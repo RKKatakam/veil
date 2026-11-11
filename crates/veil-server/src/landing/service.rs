@@ -130,9 +130,9 @@ async fn renew(hub: &Hub, project: i64, branch: &str, epoch: i64) -> Result<bool
     Ok(n == 1)
 }
 
-/// Is anything queued for `branch`?
+/// Is anything queued or merging for `branch`?
 pub(super) async fn has_ready(hub: &Hub, project: i64, branch: &str) -> Result<bool> {
-    let n: Option<i64> = sqlx::query_scalar("SELECT seq FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state = 'queued' LIMIT 1")
+    let n: Option<i64> = sqlx::query_scalar("SELECT seq FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state IN ('queued', 'merging') LIMIT 1")
         .bind(project)
         .bind(branch)
         .fetch_optional(&hub.db)
@@ -155,6 +155,28 @@ struct Row {
     agent_session: Option<String>,
 }
 
+/// Per-entry review check state (`BUG-1880`): what `prs::verify_landing_review`
+/// is asked again inside the batch's transaction.
+#[derive(Clone)]
+struct EntryReviewCheck {
+    project: Arc<Project>,
+    viewer: Viewer,
+    diff: crate::prs::StackReviewDiff,
+    claim: Option<super::ReviewClaim>,
+}
+
+/// Batch-level review rules state verified inside `Service::commit`'s single
+/// transaction (`BUG-1880`).
+#[derive(Clone)]
+struct BatchReviewGuard {
+    ctx: crate::prs::BranchReviewContext,
+    project_epoch: i64,
+    protected: bool,
+    /// The server has reverted some change of the project twice: such a
+    /// change needs a person's approval on any branch (BUG-1884).
+    reverted_twice: bool,
+}
+
 /// Metadata of a row in a built batch.
 #[derive(Clone)]
 struct RowMeta {
@@ -165,6 +187,8 @@ struct RowMeta {
     change_id: Option<veil_core::ChangeId>,
     agent_session: Option<String>,
     epochs: (i64, i64),
+    user_entry: bool,
+    review_check: Option<EntryReviewCheck>,
 }
 
 impl crate::limits::landing::QueuedEntry for Row {
@@ -234,6 +258,8 @@ struct Prepared {
     /// and the push's checks run again.
     recheck: bool,
     epochs: (i64, i64),
+    review_refusal: Option<String>,
+    review_check: Option<EntryReviewCheck>,
 }
 
 /// A batch's inputs, read before it is built.
@@ -248,6 +274,7 @@ struct Inputs {
     /// Stack changes that landed already, in the branch's lineage
     /// (`landings`).
     landed: HashMap<ObjectId, Record>,
+    review_guard: Option<BatchReviewGuard>,
 }
 
 /// Where a stack change landed already (its edits are on the branch).
@@ -294,6 +321,7 @@ struct Built {
     accept: Option<String>,
     /// The default branch's `.veilrules` at the new tip (S21).
     rules_file: Option<crate::prs::state::RulesFile>,
+    review_guard: Option<BatchReviewGuard>,
 }
 
 impl Built {
@@ -387,6 +415,7 @@ impl Service {
     async fn run(&self, wake: Arc<Notify>) -> Result<()> {
         let mut state = self.load().await?;
         let mut known = Known::default();
+        let mut last_gc_epoch: Option<i64> = None;
         let mut inflight: Option<InFlight> = None;
         let mut idle = Instant::now();
         let mut renewed = Instant::now();
@@ -405,6 +434,7 @@ impl Service {
                 self.clean().await?;
                 cleaned = Some(Instant::now());
             }
+            let has_merging = self.reclaim_expired_merges().await?;
             let exclude = inflight.as_ref().map(|f| f.seqs.clone()).unwrap_or_default();
             let rows = self.ready(&exclude).await?;
             if rows.is_empty() {
@@ -414,7 +444,9 @@ impl Service {
                     }
                     continue;
                 }
-                if idle.elapsed() > IDLE {
+                if has_merging {
+                    idle = Instant::now();
+                } else if idle.elapsed() > IDLE {
                     return Ok(());
                 }
                 let _ = tokio::time::timeout(Duration::from_millis(250), wake.notified()).await;
@@ -427,6 +459,10 @@ impl Service {
                 continue;
             }
             idle = Instant::now();
+            let gc_epoch = crate::pack_gc::read_gc_epoch(&self.hub, self.project).await?;
+            if last_gc_epoch.replace(gc_epoch) != Some(gc_epoch) {
+                known = Known::default();
+            }
             // The batch being committed holds its objects; a committed one's
             // are stored (BUG-1107).
             let on = inflight.as_ref().map(|f| f.after.clone()).unwrap_or_else(|| State { made_bytes: 0, ..state.clone() });
@@ -467,7 +503,7 @@ impl Service {
             let s = Arc::new(self.clone_handle());
             let task = tokio::spawn(async move {
                 store.await.map_err(|e| Error::Other(e.into()))??;
-                s.commit(built).await
+                s.commit(built, gc_epoch).await
             });
             inflight = Some(InFlight { task, seqs, alone, after });
         }
@@ -526,7 +562,9 @@ impl Service {
             Err(e) => {
                 // Nothing of it committed (the transaction rolled back): the
                 // entries are still queued, built again from the database.
-                eprintln!("veil-server: a landing batch of project {} failed: {e:?}", self.project);
+                if !crate::pack_gc::is_gc_epoch_changed(&e) {
+                    eprintln!("veil-server: a landing batch of project {} failed: {e:?}", self.project);
+                }
                 *state = self.load().await?;
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 Ok(true)
@@ -550,6 +588,36 @@ impl Service {
             recent: tip.into_iter().collect(),
             ..State::default()
         })
+    }
+
+    /// Reclaim `merging` rows on this branch whose worker claim expired (or had
+    /// none), fenced on this service's live branch lease (`BUG-1883`). Returns
+    /// whether any live `merging` rows remain on the branch.
+    async fn reclaim_expired_merges(&self) -> Result<bool> {
+        let (total, expired): (i64, i64) = sqlx::query_as(&format!(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE result IS NULL OR (result::jsonb->>'expires_at')::BIGINT < {DB_NOW}) \
+             FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state = 'merging'"
+        ))
+        .bind(self.project)
+        .bind(&self.branch)
+        .fetch_one(&self.hub.db)
+        .await?;
+        if expired > 0 {
+            sqlx::query(&format!(
+                "UPDATE landing_queue AS q SET state = 'queued', result = NULL \
+                 WHERE q.project_id = $1 AND q.branch = $2 AND q.state = 'merging' \
+                   AND (q.result IS NULL OR (q.result::jsonb->>'expires_at')::BIGINT < {DB_NOW}) \
+                   AND EXISTS (SELECT 1 FROM landing_leases l WHERE l.project_id = $1 AND l.branch = $2 \
+                               AND l.holder = $3 AND l.epoch = $4 AND l.expires_at >= {DB_NOW})"
+            ))
+            .bind(self.project)
+            .bind(&self.branch)
+            .bind(&self.hub.landing.holder)
+            .bind(self.epoch)
+            .execute(&self.hub.db)
+            .await?;
+        }
+        Ok(total > expired)
     }
 
     /// The ready rows, leaving out those being committed: reverts first
@@ -723,8 +791,95 @@ impl Service {
             let w = who[&k].clone();
             let cur_epochs = (person_epoch(row.person.id), project_epoch);
             let recheck = row.epochs != cur_epochs;
-            entries.push(Prepared { row, who: w, recheck, epochs: cur_epochs });
+            entries.push(Prepared {
+                row,
+                who: w,
+                recheck,
+                epochs: cur_epochs,
+                review_refusal: None,
+                review_check: None,
+            });
         }
+        // Every entry meets the review rules again here, as its submit did
+        // (BUG-1880), an embargo's release among them (BUG-1861: its claim
+        // names the embargo whose PRs may carry the approvals). Only the
+        // server's own reverts are exempt.
+        let is_user_entry = |ticket: &str| !ticket.starts_with("revert-");
+        let review_guard = if let Some(first_proj) = entries
+            .iter()
+            .find(|e| is_user_entry(&e.row.ticket))
+            .and_then(|e| e.who.as_ref().ok().map(|a| a.project.clone()))
+        {
+            let ctx = crate::prs::branch_review_context(hub, &first_proj, &self.branch, on.tip, on.made.clone()).await?;
+            let is_protected = ctx.protected.contains(&self.branch);
+            // On any branch, a change the server reverted twice needs a
+            // person's approval (BUG-1884): the reverts' outcomes first, then
+            // whether the project has such a change at all.
+            crate::bisect::settle_queued_reverts(hub, self.project).await?;
+            let reverted_twice = {
+                let mut c = hub.db.acquire().await?;
+                crate::bisect::has_reverted_twice(&mut c, self.project).await?
+            };
+            if is_protected || reverted_twice {
+                let pending_stacks: Vec<(usize, Vec<Entry>)> = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| is_user_entry(&e.row.ticket) && e.who.is_ok() && !e.row.stack.is_empty())
+                    .map(|(i, e)| (i, e.row.stack.clone()))
+                    .collect();
+                let diffs: Vec<(usize, crate::prs::StackReviewDiff)> = if pending_stacks.is_empty() {
+                    Vec::new()
+                } else {
+                    sync::blocking(hub, self.project, move |src| {
+                        pending_stacks
+                            .into_iter()
+                            .map(|(i, st)| Ok((i, crate::prs::stack_review_diff(src, &st)?)))
+                            .collect()
+                    })
+                    .await?
+                };
+                if !diffs.is_empty() {
+                    let mut c = hub.db.acquire().await?;
+                    for (idx, diff) in diffs {
+                        let e = &mut entries[idx];
+                        let Ok(a) = &e.who else { continue };
+                        let claim = e.row.stack.first().and_then(|x| x.review.clone());
+                        match crate::prs::verify_landing_review(
+                            &mut c,
+                            &a.project,
+                            &a.viewer,
+                            &self.branch,
+                            &diff,
+                            &ctx.rules,
+                            claim.as_ref(),
+                            is_protected,
+                        )
+                        .await?
+                        {
+                            Ok(_) => {
+                                e.review_check = Some(EntryReviewCheck {
+                                    project: a.project.clone(),
+                                    viewer: a.viewer.clone(),
+                                    diff,
+                                    claim,
+                                });
+                            }
+                            Err(why) => {
+                                e.review_refusal = Some(why);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(BatchReviewGuard {
+                ctx,
+                project_epoch,
+                protected: is_protected,
+                reverted_twice,
+            })
+        } else {
+            None
+        };
         // View keys known and not kept: attached from their newest memo on
         // the recent line, or handed to the background fill.
         let recent: Vec<ObjectId> = on.recent.iter().copied().collect();
@@ -814,7 +969,7 @@ impl Service {
             .await?;
             rows.into_iter().filter_map(|(s, l)| Some((ObjectId::from_hex(&s).ok()?, Record { landed: ObjectId::from_hex(&l).ok()?, change: None }))).collect()
         };
-        Ok(Inputs { entries, attach, memo, origins, landed })
+        Ok(Inputs { entries, attach, memo, origins, landed, review_guard })
     }
 
     /// Build the batch on `on` (on a blocking thread: trees, hashes,
@@ -827,9 +982,22 @@ impl Service {
 
     /// Commit the batch (its objects stored already) in one transaction;
     /// then tell the waiters here, spawn merge workers, and emit events.
-    async fn commit(&self, b: Built) -> Result<Committed> {
+    async fn commit(&self, mut b: Built, gc_epoch: i64) -> Result<Committed> {
         let t = Instant::now();
         let hub = &self.hub;
+        for o in &mut b.outcomes {
+            if let Outcome::Merging(job) = o {
+                job.claim_token = hub.landing.next_claim_token();
+            }
+        }
+        let claim_tokens: Vec<Option<i64>> = b
+            .outcomes
+            .iter()
+            .map(|o| match o {
+                Outcome::Merging(job) => Some(job.claim_token as i64),
+                _ => None,
+            })
+            .collect();
         let moved = b.after.tip != b.old_tip;
         let results: Vec<Option<LandResult>> = b
             .rows
@@ -911,9 +1079,25 @@ impl Service {
                 _ => None,
             })
             .collect();
+        let has_active_user_entries = b
+            .rows
+            .iter()
+            .zip(&b.outcomes)
+            .any(|(meta, o)| meta.user_entry && matches!(o, Outcome::Landed { .. } | Outcome::Merging(_)));
+        let active_review_checks: Vec<EntryReviewCheck> = b
+            .rows
+            .iter()
+            .zip(&b.outcomes)
+            .filter_map(|(meta, o)| match (o, &meta.review_check) {
+                (Outcome::Landed { .. } | Outcome::Merging(_), Some(rc)) => Some(rc.clone()),
+                _ => None,
+            })
+            .collect();
+        let review_guard = b.review_guard.clone();
+        let old_tip_id = b.old_tip;
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-            let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing) = (
+            let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing, active_review_checks, review_guard, claim_tokens) = (
                 ls.clone(),
                 ll.clone(),
                 mc.clone(),
@@ -923,6 +1107,9 @@ impl Service {
                 snapshot_authors.clone(),
                 active_agents.clone(),
                 rules_landing.clone(),
+                active_review_checks.clone(),
+                review_guard.clone(),
+                claim_tokens.clone(),
             );
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
@@ -939,6 +1126,7 @@ impl Service {
                 tx_results.clone(),
             );
             Box::pin(async move {
+                crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 // Fencing: only the lease's current holder moves the branch.
                 let held = sqlx::query(&format!(
                     "UPDATE landing_leases SET expires_at = {DB_NOW} + $5 WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4"
@@ -1001,6 +1189,50 @@ impl Service {
                 if n != 1 {
                     return Err(Error::conflict(MOVED));
                 }
+                // Re-verify the review rules and PR gates inside the batch's
+                // commit transaction before recording new rules or updating
+                // queue rows (`BUG-1880`): a protected branch's, an embargo
+                // PR's approvals for a release, a change reverted twice.
+                if has_active_user_entries {
+                    if let Some(guard) = &review_guard {
+                        let cur_proj_epoch: i64 = sqlx::query_scalar(
+                            "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = 0), 0)",
+                        )
+                        .bind(pid)
+                        .fetch_one(&mut *c)
+                        .await?;
+                        if cur_proj_epoch != guard.project_epoch {
+                            return Err(Error::conflict(MOVED));
+                        }
+                        if !crate::prs::rules_unchanged_in_tx(&mut *c, pid, &branch, old_tip_id, &guard.ctx).await? {
+                            return Err(Error::conflict(MOVED));
+                        }
+                        // A change reverted twice since the entries were
+                        // read: they are read again under that rule.
+                        if !guard.reverted_twice && crate::bisect::has_reverted_twice(&mut *c, pid).await? {
+                            return Err(Error::conflict(MOVED));
+                        }
+                        if guard.protected || guard.reverted_twice {
+                            for rc in &active_review_checks {
+                                if crate::prs::verify_landing_review(
+                                    &mut *c,
+                                    &rc.project,
+                                    &rc.viewer,
+                                    &branch,
+                                    &rc.diff,
+                                    &guard.ctx.rules,
+                                    rc.claim.as_ref(),
+                                    guard.protected,
+                                )
+                                .await?
+                                .is_err()
+                                {
+                                    return Err(Error::conflict(MOVED));
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(l) = &rules_landing {
                     crate::prs::state::record_landing(&mut *c, pid, l).await?;
                 }
@@ -1027,17 +1259,26 @@ impl Service {
                     .map(|r| r.as_ref().map(|x| serde_json::to_string(x).unwrap_or_default()))
                     .collect();
                 let dones: Vec<Option<i64>> = results.iter().map(|r| r.as_ref().map(|_| now_ms)).collect();
-                let n = sqlx::query(
-                    "UPDATE landing_queue AS q SET state = v.state, result = v.result, done_at = v.done_at \
-                     FROM unnest($3::BIGINT[], $4::TEXT[], $5::TEXT[], $6::BIGINT[]) AS v(seq, state, result, done_at) \
-                     WHERE q.project_id = $1 AND q.branch = $2 AND q.seq = v.seq AND q.state = 'queued'",
-                )
+                let n = sqlx::query(&format!(
+                    "UPDATE landing_queue AS q \
+                     SET state = v.state, \
+                         result = CASE \
+                             WHEN v.claim_token IS NOT NULL THEN jsonb_build_object('holder', $7::TEXT, 'token', v.claim_token, 'expires_at', {DB_NOW} + $8::BIGINT)::TEXT \
+                             ELSE v.result \
+                         END, \
+                         done_at = v.done_at \
+                     FROM unnest($3::BIGINT[], $4::TEXT[], $5::TEXT[], $6::BIGINT[], $9::BIGINT[]) AS v(seq, state, result, done_at, claim_token) \
+                     WHERE q.project_id = $1 AND q.branch = $2 AND q.seq = v.seq AND q.state = 'queued'"
+                ))
                 .bind(pid)
                 .bind(&branch)
                 .bind(&seqs)
                 .bind(&states)
                 .bind(&texts)
                 .bind(&dones)
+                .bind(&holder)
+                .bind(LEASE_MS)
+                .bind(&claim_tokens)
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
@@ -1335,7 +1576,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         pending: (*on.made).clone(),
         staged: None,
     };
-    let Inputs { entries, attach, mut memo, origins, landed } = inputs;
+    let Inputs { entries, attach, mut memo, origins, landed, review_guard } = inputs;
     let mut b = Built {
         rows: Vec::new(),
         outcomes: Vec::new(),
@@ -1351,6 +1592,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         alone: false,
         accept: None,
         rules_file: None,
+        review_guard,
     };
     // Attached keys: projected from their memo over what came after it.
     for (k, who, at, m) in attach {
@@ -1404,6 +1646,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         }
         let mark = (b.objects.len(), b.bytes, b.snapshots.len(), b.memos.len(), b.landings.len(), b.flushes);
         let last_cid = p.row.stack.last().and_then(|e| src.snapshot(&e.id).ok().map(|s| s.change_id));
+        let user_entry = !p.row.ticket.starts_with("revert-");
         let row = RowMeta {
             seq: p.row.seq,
             ticket: p.row.ticket.clone(),
@@ -1412,6 +1655,8 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             change_id: last_cid,
             agent_session: p.row.agent_session.clone(),
             epochs: p.epochs,
+            user_entry,
+            review_check: p.review_check.clone(),
         };
         let outcome = match entry(&hub, &mut src, branch, &p, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
             Ok(Some(o)) => o,
@@ -1495,12 +1740,6 @@ fn entry(
     // lands as a merge, on the tip it was made on (except an embargoed
     // merge landing at release, whose edits land on the current tip).
     let as_merge = |s: &Snapshot, base: ObjectId| s.embargo.is_none() && s.parents.len() > 1 && !s.parents[1..].contains(&base);
-    if sets.iter().flatten().any(|c| c.path == POLICY_FILE || c.path == RULES_FILE) {
-        if !b.rows.is_empty() {
-            return Ok(None);
-        }
-        b.alone = true;
-    }
     // Access changed since the submit (or after a re-queued merge): it
     // decides first, whatever happened on the tip since, so the answer to
     // someone who may no longer see or write a path never says whether it
@@ -1538,6 +1777,15 @@ fn entry(
                 }
             }
         }
+    }
+    if let Some(why) = &p.review_refusal {
+        return Ok(Some(Outcome::Rejected(why.clone())));
+    }
+    if sets.iter().flatten().any(|c| c.path == POLICY_FILE || c.path == RULES_FILE) {
+        if !b.rows.is_empty() {
+            return Ok(None);
+        }
+        b.alone = true;
     }
     // The stack, change by change, on the tip: each as a new snapshot, never
     // the submitted one, so nothing hidden below it shows in the answer
@@ -1594,6 +1842,7 @@ fn entry(
                     lineage: p.row.lineage,
                     merges: p.row.merges,
                     tip: chain,
+                    claim_token: 0,
                 })));
             }
             let report = super::merge::build_conflict(

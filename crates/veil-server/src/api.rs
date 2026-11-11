@@ -611,6 +611,10 @@ async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name):
                 .bind(me.id)
                 .execute(&mut *c)
                 .await?;
+            sqlx::query("INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 0, 0) ON CONFLICT (project_id, person_id) DO NOTHING")
+                .bind(id)
+                .execute(&mut *c)
+                .await?;
             Ok(())
         })
     })
@@ -757,11 +761,13 @@ async fn land_status(
     let Some((branch, r)) = crate::landing::read(&hub, project.id, me, &ticket).await? else {
         return Err(Error::not_found("no landing of yours with that ticket"));
     };
+    if r.state == veil_core::hub::land::LandState::Queued {
+        crate::landing::ensure(&hub, project.id, &branch);
+    }
     let r = if r.state != veil_core::hub::land::LandState::Queued || q.wait == Some(false) {
         r
     } else {
         let w = hub.landing.register(&ticket);
-        crate::landing::ensure(&hub, project.id, &branch);
         let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
         crate::landing::wait(&hub, project.id, me, &branch, w, deadline).await?
     };

@@ -300,6 +300,16 @@ async fn names(hub: &Hub, ids: &[i64]) -> Result<HashMap<i64, String>> {
 }
 
 
+/// The real tip of `branch`, if it exists and is not a hidden embargo line.
+async fn tip(hub: &Hub, project: i64, branch: &str) -> Result<Option<ObjectId>> {
+    let t: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL")
+        .bind(project)
+        .bind(branch)
+        .fetch_optional(&hub.db)
+        .await?;
+    t.map(|t| hex_id(&t)).transpose()
+}
+
 /// The review rules of the default branch's tip.
 async fn rules(hub: &Arc<Hub>, ask: &Ask) -> Result<Review> {
     state::rules_in_force(hub, &ask.project, &ask.project.default_branch).await
@@ -606,6 +616,7 @@ pub async fn create_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr
     let title = check_title(&q.title)?;
     let body = q.body.unwrap_or_default();
     check_text("the body", &body, MAX_TEXT)?;
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let onto = q.onto.unwrap_or_else(|| ask.project.default_branch.clone());
     let deadline = Instant::now() + DEADLINE;
     // The target is a branch, named as the caller names it.
@@ -615,6 +626,13 @@ pub async fn create_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr
     if land_at_release && pr_embargo.is_empty() {
         return Err(Error::bad_request("land_at_release applies only to an embargoed PR"));
     }
+    // The branch landing deletes (BUG-1885). An embargoed PR has none: its
+    // head is the embargo's line, which only the release removes.
+    let source_branch = if pr_embargo.is_empty() {
+        crate::branches::source_of_pr(hub, ask.project.id, &q.head, &onto, head).await?
+    } else {
+        None
+    };
     let r = if pr_embargo.is_empty() {
         compute(hub, ask, head, onto_tip).await?
     } else {
@@ -635,7 +653,7 @@ pub async fn create_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr
     for _ in 0..5 {
         let id = random_id();
         let now = veil_core::now_millis();
-        let (r, key, lines, title, body, onto, pr_emb, id2) = (
+        let (r, key, lines, title, body, onto, pr_emb, src_b, id2) = (
             r.clone(),
             key.clone(),
             lines.clone(),
@@ -643,10 +661,11 @@ pub async fn create_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr
             body.clone(),
             onto.clone(),
             pr_emb.clone(),
+            source_branch.clone(),
             id.clone(),
         );
         let fresh = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
-            let (r, key, lines, title, body, onto, pr_emb, id) = (
+            let (r, key, lines, title, body, onto, pr_emb, src_b, id) = (
                 r.clone(),
                 key.clone(),
                 lines.clone(),
@@ -654,9 +673,11 @@ pub async fn create_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr
                 body.clone(),
                 onto.clone(),
                 pr_emb.clone(),
+                src_b.clone(),
                 id2.clone(),
             );
             Box::pin(async move {
+                crate::pack_gc::guard_root_write(&mut *c, project, gc_epoch).await?;
                 if !pr_emb.is_empty() {
                     let locked = sqlx::query(
                         "UPDATE embargo_lines SET has_pr = TRUE WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL",
@@ -672,8 +693,8 @@ pub async fn create_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr
                 }
                 let class = class::put_class_for(&mut *c, project, &key, &lines, &pr_emb).await?;
                 let inserted = sqlx::query(
-                    "INSERT INTO prs (project_id, id, class_id, policy_key, target, author, title, body, state, revision, created_at, updated_at, embargo, land_at_release) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, $9, $9, $10, $11) ON CONFLICT (project_id, id) DO NOTHING",
+                    "INSERT INTO prs (project_id, id, class_id, policy_key, target, author, title, body, state, revision, created_at, updated_at, embargo, land_at_release, source_branch) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, $9, $9, $10, $11, $12) ON CONFLICT (project_id, id) DO NOTHING",
                 )
                 .bind(project)
                 .bind(&id)
@@ -686,6 +707,7 @@ pub async fn create_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr
                 .bind(now)
                 .bind(&pr_emb)
                 .bind(land_at_release && !pr_emb.is_empty())
+                .bind(&src_b)
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
@@ -929,8 +951,15 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     if pr.revision >= MAX_REVISIONS {
         return Err(Error::bad_request(format!("a PR has at most {MAX_REVISIONS} revisions; open a new one")));
     }
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let deadline = Instant::now() + DEADLINE;
     let (head, head_emb) = embargo::resolve_head(hub, ask, &q.head, deadline).await?;
+    // An embargoed PR never has a source branch to delete (BUG-1885).
+    let source_branch = if pr.embargo.is_empty() {
+        crate::branches::source_of_pr(hub, ask.project.id, &q.head, &pr.target, head).await?
+    } else {
+        None
+    };
     // The target as the caller sees it (never a withheld one), then its tip.
     let (onto, onto_emb) = embargo::resolve_onto(hub, ask, &pr.target, deadline)
         .await
@@ -1002,12 +1031,14 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     let (project, prid, pr_emb, r, old_rev) = (ask.project.id, pr.id.clone(), pr.embargo.clone(), Arc::new(r), pr.revision);
     let now = veil_core::now_millis();
     let ok = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
-        let (key, lines, prid, pr_emb, r, moved) = (key.clone(), lines.clone(), prid.clone(), pr_emb.clone(), r.clone(), moved.clone());
+        let (key, lines, prid, pr_emb, r, moved, src_b) =
+            (key.clone(), lines.clone(), prid.clone(), pr_emb.clone(), r.clone(), moved.clone(), source_branch.clone());
         Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, project, gc_epoch).await?;
             let class = class::put_class_for(&mut *c, project, &key, &lines, &pr_emb).await?;
             // The compare-and-swap: two new revisions at once, one wins.
             let moved_on = sqlx::query(
-                "UPDATE prs SET revision = $1, class_id = $2, policy_key = $3, updated_at = $4 \
+                "UPDATE prs SET revision = $1, class_id = $2, policy_key = $3, updated_at = $4, source_branch = COALESCE($9, source_branch) \
                  WHERE project_id = $5 AND id = $6 AND revision = $7 AND embargo = $8 AND state = 'open'",
             )
             .bind(n)
@@ -1018,6 +1049,7 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
             .bind(&prid)
             .bind(old_rev)
             .bind(&pr_emb)
+            .bind(&src_b)
             .execute(&mut *c)
             .await?
             .rows_affected();
@@ -1553,100 +1585,282 @@ pub async fn stack_touched_paths(
     .await
 }
 
-/// Check the review rules in force for a landing `stack` onto a protected
-/// `branch` (S17 + S21, `docs/HUB.md` §13.24): every landing onto a protected
-/// branch meets the review rules by every route (push, `POST …/land`, API
-/// commit with land, `POST …/prs/{id}/land`, and embargo release). If an open
-/// PR on `branch` has `stack`'s patch as its current revision (and covers its
-/// paths), its gate decides (and its id is returned so it is marked `landed`
-/// when the landing commits); otherwise `stack` is rated directly under the
-/// rules in force with 0 approvals.
-pub async fn check_landing_review(
-    hub: &Arc<Hub>,
-    project: &crate::perm::Project,
-    viewer: &Viewer,
-    branch: &str,
-    stack: &[crate::landing::Entry],
-    staged: Option<Arc<crate::sync::Staged>>,
-    branch_protected: bool,
-) -> Result<Option<String>> {
-    check_landing_review_for_embargo(hub, project, viewer, branch, stack, staged, branch_protected, None).await
+/// Diff summary of a landing stack for the review rules' check (`BUG-1880`).
+#[derive(Clone, Debug)]
+pub struct StackReviewDiff {
+    pub touched: BTreeSet<String>,
+    pub files: Vec<rules::FileChange>,
+    pub patch: String,
+    /// The change ids of the stack's entries (the rule for a change the
+    /// server reverted twice: BUG-1884).
+    pub changes: Vec<String>,
 }
 
-/// [`check_landing_review`] for an embargo's release: a PR of that embargo
-/// may carry the approvals (BUG-1861).
-#[allow(clippy::too_many_arguments)]
-pub async fn check_landing_review_for_embargo(
+/// Compute [`StackReviewDiff`] for `stack` from `src`.
+pub fn stack_review_diff(src: &crate::sync::Source, stack: &[crate::landing::Entry]) -> Result<StackReviewDiff> {
+    let mut changes = Vec::with_capacity(stack.len());
+    let mut touched = BTreeSet::new();
+    let mut files: std::collections::BTreeMap<String, rules::FileChange> = std::collections::BTreeMap::new();
+    let mut patch = blake3::Hasher::new_derive_key("veil 2026 hub pr patch v1");
+    for e in stack {
+        let s = src.snapshot(&e.id)?;
+        changes.push(s.change_id.to_string());
+        let parent = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) {
+            e.base
+        } else {
+            s.parents.first().copied().unwrap_or_else(crate::sync::root_snapshot_id)
+        };
+        let ptree = src.snapshot(&parent)?.tree;
+        let (leaves, dirs) = crate::derive::changes::diff(src, ptree, s.tree)?;
+        if !leaves.is_empty() {
+            patch.update(&s.change_id.0);
+            patch.update(&(leaves.len() as u64).to_le_bytes());
+        }
+        for c in &leaves {
+            patch.update(&(c.path.len() as u64).to_le_bytes());
+            patch.update(c.path.as_bytes());
+            revision::entry_bytes(&mut patch, c.old.as_ref());
+            revision::entry_bytes(&mut patch, c.new.as_ref());
+            let secret = [&c.old, &c.new].iter().any(|e| e.as_ref().is_some_and(|e| !e.visibility.is_public()));
+            let executable = c.new.as_ref().is_some_and(|e| e.executable);
+            let regular = [&c.old, &c.new].iter().all(|e| e.as_ref().is_none_or(|e| e.kind == veil_core::object::EntryKind::File));
+            let f = files.entry(c.path.clone()).or_insert(rules::FileChange {
+                path: c.path.clone(),
+                secret,
+                executable,
+                regular,
+            });
+            f.secret |= secret;
+            f.executable |= executable;
+            f.regular &= regular;
+            touched.insert(c.path.clone());
+        }
+        touched.extend(dirs.into_iter().filter(|d| !d.is_empty()));
+    }
+    Ok(StackReviewDiff {
+        touched,
+        files: files.into_values().collect(),
+        patch: patch.finalize().to_hex().to_string(),
+        changes,
+    })
+}
+
+/// Snapshot of the default branch's protection set and review rules prepared for
+/// a landing batch (`BUG-1880`).
+#[derive(Clone, Debug)]
+pub struct BranchReviewContext {
+    pub default_branch: String,
+    pub default_tip: Option<ObjectId>,
+    pub default_file: state::RulesFile,
+    pub protected: std::collections::BTreeSet<String>,
+    pub rules: Review,
+}
+
+pub async fn branch_review_context(
     hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    branch: &str,
+    on_tip: Option<ObjectId>,
+    pending: Arc<HashMap<ObjectId, bytes::Bytes>>,
+) -> Result<BranchReviewContext> {
+    let db_default_tip = tip(hub, project.id, &project.default_branch).await?;
+    let default_tip = if branch == project.default_branch {
+        on_tip
+    } else {
+        db_default_tip
+    };
+    let pid = project.id;
+    let rt = tokio::runtime::Handle::current();
+    let (protected, default_file) = tokio::task::spawn_blocking({
+        let hub = hub.clone();
+        move || {
+            let src = crate::sync::Source {
+                hub,
+                project: pid,
+                rt,
+                pending: (*pending).clone(),
+                staged: None,
+            };
+            let protected = crate::landing::protected(&src, default_tip)?;
+            let file = match default_tip {
+                Some(t) => state::file_at(&src, src.snapshot(&t)?.tree)?,
+                None => state::RulesFile::Absent,
+            };
+            Ok::<_, Error>((protected, file))
+        }
+    })
+    .await
+    .map_err(|e| Error::Other(e.into()))??;
+    let rules = match &default_file {
+        state::RulesFile::Valid(t) => Review::parse(Some(t.as_bytes())),
+        state::RulesFile::Absent => Review::default(),
+        state::RulesFile::Broken(_) if default_tip == db_default_tip => {
+            state::rules_in_force(hub, project, &project.default_branch).await?
+        }
+        state::RulesFile::Broken(_) => {
+            let row: Option<(String, String)> = sqlx::query_as(
+                "SELECT checked, state FROM pr_review_rules WHERE project_id = $1",
+            )
+            .bind(project.id)
+            .fetch_optional(&hub.db)
+            .await?;
+            let st = match (row, db_default_tip) {
+                (Some((checked, state_str)), Some(dbt)) if checked == dbt.hex() => {
+                    serde_json::from_str(&state_str).unwrap_or(state::RulesState::Strict)
+                }
+                _ => state::RulesState::Strict,
+            };
+            state::review_of(&default_file, &st)
+        }
+    };
+    Ok(BranchReviewContext {
+        default_branch: project.default_branch.clone(),
+        default_tip,
+        default_file,
+        protected,
+        rules,
+    })
+}
+
+/// Verify inside a batch's commit transaction that the default branch's review
+/// rules have not changed since [`branch_review_context`] ran (`BUG-1880`).
+pub async fn rules_unchanged_in_tx(
+    c: &mut sqlx::PgConnection,
+    project_id: i64,
+    branch: &str,
+    old_tip: Option<ObjectId>,
+    ctx: &BranchReviewContext,
+) -> Result<bool> {
+    let tip = if branch == ctx.default_branch {
+        old_tip
+    } else {
+        let cur: Option<String> = sqlx::query_scalar(
+            "SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL",
+        )
+        .bind(project_id)
+        .bind(&ctx.default_branch)
+        .fetch_optional(&mut *c)
+        .await?;
+        if cur != ctx.default_tip.map(|t| t.hex()) {
+            return Ok(false);
+        }
+        ctx.default_tip
+    };
+    let live_rules = match tip {
+        None => Review::default(),
+        Some(t) => {
+            let row: Option<(String, String)> = sqlx::query_as(
+                "SELECT checked, state FROM pr_review_rules WHERE project_id = $1",
+            )
+            .bind(project_id)
+            .fetch_optional(&mut *c)
+            .await?;
+            let st = match row {
+                Some((checked, state_str)) if checked == t.hex() => {
+                    serde_json::from_str(&state_str).unwrap_or(state::RulesState::Strict)
+                }
+                _ => state::next_state(&ctx.default_file, None),
+            };
+            state::review_of(&ctx.default_file, &st)
+        }
+    };
+    Ok(live_rules == ctx.rules)
+}
+
+/// Every refusal of a landing under the review rules starts with this.
+pub const NOT_READY: &str = "not ready to land:";
+
+/// Evaluate the review rules for a landing on `c` (usable both in
+/// `Service::prepare` and inside `Service::commit`'s single transaction,
+/// `BUG-1880`), the one rule every route that lands meets (S17 + S21,
+/// `docs/HUB.md` §13.24: push, `POST …/land`, API commit with land,
+/// `POST …/prs/{id}/land`, an embargo's release): a protected branch's
+/// (`branch_protected`), and on any branch a person's approval of a change
+/// the server reverted twice (BUG-1884; the reverts as recorded:
+/// `bisect::settle_queued_reverts` comes first). On an unprotected branch
+/// with no such change there is nothing to meet.
+///
+/// A landing of a PR (`ReviewClaim::Pr`) meets that PR's gate at the revision
+/// it was submitted at. Any other: if an open PR on `branch` has the stack's
+/// patch as its current revision (and covers its paths), its gate decides;
+/// for an embargo's release (`ReviewClaim::Embargo`), a PR of that embargo
+/// may carry the approvals (BUG-1861). Otherwise the stack is rated directly
+/// under `rules` with 0 approvals.
+///
+/// Returns `Ok(Ok(matched_pr))` when ready, or `Ok(Err(message))` with the
+/// refusal message the submit route gives.
+#[allow(clippy::too_many_arguments)]
+pub async fn verify_landing_review(
+    c: &mut sqlx::PgConnection,
     project: &crate::perm::Project,
     viewer: &Viewer,
     branch: &str,
-    stack: &[crate::landing::Entry],
-    staged: Option<Arc<crate::sync::Staged>>,
+    diff: &StackReviewDiff,
+    rules: &Review,
+    claim: Option<&crate::landing::ReviewClaim>,
     branch_protected: bool,
-    embargo_id: Option<&str>,
-) -> Result<Option<String>> {
-    if stack.is_empty() {
-        return Ok(None);
-    }
-    let rules = state::rules_in_force(hub, project, &project.default_branch).await?;
-    let entries = stack.to_vec();
-    let r2 = rules.clone();
-    let (cids, touched, risk, patch) = crate::sync::blocking_staged(hub, project.id, staged, move |src| {
-        let mut cids = Vec::with_capacity(entries.len());
-        let mut touched = BTreeSet::new();
-        let mut files: std::collections::BTreeMap<String, rules::FileChange> = std::collections::BTreeMap::new();
-        let mut patch = blake3::Hasher::new_derive_key("veil 2026 hub pr patch v1");
-        for e in &entries {
-            let s = src.snapshot(&e.id)?;
-            cids.push(s.change_id.to_string());
-            let parent = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) {
-                e.base
-            } else {
-                s.parents.first().copied().unwrap_or_else(crate::sync::root_snapshot_id)
-            }
-            ;
-            let ptree = src.snapshot(&parent)?.tree;
-            let (leaves, dirs) = crate::derive::changes::diff(src, ptree, s.tree)?;
-            if !leaves.is_empty() {
-                patch.update(&s.change_id.0);
-                patch.update(&(leaves.len() as u64).to_le_bytes());
-            }
-            for c in &leaves {
-                patch.update(&(c.path.len() as u64).to_le_bytes());
-                patch.update(c.path.as_bytes());
-                revision::entry_bytes(&mut patch, c.old.as_ref());
-                revision::entry_bytes(&mut patch, c.new.as_ref());
-                let secret = [&c.old, &c.new].iter().any(|e| e.as_ref().is_some_and(|e| !e.visibility.is_public()));
-                let executable = c.new.as_ref().is_some_and(|e| e.executable);
-                let regular = [&c.old, &c.new].iter().all(|e| e.as_ref().is_none_or(|e| e.kind == veil_core::object::EntryKind::File));
-                let f = files.entry(c.path.clone()).or_insert(rules::FileChange {
-                    path: c.path.clone(),
-                    secret,
-                    executable,
-                    regular,
-                });
-                f.secret |= secret;
-                f.executable |= executable;
-                f.regular &= regular;
-                touched.insert(c.path.clone());
-            }
-            touched.extend(dirs.into_iter().filter(|d| !d.is_empty()));
-        }
-        let files: Vec<rules::FileChange> = files.into_values().collect();
-        let (risk, _) = classify(&files, &r2);
-        Ok((cids, touched, risk, patch.finalize().to_hex().to_string()))
-    })
-    .await?;
-
-    let rev_twice = crate::bisect::any_reverted_twice(hub, project.id, &cids).await?;
+) -> Result<std::result::Result<Option<String>, String>> {
+    let rev_twice = crate::bisect::any_reverted_twice_conn(&mut *c, project.id, &diff.changes).await?;
     if !branch_protected && !rev_twice {
-        return Ok(None);
+        return Ok(Ok(None));
+    }
+    if let Some(crate::landing::ReviewClaim::Pr { id, revision: req_rev, patch: req_patch }) = claim {
+        type Row = (String, i64, String, String, String, String, i32, i64, i64, String, bool, Option<String>, Option<String>);
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT p.target, p.author, pe.name, p.title, p.body, p.state, p.revision, p.created_at, p.updated_at, p.embargo, p.land_at_release, r.patch, r.files \
+             FROM prs p JOIN people pe ON pe.id = p.author \
+             LEFT JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = p.revision \
+             WHERE p.project_id = $1 AND p.id = $2",
+        )
+        .bind(project.id)
+        .bind(id)
+        .fetch_optional(&mut *c)
+        .await?;
+        let Some((target, author, author_name, title, body, state_str, cur_rev, created_at, updated_at, embargo, land_at_release, cur_patch, cur_files)) = row
+        else {
+            return Ok(Err(format!("{NOT_READY} the PR no longer exists")));
+        };
+        let pr = PrRow {
+            id: id.clone(),
+            target,
+            author,
+            author_name,
+            title,
+            body,
+            state: state_str,
+            revision: cur_rev,
+            created_at,
+            updated_at,
+            embargo,
+            land_at_release,
+        };
+        if pr.state == "open" && (cur_rev != *req_rev || cur_patch.as_deref() != Some(req_patch.as_str())) {
+            return Ok(Err(format!("{NOT_READY} a new revision was pushed to the PR")));
+        }
+        let pr_files: Vec<FileChange> = match cur_files {
+            Some(f) => serde_json::from_str(&f).map_err(|e| Error::Other(e.into()))?,
+            None => diff.files.clone(),
+        };
+        let (pr_risk, _) = classify(&pr_files, rules);
+        let patch_ref = cur_patch.as_deref().unwrap_or(req_patch.as_str());
+        let g = review::gate_conn(&mut *c, project, viewer, &pr, patch_ref, pr_risk, rules, rev_twice, false).await?;
+        return if g.ready {
+            Ok(Ok(Some(pr.id)))
+        } else {
+            Ok(Err(format!("{NOT_READY} {}", g.reasons.join("; "))))
+        };
     }
 
-    type Cand = (String, i64, String, String, String, i32, i64, i64, String, bool);
+    let (effective_patch, embargo_id) = match claim {
+        Some(crate::landing::ReviewClaim::Patch { patch }) => (patch.as_str(), None),
+        Some(crate::landing::ReviewClaim::Embargo { embargo, patch }) => (patch.as_str(), Some(embargo.as_str())),
+        _ => (diff.patch.as_str(), None),
+    };
+    let (risk, _) = classify(&diff.files, rules);
+
+    type Cand = (String, i64, String, String, String, i32, i64, i64, String, bool, String);
     let cands: Vec<Cand> = sqlx::query_as(
-        "SELECT p.id, p.author, pe.name, p.title, p.body, p.revision, p.created_at, p.updated_at, p.embargo, p.land_at_release \
+        "SELECT p.id, p.author, pe.name, p.title, p.body, p.revision, p.created_at, p.updated_at, p.embargo, p.land_at_release, r.files \
          FROM prs p JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = p.revision \
          JOIN people pe ON pe.id = p.author \
          WHERE p.project_id = $1 AND p.target = $2 AND p.state = 'open' \
@@ -1656,14 +1870,14 @@ pub async fn check_landing_review_for_embargo(
     )
     .bind(project.id)
     .bind(branch)
-    .bind(&patch)
+    .bind(effective_patch)
     .bind(embargo_id)
-    .fetch_all(&hub.db)
+    .fetch_all(&mut *c)
     .await?;
     let mut not_ready_reasons: Option<Vec<String>> = None;
-    for (id, author, author_name, title, body, revision, created_at, updated_at, pr_embargo, land_at_release) in cands {
-        let pr_paths: BTreeSet<String> = review::paths_of(hub, project.id, &id).await?.into_iter().collect();
-        if !touched.is_subset(&pr_paths) {
+    for (id, author, author_name, title, body, revision, created_at, updated_at, pr_embargo, land_at_release, rev_files_json) in cands {
+        let pr_paths: BTreeSet<String> = review::paths_of_conn(&mut *c, project.id, &id).await?.into_iter().collect();
+        if !diff.touched.is_subset(&pr_paths) {
             continue;
         }
         let pr = PrRow {
@@ -1680,26 +1894,18 @@ pub async fn check_landing_review_for_embargo(
             embargo: pr_embargo,
             land_at_release,
         };
-        let revs = rated(hub, project.id, &pr.id, &rules).await?;
-        let pr_risk = revs
-            .iter()
-            .find(|r| r.n == pr.revision)
-            .map(|r| Risk::parse(&r.risk))
-            .unwrap_or(risk);
-        let gate = review::gate(hub, project, viewer, &pr, &patch, pr_risk, &rules, rev_twice).await?;
+        let rev_files: Vec<FileChange> = serde_json::from_str(&rev_files_json).map_err(|e| Error::Other(e.into()))?;
+        let (pr_risk, _) = classify(&rev_files, rules);
+        let gate = review::gate_conn(&mut *c, project, viewer, &pr, effective_patch, pr_risk, rules, rev_twice, false).await?;
         if gate.ready {
-            return Ok(Some(pr.id));
+            return Ok(Ok(Some(pr.id)));
         }
         if not_ready_reasons.is_none() {
             not_ready_reasons = Some(gate.reasons);
         }
     }
     if let Some(reasons) = not_ready_reasons {
-        return Err(Error::new(
-            StatusCode::CONFLICT,
-            "not_ready",
-            format!("not ready to land: {}", reasons.join("; ")),
-        ));
+        return Ok(Err(format!("{NOT_READY} {}", reasons.join("; "))));
     }
     let risk = if rev_twice { Risk::High } else { risk };
     let mut need = if branch_protected {
@@ -1711,9 +1917,9 @@ pub async fn check_landing_review_for_embargo(
         need.approvals = need.approvals.max(1);
         need.people_only = true;
     }
-    let paths: Vec<String> = touched.into_iter().collect();
+    let paths: Vec<String> = diff.touched.iter().cloned().collect();
     let held: Vec<String> = if branch_protected {
-        review::holds_for_pr(hub, project.id, embargo_id.unwrap_or(""), &paths)
+        review::holds_for_pr_conn(&mut *c, project.id, embargo_id.unwrap_or(""), &paths)
             .await?
             .into_iter()
             .map(|(_, n, _)| n)
@@ -1722,7 +1928,7 @@ pub async fn check_landing_review_for_embargo(
         Vec::new()
     };
     if need.approvals == 0 && held.is_empty() {
-        return Ok(None);
+        return Ok(Ok(None));
     }
     let mut reasons: Vec<String> = if !branch_protected {
         Vec::new()
@@ -1749,11 +1955,57 @@ pub async fn check_landing_review_for_embargo(
     for h in &held {
         reasons.push(format!("{h} asked for changes"));
     }
-    Err(Error::new(
-        StatusCode::CONFLICT,
-        "not_ready",
-        format!("not ready to land: {}", reasons.join("; ")),
-    ))
+    Ok(Err(format!("{NOT_READY} {}", reasons.join("; "))))
+}
+
+/// Check the review rules in force for a landing `stack` onto `branch`
+/// ([`verify_landing_review`]) when a route submits it: `Err` (`not_ready`)
+/// with the refusal, or what the landing batch checks again in its own
+/// transaction (BUG-1880), kept on the stack's first entry.
+pub async fn check_landing_review(
+    hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    viewer: &Viewer,
+    branch: &str,
+    stack: &[crate::landing::Entry],
+    staged: Option<Arc<crate::sync::Staged>>,
+    branch_protected: bool,
+) -> Result<Option<crate::landing::ReviewClaim>> {
+    check_landing_review_for_embargo(hub, project, viewer, branch, stack, staged, branch_protected, None).await
+}
+
+/// [`check_landing_review`] for an embargo's release: a PR of that embargo
+/// may carry the approvals (BUG-1861), at submit and in the batch alike.
+#[allow(clippy::too_many_arguments)]
+pub async fn check_landing_review_for_embargo(
+    hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    viewer: &Viewer,
+    branch: &str,
+    stack: &[crate::landing::Entry],
+    staged: Option<Arc<crate::sync::Staged>>,
+    branch_protected: bool,
+    embargo_id: Option<&str>,
+) -> Result<Option<crate::landing::ReviewClaim>> {
+    if stack.is_empty() {
+        return Ok(None);
+    }
+    let rules = state::rules_in_force(hub, project, &project.default_branch).await?;
+    let entries = stack.to_vec();
+    let diff = crate::sync::blocking_staged(hub, project.id, staged, move |src| stack_review_diff(src, &entries)).await?;
+    crate::bisect::settle_queued_reverts(hub, project.id).await?;
+    // An embargo's release always says whose PRs count; any other landing
+    // names its patch where the branch's rules were met.
+    let claim = match embargo_id {
+        Some(e) => Some(crate::landing::ReviewClaim::Embargo { embargo: e.to_string(), patch: diff.patch.clone() }),
+        None if branch_protected => Some(crate::landing::ReviewClaim::Patch { patch: diff.patch.clone() }),
+        None => None,
+    };
+    let mut c = hub.db.acquire().await?;
+    match verify_landing_review(&mut c, project, viewer, branch, &diff, &rules, claim.as_ref(), branch_protected).await? {
+        Ok(_) => Ok(claim),
+        Err(msg) => Err(Error::new(StatusCode::CONFLICT, "not_ready", msg)),
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1771,6 +2023,7 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
 pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: LandPr) -> Result<Value> {
     let me = participant(ask, caller)?;
     let person = signed_in(caller)?.clone();
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let pr = visible(hub, ask, id).await?;
     if !pr.embargo.is_empty() {
         return embargo::land_embargoed(hub, ask, me, &pr, q.at_release).await;
@@ -1787,31 +2040,44 @@ pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: 
         return Err(Error::new(StatusCode::CONFLICT, "not_ready", format!("not ready to land: {}", g.reasons.join("; "))));
     }
     let current = revs.iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
-    let judged = match crate::landing::stack(hub, &ask.project, &ask.viewer, &pr.target, current.head, &HashMap::new(), None).await? {
+    let mut judged = match crate::landing::stack(hub, &ask.project, &ask.viewer, &pr.target, current.head, &HashMap::new(), None).await? {
         Ok(s) if !s.branch => return Err(Error::conflict(format!("the target {} no longer exists", pr.target))),
         Ok(s) => s,
         Err(why) => return Err(Error::bad_request(why)),
     };
     crate::landing::agent_stack(hub, &ask.project, &ask.viewer, &pr.target, &judged, current.head, false, None).await?;
-    // Re-check the gate right before queueing so an access, rule, or hold
-    // change during stack computation is never missed.
-    let (_, g) = gate(hub, ask, &pr).await?;
+    // Re-check the PR and its gate right before queueing so a revision,
+    // access, rule, or hold change during stack computation is never missed.
+    let pr_now = visible(hub, ask, id).await?;
+    if pr_now.state == "open" && pr_now.revision != pr.revision {
+        return Err(Error::new(StatusCode::CONFLICT, "not_ready", "not ready to land: a new revision was pushed to the PR"));
+    }
+    let (_, g) = gate(hub, ask, &pr_now).await?;
     if !g.ready {
         return Err(Error::new(StatusCode::CONFLICT, "not_ready", format!("not ready to land: {}", g.reasons.join("; "))));
     }
     if judged.stack.is_empty() {
         let now = veil_core::now_millis();
-        let n = sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
+        let n = sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open' AND revision = $4")
             .bind(now)
             .bind(ask.project.id)
             .bind(&pr.id)
+            .bind(pr.revision)
             .execute(&hub.db)
             .await?
             .rows_affected();
         if n > 0 {
             crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.landed").await;
         }
+        let _ = crate::branches::delete_landed_pr_branch(hub, &ask.project, &pr.id, pr.revision, me).await;
         return show(hub, ask, id).await;
+    }
+    if let Some(first) = judged.stack.first_mut() {
+        first.review = Some(crate::landing::ReviewClaim::Pr {
+            id: pr.id.clone(),
+            revision: pr.revision,
+            patch: current.patch.clone(),
+        });
     }
     let who = crate::landing::Submitter {
         person,
@@ -1830,7 +2096,10 @@ pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: 
     let who2 = who.clone();
     let r = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
         let (q, who) = (q2.clone(), who2.clone());
-        Box::pin(async move { crate::landing::insert(&mut *c, pid, &who, &q).await })
+        Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
+            crate::landing::insert(&mut *c, pid, &who, &q).await
+        })
     })
     .await;
     if let Err(e) = r {
@@ -1847,16 +2116,18 @@ pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: 
     match r.state {
         LandState::Landed => {
             let now = veil_core::now_millis();
-            let n = sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
+            let n = sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open' AND revision = $4")
                 .bind(now)
                 .bind(ask.project.id)
                 .bind(&pr.id)
+                .bind(pr.revision)
                 .execute(&hub.db)
                 .await?
                 .rows_affected();
             if n > 0 {
                 crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.landed").await;
             }
+            let _ = crate::branches::delete_landed_pr_branch(hub, &ask.project, &pr.id, pr.revision, me).await;
             let mut v = show(hub, ask, id).await?;
             v["landing"] = serde_json::to_value(&r).unwrap_or_default();
             Ok(v)
@@ -1872,7 +2143,14 @@ pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: 
             });
             Err(Error::new(StatusCode::CONFLICT, "conflict", msg))
         }
-        LandState::Rejected => Err(Error::bad_request(r.message.unwrap_or_else(|| "landing rejected".into()))),
+        LandState::Rejected => {
+            let msg = r.message.unwrap_or_else(|| "landing rejected".into());
+            if msg.starts_with(NOT_READY) {
+                Err(Error::new(StatusCode::CONFLICT, "not_ready", msg))
+            } else {
+                Err(Error::bad_request(msg))
+            }
+        }
         LandState::Queued => {
             let mut v = show(hub, ask, id).await?;
             v["landing"] = serde_json::to_value(&r).unwrap_or_default();

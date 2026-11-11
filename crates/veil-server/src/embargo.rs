@@ -100,26 +100,39 @@ pub struct LineUpsert {
     pub created_at: i64,
 }
 
+/// What [`can_see_groups`] knows without the database: `Some(true)` for an
+/// admin or a member of a group the policy binds one of `group_names` to,
+/// `Some(false)` when `viewer` is in no group or no group is named.
+fn in_bound_groups(project: &Project, viewer: &Viewer, group_names: &[String]) -> Option<bool> {
+    if viewer.admin {
+        return Some(true);
+    }
+    if viewer.groups.is_empty() || group_names.is_empty() {
+        return Some(false);
+    }
+    let bound = group_names.iter().any(|g| matches!(project.bindings.get(g), Some(Binding::Group(gid)) if viewer.groups.contains(gid)));
+    bound.then_some(true)
+}
+
 /// Does `viewer` belong to at least one of `group_names` in `project` (or is
 /// `viewer` an admin of `project`)?
 pub async fn can_see_groups(hub: &Hub, project: &Project, viewer: &Viewer, group_names: &[String]) -> Result<bool> {
-    if viewer.admin {
-        return Ok(true);
+    if let Some(known) = in_bound_groups(project, viewer, group_names) {
+        return Ok(known);
     }
-    if viewer.groups.is_empty() || group_names.is_empty() {
-        return Ok(false);
-    }
-    for g in group_names {
-        if let Some(Binding::Group(gid)) = project.bindings.get(g) {
-            if viewer.groups.contains(gid) {
-                return Ok(true);
-            }
-        }
+    let mut c = hub.db.acquire().await?;
+    can_see_groups_conn(&mut c, project, viewer, group_names).await
+}
+
+/// [`can_see_groups`] on a connection.
+async fn can_see_groups_conn(c: &mut PgConnection, project: &Project, viewer: &Viewer, group_names: &[String]) -> Result<bool> {
+    if let Some(known) = in_bound_groups(project, viewer, group_names) {
+        return Ok(known);
     }
     let gids: Vec<i64> = sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = ANY($2)")
         .bind(project.id)
         .bind(group_names)
-        .fetch_all(&hub.db)
+        .fetch_all(&mut *c)
         .await?;
     Ok(gids.into_iter().any(|gid| viewer.groups.contains(&gid)))
 }
@@ -129,11 +142,21 @@ pub async fn can_see(hub: &Hub, project: &Project, viewer: &Viewer, embargo_id: 
     if viewer.admin {
         return Ok(true);
     }
+    let mut c = hub.db.acquire().await?;
+    can_see_conn(&mut c, project, viewer, embargo_id).await
+}
+
+/// [`can_see`] on a connection (a landing batch counts an embargoed PR's
+/// approvals inside its transaction: BUG-1880).
+pub async fn can_see_conn(c: &mut PgConnection, project: &Project, viewer: &Viewer, embargo_id: &str) -> Result<bool> {
+    if viewer.admin {
+        return Ok(true);
+    }
     let row: Option<(Vec<String>, Option<i64>)> =
         sqlx::query_as("SELECT group_names, released_at FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2")
             .bind(project.id)
             .bind(embargo_id)
-            .fetch_optional(&hub.db)
+            .fetch_optional(&mut *c)
             .await?;
     let Some((groups, released_at)) = row else {
         return Ok(false);
@@ -141,7 +164,7 @@ pub async fn can_see(hub: &Hub, project: &Project, viewer: &Viewer, embargo_id: 
     if released_at.is_some() {
         return Ok(true);
     }
-    can_see_groups(hub, project, viewer, &groups).await
+    can_see_groups_conn(c, project, viewer, &groups).await
 }
 
 /// Filter branch `(name, target)` rows from `branches` so that hidden embargo
@@ -1067,7 +1090,8 @@ pub(crate) async fn read_embargo_ticket(
 /// every landing (its submitter's outstanding-landing bounds, S24), and wait
 /// for the landing service (S17). A ticket that failed is queued again only
 /// when a person asks (`manual_retry`); a push to the line removes it
-/// (`record_in_tx`).
+/// (`record_in_tx`). `gc_epoch`: the project's GC epoch as read before
+/// `judged` was computed (BUG-1881).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn queue_and_wait_embargo_landing(
     hub: &Arc<Hub>,
@@ -1078,6 +1102,7 @@ pub(crate) async fn queue_and_wait_embargo_landing(
     judged: crate::landing::Judged,
     who: &crate::landing::Submitter,
     manual_retry: bool,
+    gc_epoch: i64,
 ) -> Result<veil_core::hub::land::LandResult> {
     let existing = read_embargo_ticket(hub, project.id, ticket).await?;
     let need_queue = match &existing {
@@ -1100,6 +1125,9 @@ pub(crate) async fn queue_and_wait_embargo_landing(
             let q = q.clone();
             let who2 = who2.clone();
             Box::pin(async move {
+                // The queue row holds the stack's snapshots (roots): in line
+                // with GC's switch before any other lock (BUG-1881).
+                crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 let unreleased: Option<bool> = sqlx::query_scalar(
                     "SELECT released_at IS NULL FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 FOR UPDATE",
                 )
@@ -1245,6 +1273,24 @@ pub async fn release_one(
     pushed_record: Option<EmbargoRecord>,
     submitter: Option<(&Viewer, &crate::landing::Submitter)>,
 ) -> Result<bool> {
+    loop {
+        match release_one_once(hub, project_id, embargo_id, pushed_record.clone(), submitter).await {
+            Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn release_one_once(
+    hub: &Arc<Hub>,
+    project_id: i64,
+    embargo_id: &str,
+    pushed_record: Option<EmbargoRecord>,
+    submitter: Option<(&Viewer, &crate::landing::Submitter)>,
+) -> Result<bool> {
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project_id).await?;
     type Line = (Vec<String>, String, String, Option<i64>, String, String);
     let row: Option<Line> = sqlx::query_as(
         "SELECT group_names, target_branch, embargo_branch, released_at, record_json, created_by \
@@ -1320,7 +1366,7 @@ pub async fn release_one(
     // 1. Land the line.
     if let Some(etip_hex) = &etip {
         let etip_id = ObjectId::from_hex(etip_hex).map_err(|e| Error::Other(e.into()))?;
-        let judged = match crate::landing::stack_for_embargo(
+        let mut judged = match crate::landing::stack_for_embargo(
             hub,
             &project,
             &admin_viewer,
@@ -1352,28 +1398,38 @@ pub async fn release_one(
             // The review rules of a protected branch (BUG-1861); on any branch,
             // a change the server reverted twice needs a person (BUG-1884).
             let protected = is_protected_branch(hub, project_id, &project.default_branch, &target_branch).await?;
-            {
-                if let Err(e) = crate::prs::check_landing_review_for_embargo(
-                    hub,
-                    &project,
-                    &release_viewer,
-                    &target_branch,
-                    &judged.stack,
-                    None,
-                    protected,
-                    Some(embargo_id),
+            let waits = |message: &str| {
+                Error::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "not_ready",
+                    format!("embargo {embargo_id} is not released: it waits for approval, and releases once it is approved ({message})"),
                 )
-                .await
-                {
+            };
+            match crate::prs::check_landing_review_for_embargo(
+                hub,
+                &project,
+                &release_viewer,
+                &target_branch,
+                &judged.stack,
+                None,
+                protected,
+                Some(embargo_id),
+            )
+            .await
+            {
+                // What the landing batch checks again in its own transaction
+                // (BUG-1880): this embargo's PRs may carry the approvals.
+                Ok(claim) => {
+                    if let (Some(first), Some(claim)) = (judged.stack.first_mut(), claim) {
+                        first.review = Some(claim);
+                    }
+                }
+                Err(e) => {
                     let Error::Api { code: "not_ready", message, .. } = &e else {
                         return Err(e);
                     };
                     let _ = hold_embargo_for_approval(hub, project_id, embargo_id, message).await;
-                    return Err(Error::new(
-                        axum::http::StatusCode::CONFLICT,
-                        "not_ready",
-                        format!("embargo {embargo_id} is not released: it waits for approval, and releases once it is approved ({message})"),
-                    ));
+                    return Err(waits(message));
                 }
             }
             // One ticket per tip of the line: servers and retries that land the
@@ -1381,11 +1437,24 @@ pub async fn release_one(
             // stands in for commits pushed to the line since (BUG-1875).
             let ticket = format!("embargo-{project_id}-{embargo_id}-{}", &etip_hex[..16]);
             let outcome =
-                queue_and_wait_embargo_landing(hub, &project, embargo_id, &ticket, &target_branch, judged, &who, manual).await?;
+                queue_and_wait_embargo_landing(hub, &project, embargo_id, &ticket, &target_branch, judged, &who, manual, gc_epoch).await?;
             if outcome.state != LandState::Landed {
                 let msg = outcome
                     .message
                     .unwrap_or_else(|| "embargo release landing did not complete".into());
+                // The batch refused it under the review rules: an approval was
+                // withdrawn while it was queued (BUG-1880). It waits for
+                // approval as a release refused before queueing does, and the
+                // refused ticket goes, so that the approval queues it again.
+                if outcome.state == LandState::Rejected && msg.starts_with(crate::prs::NOT_READY) {
+                    sqlx::query("DELETE FROM landing_queue WHERE project_id = $1 AND ticket = $2 AND state NOT IN ('queued', 'merging', 'landed')")
+                        .bind(project_id)
+                        .bind(&ticket)
+                        .execute(&hub.db)
+                        .await?;
+                    let _ = hold_embargo_for_approval(hub, project_id, embargo_id, &msg).await;
+                    return Err(waits(&msg));
+                }
                 let _ = record_embargo_status(hub, project_id, embargo_id, Some("failed"), Some(&msg)).await;
                 return Err(Error::conflict(msg));
             }

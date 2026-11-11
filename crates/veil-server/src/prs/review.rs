@@ -45,13 +45,18 @@ pub struct Verdict {
 
 /// The access of `person` in `project` now, from the database.
 pub async fn viewer_of(hub: &Hub, project: i64, person: i64) -> Result<Viewer> {
+    let mut c = hub.db.acquire().await?;
+    viewer_of_conn(&mut c, project, person).await
+}
+
+pub async fn viewer_of_conn(c: &mut sqlx::PgConnection, project: i64, person: i64) -> Result<Viewer> {
     let (admin, groups): (bool, Vec<i64>) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM project_admins WHERE project_id = $1 AND person_id = $2), \
          ARRAY(SELECT g.id FROM groups g JOIN group_members m ON m.group_id = g.id WHERE g.project_id = $1 AND m.person_id = $2)",
     )
     .bind(project)
     .bind(person)
-    .fetch_one(&hub.db)
+    .fetch_one(&mut *c)
     .await?;
     Ok(Viewer {
         person: Some(person),
@@ -69,10 +74,15 @@ pub fn writes_all(project: &Project, viewer: &Viewer, paths: &[String]) -> bool 
 
 /// The PR's touched paths.
 pub async fn paths_of(hub: &Hub, project: i64, pr: &str) -> Result<Vec<String>> {
+    let mut c = hub.db.acquire().await?;
+    paths_of_conn(&mut c, project, pr).await
+}
+
+pub async fn paths_of_conn(c: &mut sqlx::PgConnection, project: i64, pr: &str) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar("SELECT path FROM pr_paths WHERE project_id = $1 AND pr = $2 ORDER BY path")
         .bind(project)
         .bind(pr)
-        .fetch_all(&hub.db)
+        .fetch_all(&mut *c)
         .await?)
 }
 
@@ -86,6 +96,11 @@ pub const REVIEW_BYTES: usize = 256 << 10;
 /// revision with patch `patch`; the texts of the latest
 /// [`REVIEWS_SHOWN`] within [`REVIEW_BYTES`] are read after.
 pub async fn verdicts(hub: &Hub, project: i64, pr: &str, patch: &str) -> Result<Vec<Verdict>> {
+    let mut c = hub.db.acquire().await?;
+    verdicts_conn(&mut c, project, pr, patch, true).await
+}
+
+pub async fn verdicts_conn(c: &mut sqlx::PgConnection, project: i64, pr: &str, patch: &str, with_bodies: bool) -> Result<Vec<Verdict>> {
     type Row = (i64, String, i32, String, bool, i64, String, i64);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT DISTINCT ON (r.person) r.person, pe.name, r.revision, r.verdict, r.agent, r.at, r.patch, octet_length(r.body)::BIGINT \
@@ -94,13 +109,16 @@ pub async fn verdicts(hub: &Hub, project: i64, pr: &str, patch: &str) -> Result<
     )
     .bind(project)
     .bind(pr)
-    .fetch_all(&hub.db)
+    .fetch_all(&mut *c)
     .await?;
     let mut out: Vec<Verdict> = rows
         .into_iter()
         .map(|(person, name, revision, verdict, agent, at, p, size)| Verdict { person, name, revision, verdict, agent, body: None, size, at, current: p == patch })
         .collect();
     out.sort_by_key(|a| std::cmp::Reverse((a.at, a.person)));
+    if !with_bodies {
+        return Ok(out);
+    }
     let mut bytes = 0usize;
     let mut want: Vec<(i64, i32)> = Vec::new();
     for v in out.iter().take(REVIEWS_SHOWN) {
@@ -120,7 +138,7 @@ pub async fn verdicts(hub: &Hub, project: i64, pr: &str, patch: &str) -> Result<
         .bind(pr)
         .bind(&people)
         .bind(&revs)
-        .fetch_all(&hub.db)
+        .fetch_all(&mut *c)
         .await?;
         let bodies: HashMap<(i64, i32), String> = bodies.into_iter().map(|(p, r, b)| ((p, r), b)).collect();
         for v in out.iter_mut() {
@@ -238,6 +256,13 @@ pub async fn holds_on(hub: &Hub, project: i64, paths: &[String]) -> Result<Vec<(
 /// Holds applying to a PR in `embargo` (`""` for ordinary PRs; for embargoed
 /// PRs, includes holds in `pr_embargo_holds` for the same embargo).
 pub async fn holds_for_pr(hub: &Hub, project: i64, embargo: &str, paths: &[String]) -> Result<Vec<(i64, String, i64)>> {
+    let mut c = hub.db.acquire().await?;
+    holds_for_pr_conn(&mut c, project, embargo, paths).await
+}
+
+/// [`holds_for_pr`] on a connection (a landing batch asks inside its
+/// transaction: BUG-1880).
+pub async fn holds_for_pr_conn(c: &mut sqlx::PgConnection, project: i64, embargo: &str, paths: &[String]) -> Result<Vec<(i64, String, i64)>> {
     if embargo.is_empty() {
         return Ok(sqlx::query_as(
             "SELECT h.person, pe.name, MAX(h.at) FROM pr_holds h JOIN people pe ON pe.id = h.person \
@@ -245,7 +270,7 @@ pub async fn holds_for_pr(hub: &Hub, project: i64, embargo: &str, paths: &[Strin
         )
         .bind(project)
         .bind(paths)
-        .fetch_all(&hub.db)
+        .fetch_all(&mut *c)
         .await?);
     }
     Ok(sqlx::query_as(
@@ -258,7 +283,7 @@ pub async fn holds_for_pr(hub: &Hub, project: i64, embargo: &str, paths: &[Strin
     .bind(project)
     .bind(paths)
     .bind(embargo)
-    .fetch_all(&hub.db)
+    .fetch_all(&mut *c)
     .await?)
 }
 
@@ -317,22 +342,40 @@ pub async fn gate(
     rules: &Review,
     reverted_twice: bool,
 ) -> Result<Gate> {
+    let mut c = hub.db.acquire().await?;
+    gate_conn(&mut c, project, viewer, pr, patch, risk, rules, reverted_twice, true).await
+}
+
+/// [`gate`] on a connection (a landing batch asks inside its transaction:
+/// BUG-1880), with the reviews' bodies only when `with_bodies`.
+#[allow(clippy::too_many_arguments)]
+pub async fn gate_conn(
+    c: &mut sqlx::PgConnection,
+    project: &Project,
+    viewer: &Viewer,
+    pr: &PrRow,
+    patch: &str,
+    risk: Risk,
+    rules: &Review,
+    reverted_twice: bool,
+    with_bodies: bool,
+) -> Result<Gate> {
     let risk = if reverted_twice { Risk::High } else { risk };
     let mut need = rules.need(risk);
     if reverted_twice {
         need.approvals = need.approvals.max(1);
         need.people_only = true;
     }
-    let paths = paths_of(hub, project.id, &pr.id).await?;
+    let paths = paths_of_conn(&mut *c, project.id, &pr.id).await?;
     let mut reviews = Vec::new();
     let mut approvals = 0u32;
     let mut access: HashMap<i64, bool> = HashMap::new();
-    let latest = verdicts(hub, project.id, &pr.id, patch).await?;
+    let latest = verdicts_conn(&mut *c, project.id, &pr.id, patch, with_bodies).await?;
     // Requests for changes at any of these paths, whoever opened this PR
     // (BUG-1326): released for this PR only by that reviewer's approval of
     // it (its current patch, given after the hold), for every PR by an
     // admin's dismissal.
-    let held: Vec<String> = holds_for_pr(hub, project.id, &pr.embargo, &paths)
+    let held: Vec<String> = holds_for_pr_conn(&mut *c, project.id, &pr.embargo, &paths)
         .await?
         .into_iter()
         .filter(|(person, _, at)| !latest.iter().any(|v| v.person == *person && v.verdict == "approve" && v.current && v.at >= *at))
@@ -346,11 +389,11 @@ pub async fn gate(
             match access.get(&v.person) {
                 Some(w) => *w,
                 None => {
-                    let rv = viewer_of(hub, project.id, v.person).await?;
+                    let rv = viewer_of_conn(&mut *c, project.id, v.person).await?;
                     let in_embargo = if pr.embargo.is_empty() {
                         true
                     } else {
-                        crate::embargo::can_see(hub, project, &rv, &pr.embargo).await?
+                        crate::embargo::can_see_conn(&mut *c, project, &rv, &pr.embargo).await?
                     };
                     let w = in_embargo && writes_all(project, &rv, &paths);
                     access.insert(v.person, w);

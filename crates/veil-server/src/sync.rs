@@ -2433,6 +2433,7 @@ async fn push_staged(
     if req.force && viewer.agent {
         return Err(agent_refusal("an agent session never forces a branch move"));
     }
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     if req.updates.len() > MAX_PUSH_UPDATES {
         return Err(Error::bad_request(format!("at most {MAX_PUSH_UPDATES} branch updates per push")));
     }
@@ -2684,10 +2685,14 @@ async fn push_staged(
     // The review rules a landing on the default branch brings (S21,
     // `prs::state`): recorded in this push's transaction.
     let mut rules_landing: Option<crate::prs::state::Landing> = None;
+    // The default branch, for the deletions of merged branches (BUG-1885):
+    // read once a push, its lineage checked again where the branch goes.
+    let mut default_anc: Option<(ObjectId, i64, crate::landing::Ancestry)> = None;
     // New branches, against the branches when the push began (concurrent
-    // pushes may each add up to the bound).
+    // pushes may each add up to the bound; deletions in the push free slots at once).
     let created: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_some() && !current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
-    if !created.is_empty() && current.len() + created.len() > MAX_BRANCHES {
+    let deleting: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_none() && current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
+    if !created.is_empty() && current.len().saturating_sub(deleting.len()) + created.len() > MAX_BRANCHES {
         return Err(Error::bad_request(format!("a project has at most {MAX_BRANCHES} branches")));
     }
     for u in &req.updates {
@@ -2777,18 +2782,23 @@ async fn push_staged(
                 results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
                 continue;
             }
+            let mut stack = judged.stack;
             match crate::prs::check_landing_review(
                 hub,
                 project,
                 viewer,
                 &u.branch,
-                &judged.stack,
+                &stack,
                 Some(st.clone()),
                 protected.contains(&u.branch),
             )
             .await
             {
-                Ok(_) => {}
+                Ok(claim) => {
+                    if let (Some(first), Some(c)) = (stack.first_mut(), claim) {
+                        first.review = Some(c);
+                    }
+                }
                 Err(e) if land_all => return Err(e),
                 Err(Error::Api { message, .. }) => {
                     results.push(refuse(&message));
@@ -2799,7 +2809,7 @@ async fn push_staged(
             queued.push(crate::landing::Queued {
                 ticket: crate::landing::ticket(),
                 branch: u.branch.clone(),
-                stack: judged.stack,
+                stack,
                 lineage: judged.lineage,
                 skipped: Arc::new(std::sync::Mutex::new(judged.skipped)),
             });
@@ -2819,11 +2829,62 @@ async fn push_staged(
             });
             continue;
         }
-        if new_real.is_none() && !viewer.admin {
-            return Err(Error::forbidden("only admins may delete a branch"));
-        }
-        if new_real.is_none() && viewer.agent {
-            return Err(agent_refusal("an agent session never deletes a branch"));
+        if new_real.is_none() {
+            // A branch whose tip is contained in the default branch holds
+            // nothing of its own: whoever may write here deletes it
+            // (BUG-1885). Any other deletion stays an admin's, and is never
+            // an agent session's. Never this way: a forced push, the default
+            // branch, a protected one, an embargo's line.
+            let mut merged = false;
+            if let Some(c) = cur {
+                if !req.force
+                    && !(viewer.admin && !viewer.agent)
+                    && !is_embargo_branch
+                    && !crate::branches::kept(&u.branch, &project.default_branch, &protected)
+                    && project.view(viewer).writes_anything()
+                {
+                    if default_anc.is_none() {
+                        if let Some((tip, lineage)) = crate::branches::tip_of(hub, project.id, &project.default_branch).await? {
+                            let anc = crate::landing::Ancestry::new_staged(hub.clone(), project.id, &project.default_branch, tip, lineage, Some(st.clone()));
+                            default_anc = Some((tip, lineage, anc));
+                        }
+                    }
+                    if let Some((tip, _, anc)) = default_anc.as_mut() {
+                        merged = crate::branches::contained(hub, project.id, anc, *tip, c).await?;
+                    }
+                }
+            }
+            if !merged {
+                if !viewer.admin {
+                    return Err(Error::forbidden(if is_embargo_branch || crate::branches::kept(&u.branch, &project.default_branch, &protected) {
+                        "only admins may delete a branch".to_string()
+                    } else {
+                        format!(
+                            "only admins may delete a branch, unless its work is all on '{}' and you may write here: '{}' was not deleted",
+                            project.default_branch, u.branch
+                        )
+                    }));
+                }
+                if viewer.agent {
+                    return Err(agent_refusal("an agent session never deletes a branch"));
+                }
+            } else if let Some(c) = cur {
+                // S11: an agent session deletes only a branch it may move.
+                match crate::branches::agent_may_delete(hub, project, viewer, c, Some(st.clone())).await? {
+                    Some(AgentTip::Narrowed) => {
+                        results.push(BranchResult {
+                            branch: u.branch.clone(),
+                            ok: false,
+                            message: Some(NARROWED_MOVE.into()),
+                            tip: cur_seen,
+                            ticket: None,
+                        });
+                        continue;
+                    }
+                    Some(AgentTip::Access) => return Err(agent_refusal(AGENT_ACCESS_MOVE)),
+                    Some(AgentTip::DefaultBranch) | None => {}
+                }
+            }
         }
         // The one rule of every tip an agent session sets (`agent_tip`):
         // first, for a narrowed one, anything outside its paths; then the
@@ -2933,6 +2994,11 @@ async fn push_staged(
             }
         }
         plans.push((u.branch.clone(), cur, new_real, accept, policy_text_update));
+    }
+    let planned_creates: HashSet<&str> = plans.iter().filter(|(_, cur, new, ..)| cur.is_none() && new.is_some()).map(|(b, ..)| b.as_str()).collect();
+    let planned_deletes: HashSet<&str> = plans.iter().filter(|(_, cur, new, ..)| cur.is_some() && new.is_none()).map(|(b, ..)| b.as_str()).collect();
+    if !planned_creates.is_empty() && current.len().saturating_sub(planned_deletes.len()) + planned_creates.len() > MAX_BRANCHES {
+        return Err(Error::bad_request(format!("a project has at most {MAX_BRANCHES} branches")));
     }
     // The pusher's projections of what this push moves branches to, worked
     // out now and written in its transaction (an admin's are the snapshots).
@@ -3059,6 +3125,10 @@ async fn push_staged(
         listed.iter().map(|p| p.objects as i64).collect(),
     );
     let default_branch = project.default_branch.clone();
+    // A merged branch goes only while the default branch it was judged
+    // against is in the same lineage (not rewound since: BUG-1885).
+    let admin_delete = viewer.admin && !viewer.agent;
+    let merged_lineage = default_anc.as_ref().map_or(-1, |(_, lineage, _)| *lineage);
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
     progress.lock().unwrap().transaction = commits;
@@ -3077,6 +3147,7 @@ async fn push_staged(
         let embargo_snaps = embargo_snaps2.clone();
         let packs = packs.clone();
         Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             for q in &queued {
                 crate::landing::insert(&mut *c, pid, &who, q).await?;
             }
@@ -3113,10 +3184,16 @@ async fn push_staged(
                             lineages.push((branch.clone(), lineage));
                             1
                         }),
-                    (Some(c0), None) => sqlx::query("DELETE FROM branches WHERE project_id = $1 AND name = $2 AND target = $3")
+                    (Some(c0), None) => sqlx::query(
+                        "DELETE FROM branches WHERE project_id = $1 AND name = $2 AND target = $3 \
+                         AND ($4 OR EXISTS (SELECT 1 FROM branches WHERE project_id = $1 AND name = $5 AND lineage = $6))",
+                    )
                         .bind(pid)
                         .bind(&branch)
                         .bind(c0.hex())
+                        .bind(admin_delete)
+                        .bind(&default_branch)
+                        .bind(merged_lineage)
                         .execute(&mut *c)
                         .await?
                         .rows_affected(),

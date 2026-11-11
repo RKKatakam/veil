@@ -592,6 +592,10 @@ pub async fn finish_release(
     record_json: &str,
     submitter: Option<(&Viewer, &crate::landing::Submitter)>,
 ) -> Result<bool> {
+    // Read before any object is judged: what this step queues and what it
+    // records wait in line with GC's switch (BUG-1881), and a switch
+    // meanwhile has `embargo::release_one` run the release again.
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     type CandRow = (String, String, i64, String, String, String, i32, i64, i64, bool);
     let prs: Vec<CandRow> = sqlx::query_as(
         "SELECT p.id, p.target, p.author, pe.name, p.title, p.body, p.revision, p.created_at, p.updated_at, p.land_at_release \
@@ -650,7 +654,7 @@ pub async fn finish_release(
         };
         let onto_line = pr_target == ebranch;
         let land_branch = if onto_line { target_branch.to_string() } else { pr_target.clone() };
-        let judged = match crate::landing::stack_for_embargo(
+        let mut judged = match crate::landing::stack_for_embargo(
             hub,
             project,
             &admin_viewer,
@@ -705,6 +709,15 @@ pub async fn finish_release(
         let (_, who) = crate::embargo::choose_submitter(hub, project, &judged.stack, creator, submitter).await?;
         // (Per revision: a ticket that landed an earlier head never stands in for this one.)
         let ticket = format!("embargo-pr-{}-{id}-{}", project.id, &current.head.hex()[..16]);
+        // The landing batch asks this PR's gate again in its own
+        // transaction, at this revision (BUG-1880).
+        if let Some(first) = judged.stack.first_mut() {
+            first.review = Some(crate::landing::ReviewClaim::Pr {
+                id: id.clone(),
+                revision: pr_row.revision,
+                patch: current.patch.clone(),
+            });
+        }
         let outcome = crate::embargo::queue_and_wait_embargo_landing(
             hub,
             project,
@@ -714,8 +727,17 @@ pub async fn finish_release(
             judged,
             &who,
             manual_retry,
+            gc_epoch,
         )
         .await;
+        // GC switched meanwhile: the release runs again (never: the PR is
+        // left unlanded because of it).
+        if let Err(e) = outcome {
+            if crate::pack_gc::is_gc_epoch_changed(&e) {
+                return Err(e);
+            }
+            continue;
+        }
         if matches!(&outcome, Ok(o) if o.state == LandState::Landed) {
             landed_prs.insert(id.clone());
             touched_branches.insert(land_branch);
@@ -753,6 +775,7 @@ pub async fn finish_release(
             let landed_set = landed_set.clone();
             let closed_set = closed_set.clone();
             Box::pin(async move {
+                crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 let n = sqlx::query(
                     "UPDATE embargo_lines SET released_at = COALESCE(released_at, $1), record_json = $2 \
                      WHERE project_id = $3 AND embargo_id = $4 AND released_at IS NULL",

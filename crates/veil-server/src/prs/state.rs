@@ -152,6 +152,7 @@ pub async fn record_landing(c: &mut sqlx::PgConnection, project: i64, l: &Landin
 /// The `[review]` rules in force at the tip of `branch` (the default
 /// branch), bringing a record that is behind the tip up to it.
 pub async fn rules_in_force(hub: &Arc<Hub>, project: &crate::perm::Project, branch: &str) -> Result<Review> {
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     // The tip and the record in one statement (BUG-1322): a landing writes
     // both in one transaction, so this is a state some landing left.
     type Row = (String, Option<String>, Option<String>);
@@ -187,7 +188,11 @@ pub async fn rules_in_force(hub: &Arc<Hub>, project: &crate::perm::Project, bran
     };
     let state = next_state(&file, prev.as_ref());
     if state != RulesState::Strict {
-        write_record(hub, project.id, recorded.as_ref().map(|r| r.0.as_str()), tip, &state).await?;
+        match write_record_at(hub, project.id, gc_epoch, recorded.as_ref().map(|r| r.0.as_str()), tip, &state).await {
+            Ok(_) => {}
+            Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(review_of(&file, &state))
 }
@@ -197,23 +202,41 @@ pub async fn rules_in_force(hub: &Arc<Hub>, project: &crate::perm::Project, bran
 /// server that read it before another moved it writes nothing. Answers
 /// whether it wrote.
 pub async fn write_record(hub: &Hub, project: i64, read: Option<&str>, tip: ObjectId, state: &RulesState) -> Result<bool> {
-    let n = match read {
-        Some(checked) => sqlx::query("UPDATE pr_review_rules SET checked = $2, state = $3 WHERE project_id = $1 AND checked = $4")
-            .bind(project)
-            .bind(tip.hex())
-            .bind(state_json(state))
-            .bind(checked)
-            .execute(&hub.db)
-            .await?
-            .rows_affected(),
-        None => sqlx::query("INSERT INTO pr_review_rules (project_id, checked, state) VALUES ($1, $2, $3) ON CONFLICT (project_id) DO NOTHING")
-            .bind(project)
-            .bind(tip.hex())
-            .bind(state_json(state))
-            .execute(&hub.db)
-            .await?
-            .rows_affected(),
-    };
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project).await?;
+    write_record_at(hub, project, gc_epoch, read, tip, state).await
+}
+
+async fn write_record_at(hub: &Hub, project: i64, gc_epoch: i64, read: Option<&str>, tip: ObjectId, state: &RulesState) -> Result<bool> {
+    let read = read.map(str::to_string);
+    let state_str = state_json(state);
+    let tip_hex = tip.hex();
+    let n = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+        let read = read.clone();
+        let state_str = state_str.clone();
+        let tip_hex = tip_hex.clone();
+        Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, project, gc_epoch).await?;
+            let rows = match &read {
+                Some(checked) => sqlx::query("UPDATE pr_review_rules SET checked = $2, state = $3 WHERE project_id = $1 AND checked = $4")
+                    .bind(project)
+                    .bind(&tip_hex)
+                    .bind(&state_str)
+                    .bind(checked)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected(),
+                None => sqlx::query("INSERT INTO pr_review_rules (project_id, checked, state) VALUES ($1, $2, $3) ON CONFLICT (project_id) DO NOTHING")
+                    .bind(project)
+                    .bind(&tip_hex)
+                    .bind(&state_str)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected(),
+            };
+            Ok(rows)
+        })
+    })
+    .await?;
     Ok(n == 1)
 }
 

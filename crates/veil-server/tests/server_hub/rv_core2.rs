@@ -1,17 +1,943 @@
-//! Whole-codebase review, 2026-11-11, `rv-core2`: request budgets (BUG-1882).
+//! Whole-codebase review, 2026-11-11, `rv-core2`: the landing service's
+//! batches and merges, approval when an entry lands, derived data, GC races
+//! and request budgets (BUG-1880 to BUG-1889). Each test here is the
+//! reproduction of one `docs/BUGS.md` row, ignored until its fix.
 
 use std::{
     sync::{
-        atomic::Ordering,
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
 
-use serde_json::json;
-use veil_core::ObjectId;
+use serde_json::{json, Value};
+use veil_core::{crypto::domains::SIG_CONTEXT_HUB_PR_REVIEW, hub::pr::review_message, ObjectId};
+use veil_server::pack_gc::{self, Options, SwitchHook};
 
 use crate::support::*;
+
+fn project_id(hub: &TestHub, name: &str) -> i64 {
+    hub.rt
+        .block_on(sqlx::query_scalar::<_, i64>("SELECT id FROM projects WHERE name = $1").bind(name).fetch_one(&hub.hub().db))
+        .unwrap()
+}
+
+fn put(path: &str, text: &str) -> Value {
+    json!({"path": path, "put": {"text": text}})
+}
+
+/// Another server holds `branch`'s landing lease (for ten minutes): nothing
+/// queued for it lands until [`release_lease`].
+fn hold_lease(hub: &TestHub, project: i64, branch: &str) {
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) \
+                 VALUES ($1, $2, 'rv-core2-another-server', 1, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 600000) \
+                 ON CONFLICT (project_id, branch) DO UPDATE SET holder = EXCLUDED.holder, epoch = landing_leases.epoch + 1, expires_at = EXCLUDED.expires_at",
+            )
+            .bind(project)
+            .bind(branch)
+            .execute(&hub.hub().db),
+        )
+        .unwrap();
+}
+
+/// The other server's lease ends.
+fn release_lease(hub: &TestHub, project: i64, branch: &str) {
+    hub.rt
+        .block_on(
+            sqlx::query("DELETE FROM landing_leases WHERE project_id = $1 AND branch = $2 AND holder = 'rv-core2-another-server'")
+                .bind(project)
+                .bind(branch)
+                .execute(&hub.hub().db),
+        )
+        .unwrap();
+}
+
+/// The ticket's outcome, once it is no longer queued (within a minute).
+fn outcome(api: &Api, token: &str, project: &str, ticket: &str) -> Value {
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        let r = api.get(Some(token), &format!("/v1/projects/{project}/land/{ticket}"));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v = r.json();
+        if v["state"] != "queued" || Instant::now() > until {
+            return v;
+        }
+    }
+}
+
+async fn is_yugabyte(db: &sqlx::PgPool) -> bool {
+    let v: String = sqlx::query_scalar("SELECT version()").fetch_one(db).await.unwrap();
+    v.contains("-YB-")
+}
+
+/// Wait until a statement matching `query_like` waits on a lock (`pg_stat_activity`
+/// reports `wait_event_type = 'Lock'` on PostgreSQL; YugabyteDB does not populate
+/// `wait_event_type`, so wait briefly once active, matching `prs::s21_adversarial`).
+async fn wait_for_sql_lock(db: &sqlx::PgPool, query_like: &str, msg: &str) {
+    if is_yugabyte(db).await {
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND query LIKE $1",
+            )
+            .bind(query_like)
+            .fetch_one(db)
+            .await
+            .unwrap_or(0);
+            if active > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        return;
+    }
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1",
+        )
+        .bind(query_like)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(Instant::now() < until, "{msg}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+struct TxGuard<'a>(&'a tokio::runtime::Runtime, Option<sqlx::Transaction<'static, sqlx::Postgres>>);
+
+impl TxGuard<'_> {
+    fn rollback(mut self) {
+        if let Some(tx) = self.1.take() {
+            self.0.block_on(tx.rollback()).unwrap();
+        }
+    }
+}
+
+impl Drop for TxGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.1.take() {
+            let _ = self.0.block_on(tx.rollback());
+        }
+    }
+}
+
+/// Submit an overlapping landing and hold its merge worker's commit while the
+/// row is `merging`. On PostgreSQL, holds `LOCK TABLE origins IN EXCLUSIVE MODE`
+/// and waits for `INSERT INTO origins%`; on YugabyteDB (which rejects `LOCK TABLE
+/// ... EXCLUSIVE`), locks `access_epochs (pid, -1) FOR UPDATE` as soon as the
+/// row enters `merging` so `run_worker`'s `guard_root_write` (`FOR SHARE`) waits
+/// while `renew_task` keeps renewing `landing_queue`.
+fn hold_worker_in_merging<'a>(
+    rt: &'a tokio::runtime::Runtime,
+    db: &sqlx::PgPool,
+    pid: i64,
+    mut submit: impl FnMut() -> String,
+) -> (String, TxGuard<'a>) {
+    if !rt.block_on(is_yugabyte(db)) {
+        let mut lock = rt.block_on(db.begin()).unwrap();
+        rt.block_on(sqlx::query("LOCK TABLE origins IN EXCLUSIVE MODE").execute(&mut *lock)).unwrap();
+        let guard = TxGuard(rt, Some(lock));
+        let ticket = submit();
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let st: String = rt
+                .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(db))
+                .unwrap();
+            let waiting: i64 = rt
+                .block_on(
+                    sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO origins%'")
+                        .fetch_one(db),
+                )
+                .unwrap();
+            if st == "merging" && waiting > 0 {
+                return (ticket, guard);
+            }
+            assert!(Instant::now() < until, "the entry was handed to a merge worker: {st}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    rt.block_on(
+        sqlx::query("INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 0, 0) ON CONFLICT DO NOTHING")
+            .bind(pid)
+            .execute(db),
+    )
+    .unwrap();
+    for attempt in 0..5 {
+        let ticket = submit();
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let st: String = rt
+                .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(db))
+                .unwrap();
+            if st == "merging" {
+                let mut lock = rt.block_on(db.begin()).unwrap();
+                rt.block_on(
+                    sqlx::query("SELECT 1 FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE")
+                        .bind(pid)
+                        .execute(&mut *lock),
+                )
+                .unwrap();
+                let guard = TxGuard(rt, Some(lock));
+                let st_after: String = rt
+                    .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(db))
+                    .unwrap();
+                if st_after == "merging" {
+                    std::thread::sleep(Duration::from_millis(400));
+                    return (ticket, guard);
+                }
+                guard.rollback();
+                break;
+            }
+            assert!(Instant::now() < until || attempt < 4, "entry did not stay in merging on YugabyteDB: {st}");
+            if st != "queued" || Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    panic!("could not trap worker in merging on YugabyteDB");
+}
+
+/// `docs/HUB.md` §13.24: every landing onto a protected branch meets the
+/// review rules. The rules are asked when the entry is queued and never
+/// again: a reviewer who takes the approval back (a request for changes,
+/// answered `ready: false`) while the entry waits in the queue (here behind
+/// another server's lease; in use, behind a long queue, a slow batch or a
+/// merge worker) still sees it land.
+#[test]
+fn bug_1880_an_approval_withdrawn_while_the_entry_is_queued_still_lands() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
+
+    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect main with review rules");
+    p.admin.ok(&p.dir, &["push"]);
+
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": base.hex(), "edits": [put("src/feature-1880.rs", "pub fn feat() {}\n")]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let feat: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "feat", "expected": null, "new": feat.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let pr = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "feat", "title": "add feat"})).json();
+    let (pr_id, patch) = (pr["id"].as_str().unwrap().to_string(), pr["patch"].as_str().unwrap().to_string());
+    let review = |verdict: &str| {
+        let sig = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, verdict));
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+            &json!({"patch": patch, "verdict": verdict, "signature": sig}),
+        )
+    };
+    let r = review("approve");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true);
+
+    // The approved change is queued, and waits.
+    hold_lease(&th, pid, "main");
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": feat.hex(), "wait": false}),
+    );
+    assert_eq!(r.status, 200, "the approved change is queued: {}", String::from_utf8_lossy(&r.body));
+    let queued = r.json();
+    assert_eq!(queued["state"], "queued", "{queued}");
+    let ticket = queued["ticket"].as_str().unwrap().to_string();
+
+    // Its reviewer takes the approval back, and is told the PR is not ready.
+    let r = review("request-changes");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], false, "the PR is no longer ready to land");
+
+    release_lease(&th, pid, "main");
+    let done = outcome(&api, &dev_tok, &p.name, &ticket);
+    assert_ne!(done["state"], "queued", "the entry was answered: {done}");
+    assert_eq!(
+        api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"],
+        base,
+        "a change whose only approval was withdrawn landed on protected main: {done}"
+    );
+    assert_eq!(done["state"], "rejected", "{done}");
+    assert!(
+        done["message"].as_str().unwrap_or_default().starts_with("not ready to land:"),
+        "expected submit review refusal, got: {done}"
+    );
+}
+
+/// BUG-1880's fix checks the review again in the batch's transaction, but
+/// reads it without a lock (`READ COMMITTED`): a reviewer who takes the
+/// approval back after that read and before the batch commits is answered
+/// `ready: false`, and the change still lands. The window is the batch's
+/// transaction after that read (milliseconds; longer when it waits for a
+/// row, as here).
+#[test]
+#[ignore = "BUG-1886: an approval withdrawn while the landing batch commits still lands"]
+fn bug_1886_an_approval_withdrawn_while_the_batch_commits_still_lands() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
+
+    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect main with review rules");
+    p.admin.ok(&p.dir, &["push"]);
+
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": base.hex(), "edits": [put("src/feature-1880.rs", "pub fn feat() {}\n")]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let feat: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "feat", "expected": null, "new": feat.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let pr = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "feat", "title": "add feat"})).json();
+    let (pr_id, patch) = (pr["id"].as_str().unwrap().to_string(), pr["patch"].as_str().unwrap().to_string());
+    let review = |verdict: &str| {
+        let sig = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, verdict));
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+            &json!({"patch": patch, "verdict": verdict, "signature": sig}),
+        )
+    };
+    let r = review("approve");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true);
+
+    // The approved change is queued, and waits behind another server's lease.
+    hold_lease(&th, pid, "main");
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": feat.hex(), "wait": false}),
+    );
+    assert_eq!(r.status, 200, "the approved change is queued: {}", String::from_utf8_lossy(&r.body));
+    let queued = r.json();
+    assert_eq!(queued["state"], "queued", "{queued}");
+    let ticket = queued["ticket"].as_str().unwrap().to_string();
+    // The batch that lands it checks the review in its transaction, and is
+    // then held at the entry's row, which it writes after that check.
+    let h = th.hub();
+    let mut held = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt
+        .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
+        .unwrap();
+    release_lease(&th, pid, "main");
+    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
+
+    // Its reviewer takes the approval back, and is told the PR is not ready.
+    let r = review("request-changes");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], false, "the PR is no longer ready to land");
+
+    th.rt.block_on(held.rollback()).unwrap();
+    let done = outcome(&api, &dev_tok, &p.name, &ticket);
+    assert_ne!(done["state"], "queued", "the entry was answered: {done}");
+    assert_eq!(
+        api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"],
+        base,
+        "a change whose only approval was withdrawn (its reviewer told so) landed on protected main: {done}"
+    );
+    assert_eq!(done["state"], "rejected", "{done}");
+}
+
+/// BUG-1880 variants: (1) `.veilrules` tightened by an entry ahead in the
+/// queue, (2) a `pr_holds` hold placed on a path while queued, and (3) a new
+/// revision pushed to a PR while `prs::land` is queued.
+#[test]
+fn bug_1880_tightened_rules_hold_and_new_revision_while_queued_are_refused() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
+
+    // Initially `src/docs/**` is `checks_only` (0 approvals needed).
+    write_files(
+        &p.dir,
+        &[(
+            ".veilrules",
+            "[branches.main]\nprotected = true\n\n[review]\nchecks_only = [\"src/docs/**\"]\n",
+        )],
+    );
+    p.admin.commit_main(&p.dir, "protect main with checks_only src/docs");
+    p.admin.ok(&p.dir, &["push"]);
+
+    // --- Variant 2: a hold (`pr_holds`) placed on `src/docs/held.md` while queued ---
+    let base1 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let held_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base1.hex(), "edits": [put("src/docs/held.md", "v1\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    let other_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base1.hex(), "edits": [put("src/docs/held.md", "other pr\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "other-held", "expected": null, "new": other_snap.hex()}], "force": false}),
+    );
+    let other_pr = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "other-held", "title": "other doc"}),
+        )
+        .json();
+    let (other_pr_id, other_patch) = (
+        other_pr["id"].as_str().unwrap().to_string(),
+        other_pr["patch"].as_str().unwrap().to_string(),
+    );
+
+    hold_lease(&th, pid, "main");
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": held_snap.hex(), "wait": false}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let held_ticket = r.json()["ticket"].as_str().unwrap().to_string();
+
+    // Admin requests changes on `other_pr`, placing a `pr_holds` hold on `src/docs/held.md`.
+    let sig = p.admin.identity().sign(
+        SIG_CONTEXT_HUB_PR_REVIEW,
+        &review_message(&p.name, &other_pr_id, &other_patch, "request-changes"),
+    );
+    let r = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/prs/{other_pr_id}/reviews", p.name),
+        &json!({"patch": other_patch, "verdict": "request-changes", "signature": sig}),
+    );
+    assert_eq!(r.status, 200);
+
+    release_lease(&th, pid, "main");
+    let done_held = outcome(&api, &dev_tok, &p.name, &held_ticket);
+    assert_eq!(done_held["state"], "rejected", "{done_held}");
+    assert!(
+        done_held["message"].as_str().unwrap_or_default().contains("asked for changes"),
+        "{done_held}"
+    );
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"], base1);
+
+    // --- Variant 1: `.veilrules` tightened by an entry ahead in the queue ---
+    // Admin prepares a `.veilrules` update removing `checks_only`, approved by a second admin.
+    let admin_base1 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let tighten_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": admin_base1.hex(), "edits": [put(".veilrules", "[branches.main]\nprotected = true\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "tighten-rules", "expected": null, "new": tighten_snap.hex()}], "force": false}),
+    );
+    let rules_pr = api
+        .post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "tighten-rules", "title": "tighten rules"}),
+        )
+        .json();
+    let (rules_pr_id, rules_patch) = (
+        rules_pr["id"].as_str().unwrap().to_string(),
+        rules_pr["patch"].as_str().unwrap().to_string(),
+    );
+    let admin2 = th.person("admin2_1880");
+    let admin2_tok = admin2.token();
+    th.rt.block_on(async {
+        sqlx::query("INSERT INTO project_admins (project_id, person_id) SELECT $1, id FROM people WHERE name = $2")
+            .bind(pid)
+            .bind(&admin2.name)
+            .execute(&th.hub().db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, 0, 1, 0) \
+             ON CONFLICT (project_id, person_id) DO UPDATE SET epoch = access_epochs.epoch + 1",
+        )
+        .bind(pid)
+        .execute(&th.hub().db)
+        .await
+        .unwrap();
+    });
+    let sig_rules = admin2.identity().sign(
+        SIG_CONTEXT_HUB_PR_REVIEW,
+        &review_message(&p.name, &rules_pr_id, &rules_patch, "approve"),
+    );
+    let r = api.post_json(
+        Some(&admin2_tok),
+        &format!("/v1/projects/{}/prs/{rules_pr_id}/reviews", p.name),
+        &json!({"patch": rules_patch, "verdict": "approve", "signature": sig_rules}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true);
+
+    let doc_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base1.hex(), "edits": [put("src/docs/unapproved.md", "needs approval under new rules\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+
+    hold_lease(&th, pid, "main");
+    // Queue the rule-tightening entry first, then Dev's unapproved `docs/` entry behind it.
+    let r1 = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": tighten_snap.hex(), "wait": false}),
+    );
+    assert_eq!(r1.status, 200, "{}", String::from_utf8_lossy(&r1.body));
+    let t_rules = r1.json()["ticket"].as_str().unwrap().to_string();
+
+    let r2 = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": doc_snap.hex(), "wait": false}),
+    );
+    assert_eq!(r2.status, 200, "{}", String::from_utf8_lossy(&r2.body));
+    let t_doc = r2.json()["ticket"].as_str().unwrap().to_string();
+
+    release_lease(&th, pid, "main");
+    let done_rules = outcome(&api, &admin_tok, &p.name, &t_rules);
+    assert_eq!(done_rules["state"], "landed", "{done_rules}");
+    let done_doc = outcome(&api, &dev_tok, &p.name, &t_doc);
+    assert_eq!(done_doc["state"], "rejected", "entry behind tightened .veilrules must be refused: {done_doc}");
+    assert!(
+        done_doc["message"].as_str().unwrap_or_default().starts_with("not ready to land:"),
+        "{done_doc}"
+    );
+
+    // --- Variant 3: a new revision pushed to a PR while `POST /prs/{id}/land` is queued ---
+    let base2 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let rev1_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base2.hex(), "edits": [put("src/rev1880.rs", "pub fn v() -> i32 { 1 }\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    let rev2_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base2.hex(), "edits": [put("src/rev1880.rs", "pub fn v() -> i32 { 2 }\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "pr-rev-race", "expected": null, "new": rev1_snap.hex()}], "force": false}),
+    );
+    let pr3 = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "pr-rev-race", "title": "rev race"}),
+        )
+        .json();
+    let (pr3_id, pr3_patch) = (
+        pr3["id"].as_str().unwrap().to_string(),
+        pr3["patch"].as_str().unwrap().to_string(),
+    );
+    let sig3 = p.admin.identity().sign(
+        SIG_CONTEXT_HUB_PR_REVIEW,
+        &review_message(&p.name, &pr3_id, &pr3_patch, "approve"),
+    );
+    let r = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/prs/{pr3_id}/reviews", p.name),
+        &json!({"patch": pr3_patch, "verdict": "approve", "signature": sig3}),
+    );
+    assert_eq!(r.status, 200);
+
+    hold_lease(&th, pid, "main");
+    let api_land = th.api();
+    let (tok_land, pname, pr3_land) = (dev_tok.clone(), p.name.clone(), pr3_id.clone());
+    let land_handle = std::thread::spawn(move || {
+        api_land.post_json(
+            Some(&tok_land),
+            &format!("/v1/projects/{pname}/prs/{pr3_land}/land"),
+            &json!({}),
+        )
+    });
+    // Wait until `prs::land` has inserted the queued row into `landing_queue`.
+    let wait_until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let cnt: i64 = th
+            .rt
+            .block_on(
+                sqlx::query_scalar("SELECT COUNT(*) FROM landing_queue WHERE project_id = $1 AND state = 'queued'")
+                    .bind(pid)
+                    .fetch_one(&th.hub().db),
+            )
+            .unwrap();
+        if cnt >= 1 {
+            break;
+        }
+        assert!(Instant::now() < wait_until, "prs::land did not queue in time");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Push revision 2 to the PR while revision 1's landing is queued.
+    let push_r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "pr-rev-race-2", "expected": null, "new": rev2_snap.hex()}], "force": false}),
+    );
+    assert_eq!(push_r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&push_r.body));
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/prs/{pr3_id}/revisions", p.name),
+        &json!({"head": "pr-rev-race-2"}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["revision"], 2);
+
+    release_lease(&th, pid, "main");
+    let land_resp = land_handle.join().unwrap();
+    assert_eq!(land_resp.status, 409, "stale PR revision must be refused: {}", String::from_utf8_lossy(&land_resp.body));
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"], base2);
+    let pr_after = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr3_id}", p.name)).json();
+    assert_eq!(pr_after["state"], "open", "PR must remain open at revision 2: {pr_after}");
+    assert_eq!(pr_after["revision"], 2);
+}
+
+/// GC never deletes an object a concurrent push is about to reference. The
+/// only guard is the reference stamp, read in GC's own transaction: a push
+/// whose transaction is open then (it found the snapshot stored, and waits
+/// for its branch's row, as behind another push to the branch) commits
+/// after it, onto objects GC deletes.
+#[test]
+fn bug_1881_a_push_committing_during_the_gc_switch_points_its_branch_at_deleted_objects() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let admin_tok = p.admin.token();
+    let h = th.hub();
+    let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let push = |api: &Api, tok: &str, branch: &str, expected: Option<ObjectId>, new: Option<ObjectId>, force: bool| {
+        api.post_json(
+            Some(tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": new.map(|e| e.hex())}], "force": force}),
+        )
+    };
+
+    // A branch `hold` at main, and a change on a branch that is then deleted.
+    let r = push(&api, &admin_tok, "hold", None, Some(main0), false);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    const CONTENT: &str = "RV-CORE2-BUG-1881-CONTENT-5d0c1f7e\n";
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/gc-race-1881.txt", CONTENT);
+    let (snap, r) = c.push_edited("tmp-1881", None, |_| {});
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = push(&api, &admin_tok, "tmp-1881", Some(snap), None, true);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+
+    // GC sees the change unreferenced; two minutes later it is past retention.
+    let gc = |offset: i64, hook: Option<SwitchHook>| {
+        th.rt.block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: offset,
+                before_switch: hook,
+                ..Options::default()
+            },
+        ))
+    };
+    gc(0, None).unwrap();
+
+    // Right before GC checks its stamp: the branch's row is locked (as by
+    // another push to it), and a push of `hold` to the change begins. It
+    // finds the snapshot stored and waits for the row in its transaction.
+    let (tx_done, rx_done) = std::sync::mpsc::channel::<Reply>();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let once = Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (db, release, once) = (h.db.clone(), release.clone(), once.clone());
+        let (authority, cert, tok, name) = (th.authority(), th.cert_pem.clone(), admin_tok.clone(), p.name.clone());
+        SwitchHook(Arc::new(move || {
+            let (db, release, once, tx_done) = (db.clone(), release.clone(), once.clone(), tx_done.clone());
+            let (authority, cert, tok, name) = (authority.clone(), cert.clone(), tok.clone(), name.clone());
+            Box::pin(async move {
+                if once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let mut lock = db.begin().await.unwrap();
+                sqlx::query("SELECT 1 FROM branches WHERE project_id = $1 AND name = 'hold' FOR UPDATE").bind(pid).execute(&mut *lock).await.unwrap();
+                std::thread::spawn(move || {
+                    let api = Api::at(&authority, &cert);
+                    let r = api.post_json(
+                        Some(&tok),
+                        &format!("/v1/projects/{name}/push"),
+                        &json!({"updates": [{"branch": "hold", "expected": main0.hex(), "new": snap.hex()}], "force": false}),
+                    );
+                    let _ = tx_done.send(r);
+                });
+                wait_for_sql_lock(&db, "UPDATE branches SET target%", "the push never reached its branch update").await;
+                // The row is released when GC is done (or after 8 s, were GC to wait for the push).
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(8), release.notified()).await;
+                    lock.rollback().await.unwrap();
+                });
+            })
+        }))
+    };
+    gc(120_000, Some(hook)).unwrap();
+    assert!(once.load(Ordering::SeqCst), "GC reached its switch");
+    release.notify_one();
+
+    let r = rx_done.recv_timeout(Duration::from_secs(60)).expect("the push answers");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "the push moved `hold`: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(api.tips(Some(&admin_tok), &p.name).unwrap().branches["hold"], snap);
+
+    // What the branch holds can be read.
+    let r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev=hold&path=src/gc-race-1881.txt", p.name));
+    assert_eq!(r.status, 200, "`hold` points at objects GC deleted: {}", String::from_utf8_lossy(&r.body).chars().take(300).collect::<String>());
+    assert!(String::from_utf8_lossy(&r.body).contains(CONTENT.trim_end()), "the file's content is served");
+}
+
+#[test]
+fn bug_1881_pr_writer_and_reverse_switch_order_serialize_with_gc() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let admin_tok = p.admin.token();
+    let h = th.hub();
+    let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let push = |api: &Api, tok: &str, branch: &str, expected: Option<ObjectId>, new: Option<ObjectId>, force: bool| {
+        api.post_json(
+            Some(tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": new.map(|e| e.hex())}], "force": force}),
+        )
+    };
+
+    // Open a PR on an initial branch `feat1`.
+    let mut c1 = Craft::new(&api, &p.admin, &p.name, "main");
+    c1.file("src/pr-1881.txt", "v1\n");
+    let (_, r) = c1.push_edited("feat1", None, |_| {});
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let pr = api
+        .post_json(Some(&admin_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "feat1", "title": "gc race pr"}))
+        .json();
+    let pr_id = pr["id"].as_str().unwrap().to_string();
+
+    // Create an unreferenced snapshot `snap2` past retention.
+    const PR_CONTENT: &str = "RV-CORE2-BUG-1881-PR-REV-99a1b2c3\n";
+    let mut c2 = Craft::new(&api, &p.admin, &p.name, "main");
+    c2.file("src/pr-1881.txt", PR_CONTENT);
+    let (snap2, r) = c2.push_edited("tmp-pr-1881", None, |_| {});
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let r = push(&api, &admin_tok, "tmp-pr-1881", Some(snap2), None, true);
+    assert_eq!(r.json()["results"][0]["ok"], true);
+
+    let gc = |offset: i64, hook: Option<SwitchHook>| {
+        th.rt.block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: offset,
+                before_switch: hook,
+                ..Options::default()
+            },
+        ))
+    };
+    gc(0, None).unwrap();
+
+    // Order A (non-push root writer commits during GC switch): `add_revision`
+    // enters its transaction (`FOR SHARE` on the GC epoch) and waits on the PR
+    // row while GC reaches its switch; GC waits for it and keeps `snap2`.
+    let (tx_pr, rx_pr) = std::sync::mpsc::channel::<Reply>();
+    let release_pr = Arc::new(tokio::sync::Notify::new());
+    let once_pr = Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (db, release, once) = (h.db.clone(), release_pr.clone(), once_pr.clone());
+        let (authority, cert, tok, name, pr_id) = (th.authority(), th.cert_pem.clone(), admin_tok.clone(), p.name.clone(), pr_id.clone());
+        SwitchHook(Arc::new(move || {
+            let (db, release, once, tx_pr) = (db.clone(), release.clone(), once.clone(), tx_pr.clone());
+            let (authority, cert, tok, name, pr_id) = (authority.clone(), cert.clone(), tok.clone(), name.clone(), pr_id.clone());
+            Box::pin(async move {
+                if once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let mut lock = db.begin().await.unwrap();
+                sqlx::query("SELECT 1 FROM prs WHERE project_id = $1 AND id = $2 FOR UPDATE")
+                    .bind(pid)
+                    .bind(&pr_id)
+                    .execute(&mut *lock)
+                    .await
+                    .unwrap();
+                std::thread::spawn(move || {
+                    let api = Api::at(&authority, &cert);
+                    let r = api.post_json(
+                        Some(&tok),
+                        &format!("/v1/projects/{name}/prs/{pr_id}/revisions"),
+                        &json!({"head": snap2.hex()}),
+                    );
+                    let _ = tx_pr.send(r);
+                });
+                wait_for_sql_lock(&db, "UPDATE prs SET revision%", "add_revision never reached its prs update").await;
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(6), release.notified()).await;
+                    lock.rollback().await.unwrap();
+                });
+            })
+        }))
+    };
+    gc(120_000, Some(hook)).unwrap();
+    release_pr.notify_one();
+    let r = rx_pr.recv_timeout(Duration::from_secs(60)).expect("PR revision answers");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let diff_r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/prs/{pr_id}/diff", p.name));
+    assert_eq!(diff_r.status, 200, "PR diff points at objects GC deleted: {}", String::from_utf8_lossy(&diff_r.body));
+    assert!(String::from_utf8_lossy(&diff_r.body).contains(PR_CONTENT.trim_end()));
+
+    // Order B (GC switch commits after push checked objects, before push commits):
+    // GC holds `access_epochs FOR UPDATE` while blocked on `packs FOR UPDATE`;
+    // a push of `hold2` to an expired unreferenced `snap3` passes its pre-tx
+    // checks and blocks on `access_epochs FOR SHARE`. Once GC finishes its
+    // switch and sweeps `snap3`, the push sees `GcEpochChanged`, reruns from
+    // scratch, and refuses cleanly instead of moving `hold2` to deleted objects.
+    let r = push(&api, &admin_tok, "hold2", None, Some(main0), false);
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let mut c3 = Craft::new(&api, &p.admin, &p.name, "main");
+    c3.file("src/reverse-1881.txt", "RV-CORE2-BUG-1881-REV-ORDER\n");
+    let (snap3, r) = c3.push_edited("tmp-rev-1881", None, |_| {});
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let r = push(&api, &admin_tok, "tmp-rev-1881", Some(snap3), None, true);
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    gc(240_000, None).unwrap();
+
+    let snap_lock = TxGuard(
+        &th.rt,
+        Some(th.rt.block_on(async {
+            let mut tx = h.db.begin().await.unwrap();
+            sqlx::query("SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2 FOR SHARE")
+                .bind(pid)
+                .bind(snap3.hex())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            tx
+        })),
+    );
+    let h_gc = h.clone();
+    let gc_handle = th.rt.spawn(async move {
+        pack_gc::run_project(
+            &h_gc,
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: 360_000,
+                ..Options::default()
+            },
+        )
+        .await
+    });
+    th.rt.block_on(wait_for_sql_lock(&h.db, "DELETE FROM snapshots%", "GC never reached DELETE FROM snapshots"));
+
+    let (tx_push, rx_push) = std::sync::mpsc::channel::<Reply>();
+    {
+        let (authority, cert, tok, name) = (th.authority(), th.cert_pem.clone(), admin_tok.clone(), p.name.clone());
+        std::thread::spawn(move || {
+            let api = Api::at(&authority, &cert);
+            let r = api.post_json(
+                Some(&tok),
+                &format!("/v1/projects/{name}/push"),
+                &json!({"updates": [{"branch": "hold2", "expected": main0.hex(), "new": snap3.hex()}], "force": false}),
+            );
+            let _ = tx_push.send(r);
+        });
+    }
+    th.rt.block_on(wait_for_sql_lock(
+        &h.db,
+        "SELECT e.epoch FROM (SELECT pg_advisory_xact_lock_shared%FOR SHARE%",
+        "push never reached guard_root_write (in line behind GC's switch)",
+    ));
+    snap_lock.rollback();
+    let rep = th.rt.block_on(gc_handle).unwrap().unwrap();
+    assert!(rep.packed_objects_deleted + rep.loose_objects_deleted > 0, "GC swept snap3: {rep:?}");
+
+    let r = rx_push.recv_timeout(Duration::from_secs(60)).expect("push answers after retry");
+    assert_ne!(r.status, 500, "push never 500s: {}", String::from_utf8_lossy(&r.body));
+    assert_ne!(r.json()["results"][0]["ok"], json!(true), "push without objects does not point hold2 at swept snap3: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(api.tips(Some(&admin_tok), &p.name).unwrap().branches["hold2"], main0);
+}
 
 struct Stalls {
     left: usize,
@@ -182,4 +1108,736 @@ fn bug_1882_one_persons_agent_sessions_share_one_quarter_of_the_answers_budget()
     assert_eq!(ok_count, 1, "one person's 6 agent sessions hold at most one 12 MiB answer in a 16 MiB quarter");
     assert!(held <= 16 << 10, "one person holds at most a quarter of the 64 MiB answers budget: {held} KiB");
     assert_eq!(victim_r.status, 200, "another person's read succeeds beside stalled agent-session answers");
+}
+
+/// Every queued entry lands once or is refused, whatever servers stop. A
+/// `merging` row has no owner: only a server's start gives it back to the
+/// queue (`landing::resume`, which resets every server's). When the server
+/// whose worker held it goes away while the others keep running, nothing
+/// ever answers it: the ticket stays `queued`, and counts against its
+/// person's outstanding landings.
+#[test]
+fn bug_1883_a_merging_entry_of_a_server_that_went_away_is_never_answered() {
+    let a = TestHub::start();
+    let p = setup_project(&a);
+    let b = TestHub::beside(&a);
+    let (api_a, api_b) = (a.api(), b.api());
+    let pid = project_id(&a, &p.name);
+    let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
+    let db = b.hub().db.clone();
+    const FILE: &str = "src/merge-1883.txt";
+    let text = |second: &str, last: &str| {
+        let mut lines: Vec<String> = (0..30).map(|i| format!("line {i} of bug 1883")).collect();
+        lines[2] = second.to_string();
+        lines[28] = last.to_string();
+        lines.join("\n") + "\n"
+    };
+    let land_as_admin = |content: String| {
+        let base = api_a.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+        let r = api_a.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "base": base.hex(), "edits": [put(FILE, &content)], "wait": true}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    };
+    land_as_admin(text("two", "twenty-eight"));
+    // dev changes line 2 on that tip; the admin lands a change of line 28 first.
+    let base = api_a.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api_a.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": base.hex(), "edits": [put(FILE, &text("TWO BY DEV", "twenty-eight"))]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let change: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    land_as_admin(text("two", "TWENTY-EIGHT BY ADMIN"));
+
+    // The merge worker's commit waits, so that the server stops while the
+    // entry is `merging`.
+    let (ticket, lock) = hold_worker_in_merging(&b.rt, &db, pid, || {
+        let r = api_a.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "snapshot": change.hex(), "wait": false}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["state"], "queued", "{}", r.json());
+        r.json()["ticket"].as_str().unwrap().to_string()
+    });
+    let state = || -> String {
+        b.rt.block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(&db)).unwrap()
+    };
+    // The server with the worker goes away; the other keeps running.
+    drop(api_a);
+    drop(a);
+    lock.rollback();
+    assert_eq!(state(), "merging", "the worker's commit went with its server");
+
+    // The entry's submitter asks the server that is left.
+    let until = Instant::now() + Duration::from_secs(45);
+    let done = loop {
+        let r = api_b.get(Some(&dev_tok), &format!("/v1/projects/{}/land/{ticket}", p.name));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v = r.json();
+        if v["state"] != "queued" || Instant::now() > until {
+            break v;
+        }
+    };
+    assert_eq!(done["state"], "landed", "45 s after its server went away the entry is still `{}` in the queue: {done}", state());
+    assert_eq!(done["merges"], 1, "only the surviving worker's merge counts: {done}");
+}
+
+/// BUG-1883: starting another server (`landing::resume`) does not reset a live
+/// `merging` claim held by a running peer, and only the surviving worker's
+/// merge counts.
+#[test]
+fn bug_1883_peer_resume_preserves_live_merge_claims() {
+    let a = TestHub::start();
+    let p = setup_project(&a);
+    let b = TestHub::beside(&a);
+    let (api_a, api_b) = (a.api(), b.api());
+    let pid = project_id(&a, &p.name);
+    let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
+    let db = a.hub().db.clone();
+    const FILE: &str = "src/merge-1883-peer.txt";
+    let text = |second: &str, last: &str| {
+        let mut lines: Vec<String> = (0..30).map(|i| format!("line {i} of bug 1883 peer")).collect();
+        lines[2] = second.to_string();
+        lines[28] = last.to_string();
+        lines.join("\n") + "\n"
+    };
+    let land_as_admin = |content: String| {
+        let base = api_a.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+        let r = api_a.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "base": base.hex(), "edits": [put(FILE, &content)], "wait": true}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    };
+    land_as_admin(text("two", "twenty-eight"));
+    let base = api_a.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api_a.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": base.hex(), "edits": [put(FILE, &text("TWO BY DEV", "twenty-eight"))]}),
+    );
+    assert_eq!(r.status, 200);
+    let change: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    land_as_admin(text("two", "TWENTY-EIGHT BY ADMIN"));
+
+    // Hold the merge worker's commit so `a` stays in `merging` with a live claim.
+    let (ticket, lock) = hold_worker_in_merging(&a.rt, &db, pid, || {
+        let r = api_a.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "snapshot": change.hex(), "wait": false}),
+        );
+        assert_eq!(r.status, 200);
+        r.json()["ticket"].as_str().unwrap().to_string()
+    });
+
+    // Peer `b` runs `landing::resume`: `a`'s live claim must NOT be reset to `queued`.
+    b.rt.block_on(veil_server::landing::resume(b.hub()));
+    let (st_after_resume, claim_after_resume): (String, Option<String>) = a
+        .rt
+        .block_on(sqlx::query_as("SELECT state, result FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(&db))
+        .unwrap();
+    assert_eq!(st_after_resume, "merging", "peer resume must not reset a live merge claim");
+    assert!(claim_after_resume.is_some(), "live claim metadata must remain intact");
+
+    lock.rollback();
+    let done = outcome(&api_b, &dev_tok, &p.name, &ticket);
+    assert_eq!(done["state"], "landed", "{done}");
+    assert_eq!(done["merges"], 1, "no duplicate merge counted when peer runs resume: {done}");
+}
+
+// ---------------------------------------------------------------------------
+// BUG-1885: merged branches can be deleted by writers and on PR landing
+// ---------------------------------------------------------------------------
+
+/// A change made through the API (`POST …/changes`): it is accepted, and
+/// this is its snapshot.
+/// With `"onto": {"branch": B, "expected": null}`, then pushed as the new
+/// branch `B` (the API's `onto` moves a branch that exists).
+fn api_change(api: &Api, token: &str, project: &str, body: &Value) -> ObjectId {
+    let mut body = body.clone();
+    let new_branch = match body["onto"]["expected"].is_null() {
+        true => body.as_object_mut().unwrap().remove("onto").and_then(|o| o["branch"].as_str().map(str::to_string)),
+        false => None,
+    };
+    let r = api.post_json(Some(token), &format!("/v1/projects/{project}/changes"), &body);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let snap: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&r.body)));
+    if let Some(branch) = new_branch {
+        let r = api.post_json(
+            Some(token),
+            &format!("/v1/projects/{project}/push"),
+            &json!({"updates": [{"branch": branch, "expected": null, "new": snap.hex()}]}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    }
+    snap
+}
+
+/// BUG-1885, guarantees 1 and 5: anyone with write access to the project may
+/// delete a branch whose tip is already contained in the default branch (by
+/// `vl tag delete` then `vl push`, and by HTTP `/push`); unmerged branches,
+/// protected branches, the default branch, `embargo/…` lines, and callers
+/// without write access stay refused, in clear words.
+#[test]
+fn bug_1885_writers_may_delete_merged_branches_only() {
+    /// What a deletion that only an admin may make is answered.
+    fn admins_only(branch: &str) -> String {
+        format!("only admins may delete a branch, unless its work is all on 'main' and you may write here: '{branch}' was not deleted")
+    }
+
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    // Protect `rel-prot-1` (pointing at `main`) via `.veilrules` on `main`.
+    write_files(&p.dir, &[(".veilrules", "[branches.rel-prot-1]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect rel-prot-1");
+    p.admin.ok(&p.dir, &["push"]);
+
+    let dev_dir = p.dev.dir("clone");
+    p.dev.clone_trusting(&hub.url(&p.name), &dev_dir, &p.fp);
+
+    // 1. `dev` creates `task-anc-1` with a change, merges it into `main`, and
+    //    also creates `task-eq-1` right at `main`, plus `task-unmerged-1`
+    //    holding work NOT on `main`.
+    write_files(&dev_dir, &[("src/anc1.rs", "pub fn anc1() -> u32 { 1 }\n")]);
+    p.dev.ok(&dev_dir, &["commit", "--no-advance", "-m", "anc1"]);
+    p.dev.ok(&dev_dir, &["tag", "set", "task-anc-1", "-r", "@-"]);
+    p.dev.ok(&dev_dir, &["push", "-t", "task-anc-1"]);
+
+    // Advance `main` past `task-anc-1` (merge/fast-forward + one more commit so
+    // `task-anc-1` is a strict ancestor of `main`).
+    p.dev.ok(&dev_dir, &["tag", "set", "main", "-r", "task-anc-1"]);
+    p.dev.ok(&dev_dir, &["new", "main"]);
+    write_files(&dev_dir, &[("src/after_anc.rs", "pub fn after() {}\n")]);
+    p.dev.commit_main(&dev_dir, "advance main past task-anc-1");
+    p.dev.ok(&dev_dir, &["tag", "set", "task-eq-1", "-r", "main"]);
+    p.dev.ok(&dev_dir, &["tag", "set", "rel-prot-1", "-r", "main"]);
+    p.dev.ok(&dev_dir, &["push"]);
+
+    // Create `task-unmerged-1` with work not on `main`.
+    p.dev.ok(&dev_dir, &["new", "main"]);
+    write_files(&dev_dir, &[("src/unmerged1.rs", "pub fn unmerged() {}\n")]);
+    p.dev.ok(&dev_dir, &["commit", "--no-advance", "-m", "unmerged work"]);
+    p.dev.ok(&dev_dir, &["tag", "set", "task-unmerged-1", "-r", "@-"]);
+    p.dev.ok(&dev_dir, &["push", "-t", "task-unmerged-1"]);
+
+    // Create an embargo line pointing at `main` (contained in `main`, yet `embargo/…`).
+    let main_real: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(project_id(&hub, &p.name)).fetch_one(&hub.hub().db))
+        .unwrap();
+    hub.rt
+        .block_on(
+            sqlx::query("INSERT INTO branches (project_id, name, target) VALUES ($1, 'embargo/e1a2b3c4d5e6f708', $2)")
+                .bind(project_id(&hub, &p.name))
+                .bind(&main_real)
+                .execute(&hub.hub().db),
+        )
+        .unwrap();
+    hub.hub().caches.tips_changed(project_id(&hub, &p.name));
+
+    // Client route: `vl tag delete task-anc-1` followed by `vl push` deletes the merged ancestor branch.
+    p.dev.ok(&dev_dir, &["tag", "delete", "task-anc-1"]);
+    let pushed = p.dev.ok(&dev_dir, &["push"]);
+    assert!(pushed.contains("deleted") && pushed.contains("task-anc-1"), "expected deletion in push output: {pushed}");
+    let branches = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    assert!(!branches.contains_key("task-anc-1"), "merged ancestor branch should be deleted: {branches:?}");
+
+    // Equal-tip branch (`task-eq-1 == main`): `dev` deletes via `vl tag delete` + `vl push`.
+    p.dev.ok(&dev_dir, &["tag", "delete", "task-eq-1"]);
+    let pushed_eq = p.dev.ok(&dev_dir, &["push"]);
+    assert!(pushed_eq.contains("deleted") && pushed_eq.contains("task-eq-1"), "{pushed_eq}");
+    assert!(!api.tips(Some(&admin_tok), &p.name).unwrap().branches.contains_key("task-eq-1"));
+
+    // Unmerged branch (`task-unmerged-1`): `vl tag delete` + `vl push` is refused with today's clear admin-only refusal!
+    let unmerged_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["task-unmerged-1"];
+    p.dev.ok(&dev_dir, &["tag", "delete", "task-unmerged-1"]);
+    let refused = p.dev.fails(&dev_dir, &["push"]);
+    assert!(refused.contains("rejected") && refused.contains(&admins_only("task-unmerged-1")), "clear refusal expected: {refused}");
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches.get("task-unmerged-1"), Some(&unmerged_tip));
+    // Restore local tag so subsequent pushes in `dev_dir` are clean; admin CAN delete it.
+    p.dev.ok(&dev_dir, &["tag", "set", "task-unmerged-1", "-r", &unmerged_tip.hex()]);
+
+    // Someone in the project who may write nothing (a group no access line names) is refused even on a merged branch.
+    let reader = hub.person("reader");
+    p.admin.ok(&p.dir, &["group", "create", "observers"]);
+    p.admin.ok(&p.dir, &["group", "add", "observers", &reader.name, "--confirm", &reader.fingerprint()]);
+    let r = Craft::new(&api, &p.dev, &p.name, "main");
+    let main_dev_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let _ = r;
+    let mk_merged = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-merged-2", "expected": null, "new": main_dev_tip.hex()}]}),
+    );
+    assert_eq!(mk_merged.status, 200, "{}", String::from_utf8_lossy(&mk_merged.body));
+    let reader_tip = api.tips(Some(&reader.token()), &p.name).unwrap().branches["task-merged-2"];
+    let r_reader = api.post_json(
+        Some(&reader.token()),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-merged-2", "expected": reader_tip.hex(), "new": null}]}),
+    );
+    assert_eq!(r_reader.status, 403, "{}", String::from_utf8_lossy(&r_reader.body));
+    assert_eq!(r_reader.json()["message"], admins_only("task-merged-2"));
+    assert!(api.tips(Some(&admin_tok), &p.name).unwrap().branches.contains_key("task-merged-2"));
+
+    // Protected branch (`rel-prot-1` == `main`), default branch (`main`), and `embargo/…` line are never deleted this way.
+    let prot_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["rel-prot-1"];
+    let r_prot = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "rel-prot-1", "expected": prot_tip.hex(), "new": null}]}),
+    );
+    assert_eq!(r_prot.status, 403, "{}", String::from_utf8_lossy(&r_prot.body));
+    assert!(r_prot.json()["message"].as_str().unwrap_or("").contains("protected"));
+
+    let r_main = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "main", "expected": main_dev_tip.hex(), "new": null}]}),
+    );
+    assert_eq!(r_main.status, 403, "{}", String::from_utf8_lossy(&r_main.body));
+    assert_eq!(r_main.json()["message"], "only admins may delete a branch");
+
+    let emb_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches.get("embargo/e1a2b3c4d5e6f708").copied();
+    let r_emb = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "embargo/e1a2b3c4d5e6f708", "expected": emb_tip.map(|t| t.hex()), "new": null}]}),
+    );
+    // An `embargo/…` name is the embargo's own (`embargo.rs` answers before
+    // any rule of deletion): never deleted as a merged branch, though this
+    // one's tip is `main`'s.
+    assert_eq!(r_emb.status, 404, "{}", String::from_utf8_lossy(&r_emb.body));
+    assert_eq!(r_emb.json()["message"], "no branch 'embargo/e1a2b3c4d5e6f708'");
+
+    let branches_end = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    assert!(branches_end.contains_key("rel-prot-1"));
+    assert!(branches_end.contains_key("main"));
+    assert!(branches_end.contains_key("embargo/e1a2b3c4d5e6f708"));
+}
+
+/// BUG-1885 Guarantee 2: landing a PR deletes its source branch if its tip is
+/// now contained in the PR's target (including rebased landings onto a moved
+/// protected branch and PRs onto non-default branches), leaves the source
+/// branch alone if new unmerged work moved it ahead or if it is protected, and
+/// honours `[branches] delete_merged = false` in `.veilrules`.
+#[test]
+fn bug_1885_pr_landing_deletes_merged_source_branch_unless_disabled() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    write_files(
+        &p.dir,
+        &[(
+            ".veilrules",
+            "[branches.main]\nprotected = true\n[review]\nlow = { approvals = 0 }\nnormal = { approvals = 1 }\n",
+        )],
+    );
+    p.admin.commit_main(&p.dir, "protect main");
+    p.admin.ok(&p.dir, &["push"]);
+
+    let dev_dir = p.dev.dir("clone");
+    p.dev.clone_trusting(&hub.url(&p.name), &dev_dir, &p.fp);
+
+    // 1. CLI `vl pr create` + `vl pr land` when `main` moved meanwhile (landing service rebases!).
+    write_files(&dev_dir, &[("src/pr_del1.rs", "pub fn f1() -> u32 { 1 }\n")]);
+    p.dev.ok(&dev_dir, &["commit", "--no-advance", "-m", "pr del 1"]);
+    p.dev.ok(&dev_dir, &["tag", "set", "task-pr-1", "-r", "@-"]);
+    p.dev.ok(&dev_dir, &["push", "-t", "task-pr-1"]);
+    let pr1_out = p.dev.ok(&dev_dir, &["pr", "create", "task-pr-1", "--title", "PR 1", "--json"]);
+    let pr1: Value = serde_json::from_str(pr1_out.lines().next().unwrap()).unwrap();
+    let pr1_id = pr1["id"].as_str().unwrap();
+
+    // Advance `main` with a low-risk docs change so `task-pr-1` must rebase on land.
+    let base_main = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let r_doc = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "base": base_main.hex(), "edits": [put("docs/note.md", "hello\n")], "wait": true}),
+    );
+    assert_eq!(r_doc.status, 200, "{}", String::from_utf8_lossy(&r_doc.body));
+    assert_eq!(r_doc.json()["state"], "landed");
+
+    p.admin.ok(&p.dir, &["pr", "review", pr1_id, "--approve"]);
+    p.dev.ok(&dev_dir, &["pr", "land", pr1_id]);
+    let tips_after_pr1 = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    assert!(!tips_after_pr1.contains_key("task-pr-1"), "PR source branch must be deleted on land: {tips_after_pr1:?}");
+    assert_eq!(
+        api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?path=src/pr_del1.rs", p.name)).status,
+        200,
+        "landed file is on main"
+    );
+
+    // 2. Sub-branch PR onto a non-default feature branch (`onto: "feat-umb-1"`).
+    let main_now = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_eq!(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "feat-umb-1", "expected": null, "new": main_now.hex()}]}),
+        )
+        .status,
+        200
+    );
+    let sub_snap: ObjectId = api_change(&api, &dev_tok, &p.name, &json!({"base": main_now.hex(), "edits": [put("src/sub_umb.rs", "pub fn sub() {}\n")]}));
+    assert_eq!(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "task-sub-1", "expected": null, "new": sub_snap.hex()}]}),
+        )
+        .status,
+        200
+    );
+    let pr_sub = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "task-sub-1", "onto": "feat-umb-1", "title": "sub into feature"}),
+        )
+        .json();
+    let pr_sub_id = pr_sub["id"].as_str().unwrap();
+    let sub_patch = pr_sub["patch"].as_str().unwrap();
+    let sig_sub = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, pr_sub_id, sub_patch, "approve"));
+    assert_eq!(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_sub_id}/reviews", p.name),
+            &json!({"patch": sub_patch, "verdict": "approve", "signature": sig_sub}),
+        )
+        .status,
+        200
+    );
+    let r_land_sub = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_sub_id}/land", p.name), &json!({}));
+    assert_eq!(r_land_sub.status, 200, "{}", String::from_utf8_lossy(&r_land_sub.body));
+    let tips_after_sub = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    assert!(!tips_after_sub.contains_key("task-sub-1"), "sub-branch deleted when landed into feature target: {tips_after_sub:?}");
+    assert!(tips_after_sub.contains_key("feat-umb-1"));
+
+    // 3. Source branch moved ahead to unmerged work while PR was open -> NOT deleted!
+    let main_now2 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let ahead1: ObjectId = api_change(&api, &dev_tok, &p.name, &json!({"base": main_now2.hex(), "edits": [put("src/ahead1.rs", "pub fn a1() {}\n")]}));
+    assert_eq!(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "task-ahead-1", "expected": null, "new": ahead1.hex()}]}),
+        )
+        .status,
+        200
+    );
+    let pr_ahead = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "task-ahead-1", "title": "ahead"}),
+        )
+        .json();
+    let pr_ahead_id = pr_ahead["id"].as_str().unwrap();
+    let ahead_patch = pr_ahead["patch"].as_str().unwrap();
+    // Push a second unmerged commit onto `task-ahead-1` without updating the PR.
+    let ahead2: ObjectId = api_change(&api, &dev_tok, &p.name, &json!({"base": ahead1.hex(), "edits": [put("src/ahead2.rs", "pub fn a2() {}\n")]}));
+    assert_eq!(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "task-ahead-1", "expected": ahead1.hex(), "new": ahead2.hex()}]}),
+        )
+        .status,
+        200
+    );
+    let sig_ahead = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, pr_ahead_id, ahead_patch, "approve"));
+    assert_eq!(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_ahead_id}/reviews", p.name),
+            &json!({"patch": ahead_patch, "verdict": "approve", "signature": sig_ahead}),
+        )
+        .status,
+        200
+    );
+    let r_land_ahead = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_ahead_id}/land", p.name), &json!({}));
+    assert_eq!(r_land_ahead.status, 200, "{}", String::from_utf8_lossy(&r_land_ahead.body));
+    assert_eq!(
+        api.tips(Some(&dev_tok), &p.name).unwrap().branches.get("task-ahead-1"),
+        Some(&ahead2),
+        "branch with unmerged work past the PR head must be kept"
+    );
+
+    // 4. `.veilrules` `[branches] delete_merged = false` turns off auto-deletion on PR land.
+    let main_admin = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let rules_snap: ObjectId = api_change(&api, &admin_tok, &p.name, &json!({
+                "base": main_admin.hex(),
+                "edits": [put(".veilrules", "[branches]\ndelete_merged = false\n\n[branches.main]\nprotected = true\n\n[review]\nnormal = { approvals = 1 }\nhigh = { approvals = 1, people_only = true }\n")],
+            }));
+    assert_eq!(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "main", "expected": main_admin.hex(), "new": rules_snap.hex()}], "force": true}),
+        )
+        .status,
+        200
+    );
+
+    let main_now3 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let keep_snap: ObjectId = api_change(&api, &dev_tok, &p.name, &json!({"base": main_now3.hex(), "edits": [put("src/keep_me.rs", "pub fn keep() {}\n")]}));
+    assert_eq!(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "task-keep-1", "expected": null, "new": keep_snap.hex()}]}),
+        )
+        .status,
+        200
+    );
+    let pr_keep = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "task-keep-1", "title": "keep branch"}),
+        )
+        .json();
+    let pr_keep_id = pr_keep["id"].as_str().unwrap();
+    let keep_patch = pr_keep["patch"].as_str().unwrap();
+    let sig_keep = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, pr_keep_id, keep_patch, "approve"));
+    assert_eq!(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_keep_id}/reviews", p.name),
+            &json!({"patch": keep_patch, "verdict": "approve", "signature": sig_keep}),
+        )
+        .status,
+        200
+    );
+    let r_land_keep = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_keep_id}/land", p.name), &json!({}));
+    assert_eq!(r_land_keep.status, 200, "{}", String::from_utf8_lossy(&r_land_keep.body));
+    assert_eq!(
+        api.tips(Some(&dev_tok), &p.name).unwrap().branches.get("task-keep-1"),
+        Some(&keep_snap),
+        "[branches] delete_merged = false must preserve the merged source branch"
+    );
+}
+
+/// BUG-1885 Guarantee 3: a narrowed agent session may delete only a merged
+/// branch it may move (S11's `agent_tip` rule); unmerged branches and merged
+/// branches touching paths outside its narrowing are refused.
+#[test]
+fn bug_1885_narrowed_agent_deletes_only_merged_branches_it_may_move() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+
+    let narrow_api = api
+        .post_json(
+            Some(&dev_tok),
+            "/v1/sessions/agent",
+            &json!({"project": p.name, "attribution": {"agent": "claude-code", "task": "BUG-1885-A"}, "only": ["src/api"]}),
+        )
+        .json()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let wide_agent = api
+        .post_json(
+            Some(&dev_tok),
+            "/v1/sessions/agent",
+            &json!({"project": p.name, "attribution": {"agent": "claude-code", "task": "BUG-1885-W"}, "only": []}),
+        )
+        .json()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+
+    // 1. `narrow_api` creates `task-api-1` (inside `src/api`) and `task-wip-1` (unmerged, inside `src/api`).
+    let api_snap: ObjectId = api_change(&api, &narrow_api, &p.name, &json!({"base": base.hex(), "edits": [put("src/api/h.rs", "pub fn h() {}\n")], "onto": {"branch": "task-api-1", "expected": null}}));
+    let wip_snap: ObjectId = api_change(&api, &narrow_api, &p.name, &json!({"base": base.hex(), "edits": [put("src/api/wip.rs", "pub fn wip() {}\n")], "onto": {"branch": "task-wip-1", "expected": null}}));
+
+    // 2. `dev` creates `task-other-1` touching `src/other_mod.rs` (outside `src/api`).
+    let other_snap: ObjectId = api_change(&api, &dev_tok, &p.name, &json!({"base": api_snap.hex(), "edits": [put("src/other_mod.rs", "pub fn other() {}\n")], "onto": {"branch": "task-other-1", "expected": null}}));
+
+    // Advance `main` to `other_snap`, which contains BOTH `task-api-1` and `task-other-1`!
+    let r_ff = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "main", "expected": base.hex(), "new": other_snap.hex()}]}),
+    );
+    assert_eq!(r_ff.status, 200, "{}", String::from_utf8_lossy(&r_ff.body));
+    assert_eq!(r_ff.json()["results"][0]["ok"], true);
+
+    // Unmerged branch (`task-wip-1`): even inside `src/api`, the session of someone who is no admin never deletes it
+    // (an admin's agent session is told `an agent session never deletes a branch`: `agents::`).
+    let r_wip = api.post_json(
+        Some(&narrow_api),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-wip-1", "expected": wip_snap.hex(), "new": null}]}),
+    );
+    assert_eq!(r_wip.status, 403, "{}", String::from_utf8_lossy(&r_wip.body));
+    assert_eq!(r_wip.json()["code"], "forbidden");
+    assert_eq!(
+        r_wip.json()["message"],
+        "only admins may delete a branch, unless its work is all on 'main' and you may write here: 'task-wip-1' was not deleted"
+    );
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches.get("task-wip-1"), Some(&wip_snap));
+
+    // Merged branch outside narrowing (`task-other-1`): refused with S11's narrowing refusal, naming no path!
+    let r_other = api.post_json(
+        Some(&narrow_api),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-other-1", "expected": other_snap.hex(), "new": null}]}),
+    );
+    assert_eq!(r_other.status, 200, "{}", String::from_utf8_lossy(&r_other.body));
+    let res0 = &r_other.json()["results"][0];
+    assert_eq!(res0["ok"], false, "{res0}");
+    assert_eq!(res0["message"], "this agent session is narrowed: this would change files outside its paths");
+    assert!(!String::from_utf8_lossy(&r_other.body).contains("other_mod"));
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches.get("task-other-1"), Some(&other_snap));
+
+    // Merged branch inside narrowing (`task-api-1`): `narrow_api` deletes it even though `main` moved on in `src/other_mod.rs`!
+    let r_api = api.post_json(
+        Some(&narrow_api),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-api-1", "expected": api_snap.hex(), "new": null}]}),
+    );
+    assert_eq!(r_api.status, 200, "{}", String::from_utf8_lossy(&r_api.body));
+    assert_eq!(r_api.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r_api.body));
+    assert!(!api.tips(Some(&dev_tok), &p.name).unwrap().branches.contains_key("task-api-1"));
+
+    // Unnarrowed agent session (`wide_agent`) deletes merged `task-other-1`.
+    let r_wide = api.post_json(
+        Some(&wide_agent),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-other-1", "expected": other_snap.hex(), "new": null}]}),
+    );
+    assert_eq!(r_wide.status, 200, "{}", String::from_utf8_lossy(&r_wide.body));
+    assert_eq!(r_wide.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r_wide.body));
+    let end_branches = api.tips(Some(&dev_tok), &p.name).unwrap().branches;
+    assert!(!end_branches.contains_key("task-other-1"));
+    assert_eq!(end_branches.get("task-wip-1"), Some(&wip_snap));
+}
+
+/// BUG-1885 Guarantee 4: deleted branches stop counting toward
+/// `sync::MAX_BRANCHES` (10,000) at once (both in the same push and in
+/// subsequent pushes), while search heads, derived rows and referenced objects
+/// stay intact for existing purge/GC.
+#[test]
+fn bug_1885_deleted_branches_stop_counting_toward_max_branches_at_once() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+    let pid = project_id(&hub, &p.name);
+
+    // Create a merged branch `task-cap-1` via push so search/derived rows exist for it.
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let cap_snap: ObjectId = api_change(&api, &dev_tok, &p.name, &json!({"base": base.hex(), "edits": [put("src/cap_keep.rs", "pub fn cap_keep_token_9911() {}\n")], "onto": {"branch": "task-cap-1", "expected": null}}));
+    let r_ff = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "main", "expected": base.hex(), "new": cap_snap.hex()}]}),
+    );
+    assert_eq!(r_ff.status, 200);
+    assert_eq!(r_ff.json()["results"][0]["ok"], true);
+
+    let h = hub.hub();
+    hub.rt.block_on(veil_server::derive::catch_up_project(&h, pid)).unwrap();
+    hub.rt.block_on(veil_server::search::index::catch_up_project(&h, pid)).unwrap();
+
+    let search_head_before: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM search_heads WHERE project_id = $1 AND branch = 'task-cap-1'").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    assert!(search_head_before >= 1, "task-cap-1 indexed in search_heads before deletion");
+
+    // Fill `branches` to `MAX_BRANCHES` (currently `main` + `task-cap-1` = 2; insert 9,998 more).
+    let main_real: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    let need = (veil_server::sync::MAX_BRANCHES - 2) as i64;
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO branches (project_id, name, target) \
+                 SELECT $1, 'bulk-' || g::text, $2 FROM generate_series(1, $3) AS g",
+            )
+            .bind(pid)
+            .bind(&main_real)
+            .bind(need)
+            .execute(&h.db),
+        )
+        .unwrap();
+    h.caches.tips_changed(pid);
+
+    // At `MAX_BRANCHES`: creating one more branch is refused.
+    let r_over = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-over-1", "expected": null, "new": cap_snap.hex()}]}),
+    );
+    assert_eq!(r_over.status, 400, "{}", String::from_utf8_lossy(&r_over.body));
+    assert!(r_over.json()["message"].as_str().unwrap_or("").contains("10000 branches"));
+
+    // Deleting `task-cap-1` and creating `task-rep-1` in ONE push succeeds at once!
+    let r_swap = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [
+                {"branch": "task-cap-1", "expected": cap_snap.hex(), "new": null},
+                {"branch": "task-rep-1", "expected": null, "new": cap_snap.hex()}
+            ]
+        }),
+    );
+    assert_eq!(r_swap.status, 200, "{}", String::from_utf8_lossy(&r_swap.body));
+    assert_eq!(r_swap.json()["results"][0]["ok"], true);
+    assert_eq!(r_swap.json()["results"][1]["ok"], true);
+
+    // Deleting `task-rep-1` in one push, then creating `task-rep-2` in the very next push, succeeds at once!
+    let r_del = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-rep-1", "expected": cap_snap.hex(), "new": null}]}),
+    );
+    assert_eq!(r_del.status, 200, "{}", String::from_utf8_lossy(&r_del.body));
+    assert_eq!(r_del.json()["results"][0]["ok"], true);
+
+    let r_create = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-rep-2", "expected": null, "new": cap_snap.hex()}]}),
+    );
+    assert_eq!(r_create.status, 200, "{}", String::from_utf8_lossy(&r_create.body));
+    assert_eq!(r_create.json()["results"][0]["ok"], true);
+
+    // Search heads, derived rows, and objects referenced by `main` stay intact.
+    let search_head_after: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM search_heads WHERE project_id = $1 AND branch = 'task-cap-1'").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    assert_eq!(search_head_after, search_head_before, "search_heads left for existing purge/GC");
+    let file_r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?path=src/cap_keep.rs", p.name));
+    assert_eq!(file_r.status, 200, "referenced object remains intact");
 }

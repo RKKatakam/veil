@@ -114,6 +114,7 @@ pub async fn post_check_route(
         validate_log(l).map_err(Error::bad_request)?;
     }
 
+    let gc_epoch = crate::pack_gc::read_gc_epoch(&hub, project.id).await?;
     let Some(real_id) = resolve_snapshot(&hub, &project, &viewer, &req.snapshot).await? else {
         return Err(Error::not_found("no such snapshot in your view of this project"));
     };
@@ -161,6 +162,7 @@ pub async fn post_check_route(
         let project_for_tx = project_for_tx.clone();
         let rules_for_tx = rules_for_tx.clone();
         Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             let existing: Option<(i64, String, bool)> = sqlx::query_as(
                 "SELECT runner_id, session_paths, admin_only FROM checks WHERE project_id = $1 AND snapshot = $2 AND name = $3",
             )

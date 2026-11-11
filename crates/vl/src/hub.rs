@@ -699,6 +699,7 @@ impl Client {
         match status {
             200 => Ok(Some(serde_json::from_slice(&out)?)),
             409 => Ok(None),
+            403 if req.updates.iter().any(|u| u.new.is_none()) => Err(DeletionRefused(Self::error(403, &out).to_string()).into()),
             s => Err(Self::error(s, &out)),
         }
     }
@@ -1508,9 +1509,23 @@ impl Uploads<'_> {
     }
 }
 
+/// The server refused (`403`) a push that deletes branches, with its reason.
+#[derive(Debug)]
+pub struct DeletionRefused(pub String);
+
+impl std::fmt::Display for DeletionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeletionRefused {}
+
 pub struct PushOutcome {
     pub warnings: Vec<String>,
     pub moved: Vec<(String, ObjectId)>,
+    /// Branches deleted on the server by this push.
+    pub deleted: Vec<String>,
     /// Of `moved`: protected branches, where the server's landing service
     /// landed the pushed changes (`docs/HUB.md` §13.19).
     pub landed: Vec<String>,
@@ -1535,8 +1550,12 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
     let release_warnings = repo.take_back_releases_out_of_force()?;
     let newly_released = repo.keys().publish_staged_releases()?;
     let mut attempt = 0;
+    // Why the server refused this push's deletions: the rest is then pushed
+    // without them, and they are shown as rejected.
+    let mut refused_deletions: Option<String> = None;
     loop {
         attempt += 1;
+        let deleted = veil_core::remote::deleted_tags(&**repo.backend())?;
         let view = repo.view().clone();
         let prefix = format!("{remote}/");
         let mut updates = Vec::new();
@@ -1554,8 +1573,37 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 new: Some(tag.target),
             });
         }
+        // Tags deleted here (`vl tag delete`) are deleted on the server too,
+        // while its tag is still where this one was deleted: never work
+        // somebody pushed to it since. The server decides who may
+        // (`docs/HUB.md`: a branch merged into the default branch, anyone
+        // who may write; any other, admins).
+        let deletions: Vec<String> = deleted
+            .iter()
+            .filter(|(name, at)| {
+                !view.tags.contains_key(*name)
+                    && (only_tags.is_empty() || only_tags.contains(*name))
+                    && view.remote_tags.get(&format!("{prefix}{name}")) == Some(*at)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if refused_deletions.is_none() {
+            for name in &deletions {
+                updates.push(BranchUpdate {
+                    branch: name.clone(),
+                    expected: Some(deleted[name]),
+                    new: None,
+                });
+            }
+        }
+        let not_deleted = |rejected: &mut Vec<(String, String)>| {
+            if let Some(why) = &refused_deletions {
+                rejected.extend(deletions.iter().map(|name| (name.clone(), why.clone())));
+            }
+        };
         for t in only_tags {
-            if !view.tags.contains_key(t) {
+            let deleted_remote = deleted.contains_key(t) && view.remote_tags.contains_key(&format!("{prefix}{t}"));
+            if !view.tags.contains_key(t) && !deleted_remote {
                 bail!("no tag '{t}' here");
             }
         }
@@ -1564,13 +1612,14 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         // to the server's hidden `embargo/<id>` line with its signed record when
         // its groups exist on the server.
         let targets: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
-        let blocks = veil_core::remote::embargo_blocks(repo, &targets)?;
+        let mut blocks = veil_core::remote::embargo_blocks(repo, &targets)?.into_iter();
         let mut server_groups: Option<HashSet<String>> = None;
         let mut withheld = Vec::new();
         let mut kept = Vec::new();
         let mut embargoes: BTreeMap<String, veil_core::keychain::EmbargoRecord> = BTreeMap::new();
         let mut embargo_targets: BTreeMap<String, (String, ObjectId)> = BTreeMap::new();
-        for (u, why) in updates.into_iter().zip(blocks) {
+        for u in updates {
+            let why = if u.new.is_some() { blocks.next().unwrap_or(None) } else { None };
             match why {
                 Some(why) => {
                     let carried = u.new.and_then(|t| repo.carried_embargo(&t).ok().flatten());
@@ -1631,9 +1680,18 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             .chain(veil_core::remote::withdrawn_warnings(repo, &sent)?)
             .collect();
         if updates.is_empty() && embargoes.is_empty() {
+            not_deleted(&mut withheld);
+            if refused_deletions.is_some() {
+                let tx = repo.transaction(format!("push to {remote}"))?;
+                for name in &deletions {
+                    veil_core::remote::clear_tag_deletion(&**tx.repo().backend(), name)?;
+                }
+                tx.commit()?;
+            }
             return Ok(PushOutcome {
                 warnings: release_warnings,
                 moved: vec![],
+                deleted: vec![],
                 landed: vec![],
                 rejected: withheld,
                 uploaded: 0,
@@ -1648,13 +1706,20 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         };
         let pushed: HashMap<String, ObjectId> = updates.iter().filter_map(|u| Some((u.branch.clone(), u.new?))).collect();
         let req_embargoes: Vec<veil_core::keychain::EmbargoRecord> = embargoes.into_values().collect();
-        let Some(result) = client.push(&PushRequest {
+        let answer = match client.push(&PushRequest {
             updates,
             force,
             receipts,
             embargoes: req_embargoes,
-        })?
-        else {
+        }) {
+            // A deletion the server refuses never holds back the rest.
+            Err(e) if refused_deletions.is_none() && e.downcast_ref::<DeletionRefused>().is_some() => {
+                refused_deletions = Some(e.to_string());
+                continue;
+            }
+            r => r?,
+        };
+        let Some(result) = answer else {
             if attempt < 5 {
                 std::thread::sleep(Duration::from_millis(50 * attempt));
                 continue;
@@ -1664,11 +1729,13 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         let mut out = PushOutcome {
             warnings: withdrawn.iter().cloned().chain(result.warnings.iter().cloned()).collect(),
             moved: vec![],
+            deleted: vec![],
             landed: vec![],
             rejected: withheld,
             uploaded,
             created,
         };
+        not_deleted(&mut out.rejected);
         let mut tx = repo.transaction(format!("push to {remote}"))?;
         tx.repository_wide();
         let mut missing = false;
@@ -1714,9 +1781,17 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 }
                 (true, None) => {
                     tx.view.remote_tags.remove(&format!("{prefix}{}", r.branch));
+                    veil_core::remote::clear_tag_deletion(&**tx.repo().backend(), &r.branch)?;
+                    out.deleted.push(r.branch);
                 }
                 (false, _) => out.rejected.push((r.branch, r.message.unwrap_or_default())),
             }
+        }
+        // A deletion the server refused is over: the server kept the tag,
+        // and the next pull brings it back here (it is not asked again on
+        // every push).
+        for (name, _) in out.rejected.iter().filter(|(name, _)| deletions.contains(name)) {
+            veil_core::remote::clear_tag_deletion(&**tx.repo().backend(), name)?;
         }
         for id in &newly_released {
             let eb = veil_core::embargo::embargo_branch(id);

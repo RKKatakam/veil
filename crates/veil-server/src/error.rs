@@ -141,6 +141,11 @@ impl IntoResponse for Error {
                     false,
                 );
             }
+            Error::Other(e) if crate::pack_gc::gc_epoch_changed(&e) => {
+                let mut r = Error::busy().into_response();
+                r.extensions_mut().insert(crate::db::Retryable);
+                return r;
+            }
             Error::Other(e) => {
                 eprintln!("veil-server: error: {e:#}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error".to_string())

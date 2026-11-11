@@ -337,6 +337,21 @@ protected = true
 - Over HTTPS: `POST /v1/projects/{project}/land` and
   `GET /v1/projects/{project}/land/{ticket}` ([HUB.md §13.19](../HUB.md)).
 
+**Merged branches are cleaned up.** When a pull request lands, the server
+deletes the branch it was opened from (`vl pr create task-4821`), if the
+branch still points at what landed. Anyone who may write to the project may
+delete a branch whose work is all on the default branch (`vl tag delete NAME`,
+then `vl push`); deleting a branch that holds other work stays an admin's.
+The default branch, protected branches and embargo lines are never deleted
+this way, and an agent session deletes only a branch it may move. A deleted
+branch stops counting toward the project's 10,000 branches at once. To keep
+the branches of landed pull requests:
+
+```toml
+[branches]
+delete_merged = false
+```
+
 ## Committing without a checkout
 
 Scripts, CI jobs and agents can make a change with no clone at all: send

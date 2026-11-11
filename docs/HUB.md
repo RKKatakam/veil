@@ -913,7 +913,9 @@ quay.io; the tests use the MinIO server binary packaged as
   | create or delete groups, choose managers | admins |
   | add or remove a group's people | admins and that group's managers; **a manager never adds themselves** |
   | upload objects, push, read key rings | participants: admins, group members, people named on a rule |
-  | force a branch move, delete a branch | admins |
+  | force a branch move | admins |
+  | delete a branch | admins. Anyone who may write a path, when the branch's work is all on the default branch (its tip is the default branch's tip or below it, or the landing service landed it there): `vl tag delete NAME`, then `vl push` (BUG-1885). Never this way: the default branch, a protected branch, an embargo's line, a forced push. An agent session: only a merged branch, and only one it may move (§13.27: its tip's change stays inside a narrowed session's paths and changes no file that decides access) |
+  | delete a pull request's source branch when it lands | the server, if the branch still points at the head that landed (never the default branch, the target, a protected branch or an embargo's line); `[branches] delete_merged = false` in `.veilrules` turns it off |
 
 * **Every check is on the server, on every request**; removing someone
   takes effect on their next request, on every server: servers cache
@@ -1713,7 +1715,9 @@ one entry can hold: **10,000 branches per project** and **1,000 branch
 updates per push** (`sync::MAX_BRANCHES`, `MAX_PUSH_UPDATES`), and **1,000
 groups per project** (`perm::MAX_GROUPS`); each is checked against the
 records when the request begins, so concurrent requests may each add up to
-the bound.
+the bound. A deleted branch stops counting at once (in the push that
+deletes it too); its search heads and derived rows are left to the purges
+and GC that exist (BUG-1885).
 
 **Branch tips.** A pull may see a tip up to **100 ms** old, as
 `phase-2-thin-clients.md` §5.1 allows; rows read before a push's notice are
@@ -5413,6 +5417,7 @@ Design: [`docs/design/server/storage-and-cost.md` §8](design/server/storage-and
   3. **Atomic switch transaction:** in one `READ COMMITTED` transaction (`db::transaction`), the job locks the replaced packs (`SELECT ... FOR UPDATE`), verifies they are still `LISTED` (and, when GC drops unreferenced objects, verifies the project's ref/push stamp `RefStamp` is unchanged), updates the new pack(s) to `LISTED` (`state = 1`), and marks the replaced packs `DISCARDED` (`state = 2`, `discarded_at = now_ms`).
   4. **Cross-server lookup coherence:** the server that ran the switch calls `Objects::listed_here` and `Objects::forget_packs` (`Packs::forget`). Other servers prune unlisted packs on `Packs::refresh_in`, and if a ranged read (`Objects::try_pack_range`, `Objects::stored`, `Objects::get_blocking`, `Packs::find_paged_in`) encounters a pack that was already merged and swept after its grace window, it forgets that pack and refreshes the project's listing seamlessly without surfacing an error.
   5. **Grace-period sweep:** once `now_ms - discarded_at >= pack_grace_ms`, `sweep_discarded` deletes the storage object (`store.delete`) and then deletes the `DISCARDED` row from `packs`. Uncommitted job packs from an interrupted run (`state = 0 AND person_id IS NULL`) and abandoned client uploads older than `staged_grace_ms` are discarded and swept by `sweep_staged`.
+* **A switch that drops objects excludes the transactions that add roots (BUG-1881).** Each such switch (`run_with_lock`, `compact_batch` when it drops objects, `mark_and_sweep_loose`) locks the project's GC epoch row (`access_epochs (project, -1)`) `FOR UPDATE` before it reads the reference stamp, and raises the epoch as it commits. Every transaction that adds a root (a push, an API commit, a PR or its revision, a landing's queue entry and batch, a merge worker, a check, an embargo's release, a bisect, the search index) read the epoch before it checked its objects (`pack_gc::read_gc_epoch`), and its first statement locks the row `FOR SHARE` and compares (`guard_root_write`): after a switch it starts over (`GcEpochChanged`), and a switch that follows it sees its rows in the stamp and gives up. Writers never wait for each other, and add no commit. Both sides first take a transaction-level advisory lock (`GATE_BASE ^ project`: writers shared, the switch exclusive), which is granted in arrival order: PostgreSQL lets new `FOR SHARE` lockers join a row ahead of a waiting `FOR UPDATE`, so under steady pushes the switch alone never got the row. While a switch's transaction runs (the stamp's read, the purge), the project's root writers wait for it.
 * **Garbage collection reachability closure.** `mark_and_sweep_loose` walks the object graph starting from all server roots of the project:
   * all `branches` (both public branches and hidden embargo branches `embargo/<id>` where `hidden_for_embargo IS NOT NULL`),
   * `embargo_lines` (`record_json`) and `embargo_snapshots` (S22),
