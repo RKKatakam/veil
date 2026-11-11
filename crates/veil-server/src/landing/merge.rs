@@ -148,6 +148,7 @@ pub struct Job {
     pub lineage: i64,
     pub merges: u32,
     pub tip: ObjectId,
+    pub claim_token: u64,
 }
 
 /// Read `.veilattributes` from a real tree `tree` in `src`, restricted to
@@ -447,6 +448,42 @@ fn can_merge_entries(
 pub fn spawn(hub: &Arc<Hub>, job: Job) {
     let hub = hub.clone();
     tokio::spawn(async move {
+        struct RenewStop(tokio::task::AbortHandle);
+        impl Drop for RenewStop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let renew_task = {
+            let hub = hub.clone();
+            let holder = hub.landing.holder.clone();
+            let (pid, branch, seq, token) = (job.project, job.branch.clone(), job.seq, job.claim_token as i64);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let res = sqlx::query(
+                        "UPDATE landing_queue \
+                         SET result = jsonb_build_object('holder', $4::TEXT, 'token', $5::BIGINT, 'expires_at', (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $6::BIGINT)::TEXT \
+                         WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging' \
+                         AND result IS NOT NULL AND (result::jsonb->>'holder') = $4 AND (result::jsonb->>'token')::BIGINT = $5",
+                    )
+                    .bind(pid)
+                    .bind(&branch)
+                    .bind(seq)
+                    .bind(&holder)
+                    .bind(token)
+                    .bind(super::LEASE_MS)
+                    .execute(&hub.db)
+                    .await;
+                    if let Ok(r) = res {
+                        if r.rows_affected() == 0 {
+                            break;
+                        }
+                    }
+                }
+            })
+        };
+        let renew_guard = RenewStop(renew_task.abort_handle());
         let _permit = hub.landing.merges.sem.clone().acquire_owned().await.ok();
         loop {
             match run_worker(&hub, job.clone()).await {
@@ -456,6 +493,20 @@ pub fn spawn(hub: &Arc<Hub>, job: Job) {
                 }
                 Err(e) => {
                     eprintln!("veil-server: merge worker failed: {e:?}");
+                    drop(renew_guard);
+                    let _ = sqlx::query(
+                        "UPDATE landing_queue SET state = 'queued', result = NULL \
+                         WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging' \
+                         AND result IS NOT NULL AND (result::jsonb->>'holder') = $4 AND (result::jsonb->>'token')::BIGINT = $5",
+                    )
+                    .bind(job.project)
+                    .bind(&job.branch)
+                    .bind(job.seq)
+                    .bind(&hub.landing.holder)
+                    .bind(job.claim_token as i64)
+                    .execute(&hub.db)
+                    .await;
+                    super::ensure(&hub, job.project, &job.branch);
                     break;
                 }
             }
@@ -574,10 +625,12 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
             let agent_session = job.agent_session.clone();
             let branch = job.branch.clone();
             let seq = job.seq;
+            let holder = hub.landing.holder.clone();
+            let claim_token = job.claim_token as i64;
             let max_merges = i64::from(MAX_MERGES);
             let requeue_out: std::result::Result<Option<i64>, String> =
                 crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-                    let (snap_hex, snap_authors, orig_real, orig_src, encoded, branch, agent_session) = (
+                    let (snap_hex, snap_authors, orig_real, orig_src, encoded, branch, agent_session, holder) = (
                         snap_hex.clone(),
                         snap_authors.clone(),
                         orig_real.clone(),
@@ -585,6 +638,7 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
                         encoded.clone(),
                         branch.clone(),
                         agent_session.clone(),
+                        holder.clone(),
                     );
                     Box::pin(async move {
                         crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
@@ -616,9 +670,10 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
                             .await?;
                         }
                         let m: Option<i64> = sqlx::query_scalar(
-                            "UPDATE landing_queue SET state = 'queued', stack = $4, merges = merges + 1, \
+                            "UPDATE landing_queue SET state = 'queued', result = NULL, stack = $4, merges = merges + 1, \
                              created_at = (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT \
                              WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging' AND merges < $5 \
+                             AND result IS NOT NULL AND (result::jsonb->>'holder') = $6 AND (result::jsonb->>'token')::BIGINT = $7 \
                              RETURNING merges",
                         )
                         .bind(pid)
@@ -626,6 +681,8 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
                         .bind(seq)
                         .bind(&encoded)
                         .bind(max_merges)
+                        .bind(&holder)
+                        .bind(claim_token)
                         .fetch_optional(&mut *c)
                         .await?;
                         Ok(Ok(m))
@@ -693,14 +750,17 @@ async fn finish_terminal(
     let pid = job.project;
     let branch = job.branch.clone();
     let seq = job.seq;
+    let holder = hub.landing.holder.clone();
+    let claim_token = job.claim_token as i64;
     let state_owned = state_str.to_string();
     let n = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-        let (branch, state_owned, text) = (branch.clone(), state_owned.clone(), text.clone());
+        let (branch, state_owned, text, holder) = (branch.clone(), state_owned.clone(), text.clone(), holder.clone());
         Box::pin(async move {
             crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             Ok(sqlx::query(
                 "UPDATE landing_queue SET state = $4, result = $5, done_at = $6 \
-                 WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging'",
+                 WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging' \
+                 AND result IS NOT NULL AND (result::jsonb->>'holder') = $7 AND (result::jsonb->>'token')::BIGINT = $8",
             )
             .bind(pid)
             .bind(&branch)
@@ -708,6 +768,8 @@ async fn finish_terminal(
             .bind(&state_owned)
             .bind(&text)
             .bind(veil_core::now_millis())
+            .bind(&holder)
+            .bind(claim_token)
             .execute(&mut *c)
             .await?
             .rows_affected())

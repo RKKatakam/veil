@@ -130,9 +130,9 @@ async fn renew(hub: &Hub, project: i64, branch: &str, epoch: i64) -> Result<bool
     Ok(n == 1)
 }
 
-/// Is anything queued for `branch`?
+/// Is anything queued or merging for `branch`?
 pub(super) async fn has_ready(hub: &Hub, project: i64, branch: &str) -> Result<bool> {
-    let n: Option<i64> = sqlx::query_scalar("SELECT seq FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state = 'queued' LIMIT 1")
+    let n: Option<i64> = sqlx::query_scalar("SELECT seq FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state IN ('queued', 'merging') LIMIT 1")
         .bind(project)
         .bind(branch)
         .fetch_optional(&hub.db)
@@ -430,6 +430,7 @@ impl Service {
                 self.clean().await?;
                 cleaned = Some(Instant::now());
             }
+            let has_merging = self.reclaim_expired_merges().await?;
             let exclude = inflight.as_ref().map(|f| f.seqs.clone()).unwrap_or_default();
             let rows = self.ready(&exclude).await?;
             if rows.is_empty() {
@@ -439,7 +440,9 @@ impl Service {
                     }
                     continue;
                 }
-                if idle.elapsed() > IDLE {
+                if has_merging {
+                    idle = Instant::now();
+                } else if idle.elapsed() > IDLE {
                     return Ok(());
                 }
                 let _ = tokio::time::timeout(Duration::from_millis(250), wake.notified()).await;
@@ -581,6 +584,36 @@ impl Service {
             recent: tip.into_iter().collect(),
             ..State::default()
         })
+    }
+
+    /// Reclaim `merging` rows on this branch whose worker claim expired (or had
+    /// none), fenced on this service's live branch lease (`BUG-1883`). Returns
+    /// whether any live `merging` rows remain on the branch.
+    async fn reclaim_expired_merges(&self) -> Result<bool> {
+        let (total, expired): (i64, i64) = sqlx::query_as(&format!(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE result IS NULL OR (result::jsonb->>'expires_at')::BIGINT < {DB_NOW}) \
+             FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state = 'merging'"
+        ))
+        .bind(self.project)
+        .bind(&self.branch)
+        .fetch_one(&self.hub.db)
+        .await?;
+        if expired > 0 {
+            sqlx::query(&format!(
+                "UPDATE landing_queue AS q SET state = 'queued', result = NULL \
+                 WHERE q.project_id = $1 AND q.branch = $2 AND q.state = 'merging' \
+                   AND (q.result IS NULL OR (q.result::jsonb->>'expires_at')::BIGINT < {DB_NOW}) \
+                   AND EXISTS (SELECT 1 FROM landing_leases l WHERE l.project_id = $1 AND l.branch = $2 \
+                               AND l.holder = $3 AND l.epoch = $4 AND l.expires_at >= {DB_NOW})"
+            ))
+            .bind(self.project)
+            .bind(&self.branch)
+            .bind(&self.hub.landing.holder)
+            .bind(self.epoch)
+            .execute(&self.hub.db)
+            .await?;
+        }
+        Ok(total > expired)
     }
 
     /// The ready rows, leaving out those being committed: reverts first
@@ -929,9 +962,22 @@ impl Service {
 
     /// Commit the batch (its objects stored already) in one transaction;
     /// then tell the waiters here, spawn merge workers, and emit events.
-    async fn commit(&self, b: Built, gc_epoch: i64) -> Result<Committed> {
+    async fn commit(&self, mut b: Built, gc_epoch: i64) -> Result<Committed> {
         let t = Instant::now();
         let hub = &self.hub;
+        for o in &mut b.outcomes {
+            if let Outcome::Merging(job) = o {
+                job.claim_token = hub.landing.next_claim_token();
+            }
+        }
+        let claim_tokens: Vec<Option<i64>> = b
+            .outcomes
+            .iter()
+            .map(|o| match o {
+                Outcome::Merging(job) => Some(job.claim_token as i64),
+                _ => None,
+            })
+            .collect();
         let moved = b.after.tip != b.old_tip;
         let results: Vec<Option<LandResult>> = b
             .rows
@@ -1031,7 +1077,7 @@ impl Service {
         let old_tip_id = b.old_tip;
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-            let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing, active_review_checks, review_guard) = (
+            let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing, active_review_checks, review_guard, claim_tokens) = (
                 ls.clone(),
                 ll.clone(),
                 mc.clone(),
@@ -1043,6 +1089,7 @@ impl Service {
                 rules_landing.clone(),
                 active_review_checks.clone(),
                 review_guard.clone(),
+                claim_tokens.clone(),
             );
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
@@ -1185,17 +1232,26 @@ impl Service {
                     .map(|r| r.as_ref().map(|x| serde_json::to_string(x).unwrap_or_default()))
                     .collect();
                 let dones: Vec<Option<i64>> = results.iter().map(|r| r.as_ref().map(|_| now_ms)).collect();
-                let n = sqlx::query(
-                    "UPDATE landing_queue AS q SET state = v.state, result = v.result, done_at = v.done_at \
-                     FROM unnest($3::BIGINT[], $4::TEXT[], $5::TEXT[], $6::BIGINT[]) AS v(seq, state, result, done_at) \
-                     WHERE q.project_id = $1 AND q.branch = $2 AND q.seq = v.seq AND q.state = 'queued'",
-                )
+                let n = sqlx::query(&format!(
+                    "UPDATE landing_queue AS q \
+                     SET state = v.state, \
+                         result = CASE \
+                             WHEN v.claim_token IS NOT NULL THEN jsonb_build_object('holder', $7::TEXT, 'token', v.claim_token, 'expires_at', {DB_NOW} + $8::BIGINT)::TEXT \
+                             ELSE v.result \
+                         END, \
+                         done_at = v.done_at \
+                     FROM unnest($3::BIGINT[], $4::TEXT[], $5::TEXT[], $6::BIGINT[], $9::BIGINT[]) AS v(seq, state, result, done_at, claim_token) \
+                     WHERE q.project_id = $1 AND q.branch = $2 AND q.seq = v.seq AND q.state = 'queued'"
+                ))
                 .bind(pid)
                 .bind(&branch)
                 .bind(&seqs)
                 .bind(&states)
                 .bind(&texts)
                 .bind(&dones)
+                .bind(&holder)
+                .bind(LEASE_MS)
+                .bind(&claim_tokens)
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
@@ -1759,6 +1815,7 @@ fn entry(
                     lineage: p.row.lineage,
                     merges: p.row.merges,
                     tip: chain,
+                    claim_token: 0,
                 })));
             }
             let report = super::merge::build_conflict(

@@ -371,6 +371,8 @@ pub struct Services {
     waiting_by_person: Mutex<HashMap<i64, usize>>,
     /// The branches whose waiters here a poller answers (`poll`).
     pollers: Mutex<std::collections::HashSet<(i64, String)>>,
+    /// Monotonic token distinguishing merge-worker claims (`BUG-1883`).
+    next_claim: AtomicU64,
     /// Content merge workers running on this server (S18).
     pub merges: merge::Workers,
     pub stats: Stats,
@@ -388,6 +390,7 @@ impl Default for Services {
             next_waiter: AtomicU64::new(1),
             waiting_by_person: Mutex::new(HashMap::new()),
             pollers: Mutex::new(Default::default()),
+            next_claim: AtomicU64::new(1),
             merges: merge::Workers::default(),
             stats: Stats::default(),
         }
@@ -410,6 +413,10 @@ pub struct Waiter {
 }
 
 impl Services {
+    pub(crate) fn next_claim_token(&self) -> u64 {
+        self.next_claim.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Wait here for `ticket`'s outcome.
     pub fn register(&self, ticket: &str) -> Waiter {
         let (tx, rx) = oneshot::channel();
@@ -485,21 +492,33 @@ pub fn ensure(hub: &Arc<Hub>, project: i64, branch: &str) {
             hub.landing.held_elsewhere.lock().unwrap().insert(key.clone(), Instant::now());
         }
         hub.landing.running.lock().unwrap().remove(&key);
-        // An entry submitted while it was stopping is not left waiting.
-        if !held_elsewhere && service::has_ready(&hub, project, &key.1).await.unwrap_or(false) {
+        // An entry submitted while it was stopping (or held by another server
+        // that may stop before answering, `BUG-1883`) is not left waiting.
+        if service::has_ready(&hub, project, &key.1).await.unwrap_or(false) {
+            if held_elsewhere {
+                tokio::time::sleep(Duration::from_millis(LEASE_MS as u64 + 100)).await;
+            }
             ensure(&hub, project, &key.1);
         }
     });
 }
 
-/// Start the services of every branch with queued entries (a server
-/// starting after another stopped).
+/// Start the services of every branch with queued or merging entries (a server
+/// starting after another stopped). Only resets `merging` rows owned by this
+/// holder, unclaimed, or expired (`BUG-1883`), never live claims of other servers.
 pub async fn resume(hub: Arc<Hub>) {
-    let _ = sqlx::query("UPDATE landing_queue SET state = 'queued' WHERE state = 'merging'")
-        .execute(&hub.db)
-        .await;
+    let _ = sqlx::query(
+        "UPDATE landing_queue SET state = 'queued', result = NULL \
+         WHERE state = 'merging' AND (result IS NULL OR (result::jsonb->>'holder') = $1 \
+         OR (result::jsonb->>'expires_at')::BIGINT < (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)",
+    )
+    .bind(&hub.landing.holder)
+    .execute(&hub.db)
+    .await;
     let rows: std::result::Result<Vec<(i64, String)>, _> =
-        sqlx::query_as("SELECT DISTINCT project_id, branch FROM landing_queue WHERE state = 'queued'").fetch_all(&hub.db).await;
+        sqlx::query_as("SELECT DISTINCT project_id, branch FROM landing_queue WHERE state IN ('queued', 'merging')")
+            .fetch_all(&hub.db)
+            .await;
     match rows {
         Ok(rows) => {
             for (p, b) in rows {
@@ -755,7 +774,8 @@ fn poll(hub: &Arc<Hub>, project: i64, branch: &str) {
             let now = veil_core::now_millis();
             hub.landing.stats.polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rows: std::result::Result<Vec<(String, String)>, _> = sqlx::query_as(
-                "SELECT ticket, result FROM landing_queue WHERE project_id = $1 AND branch = $2 AND done_at >= $3 AND result IS NOT NULL",
+                "SELECT ticket, result FROM landing_queue WHERE project_id = $1 AND branch = $2 AND done_at >= $3 \
+                 AND result IS NOT NULL AND state NOT IN ('queued', 'merging')",
             )
             .bind(key.0)
             .bind(&key.1)
@@ -805,6 +825,7 @@ pub async fn submit(
     }
     match (req.snapshot, req.base) {
         (Some(snapshot), None) if req.edits.is_empty() && req.change_id.is_none() && req.description.is_empty() => {
+            let onto = req.onto.clone();
             let push = PushRequest {
                 updates: vec![BranchUpdate {
                     branch: req.onto.clone(),
@@ -815,7 +836,15 @@ pub async fn submit(
                 receipts: req.receipts,
                 ..Default::default()
             };
-            let (pushed, mut landings) = crate::sync::push_with(hub, project, viewer, &who, push, true, req.wait).await?;
+            let (pushed, mut landings) = match crate::sync::push_with(hub, project, viewer, &who, push, true, req.wait).await {
+                Ok(v) => v,
+                Err(e) => {
+                    if matches!(&e, Error::Api { status, .. } if *status == axum::http::StatusCode::TOO_MANY_REQUESTS) {
+                        ensure(hub, project.id, &onto);
+                    }
+                    return Err(e);
+                }
+            };
             match landings.pop() {
                 // Projected for the pusher by `push_with`.
                 Some(l) => Ok(l),
@@ -849,6 +878,9 @@ pub async fn submit(
             let made = match r {
                 Ok(m) => m,
                 Err(e) => {
+                    if matches!(&e, Error::Api { status, .. } if *status == axum::http::StatusCode::TOO_MANY_REQUESTS) {
+                        ensure(hub, project.id, &q.branch);
+                    }
                     abandon(hub, w);
                     return Err(e);
                 }

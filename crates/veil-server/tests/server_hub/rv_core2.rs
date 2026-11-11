@@ -69,6 +69,146 @@ fn outcome(api: &Api, token: &str, project: &str, ticket: &str) -> Value {
     }
 }
 
+async fn is_yugabyte(db: &sqlx::PgPool) -> bool {
+    let v: String = sqlx::query_scalar("SELECT version()").fetch_one(db).await.unwrap();
+    v.contains("-YB-")
+}
+
+/// Wait until a statement matching `query_like` waits on a lock (`pg_stat_activity`
+/// reports `wait_event_type = 'Lock'` on PostgreSQL; YugabyteDB does not populate
+/// `wait_event_type`, so wait briefly once active, matching `prs::s21_adversarial`).
+async fn wait_for_sql_lock(db: &sqlx::PgPool, query_like: &str, msg: &str) {
+    if is_yugabyte(db).await {
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND query LIKE $1",
+            )
+            .bind(query_like)
+            .fetch_one(db)
+            .await
+            .unwrap_or(0);
+            if active > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        return;
+    }
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1",
+        )
+        .bind(query_like)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(Instant::now() < until, "{msg}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+struct TxGuard<'a>(&'a tokio::runtime::Runtime, Option<sqlx::Transaction<'static, sqlx::Postgres>>);
+
+impl TxGuard<'_> {
+    fn rollback(mut self) {
+        if let Some(tx) = self.1.take() {
+            self.0.block_on(tx.rollback()).unwrap();
+        }
+    }
+}
+
+impl Drop for TxGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.1.take() {
+            let _ = self.0.block_on(tx.rollback());
+        }
+    }
+}
+
+/// Submit an overlapping landing and hold its merge worker's commit while the
+/// row is `merging`. On PostgreSQL, holds `LOCK TABLE origins IN EXCLUSIVE MODE`
+/// and waits for `INSERT INTO origins%`; on YugabyteDB (which rejects `LOCK TABLE
+/// ... EXCLUSIVE`), locks `access_epochs (pid, -1) FOR UPDATE` as soon as the
+/// row enters `merging` so `run_worker`'s `guard_root_write` (`FOR SHARE`) waits
+/// while `renew_task` keeps renewing `landing_queue`.
+fn hold_worker_in_merging<'a>(
+    rt: &'a tokio::runtime::Runtime,
+    db: &sqlx::PgPool,
+    pid: i64,
+    mut submit: impl FnMut() -> String,
+) -> (String, TxGuard<'a>) {
+    if !rt.block_on(is_yugabyte(db)) {
+        let mut lock = rt.block_on(db.begin()).unwrap();
+        rt.block_on(sqlx::query("LOCK TABLE origins IN EXCLUSIVE MODE").execute(&mut *lock)).unwrap();
+        let guard = TxGuard(rt, Some(lock));
+        let ticket = submit();
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let st: String = rt
+                .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(db))
+                .unwrap();
+            let waiting: i64 = rt
+                .block_on(
+                    sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO origins%'")
+                        .fetch_one(db),
+                )
+                .unwrap();
+            if st == "merging" && waiting > 0 {
+                return (ticket, guard);
+            }
+            assert!(Instant::now() < until, "the entry was handed to a merge worker: {st}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    rt.block_on(
+        sqlx::query("INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 0, 0) ON CONFLICT DO NOTHING")
+            .bind(pid)
+            .execute(db),
+    )
+    .unwrap();
+    for attempt in 0..5 {
+        let ticket = submit();
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let st: String = rt
+                .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(db))
+                .unwrap();
+            if st == "merging" {
+                let mut lock = rt.block_on(db.begin()).unwrap();
+                rt.block_on(
+                    sqlx::query("SELECT 1 FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE")
+                        .bind(pid)
+                        .execute(&mut *lock),
+                )
+                .unwrap();
+                let guard = TxGuard(rt, Some(lock));
+                let st_after: String = rt
+                    .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(db))
+                    .unwrap();
+                if st_after == "merging" {
+                    std::thread::sleep(Duration::from_millis(400));
+                    return (ticket, guard);
+                }
+                guard.rollback();
+                break;
+            }
+            assert!(Instant::now() < until || attempt < 4, "entry did not stay in merging on YugabyteDB: {st}");
+            if st != "queued" || Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    panic!("could not trap worker in merging on YugabyteDB");
+}
+
 /// `docs/HUB.md` §13.24: every landing onto a protected branch meets the
 /// review rules. The rules are asked when the entry is queued and never
 /// again: a reviewer who takes the approval back (a request for changes,
@@ -515,20 +655,7 @@ fn bug_1881_a_push_committing_during_the_gc_switch_points_its_branch_at_deleted_
                     );
                     let _ = tx_done.send(r);
                 });
-                let until = Instant::now() + Duration::from_secs(30);
-                loop {
-                    let waiting: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'UPDATE branches SET target%'",
-                    )
-                    .fetch_one(&db)
-                    .await
-                    .unwrap();
-                    if waiting > 0 {
-                        break;
-                    }
-                    assert!(Instant::now() < until, "the push never reached its branch update");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                wait_for_sql_lock(&db, "UPDATE branches SET target%", "the push never reached its branch update").await;
                 // The row is released when GC is done (or after 8 s, were GC to wait for the push).
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(Duration::from_secs(8), release.notified()).await;
@@ -637,20 +764,7 @@ fn bug_1881_pr_writer_and_reverse_switch_order_serialize_with_gc() {
                     );
                     let _ = tx_pr.send(r);
                 });
-                let until = Instant::now() + Duration::from_secs(30);
-                loop {
-                    let waiting: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'UPDATE prs SET revision%'",
-                    )
-                    .fetch_one(&db)
-                    .await
-                    .unwrap();
-                    if waiting > 0 {
-                        break;
-                    }
-                    assert!(Instant::now() < until, "add_revision never reached its prs update");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                wait_for_sql_lock(&db, "UPDATE prs SET revision%", "add_revision never reached its prs update").await;
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(Duration::from_secs(6), release.notified()).await;
                     lock.rollback().await.unwrap();
@@ -682,16 +796,19 @@ fn bug_1881_pr_writer_and_reverse_switch_order_serialize_with_gc() {
     assert_eq!(r.json()["results"][0]["ok"], true);
     gc(240_000, None).unwrap();
 
-    let snap_lock = th.rt.block_on(async {
-        let mut tx = h.db.begin().await.unwrap();
-        sqlx::query("SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2 FOR SHARE")
-            .bind(pid)
-            .bind(snap3.hex())
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-        tx
-    });
+    let snap_lock = TxGuard(
+        &th.rt,
+        Some(th.rt.block_on(async {
+            let mut tx = h.db.begin().await.unwrap();
+            sqlx::query("SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2 FOR SHARE")
+                .bind(pid)
+                .bind(snap3.hex())
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            tx
+        })),
+    );
     let h_gc = h.clone();
     let gc_handle = th.rt.spawn(async move {
         pack_gc::run_project(
@@ -708,22 +825,7 @@ fn bug_1881_pr_writer_and_reverse_switch_order_serialize_with_gc() {
         )
         .await
     });
-    th.rt.block_on(async {
-        let until = Instant::now() + Duration::from_secs(30);
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'DELETE FROM snapshots%'",
-            )
-            .fetch_one(&h.db)
-            .await
-            .unwrap();
-            if waiting > 0 {
-                break;
-            }
-            assert!(Instant::now() < until, "GC never reached DELETE FROM snapshots");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    });
+    th.rt.block_on(wait_for_sql_lock(&h.db, "DELETE FROM snapshots%", "GC never reached DELETE FROM snapshots"));
 
     let (tx_push, rx_push) = std::sync::mpsc::channel::<Reply>();
     {
@@ -738,23 +840,12 @@ fn bug_1881_pr_writer_and_reverse_switch_order_serialize_with_gc() {
             let _ = tx_push.send(r);
         });
     }
-    th.rt.block_on(async {
-        let until = Instant::now() + Duration::from_secs(30);
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'SELECT epoch FROM access_epochs%FOR SHARE%'",
-            )
-            .fetch_one(&h.db)
-            .await
-            .unwrap();
-            if waiting > 0 {
-                break;
-            }
-            assert!(Instant::now() < until, "push never reached guard_root_write FOR SHARE");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        snap_lock.rollback().await.unwrap();
-    });
+    th.rt.block_on(wait_for_sql_lock(
+        &h.db,
+        "SELECT epoch FROM access_epochs%FOR SHARE%",
+        "push never reached guard_root_write FOR SHARE",
+    ));
+    snap_lock.rollback();
     let rep = th.rt.block_on(gc_handle).unwrap().unwrap();
     assert!(rep.packed_objects_deleted + rep.loose_objects_deleted > 0, "GC swept snap3: {rep:?}");
 
@@ -901,7 +992,6 @@ fn bug_1882_one_persons_agent_sessions_take_the_whole_signed_in_body_pool() {
 /// ever answers it: the ticket stays `queued`, and counts against its
 /// person's outstanding landings.
 #[test]
-#[ignore = "BUG-1883: a merging entry of a server that went away is never answered"]
 fn bug_1883_a_merging_entry_of_a_server_that_went_away_is_never_answered() {
     let a = TestHub::start();
     let p = setup_project(&a);
@@ -939,40 +1029,25 @@ fn bug_1883_a_merging_entry_of_a_server_that_went_away_is_never_answered() {
     let change: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
     land_as_admin(text("two", "TWENTY-EIGHT BY ADMIN"));
 
-    // The merge worker's commit waits (its insert into `origins`), so that the
-    // server stops while the entry is `merging`.
-    let mut lock = b.rt.block_on(db.begin()).unwrap();
-    b.rt.block_on(sqlx::query("LOCK TABLE origins IN EXCLUSIVE MODE").execute(&mut *lock)).unwrap();
-    let r = api_a.post_json(
-        Some(&dev_tok),
-        &format!("/v1/projects/{}/land", p.name),
-        &json!({"onto": "main", "snapshot": change.hex(), "wait": false}),
-    );
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["state"], "queued", "{}", r.json());
-    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    // The merge worker's commit waits, so that the server stops while the
+    // entry is `merging`.
+    let (ticket, lock) = hold_worker_in_merging(&b.rt, &db, pid, || {
+        let r = api_a.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "snapshot": change.hex(), "wait": false}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["state"], "queued", "{}", r.json());
+        r.json()["ticket"].as_str().unwrap().to_string()
+    });
     let state = || -> String {
         b.rt.block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(&db)).unwrap()
     };
-    let until = Instant::now() + Duration::from_secs(30);
-    loop {
-        let waiting: i64 = b
-            .rt
-            .block_on(
-                sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO origins%'")
-                    .fetch_one(&db),
-            )
-            .unwrap();
-        if state() == "merging" && waiting > 0 {
-            break;
-        }
-        assert!(Instant::now() < until, "the entry was handed to a merge worker: {}", state());
-        std::thread::sleep(Duration::from_millis(50));
-    }
     // The server with the worker goes away; the other keeps running.
     drop(api_a);
     drop(a);
-    b.rt.block_on(lock.rollback()).unwrap();
+    lock.rollback();
     assert_eq!(state(), "merging", "the worker's commit went with its server");
 
     // The entry's submitter asks the server that is left.
@@ -986,4 +1061,71 @@ fn bug_1883_a_merging_entry_of_a_server_that_went_away_is_never_answered() {
         }
     };
     assert_eq!(done["state"], "landed", "45 s after its server went away the entry is still `{}` in the queue: {done}", state());
+    assert_eq!(done["merges"], 1, "only the surviving worker's merge counts: {done}");
+}
+
+/// BUG-1883: starting another server (`landing::resume`) does not reset a live
+/// `merging` claim held by a running peer, and only the surviving worker's
+/// merge counts.
+#[test]
+fn bug_1883_peer_resume_preserves_live_merge_claims() {
+    let a = TestHub::start();
+    let p = setup_project(&a);
+    let b = TestHub::beside(&a);
+    let (api_a, api_b) = (a.api(), b.api());
+    let pid = project_id(&a, &p.name);
+    let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
+    let db = a.hub().db.clone();
+    const FILE: &str = "src/merge-1883-peer.txt";
+    let text = |second: &str, last: &str| {
+        let mut lines: Vec<String> = (0..30).map(|i| format!("line {i} of bug 1883 peer")).collect();
+        lines[2] = second.to_string();
+        lines[28] = last.to_string();
+        lines.join("\n") + "\n"
+    };
+    let land_as_admin = |content: String| {
+        let base = api_a.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+        let r = api_a.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "base": base.hex(), "edits": [put(FILE, &content)], "wait": true}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    };
+    land_as_admin(text("two", "twenty-eight"));
+    let base = api_a.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api_a.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": base.hex(), "edits": [put(FILE, &text("TWO BY DEV", "twenty-eight"))]}),
+    );
+    assert_eq!(r.status, 200);
+    let change: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    land_as_admin(text("two", "TWENTY-EIGHT BY ADMIN"));
+
+    // Hold the merge worker's commit so `a` stays in `merging` with a live claim.
+    let (ticket, lock) = hold_worker_in_merging(&a.rt, &db, pid, || {
+        let r = api_a.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "snapshot": change.hex(), "wait": false}),
+        );
+        assert_eq!(r.status, 200);
+        r.json()["ticket"].as_str().unwrap().to_string()
+    });
+
+    // Peer `b` runs `landing::resume`: `a`'s live claim must NOT be reset to `queued`.
+    b.rt.block_on(veil_server::landing::resume(b.hub()));
+    let (st_after_resume, claim_after_resume): (String, Option<String>) = a
+        .rt
+        .block_on(sqlx::query_as("SELECT state, result FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(&db))
+        .unwrap();
+    assert_eq!(st_after_resume, "merging", "peer resume must not reset a live merge claim");
+    assert!(claim_after_resume.is_some(), "live claim metadata must remain intact");
+
+    lock.rollback();
+    let done = outcome(&api_b, &dev_tok, &p.name, &ticket);
+    assert_eq!(done["state"], "landed", "{done}");
+    assert_eq!(done["merges"], 1, "no duplicate merge counted when peer runs resume: {done}");
 }

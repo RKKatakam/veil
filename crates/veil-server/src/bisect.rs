@@ -1485,9 +1485,7 @@ pub async fn sync_revert_outcome(hub: &Arc<Hub>, project_id: i64, branch: &str) 
         return Ok(());
     };
     if state == "queued" || state == "merging" {
-        if state == "queued" {
-            crate::landing::ensure(hub, project_id, branch);
-        }
+        crate::landing::ensure(hub, project_id, branch);
         return Ok(());
     }
     let Some(res_json) = res_opt else {

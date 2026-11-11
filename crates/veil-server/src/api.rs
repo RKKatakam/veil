@@ -720,11 +720,13 @@ async fn land_status(
     let Some((branch, r)) = crate::landing::read(&hub, project.id, me, &ticket).await? else {
         return Err(Error::not_found("no landing of yours with that ticket"));
     };
+    if r.state == veil_core::hub::land::LandState::Queued {
+        crate::landing::ensure(&hub, project.id, &branch);
+    }
     let r = if r.state != veil_core::hub::land::LandState::Queued || q.wait == Some(false) {
         r
     } else {
         let w = hub.landing.register(&ticket);
-        crate::landing::ensure(&hub, project.id, &branch);
         let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
         crate::landing::wait(&hub, project.id, me, &branch, w, deadline).await?
     };
