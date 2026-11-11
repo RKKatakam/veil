@@ -400,8 +400,12 @@ pub fn plain_text_line_ranges_from_parent(
     let parent_suf_start = parent.len() - eq_suf;
     let mut s_idx = p_lines + bsearch_start_lt(&parent_lines[p_lines..], parent_suf_start);
     while s_idx < parent_lines.len() {
-        let (a, _) = parent_lines[s_idx];
-        if a == 0 || (a > pre_byte && data[data.len() - (parent.len() - a) - 1] == b'\n') {
+        // Where that line of the shared end starts in `data`: a line of
+        // `data` only at its start or after a newline (BUG-1893: taken for
+        // one at the start of `parent`, whatever `data` had before it; and
+        // the byte before the start of `data` was read).
+        let at = data.len() - (parent.len() - parent_lines[s_idx].0);
+        if at == 0 || data[at - 1] == b'\n' {
             break;
         }
         s_idx += 1;
@@ -575,10 +579,21 @@ fn common_suffix_len(a: &[u8], b: &[u8]) -> usize {
     lo
 }
 
-/// When `old` and `new` have the same number of lines (`m == n`) and differ at
-/// between 1 and 8 isolated line indices (none of whose old or new lines appear
-/// elsewhere in the differing span or equal their immediate neighbors), returns
-/// the differing line indices `diffs[..ndiffs]`.
+/// The lines at which `old` and `new` differ, if [`map_lines`] maps every
+/// other line of `new` to the line of `old` at its own place and these to
+/// nothing: both texts have as many lines, they differ at 1 to 8 of them,
+/// and the diff of the whole texts could not have paired or moved a line
+/// otherwise. `None` if that is not known (then [`map_lines_trimmed`]
+/// answers).
+///
+/// The diff is of the lines from the first to the last that differ: the
+/// lines before and after them are mapped in place if the one at each edge
+/// occurs nowhere between (`trimmed`). Between, the lines that differ are
+/// none of the other text's lines, so only the unchanged ones can pair, all
+/// of them in one way, and no edit has a line equal to its own to slide
+/// past (BUG-1893: lines that differ were compared only with each other
+/// and their neighbours, so a changed line equal to an unchanged one
+/// further on could pair with it in the diff, and not here).
 pub fn isolated_replacements(old: &[u8], old_lines: &[(usize, usize)], new: &[u8], new_lines: &[(usize, usize)]) -> Option<Vec<usize>> {
     let n = new_lines.len();
     let m = old_lines.len();
@@ -593,8 +608,16 @@ pub fn isolated_replacements(old: &[u8], old_lines: &[(usize, usize)], new: &[u8
         if ob - oa == nb - na && old[oa..ob] == new[na..nb] {
             let eq = common_prefix_len(&old[oa..], &new[na..]);
             let target_byte = oa + eq;
-            let jump = bsearch_end_le(&old_lines[cur..], target_byte);
-            cur += jump.max(1);
+            let mut jump = bsearch_end_le(&old_lines[cur..], target_byte).max(1);
+            // Lines within the shared bytes are shared, but for `old`'s last
+            // line if it has no newline: `new`'s may go on (BUG-1893).
+            if jump > 1 {
+                let ((oa, ob), (na, nb)) = (old_lines[cur + jump - 1], new_lines[cur + jump - 1]);
+                if ob - oa != nb - na {
+                    jump -= 1;
+                }
+            }
+            cur += jump;
         } else {
             if diffs.len() >= 8 {
                 return None;
@@ -603,30 +626,39 @@ pub fn isolated_replacements(old: &[u8], old_lines: &[(usize, usize)], new: &[u8
             cur += 1;
         }
     }
+    if diffs.is_empty() {
+        return Some(diffs);
+    }
+    let old_line = |i: usize| &old[old_lines[i].0..old_lines[i].1];
+    let new_line = |i: usize| &new[new_lines[i].0..new_lines[i].1];
+    let (first, last) = (diffs[0], diffs[diffs.len() - 1]);
+    // The lines that differ, of both texts: none of `old`'s is one of `new`'s.
+    let mut apart: Vec<&[u8]> = Vec::with_capacity(2 * diffs.len() + 2);
     for &d in &diffs {
-        let (oa, ob) = old_lines[d];
-        let (na, nb) = new_lines[d];
-        let ol = &old[oa..ob];
-        let nl = &new[na..nb];
-        if d > 0 {
-            let (poa, pob) = old_lines[d - 1];
-            let (pna, pnb) = new_lines[d - 1];
-            if ol == &old[poa..pob] || ol == &new[pna..pnb] || nl == &old[poa..pob] || nl == &new[pna..pnb] {
-                return None;
-            }
+        let ol = old_line(d);
+        if diffs.iter().any(|&d2| ol == new_line(d2)) {
+            return None;
         }
-        if d + 1 < n {
-            let (noa, nob) = old_lines[d + 1];
-            let (nna, nnb) = new_lines[d + 1];
-            if ol == &old[noa..nob] || ol == &new[nna..nnb] || nl == &old[noa..nob] || nl == &new[nna..nnb] {
-                return None;
-            }
+        apart.push(ol);
+        apart.push(new_line(d));
+    }
+    // The line before the first and the one after the last are none of them,
+    for edge in [first.checked_sub(1), (last + 1 < n).then_some(last + 1)].into_iter().flatten() {
+        let el = old_line(edge);
+        if apart[..2 * diffs.len()].contains(&el) {
+            return None;
         }
-        for &d2 in &diffs {
-            let (na2, nb2) = new_lines[d2];
-            if ol == &new[na2..nb2] {
-                return None;
-            }
+        apart.push(el);
+    }
+    // and no unchanged line between is any of those (few end as one does).
+    let end = |l: &[u8]| l.last_chunk::<8>().map(|c| u64::from_le_bytes(*c));
+    let ends: Vec<Option<u64>> = apart.iter().map(|l| end(l)).collect();
+    let mut next = 1;
+    for i in first + 1..last {
+        if i == diffs[next] {
+            next += 1;
+        } else if ends.contains(&end(old_line(i))) && apart.contains(&old_line(i)) {
+            return None;
         }
     }
     Some(diffs)
@@ -644,6 +676,12 @@ pub fn map_lines_trimmed(old: &[u8], old_lines: &[(usize, usize)], new: &[u8], n
     // Find first differing byte between `old` and `new`, then binary search `old_lines` for the line containing it.
     let eq_prefix_bytes = common_prefix_len(old, new);
     let mut p0 = old_lines[..min_len].partition_point(|&(_, b)| b <= eq_prefix_bytes);
+    // The lines of `old` that end within the shared bytes are `new`'s too,
+    // but for `old`'s last line if it has no newline: every byte of it starts
+    // a line of `new` that may go on, with its newline or more (BUG-1893).
+    if p0 > 0 && new_lines[p0 - 1].1 != old_lines[p0 - 1].1 {
+        p0 -= 1;
+    }
     while p0 < min_len {
         let (oa, ob) = old_lines[p0];
         let (na, nb) = new_lines[p0];
@@ -1319,6 +1357,157 @@ mod tests {
         }
     }
 
+    /// The maps the server's blame uses ([`map_lines_ranged`] over
+    /// [`map_lines_trimmed`], and [`isolated_replacements`] where it
+    /// answers) say what [`map_lines`] says of `old` and `new`. Returns the
+    /// lines `isolated_replacements` answered with, if it did.
+    fn ranged_maps_agree(old: &str, new: &str) -> Option<usize> {
+        let (o, w) = (old.as_bytes(), new.as_bytes());
+        let (ol, nl) = (line_ranges(o), line_ranges(w));
+        let want = map_lines(o, w, nl.len());
+        assert_eq!(map_lines_ranged(o, &ol, w, &nl), want, "map_lines_ranged, {old:?} -> {new:?}");
+        let d = isolated_replacements(o, &ol, w, &nl)?;
+        let map: Vec<Option<u32>> = (0..nl.len()).map(|i| (!d.contains(&i)).then_some(i as u32)).collect();
+        assert_eq!((map, false), want, "isolated_replacements {d:?}, {old:?} -> {new:?}");
+        Some(d.len())
+    }
+
+    /// BUG-1893: a last line without its newline is not the line that has
+    /// one (or goes on), though every byte of it starts the new text. The
+    /// server's maps took it for a shared line, so its blame gave such a
+    /// line to the change before the one that ended or extended it, and a
+    /// thin clone (answered by the server) disagreed with a full one.
+    #[test]
+    fn bug_1893_a_last_line_without_its_newline_is_not_the_line_with_one() {
+        let ranged = |old: &str, new: &str| {
+            let (o, w) = (old.as_bytes(), new.as_bytes());
+            map_lines_ranged(o, &line_ranges(o), w, &line_ranges(w)).0
+        };
+        let isolated = |old: &str, new: &str| {
+            let (o, w) = (old.as_bytes(), new.as_bytes());
+            isolated_replacements(o, &line_ranges(o), w, &line_ranges(w))
+        };
+        // The test project's file: a newline, then a second line.
+        assert_eq!(mapped("MARK", "MARK\nsecond line\n"), vec![None, None]);
+        assert_eq!(ranged("MARK", "MARK\nsecond line\n"), vec![None, None]);
+        assert_eq!(ranged("a\nb", "a\nb\nc\n"), vec![Some(0), None, None]);
+        assert_eq!(ranged("a\nb", "a\nbc\nd\n"), vec![Some(0), None, None]);
+        // As many lines after as before: only the newline added, or the
+        // last line longer.
+        assert_eq!(mapped("a\nb", "a\nb\n"), vec![Some(0), None]);
+        assert_eq!(ranged("a\nb", "a\nb\n"), vec![Some(0), None]);
+        assert_eq!(isolated("a\nb", "a\nb\n"), Some(vec![1]));
+        assert_eq!(isolated("a\nb", "a\nbc"), Some(vec![1]));
+        assert_eq!(isolated("a", "a\n"), Some(vec![0]));
+        // The newline removed, and unchanged texts.
+        assert_eq!(ranged("a\nb\n", "a\nb"), vec![Some(0), None]);
+        assert_eq!(isolated("a\nb\n", "a\nb"), Some(vec![1]));
+        assert_eq!(ranged("a\nb", "a\nb"), vec![Some(0), Some(1)]);
+        assert_eq!(isolated("a\nb", "a\nb"), Some(vec![]));
+        for (old, new) in [("MARK", "MARK\nsecond line\n"), ("a\nb", "a\nb\n"), ("a\nb", "a\nbc"), ("a\nb\n", "a\nb"), ("a", "a\n"), ("a", "ab"), ("x\na", "a")] {
+            ranged_maps_agree(old, new);
+        }
+        // Texts of as many lines, few of them distinct, that differ at a
+        // few: where `isolated_replacements` answers, with and without a
+        // last newline. (A changed line equal to an unchanged one further
+        // on, "x\ny\nb\n" -> "b\nz\nb\n", was the other way it disagreed.)
+        ranged_maps_agree("x\ny\nb\n", "b\nz\nb\n");
+        let mut seed = 0x1893_0b5e_55ed_c0deu64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        const LINES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let (mut one, mut several) = (0, 0);
+        for case in 0..60_000u32 {
+            let k = 2 + rnd() % 5;
+            let old: Vec<&str> = (0..1 + rnd() % 14).map(|_| LINES[rnd() % k]).collect();
+            let mut new = old.clone();
+            for _ in 0..1 + rnd() % 4 {
+                let at = rnd() % new.len();
+                new[at] = LINES[rnd() % (k + 2)];
+            }
+            let (mut old, mut new) = (old.join("\n") + "\n", new.join("\n") + "\n");
+            if case.is_multiple_of(5) {
+                old.pop();
+            }
+            if case.is_multiple_of(3) {
+                new.pop();
+            }
+            match ranged_maps_agree(&old, &new) {
+                Some(1) => one += 1,
+                Some(n) if n > 1 => several += 1,
+                _ => {}
+            }
+        }
+        assert!(one > 1_000 && several > 1_000, "isolated_replacements answered: {one} times with one line, {several} with several");
+    }
+
+    /// BUG-1893's class, for the lines themselves: line ranges reused from
+    /// a parent version ([`plain_text_line_ranges_from_parent`], the
+    /// server's blame jobs) are the text's own, whether or not either text
+    /// ends with a newline, on long texts of repeated lines (it reuses
+    /// nothing below 4,096 bytes or 64 lines).
+    #[test]
+    fn bug_1893_line_ranges_reused_from_a_parent_are_the_texts_own() {
+        let mut seed = 0x1893_11e5_0f7e_47a1u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        // A first line removed (the byte before the text's start was read:
+        // a panic), and one with something put before it (taken for the
+        // parent's first line, and what was put before it for a line).
+        let rest = "a line of fifty bytes or thereabouts, to be long\n".repeat(100);
+        let parent = format!("the first line\n{rest}");
+        let own = |data: &str| assert_eq!(plain_text_line_ranges_from_parent(data.as_bytes(), parent.as_bytes(), &line_ranges(parent.as_bytes())), Some(line_ranges(data.as_bytes())), "{:?}…", &data[..30]);
+        own(&rest);
+        own(&format!("// {parent}"));
+        own(&format!("first\n{parent}"));
+        own(&format!("{parent}last"));
+        own(parent.trim_end());
+        let mut reused = 0;
+        for case in 0..3_000u32 {
+            let k = 2 + rnd() % 30;
+            let line = |r: usize| format!("{}\n", "line of some length ".repeat(1 + r % k % 4) + &(r % k).to_string());
+            let mut lines: Vec<String> = (0..64 + rnd() % 200).map(|_| line(rnd())).collect();
+            let mut parent = lines.concat();
+            if case.is_multiple_of(3) {
+                parent.pop();
+            }
+            for _ in 0..rnd() % 4 {
+                let at = rnd() % lines.len();
+                match rnd() % 4 {
+                    0 => lines.insert(at, line(rnd())),
+                    1 => drop(lines.remove(at)),
+                    2 => lines[at] = line(rnd()),
+                    _ => {
+                        let within = rnd() % lines[at].len();
+                        lines[at].insert(within, 'x');
+                    }
+                }
+            }
+            let mut data = lines.concat();
+            match case % 7 {
+                0 => drop(data.pop()),
+                1 => data.push_str("more"),
+                2 => data.truncate(rnd() % (data.len() + 1)),
+                3 => data = format!("{parent}\n"),
+                4 => data = format!("{parent}{}", &line(rnd())[..3]),
+                _ => {}
+            }
+            let got = plain_text_line_ranges_from_parent(data.as_bytes(), parent.as_bytes(), &line_ranges(parent.as_bytes()));
+            assert_eq!(got, Some(line_ranges(data.as_bytes())), "case {case}");
+            assert_eq!(got, plain_text_line_ranges(data.as_bytes()), "case {case}");
+            reused += usize::from(data.len() >= 4096);
+        }
+        assert!(reused > 2_000, "{reused} texts long enough to reuse a parent's lines");
+    }
+
     /// S14 cycle 2 (review): `map_lines` with its trimmed ends answers
     /// exactly what it answered before the trim (the diff of the whole
     /// texts within the work limit, the shared ends past it), on
@@ -1393,6 +1582,7 @@ mod tests {
             }
             let n = line_ranges(new.as_bytes()).len();
             assert_eq!(map_lines(old.as_bytes(), new.as_bytes(), n), reference(old.as_bytes(), new.as_bytes(), n), "{old:?} -> {new:?}");
+            ranged_maps_agree(&old, &new);
             cases += 1;
         }
         // Around the work limit: shared ends of repeated edge lines (which
@@ -1412,6 +1602,8 @@ mod tests {
                 let want = reference(old.as_bytes(), new.as_bytes(), n);
                 assert_eq!(got.1, want.1, "coarse decision, {len} lines in the middle, {ends} at each end");
                 assert!(got == want, "mapping, {len} lines in the middle, {ends} at each end");
+                let (ol, nl) = (line_ranges(old.as_bytes()), line_ranges(new.as_bytes()));
+                assert!(map_lines_ranged(old.as_bytes(), &ol, new.as_bytes(), &nl) == want, "ranged mapping, {len} lines in the middle, {ends} at each end");
                 if got.1 {
                     coarse += 1;
                 } else {
