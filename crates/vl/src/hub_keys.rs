@@ -470,6 +470,7 @@ fn may_grant(how: &How, ever: bool) -> bool {
 /// revoke every member whose name is not a target and cancel their
 /// invites. `only`: touch these people only. Returns `None` when this
 /// device is not the ring's admin.
+#[allow(clippy::too_many_arguments)]
 fn admin_sync(
     ctx: &mut Ctx,
     client: &Client,

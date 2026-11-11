@@ -321,7 +321,7 @@ pub fn leave_gates() {
     });
 }
 
-/// Carry every request task-local ([`RequestLocals`]) into a spawned task
+/// Carry every request task-local (`RequestLocals`) into a spawned task
 /// that finishes the request's own work (`sync::push_with`, BUG-1668,
 /// BUG-1863).
 pub fn in_request<F: std::future::Future>(hub: &crate::Hub, f: F) -> impl std::future::Future<Output = F::Output> {
