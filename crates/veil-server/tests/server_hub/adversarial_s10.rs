@@ -305,6 +305,34 @@ fn bug_1055_a_renamed_secret_that_vl_keeps_sealed_is_accepted() {
     assert!(out.status.success(), "the push of vl's own renamed secret was refused: {text}");
 }
 
+/// BUG-1055's class by another route (review `rv-core`): the secret is
+/// made and renamed within one change. `vl` records the working copy
+/// between the two (`vl status`), keeps the renamed file sealed against
+/// that recording (`builder.rs` `protect_moves`), and the committed change
+/// then adds a sealed file at an ordinary path on a parent that never held
+/// the secret: nothing in the pushed history shows where it came from.
+/// The server must take what `vl` itself writes, or `vl` must not write it.
+#[test]
+#[ignore = "BUG-1833: a secret made and renamed within one change is committed sealed, and no push of it is ever accepted"]
+fn bug_1833_a_secret_made_and_renamed_within_one_change_is_accepted() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    write_files(&p.dir, &[(&format!("{BILL_DIR}/.env.staging"), "REGION=review-marker-made-and-renamed-0001\n")]);
+    // Any command records the working copy: the secret is in the change, sealed.
+    p.admin.ok(&p.dir, &["status"]);
+    std::fs::rename(p.dir.join(format!("{BILL_DIR}/.env.staging")), p.dir.join("settings-staging.txt")).unwrap();
+    p.admin.commit_main(&p.dir, "staging settings");
+    // Control: the member's own vl keeps it sealed at the new path.
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
+    let tree = repo.snapshot(&repo.view().tags["main"].target).unwrap().tree;
+    let e = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new("settings-staging.txt").unwrap()).unwrap().expect("recorded");
+    assert!(!e.visibility.is_public(), "control: vl keeps the renamed secret sealed");
+    drop(repo);
+    let out = p.admin.run(&p.dir, &["push"]);
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "the push of what vl itself recorded was refused: {text}");
+}
+
 /// A stack over a hidden change (BUG-1054's fix makes the caller's own
 /// changes again on the real tip) fails with 400 "missing object" when a
 /// change of the stack holds a folder its maker sees whole: `restack`
