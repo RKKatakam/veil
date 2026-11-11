@@ -2,11 +2,74 @@
 
 # Veil (`vl`)
 
-**Server-centric version control for teams and AI agents at scale.** The
-`vl` client is always connected to the Veil server (the Hub), which stores
-every project and decides who can see what. Veil is not Git and not
-offline-first. Start with [what Veil is](docs/OVERVIEW.md) and
-[who can see what](docs/VISIBILITY.md).
+**Version control built for AI agents.** Git assumes a few people who each
+hold the whole history and take turns pushing. Veil assumes thousands of
+agents working at once: each in its own sandbox, each seeing only the
+folders it was given, all landing into one `main` without ever pulling,
+rebasing or retrying. A server (the Hub) stores the code, decides who sees
+what, and does the merging.
+
+Veil is not Git, and doesn't interoperate with it. It's written in Rust.
+
+## Why it's built for agents
+
+| What goes wrong with Git | What Veil does |
+|---|---|
+| An agent forgets `git add`, or ends up on a detached HEAD | **No staging and no index.** Every `vl` command records the working copy first. Work can't be lost by forgetting a step. |
+| A conflict stops a rebase halfway, with markers in the tree | **A merge or rebase always finishes.** The conflict is stored as data in the change, to resolve later, by that agent or another. |
+| Twenty agents need twenty clones or worktrees | **Workspaces.** `vl ws exec NAME --mount -- cmd` gives a command its own copy of the project in milliseconds, whatever the project's size; files load when read. |
+| An agent runs on your machine with your SSH keys in reach | **Sandboxes** (bubblewrap, on Linux): its own files, home folder, processes and ports; limits on memory, CPU and time. A secret's value copied into another file is refused, not recorded. |
+| Every push to `main` races every other; losers pull, rebase and try again | **`vl land`.** The server lands changes on the newest `main` in batches, so nobody retries. Only a real conflict comes back, to the agent that caused it. |
+| A broken `main` blocks everyone until a person bisects it | **Land first, test after.** `main@tested` is the newest `main` that passed its checks, and agents start from it. The server bisects a failure and reverts the culprit; a change reverted twice needs a person. |
+| Anyone who can clone sees everything | **Folder permissions, enforced by the server,** in every answer: files, log, blame, search, diffs, PRs, CI. An agent's session can be narrowed to the folders its task needs. |
+| A failed approach is thrown away, and the next agent tries it again | **Recorded dead ends.** `vl attempt drop --reason "…"` keeps the failed version and why, on the change, for the next agent or reviewer. |
+| "Who wrote this?" is a name anyone can type | **Signed attribution.** Each change records the agent, task and run that made it, under its person's signature. `vl log --agent 'claude-*'` filters by it. |
+| `git reflog` archaeology after a bad step | **`vl undo`** takes back any command exactly, and `vl redo` brings it back. |
+
+An agent's whole loop:
+
+```sh
+vl ws new fix-login                 # starts from main@tested, the last main that passed its checks
+vl ws exec fix-login --mount --private-ports --memory 4G \
+   --agent "claude-code" --task "TASK-812" -- my-agent "fix the login bug"
+vl attempt drop fix-login@ --reason "locking order deadlocks"   # a dead end, kept with its reason
+vl land fix-login@                  # the server puts it on main: no pull, no retry
+```
+
+Also built in: pull requests with risk-based approval rules, embargoes for
+security fixes (hidden until a deadline), secrets encrypted automatically
+(`.env`, keys), thin clones, a web client with passkey sign-in, and history,
+blame and search answered by the server in milliseconds.
+
+## Measured
+
+On one 32-core machine that was also running other work, with PostgreSQL
+and S3-compatible storage beside it ([landings](docs/design/scale/LOAD.md),
+[Git comparison](docs/design/scale/OPENSCION.md)):
+
+| | Veil | For comparison |
+|---|---|---|
+| Landings a second into one `main`, 1,000 agents | **993** (p99 327 ms) | 20 to 30 with pull, rebase, push and retry (Veil's own push model before the landing service) |
+| The same, 10,000 agents | **943** (p99 about 1 s) | |
+| Import a 10,000-file folder | **300 to 386 ms** | Git: 928 to 1,132 ms |
+| Clone 10,000 files through the server | **443 to 533 ms** | Git: 595 to 788 ms |
+| Commit one changed file among 10,000 | 22 to 37 ms | **Git: 9 to 10 ms.** Git doesn't force the commit to disk here; Veil does. |
+
+## Where it stands
+
+Veil is pre-release. Every milestone of the server plan is built, and the
+whole suite is green: about 800 server tests, each run on PostgreSQL and on
+YugabyteDB, and about 2,300 client and engine tests. A review of the whole
+code base this week found about 75 bugs; every one is in
+[docs/BUGS.md](docs/BUGS.md) with the test that reproduces it, and all but a
+handful are fixed.
+
+Not proven yet: scale across several machines (the numbers above are from
+one), and the sandbox on macOS, where commands run unconfined for now. By
+design there is no offline mode: `vl` commits, splits, squashes and undoes
+locally, and everything shared goes through the server.
+
+## Who can see what
 
 | | Veil |
 |---|---|
@@ -17,12 +80,8 @@ offline-first. Start with [what Veil is](docs/OVERVIEW.md) and
 | Agents | **Virtual workspaces** and in-memory sandboxes; an agent sees what its person sees, with the same secrets |
 | Scale | The Scion design: lock-free commits, an atomic branch move, fetch on demand, server-side merges, history and search, batched landings |
 
-**Today:** the client engine and the server's first milestone (S1: sign-in,
-groups, folder access, `public`, encrypted secrets, push, pull and clone
-through the server) are built ([OVERVIEW.md](docs/OVERVIEW.md), "What exists
-today, and what's next"). `vl` syncs only through the Veil server, and only
-secret files are ever encrypted: folders are restricted by the server's
-access rules (`vl access`).
+Start with [what Veil is](docs/OVERVIEW.md) and
+[who can see what](docs/VISIBILITY.md).
 
 ## Documentation
 
@@ -481,13 +540,12 @@ drop(ws);                                       // vanishes; the snapshot remain
 
 ## Status
 
-The client engine, the CLI and the server's milestone S1 work end-to-end
-and are covered by tests (`cargo test`; `scripts/verify-server.sh` for the
-server). The simplification pass is under way: plain-file remotes are gone,
-and only secret files are encrypted ([OVERVIEW.md](docs/OVERVIEW.md)). See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#limitations-and-roadmap) for
-known limitations. The engine also builds for WebAssembly
-([docs/guide/embedding.md](docs/guide/embedding.md)).
+See [Where it stands](#where-it-stands) at the top. Known limits are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#limitations-and-roadmap), and
+every known bug, open or fixed, is in [docs/BUGS.md](docs/BUGS.md). The
+checks are `cargo test` for the client and engine and
+`scripts/verify-server.sh` for the server. The engine also builds for
+WebAssembly ([docs/guide/embedding.md](docs/guide/embedding.md)).
 
 ## Credits
 
