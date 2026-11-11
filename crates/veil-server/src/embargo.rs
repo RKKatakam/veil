@@ -602,6 +602,24 @@ pub async fn release_one(
     pushed_record: Option<EmbargoRecord>,
     agent_viewer: Option<&Viewer>,
 ) -> Result<bool> {
+    loop {
+        match release_one_once(hub, project_id, embargo_id, pushed_record.clone(), agent_viewer).await {
+            Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn release_one_once(
+    hub: &Arc<Hub>,
+    project_id: i64,
+    embargo_id: &str,
+    pushed_record: Option<EmbargoRecord>,
+    agent_viewer: Option<&Viewer>,
+) -> Result<bool> {
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project_id).await?;
     let row: Option<(String, String, Option<i64>, String, String)> = sqlx::query_as(
         "SELECT target_branch, embargo_branch, released_at, record_json, created_by \
          FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
@@ -707,22 +725,49 @@ pub async fn release_one(
                     lineage: judged.lineage,
                     skipped: Arc::new(std::sync::Mutex::new(judged.skipped)),
                 };
-                sqlx::query(
-                    "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, \
-                     project_epoch, state, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued', \
-                     (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT) ON CONFLICT (ticket) DO NOTHING",
-                )
-                .bind(project_id)
-                .bind(&q.branch)
-                .bind(&q.ticket)
-                .bind(who.person.id)
-                .bind(&who.person.name)
-                .bind(&who.person.device_key)
-                .bind(crate::landing::encode_stack(&q.stack))
-                .bind(q.lineage)
-                .bind(who.epochs.person)
-                .bind(who.epochs.project.map_or(0, |(_, e)| e))
-                .execute(&hub.db)
+                let encoded_stack = crate::landing::encode_stack(&q.stack);
+                let (q_branch, q_ticket, p_name, d_key) = (
+                    q.branch.clone(),
+                    q.ticket.clone(),
+                    who.person.name.clone(),
+                    who.person.device_key.clone(),
+                );
+                let (p_id, q_lin, p_ep, j_ep) = (
+                    who.person.id,
+                    q.lineage,
+                    who.epochs.person,
+                    who.epochs.project.map_or(0, |(_, e)| e),
+                );
+                crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+                    let (q_branch, q_ticket, p_name, d_key, encoded_stack) = (
+                        q_branch.clone(),
+                        q_ticket.clone(),
+                        p_name.clone(),
+                        d_key.clone(),
+                        encoded_stack.clone(),
+                    );
+                    Box::pin(async move {
+                        crate::pack_gc::guard_root_write(&mut *c, project_id, gc_epoch).await?;
+                        sqlx::query(
+                            "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, \
+                             project_epoch, state, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued', \
+                             (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT) ON CONFLICT (ticket) DO NOTHING",
+                        )
+                        .bind(project_id)
+                        .bind(&q_branch)
+                        .bind(&q_ticket)
+                        .bind(p_id)
+                        .bind(&p_name)
+                        .bind(&d_key)
+                        .bind(&encoded_stack)
+                        .bind(q_lin)
+                        .bind(p_ep)
+                        .bind(j_ep)
+                        .execute(&mut *c)
+                        .await?;
+                        Ok(())
+                    })
+                })
                 .await?;
             }
         }
@@ -751,6 +796,7 @@ pub async fn release_one(
 
     // Finalize the release in one transaction: set `released_at`, update `record_json`,
     // delete `embargo/<id>` from `branches`, and delete its `embargo_snapshots`.
+    let gc_epoch2 = crate::pack_gc::read_gc_epoch(hub, project_id).await?;
     let now_ms: i64 = sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
         .fetch_one(&hub.db)
         .await?;
@@ -771,6 +817,7 @@ pub async fn release_one(
         let ebranch2 = ebranch2.clone();
         let new_json = new_json.clone();
         Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, project_id, gc_epoch2).await?;
             let n = sqlx::query(
                 "UPDATE embargo_lines SET released_at = COALESCE(released_at, $1), record_json = $2 \
                  WHERE project_id = $3 AND embargo_id = $4 AND released_at IS NULL",

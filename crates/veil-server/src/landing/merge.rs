@@ -448,8 +448,17 @@ pub fn spawn(hub: &Arc<Hub>, job: Job) {
     let hub = hub.clone();
     tokio::spawn(async move {
         let _permit = hub.landing.merges.sem.clone().acquire_owned().await.ok();
-        if let Err(e) = run_worker(&hub, job).await {
-            eprintln!("veil-server: merge worker failed: {e:?}");
+        loop {
+            match run_worker(&hub, job.clone()).await {
+                Ok(()) => break,
+                Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => {
+                    eprintln!("veil-server: merge worker failed: {e:?}");
+                    break;
+                }
+            }
         }
     });
 }
@@ -471,6 +480,7 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
     // 1. Re-open the project, viewer and submitting agent session as the
     //    submitter is *now* (current access epochs), so revoked access or an
     //    expired/revoked agent session is caught before any merge lands.
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, job.project).await?;
     let session_gone = if let Some(sh) = &job.agent_session {
         match crate::auth::load_agent_session(&hub.db, sh, job.person.id, job.project).await? {
             Some(grant) => {
@@ -483,7 +493,7 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
         false
     };
     let epochs_rows: Vec<(i64, i64, i64)> = sqlx::query_as(
-        "SELECT project_id, person_id, epoch FROM access_epochs WHERE (project_id = 0 AND person_id = $1) OR (project_id = $2 AND person_id IN (0, -1))",
+        "SELECT project_id, person_id, epoch FROM access_epochs WHERE (project_id = 0 AND person_id = $1) OR (project_id = $2 AND person_id = 0)",
     )
     .bind(job.person.id)
     .bind(job.project)
@@ -491,8 +501,6 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
     .await?;
     let person_epoch = epochs_rows.iter().find(|e| e.0 == 0 && e.1 == job.person.id).map_or(0, |e| e.2);
     let project_epoch = epochs_rows.iter().find(|e| e.0 == job.project && e.1 == 0).map_or(0, |e| e.2);
-    let gc_epoch = epochs_rows.iter().find(|e| e.0 == job.project && e.1 == -1).map_or(0, |e| e.2);
-    hub.observe_gc_epoch(job.project, gc_epoch);
     let caller = Caller {
         person: Some(job.person.clone()),
         epochs: Epochs {
@@ -579,6 +587,7 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
                         agent_session.clone(),
                     );
                     Box::pin(async move {
+                        crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                         if let Some(sh) = &agent_session {
                             if crate::auth::load_agent_session(&mut *c, sh, person_id, pid).await?.is_none() {
                                 return Ok(Err("this agent session has expired or been revoked: sign in again".to_string()));
@@ -652,13 +661,13 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
                     res.change_id = change_id;
                     res.message = Some(why);
                     res.merges = job.merges;
-                    finish_terminal(hub, &job, "rejected", "land.rejected", res).await?;
+                    finish_terminal(hub, &job, gc_epoch, "rejected", "land.rejected", res).await?;
                 }
             }
         }
         WorkerOutcome::Conflict(report) => {
             let res = report.into_result(&job.ticket, &job.branch);
-            finish_terminal(hub, &job, "conflict", "land.conflict", res).await?;
+            finish_terminal(hub, &job, gc_epoch, "conflict", "land.conflict", res).await?;
         }
         WorkerOutcome::Rejected(why, cid) => {
             let mut res = super::queued(&job.ticket);
@@ -666,7 +675,7 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
             res.change_id = cid;
             res.message = Some(why);
             res.merges = job.merges;
-            finish_terminal(hub, &job, "rejected", "land.rejected", res).await?;
+            finish_terminal(hub, &job, gc_epoch, "rejected", "land.rejected", res).await?;
         }
     }
     Ok(())
@@ -675,24 +684,36 @@ async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
 async fn finish_terminal(
     hub: &Arc<Hub>,
     job: &Job,
+    gc_epoch: i64,
     state_str: &str,
     event_name: &str,
     res: LandResult,
 ) -> Result<()> {
     let text = serde_json::to_string(&res).unwrap_or_default();
-    let n = sqlx::query(
-        "UPDATE landing_queue SET state = $4, result = $5, done_at = $6 \
-         WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging'",
-    )
-    .bind(job.project)
-    .bind(&job.branch)
-    .bind(job.seq)
-    .bind(state_str)
-    .bind(&text)
-    .bind(veil_core::now_millis())
-    .execute(&hub.db)
-    .await?
-    .rows_affected();
+    let pid = job.project;
+    let branch = job.branch.clone();
+    let seq = job.seq;
+    let state_owned = state_str.to_string();
+    let n = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+        let (branch, state_owned, text) = (branch.clone(), state_owned.clone(), text.clone());
+        Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
+            Ok(sqlx::query(
+                "UPDATE landing_queue SET state = $4, result = $5, done_at = $6 \
+                 WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging'",
+            )
+            .bind(pid)
+            .bind(&branch)
+            .bind(seq)
+            .bind(&state_owned)
+            .bind(&text)
+            .bind(veil_core::now_millis())
+            .execute(&mut *c)
+            .await?
+            .rows_affected())
+        })
+    })
+    .await?;
     if n == 1 {
         match res.state {
             LandState::Conflict => {

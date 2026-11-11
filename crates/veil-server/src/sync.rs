@@ -2338,6 +2338,7 @@ async fn push_staged(
     if req.force && viewer.agent {
         return Err(agent_refusal("an agent session never forces a branch move"));
     }
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     if req.updates.len() > MAX_PUSH_UPDATES {
         return Err(Error::bad_request(format!("at most {MAX_PUSH_UPDATES} branch updates per push")));
     }
@@ -2927,6 +2928,7 @@ async fn push_staged(
         let embargo_snaps = embargo_snaps2.clone();
         let packs = packs.clone();
         Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             for q in &queued {
                 crate::landing::insert(&mut *c, pid, &who, q).await?;
             }

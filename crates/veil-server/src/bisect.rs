@@ -106,6 +106,7 @@ struct BisectRow {
     revert_ticket: Option<String>,
     revert_snapshot: Option<ObjectId>,
     updated_at: i64,
+    gc_epoch: i64,
 }
 
 /// Public response for `GET /v1/projects/{p}/bisect/{branch}`, projected and
@@ -168,6 +169,7 @@ async fn release_lease(hub: &Hub, project_id: i64, branch: &str, holder: &str, e
 /// Load the current `bisects` row for `(project_id, branch)`.
 async fn load_bisect(hub: &Hub, project_id: i64, branch: &str) -> Result<Option<BisectRow>> {
     use sqlx::Row;
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project_id).await?;
     let row = sqlx::query(
         "SELECT project_id, branch, lineage, check_name, good, bad, candidates, lo, hi, phase, probes, \
          culprit, culprit_parent, culprit_fails, parent_passes, confirm_requested_at, session_paths, \
@@ -226,6 +228,7 @@ async fn load_bisect(hub: &Hub, project_id: i64, branch: &str) -> Result<Option<
         revert_ticket: r.get("revert_ticket"),
         revert_snapshot: revert_snapshot_opt.as_deref().map(parse_id).transpose()?,
         updated_at: r.get("updated_at"),
+        gc_epoch,
     }))
 }
 
@@ -238,6 +241,7 @@ async fn save_bisect(hub: &Hub, b: &BisectRow, holder: &str, epoch: i64) -> Resu
     let paths_json = serde_json::to_string(&b.session_paths).map_err(|e| Error::Other(e.into()))?;
     let now = veil_core::now_millis();
     let pid = b.project_id;
+    let gc_epoch = b.gc_epoch;
     let branch = b.branch.clone();
     let lineage = b.lineage;
     let check_name = b.check_name.clone();
@@ -287,6 +291,7 @@ async fn save_bisect(hub: &Hub, b: &BisectRow, holder: &str, epoch: i64) -> Resu
             holder.clone(),
         );
         Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             let held = sqlx::query(&format!(
                 "UPDATE bisect_leases SET expires_at = {DB_NOW} + $5 \
                  WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4"
@@ -488,23 +493,30 @@ async fn step_branch(
     let Some((holder, epoch)) = acquire_lease(hub, project.id, branch).await? else {
         return Ok(());
     };
-    let res = step_branch_leased(
-        hub,
-        project,
-        rules,
-        branch,
-        branch_tip,
-        lineage,
-        reported_snap,
-        check_name,
-        state,
-        session_paths,
-        admin_only,
-        recorded_at,
-        &holder,
-        epoch,
-    )
-    .await;
+    let mut res = Ok(());
+    for _ in 0..8 {
+        res = step_branch_leased(
+            hub,
+            project,
+            rules,
+            branch,
+            branch_tip,
+            lineage,
+            reported_snap,
+            check_name,
+            state,
+            session_paths,
+            admin_only,
+            recorded_at,
+            &holder,
+            epoch,
+        )
+        .await;
+        match &res {
+            Err(e) if crate::pack_gc::is_gc_epoch_changed(e) => continue,
+            _ => break,
+        }
+    }
     release_lease(hub, project.id, branch, &holder, epoch).await;
     res
 }
@@ -610,6 +622,7 @@ async fn step_branch_leased(
 
     // Walk `branch_tip` down to `tested_snap` along first parents and verify `reported_snap`
     // is on the branch's first-parent line above `tested_snap`.
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     let check_paths = rules.checks.get(check_name).cloned().unwrap_or_default();
     let sess_paths = session_paths.to_vec();
     let tip = branch_tip;
@@ -668,6 +681,7 @@ async fn step_branch_leased(
         revert_ticket: None,
         revert_snapshot: None,
         updated_at: veil_core::now_millis(),
+        gc_epoch,
     };
     b.hi = b.candidates.len() - 1;
 
@@ -1252,6 +1266,7 @@ async fn revert_confirmed_culprit(
     let ticket2 = ticket.clone();
     let p_epoch = epochs.person;
     let j_epoch = epochs.project.map_or(0, |(_, e)| e);
+    let gc_epoch = b.gc_epoch;
 
     crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let (branch_name, culprit_hex, check_name, rev_hex, ticket2, admin_name, admin_device_key, stack_json) = (
@@ -1265,6 +1280,7 @@ async fn revert_confirmed_culprit(
             stack_json.clone(),
         );
         Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             sqlx::query(
                 "INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
             )
@@ -1360,20 +1376,48 @@ async fn apply_revert_outcome(
             let landed_snap = outcome.landed.first().copied();
             b.phase = "reverted".to_string();
             b.revert_snapshot = landed_snap;
-            save_bisect(hub, b, holder, epoch).await?;
-            let landed_hex = landed_snap.map(|x| x.hex());
-            let notified = sqlx::query(
-                "UPDATE bisect_reverts SET state = 'reverted', revert_snapshot = $5 \
-                 WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND culprit = $4 AND state <> 'reverted'",
-            )
-            .bind(project_id)
-            .bind(&b.branch)
-            .bind(b.lineage)
-            .bind(culprit.hex())
-            .bind(&landed_hex)
-            .execute(&hub.db)
-            .await?
-            .rows_affected();
+            let mut notified = 0u64;
+            for attempt in 0..8 {
+                b.gc_epoch = crate::pack_gc::read_gc_epoch(hub, project_id).await?;
+                match save_bisect(hub, b, holder, epoch).await {
+                    Ok(_) => {}
+                    Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) && attempt < 7 => continue,
+                    Err(e) => return Err(e),
+                }
+                let gc_epoch = b.gc_epoch;
+                let branch_name = b.branch.clone();
+                let lineage = b.lineage;
+                let culprit_hex = culprit.hex();
+                let landed_hex = landed_snap.map(|x| x.hex());
+                let res = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+                    let (branch_name, culprit_hex, landed_hex) =
+                        (branch_name.clone(), culprit_hex.clone(), landed_hex.clone());
+                    Box::pin(async move {
+                        crate::pack_gc::guard_root_write(&mut *c, project_id, gc_epoch).await?;
+                        Ok(sqlx::query(
+                            "UPDATE bisect_reverts SET state = 'reverted', revert_snapshot = $5 \
+                             WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND culprit = $4 AND state <> 'reverted'",
+                        )
+                        .bind(project_id)
+                        .bind(&branch_name)
+                        .bind(lineage)
+                        .bind(&culprit_hex)
+                        .bind(&landed_hex)
+                        .execute(&mut *c)
+                        .await?
+                        .rows_affected())
+                    })
+                })
+                .await;
+                match res {
+                    Ok(n) => {
+                        notified = n;
+                        break;
+                    }
+                    Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) && attempt < 7 => continue,
+                    Err(e) => return Err(e),
+                }
+            }
             if notified == 1 {
                 if let Some(rev_real) = landed_snap {
                     crate::events::emit_reverted(
@@ -1393,7 +1437,14 @@ async fn apply_revert_outcome(
         }
         LandState::Conflict | LandState::Rejected => {
             b.phase = "conflict".to_string();
-            save_bisect(hub, b, holder, epoch).await?;
+            for attempt in 0..8 {
+                b.gc_epoch = crate::pack_gc::read_gc_epoch(hub, project_id).await?;
+                match save_bisect(hub, b, holder, epoch).await {
+                    Ok(_) => break,
+                    Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) && attempt < 7 => continue,
+                    Err(e) => return Err(e),
+                }
+            }
             sqlx::query(
                 "UPDATE bisect_reverts SET state = 'conflict' \
                  WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND culprit = $4",

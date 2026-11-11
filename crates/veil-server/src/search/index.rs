@@ -218,6 +218,7 @@ pub(crate) struct PreparedWrite {
     pub rows: Vec<(String, String, i64, i64, i64, i64)>,
     pub removed: Vec<String>,
     pub walk: Option<(String, String)>,
+    pub gc_epoch: i64,
 }
 
 impl PreparedWrite {
@@ -232,6 +233,7 @@ impl PreparedWrite {
         shards: &BTreeMap<String, Shard>,
         removed: Vec<String>,
         walk: Option<(&str, &str)>,
+        gc_epoch: i64,
     ) -> Self {
         let rows = shards
             .iter()
@@ -247,8 +249,41 @@ impl PreparedWrite {
             rows,
             removed,
             walk: walk.map(|(b, s)| (b.to_string(), s.to_string())),
+            gc_epoch,
         }
     }
+}
+
+fn read_gc_epoch_cx(cx: &Cx, pool: &PgPool) -> Result<i64> {
+    let project = cx.project();
+    let epoch: i64 = cx.db(|| async {
+        let cur: Option<i64> = sqlx::query_scalar(
+            "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1",
+        )
+        .bind(project)
+        .fetch_optional(pool)
+        .await?;
+        match cur {
+            Some(e) => Ok(e),
+            None => {
+                sqlx::query(
+                    "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) \
+                     VALUES ($1, -1, 0, 0) ON CONFLICT (project_id, person_id) DO NOTHING",
+                )
+                .bind(project)
+                .execute(pool)
+                .await?;
+                sqlx::query_scalar(
+                    "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1",
+                )
+                .bind(project)
+                .fetch_one(pool)
+                .await
+            }
+        }
+    })?;
+    cx.hub().observe_gc_epoch(project, epoch);
+    Ok(epoch)
 }
 
 pub(crate) async fn apply_write(
@@ -256,6 +291,15 @@ pub(crate) async fn apply_write(
     project: i64,
     w: &PreparedWrite,
 ) -> std::result::Result<bool, sqlx::Error> {
+    let cur_gc_epoch: Option<i64> = sqlx::query_scalar(
+        "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR SHARE",
+    )
+    .bind(project)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if cur_gc_epoch != Some(w.gc_epoch) {
+        return Ok(false);
+    }
     let moved = match w.expect {
         Some(v) => sqlx::query(
             "UPDATE search_heads SET snapshot = $4, lines = $5, version = version + 1 \
@@ -770,6 +814,7 @@ fn prepare_code(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId, 
     }
     let ident = identity(lines);
     let all: BTreeSet<String> = lines.all().into_iter().collect();
+    let gc_epoch = read_gc_epoch_cx(cx, pool)?;
     let (head, old) = read_state(cx, pool, CODE, branch, None)?;
     if head.as_ref().is_some_and(|h| h.snapshot == tip.hex() && h.lines == ident) {
         return Ok(None);
@@ -878,6 +923,7 @@ fn prepare_code(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId, 
         &write,
         removed,
         None,
+        gc_epoch,
     )))
 }
 
@@ -983,6 +1029,7 @@ fn prepare_names(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId,
     }
     let ident = identity(lines);
     let all: BTreeSet<String> = lines.all().into_iter().collect();
+    let gc_epoch = read_gc_epoch_cx(cx, pool)?;
     let (head, old) = read_state(cx, pool, NAMES, "", None)?;
     let walked = read_head(cx, pool, WALK, branch)?;
     if head.as_ref().is_some_and(|h| h.lines == ident) && walked.as_ref().is_some_and(|w| w.snapshot == tip.hex()) {
@@ -1083,6 +1130,7 @@ fn prepare_names(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId,
         &write,
         removed,
         Some((branch, &tip_hex)),
+        gc_epoch,
     )))
 }
 

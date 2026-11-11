@@ -586,6 +586,7 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
     let title = check_title(&q.title)?;
     let body = q.body.unwrap_or_default();
     check_text("the body", &body, MAX_TEXT)?;
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let onto = q.onto.unwrap_or_else(|| ask.project.default_branch.clone());
     let deadline = Instant::now() + DEADLINE;
     // The target is a branch, named as the caller names it.
@@ -611,6 +612,7 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
         let fresh = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
             let (r, key, lines, title, body, onto, id) = (r.clone(), key.clone(), lines.clone(), title.clone(), body.clone(), onto.clone(), id2.clone());
             Box::pin(async move {
+                crate::pack_gc::guard_root_write(&mut *c, project, gc_epoch).await?;
                 let class = class::put_class(&mut *c, project, &key, &lines).await?;
                 let inserted = sqlx::query(
                     "INSERT INTO prs (project_id, id, class_id, policy_key, target, author, title, body, state, revision, created_at, updated_at) \
@@ -856,6 +858,7 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     if pr.revision >= MAX_REVISIONS {
         return Err(Error::bad_request(format!("a PR has at most {MAX_REVISIONS} revisions; open a new one")));
     }
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let deadline = Instant::now() + DEADLINE;
     let (_, head) = query::resolve_real(hub, ask, &q.head, deadline).await?;
     // The target as the caller sees it (never a withheld one), then its tip.
@@ -910,6 +913,7 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     let ok = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
         let (key, lines, prid, r, moved) = (key.clone(), lines.clone(), prid.clone(), r.clone(), moved.clone());
         Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, project, gc_epoch).await?;
             let class = class::put_class(&mut *c, project, &key, &lines).await?;
             // The compare-and-swap: two new revisions at once, one wins.
             let moved_on = sqlx::query(
@@ -1564,6 +1568,7 @@ pub async fn check_landing_review(
 pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Result<Value> {
     let me = participant(ask, caller)?;
     let person = signed_in(caller)?.clone();
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let pr = visible(hub, ask, id).await?;
     let paths = review::paths_of(hub, ask.project.id, &pr.id).await?;
     if pr.author != me && !review::writes_all(&ask.project, &ask.viewer, &paths) {
@@ -1613,7 +1618,10 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
     let who2 = who.clone();
     let r = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
         let (q, who) = (q2.clone(), who2.clone());
-        Box::pin(async move { crate::landing::insert(&mut *c, pid, &who, &q).await })
+        Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
+            crate::landing::insert(&mut *c, pid, &who, &q).await
+        })
     })
     .await;
     if let Err(e) = r {

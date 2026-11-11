@@ -387,6 +387,7 @@ impl Service {
     async fn run(&self, wake: Arc<Notify>) -> Result<()> {
         let mut state = self.load().await?;
         let mut known = Known::default();
+        let mut last_gc_epoch: Option<i64> = None;
         let mut inflight: Option<InFlight> = None;
         let mut idle = Instant::now();
         let mut renewed = Instant::now();
@@ -427,6 +428,10 @@ impl Service {
                 continue;
             }
             idle = Instant::now();
+            let gc_epoch = crate::pack_gc::read_gc_epoch(&self.hub, self.project).await?;
+            if last_gc_epoch.replace(gc_epoch) != Some(gc_epoch) {
+                known = Known::default();
+            }
             // The batch being committed holds its objects; a committed one's
             // are stored (BUG-1107).
             let on = inflight.as_ref().map(|f| f.after.clone()).unwrap_or_else(|| State { made_bytes: 0, ..state.clone() });
@@ -467,7 +472,7 @@ impl Service {
             let s = Arc::new(self.clone_handle());
             let task = tokio::spawn(async move {
                 store.await.map_err(|e| Error::Other(e.into()))??;
-                s.commit(built).await
+                s.commit(built, gc_epoch).await
             });
             inflight = Some(InFlight { task, seqs, alone, after });
         }
@@ -526,7 +531,9 @@ impl Service {
             Err(e) => {
                 // Nothing of it committed (the transaction rolled back): the
                 // entries are still queued, built again from the database.
-                eprintln!("veil-server: a landing batch of project {} failed: {e:?}", self.project);
+                if !crate::pack_gc::is_gc_epoch_changed(&e) {
+                    eprintln!("veil-server: a landing batch of project {} failed: {e:?}", self.project);
+                }
                 *state = self.load().await?;
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 Ok(true)
@@ -825,7 +832,7 @@ impl Service {
 
     /// Commit the batch (its objects stored already) in one transaction;
     /// then tell the waiters here, spawn merge workers, and emit events.
-    async fn commit(&self, b: Built) -> Result<Committed> {
+    async fn commit(&self, b: Built, gc_epoch: i64) -> Result<Committed> {
         let t = Instant::now();
         let hub = &self.hub;
         let moved = b.after.tip != b.old_tip;
@@ -937,6 +944,7 @@ impl Service {
                 tx_results.clone(),
             );
             Box::pin(async move {
+                crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 // Fencing: only the lease's current holder moves the branch.
                 let held = sqlx::query(&format!(
                     "UPDATE landing_leases SET expires_at = {DB_NOW} + $5 WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4"

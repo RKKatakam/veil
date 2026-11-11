@@ -574,6 +574,10 @@ async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name):
                 .bind(me.id)
                 .execute(&mut *c)
                 .await?;
+            sqlx::query("INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 0, 0) ON CONFLICT (project_id, person_id) DO NOTHING")
+                .bind(id)
+                .execute(&mut *c)
+                .await?;
             Ok(())
         })
     })

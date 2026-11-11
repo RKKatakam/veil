@@ -150,7 +150,6 @@ fn bug_1880_an_approval_withdrawn_while_the_entry_is_queued_still_lands() {
 /// for its branch's row, as behind another push to the branch) commits
 /// after it, onto objects GC deletes.
 #[test]
-#[ignore = "BUG-1881: a push that commits while GC switches moves its branch to deleted objects"]
 fn bug_1881_a_push_committing_during_the_gc_switch_points_its_branch_at_deleted_objects() {
     let th = TestHub::start();
     let p = setup_project(&th);
@@ -258,6 +257,218 @@ fn bug_1881_a_push_committing_during_the_gc_switch_points_its_branch_at_deleted_
     let r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev=hold&path=src/gc-race-1881.txt", p.name));
     assert_eq!(r.status, 200, "`hold` points at objects GC deleted: {}", String::from_utf8_lossy(&r.body).chars().take(300).collect::<String>());
     assert!(String::from_utf8_lossy(&r.body).contains(CONTENT.trim_end()), "the file's content is served");
+}
+
+#[test]
+fn bug_1881_pr_writer_and_reverse_switch_order_serialize_with_gc() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let admin_tok = p.admin.token();
+    let h = th.hub();
+    let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let push = |api: &Api, tok: &str, branch: &str, expected: Option<ObjectId>, new: Option<ObjectId>, force: bool| {
+        api.post_json(
+            Some(tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": new.map(|e| e.hex())}], "force": force}),
+        )
+    };
+
+    // Open a PR on an initial branch `feat1`.
+    let mut c1 = Craft::new(&api, &p.admin, &p.name, "main");
+    c1.file("src/pr-1881.txt", "v1\n");
+    let (_, r) = c1.push_edited("feat1", None, |_| {});
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let pr = api
+        .post_json(Some(&admin_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "feat1", "title": "gc race pr"}))
+        .json();
+    let pr_id = pr["id"].as_str().unwrap().to_string();
+
+    // Create an unreferenced snapshot `snap2` past retention.
+    const PR_CONTENT: &str = "RV-CORE2-BUG-1881-PR-REV-99a1b2c3\n";
+    let mut c2 = Craft::new(&api, &p.admin, &p.name, "main");
+    c2.file("src/pr-1881.txt", PR_CONTENT);
+    let (snap2, r) = c2.push_edited("tmp-pr-1881", None, |_| {});
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let r = push(&api, &admin_tok, "tmp-pr-1881", Some(snap2), None, true);
+    assert_eq!(r.json()["results"][0]["ok"], true);
+
+    let gc = |offset: i64, hook: Option<SwitchHook>| {
+        th.rt.block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: offset,
+                before_switch: hook,
+                ..Options::default()
+            },
+        ))
+    };
+    gc(0, None).unwrap();
+
+    // Order A (non-push root writer commits during GC switch): `add_revision`
+    // enters its transaction (`FOR SHARE` on the GC epoch) and waits on the PR
+    // row while GC reaches its switch; GC waits for it and keeps `snap2`.
+    let (tx_pr, rx_pr) = std::sync::mpsc::channel::<Reply>();
+    let release_pr = Arc::new(tokio::sync::Notify::new());
+    let once_pr = Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (db, release, once) = (h.db.clone(), release_pr.clone(), once_pr.clone());
+        let (authority, cert, tok, name, pr_id) = (th.authority(), th.cert_pem.clone(), admin_tok.clone(), p.name.clone(), pr_id.clone());
+        SwitchHook(Arc::new(move || {
+            let (db, release, once, tx_pr) = (db.clone(), release.clone(), once.clone(), tx_pr.clone());
+            let (authority, cert, tok, name, pr_id) = (authority.clone(), cert.clone(), tok.clone(), name.clone(), pr_id.clone());
+            Box::pin(async move {
+                if once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let mut lock = db.begin().await.unwrap();
+                sqlx::query("SELECT 1 FROM prs WHERE project_id = $1 AND id = $2 FOR UPDATE")
+                    .bind(pid)
+                    .bind(&pr_id)
+                    .execute(&mut *lock)
+                    .await
+                    .unwrap();
+                std::thread::spawn(move || {
+                    let api = Api::at(&authority, &cert);
+                    let r = api.post_json(
+                        Some(&tok),
+                        &format!("/v1/projects/{name}/prs/{pr_id}/revisions"),
+                        &json!({"head": snap2.hex()}),
+                    );
+                    let _ = tx_pr.send(r);
+                });
+                let until = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let waiting: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'UPDATE prs SET revision%'",
+                    )
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+                    if waiting > 0 {
+                        break;
+                    }
+                    assert!(Instant::now() < until, "add_revision never reached its prs update");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(6), release.notified()).await;
+                    lock.rollback().await.unwrap();
+                });
+            })
+        }))
+    };
+    gc(120_000, Some(hook)).unwrap();
+    release_pr.notify_one();
+    let r = rx_pr.recv_timeout(Duration::from_secs(60)).expect("PR revision answers");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let diff_r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/prs/{pr_id}/diff", p.name));
+    assert_eq!(diff_r.status, 200, "PR diff points at objects GC deleted: {}", String::from_utf8_lossy(&diff_r.body));
+    assert!(String::from_utf8_lossy(&diff_r.body).contains(PR_CONTENT.trim_end()));
+
+    // Order B (GC switch commits after push checked objects, before push commits):
+    // GC holds `access_epochs FOR UPDATE` while blocked on `packs FOR UPDATE`;
+    // a push of `hold2` to an expired unreferenced `snap3` passes its pre-tx
+    // checks and blocks on `access_epochs FOR SHARE`. Once GC finishes its
+    // switch and sweeps `snap3`, the push sees `GcEpochChanged`, reruns from
+    // scratch, and refuses cleanly instead of moving `hold2` to deleted objects.
+    let r = push(&api, &admin_tok, "hold2", None, Some(main0), false);
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let mut c3 = Craft::new(&api, &p.admin, &p.name, "main");
+    c3.file("src/reverse-1881.txt", "RV-CORE2-BUG-1881-REV-ORDER\n");
+    let (snap3, r) = c3.push_edited("tmp-rev-1881", None, |_| {});
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let r = push(&api, &admin_tok, "tmp-rev-1881", Some(snap3), None, true);
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    gc(240_000, None).unwrap();
+
+    let snap_lock = th.rt.block_on(async {
+        let mut tx = h.db.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2 FOR SHARE")
+            .bind(pid)
+            .bind(snap3.hex())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        tx
+    });
+    let h_gc = h.clone();
+    let gc_handle = th.rt.spawn(async move {
+        pack_gc::run_project(
+            &h_gc,
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: 360_000,
+                ..Options::default()
+            },
+        )
+        .await
+    });
+    th.rt.block_on(async {
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'DELETE FROM snapshots%'",
+            )
+            .fetch_one(&h.db)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            assert!(Instant::now() < until, "GC never reached DELETE FROM snapshots");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    let (tx_push, rx_push) = std::sync::mpsc::channel::<Reply>();
+    {
+        let (authority, cert, tok, name) = (th.authority(), th.cert_pem.clone(), admin_tok.clone(), p.name.clone());
+        std::thread::spawn(move || {
+            let api = Api::at(&authority, &cert);
+            let r = api.post_json(
+                Some(&tok),
+                &format!("/v1/projects/{name}/push"),
+                &json!({"updates": [{"branch": "hold2", "expected": main0.hex(), "new": snap3.hex()}], "force": false}),
+            );
+            let _ = tx_push.send(r);
+        });
+    }
+    th.rt.block_on(async {
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'SELECT epoch FROM access_epochs%FOR SHARE%'",
+            )
+            .fetch_one(&h.db)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            assert!(Instant::now() < until, "push never reached guard_root_write FOR SHARE");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        snap_lock.rollback().await.unwrap();
+    });
+    let rep = th.rt.block_on(gc_handle).unwrap().unwrap();
+    assert!(rep.packed_objects_deleted + rep.loose_objects_deleted > 0, "GC swept snap3: {rep:?}");
+
+    let r = rx_push.recv_timeout(Duration::from_secs(60)).expect("push answers after retry");
+    assert_ne!(r.status, 500, "push never 500s: {}", String::from_utf8_lossy(&r.body));
+    assert_ne!(r.json()["results"][0]["ok"], json!(true), "push without objects does not point hold2 at swept snap3: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(api.tips(Some(&admin_tok), &p.name).unwrap().branches["hold2"], main0);
 }
 
 /// A request body that sends `left` bytes, then stops until its gate
