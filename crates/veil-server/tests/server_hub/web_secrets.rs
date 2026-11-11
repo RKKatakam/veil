@@ -37,27 +37,27 @@ use veil_core::{
 use crate::support::*;
 
 #[derive(Clone)]
-struct WebReply {
-    status: u16,
-    headers: BTreeMap<String, Vec<String>>,
-    body: Vec<u8>,
+pub(crate) struct WebReply {
+    pub(crate) status: u16,
+    pub(crate) headers: BTreeMap<String, Vec<String>>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl WebReply {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body)
             .unwrap_or_else(|e| panic!("status {}: bad JSON ({e}): {}", self.status, self.text()))
     }
 
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(&name.to_ascii_lowercase())?.first().map(String::as_str)
     }
 
-    fn set_cookies(&self) -> Vec<&str> {
+    pub(crate) fn set_cookies(&self) -> Vec<&str> {
         self.headers
             .get("set-cookie")
             .map(|v| v.iter().map(String::as_str).collect())
@@ -65,24 +65,24 @@ impl WebReply {
     }
 }
 
-type SentLog = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+pub(crate) type SentLog = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
-struct BrowserClient {
-    agent: ureq::Agent,
-    base: String,
-    origin: String,
-    rp_id: String,
-    cookie: Option<String>,
-    csrf: Option<String>,
-    sent_bodies: SentLog,
+pub(crate) struct BrowserClient {
+    pub(crate) agent: ureq::Agent,
+    pub(crate) base: String,
+    pub(crate) origin: String,
+    pub(crate) rp_id: String,
+    pub(crate) cookie: Option<String>,
+    pub(crate) csrf: Option<String>,
+    pub(crate) sent_bodies: SentLog,
 }
 
 impl BrowserClient {
-    fn new(hub: &TestHub) -> Self {
+    pub(crate) fn new(hub: &TestHub) -> Self {
         Self::at(&hub.authority(), &hub.cert_pem)
     }
 
-    fn at(authority: &str, cert_pem: &str) -> Self {
+    pub(crate) fn at(authority: &str, cert_pem: &str) -> Self {
         let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(cert_pem.as_bytes())
             .filter_map(|i| match i {
                 Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
@@ -113,7 +113,7 @@ impl BrowserClient {
         }
     }
 
-    fn finish(r: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> WebReply {
+    pub(crate) fn finish(r: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> WebReply {
         let r = r.expect("HTTP response");
         let status = r.status().as_u16();
         let mut headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -126,7 +126,7 @@ impl BrowserClient {
         WebReply { status, headers, body }
     }
 
-    fn capture_cookie(&mut self, r: &WebReply) {
+    pub(crate) fn capture_cookie(&mut self, r: &WebReply) {
         for sc in r.set_cookies() {
             if let Some(rest) = sc.strip_prefix("__Host-veil_session=") {
                 let val = rest.split(';').next().unwrap_or("");
@@ -139,7 +139,7 @@ impl BrowserClient {
         }
     }
 
-    fn get(&self, path: &str) -> WebReply {
+    pub(crate) fn get(&self, path: &str) -> WebReply {
         let mut req = self
             .agent
             .get(format!("{}{path}", self.base))
@@ -152,7 +152,7 @@ impl BrowserClient {
         Self::finish(req.call())
     }
 
-    fn get_api(&self, path: &str) -> WebReply {
+    pub(crate) fn get_api(&self, path: &str) -> WebReply {
         let mut req = self
             .agent
             .get(format!("{}{path}", self.base))
@@ -164,11 +164,11 @@ impl BrowserClient {
         Self::finish(req.call())
     }
 
-    fn post_json(&self, path: &str, body: &Value, include_csrf: bool) -> WebReply {
+    pub(crate) fn post_json(&self, path: &str, body: &Value, include_csrf: bool) -> WebReply {
         self.post_json_origin(path, body, include_csrf, &self.origin)
     }
 
-    fn post_json_origin(&self, path: &str, body: &Value, include_csrf: bool, origin: &str) -> WebReply {
+    pub(crate) fn post_json_origin(&self, path: &str, body: &Value, include_csrf: bool, origin: &str) -> WebReply {
         let bytes = serde_json::to_vec(body).unwrap();
         self.sent_bodies.lock().unwrap().push((path.to_string(), bytes.clone()));
         let mut req = self
@@ -189,7 +189,7 @@ impl BrowserClient {
         Self::finish(req.send(&bytes))
     }
 
-    fn post_form(&self, path: &str, fields: &[(&str, &str)], include_csrf: bool) -> WebReply {
+    pub(crate) fn post_form(&self, path: &str, fields: &[(&str, &str)], include_csrf: bool) -> WebReply {
         let mut pairs: Vec<String> = fields
             .iter()
             .map(|(k, v)| format!("{}={}", url_enc(k), url_enc(v)))
@@ -214,7 +214,7 @@ impl BrowserClient {
     }
 }
 
-fn url_enc(s: &str) -> String {
+pub(crate) fn url_enc(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
@@ -227,17 +227,17 @@ fn url_enc(s: &str) -> String {
 
 /// Real ES256 (P-256 ECDSA SHA-256) virtual WebAuthn passkey authenticator with
 /// optional WebAuthn PRF support.
-struct VirtualPasskey {
-    cred_id: Vec<u8>,
-    cred_id_b64: String,
-    key_pair: KeyPair,
-    sign_count: u32,
-    prf_secret: Option<[u8; 32]>,
-    bundle: Option<BrowserDeviceBundle>,
+pub(crate) struct VirtualPasskey {
+    pub(crate) cred_id: Vec<u8>,
+    pub(crate) cred_id_b64: String,
+    pub(crate) key_pair: KeyPair,
+    pub(crate) sign_count: u32,
+    pub(crate) prf_secret: Option<[u8; 32]>,
+    pub(crate) bundle: Option<BrowserDeviceBundle>,
 }
 
 impl VirtualPasskey {
-    fn new_with_prf(tag: u8) -> Self {
+    pub(crate) fn new_with_prf(tag: u8) -> Self {
         let mut cred_id = vec![0x42, tag];
         cred_id.extend_from_slice(&veil_core::crypto::random_bytes::<16>());
         let cred_id_b64 = b64url_encode(&cred_id);
@@ -252,13 +252,13 @@ impl VirtualPasskey {
         }
     }
 
-    fn new_without_prf(tag: u8) -> Self {
+    pub(crate) fn new_without_prf(tag: u8) -> Self {
         let mut p = Self::new_with_prf(tag);
         p.prf_secret = None;
         p
     }
 
-    fn prf_eval(&self, prf_salt_b64: &str) -> Option<[u8; 32]> {
+    pub(crate) fn prf_eval(&self, prf_salt_b64: &str) -> Option<[u8; 32]> {
         let secret = self.prf_secret?;
         let mut h = blake3::Hasher::new_keyed(&secret);
         h.update(b"webauthn-prf-eval:");
@@ -267,7 +267,7 @@ impl VirtualPasskey {
     }
 
     /// Encode COSE_Key map for ES256 (`{1: 2, 3: -7, -1: 1, -2: x, -3: y}`).
-    fn cose_es256_public_key(&self) -> Vec<u8> {
+    pub(crate) fn cose_es256_public_key(&self) -> Vec<u8> {
         let raw = self.key_pair.public_key_raw();
         assert_eq!(raw.len(), 65, "uncompressed P-256 point must be 65 bytes");
         assert_eq!(raw[0], 0x04);
@@ -298,7 +298,7 @@ impl VirtualPasskey {
     }
 
     /// Build `attestationObject` CBOR (`{"fmt": "none", "attStmt": {}, "authData": h'...'}`).
-    fn make_attestation_object(&self, rp_id: &str, sign_count: u32) -> Vec<u8> {
+    pub(crate) fn make_attestation_object(&self, rp_id: &str, sign_count: u32) -> Vec<u8> {
         let mut auth_data = Vec::new();
         auth_data.extend_from_slice(&sha256(rp_id.as_bytes()));
         auth_data.push(0x45); // flags: UP (0x01) | UV (0x04) | AT (0x40)
@@ -333,7 +333,7 @@ impl VirtualPasskey {
         att
     }
 
-    fn enroll(&mut self, web: &mut BrowserClient, person_name: &str, code: &str) -> Value {
+    pub(crate) fn enroll(&mut self, web: &mut BrowserClient, person_name: &str, code: &str) -> Value {
         let begin = web.post_json("/web/passkey/register/begin", &json!({ "code": code }), false);
         assert_eq!(begin.status, 200, "register/begin failed: {}", begin.text());
         let bj = begin.json();
@@ -383,7 +383,7 @@ impl VirtualPasskey {
         fj
     }
 
-    fn sign_in(&mut self, web: &mut BrowserClient, person_hint: Option<&str>) -> Value {
+    pub(crate) fn sign_in(&mut self, web: &mut BrowserClient, person_hint: Option<&str>) -> Value {
         let begin = web.post_json(
             "/web/passkey/login/begin",
             &match person_hint {
@@ -405,7 +405,7 @@ impl VirtualPasskey {
         fj
     }
 
-    fn assert_with(&self, web: &BrowserClient, challenge: &str, origin: &str, rp_id: &str, sign_count: u32) -> WebReply {
+    pub(crate) fn assert_with(&self, web: &BrowserClient, challenge: &str, origin: &str, rp_id: &str, sign_count: u32) -> WebReply {
         let client_data = serde_json::to_vec(&json!({
             "type": "webauthn.get",
             "challenge": challenge,
@@ -435,7 +435,7 @@ impl VirtualPasskey {
     }
 }
 
-fn mint_enroll_code(hub: &TestHub, person: &Person) -> String {
+pub(crate) fn mint_enroll_code(hub: &TestHub, person: &Person) -> String {
     let r = hub
         .api()
         .post_json(Some(&person.token()), "/v1/sessions/web-enroll", &json!({}));
@@ -445,7 +445,7 @@ fn mint_enroll_code(hub: &TestHub, person: &Person) -> String {
     code
 }
 
-fn catch_up(hub: &TestHub, project: &str) {
+pub(crate) fn catch_up(hub: &TestHub, project: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         let r = hub.api().get(None, &format!("/v1/projects/{project}/q/log?limit=1"));
@@ -456,7 +456,7 @@ fn catch_up(hub: &TestHub, project: &str) {
     }
 }
 
-fn assert_no_canary_bytes(haystack: &[u8], canaries: &[&str], ctx: &str) {
+pub(crate) fn assert_no_canary_bytes(haystack: &[u8], canaries: &[&str], ctx: &str) {
     let text = String::from_utf8_lossy(haystack);
     for c in canaries {
         assert!(

@@ -47,3 +47,4 @@ mod bisect;
 mod pack_gc;
 mod web;
 mod web_secrets;
+mod rv_s26;
