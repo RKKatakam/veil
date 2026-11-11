@@ -2887,7 +2887,8 @@ fn bug_1574_a_sandbox_whose_root_the_server_refuses_keeps_a_readable_record() {
     assert!(!aall.contains("its manifest is unreadable"), "{manifest}\n{aall}");
 }
 
-/// BUG-1625 (review of `s8k` / `s8kr`): `hub_cmd::move_before_push` pages
+/// BUG-1625 (review of `s8k` / `s8kr`; fixed: each tip once, through
+/// `Repo::page_in`, one request): `hub_cmd::move_before_push` paged
 /// in the server's current tips that the clone does not hold via
 /// `Repo::deepen(&unheld, HISTORY_PAGE)` without deduplicating `unheld`,
 /// and `Repo::deepen` calls `Repo::may_page` (`server_roots` ->
@@ -2897,7 +2898,6 @@ fn bug_1574_a_sandbox_whose_root_the_server_refuses_keeps_a_readable_record() {
 /// commit on `main`) since this thin clone's last pull, `vl push` of one
 /// tag costs two requests per moved server branch.
 #[test]
-#[ignore = "BUG-1625: move_before_push calls Repo::deepen on unheld server tips without deduplicating and through may_page, costing two requests per moved server branch"]
 fn bug_1625_a_push_after_many_server_branches_moved_costs_no_request_a_branch() {
     let hub = TestHub::start();
     let mut cost = Vec::new();

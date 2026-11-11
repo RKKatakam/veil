@@ -744,24 +744,36 @@ impl Repo {
         if !self.store.may_fetch() {
             return Ok(0);
         }
-        let Some(promisor) = self.store.promisor() else {
+        if self.store.promisor().is_none() {
             return Err(VeilError::Unavailable(
                 "this command needs history this thin clone does not hold, and has no connection to its server".into(),
             ));
-        };
+        }
         let mut wanted = Vec::with_capacity(tips.len());
         for t in tips {
             if self.may_page(t)? {
                 wanted.push(*t);
             }
         }
-        if wanted.is_empty() {
+        self.page_in(&wanted, limit)
+    }
+
+    /// [`Repo::deepen`] for tips that need no question: the server's own
+    /// branch tips, which a full clone made now would hold. One request for
+    /// all of them, however many branches name them (BUG-1625).
+    pub fn page_in(&self, wanted: &[ObjectId], limit: usize) -> Result<usize> {
+        if wanted.is_empty() || !self.store.may_fetch() {
             return Ok(0);
         }
-        let page = promisor.history(&wanted, limit)?;
+        let Some(promisor) = self.store.promisor() else {
+            return Err(VeilError::Unavailable(
+                "this command needs history this thin clone does not hold, and has no connection to its server".into(),
+            ));
+        };
+        let page = promisor.history(wanted, limit)?;
         // One snapshot asked for: the page starts with it as the person's
         // current view has it; another id is a view change (BUG-1509).
-        if let ([asked], Some((first, _))) = (wanted.as_slice(), page.first()) {
+        if let ([asked], Some((first, _))) = (wanted, page.first()) {
             self.store.note_projection(*asked, *first);
         }
         let mut incoming = crate::remote::Incoming::new(&self.store);
