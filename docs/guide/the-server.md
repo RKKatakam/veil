@@ -29,6 +29,22 @@ to `vl login --ca` once. Objects go to `./hub/objects`, or to S3 with
 `--s3-endpoint URL --s3-bucket NAME` (credentials in `VEIL_S3_ACCESS_KEY` and
 `VEIL_S3_SECRET_KEY`).
 
+`--database-url` (or `VEIL_DATABASE_URL`, which keeps the password off the
+command line) also says whether the connection to the database is encrypted:
+
+```text
+postgres://veil:PASSWORD@127.0.0.1:5432/veil                                              no TLS: the same machine or a private network
+postgres://veil:PASSWORD@db.example.com:5432/veil?sslmode=require                         TLS; the database's certificate is not checked
+postgres://veil:PASSWORD@db.example.com:5432/veil?sslmode=verify-ca&sslrootcert=ca.pem    TLS; the certificate must be signed by the CA in ca.pem
+postgres://veil:PASSWORD@db.example.com:5432/veil?sslmode=verify-full&sslrootcert=ca.pem  the same, and it must name db.example.com
+```
+
+A managed PostgreSQL accepts only TLS: use `verify-full` with the CA
+certificate its provider gives you. Without `sslrootcert` the public
+certificate authorities are accepted. Without `sslmode` the server does not
+try TLS, and a database that requires it refuses the connection. For now
+`verify-ca` checks the name too, as `verify-full` does (BUG-1909).
+
 Its limits have defaults (`docs/HUB.md` §13.25): `--device-rate 200/50000`
 (a burst a second, the most an hour), `--anonymous-rate 20/1000` per address,
 `--max-connections 1024` and `--request-memory 512M` (all request bodies

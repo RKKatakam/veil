@@ -86,6 +86,12 @@ pub fn connect_lazy(url: &str, max: u32) -> anyhow::Result<PgPool> {
 
 fn options(url: &str, max: u32) -> anyhow::Result<(PgPoolOptions, sqlx::postgres::PgConnectOptions)> {
     let opts: sqlx::postgres::PgConnectOptions = url.parse()?;
+    // TLS to the database is the operator's choice (BUG-1590): `sslmode=` in
+    // the URL (or `PGSSLMODE`) says `require`, `verify-ca` or `verify-full`.
+    // A URL that says nothing asks for no TLS, as before there was any;
+    // sqlx's own default (`prefer`) would try it against every database.
+    let said = url.split_once('?').is_some_and(|(_, query)| query.split('&').any(|pair| pair.starts_with("sslmode=") || pair.starts_with("ssl-mode=")));
+    let opts = if said || std::env::var_os("PGSSLMODE").is_some() { opts } else { opts.ssl_mode(sqlx::postgres::PgSslMode::Disable) };
     let opts = opts.options([
         ("statement_timeout", format!("{}", STATEMENT_TIMEOUT.as_millis())),
         ("lock_timeout", format!("{}", LOCK_TIMEOUT.as_millis())),

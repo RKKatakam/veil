@@ -38,7 +38,9 @@ webpki = { package = "rustls-webpki", version = "0.103", default-features = fals
 # A self-signed certificate for local development (`--self-signed`).
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 # Metadata in PostgreSQL / YugabyteDB, plain SQL, no compile-time database.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+# TLS to the database (`sslmode=` in `--database-url`, BUG-1590) is rustls
+# with ring, as everywhere else: no OpenSSL, no native-tls.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-ring-webpki"] }
 # The S3 object store: request signing without the AWS SDK, sent with reqwest.
 rusty-s3 = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

@@ -70,14 +70,17 @@ Options:
   the hub, for `vl` clients and manual tests. The cache *gate* cannot be run
   against it (BUG-1591, §6), so it is off by default.
 
-**Why not managed PostgreSQL.** The server's database driver is built
-without TLS (BUG-1590), and DigitalOcean's managed databases accept TLS
-connections only. A PostgreSQL container on a droplet in the same VPC is
+**Why not managed PostgreSQL.** When the kit was built, the server's
+database driver had no TLS (BUG-1590, fixed since: "TLS to the database",
+§3), and DigitalOcean's managed databases accept TLS connections only. The
+kit keeps its PostgreSQL container on a droplet in the same VPC: it is
 also what the rehearsal and `scripts/bench-server.sh` run, so the test
 measures the configuration the project has measured all along, with
 superuser access for `pg_stat_statements` and the counters the cost gates
-read. If BUG-1590 is fixed, a managed `db-s-4vcpu-8gb` ($0.179/h) could
-replace the droplet; the gates do not need it.
+read. A managed `db-s-4vcpu-8gb` ($0.179/h) could now replace the droplet
+for the server itself; the kit does not set one up, the gates do not need
+it, and `veil-bench`'s own reads of the database's counters are still
+built without TLS.
 
 **Cost** (DigitalOcean list prices as published, USD, hourly = monthly/672;
 **confirm them with `deploy/do/estimate.sh --live --approve` or
@@ -133,6 +136,26 @@ private CA and a certificate for the hub's public and private addresses;
 `configure.sh` runs it and copies the CA to every droplet. Clients pin it:
 `vl login https://HUB:8443 --ca deploy/do/state/NAME/tls/ca.pem`;
 `veil-bench … --ca`. The certificate is valid 30 days.
+
+**TLS to the database.** `--database-url` (or `VEIL_DATABASE_URL`) says
+whether the server's connections to the database are encrypted, with
+PostgreSQL's own `sslmode` parameter (rustls, as the rest of the server):
+
+| The URL ends with | The connection |
+|---|---|
+| nothing about `sslmode` | is not encrypted, and the server does not try TLS. For a database on the same machine or a private network (the kit's) |
+| `?sslmode=require` | is encrypted; the database's certificate is not checked |
+| `?sslmode=verify-ca&sslrootcert=/path/ca.pem` | is encrypted, and the certificate must be signed by the CA in that file |
+| `?sslmode=verify-full&sslrootcert=/path/ca.pem` | the same, and the certificate must name the host in the URL. The form for a managed database: `sslrootcert` is the CA certificate the provider lets you download |
+
+Without `sslrootcert`, `verify-ca` and `verify-full` accept the public
+certificate authorities (Mozilla's list, built in). `PGSSLMODE` and
+`PGSSLROOTCERT` in the environment do the same as the two parameters. A
+database that accepts only TLS refuses a URL without `sslmode` ("no
+pg_hba.conf entry … no encryption"). At present `verify-ca` also checks
+the name, as `verify-full` does (BUG-1909): reach the database by a name
+its certificate carries. Proven against PostgreSQL 17 with `ssl = on` and
+only `hostssl` lines; not yet run against a managed service.
 
 ## 4. Local rehearsal
 
@@ -317,8 +340,8 @@ reports both.
 
 Found and filed by the rehearsal:
 
-- **BUG-1590** (`docs/BUGS.md`): the server cannot use a database that
-  requires TLS, which rules out managed PostgreSQL (§2).
+- **BUG-1590** (`docs/BUGS.md`, fixed since): the server could not use a
+  database that requires TLS, which ruled out managed PostgreSQL (§2).
 - **BUG-1591**: `veil-bench load --via cache` cannot measure a running
   cache, so the cache gate runs on the hub in its same-machine form (§6).
 - **BUG-1592**: the cache advertises HTTP/2 but serves HTTP/1 only; HTTP/2
@@ -354,9 +377,11 @@ by the rehearsal's equivalent Docker commands and by the DigitalOcean run.
 - **Droplet limit.** New accounts often may not create 4 or 7 droplets at
   once; `create.sh` then fails on the first refused droplet and leaves the
   earlier ones running: `destroy.sh --approve` removes them by tag.
-- **BUG-1590**: no TLS to the database, so the database is on the VPC's
-  private network only, behind the firewall; the hub and the database are
-  one hop apart. Managed PostgreSQL is out until fixed.
+- **The database is not encrypted in transit in the kit**: its URL has no
+  `sslmode`, and the database is on the VPC's private network only, behind
+  the firewall, one hop from the hub. The server can use TLS to a database
+  (BUG-1590, fixed; §3), which the kit's PostgreSQL container does not
+  offer.
 - **BUG-1591**: the cache gate runs on the hub in the same-machine form,
   not across the network to a cache droplet.
 - **Phase 4 benchmarks** are not built; the YugabyteDB topology waits for
