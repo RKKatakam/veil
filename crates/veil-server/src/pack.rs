@@ -826,7 +826,7 @@ impl Packs {
     /// ([`Packs::forget`]); `again` then reads the listing anew before it
     /// searches (the map may name another replaced pack that holds the
     /// object), and once more if a pack was found gone meanwhile (by this
-    /// lookup's own index reads, or another's), at most [`LISTINGS`] times:
+    /// lookup's own index reads, or another's), at most `LISTINGS` times:
     /// a switch commits before its replaced packs are deleted, so a listing
     /// read after one was found gone names what replaced it.
     pub async fn locate(&self, store: &Arc<dyn BlobStore>, project: i64, id: &ObjectId, again: bool, since: Instant, reads: &AtomicU64) -> Result<Option<(Arc<str>, Slot)>> {

@@ -18,7 +18,7 @@
 //!   required checks all passed. `tested` moves only forward (`depth` from
 //!   the root increases monotonically).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use axum::{
@@ -197,7 +197,34 @@ pub async fn post_check_route(
                     .bind(&real_hex)
                     .fetch_one(&mut *c)
                     .await?;
-                if tip_count >= MAX_CHECKS_PER_SNAPSHOT as i64 {
+                // Results that count for nothing never take the places of
+                // those that count (BUG-1925): a poster whose result does not
+                // count is bounded by all the snapshot's rows, one whose
+                // result counts by the rows that count now. A snapshot then
+                // keeps fewer than twice the bound.
+                let mut full = tip_count >= MAX_CHECKS_PER_SNAPSHOT as i64;
+                if full && counts {
+                    let rows: Vec<(String, i64, String, bool)> = sqlx::query_as(
+                        "SELECT name, runner_id, session_paths, admin_only FROM checks WHERE project_id = $1 AND snapshot = $2 LIMIT $3",
+                    )
+                    .bind(pid)
+                    .bind(&real_hex)
+                    .bind(2 * MAX_CHECKS_PER_SNAPSHOT as i64)
+                    .fetch_all(&mut *c)
+                    .await?;
+                    let posters: Vec<i64> = rows.iter().map(|r| r.1).collect::<BTreeSet<_>>().into_iter().collect();
+                    let roles = load_poster_roles(&mut *c, pid, &posters).await?;
+                    let counting = rows
+                        .iter()
+                        .filter(|(row_name, poster, paths, row_admin_only)| {
+                            let (adm, grps) = roles.get(poster).cloned().unwrap_or_default();
+                            let paths: Vec<String> = serde_json::from_str(paths).unwrap_or_default();
+                            stored_check_counts(&project_for_tx, *poster, adm, &grps, &paths, *row_admin_only, &rules_for_tx, row_name)
+                        })
+                        .count();
+                    full = counting >= MAX_CHECKS_PER_SNAPSHOT;
+                }
+                if full {
                     return Err(Error::bad_request(format!(
                         "a snapshot keeps at most {MAX_CHECKS_PER_SNAPSHOT} distinct checks"
                     )));

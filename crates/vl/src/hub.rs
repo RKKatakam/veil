@@ -302,10 +302,35 @@ pub struct Client {
 }
 
 /// How often, how long each time and how long in all [`Client::send`]
-/// waits out a server's `retry_after_ms` (BUG-1331).
+/// waits out a server's `retry_after_ms` (BUG-1331) or `warming` (BUG-1913).
 const RETRIES: u32 = 8;
 const RETRY_WAIT: Duration = Duration::from_secs(30);
 const RETRY_FOR: Duration = Duration::from_secs(120);
+
+/// Is this answer `503 warming`: the server is preparing the caller's
+/// history, and the same request succeeds a little later? [`Client::send`]
+/// has waited it out already (BUG-1913): no caller asks again for it.
+pub(crate) fn is_warming(status: u16, body: &[u8]) -> bool {
+    status == 503 && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v["code"] == "warming")
+}
+
+/// How many milliseconds an answer asks for before the request is sent
+/// again, after `tries` waits: the `retry_after_ms` of a `429` or a `503`
+/// (BUG-1331); for a `503 warming`, which carries none (BUG-1913), half a
+/// second, twice as long each time, up to 8 s (the server waits for the
+/// history itself, up to a query's deadline, before each such answer).
+/// `None`: the answer is the request's.
+fn retry_after(status: u16, body: &[u8], tries: u32) -> Option<u64> {
+    if !matches!(status, 429 | 503) {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    match v["retry_after_ms"].as_u64() {
+        Some(ms) => Some(ms),
+        None if v["code"] == "warming" => Some(500 << tries.min(4)),
+        None => None,
+    }
+}
 
 /// Fewest and most objects, and about the most bytes, per fetch request
 /// when [`Client::fetch_each`] splits them, and how many requests it sends
@@ -413,23 +438,21 @@ impl Client {
         }
     }
 
-    /// [`Client::send_once`], waiting out a server that says when to come
-    /// back (BUG-1331): past its rate limits (`429`) or shedding load
-    /// (`503`), its answer carries `retry_after_ms`. At most [`RETRIES`]
-    /// waits of at most [`RETRY_WAIT`] each, within [`RETRY_FOR`] in all;
-    /// then the server's last answer.
+    /// [`Client::send_once`], waiting out a server that says to come back
+    /// ([`retry_after`]): past its rate limits (`429`) or shedding load
+    /// (`503`), its answer carries `retry_after_ms` (BUG-1331); preparing
+    /// the caller's history, it answers `503 warming` (BUG-1913), on any
+    /// route that reads history (a pull's `/history` among them). At most
+    /// [`RETRIES`] waits of at most [`RETRY_WAIT`] each, within
+    /// [`RETRY_FOR`] in all; then the server's last answer.
     fn send(&self, method: &str, path: &str, body: Option<(&str, Vec<u8>)>, auth: bool) -> Result<(u16, Vec<u8>)> {
         let start = std::time::Instant::now();
         let mut tries = 0;
         loop {
             let (status, out) = self.send_once(method, path, body.as_ref().map(|(ct, b)| (*ct, &b[..])), auth)?;
-            let wait = match status {
-                429 | 503 => serde_json::from_slice::<serde_json::Value>(&out).ok().and_then(|v| v["retry_after_ms"].as_u64()),
-                _ => None,
-            };
-            let Some(ms) = wait else { return Ok((status, out)) };
+            let Some(ms) = retry_after(status, &out, tries) else { return Ok((status, out)) };
             let jitter = u64::from(veil_core::crypto::random_bytes::<1>()[0]);
-            let wait = Duration::from_millis(ms + jitter).min(RETRY_WAIT);
+            let wait = Duration::from_millis(ms.saturating_add(jitter)).min(RETRY_WAIT);
             if tries >= RETRIES || start.elapsed() + wait > RETRY_FOR {
                 return Ok((status, out));
             }
@@ -2160,6 +2183,30 @@ mod tests {
         assert!(after.contains("renewed"), "the change is written: {after}");
         assert!(after.contains("MARKER-LATER-FIELD-1a"), "a server entry's unknown field was dropped: {after}");
         assert!(after.contains("MARKER-LATER-TOP-2b"), "an unknown top-level field was dropped: {after}");
+    }
+
+    /// BUG-1913: `vl` waits out `503 warming` as it does an answer with
+    /// `retry_after_ms` (BUG-1331), on every request ([`Client::send`] asks
+    /// [`retry_after`]): half a second, doubling to 8 s, or what the server
+    /// says. Any other answer is the request's.
+    #[test]
+    fn bug_1913_warming_is_waited_out_as_retry_after_is() {
+        let warming = br#"{"code":"warming","message":"this history is being prepared for you; try again in a few seconds"}"#;
+        let waits: Vec<Option<u64>> = (0..RETRIES).map(|tries| retry_after(503, warming, tries)).collect();
+        assert_eq!(waits, [500, 1_000, 2_000, 4_000, 8_000, 8_000, 8_000, 8_000].map(Some));
+        assert!(is_warming(503, warming));
+        // The server's own time comes first, for `warming` too.
+        assert_eq!(retry_after(503, br#"{"code":"warming","message":"m","retry_after_ms":1500}"#, 3), Some(1_500));
+        assert_eq!(retry_after(503, br#"{"code":"busy","message":"m","retry_after_ms":700}"#, 0), Some(700));
+        assert_eq!(retry_after(429, br#"{"code":"rate_limited","message":"m","retry_after_ms":1000}"#, 7), Some(1_000));
+        assert_eq!(retry_after(429, br#"{"code":"rate_limited","message":"m","retry_after_ms":18446744073709551615}"#, 0), Some(u64::MAX));
+        // Not asked to come back: a query past its deadline, an answer
+        // that is not the server's, and `warming` under any other status.
+        for (status, body) in [(503, &br#"{"code":"deadline","message":"m"}"#[..]), (503, b"<html>"), (200, warming), (404, warming), (500, warming)] {
+            assert_eq!(retry_after(status, body, 0), None, "{status} {}", String::from_utf8_lossy(body));
+            assert!(!is_warming(status, body) || status == 503);
+        }
+        assert!(!is_warming(503, br#"{"code":"deadline","message":"m"}"#) && !is_warming(200, warming));
     }
 
     /// `vl` says it reads encoded frames, and reads both kinds: plain

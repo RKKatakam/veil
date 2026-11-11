@@ -321,6 +321,8 @@ pub struct RefStamp {
 }
 
 /// `(table_name, row_expr, extra_where)` stamped by [`read_ref_stamp`].
+/// Every table GC takes roots from is here, with each of its root columns
+/// in its row ([`unstamped_root_columns`] lists any that is not: BUG-1923).
 const STAMP_TABLES: &[(&str, &str, &str)] = &[
     ("branches", "concat_ws(chr(31), name, target, lineage::text, COALESCE(hidden_for_embargo, ''))", ""),
     ("snapshots", "concat_ws(chr(31), id, author::text)", ""),
@@ -335,6 +337,10 @@ const STAMP_TABLES: &[(&str, &str, &str)] = &[
     ("pr_revisions", "concat_ws(chr(31), pr, n::text, base, head, changes)", ""),
     ("bisects", "concat_ws(chr(31), branch, lineage::text, check_name, phase, good, bad, candidates, probes, COALESCE(culprit, ''), COALESCE(culprit_parent, ''), COALESCE(revert_snapshot, ''), updated_at::text)", ""),
     ("bisect_reverts", "concat_ws(chr(31), branch, lineage::text, culprit, check_name, ticket, COALESCE(revert_snapshot, ''), state)", ""),
+    // BUG-1923: the two root tables the stamp left out. A shard's counters
+    // are not in its row: only what names a segment moves the stamp.
+    ("search_shards", "concat_ws(chr(31), kind, branch, line_key, segments)", ""),
+    ("pr_review_rules", "checked", ""),
 ];
 
 /// Error marker raised inside a root-adding transaction when the project's GC
@@ -461,6 +467,25 @@ async fn lock_gc_epoch_tx(c: &mut PgConnection, project: i64) -> Result<()> {
         .await?;
     }
     Ok(())
+}
+
+/// The root columns of the registry ([`OBJECT_SCHEMA_COLUMNS`]: `GcRoot` and
+/// `GcConditionalLeafRoot`) that the reference stamp does not read: their
+/// table is not in `STAMP_TABLES`, or its stamped row leaves the column
+/// out. Empty, or GC would not give way to a row written right before its
+/// switch (BUG-1923); a test holds it empty, so a root table registered
+/// later cannot be left unstamped.
+pub fn unstamped_root_columns() -> Vec<(&'static str, &'static str)> {
+    OBJECT_SCHEMA_COLUMNS
+        .iter()
+        .filter(|(_, _, role)| matches!(role, SchemaColumnRole::GcRoot | SchemaColumnRole::GcConditionalLeafRoot))
+        .filter(|(table, col, _)| {
+            !STAMP_TABLES
+                .iter()
+                .any(|(t, expr, _)| t == table && expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|word| word == *col))
+        })
+        .map(|&(table, col, _)| (table, col))
+        .collect()
 }
 
 /// Names of all tables fingerprinted by [`project_ref_stamp`].
@@ -1511,7 +1536,7 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("access_epochs", &["project_id", "person_id", "epoch", "changed_at"]),
     ("audit_log", &["id", "project_id", "at", "actor", "action", "details"]),
     ("bisect_leases", &["project_id", "branch", "holder", "epoch", "expires_at"]),
-    ("bisect_reverts", &["project_id", "branch", "lineage", "check_name", "ticket", "state", "created_at", "culprit_change_id"]),
+    ("bisect_reverts", &["project_id", "branch", "lineage", "check_name", "ticket", "state", "created_at", "culprit_change_id", "culprit_patch"]),
     ("bisects", &["project_id", "branch", "lineage", "check_name", "lo", "hi", "phase", "culprit_fails", "parent_passes", "confirm_requested_at", "session_paths", "admin_only", "revert_ticket", "created_at", "updated_at"]),
     ("blame_ends", &["project_id", "view_key", "path_key", "follow", "held", "kept_bytes", "path_keys", "created_at"]),
     ("blame_jobs", &["project_id", "view_key", "path_key", "follow", "holder", "expires_at"]),

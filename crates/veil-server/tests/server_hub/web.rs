@@ -1411,6 +1411,34 @@ fn bug_1871_the_web_client_never_asks_for_a_device_identity_file() {
     assert_absent(&js.text(), &asks, "GET /static/app.js");
 }
 
+/// BUG-1927: the same-origin check compared the `Origin` header's host with
+/// the request's and ignored its scheme, so a page of the same host over
+/// `http://` (anyone on the network path can serve one) passed as the same
+/// origin wherever no `Sec-Fetch-Site` header came with it. The server
+/// speaks `https://` only: an origin is the whole of scheme, host and port.
+#[test]
+fn bug_1927_an_origin_of_another_scheme_is_not_the_same_origin() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let web = WebClient::new(&hub);
+    let origin = web.origin.clone();
+    assert!(origin.starts_with("https://"), "{origin}");
+    let token = || {
+        let r = hub.api().post_json(Some(&alice.token()), "/v1/sessions/web", &json!({ "seconds": 1800 }));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        r.json()["token"].as_str().unwrap().to_string()
+    };
+    for other in [origin.replacen("https://", "http://", 1), origin.replacen("https://", "HTTP://", 1), origin.replacen("https://", "", 1)] {
+        let r = web.post_json_web("/web/session", &json!({ "token": token() }), None, Some(&other), None);
+        assert_eq!(r.status, 403, "Origin {other}: {}", r.text());
+        assert_eq!(r.json()["code"], "csrf_failed", "Origin {other}: {}", r.text());
+        assert_eq!(r.json()["message"], "request Origin does not match Host", "Origin {other}: {}", r.text());
+    }
+    // The server's own origin, with no `Sec-Fetch-Site` beside it.
+    let r = web.post_json_web("/web/session", &json!({ "token": token() }), None, Some(&origin), None);
+    assert_eq!(r.status, 200, "{}", r.text());
+}
+
 /// BUG-1906: the web client works over HTTP/2 (every browser: `:authority`,
 /// no `Host` header) and over HTTP/1.1 (`Host`): a page, a session, a form
 /// that changes something, and signing out; and over both a request from

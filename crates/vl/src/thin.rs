@@ -241,11 +241,11 @@ impl HubPromisor {
         }
         let req = HistoryRequest { tips: tips.to_vec(), stop: Vec::new(), limit: Some(limit) };
         let body = serde_json::to_vec(&req)?;
-        // The viewer graph may still be filling ("warming", 503): ask again
-        // for about 10 s, as for any query.
+        // Any other 503 than `warming` (which `Client::send` has waited
+        // out, BUG-1913): ask again for about 10 s, as for any query.
         let mut answer = self.post("/history", body.clone())?;
         for _ in 0..20 {
-            if answer.0 != 503 {
+            if answer.0 != 503 || crate::hub::is_warming(answer.0, &answer.1) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -284,7 +284,7 @@ impl HubPromisor {
                 }
                 // A server older than revision 6.
                 404 | 405 => return Ok(None),
-                503 if attempt < 19 => std::thread::sleep(std::time::Duration::from_millis(500)),
+                503 if attempt < 19 && !crate::hub::is_warming(status, &out) => std::thread::sleep(std::time::Duration::from_millis(500)),
                 s => return Err(self.refused(s, &out)),
             }
         }
@@ -301,8 +301,9 @@ impl HubPromisor {
             let from: Vec<String> = from.iter().take(veil_core::hub::wire::MAX_RESOLVE_FROM).map(|f| f.hex()).collect();
             path.push_str(&format!("&from={}", from.join(",")));
         }
-        // The viewer's graph may still be filling ("warming"): ask again,
-        // as any client of the query API does, for about 10 s.
+        // A query past its deadline (503): ask again, as any client of the
+        // query API does, for about 10 s. (`warming`, the viewer's graph
+        // still filling, was waited out by `Client::send`: BUG-1913.)
         for attempt in 0..20 {
             let (status, out) = {
                 let c = self.client()?;
@@ -312,7 +313,7 @@ impl HubPromisor {
                 200 => return serde_json::from_slice(&out).map(Some).map_err(|e| unavailable(&self.url, e)),
                 // A server without the route (older than revision 5).
                 404 | 405 => return Ok(None),
-                503 if attempt < 19 => std::thread::sleep(std::time::Duration::from_millis(500)),
+                503 if attempt < 19 && !crate::hub::is_warming(status, &out) => std::thread::sleep(std::time::Duration::from_millis(500)),
                 s => return Err(self.refused(s, &out)),
             }
         }
@@ -320,7 +321,8 @@ impl HubPromisor {
     }
 
     /// A query route (`/v1/projects/{p}/q/{route}`, S16, `docs/HUB.md`
-    /// §13.34), retrying `warming` and `deadline` (`503`) up to 20 times.
+    /// §13.34), retrying `deadline` and `indexing` (`503`) up to 20 times
+    /// (`warming` was waited out by `Client::send`, BUG-1913).
     fn query_direct(&self, route: &str, params: &[(&str, String)]) -> veil_core::Result<std::result::Result<serde_json::Value, (String, String)>> {
         const RETRIES: usize = 19;
         for attempt in 0..=RETRIES {
@@ -331,7 +333,7 @@ impl HubPromisor {
             match r {
                 Ok(v) => return Ok(Ok(v)),
                 Err((code, msg)) if matches!(code.as_str(), "warming" | "deadline" | "indexing") => {
-                    if attempt < RETRIES {
+                    if attempt < RETRIES && code != "warming" {
                         std::thread::sleep(std::time::Duration::from_millis(500));
                         continue;
                     }

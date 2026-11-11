@@ -950,13 +950,13 @@ enum Landed {
 
 /// Most snapshots the server already held that one move of a branch may
 /// bring for their changes to be written to `landed_changes` at the move
-/// ([`reached`]); a move that reaches more leaves the branch's
+/// (`reached`); a move that reaches more leaves the branch's
 /// `changes_recorded` false (BUG-1524).
 pub const REACH_BUDGET: usize = 256;
 
 /// Most revisions of one change by one author the derived graph is asked
 /// about, on a branch whose changes are not all recorded
-/// ([`Ancestry::revision_on_branch`]).
+/// (`Ancestry::revision_on_branch`).
 pub const MAX_REVISIONS: usize = 256;
 
 /// The changes a move of `branch` brings with snapshots the server already

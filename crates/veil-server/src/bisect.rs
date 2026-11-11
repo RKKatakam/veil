@@ -138,34 +138,42 @@ pub struct BisectStatus {
     pub updated_at: i64,
 }
 
-/// Whether any `change_id` in `change_ids` has been automatically reverted at
-/// least twice in `project_id` (BUG-1884). Counted by `change_id` across
-/// rebases and lineages, and never reset.
-pub async fn any_reverted_twice(hub: &Hub, project_id: i64, change_ids: &[String]) -> Result<bool> {
-    if change_ids.is_empty() {
+/// The reverts "reverted twice" counts, by each of the two names a reverted
+/// change has (BUG-1884, BUG-1921): its change id, which its submitter
+/// chooses, and what its edits were (`prs::edits_id`, recorded with the
+/// revert), which a new change id does not change. `$1` is the project.
+const REVERTED_KEYS: &str = "SELECT culprit_change_id AS k, branch FROM bisect_reverts \
+     WHERE project_id = $1 AND culprit_change_id <> '' AND state = 'reverted' \
+     UNION ALL \
+     SELECT culprit_patch AS k, branch FROM bisect_reverts \
+     WHERE project_id = $1 AND culprit_patch <> '' AND state = 'reverted'";
+
+/// Whether any of `ids` (the change ids of some changes, and what their
+/// edits are: `prs::edits_id`) names a change the server has automatically
+/// reverted at least twice in `project_id` (BUG-1884, BUG-1921). Counted
+/// across rebases and lineages, and never reset.
+pub async fn any_reverted_twice(hub: &Hub, project_id: i64, ids: &[String]) -> Result<bool> {
+    if ids.is_empty() {
         return Ok(false);
     }
     sync_queued_reverts(hub, project_id, None).await?;
     let mut c = hub.db.acquire().await?;
-    any_reverted_twice_conn(&mut c, project_id, change_ids).await
+    any_reverted_twice_conn(&mut c, project_id, ids).await
 }
 
 /// [`any_reverted_twice`] on a connection, of the reverts as recorded: the
 /// caller has brought the queued ones up to date ([`settle_queued_reverts`]).
 /// A landing batch asks inside its transaction (BUG-1880).
-pub async fn any_reverted_twice_conn(c: &mut sqlx::PgConnection, project_id: i64, change_ids: &[String]) -> Result<bool> {
-    if change_ids.is_empty() {
+pub async fn any_reverted_twice_conn(c: &mut sqlx::PgConnection, project_id: i64, ids: &[String]) -> Result<bool> {
+    if ids.is_empty() {
         return Ok(false);
     }
-    let hit: Option<String> = sqlx::query_scalar(
-        "SELECT culprit_change_id FROM bisect_reverts \
-         WHERE project_id = $1 AND culprit_change_id <> '' AND culprit_change_id = ANY($2) AND state = 'reverted' \
-         GROUP BY culprit_change_id HAVING COUNT(*) >= 2 LIMIT 1",
-    )
-    .bind(project_id)
-    .bind(change_ids)
-    .fetch_optional(&mut *c)
-    .await?;
+    let hit: Option<String> =
+        sqlx::query_scalar(&format!("SELECT k FROM ({REVERTED_KEYS}) r WHERE k = ANY($2) GROUP BY k HAVING COUNT(*) >= 2 LIMIT 1"))
+            .bind(project_id)
+            .bind(ids)
+            .fetch_optional(&mut *c)
+            .await?;
     Ok(hit.is_some())
 }
 
@@ -176,34 +184,28 @@ pub async fn settle_queued_reverts(hub: &Hub, project_id: i64) -> Result<()> {
 }
 
 /// Whether the server has reverted any change of the project twice, of the
-/// reverts as recorded. A landing batch that finds none reads no change ids
-/// for the rule (BUG-1884), and checks in its transaction that there is
-/// still none (BUG-1880).
+/// reverts as recorded. A landing batch that finds none reads nothing of
+/// its changes for the rule (BUG-1884), and checks in its transaction that
+/// there is still none (BUG-1880).
 pub async fn has_reverted_twice(c: &mut sqlx::PgConnection, project_id: i64) -> Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM bisect_reverts \
-         WHERE project_id = $1 AND culprit_change_id <> '' AND state = 'reverted' \
-         GROUP BY culprit_change_id HAVING COUNT(*) >= 2)",
-    )
-    .bind(project_id)
-    .fetch_one(&mut *c)
-    .await?)
+    Ok(sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM ({REVERTED_KEYS}) r GROUP BY k HAVING COUNT(*) >= 2)"))
+        .bind(project_id)
+        .fetch_one(&mut *c)
+        .await?)
 }
 
-/// Whether `branch` itself has any `change_id` reverted twice by the server,
-/// so even a direct fast-forward onto an unprotected branch still checks
-/// `change_id`s reverted twice there while leaving topic branches free.
+/// Whether `branch` itself has any change reverted twice by the server (by
+/// change id or by its edits), so even a direct fast-forward onto an
+/// unprotected branch still checks changes reverted twice there while
+/// leaving topic branches free.
 pub async fn branch_has_reverted_twice(hub: &Hub, project_id: i64, branch: &str) -> Result<bool> {
     sync_queued_reverts(hub, project_id, Some(branch)).await?;
-    let hit: Option<String> = sqlx::query_scalar(
-        "SELECT culprit_change_id FROM bisect_reverts \
-         WHERE project_id = $1 AND branch = $2 AND culprit_change_id <> '' AND state = 'reverted' \
-         GROUP BY culprit_change_id HAVING COUNT(*) >= 2 LIMIT 1",
-    )
-    .bind(project_id)
-    .bind(branch)
-    .fetch_optional(&hub.db)
-    .await?;
+    let hit: Option<String> =
+        sqlx::query_scalar(&format!("SELECT k FROM ({REVERTED_KEYS}) r WHERE branch = $2 GROUP BY k HAVING COUNT(*) >= 2 LIMIT 1"))
+            .bind(project_id)
+            .bind(branch)
+            .fetch_optional(&hub.db)
+            .await?;
     Ok(hit.is_some())
 }
 
@@ -1617,7 +1619,7 @@ async fn revert_confirmed_culprit(
 
     // Refuse to auto-revert changes to `.veilpolicy` or `.veilrules` (only an admin's
     // explicit push/change may alter access or branch rules).
-    let (culprit_parent, culprit_cid, touches_policy_or_rules, revert_snap_id, revert_raw) =
+    let (culprit_parent, culprit_cid, culprit_patch, touches_policy_or_rules, revert_snap_id, revert_raw) =
         sync::blocking(hub, project.id, {
             let identity = hub.identity.clone();
             move |src| {
@@ -1635,6 +1637,9 @@ async fn revert_confirmed_culprit(
                         || veil_core::hub::agent::decides_access(&c.path)
                 });
                 let cid_str = cs.change_id.to_string();
+                // What the culprit's edits were, whatever change id carries
+                // them (BUG-1921).
+                let patch = crate::prs::edits_id(src, culprit, p0)?.unwrap_or_default();
                 // Deterministic change_id for the revert of `(culprit, lineage)` so
                 // concurrent servers construct the exact same revertchange_id.
                 let mut h = blake3::Hasher::new();
@@ -1665,7 +1670,7 @@ async fn revert_confirmed_culprit(
                 rev_snap.sign(&identity);
                 let raw = Bytes::from(Object::Snapshot(rev_snap).encode());
                 let id = ObjectId::hash(&raw);
-                Ok((p0, cid_str, touches_special, id, raw))
+                Ok((p0, cid_str, patch, touches_special, id, raw))
             }
         })
         .await?;
@@ -1730,6 +1735,7 @@ async fn revert_confirmed_culprit(
 
     let culprit_cid2 = culprit_cid.clone();
     crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+        let culprit_patch = culprit_patch.clone();
         let (branch_name, culprit_hex, culprit_cid2, check_name, rev_hex, ticket2, admin_name, admin_device_key, stack_json) = (
             branch_name.clone(),
             culprit_hex.clone(),
@@ -1753,8 +1759,8 @@ async fn revert_confirmed_culprit(
             .await?;
 
             let inserted = sqlx::query(
-                "INSERT INTO bisect_reverts (project_id, branch, lineage, culprit, culprit_change_id, check_name, ticket, state, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT) \
+                "INSERT INTO bisect_reverts (project_id, branch, lineage, culprit, culprit_change_id, check_name, ticket, state, created_at, culprit_patch) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT, $8) \
                  ON CONFLICT (project_id, branch, lineage, culprit) DO NOTHING",
             )
             .bind(pid)
@@ -1764,6 +1770,7 @@ async fn revert_confirmed_culprit(
             .bind(&culprit_cid2)
             .bind(&check_name)
             .bind(&ticket2)
+            .bind(&culprit_patch)
             .execute(&mut *c)
             .await?
             .rows_affected();

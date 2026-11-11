@@ -1538,22 +1538,78 @@ fn differs_in_access_files(src: &Source, from: ObjectId, to: ObjectId) -> Result
     })
 }
 
-/// Check write access for every path changed between an existing branch tip
-/// `cur` and the unchecked snapshot `anchor` that a branch move brings onto
-/// it (BUG-1858). Never names a path `viewer` cannot read.
+/// The landed work a branch's new tip `new` holds (BUG-1920): the default
+/// branch's snapshots at the merge bases of `new` and the default branch's
+/// tip, the newest landed ones `new` contains. They are found when first
+/// asked for (a move whose every path its mover may write never asks).
+pub(crate) struct Landed {
+    tip: Option<ObjectId>,
+    new: ObjectId,
+    trees: Option<Vec<ObjectId>>,
+}
+
+impl Landed {
+    /// `tip`: the default branch's tip, or `None` where nothing counts as
+    /// landed work (a move of the default branch itself, a forced move).
+    pub(crate) fn new(tip: Option<ObjectId>, new: ObjectId) -> Landed {
+        Landed { tip, new, trees: None }
+    }
+
+    /// Does the default branch hold `entry` at `path` where `new` joins it?
+    pub(crate) fn holds(&mut self, src: &Source, rows: &mut PushRows, path: &str, entry: Option<&veil_core::TreeEntry>) -> Result<bool> {
+        let Some(tip) = self.tip else { return Ok(false) };
+        if self.trees.is_none() {
+            let mut trees = Vec::new();
+            for b in merge_bases(src, rows, self.new, tip)? {
+                trees.push(src.snapshot(&b)?.tree);
+            }
+            self.trees = Some(trees);
+        }
+        for t in self.trees.iter().flatten() {
+            if entry_at(src, t, path)?.as_ref() == entry {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// **The one write rule of a branch's move** (`docs/HUB.md` §4.5, check 2;
+/// BUG-1858, BUG-1920): every path whose entry differs between the branch's
+/// old tip `cur` and its new tip `new` needs the mover's write access,
+/// whatever the shape of the snapshots that bring the difference (a
+/// fast-forward to a snapshot the server holds, a merge with a held or an
+/// uploaded parent in any place, a stack on someone's work, a forced move).
+/// What an uploaded snapshot's own check allows as "taken from another
+/// parent's side" (`check_changes`) is decided here for the branch.
+///
+/// `landed` is the default branch's tip, given for a move that only adds to
+/// a branch other than the default one: there, a path where `new` holds
+/// what the default branch held at a merge base of the two (the newest
+/// landed snapshots `new` contains) is landed work the move takes, and no
+/// write (merging the default branch into one's own). The default branch
+/// itself, and a forced move, have no such paths. `cur` is `None` for a
+/// branch that holds nothing yet (everything in `new` is brought).
+///
+/// Never names a path `viewer` cannot read. `rows` are the push's graph
+/// rows (the merge bases are found only when a path would be refused).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn branch_move_write_refusal(
     hub: &Arc<Hub>,
     project: &Project,
     viewer: &Viewer,
-    cur: ObjectId,
-    anchor: ObjectId,
+    cur: Option<ObjectId>,
+    new: ObjectId,
+    landed: Option<ObjectId>,
+    rows: &mut PushRows,
     staged: Option<Arc<Staged>>,
 ) -> Result<Option<String>> {
-    if (viewer.admin && viewer.only.is_none() && !viewer.agent) || cur == anchor {
+    if (viewer.admin && viewer.only.is_none() && !viewer.agent) || cur == Some(new) {
         return Ok(None);
     }
     let (v, text, bindings) = (viewer.clone(), project.policy_text.clone(), project.bindings.clone());
-    blocking_in(hub, project.id, HashMap::new(), staged, move |src| {
+    let mut taken = std::mem::take(rows);
+    let (refusal, back) = blocking_in(hub, project.id, HashMap::new(), staged, move |src| {
         let p = Project {
             id: src.project,
             name: String::new(),
@@ -1563,27 +1619,47 @@ pub(crate) async fn branch_move_write_refusal(
             bindings,
         };
         let view = p.view(&v);
-        let from = src.snapshot(&cur)?.tree;
-        let to = src.snapshot(&anchor)?.tree;
-        if from == to {
-            return Ok(None);
+        let from = match cur {
+            Some(c) => Some(src.snapshot(&c)?.tree),
+            None => None,
+        };
+        let to = src.snapshot(&new)?.tree;
+        if from == Some(to) {
+            return Ok((None, taken));
         }
+        // An error in finding the landed work ends the walk.
+        let failed: std::cell::RefCell<Option<Error>> = std::cell::RefCell::new(None);
+        let landed = std::cell::RefCell::new((Landed::new(landed, new), &mut taken));
+        let is_landed = |path: &str, y: Option<&veil_core::TreeEntry>| -> Result<bool> {
+            let (landed, rows) = &mut *landed.borrow_mut();
+            landed.holds(src, rows, path, y)
+        };
         let refusal = std::cell::RefCell::new(None);
-        differs_where(&|id| stored_tree(src, id), Some(from), to, &|path, x, y| {
+        differs_where(&|id| stored_tree(src, id), from, to, &|path, x, y| {
             let is_dir = |e: Option<&veil_core::TreeEntry>| e.is_some_and(|e| e.kind == EntryKind::Dir);
             let is_file = |e: Option<&veil_core::TreeEntry>| e.is_some_and(|e| e.kind != EntryKind::Dir);
             if is_file(x) || is_file(y) {
-                if !view.within_narrowing(path) {
-                    *refusal.borrow_mut() = Some(NARROWED_MOVE.to_string());
-                    return Visit::Found;
-                }
-                if !view.read(path) {
-                    *refusal.borrow_mut() = Some("you may not move this branch across changes outside your view".to_string());
-                    return Visit::Found;
-                }
-                if !view.write(path) {
-                    *refusal.borrow_mut() = Some(format!("you may not write '{path}'"));
-                    return Visit::Found;
+                let why = if !view.within_narrowing(path) {
+                    Some(NARROWED_MOVE.to_string())
+                } else if !view.read(path) {
+                    Some("you may not move this branch across changes outside your view".to_string())
+                } else if !view.write(path) {
+                    Some(format!("you may not write '{path}'"))
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    match is_landed(path, y) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            *refusal.borrow_mut() = Some(why);
+                            return Visit::Found;
+                        }
+                        Err(e) => {
+                            *failed.borrow_mut() = Some(e);
+                            return Visit::Found;
+                        }
+                    }
                 }
             }
             if is_dir(x) || is_dir(y) {
@@ -1592,9 +1668,14 @@ pub(crate) async fn branch_move_write_refusal(
                 Visit::Skip
             }
         })?;
-        Ok(refusal.into_inner())
+        if let Some(e) = failed.into_inner() {
+            return Err(e);
+        }
+        Ok((refusal.into_inner(), taken))
     })
-    .await
+    .await?;
+    *rows = back;
+    Ok(refusal)
 }
 
 /// Why an agent session may not set a branch's tip ([`agent_tip`]).
@@ -2111,6 +2192,14 @@ fn check_changes(
 /// [`veil_core::policy::sealed_secret`] for sealed content labelled
 /// `visibility` at changed path `c`, among `changes` (relative to the first
 /// of real `parents`).
+///
+/// "A parent holds a sealed file at the path" is read as `vl` reads it
+/// (`Transaction::reconcile_sealing`, `Builder::protect_moves`,
+/// `upgrade::sealed_entries`): a parent's conflict there with a sealed
+/// version counts. A conflict entry's own label is always public; its
+/// versions carry theirs, each checked by this rule when the conflict was
+/// accepted. Otherwise the resolution of a conflict in a renamed secret,
+/// recorded as a change of its own, is refused for good (BUG-1930).
 fn sealed_secret_here(src: &Source, c: &Change, changes: &[Change], parents: &[ObjectId], visibility: &Visibility) -> Result<bool> {
     let Visibility::Cloaked { scope } = visibility else { return Ok(false) };
     veil_core::policy::sealed_secret(
@@ -2119,7 +2208,15 @@ fn sealed_secret_here(src: &Source, c: &Change, changes: &[Change], parents: &[O
         false,
         |path| {
             for p in parents {
-                if entry_at(src, &src.snapshot(p)?.tree, path)?.is_some_and(|e| !e.visibility.is_public()) {
+                let Some(e) = entry_at(src, &src.snapshot(p)?.tree, path)? else { continue };
+                let sealed = match e.kind {
+                    EntryKind::Conflict => match Object::decode(&src.raw(&e.id)?)? {
+                        Object::Conflict(cf) => cf.adds.iter().chain(&cf.removes).flatten().any(|t| !t.visibility.is_public()),
+                        _ => false,
+                    },
+                    _ => !e.visibility.is_public(),
+                };
+                if sealed {
                     return Ok(true);
                 }
             }
@@ -2918,24 +3015,24 @@ async fn push_staged(
                     });
                     continue;
                 }
-                if !(viewer.admin && viewer.only.is_none() && !viewer.agent) {
-                    let mut x = n;
-                    let mut checked_from_cur = false;
-                    for _ in 0..=completed.len() {
-                        let Some((parents, _)) = real_parents_of.get(&x) else { break };
-                        if parents.contains(&c) {
-                            checked_from_cur = true;
-                            break;
-                        }
-                        match parents.first().copied() {
-                            Some(p) => x = p,
-                            None => break,
-                        }
-                    }
-                    if !checked_from_cur {
-                        if let Some(msg) = branch_move_write_refusal(hub, project, viewer, c, x, Some(st.clone())).await? {
-                            return Err(Error::forbidden(msg));
-                        }
+            }
+            // The one write rule of a branch's move (BUG-1858, BUG-1920),
+            // for a push of any shape. A new branch other than the default
+            // one or a protected one holds nothing landed, and anyone may
+            // name what they can read; a new protected branch is judged
+            // against the default branch, a new default branch against
+            // nothing.
+            if let Some(n) = new_real {
+                let default = u.branch == project.default_branch;
+                if cur.is_some() || default || protected.contains(&u.branch) {
+                    let default_tip = if default { None } else { current.get(&project.default_branch).copied() };
+                    let (from, landed) = match cur {
+                        Some(c) if req.force && !is_ancestor_in(hub, project.id, Some(st.clone()), c, n).await? => (Some(c), None),
+                        Some(c) => (Some(c), default_tip),
+                        None => (default_tip, default_tip),
+                    };
+                    if let Some(msg) = branch_move_write_refusal(hub, project, viewer, from, n, landed, &mut rows, Some(st.clone())).await? {
+                        return Err(Error::forbidden(msg));
                     }
                 }
             }

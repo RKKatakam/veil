@@ -62,7 +62,7 @@ pub fn search(ctx: &mut Ctx, a: &SearchArgs) -> Result<ExitCode> {
     let v: Value = loop {
         match client.query("search", &params)? {
             Ok(v) => break v,
-            Err((code, _)) if (code == "indexing" || code == "warming") && tries < 30 => {
+            Err((code, _)) if code == "indexing" && tries < 30 => {
                 tries += 1;
                 std::thread::sleep(Duration::from_millis(500));
             }

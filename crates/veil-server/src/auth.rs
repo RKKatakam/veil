@@ -620,17 +620,24 @@ impl Caller {
         self.person.as_ref().ok_or_else(|| Error::unauthorized("sign in first (`vl login`)"))
     }
 
-    /// True when the request is a browser/web request (web UI route, cookie
-    /// auth, browser fetch/origin headers, or a `web-` session token).
+    /// True when the request is known to be a browser/web request (web UI
+    /// route, cookie auth, browser fetch/origin headers, or a `web-` session
+    /// token): what a web-only thing asks.
     pub fn is_web(&self) -> bool {
         crate::web::current_is_web()
+    }
+
+    /// True when the web client's restrictions apply: a browser/web request,
+    /// or one whose context is not known (`web::current_may_be_web`).
+    pub fn may_be_web(&self) -> bool {
+        crate::web::current_may_be_web()
     }
 
     /// Refuse an action that S25's no-secrets web client may never perform
     /// (secret key rings, secret shares, raw object streams, device/invite
     /// management, or minting child sessions).
     pub fn not_web(&self) -> Result<()> {
-        if self.is_web() {
+        if self.may_be_web() {
             return Err(Error::new(
                 axum::http::StatusCode::FORBIDDEN,
                 WEB_SESSION,

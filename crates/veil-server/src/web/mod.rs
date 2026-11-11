@@ -26,8 +26,8 @@ use veil_core::hub::wire::GroupChange;
 
 pub use assets::static_route;
 pub use session::{
-    adopt_session_route, check_same_origin, current_csrf, current_is_web, layer, login_page_route, logout_route,
-    record_session, require_csrf,
+    adopt_session_route, check_same_origin, current_csrf, current_is_web, current_may_be_web, layer, login_page_route, logout_route,
+    record_session, require_csrf, WebCtx,
 };
 
 use crate::{
@@ -94,7 +94,7 @@ pub async fn guarded_file_route(
     Path(p): Path<String>,
     Query(q): Query<FileParams>,
 ) -> Result<Response> {
-    if caller.is_web() {
+    if caller.may_be_web() {
         let ask = Ask::open(&hub, &p, &caller).await?;
         let (meta, bytes) = query::file(&hub, &ask, q, query::Limits::default()).await?;
         if meta["sealed"].as_bool() == Some(true) || meta["encoding"].as_str() != Some("content") {

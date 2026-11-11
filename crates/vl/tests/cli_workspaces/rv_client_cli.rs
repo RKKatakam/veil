@@ -274,3 +274,315 @@ fn bug_1844_a_sparse_sandbox_reads_only_its_paths_through_the_workspace_socket()
     let mounted = t.exec(&["--mount"], "vl blame docs/other.md");
     assert!(mounted.status.success() && text(&mounted).contains("dirty-outside"), "{}", text(&mounted));
 }
+
+/// Re-check of BUG-1840's fix (`rc-client`). The guard keeps a sealed
+/// secret's values out of *other* files a sandboxed command writes. A
+/// value a tracked file already held before the run was not written by
+/// the command: a sealed `.env` carries plain settings beside its secrets
+/// (`APP_URL=…`, a database URL also in `docker-compose.yml` or the
+/// README), and an agent must still be able to edit those files. "Normal
+/// use works"; `docs/VISIBILITY.md`: "If an agent writes a secret into
+/// some other file, Veil refuses to commit it and removes it after the
+/// run": this file's edit wrote none.
+#[test]
+fn bug_1931_a_sandbox_edit_of_a_file_that_already_held_a_sealed_files_value_is_recorded() {
+    const URL: &str = "http://localhost:3000/app";
+    const SECRET: &str = "Xk29vLq8sPzQw7LmTr4Bn6Yc";
+    let mut lost = Vec::new();
+    for flags in [&[][..], &["--mount"]] {
+        let t = T::new(&[
+            ("README.md", &format!("# Demo\n\nRun the app at {URL} after `make up`.\n")),
+            ("src/lib.rs", "pub fn f() {}\n"),
+            (".env", &format!("APP_URL={URL}\nAPI_KEY={SECRET}\n")),
+        ]);
+        let ls = t.ok(&["ls", "-r", "main"]);
+        assert!(ls.lines().any(|l| l.contains("cloaked") && l.ends_with(".env")), "the .env is a sealed secret:\n{ls}");
+        // The command edits the README (its URL line untouched), edits the
+        // code, and copies the real secret into a new file.
+        let o = t.exec(
+            flags,
+            r#"set -e
+               echo 'More docs.' >> README.md
+               echo '// x' >> src/lib.rs
+               v=$(grep API_KEY .env | cut -d= -f2); test -n "$v"; printf '%s\n' "$v" > val.txt"#,
+        );
+        assert!(o.status.success(), "{flags:?}: the run itself works:\n{}", text(&o));
+        // Control: the guard holds (BUG-1840), and a clean edit is recorded.
+        let listed = t.ok(&["ls", "-r", "agent@"]);
+        assert!(!listed.lines().any(|l| l.ends_with("val.txt")), "{flags:?}: the copy of the secret is not recorded:\n{listed}");
+        assert!(t.ok(&["cat", "-r", "agent@", "src/lib.rs"]).contains("// x"), "{flags:?}: the edit of the code is recorded");
+        // The README's edit is recorded too.
+        let readme = t.ok(&["cat", "-r", "agent@", "README.md"]);
+        if !readme.contains("More docs.") {
+            lost.push(format!("{flags:?}: the edit of README.md was not recorded:\n{}", text(&o)));
+            continue;
+        }
+        // And it is left where the command wrote it: the next run finds it.
+        assert!(
+            !text(&o).lines().any(|l| l.contains("README.md") && (l.contains("quarantined") || l.contains("cleaned"))),
+            "{flags:?}: README.md is neither quarantined nor cleaned:\n{}",
+            text(&o)
+        );
+        let o = t.exec(flags, "grep -q 'More docs.' README.md");
+        assert!(o.status.success(), "{flags:?}: the edit is still in the sandbox:\n{}", text(&o));
+    }
+    assert!(lost.is_empty(), "{lost:#?}");
+}
+
+/// BUG-1931's fix keeps BUG-1840 closed: only a value the path's recorded
+/// version already held is let through. A value that is new to a file is
+/// the command's copy and is never recorded: the real secret appended to
+/// the README that held the URL, the URL in a file that never held it, and
+/// the URL in a new file. On every route: a checked-out sandbox and
+/// `--mount`, at a `vl commit` through the socket and at the run's end.
+#[test]
+fn bug_1931_a_value_new_to_a_file_is_still_never_recorded() {
+    const URL: &str = "http://localhost:3000/app";
+    const SECRET: &str = "Xk29vLq8sPzQw7LmTr4Bn6Yc";
+    let readme = format!("# Demo\n\nRun the app at {URL} after `make up`.\n");
+    for flags in [&[][..], &["--mount"]] {
+        let t = T::new(&[("README.md", &readme), ("a.txt", "a\n"), ("src/lib.rs", "pub fn f() {}\n"), (".env", &format!("APP_URL={URL}\nAPI_KEY={SECRET}\n"))]);
+        let o = t.exec(
+            flags,
+            r#"set -e
+               k=$(grep API_KEY .env | cut -d= -f2); test -n "$k"
+               u=$(grep APP_URL .env | cut -d= -f2-); test -n "$u"
+               echo "key: $k" >> README.md
+               echo "see $u" > notes.md
+               echo "// $u" >> src/lib.rs
+               echo 'clean' >> a.txt
+               vl commit -m 'mid-run commit'
+               echo 'more' >> a.txt"#,
+        );
+        let out = text(&o);
+        assert!(o.status.success(), "{flags:?}: the run itself works:\n{out}");
+        let mid = t.ok(&["diff", "--from", "main", "--to", "agent@-"]);
+        assert!(mid.contains("+clean"), "{flags:?}: the clean edit was committed mid-run:\n{mid}");
+        assert!(t.ok(&["cat", "-r", "agent@", "a.txt"]).contains("more"), "{flags:?}: the later clean edit is recorded at the run's end");
+        for rev in ["agent@-", "agent@"] {
+            let listed = t.ok(&["ls", "-r", rev]);
+            assert!(!listed.lines().any(|l| l.ends_with("notes.md")), "{flags:?}: {rev}: a new file with the URL is a copy:\n{listed}\nrun:\n{out}");
+            assert_eq!(t.ok(&["cat", "-r", rev, "README.md"]), readme, "{flags:?}: {rev}: the README with the secret added is not recorded\nrun:\n{out}");
+            assert_eq!(t.ok(&["cat", "-r", rev, "src/lib.rs"]), "pub fn f() {}\n", "{flags:?}: {rev}: the URL is new to src/lib.rs\nrun:\n{out}");
+            let show = t.ok(&["diff", "--from", "main", "--to", rev]);
+            assert!(!show.contains(SECRET), "{flags:?}: {rev} holds the secret in plain text:\n{show}");
+        }
+        // "… and removes it after the run": the README is the recorded one
+        // again, the new file is gone.
+        let o = t.exec(flags, &format!("set -e; ! grep -q '{SECRET}' README.md; grep -q '{URL}' README.md; test ! -e notes.md; ! grep -q '{URL}' src/lib.rs"));
+        assert!(o.status.success(), "{flags:?}: the copies were taken out of the sandbox:\n{}", text(&o));
+    }
+}
+
+/// BUG-1931, the cleanup after the run ("scrub by the same rule"): an edit
+/// of such a file that is not recorded for another reason (here the
+/// pattern scanner holds it back, as it does outside a sandbox) stays
+/// where the command wrote it, for the person to fix, as the edit of any
+/// other file does. It is not a copy of the sealed file's value: the URL
+/// was in the file's recorded version.
+#[test]
+fn bug_1931_an_unrecorded_edit_of_such_a_file_is_not_cleaned_as_a_copy() {
+    const URL: &str = "http://localhost:3000/app";
+    let readme = format!("# Demo\n\nRun the app at {URL} after `make up`.\n");
+    for flags in [&[][..], &["--mount"]] {
+        let t = T::new(&[("README.md", &readme), (".env", &format!("APP_URL={URL}\nAPI_KEY=Xk29vLq8sPzQw7LmTr4Bn6Yc\n"))]);
+        let o = t.exec(flags, r#"echo 'key = "AKIAIOSFODNN7EXAMPLE"' >> README.md"#);
+        let out = text(&o);
+        assert!(o.status.success(), "{flags:?}: the run works:\n{out}");
+        assert!(out.lines().any(|l| l.contains("README.md") && l.contains("quarantined")), "{flags:?}: control: the scanner holds the edit back:\n{out}");
+        assert_eq!(t.ok(&["cat", "-r", "agent@", "README.md"]), readme, "{flags:?}: control: the edit is not recorded");
+        assert!(!out.lines().any(|l| l.contains("README.md") && l.contains("cleaned")), "{flags:?}: the edit is not cleaned as a copy:\n{out}");
+        let o = t.exec(flags, "grep -q AKIAIOSFODNN7EXAMPLE README.md");
+        assert!(o.status.success(), "{flags:?}: the held-back edit is still in the sandbox:\n{}", text(&o));
+    }
+}
+
+/// BUG-1931 for a file in conflict: the path's recorded version is then
+/// the conflict, and what its (public) versions held, the resolution may
+/// keep, whichever side held it. A resolution that adds the real secret is
+/// held back, and the conflicted copy is put back for the next run.
+#[test]
+fn bug_1931_a_conflict_in_a_file_that_held_a_sealed_files_value_is_resolved_in_a_sandbox() {
+    const URL: &str = "http://localhost:3000/app";
+    const SECRET: &str = "Xk29vLq8sPzQw7LmTr4Bn6Yc";
+    let with_url = format!("# Demo\n\nRun the app at {URL}.\n");
+    let without = "# Demo\n\nSee the wiki.\n";
+    for flags in [&[][..], &["--mount"]] {
+        for url_first in [true, false] {
+            let what = format!("{flags:?}, the URL on the {} side", if url_first { "first" } else { "second" });
+            let t = T::new(&[("README.md", "# Demo\n"), (".env", &format!("APP_URL={URL}\nAPI_KEY={SECRET}\n"))]);
+            let (one, two) = if url_first { (with_url.as_str(), without) } else { (without, with_url.as_str()) };
+            std::fs::write(t.proj.join("README.md"), one).unwrap();
+            t.ok(&["commit", "-m", "one"]);
+            t.ok(&["tag", "set", "side-a", "-r", "@-"]);
+            t.ok(&["new", "side-a-"]);
+            std::fs::write(t.proj.join("README.md"), two).unwrap();
+            t.ok(&["commit", "-m", "two"]);
+            t.ok(&["tag", "set", "side-b", "-r", "@-"]);
+            let out = t.ok(&["rebase", "-s", "side-b", "-d", "side-a"]);
+            assert!(out.contains("conflicts in: README.md"), "{what}: control: the rebase conflicts:\n{out}");
+            t.ok(&["rebase", "-s", "agent@", "-d", "side-b"]);
+
+            // A resolution that inlines the real secret is not recorded.
+            let o = t.exec(flags, &format!(r#"set -e; grep -q '^<<<<<<<' README.md; grep -q '{URL}' README.md; printf '# Demo
+
+Run the app at {URL}.
+Key: %s
+' "$(grep API_KEY .env | cut -d= -f2)" > README.md"#));
+            assert!(o.status.success(), "{what}: the run works:\n{}", text(&o));
+            let listed = t.ok(&["ls", "-r", "agent@"]);
+            assert!(listed.lines().any(|l| l.contains("README.md") && l.contains("conflict")), "{what}: the conflict stays recorded:\n{listed}\nrun:\n{}", text(&o));
+            assert!(!t.ok(&["diff", "--from", "side-a", "--to", "agent@"]).contains(SECRET), "{what}: the secret is not recorded");
+
+            // The conflicted copy is back; a resolution that keeps the URL
+            // (which one of the versions held) is recorded.
+            let o = t.exec(flags, &format!(r#"set -e; grep -q '^<<<<<<<' README.md; ! grep -q '{SECRET}' README.md; printf '# Demo
+
+Run the app at {URL}.
+See the wiki.
+' > README.md"#));
+            assert!(o.status.success(), "{what}: the conflicted copy is back, and the resolution runs:\n{}", text(&o));
+            let listed = t.ok(&["ls", "-r", "agent@"]);
+            assert!(listed.lines().any(|l| l.contains("README.md") && !l.contains("conflict")), "{what}: the resolution is recorded:\n{listed}\nrun:\n{}", text(&o));
+            assert_eq!(t.ok(&["cat", "-r", "agent@", "README.md"]), format!("# Demo\n\nRun the app at {URL}.\nSee the wiki.\n"), "{what}: the resolution's content\nrun:\n{}", text(&o));
+        }
+    }
+}
+
+const KEYS_1932: [&str; 3] = ["Xk29vLq8sPzQw7LmTr4Bn6Yc", "Qm83nRt5wZx1cVb7yHj2kLp9", "Ty64gFd2sAq9oPi3uLk8mNb5"];
+
+/// A project whose sealed `.env` is in conflict in the agent's workspace:
+/// two changes set the key differently, one rebased onto the other
+/// conflicts, and the workspace stands on the conflicted change (`side-b`).
+fn conflicted_env_1932() -> T {
+    const KEYS: [&str; 3] = KEYS_1932;
+    let t = T::new(&[("a.txt", "a\n"), (".env", &format!("API_KEY={}\n", KEYS[0]))]);
+    std::fs::write(t.proj.join(".env"), format!("API_KEY={}\n", KEYS[1])).unwrap();
+    t.ok(&["commit", "-m", "key one"]);
+    t.ok(&["tag", "set", "side-a", "-r", "@-"]);
+    t.ok(&["new", "side-a-"]);
+    std::fs::write(t.proj.join(".env"), format!("API_KEY={}\n", KEYS[2])).unwrap();
+    t.ok(&["commit", "-m", "key two"]);
+    t.ok(&["tag", "set", "side-b", "-r", "@-"]);
+    let out = t.ok(&["rebase", "-s", "side-b", "-d", "side-a"]);
+    assert!(out.contains("conflicts in: .env"), "control: the rebase conflicts:\n{out}");
+    t.ok(&["rebase", "-s", "agent@", "-d", "side-b"]);
+    let ls = t.ok(&["ls", "-r", "agent@"]);
+    assert!(ls.lines().any(|l| l.contains("cloaked") && l.contains(".env") && l.contains("conflict")), "control: the sandbox's .env is a sealed secret in conflict:\n{ls}");
+    t
+}
+
+/// Re-check of BUG-1840's fix (`rc-client`): a sealed secret's value
+/// written to another file in a sandbox is never recorded, also when the
+/// secret is in conflict. The sandbox then holds every version of it in
+/// plain text, between conflict markers, for the command to resolve.
+#[test]
+fn bug_1932_the_values_of_a_conflicted_sealed_secret_copied_in_a_sandbox_are_never_recorded() {
+    const KEYS: [&str; 3] = KEYS_1932;
+    let t = conflicted_env_1932();
+
+    let o = t.exec(&["-m", "agent: list the keys"], r#"set -e; grep -q '^<<<<<<<' .env; grep '^API_KEY' .env | cut -d= -f2 > vals.txt; test "$(wc -l < vals.txt)" = 3"#);
+    assert!(o.status.success(), "the run itself works (the sandbox holds the conflict's versions in plain text):\n{}", text(&o));
+
+    let listed = t.ok(&["ls", "-r", "agent@"]);
+    let show = t.ok(&["diff", "--from", "side-b", "--to", "agent@"]);
+    let recorded: Vec<&str> = KEYS.iter().copied().filter(|k| show.contains(k)).collect();
+    assert!(
+        recorded.is_empty() && !listed.lines().any(|l| l.ends_with("vals.txt")),
+        "the sealed secret's values were recorded in plain text (and would be pushed): {recorded:?}\nfiles:\n{listed}\nrun:\n{}",
+        text(&o)
+    );
+    assert!(!t.proj.join(".veil/local/sandboxes/agent/files/vals.txt").exists(), "vals.txt holds the secret's values and must be taken out of the sandbox after the run");
+}
+
+/// BUG-1932 on every route that records: a checked-out sandbox and
+/// `--mount`, at the run's end and at a `vl commit` through the workspace
+/// socket, and in a description set through the socket (BUG-1841's guard,
+/// which shared the gap). Each version of the conflicted secret is guarded:
+/// all three together, and one alone.
+#[test]
+fn bug_1932_conflicted_sealed_secret_guard_covers_mounts_socket_commits_and_descriptions() {
+    const KEYS: [&str; 3] = KEYS_1932;
+    for flags in [&[][..], &["--mount"]] {
+        let t = conflicted_env_1932();
+        let o = t.exec(
+            flags,
+            r#"set -e
+               grep -q '^<<<<<<<' .env
+               grep '^API_KEY' .env | cut -d= -f2 > vals.txt
+               test "$(wc -l < vals.txt)" = 3
+               tail -1 vals.txt > one.txt
+               echo 'clean' >> a.txt
+               vl commit -m 'mid-run commit'
+               head -1 vals.txt > later.txt
+               set +e
+               vl describe -m "key $(tail -1 vals.txt)"; echo "describe: $?"
+               vl commit -m "keys $(head -1 vals.txt)"; echo "commit: $?"
+               exit 0"#,
+        );
+        let out = text(&o);
+        assert!(o.status.success(), "{flags:?}: the run itself works:\n{out}");
+        for tag in ["describe: 1", "commit: 1"] {
+            assert!(out.contains(tag), "{flags:?}: expected the refusal `{tag}`:\n{out}");
+        }
+        for k in KEYS {
+            assert!(!out.contains(k), "{flags:?}: a refusal echoed a version of the secret:\n{out}");
+        }
+        // The clean edit was committed through the socket; no copy was,
+        // there or at the run's end.
+        let mid = t.ok(&["diff", "--from", "side-b", "--to", "agent@-"]);
+        assert!(mid.contains("+clean"), "{flags:?}: the clean edit was committed mid-run:\n{mid}");
+        for rev in ["agent@-", "agent@"] {
+            let listed = t.ok(&["ls", "-r", rev]);
+            let show = t.ok(&["diff", "--from", "side-b", "--to", rev]);
+            let recorded: Vec<&str> = KEYS.iter().copied().filter(|k| show.contains(k)).collect();
+            assert!(recorded.is_empty(), "{flags:?}: {rev} holds the secret's values in plain text: {recorded:?}\n{listed}\nrun:\n{out}");
+            for f in ["vals.txt", "one.txt", "later.txt"] {
+                assert!(!listed.lines().any(|l| l.ends_with(f)), "{flags:?}: {f} must not be recorded in {rev}:\n{listed}\nrun:\n{out}");
+            }
+            // The conflict itself is untouched, and still sealed.
+            assert!(
+                listed.lines().any(|l| l.contains("cloaked") && l.contains(".env") && l.contains("conflict")),
+                "{flags:?}: the .env of {rev} is still the sealed conflict:\n{listed}"
+            );
+        }
+        let log = t.ok(&["log", "-r", "::agent@"]);
+        for k in KEYS {
+            assert!(!log.contains(k), "{flags:?}: a version of the secret is in a description:\n{log}");
+        }
+        for f in ["vals.txt", "one.txt", "later.txt"] {
+            assert!(!t.proj.join(".veil/local/sandboxes/agent/files").join(f).exists(), "{flags:?}: {f} removed from the sandbox");
+            assert!(!t.proj.join(".veil/local/mounts/agent/upper").join(f).exists(), "{flags:?}: {f} removed from the mount overlay");
+        }
+    }
+}
+
+/// BUG-1932's guard leaves normal use alone: the command may edit the
+/// conflicted secret in place. A partial edit (markers kept) stays a sealed
+/// conflict, and its copy stays in the sandbox for the next run; a
+/// resolution is recorded as the sealed file, never plain.
+#[test]
+fn bug_1932_a_conflicted_sealed_secret_is_still_edited_and_resolved_in_place() {
+    const KEYS: [&str; 3] = KEYS_1932;
+    const NEW: &str = "Hn47bVc9xZa2lKj6hGf3dSq1";
+    for flags in [&[][..], &["--mount"]] {
+        let t = conflicted_env_1932();
+        // A partial edit: one side's key replaced, the markers kept.
+        let o = t.exec(flags, &format!(r#"set -e; grep -q '{k}' .env; sed -i 's/{k}/{NEW}/' .env; grep -q '^<<<<<<<' .env"#, k = KEYS[2]));
+        assert!(o.status.success(), "{flags:?}: the partial edit runs:\n{}", text(&o));
+        let listed = t.ok(&["ls", "-r", "agent@"]);
+        assert!(
+            listed.lines().any(|l| l.contains("cloaked") && l.contains(".env") && l.contains("conflict")),
+            "{flags:?}: a partly edited conflict is still a sealed conflict:\n{listed}\nrun:\n{}",
+            text(&o)
+        );
+        // The next run still finds the conflicted copy, with the edit, and
+        // resolves it.
+        let o = t.exec(flags, &format!(r#"set -e; grep -q '^<<<<<<<' .env; grep -q '{NEW}' .env; printf 'API_KEY={NEW}\n' > .env"#));
+        assert!(o.status.success(), "{flags:?}: the copy is still there with its edit, and the resolution runs:\n{}", text(&o));
+        let listed = t.ok(&["ls", "-r", "agent@"]);
+        let env = listed.lines().find(|l| l.contains(".env")).unwrap_or_else(|| panic!("{flags:?}: .env is recorded:\n{listed}"));
+        assert!(env.contains("cloaked") && !env.contains("conflict"), "{flags:?}: the resolution is recorded as the sealed file:\n{listed}\nrun:\n{}", text(&o));
+        assert_eq!(t.ok(&["ws", "cat", "agent", ".env"]), format!("API_KEY={NEW}\n"), "{flags:?}: the resolution's content");
+    }
+}

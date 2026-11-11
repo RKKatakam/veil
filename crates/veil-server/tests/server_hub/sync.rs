@@ -81,6 +81,83 @@ fn a_one_directory_clone_killed_during_its_checkout_is_finished() {
     assert!(interrupted > 0, "no clone was interrupted during its checkout (each finished first)");
 }
 
+/// BUG-1913: `vl pull` waits out `503 warming`. A full clone's pull asks
+/// for the server's history of the tips it had that are tips no more (one
+/// page of `/history`, BUG-1562), which reads the person's graph: while
+/// that is being filled the answer is `warming` at the query's deadline
+/// (2 s), and the fill goes on. `vl` waited out only an answer with
+/// `retry_after_ms` (`429`, `503 busy`: BUG-1331), so a pull that met
+/// `warming` failed with "this history is being prepared for you; try
+/// again in a few seconds", as
+/// `a_one_directory_clone_killed_during_its_checkout_is_finished` did under
+/// a full suite's load on YugabyteDB. Here the admins' graph is cold and
+/// another server's lease holds its fill for 8 s.
+#[test]
+fn bug_1913_a_pull_waits_out_a_warming_server() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.admin.token();
+    let was = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    // Another clone moves `main`: the tip `p.dir` has is a tip no more.
+    let other = p.admin.dir("other-1913");
+    p.admin.ok(p.admin.home.path(), &["clone", &hub.url(&p.name), other.to_str().unwrap()]);
+    write_files(&other, &[("src/later-1913.rs", "pub fn later() {}\n")]);
+    p.admin.commit_main(&other, "a later change");
+    p.admin.ok(&other, &["push"]);
+
+    // The push's own fills end; then the admins' graph is cold, and
+    // another server holds its fill.
+    let db = hub.hub().db.clone();
+    let rt = hub.rt.handle().clone();
+    let pid: i64 = rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&db)).unwrap();
+    let until = Instant::now() + Duration::from_secs(60);
+    while rt.block_on(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM view_fills WHERE project_id = $1").bind(pid).fetch_one(&db)).unwrap() > 0 {
+        assert!(Instant::now() < until, "the fills the push started did not end");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    rt.block_on(async {
+        sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, 'admin', 'other-server', $2)")
+            .bind(pid)
+            .bind(veil_core::now_millis() + 600_000)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM view_graph WHERE project_id = $1").bind(pid).execute(&db).await.unwrap();
+    });
+    hub.hub().query.rows.clear();
+    // The page the pull will ask for is answered `warming` now.
+    let (auth, format) = (format!("Bearer {token}"), veil_core::repo::REPO_FORMAT.to_string());
+    let r = api.post_with(
+        &format!("/v1/projects/{}/history", p.name),
+        &serde_json::to_vec(&serde_json::json!({"tips": [was.hex()], "stop": [], "limit": 1})).unwrap(),
+        &[("authorization", &auth), (veil_core::hub::wire::FORMAT_HEADER, &format)],
+    );
+    assert_eq!((r.status, r.json()["code"].as_str()), (503, Some("warming")), "{}", String::from_utf8_lossy(&r.body));
+
+    // The other server's fill ends 8 s from now: the pull waits until then.
+    let released = AtomicBool::new(false);
+    let out = std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_secs(8));
+            released.store(true, Ordering::SeqCst);
+            rt.block_on(sqlx::query("DELETE FROM view_fills WHERE project_id = $1 AND holder = 'other-server'").bind(pid).execute(&db)).unwrap();
+        });
+        p.admin.run(&p.dir, &["pull"])
+    });
+    assert!(
+        out.status.success(),
+        "a pull that met `warming` did not wait it out:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(released.load(Ordering::SeqCst), "the pull ended while the graph's fill was held: it never asked for the page that was `warming`");
+    p.admin.ok(&p.dir, &["new", "main"]);
+    assert_eq!(std::fs::read_to_string(p.dir.join("src/later-1913.rs")).unwrap(), "pub fn later() {}\n");
+}
+
 /// BUG-832. A clone without the project's `.veilpolicy` on disk: one
 /// directory (`--only`), or a whole clone by someone who cannot read the
 /// policy (the project root is private to admins). The secret was
