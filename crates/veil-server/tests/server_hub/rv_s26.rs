@@ -932,7 +932,6 @@ fn over_http2(hub: &TestHub, method: &str, path: &str, headers: &[(&str, &str)],
 }
 
 #[test]
-#[ignore = "BUG-1906: over HTTP/2, which every browser speaks to the server, there is no Host header: a passkey ceremony is refused (400) and so is every form of the web client (403)"]
 fn bug_1906_a_browser_enrolls_signs_in_and_signs_out_over_http2() {
     let hub = TestHub::start();
     let alice = hub.person("alice");
@@ -944,6 +943,7 @@ fn bug_1906_a_browser_enrolls_signs_in_and_signs_out_over_http2() {
     assert!(page.contains("veil-passkey-login-form"), "{page}");
 
     // A sign-in starts, over HTTP/1.1 and over HTTP/2.
+    login_challenge(&BrowserClient::http1(&hub), None);
     login_challenge(&BrowserClient::new(&hub), None);
     let (status, answer) = over_http2(&hub, "POST", "/web/passkey/login/begin", &browser, b"{}");
     assert_eq!(status, 200, "a passkey sign-in over HTTP/2: {answer}");

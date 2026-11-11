@@ -68,8 +68,7 @@ impl WebReply {
 pub(crate) type SentLog = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 pub(crate) struct BrowserClient {
-    pub(crate) agent: ureq::Agent,
-    pub(crate) base: String,
+    pub(crate) transport: WebTransport,
     pub(crate) origin: String,
     pub(crate) rp_id: String,
     pub(crate) cookie: Option<String>,
@@ -83,28 +82,20 @@ impl BrowserClient {
     }
 
     pub(crate) fn at(authority: &str, cert_pem: &str) -> Self {
-        let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(cert_pem.as_bytes())
-            .filter_map(|i| match i {
-                Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
-                _ => None,
-            })
-            .collect();
-        let tls = ureq::tls::TlsConfig::builder()
-            .provider(ureq::tls::TlsProvider::Rustls)
-            .root_certs(ureq::tls::RootCerts::Specific(Arc::new(certs)))
-            .build();
-        let agent = ureq::Agent::config_builder()
-            .tls_config(tls)
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_global(Some(Duration::from_secs(60)))
-            .build()
-            .new_agent();
+        Self::over(WebTransport::new(authority, cert_pem), authority)
+    }
+
+    /// The same client over HTTP/1.1 (`BrowserClient::new` speaks HTTP/2, as
+    /// a browser does: BUG-1906).
+    pub(crate) fn http1(hub: &TestHub) -> Self {
+        Self::over(WebTransport::http1(&hub.authority(), &hub.cert_pem), &hub.authority())
+    }
+
+    fn over(transport: WebTransport, authority: &str) -> Self {
         let origin = format!("https://{authority}");
         let rp_id = authority.split(':').next().unwrap_or(authority).to_string();
         Self {
-            agent,
-            base: origin.clone(),
+            transport,
             origin,
             rp_id,
             cookie: None,
@@ -113,17 +104,15 @@ impl BrowserClient {
         }
     }
 
-    pub(crate) fn finish(r: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> WebReply {
-        let r = r.expect("HTTP response");
-        let status = r.status().as_u16();
-        let mut headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (k, v) in r.headers() {
-            if let Ok(s) = v.to_str() {
-                headers.entry(k.as_str().to_ascii_lowercase()).or_default().push(s.to_string());
-            }
+    /// One request with this client's cookie.
+    pub(crate) fn send(&self, method: &str, path: &str, headers: &[(&str, &str)], body: Option<&[u8]>) -> WebReply {
+        let cookie = self.cookie.as_ref().map(|c| format!("__Host-veil_session={c}"));
+        let mut all = headers.to_vec();
+        if let Some(c) = &cookie {
+            all.push(("cookie", c));
         }
-        let body = r.into_body().with_config().limit(16 << 20).read_to_vec().unwrap();
-        WebReply { status, headers, body }
+        let a = self.transport.send(method, path, &all, body);
+        WebReply { status: a.status, headers: a.headers, body: a.body }
     }
 
     pub(crate) fn capture_cookie(&mut self, r: &WebReply) {
@@ -140,28 +129,11 @@ impl BrowserClient {
     }
 
     pub(crate) fn get(&self, path: &str) -> WebReply {
-        let mut req = self
-            .agent
-            .get(format!("{}{path}", self.base))
-            .header("sec-fetch-dest", "document")
-            .header("sec-fetch-mode", "navigate")
-            .header("sec-fetch-site", "same-origin");
-        if let Some(c) = &self.cookie {
-            req = req.header("cookie", &format!("__Host-veil_session={c}"));
-        }
-        Self::finish(req.call())
+        self.send("GET", path, &[("sec-fetch-dest", "document"), ("sec-fetch-mode", "navigate"), ("sec-fetch-site", "same-origin")], None)
     }
 
     pub(crate) fn get_api(&self, path: &str) -> WebReply {
-        let mut req = self
-            .agent
-            .get(format!("{}{path}", self.base))
-            .header("accept", "application/json")
-            .header("sec-fetch-site", "same-origin");
-        if let Some(c) = &self.cookie {
-            req = req.header("cookie", &format!("__Host-veil_session={c}"));
-        }
-        Self::finish(req.call())
+        self.send("GET", path, &[("accept", "application/json"), ("sec-fetch-site", "same-origin")], None)
     }
 
     pub(crate) fn post_json(&self, path: &str, body: &Value, include_csrf: bool) -> WebReply {
@@ -171,22 +143,11 @@ impl BrowserClient {
     pub(crate) fn post_json_origin(&self, path: &str, body: &Value, include_csrf: bool, origin: &str) -> WebReply {
         let bytes = serde_json::to_vec(body).unwrap();
         self.sent_bodies.lock().unwrap().push((path.to_string(), bytes.clone()));
-        let mut req = self
-            .agent
-            .post(format!("{}{path}", self.base))
-            .header("content-type", "application/json")
-            .header("accept", "application/json")
-            .header("origin", origin)
-            .header("sec-fetch-site", "same-origin");
-        if let Some(c) = &self.cookie {
-            req = req.header("cookie", &format!("__Host-veil_session={c}"));
+        let mut headers = vec![("content-type", "application/json"), ("accept", "application/json"), ("origin", origin), ("sec-fetch-site", "same-origin")];
+        if let (true, Some(csrf)) = (include_csrf, &self.csrf) {
+            headers.push(("x-veil-csrf", csrf));
         }
-        if include_csrf {
-            if let Some(csrf) = &self.csrf {
-                req = req.header("x-veil-csrf", csrf);
-            }
-        }
-        Self::finish(req.send(&bytes))
+        self.send("POST", path, &headers, Some(&bytes))
     }
 
     pub(crate) fn post_form(&self, path: &str, fields: &[(&str, &str)], include_csrf: bool) -> WebReply {
@@ -201,16 +162,7 @@ impl BrowserClient {
         }
         let encoded = pairs.join("&").into_bytes();
         self.sent_bodies.lock().unwrap().push((path.to_string(), encoded.clone()));
-        let mut req = self
-            .agent
-            .post(format!("{}{path}", self.base))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .header("origin", &self.origin)
-            .header("sec-fetch-site", "same-origin");
-        if let Some(c) = &self.cookie {
-            req = req.header("cookie", &format!("__Host-veil_session={c}"));
-        }
-        Self::finish(req.send(&encoded))
+        self.send("POST", path, &[("content-type", "application/x-www-form-urlencoded"), ("origin", &self.origin), ("sec-fetch-site", "same-origin")], Some(&encoded))
     }
 }
 

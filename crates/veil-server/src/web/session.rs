@@ -63,7 +63,23 @@ fn csrf_err(msg: &'static str) -> Error {
     Error::new(StatusCode::FORBIDDEN, CSRF_FAILED, msg)
 }
 
-/// Verify that a state-changing browser request comes from the same origin.
+/// The request's authority, in one place (BUG-1906): over HTTP/2, which every
+/// browser speaks to this server, it is `:authority` (hyper puts it in the
+/// request's URI and adds no `Host` header); over HTTP/1.1 it is `Host`. A
+/// request target that carries an authority wins over a `Host` header (RFC
+/// 9112 §3.2.2, RFC 9113 §8.3.1), so every later reader of `Host`
+/// ([`check_same_origin`], the passkey ceremonies' origin, `vl login`'s
+/// server name) sees the one authority the request was made to.
+fn set_request_authority(req: &mut Request) {
+    let Some(authority) = req.uri().authority() else { return };
+    match HeaderValue::from_str(authority.as_str()) {
+        Ok(v) => req.headers_mut().insert(header::HOST, v),
+        Err(_) => req.headers_mut().remove(header::HOST),
+    };
+}
+
+/// Verify that a state-changing browser request comes from the same origin
+/// (the request's authority: [`set_request_authority`]).
 pub fn check_same_origin(headers: &HeaderMap) -> Result<()> {
     let host = headers
         .get(header::HOST)
@@ -120,7 +136,8 @@ pub fn require_current_csrf(headers: &HeaderMap, form_csrf: Option<&str>) -> Res
 
 /// Router middleware: tracks browser/web context per request, attaches CSP &
 /// security headers, and renders static non-leaking HTML error pages on web UI routes.
-pub async fn layer(req: Request, next: Next) -> Response {
+pub async fn layer(mut req: Request, next: Next) -> Response {
+    set_request_authority(&mut req);
     let path = req.uri().path().to_string();
     let is_api = path.starts_with("/v1/");
     let wants_json = is_api

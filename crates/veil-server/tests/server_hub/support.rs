@@ -1142,3 +1142,155 @@ impl Craft<'_> {
         self.send(serde_json::json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": id.hex()}]}))
     }
 }
+
+/// What a web test's client got back.
+pub struct WebAnswer {
+    pub status: u16,
+    /// Lowercase names; a header sent twice (`set-cookie`) keeps both values.
+    pub headers: std::collections::BTreeMap<String, Vec<String>>,
+    pub body: Vec<u8>,
+}
+
+/// How the web tests' clients (`web::WebClient`, `web_secrets::BrowserClient`)
+/// reach the server. **HTTP/2 by default, as every browser speaks to it**
+/// (its TLS offers `h2` first): the request carries `:authority` and no
+/// `Host` header, which is what S25's same-origin check never saw while its
+/// tests spoke HTTP/1.1 only (BUG-1906). [`WebTransport::http1`] is the
+/// HTTP/1.1 client those tests had, for the tests that prove both.
+pub struct WebTransport {
+    base: String,
+    http1: ureq::Agent,
+    http2: Option<Http2>,
+}
+
+struct Http2 {
+    rt: tokio::runtime::Runtime,
+    authority: String,
+    tls: tokio_rustls::TlsConnector,
+    conn: std::sync::Mutex<Option<hyper::client::conn::http2::SendRequest<axum::body::Body>>>,
+}
+
+#[derive(Clone)]
+struct OnRuntime(tokio::runtime::Handle);
+
+impl<F> hyper::rt::Executor<F> for OnRuntime
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, fut: F) {
+        self.0.spawn(fut);
+    }
+}
+
+impl WebTransport {
+    /// Over HTTP/2, as a browser.
+    pub fn new(authority: &str, cert_pem: &str) -> Self {
+        let mut t = Self::http1(authority, cert_pem);
+        let mut roots = rustls::RootCertStore::empty();
+        for c in Self::certificates(cert_pem) {
+            roots.add(rustls::pki_types::CertificateDer::from(c.der().to_vec())).expect("the test server's certificate");
+        }
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        // A browser offers both and takes the server's first choice.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        t.http2 = Some(Http2 {
+            rt: tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap(),
+            authority: authority.to_string(),
+            tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            conn: std::sync::Mutex::new(None),
+        });
+        t
+    }
+
+    /// Over HTTP/1.1 (`Host`, no `:authority`).
+    pub fn http1(authority: &str, cert_pem: &str) -> Self {
+        let tls = ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::Rustls)
+            .root_certs(ureq::tls::RootCerts::Specific(Arc::new(Self::certificates(cert_pem))))
+            .build();
+        let http1 = ureq::Agent::config_builder()
+            .tls_config(tls)
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_global(Some(Duration::from_secs(60)))
+            .build()
+            .new_agent();
+        Self { base: format!("https://{authority}"), http1, http2: None }
+    }
+
+    fn certificates(cert_pem: &str) -> Vec<ureq::tls::Certificate<'static>> {
+        ureq::tls::parse_pem(cert_pem.as_bytes())
+            .filter_map(|i| match i {
+                Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One request, no redirect followed. `body` is `None` for a request
+    /// without one (`GET`, `DELETE`).
+    pub fn send(&self, method: &str, path: &str, headers: &[(&str, &str)], body: Option<&[u8]>) -> WebAnswer {
+        let url = format!("{}{path}", self.base);
+        let mut req = ureq::http::Request::builder().method(method).uri(&url);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let (status, head, body) = match &self.http2 {
+            Some(h2) => h2.send(req.body(axum::body::Body::from(body.unwrap_or_default().to_vec())).expect("a request")),
+            None => {
+                let r = match body {
+                    Some(b) => self.http1.run(req.body(b.to_vec()).expect("a request")),
+                    None => self.http1.run(req.body(()).expect("a request")),
+                }
+                .expect("HTTP response");
+                let (parts, mut body) = r.into_parts();
+                (parts.status, parts.headers, body.with_config().limit(16 << 20).read_to_vec().unwrap())
+            }
+        };
+        let mut headers: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (k, v) in &head {
+            if let Ok(s) = v.to_str() {
+                headers.entry(k.as_str().to_ascii_lowercase()).or_default().push(s.to_string());
+            }
+        }
+        WebAnswer { status: status.as_u16(), headers, body }
+    }
+}
+
+impl Http2 {
+    fn send(&self, req: ureq::http::Request<axum::body::Body>) -> (ureq::http::StatusCode, ureq::http::HeaderMap, Vec<u8>) {
+        self.rt.block_on(async {
+            // One connection for the client's life, as a browser keeps; a new
+            // one when the server closed it.
+            let kept = self.conn.lock().unwrap().take();
+            let mut sender = match kept {
+                Some(s) if !s.is_closed() => s,
+                _ => self.connect().await,
+            };
+            let r = tokio::time::timeout(Duration::from_secs(60), sender.send_request(req)).await.expect("an answer within a minute").expect("HTTP/2 response");
+            assert_eq!(r.version(), ureq::http::Version::HTTP_2);
+            let (parts, body) = r.into_parts();
+            let body = axum::body::to_bytes(axum::body::Body::new(body), 16 << 20).await.expect("the answer's body");
+            *self.conn.lock().unwrap() = Some(sender);
+            (parts.status, parts.headers, body.to_vec())
+        })
+    }
+
+    async fn connect(&self) -> hyper::client::conn::http2::SendRequest<axum::body::Body> {
+        let host = self.authority.rsplit_once(':').map_or(self.authority.as_str(), |(h, _)| h).to_string();
+        let tcp = tokio::net::TcpStream::connect(&self.authority).await.unwrap_or_else(|e| panic!("connecting to {}: {e}", self.authority));
+        let name = rustls::pki_types::ServerName::try_from(host).expect("a server name");
+        let tls = self.tls.connect(name, tcp).await.expect("the TLS handshake");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]), "the server chose HTTP/2, as it does for a browser");
+        let (sender, conn) = hyper::client::conn::http2::handshake(OnRuntime(self.rt.handle().clone()), hyper_util::rt::TokioIo::new(tls)).await.expect("the HTTP/2 handshake");
+        self.rt.spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    }
+}
