@@ -69,6 +69,9 @@ containers = []
 # The landing service's property test (`landing::edits`).
 proptest = "1"
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# The web tests' client speaks HTTP/2, as every browser does (BUG-1906): no
+# new crate, the client half of the server's own HTTP library.
+hyper = { version = "1", features = ["client", "http2"] }
 # A paused clock for the unit tests of the body time limits (S24): no new
 # crate, a feature of the runtime above.
 tokio = { version = "1.47", features = ["test-util"] }

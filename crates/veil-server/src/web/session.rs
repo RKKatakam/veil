@@ -5,7 +5,7 @@ use std::cell::RefCell;
 
 use axum::{
     body::Bytes,
-    extract::{Request, State},
+    extract::{Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -13,10 +13,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use veil_core::hub::{
-    web::{csrf_for_session, csrf_matches, web_token_hash, MAX_WEB_SESSION_MS, WEB_TOKEN_PREFIX},
-    wire::LoginRequest,
-};
+use veil_core::hub::web::{csrf_for_session, csrf_matches, web_token_hash, WEB_TOKEN_PREFIX};
 
 use crate::{
     auth::{self, CSRF_FAILED},
@@ -66,7 +63,33 @@ fn csrf_err(msg: &'static str) -> Error {
     Error::new(StatusCode::FORBIDDEN, CSRF_FAILED, msg)
 }
 
-/// Verify that a state-changing browser request comes from the same origin.
+/// The request's authority, in one place (BUG-1906): over HTTP/2, which every
+/// browser speaks to this server, it is `:authority` (hyper puts it in the
+/// request's URI and adds no `Host` header); over HTTP/1.1 it is `Host`. A
+/// request target that carries an authority wins over a `Host` header (RFC
+/// 9112 §3.2.2, RFC 9113 §8.3.1), so every later reader of `Host`
+/// ([`check_same_origin`], the passkey ceremonies' origin, `vl login`'s
+/// server name) sees the one authority the request was made to.
+fn set_request_authority(req: &mut Request) {
+    let Some(authority) = req.uri().authority() else { return };
+    match HeaderValue::from_str(authority.as_str()) {
+        Ok(v) => req.headers_mut().insert(header::HOST, v),
+        Err(_) => req.headers_mut().remove(header::HOST),
+    };
+}
+
+/// Verify that a state-changing browser request comes from the same origin
+/// (the request's authority: `set_request_authority`).
+///
+/// `Sec-Fetch-Site`, when the browser sends it, must be `same-origin`; an
+/// `Origin` must name the request's authority. **`Origin: null` beside
+/// `Sec-Fetch-Site: same-origin` is a browser's own form (BUG-1907):** the
+/// pages are served with `Referrer-Policy: no-referrer`, under which a
+/// browser sends `Origin: null` with every form it submits (Fetch,
+/// "serializing a request origin"; `fetch()` calls keep the real origin). It
+/// says nothing, exactly as a request with no `Origin` at all, which
+/// `Sec-Fetch-Site: same-origin` alone already admits; without that header
+/// `Origin: null` is refused as before.
 pub fn check_same_origin(headers: &HeaderMap) -> Result<()> {
     let host = headers
         .get(header::HOST)
@@ -82,7 +105,8 @@ pub fn check_same_origin(headers: &HeaderMap) -> Result<()> {
         verified = true;
     }
 
-    if let Some(orig) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    if let Some(orig) = origin.filter(|o| !(verified && *o == "null")) {
         let orig_host = orig
             .strip_prefix("https://")
             .or_else(|| orig.strip_prefix("http://"))
@@ -123,11 +147,12 @@ pub fn require_current_csrf(headers: &HeaderMap, form_csrf: Option<&str>) -> Res
 
 /// Router middleware: tracks browser/web context per request, attaches CSP &
 /// security headers, and renders static non-leaking HTML error pages on web UI routes.
-pub async fn layer(req: Request, next: Next) -> Response {
+pub async fn layer(mut req: Request, next: Next) -> Response {
+    set_request_authority(&mut req);
     let path = req.uri().path().to_string();
     let is_api = path.starts_with("/v1/");
     let wants_json = is_api
-        || (path.starts_with("/web/")
+        || ((path.starts_with("/web/") || path.contains("/web/"))
             && req
                 .headers()
                 .get(header::ACCEPT)
@@ -215,29 +240,47 @@ pub fn parse_form(bytes: &[u8]) -> std::collections::BTreeMap<String, String> {
     map
 }
 
-pub async fn login_page_route() -> Response {
-    let body = r#"<div class="card">
+#[derive(Default, Deserialize)]
+pub struct LoginPageQuery {
+    #[serde(default)]
+    pub enroll: Option<String>,
+}
+
+pub async fn login_page_route(Query(q): Query<LoginPageQuery>) -> Response {
+    let prefill = q.enroll.as_deref().map(str::trim).unwrap_or("");
+    let body = format!(
+        r#"<div class="card">
   <div class="card-header">Sign in to Veil</div>
   <div class="card-body">
-    <p>Sign in with a short-lived web session derived from your <code>vl</code> device session, or sign a single-use challenge in browser memory with your device identity.</p>
-    <p class="muted">Secret files (<code>.env</code>, keys) are never decrypted or served in the browser — open them locally with <code>vl</code>.</p>
-    <h3>Option 1: Short-lived web token</h3>
+    <p>Sign in with your passkey. Personal <code>vl</code> private keys never leave the machine they were made on.</p>
+    <h3>Sign in with passkey</h3>
+    <form id="veil-passkey-login-form">
+      <div class="form-row">
+        <input id="veil-passkey-person" type="text" placeholder="Username (optional)" autocomplete="username webauthn">
+        <button type="submit">Sign in with passkey</button>
+      </div>
+    </form>
+    <h3>Enroll this browser (<code>vl web</code>)</h3>
+    <p class="muted">Run <code>vl web</code> on a signed-in computer to mint a single-use enrollment code. If this browser supports WebAuthn PRF, a fresh browser device key is generated inside a Web Worker and encrypted in IndexedDB under your passkey; confirm its fingerprint with <code>vl identity confirm &lt;FINGERPRINT&gt;</code> before opening secrets.</p>
+    <form id="veil-passkey-enroll-form">
+      <div class="form-row">
+        <input id="veil-enroll-code" type="text" value="{}" placeholder="web-enroll-…" autocomplete="off" required>
+        <button type="submit">Register passkey</button>
+      </div>
+    </form>
+    <p id="veil-login-status" class="muted"></p>
+    <hr>
+    <h4>Short-lived session token</h4>
     <form method="post" action="/web/session">
       <div class="form-row">
         <input type="text" name="token" placeholder="web-…" autocomplete="off" required>
         <button type="submit">Activate web session</button>
       </div>
     </form>
-    <h3>Option 2: Device-signed challenge (in-memory WASM)</h3>
-    <form id="veil-device-login-form">
-      <textarea id="veil-identity-json" placeholder="Paste device identity JSON (kept in WASM memory only, never sent over the network)"></textarea>
-      <div class="form-row">
-        <button type="submit">Sign challenge &amp; sign in</button>
-        <span id="veil-login-status" class="muted"></span>
-      </div>
-    </form>
   </div>
-</div>"#;
+</div>"#,
+        esc(prefill)
+    );
     page_shell(
         PageCtx {
             title: "Sign in — Veil",
@@ -247,7 +290,7 @@ pub async fn login_page_route() -> Response {
             csrf: None,
             admin_link: false,
         },
-        body,
+        &body,
     )
 }
 
@@ -282,7 +325,7 @@ pub async fn adopt_session_route(State(hub): State<HubState>, headers: HeaderMap
          JOIN people p ON p.id = s.person_id \
          LEFT JOIN sessions par ON par.token_hash = s.parent_hash \
          WHERE s.token_hash = $1 AND s.expires_at > $2 AND s.agent IS NULL \
-         AND d.removed_at IS NULL AND NOT d.pending \
+         AND d.removed_at IS NULL AND (NOT d.pending OR d.browser) \
          AND (s.parent_hash IS NULL OR par.expires_at > $2)",
     )
     .bind(&hash)
@@ -314,37 +357,21 @@ pub async fn adopt_session_route(State(hub): State<HubState>, headers: HeaderMap
     Ok(resp)
 }
 
-/// `POST /web/login`: verify a single-use `hub-login` signature and issue a
-/// short-lived `web-` session directly into `__Host-veil_session`.
-pub async fn device_login_route(State(hub): State<HubState>, headers: HeaderMap, Json(req): Json<LoginRequest>) -> Result<Response> {
-    check_same_origin(&headers)?;
-    let (token, person, expires_at, csrf) = auth::login_web_direct(&hub, &headers, req, MAX_WEB_SESSION_MS).await?;
-    let now = veil_core::now_millis();
-    let max_age = ((expires_at - now) / 1000).max(1);
-    let cookie = session_cookie_value(&token, max_age);
-    let mut resp = Json(json!({
-        "person": person,
-        "expires_at": expires_at,
-        "csrf": csrf,
-    }))
-    .into_response();
-    resp.headers_mut().append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&cookie).map_err(|e| Error::Other(e.into()))?,
-    );
-    attach_security_headers(&mut resp, true);
-    Ok(resp)
-}
-
-/// `POST /web/logout`: verify same-origin + CSRF, delete the session row in
-/// PostgreSQL (bumping `access_epochs` across all servers immediately), and
-/// clear `__Host-veil_session`.
+/// `POST /web/logout`: verify same-origin + CSRF, clear `__Host-veil_session`,
+/// and if the session belongs to an enrolled browser device (`d.browser`),
+/// revoke that browser device immediately (deleting its wrapped rings & passkey
+/// credential and queuing key rotation across all projects, matching S2 device
+/// removal).
 pub async fn logout_route(State(hub): State<HubState>, headers: HeaderMap, body: Bytes) -> Result<Response> {
     let tok = auth::cookie_token(&headers).ok_or_else(|| Error::unauthorized("not signed in"))?;
     let hash = auth::session_hash(tok);
     let form = parse_form(&body);
     require_csrf(&headers, Some(&hash), form.get("_csrf").map(String::as_str))?;
 
+    // Signing out ends this session and nothing else (BUG-1905): the
+    // browser device and its passkey stay, so the next visit signs in with
+    // the passkey. Removing the browser is its own action ("Remove this
+    // browser", `web::devices`).
     sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
         .bind(&hash)
         .execute(&hub.db)
@@ -355,6 +382,5 @@ pub async fn logout_route(State(hub): State<HubState>, headers: HeaderMap, body:
         header::SET_COOKIE,
         HeaderValue::from_str(&clear_session_cookie_value()).map_err(|e| Error::Other(e.into()))?,
     );
-    let _ = esc;
     Ok(resp)
 }

@@ -20,14 +20,14 @@
 //! 5. Bounded: page sizes and API work per page are bounded; large files and
 //!    long histories, trees, searches, and PR lists are paged.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use veil_core::{
     crypto::Envelope,
-    hub::web::{sign_web_login, sign_web_pr_review, WEB_TOKEN_PREFIX},
+    hub::web::WEB_TOKEN_PREFIX,
     object::{EntryKind, Object, Snapshot, Tree, TreeEntry, Visibility},
-    Identity, ObjectId,
+    ObjectId,
 };
 
 use crate::support::*;
@@ -67,12 +67,14 @@ impl WebReply {
     }
 }
 
-/// Minimal browser-like HTTPS client (`max_redirects(0)`) with explicit cookie
-/// jar, `Origin`, `Sec-Fetch-*`, and CSRF support.
+/// Minimal browser-like HTTPS client (no redirect followed) with explicit cookie
+/// jar, `Origin`, `Sec-Fetch-*`, and CSRF support. It speaks HTTP/2, as a
+/// browser does (`WebTransport`, BUG-1906); `WebClient::http1` is the same
+/// client over HTTP/1.1.
 struct WebClient {
-    agent: ureq::Agent,
-    base: String,
+    transport: WebTransport,
     origin: String,
+    #[allow(dead_code)]
     authority: String,
     cookie: Option<String>,
     csrf: Option<String>,
@@ -84,27 +86,19 @@ impl WebClient {
     }
 
     fn at(authority: &str, cert_pem: &str) -> Self {
-        let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(cert_pem.as_bytes())
-            .filter_map(|i| match i {
-                Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
-                _ => None,
-            })
-            .collect();
-        let tls = ureq::tls::TlsConfig::builder()
-            .provider(ureq::tls::TlsProvider::Rustls)
-            .root_certs(ureq::tls::RootCerts::Specific(Arc::new(certs)))
-            .build();
-        let agent = ureq::Agent::config_builder()
-            .tls_config(tls)
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_global(Some(Duration::from_secs(60)))
-            .build()
-            .new_agent();
+        Self::over(WebTransport::new(authority, cert_pem), authority)
+    }
+
+    /// The same client over HTTP/1.1 (`WebClient::new` speaks HTTP/2, as a
+    /// browser does: BUG-1906).
+    fn http1(hub: &TestHub) -> Self {
+        Self::over(WebTransport::http1(&hub.authority(), &hub.cert_pem), &hub.authority())
+    }
+
+    fn over(transport: WebTransport, authority: &str) -> Self {
         let origin = format!("https://{authority}");
         Self {
-            agent,
-            base: origin.clone(),
+            transport,
             origin,
             authority: authority.to_string(),
             cookie: None,
@@ -112,17 +106,15 @@ impl WebClient {
         }
     }
 
-    fn finish(r: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> WebReply {
-        let r = r.expect("HTTP response");
-        let status = r.status().as_u16();
-        let mut headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (k, v) in r.headers() {
-            if let Ok(s) = v.to_str() {
-                headers.entry(k.as_str().to_ascii_lowercase()).or_default().push(s.to_string());
-            }
+    /// One request with this client's cookie.
+    fn send(&self, method: &str, path: &str, headers: &[(&str, &str)], body: Option<&[u8]>) -> WebReply {
+        let cookie = self.cookie.as_ref().map(|c| format!("__Host-veil_session={c}"));
+        let mut all = headers.to_vec();
+        if let Some(c) = &cookie {
+            all.push(("cookie", c));
         }
-        let body = r.into_body().with_config().limit(16 << 20).read_to_vec().unwrap();
-        WebReply { status, headers, body }
+        let a = self.transport.send(method, path, &all, body);
+        WebReply { status: a.status, headers: a.headers, body: a.body }
     }
 
     fn capture_cookie(&mut self, r: &WebReply) {
@@ -139,42 +131,20 @@ impl WebClient {
     }
 
     fn get(&self, path: &str) -> WebReply {
-        let mut req = self
-            .agent
-            .get(format!("{}{path}", self.base))
-            .header("sec-fetch-dest", "document")
-            .header("sec-fetch-mode", "navigate")
-            .header("sec-fetch-site", "same-origin");
-        if let Some(c) = &self.cookie {
-            req = req.header("cookie", &format!("__Host-veil_session={c}"));
-        }
-        Self::finish(req.call())
+        self.send("GET", path, &[("sec-fetch-dest", "document"), ("sec-fetch-mode", "navigate"), ("sec-fetch-site", "same-origin")], None)
     }
 
     fn get_with(&self, path: &str, extra: &[(&str, &str)]) -> WebReply {
-        let mut req = self.agent.get(format!("{}{path}", self.base));
-        if let Some(c) = &self.cookie {
-            req = req.header("cookie", &format!("__Host-veil_session={c}"));
-        }
-        for (k, v) in extra {
-            req = req.header(*k, *v);
-        }
-        Self::finish(req.call())
+        self.send("GET", path, extra, None)
     }
 
     fn post_form(&self, path: &str, fields: &[(&str, &str)], include_csrf: bool, origin: Option<&str>, fetch_site: Option<&str>) -> WebReply {
-        let mut req = self
-            .agent
-            .post(format!("{}{path}", self.base))
-            .header("content-type", "application/x-www-form-urlencoded");
+        let mut headers = vec![("content-type", "application/x-www-form-urlencoded")];
         if let Some(o) = origin {
-            req = req.header("origin", o);
+            headers.push(("origin", o));
         }
         if let Some(fs) = fetch_site {
-            req = req.header("sec-fetch-site", fs);
-        }
-        if let Some(c) = &self.cookie {
-            req = req.header("cookie", &format!("__Host-veil_session={c}"));
+            headers.push(("sec-fetch-site", fs));
         }
         let mut pairs: Vec<String> = fields.iter().map(|(k, v)| format!("{}={}", url_enc(k), url_enc(v))).collect();
         if include_csrf {
@@ -182,43 +152,32 @@ impl WebClient {
                 pairs.push(format!("_csrf={}", url_enc(csrf)));
             }
         }
-        Self::finish(req.send(pairs.join("&").as_bytes()))
+        self.send("POST", path, &headers, Some(pairs.join("&").as_bytes()))
     }
 
     fn post_json_web(&self, path: &str, body: &Value, csrf: Option<&str>, origin: Option<&str>, fetch_site: Option<&str>) -> WebReply {
-        let mut req = self
-            .agent
-            .post(format!("{}{path}", self.base))
-            .header("content-type", "application/json")
-            .header("accept", "application/json");
+        let mut headers = vec![("content-type", "application/json"), ("accept", "application/json")];
         if let Some(o) = origin {
-            req = req.header("origin", o);
+            headers.push(("origin", o));
         }
         if let Some(fs) = fetch_site {
-            req = req.header("sec-fetch-site", fs);
-        }
-        if let Some(c) = &self.cookie {
-            req = req.header("cookie", &format!("__Host-veil_session={c}"));
+            headers.push(("sec-fetch-site", fs));
         }
         if let Some(tok) = csrf {
-            req = req.header("x-veil-csrf", tok);
+            headers.push(("x-veil-csrf", tok));
         }
-        let bytes = serde_json::to_vec(body).unwrap();
-        Self::finish(req.send(&bytes))
+        self.send("POST", path, &headers, Some(&serde_json::to_vec(body).unwrap()))
     }
 
     fn delete_web(&self, path: &str, csrf: Option<&str>, origin: Option<&str>) -> WebReply {
-        let mut req = self.agent.delete(format!("{}{path}", self.base));
+        let mut headers = Vec::new();
         if let Some(o) = origin {
-            req = req.header("origin", o);
-        }
-        if let Some(c) = &self.cookie {
-            req = req.header("cookie", &format!("__Host-veil_session={c}"));
+            headers.push(("origin", o));
         }
         if let Some(tok) = csrf {
-            req = req.header("x-veil-csrf", tok);
+            headers.push(("x-veil-csrf", tok));
         }
-        Self::finish(req.call())
+        self.send("DELETE", path, &headers, None)
     }
 
     /// Sign in via short-lived derived `web-` session (`POST /v1/sessions/web` -> `POST /web/session`).
@@ -243,33 +202,6 @@ impl WebClient {
         self.capture_cookie(&adopt);
         self.csrf = Some(csrf);
         ws
-    }
-
-    /// Sign in directly with device key (`POST /v1/auth/challenge` + `sign_web_login` -> `POST /web/login`).
-    fn sign_in_device(&mut self, id: &Identity, name: Option<&str>) -> WebReply {
-        let ch = self.post_json_web(
-            "/v1/auth/challenge",
-            &json!({ "key": id.verifying_hex() }),
-            None,
-            Some(&self.origin.clone()),
-            Some("same-origin"),
-        );
-        assert_eq!(ch.status, 200, "challenge failed: {}", ch.text());
-        let chal = ch.json()["challenge"].as_str().unwrap().to_string();
-        let signed = sign_web_login(&id.to_json(), &self.authority, &chal, name).unwrap();
-        let r = self.post_json_web(
-            "/web/login",
-            &serde_json::to_value(&signed).unwrap(),
-            None,
-            Some(&self.origin.clone()),
-            Some("same-origin"),
-        );
-        if r.status == 200 {
-            assert_strict_session_cookie(&r);
-            self.capture_cookie(&r);
-            self.csrf = r.json()["csrf"].as_str().map(str::to_string);
-        }
-        r
     }
 }
 
@@ -945,10 +877,9 @@ fn guarantee_3_session_safety_csrf_cookies_csp_and_xss_escaping() {
     assert_eq!(cross_adopt.status, 403);
     assert_eq!(cross_adopt.json()["code"], "csrf_failed");
 
-    // 3. Direct device-signed login (`POST /web/login`, signed via `veil_core::hub::web::sign_web_login`).
-    let login_res = alice_web.sign_in_device(&alice.identity(), None);
-    assert_eq!(login_res.status, 200, "device-signed web login failed: {}", login_res.text());
-    assert_eq!(login_res.json()["person"], alice.name);
+    // 3. Derived web session sign-in (`POST /v1/sessions/web` -> `POST /web/session`; passkey sign-in is tested in `web_secrets`).
+    let login_ws = alice_web.sign_in_derived(&hub, &alice);
+    assert_eq!(login_ws["person"], alice.name);
 
     let mut bob_web = WebClient::new(&hub);
     bob_web.sign_in_derived(&hub, &bob);
@@ -1021,19 +952,18 @@ fn guarantee_3_session_safety_csrf_cookies_csp_and_xss_escaping() {
     );
     assert_eq!(ok_comment.status, 303, "expected 303 posting thread: {}", ok_comment.text());
 
-    // Also test device-signed PR review submitted from browser (`/v1/projects/{p}/prs/{id}/reviews` with cookie + CSRF)!
+    // Server-recorded PR review submitted from browser (`/v1/projects/{p}/prs/{id}/reviews` with cookie + CSRF, no `identity.json`!).
     let pr_json = alice_web.get_with(&format!("/v1/projects/{proj}/prs/{pr_id}"), &[("accept", "application/json")]).json();
     let patch_hash = pr_json["patch"].as_str().unwrap().to_string();
-    let review_sig = sign_web_pr_review(&bob.identity().to_json(), &proj, &pr_id, &patch_hash, "approve").unwrap();
     let bob_orig = bob_web.origin.clone();
     let rev_submit = bob_web.post_json_web(
         &format!("/v1/projects/{proj}/prs/{pr_id}/reviews"),
-        &json!({ "patch": patch_hash, "verdict": "approve", "body": format!("LGTM {XSS_SCRIPT}"), "signature": review_sig }),
+        &json!({ "patch": patch_hash, "verdict": "approve", "body": format!("LGTM {XSS_SCRIPT}") }),
         Some(&bob_csrf),
         Some(&bob_orig),
         Some("same-origin"),
     );
-    assert_eq!(rev_submit.status, 200, "WASM-signed review via cookie+CSRF failed: {}", rev_submit.text());
+    assert_eq!(rev_submit.status, 200, "server-recorded web review via cookie+CSRF failed: {}", rev_submit.text());
 
     // 6. Inspect every HTML page where hostile payloads were placed: strict CSP, `text/html`, and ZERO unescaped payloads!
     for page_url in [
@@ -1462,7 +1392,6 @@ fn extract_next_href(html: &str, prefix: &str) -> String {
 /// personal private key in the browser, which the server's code runs in
 /// (`docs/design/server/phase-4-agent-scale.md` §6 row 18, decision 13).
 #[test]
-#[ignore = "BUG-1871: the web client asks for the device identity file (its private keys) in the browser"]
 fn bug_1871_the_web_client_never_asks_for_a_device_identity_file() {
     let hub = TestHub::start();
     let web = WebClient::new(&hub);
@@ -1480,6 +1409,58 @@ fn bug_1871_the_web_client_never_asks_for_a_device_identity_file() {
     ];
     assert_absent(&login.text(), &asks, "GET /login");
     assert_absent(&js.text(), &asks, "GET /static/app.js");
+}
+
+/// BUG-1906: the web client works over HTTP/2 (every browser: `:authority`,
+/// no `Host` header) and over HTTP/1.1 (`Host`): a page, a session, a form
+/// that changes something, and signing out; and over both a request from
+/// another origin is refused exactly as before.
+#[test]
+fn bug_1906_the_web_client_works_over_http2_and_over_http1() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let proj = unique("h2web");
+    let dir = alice.dir("h");
+    std::fs::create_dir_all(&dir).unwrap();
+    alice.ok(&dir, &["init"]);
+    alice.ok(&dir, &["remote", "add", "origin", &hub.url(&proj)]);
+    write_files(&dir, &[(".veilpolicy", "public/ public\n"), ("public/a.txt", "H2_PAGE_TEXT\n")]);
+    alice.commit_main(&dir, "a file");
+    alice.ok(&dir, &["push"]);
+    catch_up(&hub, &proj);
+
+    for (version, mut web) in [("HTTP/2", WebClient::new(&hub)), ("HTTP/1.1", WebClient::http1(&hub))] {
+        let origin = web.origin.clone();
+        let login = web.get("/login");
+        assert_eq!(login.status, 200, "{version}: {}", login.text());
+        web.sign_in_derived(&hub, &alice);
+        let page = web.get(&format!("/p/{proj}/file/public/a.txt"));
+        assert_eq!(page.status, 200, "{version}: {}", page.text());
+        assert!(page.text().contains("H2_PAGE_TEXT"), "{version}");
+
+        // A form that changes something: the admin makes a group.
+        let group = if version == "HTTP/2" { "overhtwo" } else { "overhone" };
+        let made = web.post_form(&format!("/p/{proj}/admin/groups"), &[("name", group)], true, Some(&origin), Some("same-origin"));
+        assert_eq!(made.status, 303, "{version}: {}", made.text());
+        let admin = web.get(&format!("/p/{proj}/admin"));
+        assert_eq!(admin.status, 200, "{version}: {}", admin.text());
+        assert!(admin.text().contains(group), "{version}: the group was made");
+
+        // Another origin, with the cookie and the right token: refused.
+        let cross = web.post_form(&format!("/p/{proj}/admin/groups"), &[("name", "evilgroup")], true, Some("https://evil.example"), None);
+        assert_eq!(cross.status, 403, "{version}: {}", cross.text());
+        // The same host on another port is another origin.
+        let other_port = web.post_form(&format!("/p/{proj}/admin/groups"), &[("name", "evilgroup")], true, Some("https://127.0.0.1:1"), None);
+        assert_eq!(other_port.status, 403, "{version}: {}", other_port.text());
+        let admin = web.get(&format!("/p/{proj}/admin"));
+        assert_eq!(admin.status, 200, "{version}");
+        assert!(!admin.text().contains("evilgroup"), "{version}: a cross-origin form made a group");
+
+        let out = web.post_form("/web/logout", &[], true, Some(&origin), Some("same-origin"));
+        assert_eq!(out.status, 303, "{version}: {}", out.text());
+        let after = web.get(&format!("/p/{proj}/admin"));
+        assert_ne!(after.status, 200, "{version}: the session ended");
+    }
 }
 
 /// BUG-1872: a file page is bounded in lines only. A line is rendered whole

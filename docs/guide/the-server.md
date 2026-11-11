@@ -591,3 +591,65 @@ Bob is not in `finance`. His clone of `acme` has `src/` only: no `billing/`,
 not even its name, and no trace of changes that touched only `billing/`. Anyone
 on Earth, not signed in, gets the `public` folders the same way; a project with
 nothing public does not exist for them.
+
+## Using the web client and browser secrets
+
+You can browse code, read history and blame, search, and review or land pull
+requests in a browser without copying your `vl` private keys (`identity.json`)
+off your machine.
+
+To enroll a browser with a passkey, ask `vl` for a short-lived, single-use
+enrollment link:
+
+```
+vl web
+vl web --server veil://hub.example.com
+```
+
+Open the link in your browser and create a passkey (the browser asks for its
+PIN or your fingerprint each time: a touch alone does not sign in). Later
+visits sign in with that passkey directly at `/login`, and pull request
+approvals in the browser count under the same `.veilrules` checks as
+`vl pr review`. `vl web --label "work phone"` names the browser in your list of
+devices.
+
+If your browser and passkey support the WebAuthn PRF extension, the browser
+also makes **its own separate device identity** inside a Web Worker and stores
+its private keys encrypted under your passkey in IndexedDB (browsers without
+PRF still work for everything except opening secrets, and say so on secret
+pages). Like any new device, it gets **no** secret keys until you confirm its
+fingerprint from an existing `vl` device:
+
+```
+vl identity confirm 4F2A-9C1E-08B3-7D44-E510
+vl share-keys
+```
+
+A browser that waits to be confirmed stays confirmable for a day after its
+last sign-in: sign in with the passkey again and the fingerprint the page
+shows can be confirmed.
+
+Opening secrets in the browser is **off by default** on every project. A
+project admin can turn it on from the project's `/p/<project>/admin` page after
+acknowledging its security limit: **unlike `vl` on your machine, a server that
+was broken into could serve web code that reads secrets opened in a browser.**
+With the setting off, no browser gets wrapped keys and no page loads the
+secret-decryption Worker. When it is on, clicking **Show secret** shows the
+same warning on first use and decrypts the file inside the Worker on demand
+without caching the plaintext or sending it anywhere.
+
+**Sign out** ends the session and nothing else: the browser stays enrolled, and
+your next visit signs in with its passkey.
+
+Every passkey signs in as you, so every one is listed with your devices: on
+**Your devices** in the web client, and with `vl identity list`. Remove a
+browser you no longer use, or have lost, from either: **Remove this browser**
+(or **Remove** next to another browser) on that page, or its fingerprint with
+`vl`. Removing it ends its sessions, deletes its passkey and the wrapped keys
+the server kept for it, and rotates secret keys for new secrets on the next
+`vl share-keys`:
+
+```
+vl identity list
+vl identity remove 4F2A-9C1E-08B3-7D44-E510
+```

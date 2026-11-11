@@ -1660,15 +1660,24 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/v1/projects/{p}/prs/{id}/reviews", "narrowed"),
         ("/v1/projects/{p}/prs/{id}/reviews/dismiss", "person"),
         ("/v1/projects/{p}/prs/{id}/land", "narrowed"),
-        // S25: web client (delegates every read/write to `query::*`, `search::*`, `prs::*`, and `api::*`).
+        // S25 & S26: web client, passkeys, and browser secrets.
         ("/v1/sessions/web", "person"),
+        ("/v1/sessions/web-enroll", "person"),
+        ("/v1/projects/{p}/web-secrets", "person"),
+        ("/v1/projects/{p}/web/rings", "person"),
+        ("/v1/projects/{p}/web/ciphertext", "person"),
         ("/", "none"),
         ("/about", "none"),
         ("/login", "none"),
         ("/static/{asset}", "none"),
         ("/web/session", "person"),
-        ("/web/login", "none"),
+        ("/web/passkey/register/begin", "none"),
+        ("/web/passkey/register/finish", "none"),
+        ("/web/passkey/login/begin", "none"),
+        ("/web/passkey/login/finish", "none"),
         ("/web/logout", "none"),
+        ("/devices", "person"),
+        ("/web/devices/remove", "person"),
         ("/p/{p}", "narrowed"),
         ("/p/{p}/tree", "path"),
         ("/p/{p}/tree/{*path}", "path"),
@@ -1682,13 +1691,18 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/p/{p}/prs/{id}", "narrowed"),
         ("/p/{p}/prs/{id}/threads", "narrowed"),
         ("/p/{p}/prs/{id}/threads/{t}", "narrowed"),
+        ("/p/{p}/prs/{id}/reviews", "person"),
         ("/p/{p}/prs/{id}/close", "narrowed"),
         ("/p/{p}/prs/{id}/land", "narrowed"),
         ("/p/{p}/prs/{id}/dismiss", "person"),
         ("/p/{p}/admin", "person"),
+        ("/p/{p}/admin/web-secrets", "person"),
         ("/p/{p}/admin/groups", "person"),
         ("/p/{p}/admin/groups/{g}/delete", "person"),
         ("/p/{p}/admin/groups/{g}/members", "person"),
+        ("/p/{p}/web/secrets.js", "person"),
+        ("/p/{p}/web/secret-worker.js", "person"),
+        ("/p/{p}/web/secret-worker.wasm", "person"),
     ];
     let routes: Vec<&str> = API.split(".route(\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
     assert!(routes.len() >= 40, "the router was not read: {routes:?}");
@@ -1720,11 +1734,23 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         &rest[..end]
     };
     const SHARES: &str = include_str!("../../src/shares.rs");
+    const SECRETS: &str = include_str!("../../src/web/secrets.rs");
+    const WEB: &str = include_str!("../../src/web/mod.rs");
+    const DEVICES: &str = include_str!("../../src/web/devices.rs");
     for (src, f, call) in [
         (API, "access", "viewer.narrowed_to(&path)?"),
         (API, "get_rings", "viewer.narrowed_scopes(&project)"),
         (API, "get_ring", "viewer.narrowed_scopes(&project)"),
         (SHARES, "list", "viewer.within_narrowing(&path)"),
+        (SECRETS, "set_web_secrets_api_route", "caller.person_only()?"),
+        (SECRETS, "admin_web_secrets_form_route", "caller.person_only()?"),
+        (SECRETS, "web_rings_route", "caller.person_only()?"),
+        (SECRETS, "web_ciphertext_route", "caller.person_only()?"),
+        (SECRETS, "web_ciphertext_route", "query::file(&hub, &ask,"),
+        (SECRETS, "guard_project_worker_asset", "caller.person_only()?"),
+        (WEB, "pr_review_route", "caller.person_only()?"),
+        (DEVICES, "devices_page_route", "caller.person_only()?"),
+        (DEVICES, "remove_browser_route", "caller.person_only()?"),
     ] {
         assert!(handler(src, f).contains(call), "route handler {f} is not narrowed ({call})");
     }

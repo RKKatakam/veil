@@ -94,6 +94,23 @@ pub enum Cmd {
         #[arg(long, value_name = "FILE")]
         ca: Option<PathBuf>,
     },
+    /// Enroll a browser passkey on a Veil server.
+    ///
+    /// Prints a short-lived, single-use link to open in the browser. The
+    /// browser creates a passkey and its own separate device keys inside a
+    /// Web Worker; confirm the fingerprint the browser shows with
+    /// `vl identity confirm FINGERPRINT` so secret keys may be shared with it.
+    Web {
+        /// The server (`veil://host[:port]`), when signed in to several.
+        #[arg(long, value_name = "URL")]
+        server: Option<String>,
+        /// Optional label for this browser device (for example `work-laptop`).
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// Print the enrollment code and URL as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Groups of people on the Veil server (the origin remote's project).
     #[command(subcommand)]
     Group(GroupCmd),
@@ -1299,7 +1316,19 @@ pub enum IdentityCmd {
         #[arg(long)]
         server: Option<String>,
     },
-    /// Remove a device on a Veil server: a lost laptop, say. Run it on
+    /// List what signs in as you on a Veil server: your `vl` devices, the
+    /// devices that wait for you to confirm them, and your passkeys of the
+    /// web client (the browsers you enrolled with `vl web`). Remove any of
+    /// them with `vl identity remove`.
+    List {
+        /// The server (`veil://host[:port]`); default: this clone's, or the
+        /// one this device is signed in to.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Remove a device on a Veil server: a lost laptop, say, or a browser
+    /// you enrolled with `vl web` (`vl identity list` shows its passkey's
+    /// fingerprint). Run it on
     /// another of your devices to remove it everywhere; an admin may remove
     /// anyone's device from their project only (run it in a clone of the
     /// project).
@@ -1311,8 +1340,8 @@ pub enum IdentityCmd {
     /// project, and that project's keys rotate away from it; only its person
     /// removes it everywhere. It keeps what it already had.
     Remove {
-        /// The device's fingerprint (`vl identity show` on it, or the one
-        /// `vl group add` showed).
+        /// The device's fingerprint (`vl identity show` on it, the one
+        /// `vl group add` showed, or a passkey's in `vl identity list`).
         fingerprint: String,
         /// The server (`veil://host[:port]`); default: this clone's, or the
         /// one this device is signed in to.

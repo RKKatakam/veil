@@ -311,6 +311,43 @@ pub struct Devices {
     /// grant, so the server's word is enough for it).
     #[serde(default)]
     pub removed: Vec<String>,
+    /// The person's passkeys of the web client (browser devices, `docs/HUB.md`
+    /// §13.40), **listed to the person only**: every one signs in to the web
+    /// client as them, so every one is seen here and removed by its
+    /// fingerprint (`vl identity remove`, or "Your devices" in the web
+    /// client), with or without device keys (BUG-1901).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passkeys: Vec<Passkey>,
+}
+
+/// One passkey of the web client: a browser the person enrolled with `vl web`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Passkey {
+    /// What its person calls it by: the browser device's fingerprint
+    /// ([`device_fingerprint`]) when the browser made device keys (WebAuthn
+    /// PRF), or else the fingerprint of the passkey's credential id
+    /// ([`passkey_fingerprint`]).
+    pub fingerprint: String,
+    /// `vl web --label`, if one was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// When it was enrolled (Unix milliseconds).
+    pub enrolled_at: i64,
+    /// The browser has device keys: once confirmed it can open secrets in
+    /// projects that allow it. Without, it signs in for everything else.
+    pub opens_secrets: bool,
+    /// A browser with device keys waits for `vl identity confirm` before it
+    /// receives any secret key; it signs in meanwhile.
+    pub confirmed: bool,
+}
+
+/// The fingerprint of a passkey whose browser made no device keys: the
+/// first 80 bits of the SHA-256 of its credential id (base64url, as the
+/// browser sent it), in the form [`device_fingerprint`] prints. It names the
+/// passkey to its own person only (to list and remove it); nothing trusts it.
+pub fn passkey_fingerprint(credential_id: &str) -> String {
+    let hex = hex::encode_upper(&crate::hub::web::sha256(credential_id.as_bytes())[..10]);
+    hex.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-")
 }
 
 /// One device's join under an invite.
@@ -334,6 +371,8 @@ pub struct PendingDevice {
 /// device; or an admin of `project` where the person takes part).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RemoveDevice {
+    /// The device's full public identity; or, for one of the caller's own
+    /// passkeys ([`Passkey`]), its fingerprint.
     pub device: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,

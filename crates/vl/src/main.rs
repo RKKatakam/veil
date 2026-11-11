@@ -210,6 +210,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             None => bail!("{} is not a Veil server project: vl clones from a server URL, veil://host[:port]/project", safe(source)),
         },
         Cmd::Login { url, name, ca } => hub_cmd::login(url, name.as_deref(), ca.as_deref()),
+        Cmd::Web { server, label, json } => hub_cmd::web(server.as_deref(), label.as_deref(), *json),
         // Through the server's API, not the working copy: no snapshot.
         Cmd::Change(c) => hub_cmd::change(cli.repository.as_deref(), c),
         Cmd::Identity(c) => cmd_identity(c),
@@ -342,6 +343,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Init { .. }
         | Cmd::Clone { .. }
         | Cmd::Login { .. }
+        | Cmd::Web { .. }
         | Cmd::Change(_)
         | Cmd::Join { .. }
         | Cmd::Identity(_)
@@ -843,6 +845,7 @@ fn cmd_identity(c: &IdentityCmd) -> Result<ExitCode> {
             }
         }
         IdentityCmd::Confirm { fingerprint, server } => hub_cmd::confirm_device(fingerprint, server.as_deref())?,
+        IdentityCmd::List { server } => hub_keys::list_devices(server.as_deref())?,
         IdentityCmd::Remove { fingerprint, server } => hub_keys::remove_device(fingerprint, server.as_deref())?,
         IdentityCmd::RecoverAdmin { from, revoke_old } => {
             use veil_core::keychain::AdminRecovery;

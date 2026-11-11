@@ -55,6 +55,43 @@ pub fn login(url: &str, name: Option<&str>, ca: Option<&Path>) -> Result<ExitCod
     Ok(ExitCode::SUCCESS)
 }
 
+pub fn web(server: Option<&str>, label: Option<&str>, json: bool) -> Result<ExitCode> {
+    let here = server.is_none().then(|| {
+        let root = crate::ctx::find_root(&std::env::current_dir().ok()?)?;
+        let cfg = veil_core::repo::read_config(&DiskBackend::new(&root)).ok()?;
+        Some(HubUrl::parse(&cfg.remotes.get("origin")?.url)?.ok()?.authority)
+    });
+    let (authority, _me) = match here.flatten() {
+        Some(a) => hub::signed_in_servers()?
+            .into_iter()
+            .find(|(x, _)| *x == a)
+            .ok_or_else(|| anyhow!("this device is not signed in to {a} (`vl login veil://{a}`)"))?,
+        None => resolve_server(server)?,
+    };
+    let hub_url = HubUrl::parse(&format!("veil://{authority}")).ok_or_else(|| anyhow!("bad server"))??;
+    let client = Client::new(&hub_url, load_identity()?)?;
+    let enrolled = client.web_enroll(label)?;
+    let url = format!("https://{authority}/login?enroll={}", enrolled.code);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "code": enrolled.code,
+                "url": url,
+                "person": enrolled.person,
+                "expires_at": enrolled.expires_at,
+            }))?
+        );
+    } else {
+        println!("Open this one-time link in your browser (valid for 10 minutes):");
+        println!("  {}", bold(&url));
+        println!("  code: {}", dim(&enrolled.code));
+        println!("After registering a passkey, confirm the browser's device fingerprint here:");
+        println!("  {}", dim("vl identity confirm <FINGERPRINT>"));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The server a device command is for: `server`, or the only one this
 /// device is signed in to. `(authority, who this device is there)`.
 pub fn resolve_server(server: Option<&str>) -> Result<(String, String)> {

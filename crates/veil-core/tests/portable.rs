@@ -1052,18 +1052,16 @@ fn merging_eight_heads_with_the_clock_set_back_reads_a_few_operations_per_head()
 #[test]
 fn web_client_portable_helpers_have_no_secret_decryption_and_verify_signatures() {
     use veil_core::{
-        crypto::{domains, Envelope},
+        crypto::Envelope,
         hub::{
             grant::{Grant, GrantBody},
-            pr::review_message,
             project::empty_tree_id,
             web::{
-                classify_file_meta, diff_text_bounded, inspect_object_no_secrets, sign_web_login, sign_web_pr_review, verify_grant_token,
+                classify_file_meta, diff_text_bounded, inspect_object_no_secrets, seal_new_browser_device, verify_grant_token,
                 WebFileState, WebObjectSummary,
             },
-            wire::login_message,
         },
-        identity::{verify_signature, SeedSigner},
+        identity::SeedSigner,
         object::{Object, Snapshot},
     };
 
@@ -1122,21 +1120,277 @@ fn web_client_portable_helpers_have_no_secret_decryption_and_verify_signatures()
     assert!(diff_text_bounded("a\0b", "a\0c", 1024).binary);
     assert!(diff_text_bounded("1234567890", "1234567899", 4).too_large);
 
-    // 4. Device-signed login and PR review signatures verify.
-    let chal = "cd".repeat(32);
-    let login = sign_web_login(&alice.to_json(), "hub.local:443", &chal, None).unwrap();
-    assert!(verify_signature(
-        &login.key,
-        domains::SIG_CONTEXT_HUB_LOGIN,
-        &login_message("hub.local:443", &chal),
-        &login.signature
-    ));
-    let rev_sig = sign_web_pr_review(&alice.to_json(), "acme", "pr-11223344", "patch-a", "request-changes").unwrap();
-    assert!(verify_signature(
-        &alice.verifying_hex(),
-        domains::SIG_CONTEXT_HUB_PR_REVIEW,
-        &review_message("acme", "pr-11223344", "patch-a", "request-changes"),
-        &rev_sig
-    ));
+    // 4. Passkey-PRF browser device generation produces a separate device with encrypted private keys.
+    let bundle = seal_new_browser_device("alice", "cred-portable-1", &[0x33; 32]).unwrap();
+    assert!(bundle.public_identity.starts_with("veil1"));
+    assert_ne!(bundle.signing_key, alice.verifying_hex());
+    assert!(!bundle.sealed_identity_hex.contains("signing_seed"));
     clock::reset_clock();
+}
+
+#[test]
+fn web_browser_device_prf_sealing_and_worker_secret_decryption() {
+    use std::collections::BTreeMap;
+    use veil_core::{
+        crypto::Envelope,
+        hub::{
+            access::AccessPolicy,
+            web::seal_new_browser_device,
+            web_secrets::{open_secret_in_worker, verify_sealed_browser_device},
+        },
+        keychain::{project_fingerprint, Keychain},
+        object::Object,
+        policy::rule_scope,
+        vfs::MemoryBackend,
+        ObjectId,
+    };
+
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clock::set_clock(Arc::new(|| 1_750_000_000_000i64));
+
+    let bob_vl = Identity::generate("bob");
+    let prf = [0xa5u8; 32];
+    let cred_id = "cred-bob-passkey-1";
+    let browser = seal_new_browser_device("bob", cred_id, &prf).unwrap();
+    assert_ne!(browser.signing_key, bob_vl.verifying_hex(), "browser device must never copy vl keys");
+    assert_ne!(browser.member_id, bob_vl.public_hex());
+
+    let verified = verify_sealed_browser_device(cred_id, &prf, &browser.sealed_identity_hex).unwrap();
+    assert_eq!(verified.public_identity, browser.public_identity);
+    assert_eq!(verified.fingerprint, browser.fingerprint);
+    assert!(verify_sealed_browser_device(cred_id, &[0x11; 32], &browser.sealed_identity_hex).is_err());
+    assert!(verify_sealed_browser_device("other-cred", &prf, &browser.sealed_identity_hex).is_err());
+
+    // Admin creates a project with `team`, `billing/` (readable to bob), and `infra/` (not readable to bob).
+    let admin = Identity::generate("alice");
+    let backend = Arc::new(MemoryBackend::new());
+    let kc = Keychain::new(backend, Some(admin), "repo-portable-s26".into());
+    kc.set_format(8);
+    kc.create_scope("team").unwrap();
+    let team_ring = kc.load_ring("team").unwrap().unwrap();
+    let proj_id = team_ring.verify().unwrap().project.unwrap();
+    let proj_fp = project_fingerprint(&proj_id);
+
+    let access = AccessPolicy::parse("billing/ finance\ninfra/ ops\n");
+    let billing_scope = rule_scope(&access, "billing");
+    let infra_scope = rule_scope(&access, "infra");
+    kc.create_scope(&billing_scope).unwrap();
+    kc.create_scope(&infra_scope).unwrap();
+
+    kc.grant(&billing_scope, &browser.public_identity, "bob").unwrap();
+
+    let (bill_label_g0, bill_key_g0) = kc.sealing_key(&billing_scope).unwrap();
+    let bill_blob_g0 = Object::Blob(b"STRIPE_KEY=sk_live_portable_g0\n".to_vec()).encode();
+    let bill_env_g0 = Envelope::seal_deterministic(&bill_key_g0, &bill_label_g0, &bill_blob_g0).unwrap();
+    let bill_raw_g0 = Object::Sealed(bill_env_g0).encode();
+    let bill_oid_g0 = ObjectId::hash(&bill_raw_g0).hex();
+
+    // Rotate while keeping browser device: browser device must open both g0 (via backward walk) and g1.
+    kc.rotate(&billing_scope).unwrap();
+    let (bill_label_g1, bill_key_g1) = kc.sealing_key(&billing_scope).unwrap();
+    let bill_blob_g1 = Object::Blob(b"STRIPE_KEY=sk_live_portable_g1\n".to_vec()).encode();
+    let bill_env_g1 = Envelope::seal_deterministic(&bill_key_g1, &bill_label_g1, &bill_blob_g1).unwrap();
+    let bill_raw_g1 = Object::Sealed(bill_env_g1).encode();
+    let bill_oid_g1 = ObjectId::hash(&bill_raw_g1).hex();
+
+    let (infra_label, infra_key) = kc.sealing_key(&infra_scope).unwrap();
+    let infra_blob = Object::Blob(b"ROOT_KEY=secret\n".to_vec()).encode();
+    let infra_raw = Object::Sealed(Envelope::seal_deterministic(&infra_key, &infra_label, &infra_blob).unwrap()).encode();
+    let infra_oid = ObjectId::hash(&infra_raw).hex();
+
+    // Browser receives ONLY `billing` ring (no `team`, no `infra`).
+    let billing_ring = kc.load_ring(&billing_scope).unwrap().unwrap();
+    let mut rings = BTreeMap::new();
+    rings.insert(billing_scope.clone(), serde_json::to_string(&billing_ring).unwrap());
+    let rings_json = serde_json::to_string(&rings).unwrap();
+
+    let opened_g0 = open_secret_in_worker(
+        cred_id,
+        &prf,
+        &browser.sealed_identity_hex,
+        &rings_json,
+        Some(&proj_fp),
+        Some(&bill_oid_g0),
+        &bill_raw_g0,
+    )
+    .unwrap();
+    assert_eq!(opened_g0.text.as_deref(), Some("STRIPE_KEY=sk_live_portable_g0\n"));
+
+    let opened_g1 = open_secret_in_worker(
+        cred_id,
+        &prf,
+        &browser.sealed_identity_hex,
+        &rings_json,
+        Some(&proj_fp),
+        Some(&bill_oid_g1),
+        &bill_raw_g1,
+    )
+    .unwrap();
+    assert_eq!(opened_g1.text.as_deref(), Some("STRIPE_KEY=sk_live_portable_g1\n"));
+
+    // Unreadable scope (`infra`), wrong project fingerprint, wrong PRF, and non-file labels all fail closed.
+    assert!(open_secret_in_worker(
+        cred_id,
+        &prf,
+        &browser.sealed_identity_hex,
+        &rings_json,
+        Some(&proj_fp),
+        Some(&infra_oid),
+        &infra_raw,
+    )
+    .is_err());
+    assert!(open_secret_in_worker(
+        cred_id,
+        &prf,
+        &browser.sealed_identity_hex,
+        &rings_json,
+        Some("1111-2222-3333-4444-5555"),
+        Some(&bill_oid_g1),
+        &bill_raw_g1,
+    )
+    .is_err());
+    let vault_forged = Object::Sealed(Envelope::seal_random(&bill_key_g1, &format!("vault:{bill_label_g1}"), &Object::Blob(b"forged".to_vec()).encode()).unwrap()).encode();
+    let vault_oid = ObjectId::hash(&vault_forged).hex();
+    assert!(open_secret_in_worker(
+        cred_id,
+        &prf,
+        &browser.sealed_identity_hex,
+        &rings_json,
+        Some(&proj_fp),
+        Some(&vault_oid),
+        &vault_forged,
+    )
+    .is_err());
+
+    // Revoke browser device -> rotates to g2; browser device cannot open g2, and empty rings open nothing.
+    kc.revoke(&billing_scope, &browser.public_identity).unwrap();
+    let (bill_label_g2, bill_key_g2) = kc.sealing_key(&billing_scope).unwrap();
+    let bill_blob_g2 = Object::Blob(b"STRIPE_KEY=post_revoke\n".to_vec()).encode();
+    let bill_raw_g2 = Object::Sealed(
+        Envelope::seal_deterministic(&bill_key_g2, &bill_label_g2, &bill_blob_g2).unwrap(),
+    )
+    .encode();
+    let bill_oid_g2 = ObjectId::hash(&bill_raw_g2).hex();
+    let revoked_ring = kc.load_ring(&billing_scope).unwrap().unwrap();
+    let mut rev_rings = BTreeMap::new();
+    rev_rings.insert(billing_scope, serde_json::to_string(&revoked_ring).unwrap());
+    let rev_rings_json = serde_json::to_string(&rev_rings).unwrap();
+    assert!(open_secret_in_worker(
+        cred_id,
+        &prf,
+        &browser.sealed_identity_hex,
+        &rev_rings_json,
+        Some(&proj_fp),
+        Some(&bill_oid_g2),
+        &bill_raw_g2,
+    )
+    .is_err());
+    assert!(open_secret_in_worker(
+        cred_id,
+        &prf,
+        &browser.sealed_identity_hex,
+        &rev_rings_json,
+        Some(&proj_fp),
+        Some(&bill_oid_g1),
+        &bill_raw_g1,
+    )
+    .is_err());
+    assert!(open_secret_in_worker(
+        cred_id,
+        &prf,
+        &browser.sealed_identity_hex,
+        "{}",
+        Some(&proj_fp),
+        Some(&bill_oid_g1),
+        &bill_raw_g1,
+    )
+    .is_err());
+
+    clock::reset_clock();
+}
+
+/// Review `rv-s26` (S26, `docs/HUB.md` §13.40): how the browser device's
+/// private keys are sealed under the passkey's PRF output. The seal is
+/// authenticated (any changed byte, and a changed label, fail closed), uses
+/// a new nonce and a new device each time, is keyed by a key derived from
+/// the PRF output under its own domain (never the PRF output itself), holds
+/// nothing readable, and is not a repository secret: the Worker never opens
+/// a `web-device:` envelope as a file.
+#[test]
+fn web_browser_device_sealing_is_authenticated_randomised_and_domain_separated() {
+    use veil_core::{
+        crypto::{domains, Envelope, Suite},
+        hub::{
+            web::{browser_device_label, seal_new_browser_device},
+            web_secrets::{open_secret_in_worker, verify_sealed_browser_device},
+        },
+        object::Object,
+    };
+
+    let _c = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prf = [0x3cu8; 32];
+    let cred = "cred-rv-s26";
+    let a = seal_new_browser_device("carol", cred, &prf).unwrap();
+    let b = seal_new_browser_device("carol", cred, &prf).unwrap();
+    // The action: both open under the passkey that sealed them.
+    assert_eq!(verify_sealed_browser_device(cred, &prf, &a.sealed_identity_hex).unwrap().public_identity, a.public_identity);
+    assert_eq!(verify_sealed_browser_device(cred, &prf, &b.sealed_identity_hex).unwrap().public_identity, b.public_identity);
+
+    // A new device and a new nonce each time.
+    assert_ne!(a.public_identity, b.public_identity);
+    let raw_a = hex::decode(&a.sealed_identity_hex).unwrap();
+    let raw_b = hex::decode(&b.sealed_identity_hex).unwrap();
+    let (env_a, env_b) = (Envelope::from_bytes(&raw_a).unwrap(), Envelope::from_bytes(&raw_b).unwrap());
+    let nonce = |e: &Envelope| match e.suite {
+        Suite::XChaCha20Poly1305 { nonce } => nonce,
+        _ => panic!("the browser device is sealed with XChaCha20-Poly1305"),
+    };
+    assert_ne!(nonce(&env_a), nonce(&env_b), "a nonce was used twice under one key");
+    assert_eq!(env_a.scope, browser_device_label(cred).unwrap());
+    assert!(env_a.scope.starts_with(domains::WEB_DEVICE_IDENTITY_LABEL_PREFIX));
+
+    // Nothing readable in what IndexedDB holds: no field name, no name, and
+    // none of the public keys (so nothing says which device it is).
+    for needle in ["signing_seed", "secret", "carol", &a.signing_key, &a.member_id["veil1".len()..]] {
+        assert!(!raw_a.windows(needle.len()).any(|w| w == needle.as_bytes()), "the sealed record shows '{needle}'");
+    }
+
+    // Authenticated: any changed byte fails closed, in the label, the nonce
+    // or the ciphertext; so does a cut record.
+    for at in [0, 1, 2, raw_a.len() / 2, raw_a.len() - 1] {
+        let mut bad = raw_a.clone();
+        bad[at] ^= 0x01;
+        assert!(verify_sealed_browser_device(cred, &prf, &hex::encode(&bad)).is_err(), "byte {at} changed and the record opened");
+    }
+    assert!(verify_sealed_browser_device(cred, &prf, &hex::encode(&raw_a[..raw_a.len() - 1])).is_err());
+    assert!(verify_sealed_browser_device(cred, &prf, "").is_err());
+    // The label is authenticated, not only compared: a record moved to
+    // another credential's label does not open under that credential.
+    let mut moved = Envelope::from_bytes(&raw_a).unwrap();
+    moved.scope = browser_device_label("another-cred").unwrap();
+    assert!(verify_sealed_browser_device("another-cred", &prf, &hex::encode(moved.to_bytes())).is_err());
+    // A wrong passkey (another PRF output), also one bit away.
+    let mut near = prf;
+    near[31] ^= 1;
+    assert!(verify_sealed_browser_device(cred, &near, &a.sealed_identity_hex).is_err());
+
+    // Domain separation: the key is derived from the PRF output under
+    // `HUB_WEB_PRF_KEY`, so a record sealed under the PRF output itself, or
+    // under a key derived from it for another purpose, does not open.
+    let label = browser_device_label(cred).unwrap();
+    let plain = Identity::generate("carol").to_json();
+    let raw_key = Envelope::seal_random(&prf, &label, plain.as_bytes()).unwrap();
+    assert!(verify_sealed_browser_device(cred, &prf, &hex::encode(raw_key.to_bytes())).is_err());
+    let other = blake3::derive_key(domains::HUB_WEB_SESSION, &prf);
+    let other_domain = Envelope::seal_random(&other, &label, plain.as_bytes()).unwrap();
+    assert!(verify_sealed_browser_device(cred, &prf, &hex::encode(other_domain.to_bytes())).is_err());
+    let right = blake3::derive_key(domains::HUB_WEB_PRF_KEY, &prf);
+    let same_domain = Envelope::seal_random(&right, &label, plain.as_bytes()).unwrap();
+    assert!(verify_sealed_browser_device(cred, &prf, &hex::encode(same_domain.to_bytes())).is_ok(), "the documented derivation");
+
+    // The sealed record is not a repository secret: served as a file's
+    // bytes, the Worker refuses its label before any key is tried.
+    let as_file = Object::Sealed(Envelope::from_bytes(&raw_a).unwrap()).encode();
+    let refused = open_secret_in_worker(cred, &prf, &a.sealed_identity_hex, "{}", None, None, &as_file).unwrap_err();
+    assert!(matches!(refused, VeilError::Policy(_)), "{refused:?}");
 }

@@ -102,6 +102,13 @@ impl Default for Settings {
 #[derive(Clone, Copy, Debug)]
 pub struct Peer(pub IpAddr);
 
+/// The address a request counts against, set on each request by [`admit`]:
+/// the anonymous rate's key (an IPv4 address or an IPv6 /64; behind a
+/// regional cache, its client's). A route that stores something for a
+/// request without a session bounds it by this (BUG-1902).
+#[derive(Clone, Copy, Debug)]
+pub struct Address(pub u128);
+
 /// The header a regional cache's listener sets to its client's address (it
 /// replaces any the client sent); the server believes it only beside the
 /// caches' token (BUG-1332).
@@ -642,6 +649,9 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
         false => peer,
     };
     let address = Key::ip(client);
+    if let Key::Ip(a) = address {
+        parts.extensions.insert(Address(a));
+    }
     let feed = from_cache && parts.uri.path() == "/v1/cache/epochs";
     let batch = parts.method == Method::POST && parts.uri.path().starts_with("/v1/objects/") && parts.uri.path().ends_with(":batch");
     let mut who = match who(&hub, &mut parts, address, batch, feed).await {

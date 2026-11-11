@@ -1363,6 +1363,68 @@ pub fn confirmed_here(authority: &str) {
     let _ = ctx.finish();
 }
 
+/// The server `vl identity list` and `vl identity remove` talk to: this
+/// clone's, or the one this device is signed in to; and the person there.
+fn device_server(server: Option<&str>) -> Result<(String, String)> {
+    let here = server.is_none().then(|| {
+        let root = crate::ctx::find_root(&std::env::current_dir().ok()?)?;
+        let cfg = veil_core::repo::read_config(&veil_core::DiskBackend::new(&root)).ok()?;
+        Some(HubUrl::parse(&cfg.remotes.get("origin")?.url)?.ok()?.authority)
+    });
+    match here.flatten() {
+        Some(a) => hub::signed_in_servers()?
+            .into_iter()
+            .find(|(x, _)| *x == a)
+            .ok_or_else(|| anyhow!("this device is not signed in to {a} (`vl login veil://{a}`)")),
+        None => crate::hub_cmd::resolve_server(server),
+    }
+}
+
+/// `vl identity list`: everything that signs in as this person on the
+/// server: `vl` devices, devices waiting to be confirmed, and the passkeys
+/// of the web client (BUG-1901: every one is listed, and removed with `vl
+/// identity remove`).
+pub fn list_devices(server: Option<&str>) -> Result<()> {
+    let (authority, me) = device_server(server)?;
+    let identity = load_identity()?;
+    let url = HubUrl::parse(&format!("veil://{authority}")).ok_or_else(|| anyhow!("bad server"))??;
+    let mine = Client::new(&url, identity.clone())?.devices_everywhere(&me)?;
+    let this = hub::fingerprint(&identity.public_id());
+    let browser = |fp: &Option<String>| mine.passkeys.iter().any(|p| Some(&p.fingerprint) == fp.as_ref());
+    println!("{} on {}", bold(&safe(&me)), safe(&authority));
+    println!("devices");
+    for d in &mine.identities {
+        let fp = hub::fingerprint(d);
+        if browser(&fp) {
+            continue;
+        }
+        println!("  {}{}", fp.as_deref().unwrap_or("(no signing key)"), if fp == this { "  this device" } else { "" });
+    }
+    for d in &mine.pending {
+        let fp = hub::fingerprint(d);
+        if browser(&fp) {
+            continue;
+        }
+        let fp = fp.unwrap_or_default();
+        println!("  {fp}  waiting: if it is yours, `vl identity confirm {fp}`");
+    }
+    println!("passkeys of the web client (browsers enrolled with `vl web`)");
+    if mine.passkeys.is_empty() {
+        println!("  none");
+    }
+    for p in &mine.passkeys {
+        let state = match (p.opens_secrets, p.confirmed) {
+            (false, _) => "signs in; cannot open secrets".to_string(),
+            (true, false) => format!("signs in; to let it open secrets, `vl identity confirm {}`", p.fingerprint),
+            (true, true) => "signs in; confirmed to open secrets".to_string(),
+        };
+        let label = p.label.as_deref().map(|l| format!("  \"{}\"", safe(l))).unwrap_or_default();
+        println!("  {}{label}  enrolled {}  {state}", p.fingerprint, crate::render::fmt_time(p.enrolled_at));
+    }
+    println!("{}", dim("remove one with `vl identity remove FINGERPRINT`"));
+    Ok(())
+}
+
 /// `vl identity remove FINGERPRINT`: remove one of your devices (from
 /// another) everywhere, or, as an admin of this clone's project, anyone's
 /// device from this project only (BUG-843). Every ring of this clone that
@@ -1371,18 +1433,7 @@ pub fn confirmed_here(authority: &str) {
 pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
     let fp = wire::normalize_fingerprint(fingerprint)
         .ok_or_else(|| anyhow!("a device fingerprint is 20 hex digits, as `vl identity show` prints it (4F2A-9C1E-…)"))?;
-    let here = server.is_none().then(|| {
-        let root = crate::ctx::find_root(&std::env::current_dir().ok()?)?;
-        let cfg = veil_core::repo::read_config(&veil_core::DiskBackend::new(&root)).ok()?;
-        Some(HubUrl::parse(&cfg.remotes.get("origin")?.url)?.ok()?.authority)
-    });
-    let (authority, me) = match here.flatten() {
-        Some(a) => hub::signed_in_servers()?
-            .into_iter()
-            .find(|(x, _)| *x == a)
-            .ok_or_else(|| anyhow!("this device is not signed in to {a} (`vl login veil://{a}`)"))?,
-        None => crate::hub_cmd::resolve_server(server)?,
-    };
+    let (authority, me) = device_server(server)?;
     let identity = load_identity()?;
     if hub::fingerprint(&identity.public_id()).as_deref() == Some(fp.as_str()) {
         bail!("{fp} is this device: remove it from another of your devices");
@@ -1399,7 +1450,7 @@ pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
         let _ = merge_server_rings(c.repo.keys(), &client.url, client.rings().unwrap_or_default());
     }
     // The device: one of mine the server lists, or a ring member's.
-    let mine = client.devices(&me)?;
+    let mine = client.devices_everywhere(&me)?;
     let listed = mine.identities.iter().chain(&mine.pending).find(|d| hub::fingerprint(d).as_deref() == Some(fp.as_str())).cloned();
     let in_rings: Option<(String, String)> = ctx.as_ref().and_then(|c| {
         local_states(c).into_iter().flat_map(|st| st.members.into_iter()).find_map(|(id, m)| {
@@ -1410,6 +1461,16 @@ pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
     let (device, person) = match (listed, in_rings) {
         (Some(d), _) => (d, me.clone()),
         (None, Some(found)) => found,
+        // A passkey of a browser that made no device keys: it holds no
+        // secret key, so there is nothing to rotate; it no longer signs in.
+        (None, None) if mine.passkeys.iter().any(|p| p.fingerprint == fp) => {
+            client.remove_device(&fp, None)?;
+            println!("Removed {}'s passkey {} on {}: it can no longer sign in to the web client", safe(&me), bold(&fp), safe(&authority));
+            if let Some(c) = ctx.as_mut() {
+                let _ = c.finish();
+            }
+            return Ok(());
+        }
         (None, None) => bail!(
             "no device with the fingerprint {fp}: not one of {me}'s on {authority}{}",
             if ctx.is_some() { ", nor in this project's key rings" } else { " (run this in a clone of the project to find someone else's)" }

@@ -12,7 +12,8 @@ Subcommands:
 * [`vl identity recover-vault`](#vl-identity-recover-vault): Re-key this repository's local vault, sealed by an identity that was replaced, to the current identity
 * [`vl identity recover-admin`](#vl-identity-recover-admin): Hand the scope admin rights of a replaced identity over to the current one, in this repository: the replaced identity signs a grant that makes the current identity an admin. Push to share it
 * [`vl identity confirm`](#vl-identity-confirm): Confirm a fingerprint you checked out of band: another device of yours, or, in a clone, the project's
-* [`vl identity remove`](#vl-identity-remove): Remove a device on a Veil server: a lost laptop, say. Run it on another of your devices to remove it everywhere; an admin may remove anyone's device from their project only (run it in a clone of the project)
+* [`vl identity list`](#vl-identity-list): List what signs in as you on a Veil server: your `vl` devices, the devices that wait for you to confirm them, and your passkeys of the web client (the browsers you enrolled with `vl web`). Remove any of them with `vl identity remove`
+* [`vl identity remove`](#vl-identity-remove): Remove a device on a Veil server: a lost laptop, say, or a browser you enrolled with `vl web` (`vl identity list` shows its passkey's fingerprint). Run it on another of your devices to remove it everywhere; an admin may remove anyone's device from their project only (run it in a clone of the project)
 
 ## `vl identity show`
 
@@ -90,9 +91,23 @@ Options:
 |---|---|
 | `--server <SERVER>` | The server (`veil://host[:port]`); default: the one this device is signed in to |
 
+## `vl identity list`
+
+List what signs in as you on a Veil server: your `vl` devices, the devices that wait for you to confirm them, and your passkeys of the web client (the browsers you enrolled with `vl web`). Remove any of them with `vl identity remove`
+
+```text
+vl identity list [OPTIONS]
+```
+
+Options:
+
+| | |
+|---|---|
+| `--server <SERVER>` | The server (`veil://host[:port]`); default: this clone's, or the one this device is signed in to |
+
 ## `vl identity remove`
 
-Remove a device on a Veil server: a lost laptop, say. Run it on another of your devices to remove it everywhere; an admin may remove anyone's device from their project only (run it in a clone of the project).
+Remove a device on a Veil server: a lost laptop, say, or a browser you enrolled with `vl web` (`vl identity list` shows its passkey's fingerprint). Run it on another of your devices to remove it everywhere; an admin may remove anyone's device from their project only (run it in a clone of the project).
 
 Your own device can no longer sign in, and in a clone of a project the keys of every secret it could open rotate away from it at once (your other devices, and admins', do the same in your other projects in the background). A device an admin removes can no longer use that project, and that project's keys rotate away from it; only its person removes it everywhere. It keeps what it already had.
 
@@ -104,7 +119,7 @@ Arguments:
 
 | | |
 |---|---|
-| `<FINGERPRINT>` | The device's fingerprint (`vl identity show` on it, or the one `vl group add` showed) (required) |
+| `<FINGERPRINT>` | The device's fingerprint (`vl identity show` on it, the one `vl group add` showed, or a passkey's in `vl identity list`) (required) |
 
 Options:
 

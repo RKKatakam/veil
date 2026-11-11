@@ -1,10 +1,13 @@
 // Verify crates/veil-core/examples/web_wasm.rs on wasm32-unknown-unknown
 // under node (scripts/check-wasm.sh):
-//   1. exported symbols contain zero unseal / decrypt / keychain / ring entrypoints;
+//   1. exported symbols contain zero unseal / decrypt / keychain / ring entrypoints
+//      and zero raw identity.json signing entrypoints (BUG-1871);
 //   2. sealed envelopes and non-content file metadata classify strictly as "sealed"
 //      without exposing secret bytes;
 //   3. bounded text diffing produces exact unified-diff hunks and flags oversized inputs;
-//   4. device-signed login (hub-login) and PR review (hub-pr-review) work in WASM memory.
+//   4. browser device enrollment generates a distinct device in WASM memory and
+//      seals its private keys under a 32-byte WebAuthn PRF output without
+//      exposing plain private keys.
 import { readFileSync } from "node:fs";
 import { webcrypto } from "node:crypto";
 import assert from "node:assert/strict";
@@ -33,13 +36,24 @@ const { instance } = await WebAssembly.instantiate(readFileSync(file), imports);
 memory = instance.exports.memory;
 const ex = instance.exports;
 
-// Threat 18 / Guarantee 2: the web WASM module exports no secret-decryption or keyring path.
+// Threat 18 / BUG-1871: the main web WASM module exports no secret-decryption,
+// keyring, or raw identity.json signing entrypoints.
 const exportNames = Object.keys(ex);
 for (const name of exportNames) {
-  for (const forbidden of ["unseal", "decrypt", "keychain", "ring", "unwrap_key", "secret_share"]) {
+  for (const forbidden of [
+    "unseal",
+    "decrypt",
+    "keychain",
+    "ring",
+    "unwrap_key",
+    "secret_share",
+    "sign_login",
+    "sign_review",
+    "generate_identity",
+  ]) {
     assert(
       !name.toLowerCase().includes(forbidden),
-      `forbidden secret-related export in web WASM: ${name}`
+      `forbidden export in web WASM: ${name}`
     );
   }
 }
@@ -112,49 +126,30 @@ function freeAll(allocs) {
   freeAll([oldB, newB]);
 }
 
-// 3. Device-signed login and PR review in WASM memory.
+// 3. Passkey-PRF browser device generation seals private keys in WASM memory.
 {
   const nm = putStr("alice");
-  assert.equal(ex.veil_web_generate_identity(nm[0], nm[1]), 0);
-  const idJson = JSON.parse(readOut());
-  const idB = putStr(idJson);
-  const hubB = putStr("127.0.0.1:8443");
-  const chalB = putStr("ab".repeat(32));
-  assert.equal(ex.veil_web_sign_login(idB[0], idB[1], hubB[0], hubB[1], chalB[0], chalB[1]), 0);
-  const login = JSON.parse(readOut());
-  assert.equal(login.hub, "127.0.0.1:8443");
-  assert.equal(login.signature.length, 128);
-  assert(login.identity.startsWith("veil1"));
+  const cred = putStr("cred-wasm-node-test");
+  const prf = new Uint8Array(32);
+  prf.fill(0x5c);
+  const prfB = putBytes(prf);
+  assert.equal(ex.veil_web_seal_new_device(nm[0], nm[1], cred[0], cred[1], prfB[0], prfB[1]), 0);
+  const rawJson = readOut();
+  assert(!rawJson.includes("signing_seed"), "plain signing seed leaked from WASM");
+  const bundle1 = JSON.parse(rawJson);
+  assert(bundle1.public_identity.startsWith("veil1"));
+  assert.equal(bundle1.signing_key.length, 64);
+  assert.equal(bundle1.member_id.length, 69);
+  assert.equal(bundle1.fingerprint.length, 24);
+  assert(bundle1.sealed_identity_hex.length > 128);
 
-  const projB = putStr("acme");
-  const prB = putStr("pr-1234abcd");
-  const patchB = putStr("patch-digest");
-  const verdictB = putStr("approve");
-  assert.equal(
-    ex.veil_web_sign_review(
-      idB[0], idB[1],
-      projB[0], projB[1],
-      prB[0], prB[1],
-      patchB[0], patchB[1],
-      verdictB[0], verdictB[1]
-    ),
-    0
-  );
-  const reviewSig = JSON.parse(readOut());
-  assert.equal(reviewSig.length, 128);
+  assert.equal(ex.veil_web_seal_new_device(nm[0], nm[1], cred[0], cred[1], prfB[0], prfB[1]), 0);
+  const bundle2 = JSON.parse(readOut());
+  assert.notEqual(bundle1.signing_key, bundle2.signing_key);
 
-  const badVerdict = putStr("ship-it");
-  assert.equal(
-    ex.veil_web_sign_review(
-      idB[0], idB[1],
-      projB[0], projB[1],
-      prB[0], prB[1],
-      patchB[0], patchB[1],
-      badVerdict[0], badVerdict[1]
-    ),
-    1
-  );
-  freeAll([nm, idB, hubB, chalB, projB, prB, patchB, verdictB, badVerdict]);
+  const zeroPrf = putBytes(new Uint8Array(32));
+  assert.equal(ex.veil_web_seal_new_device(nm[0], nm[1], cred[0], cred[1], zeroPrf[0], zeroPrf[1]), 1);
+  freeAll([nm, cred, prfB, zeroPrf]);
 }
 
 console.log("web_wasm: ok on wasm32-unknown-unknown");

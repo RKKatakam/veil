@@ -762,9 +762,42 @@ impl Client {
     }
 
     /// A person's devices and vouches, as the server lists them: never
-    /// enough on its own to wrap a key (`docs/HUB.md` §13.11).
+    /// enough on its own to wrap a key (`docs/HUB.md` §13.11). When scoped
+    /// to a project, browser devices are omitted unless the project has
+    /// enabled browser secrets.
     pub fn devices(&self, person: &str) -> Result<Devices> {
+        let path = if self.url.project.is_empty() {
+            format!("/v1/people/{person}/devices")
+        } else {
+            format!("/v1/people/{person}/devices?project={}", self.url.project)
+        };
+        self.json("GET", &path, None::<&()>)
+    }
+
+    /// A person's devices across the whole server (regardless of project
+    /// browser-secret settings), for `vl identity remove` and `vl identity list`.
+    pub fn devices_everywhere(&self, person: &str) -> Result<Devices> {
         self.json("GET", &format!("/v1/people/{person}/devices"), None::<&()>)
+    }
+
+    /// Mint a short-lived single-use browser passkey enrollment code (`vl web`).
+    ///
+    /// Signed by this device's identity key over a challenge of the server,
+    /// as a sign-in is: the passkey it enrolls outlives this session.
+    pub fn web_enroll(&self, label: Option<&str>) -> Result<veil_core::hub::web::WebEnrollResponse> {
+        let ch: Challenge = self.json("POST", "/v1/auth/challenge", Some(&ChallengeRequest { key: self.identity.verifying_hex() }))?;
+        let hub = self.url.authority.clone();
+        let req = veil_core::hub::web::WebEnrollRequest {
+            label: label.map(str::to_string),
+            seconds: None,
+            signature: self.identity.sign(
+                veil_core::crypto::domains::SIG_CONTEXT_HUB_WEB_ENROLL,
+                &veil_core::hub::wire::login_message(&hub, &ch.challenge),
+            ),
+            challenge: ch.challenge,
+            hub,
+        };
+        self.json("POST", "/v1/sessions/web-enroll", Some(&req))
     }
 
     /// Vouch, with this device's key, that `device` (a full public

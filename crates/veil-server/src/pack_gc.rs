@@ -1394,6 +1394,7 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("blame_memo", &["project_id", "view_key", "path_key", "follow", "body", "bytes", "created_at", "path_keys"]),
     ("blame_paths", &["project_id", "path_key", "path"]),
     ("branches", &["project_id", "name", "lineage", "hidden_for_embargo"]),
+    ("browser_device_rings", &["device_id", "project_id", "scope", "body"]),
     ("challenges", &["challenge", "signing_key", "expires_at"]),
     ("change_refs", &["project_id", "change_id", "created_by", "created_at"]),
     ("checks", &["project_id", "name", "state", "summary", "url", "log", "runner_id", "runner_name", "session_paths", "admin_only", "updated_at", "run_count"]),
@@ -1401,7 +1402,7 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("device_bars", &["project_id", "device_id", "created_at"]),
     ("device_expected", &["person_id", "fingerprint", "expires_at"]),
     ("device_vouches", &["device_id", "voucher_key", "signature", "created_at"]),
-    ("devices", &["id", "person_id", "signing_key", "public_identity", "created_at", "removed_at", "pending", "fingerprint"]),
+    ("devices", &["id", "person_id", "signing_key", "public_identity", "created_at", "removed_at", "pending", "fingerprint", "browser", "prf_supported"]),
     ("embargo_lines", &["project_id", "embargo_id", "group_names", "target_branch", "embargo_branch", "until_ms", "released_at", "created_by", "created_at", "has_pr"]),
     ("embargo_snapshots", &["project_id", "embargo_id"]),
     ("file_history", &["project_id", "path_key", "depth"]),
@@ -1431,7 +1432,7 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("pr_threads", &["project_id", "pr", "id", "anchor", "now_at", "state", "author", "created_at"]),
     ("project_admins", &["project_id", "person_id"]),
     ("projections", &["project_id", "view_key", "created_at", "collapsed"]),
-    ("projects", &["id", "name", "created_by", "created_at", "default_branch", "policy_text", "policy_bindings", "policy_version"]),
+    ("projects", &["id", "name", "created_by", "created_at", "default_branch", "policy_text", "policy_bindings", "policy_version", "web_secrets"]),
     ("prs", &["project_id", "id", "class_id", "policy_key", "target", "author", "title", "body", "state", "revision", "created_at", "updated_at", "embargo", "land_at_release"]),
     ("rings", &["project_id", "scope", "body"]),
     ("rule_history", &["project_id", "line_key", "generation"]),
@@ -1449,7 +1450,9 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("view_changes", &["project_id", "view_key", "change_id", "flags"]),
     ("view_file_history", &["project_id", "view_key", "path_key", "depth"]),
     ("view_fills", &["project_id", "view_key", "holder", "expires_at"]),
-    ("view_graph", &["project_id", "view_key", "generation", "depth", "flags", "files"]),
+    ("view_graph", &["project_id", "view_key", "generation", "depth", "flags", "files"]),    ("web_enrollments", &["code_hash", "person_id", "label", "created_at", "expires_at", "used_at"]),
+    ("webauthn_challenges", &["challenge", "kind", "person_id", "code_hash", "prf_salt", "origin", "rp_id", "expires_at", "address"]),
+    ("webauthn_credentials", &["credential_id", "person_id", "device_id", "alg", "public_key", "sign_count", "prf_salt", "created_at", "label"]),
 ];
 
 /// Look up the registered [`SchemaColumnRole`] of `(table, column)` in `public`.
