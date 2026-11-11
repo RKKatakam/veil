@@ -269,6 +269,11 @@ fn build_wc_tree(
     // What `fs` was materialised from: the working copy, with the
     // entries a command put back in place of its own.
     let parent_tree = with_carried(&store, wc.tree, p.carried)?;
+    let base_tree = repo
+        .parents_tree(&wc.parents)
+        .ok()
+        .map(|m| with_carried(&store, m.tree, p.carried))
+        .transpose()?;
     // `fs` was checked out from `wc.tree`: a `.veilpolicy` edit is the
     // member's, unless a command wrote it from elsewhere (or wrote the
     // files at all).
@@ -281,6 +286,7 @@ fn build_wc_tree(
         &BuildOptions {
             policy: &wp.policy,
             parent_tree: Some(parent_tree),
+            base_tree,
             injected: p.injected,
             rescan,
             materialised: p.materialised,
@@ -449,6 +455,7 @@ impl Repo {
         // started (format 6).
         let mut tx = self.transaction(description.unwrap_or_else(|| snapshot_op_description(ws)))?;
         tx.for_workspace(ws);
+        tx.carry_entries(carried);
         let wc_id = tx.view.workspace(ws)?.wc;
         if expected_wc.is_some_and(|e| e != wc_id) {
             return Ok(WcSnapshot {
@@ -621,12 +628,18 @@ impl Repo {
         let snap = self.snapshot(snapshot)?;
         let policy = self.snapshot_policy(fs, None)?.policy;
         let parent_tree = with_carried(&self.store, snap.tree, carried)?;
+        let base_tree = self
+            .parents_tree(&snap.parents)
+            .ok()
+            .map(|m| with_carried(&self.store, m.tree, carried))
+            .transpose()?;
         let (tree, report) = build_tree_cached(
             &self.store,
             fs,
             &BuildOptions {
                 policy: &policy,
                 parent_tree: Some(parent_tree),
+                base_tree,
                 injected: None,
                 rescan: false,
                 materialised,
@@ -669,6 +682,7 @@ impl Repo {
             &BuildOptions {
                 policy: &policy,
                 parent_tree,
+                base_tree: parent_tree,
                 injected: None,
                 rescan: false,
                 materialised,
@@ -779,6 +793,7 @@ impl Repo {
         policy_from_command: bool,
     ) -> Result<(ObjectId, BuildReport)> {
         let mut tx = self.transaction("record ephemeral workspace")?;
+        tx.carry_entries(carried);
         let parent = tx.repo().snapshot(&base)?;
         let store = tx.repo().store.clone();
         // The new change's base is `base` itself.
@@ -791,6 +806,7 @@ impl Repo {
             &BuildOptions {
                 policy: &wp.policy,
                 parent_tree: Some(parent_tree),
+                base_tree: Some(parent_tree),
                 injected,
                 rescan: false,
                 materialised,

@@ -114,6 +114,11 @@ pub struct Transaction<'r> {
     kept_dir: Option<VPath>,
     /// [`Transaction::keep_attribution`].
     keep_attribution: bool,
+    /// [`Transaction::keep_sealing`].
+    keep_sealing: bool,
+    /// Paths whose sealed entries a command (`vl restore`) carried into the
+    /// directory it records (BUG-492).
+    carried_sealed: HashSet<VPath>,
 }
 
 /// Names of the operation's bytes and of its (empty) head file in a
@@ -182,6 +187,8 @@ impl<'r> Transaction<'r> {
             done: false,
             kept_dir: None,
             keep_attribution: false,
+            keep_sealing: false,
+            carried_sealed: HashSet::new(),
         })
     }
 
@@ -360,6 +367,7 @@ impl<'r> Transaction<'r> {
         let tolerated = |e: &VeilError| {
             e.is_unreadable() || e.is_not_found() || matches!(e, VeilError::Corrupt(..) | VeilError::Json(_) | VeilError::Unsupported(_))
         };
+        self.reconcile_sealing(&mut s, &tolerated)?;
         let from = s.predecessors.first().or(s.parents.first()).copied();
         let base = match from {
             Some(id) => self.repo.exact().snapshot(&id).ok().flatten(),
@@ -372,6 +380,225 @@ impl<'r> Transaction<'r> {
             Err(e) => return Err(e),
         }
         Ok(s)
+    }
+
+    /// Re-derive any sealed entry at a non-secret path in `s` whose sealing
+    /// `s.parents` do not explain (`policy::sealed_secret`, BUG-1833): its
+    /// content arrived at an ordinary path and is classified (and scanned)
+    /// there, across commits, squashes, splits, rebases and duplicates.
+    fn reconcile_sealing(&self, s: &mut Snapshot, tolerated: &impl Fn(&VeilError) -> bool) -> Result<()> {
+        use crate::object::{EntryKind, TermKind, TreeEntry, Visibility};
+        use crate::policy::{Policy, Tier};
+        let store = &self.repo.store;
+        if self.keep_sealing || store.format() < crate::repo::ONLY_SECRETS_REPO_FORMAT || s.parents.is_empty() {
+            return Ok(());
+        }
+        let Some(first_parent) = self.repo.exact().snapshot(&s.parents[0]).ok().flatten() else {
+            return Ok(());
+        };
+        let changes = match crate::tree::diff_trees(store, Some(&first_parent.tree), Some(&s.tree)) {
+            Ok(c) => c,
+            Err(e) if tolerated(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let has_candidate = changes.iter().any(|c| {
+            let Some(e) = &c.new else { return false };
+            if crate::policy::seals_secret(c.path.as_str()) {
+                return false;
+            }
+            (e.kind.holds_blob() && matches!(e.visibility, Visibility::Cloaked { .. }))
+                || (e.kind == EntryKind::Conflict
+                    && store
+                        .conflict(&e.id)
+                        .ok()
+                        .is_some_and(|cf| cf.adds.iter().chain(&cf.removes).flatten().any(|t| matches!(t.visibility, Visibility::Cloaked { .. }))))
+        });
+        if !has_candidate {
+            return Ok(());
+        }
+        let mut known_secret_ids: HashSet<ObjectId> = HashSet::new();
+        for p in &s.parents {
+            let Some(ps) = self.repo.exact().snapshot(p).ok().flatten() else { continue };
+            if let Ok((pfiles, _)) = crate::tree::walk_files_hiding(store, &ps.tree) {
+                for (_, pe) in pfiles {
+                    if !pe.visibility.is_public() {
+                        known_secret_ids.insert(pe.id);
+                    } else if pe.kind == EntryKind::Conflict {
+                        if let Ok(cf) = store.conflict(&pe.id) {
+                            for t in cf.adds.iter().chain(&cf.removes).flatten() {
+                                if !t.visibility.is_public() {
+                                    known_secret_ids.insert(t.id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok((sfiles, _)) = crate::tree::walk_files_hiding(store, &s.tree) {
+            for (sp, se) in sfiles {
+                if !se.visibility.is_public() && crate::policy::seals_secret(sp.as_str()) {
+                    known_secret_ids.insert(se.id);
+                }
+            }
+        }
+        let sealed_in_a_parent = |path: &VPath| -> bool {
+            if self.carried_sealed.contains(path) {
+                return true;
+            }
+            for p in &s.parents {
+                let Some(ps) = self.repo.exact().snapshot(p).ok().flatten() else { continue };
+                let Some(pe) = crate::tree::lookup(store, &ps.tree, path).ok().flatten() else { continue };
+                let has_sealed = match pe.kind {
+                    EntryKind::Conflict => store
+                        .conflict(&pe.id)
+                        .ok()
+                        .is_some_and(|cf| cf.adds.iter().chain(&cf.removes).flatten().any(|t| !t.visibility.is_public())),
+                    _ => !pe.visibility.is_public(),
+                };
+                if has_sealed {
+                    return true;
+                }
+            }
+            false
+        };
+        let moved_away = |scope: &str| -> bool {
+            changes.iter().any(|o| {
+                o.new.is_none()
+                    && o.old
+                        .as_ref()
+                        .is_some_and(|e| matches!(&e.visibility, Visibility::Cloaked { scope: sc } if sc == scope))
+            })
+        };
+        let initial_tree = s.tree;
+        let policy_cache: std::cell::OnceCell<Policy> = std::cell::OnceCell::new();
+        let load_policy = || -> Result<&Policy> {
+            if let Some(pol) = policy_cache.get() {
+                return Ok(pol);
+            }
+            let accepted = crate::policy::load_accepted(&*self.repo.backend).ok().flatten();
+            let (pol, _) = Policy::load_or_accepted(&crate::tree::TreeView::new(store.clone(), initial_tree), accepted.as_deref())?;
+            let _ = policy_cache.set(pol);
+            Ok(policy_cache.get().expect("just set"))
+        };
+        let plain_for = |path: &VPath, kind: EntryKind, id: &ObjectId, pol: &Policy| -> Result<Option<Option<(ObjectId, u64)>>> {
+            let plain = match store.read_blob(id) {
+                Ok(b) => b,
+                Err(err) if tolerated(&err) => return Ok(None),
+                Err(err) => return Err(err),
+            };
+            let class = match kind {
+                EntryKind::Symlink => pol.classify_link(path),
+                _ => pol.classify(path, false),
+            };
+            match class.tier {
+                Tier::Public => {
+                    if !class.allow_secrets {
+                        if let Some(f) = crate::secrets::scan(&plain).first() {
+                            return Err(VeilError::Policy(format!(
+                                "'{path}' looks like it holds a secret ({}, line {}): put secrets in a secret file such as .env, which Veil encrypts",
+                                f.rule, f.line
+                            )));
+                        }
+                    }
+                    let pub_id = store.store_file(&plain, &Visibility::Public)?;
+                    Ok(Some(Some((pub_id, plain.len() as u64))))
+                }
+                Tier::Isolated | Tier::Ignored => Ok(Some(None)),
+                Tier::Cloaked(_) => Ok(None),
+            }
+        };
+        for c in &changes {
+            let Some(e) = &c.new else { continue };
+            if crate::policy::seals_secret(c.path.as_str()) {
+                continue;
+            }
+            if e.kind.holds_blob() {
+                let Visibility::Cloaked { scope } = &e.visibility else { continue };
+                let ok = crate::policy::sealed_secret::<std::convert::Infallible>(
+                    c.path.as_str(),
+                    scope,
+                    known_secret_ids.contains(&e.id),
+                    |_| Ok(sealed_in_a_parent(&c.path)),
+                    |_| Ok(moved_away(scope)),
+                )
+                .unwrap_or(false);
+                if ok {
+                    continue;
+                }
+                let pol = load_policy()?;
+                let Some(next) = plain_for(&c.path, e.kind, &e.id, pol)? else { continue };
+                let replacement = next.map(|(pub_id, size)| TreeEntry {
+                    id: pub_id,
+                    visibility: Visibility::Public,
+                    size,
+                    ..e.clone()
+                });
+                s.tree = crate::conflict::set_entry(store, &s.tree, &c.path, replacement)?;
+            } else if e.kind == EntryKind::Conflict && !sealed_in_a_parent(&c.path) {
+                let Ok(mut cf) = store.conflict(&e.id) else { continue };
+                let mut touched = false;
+                for slot in cf.adds.iter_mut().chain(cf.removes.iter_mut()) {
+                    let Some(t) = slot.as_mut() else { continue };
+                    let Visibility::Cloaked { scope } = &t.visibility else { continue };
+                    if known_secret_ids.contains(&t.id) || moved_away(scope.as_str()) {
+                        continue;
+                    }
+                    let pol = load_policy()?;
+                    let kind = match t.kind {
+                        TermKind::Symlink => EntryKind::Symlink,
+                        TermKind::File => EntryKind::File,
+                    };
+                    let Some(next) = plain_for(&c.path, kind, &t.id, pol)? else { continue };
+                    touched = true;
+                    match next {
+                        Some((pub_id, size)) => {
+                            t.id = pub_id;
+                            t.size = size;
+                            t.visibility = Visibility::Public;
+                        }
+                        None => *slot = None,
+                    }
+                }
+                if touched {
+                    let merge = crate::conflict::Merge::of_conflict(cf).simplify();
+                    let replacement = match merge.trivial() {
+                        Some(Some(t)) => Some(t.entry(&e.name)),
+                        Some(None) => None,
+                        None => match merge.into_conflict()? {
+                            Some(nc) => Some(TreeEntry::conflict(&e.name, store.put_conflict(&nc)?)),
+                            None => None,
+                        },
+                    };
+                    s.tree = crate::conflict::set_entry(store, &s.tree, &c.path, replacement)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn carry_entries(&mut self, carried: &[(VPath, crate::object::TreeEntry)]) {
+        use crate::object::EntryKind;
+        let store = &self.repo.store;
+        for (path, e) in carried {
+            let has_sealed = match e.kind {
+                EntryKind::Conflict => store
+                    .conflict(&e.id)
+                    .ok()
+                    .is_some_and(|cf| cf.adds.iter().chain(&cf.removes).flatten().any(|t| !t.visibility.is_public())),
+                _ => !e.visibility.is_public(),
+            };
+            if has_sealed {
+                self.carried_sealed.insert(path.clone());
+            }
+        }
+    }
+
+    /// Snapshots this transaction writes keep their entries' sealing as
+    /// recorded ([`Repo::split`]: dividing one change never widens any entry's
+    /// audience).
+    pub(crate) fn keep_sealing(&mut self) {
+        self.keep_sealing = true;
     }
 
     /// Snapshots this transaction writes keep their own attribution
@@ -472,8 +699,119 @@ impl<'r> Transaction<'r> {
         self.write_snapshot(&snap)
     }
 
+    /// Make each parent in `old_parents` that `new_parents` no longer keeps a
+    /// head, unless it is missing (hidden) or an abandoned attempt. Ancestor
+    /// heads that still have another visible descendant are dropped at commit.
+    fn release_parents(&mut self, old_parents: &[ObjectId], new_parents: &[ObjectId]) -> Result<()> {
+        for p in old_parents {
+            if !new_parents.contains(p) && self.repo.exact().snapshot(p)?.is_some_and(|s| s.abandoned.is_none()) {
+                self.view.heads.insert(*p);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop any head in `self.view.heads` that another head already descends
+    /// from, keeping `heads` the maximal tips of the visible DAG.
+    fn drop_ancestor_heads(&mut self) -> Result<()> {
+        if self.view.heads.len() <= 1 {
+            return Ok(());
+        }
+        let candidates: HashSet<ObjectId> = self.view.heads.iter().copied().collect();
+        let mut parent_roots = Vec::new();
+        for h in &self.view.heads {
+            if let Some(s) = self.repo.held().snapshot(h)? {
+                parent_roots.extend(s.parents.iter().copied());
+            }
+        }
+        if parent_roots.is_empty() {
+            return Ok(());
+        }
+        let redundant = self.repo.held().reachable_among(parent_roots, &candidates)?;
+        for h in redundant {
+            self.view.heads.remove(&h);
+        }
+        Ok(())
+    }
+
+    /// Rebase each recorded attempt in `attempts` onto `new_parents` under
+    /// `change_id`, keeping what the attempt itself changed relative to its
+    /// former parents, its reason and its attribution.
+    fn rebase_attempts(&self, attempts: &[ObjectId], new_parents: &[ObjectId], change_id: ChangeId) -> Result<Vec<ObjectId>> {
+        use crate::object::EntryKind;
+        if attempts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = &self.repo.store;
+        let mut out = Vec::with_capacity(attempts.len());
+        for a in attempts {
+            let att = self.repo.snapshot(a)?;
+            let id = if att.parents == new_parents && att.change_id == change_id {
+                *a
+            } else {
+                let (tree, extra_conflicts) = if att.parents == new_parents {
+                    (att.tree, Vec::new())
+                } else {
+                    let old_base = self.repo.parents_tree(&att.parents)?.tree;
+                    let new_base = self.repo.parents_tree(new_parents)?.tree;
+                    let merged = self.repo.rebase_tree(&att.parents, new_parents, att.tree)?;
+                    let mut tree = merged.tree;
+                    let mut extra = Vec::new();
+                    for c in merged.conflicts {
+                        let te = crate::tree::lookup(store, &tree, &c)?;
+                        let be = crate::tree::lookup(store, &old_base, &c)?;
+                        let ne = crate::tree::lookup(store, &new_base, &c)?;
+                        let dirs = (te.filter(|e| e.kind == EntryKind::Dir), be.filter(|e| e.kind == EntryKind::Dir));
+                        if let (Some(te), Some(be)) = dirs {
+                            if ne.as_ref().is_none_or(|e| e.kind != EntryKind::Dir) {
+                                let (files, _) = crate::tree::walk_files_hiding(store, &te.id)?;
+                                for (rel, leaf) in files {
+                                    let mut full = c.clone();
+                                    for comp in rel.components() {
+                                        full = full.join(comp);
+                                    }
+                                    let b_leaf = crate::tree::lookup(store, &be.id, &rel)?;
+                                    if b_leaf.as_ref().is_some_and(|bl| bl.same_content(&leaf)) {
+                                        tree = crate::conflict::set_entry(store, &tree, &full, None)?;
+                                    } else if ne.is_none() && b_leaf.is_some() {
+                                        extra.push(full);
+                                    }
+                                }
+                                if ne.is_some() && crate::tree::lookup(store, &tree, &c)?.is_some() {
+                                    extra.push(c);
+                                }
+                                continue;
+                            }
+                        }
+                        extra.push(c);
+                    }
+                    (tree, extra)
+                };
+                let mut conflicts: BTreeSet<String> = att
+                    .conflicts
+                    .iter()
+                    .filter(|p| VPath::new(p).ok().and_then(|vp| crate::tree::lookup(store, &tree, &vp).ok().flatten()).is_some())
+                    .cloned()
+                    .collect();
+                conflicts.extend(extra_conflicts.iter().map(|c| c.to_string()));
+                let mut na = (*att).clone();
+                na.change_id = change_id;
+                na.parents = new_parents.to_vec();
+                na.tree = tree;
+                na.predecessors = vec![*a];
+                na.conflicts = conflicts.into_iter().collect();
+                let na = self.indexed(na)?;
+                store.put_snapshot(&self.sign(&na))?
+            };
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Replace `old` with `new` (same change, new content/metadata).
-    pub fn rewrite(&mut self, old: ObjectId, new: Snapshot) -> Result<ObjectId> {
+    pub fn rewrite(&mut self, old: ObjectId, mut new: Snapshot) -> Result<ObjectId> {
         if old == self.repo.root_id {
             return Err(VeilError::repo("the root snapshot cannot be rewritten"));
         }
@@ -484,6 +822,7 @@ impl<'r> Transaction<'r> {
         // nothing (BUG-246).
         let prev = self.repo.snapshot(&old)?;
         self.check_parents(&new)?;
+        new.attempts = self.rebase_attempts(&new.attempts, &new.parents, new.change_id)?;
         let new = self.stamped(self.indexed(new)?);
         let mut same = new.clone();
         same.predecessors = prev.predecessors.clone();
@@ -495,6 +834,7 @@ impl<'r> Transaction<'r> {
         let id = self.repo.store.put_snapshot(&self.sign(&new))?;
         self.rewritten.insert(old, Rewrite::Replaced(id));
         self.view.heads.remove(&old);
+        self.release_parents(&prev.parents, &new.parents)?;
         self.add_head(id)?;
         Ok(id)
     }
@@ -650,6 +990,7 @@ impl<'r> Transaction<'r> {
             ns.tree = merged.tree;
             ns.predecessors = vec![*id];
             ns.conflicts = conflicts.into_iter().collect();
+            ns.attempts = self.rebase_attempts(&s.attempts, &ns.parents, ns.change_id)?;
             let ns = self.indexed(ns)?;
             let nid = store.put_snapshot(&self.sign(&ns))?;
             self.rewritten.insert(*id, Rewrite::Replaced(nid));
@@ -700,9 +1041,7 @@ impl<'r> Transaction<'r> {
         let s = self.repo.snapshot(&id)?;
         self.rewritten.insert(id, Rewrite::Abandoned(s.parents.clone()));
         self.view.heads.remove(&id);
-        for p in &s.parents {
-            self.view.heads.insert(*p);
-        }
+        self.release_parents(&s.parents, &[])?;
         Ok(())
     }
 
@@ -865,7 +1204,11 @@ impl<'r> Transaction<'r> {
             // relative to the merge of its old ones. A merge one of whose
             // parents moved is re-merged, never rebased by one parent's diff
             // (that dropped what the other parents hold, BUG-251).
-            let out = match self.repo.rebase_tree(&s.parents, &new_parents, s.tree) {
+            let (out, attempts) = match self
+                .repo
+                .rebase_tree(&s.parents, &new_parents, s.tree)
+                .and_then(|o| Ok((o, self.rebase_attempts(&s.attempts, &new_parents, s.change_id)?)))
+            {
                 // A merge of concurrent operations never fails for a policy
                 // reason (threat 18; two embargoes combined, say): this
                 // snapshot, and what is built on it, stay where their side
@@ -884,9 +1227,16 @@ impl<'r> Transaction<'r> {
             ns.tree = tree;
             ns.predecessors = vec![id];
             ns.conflicts = conflicts.into_iter().collect();
+            ns.attempts = attempts;
             // Rebasing someone else's change: `author` stays theirs, the
             // signature becomes ours, and `predecessors` keeps the original.
-            let ns = self.indexed(ns)?;
+            let ns = match self.indexed(ns) {
+                Err(VeilError::Policy(why)) if self.merge.is_some() => {
+                    self.merge.as_mut().expect("a merge").held.push((id, why));
+                    continue;
+                }
+                r => r?,
+            };
             let nid = store.put_snapshot(&self.sign(&ns))?;
             self.rewritten.insert(id, Rewrite::Replaced(nid));
             if !pinned.contains(&crate::repo::RefKey::Head(id)) {
@@ -930,6 +1280,7 @@ impl<'r> Transaction<'r> {
             };
             self.view.workspaces.get_mut(&name).unwrap().wc = new_wc;
         }
+        self.drop_ancestor_heads()?;
         Ok(())
     }
 
@@ -1212,6 +1563,12 @@ impl<'r> Transaction<'r> {
             self.rewritten = union.clone();
             self.merge.as_mut().expect("a merge").held.clear();
             for (k, v) in &reversals {
+                if let Rewrite::Replaced(to) = v {
+                    if let (Some(ks), Some(ts)) = (self.repo.held().snapshot(k)?, self.repo.held().snapshot(to)?) {
+                        let (kp, tp) = (ks.parents.clone(), ts.parents.clone());
+                        self.release_parents(&kp, &tp)?;
+                    }
+                }
                 self.rewritten.insert(*k, v.clone());
             }
             if !self.rewritten.is_empty() {

@@ -81,6 +81,7 @@ pub fn normalize_access_path(pattern: &str) -> Result<String, String> {
 impl AccessPolicy {
     /// The access lines of `text` (a `.veilpolicy`).
     pub fn parse(text: &str) -> AccessPolicy {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut out = AccessPolicy::default();
         for (n, line) in text.lines().enumerate() {
             let fields = split_fields(line);

@@ -565,6 +565,86 @@ fn case_insensitive(builtin: bool, secret: bool, tier: &Tier) -> bool {
     (builtin && secret) || (!builtin && matches!(tier, Tier::Cloaked(_) | Tier::Isolated))
 }
 
+/// Strip leading `/` and `./` prefixes (reading `./` as the root), returning
+/// the remainder and whether a root anchor (`/` or `./`) was present.
+fn strip_root_prefix(s: &str) -> (&str, bool) {
+    let mut anchored = s.starts_with('/');
+    let mut p = s.trim_start_matches('/');
+    while let Some(rest) = p.strip_prefix("./") {
+        anchored = true;
+        p = rest.trim_start_matches('/');
+    }
+    (p, anchored)
+}
+
+/// Unicode Default_Ignorable_Code_Point or control characters that editors or
+/// copy-paste can insert without `char::is_whitespace` splitting them.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x034F
+            | 0x061C
+            | 0x115F..=0x1160
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x3164
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFA0
+            | 0xFFF0..=0xFFF8
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE0FFF
+    ) || c.is_control()
+}
+
+fn has_unescaped_quote(s: &str) -> bool {
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+            continue;
+        }
+        if matches!(c, '"' | '\'') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strip quotes, invisible characters and `.`/`..`/empty components so an
+/// invalid protective rule still isolates what it appeared to name (or `**`).
+fn clean_protective_pattern(raw: &str) -> String {
+    let stripped: String = raw
+        .chars()
+        .filter(|c| !is_default_ignorable(*c) && !matches!(c, '"' | '\''))
+        .collect();
+    let dir_only = stripped.trim().ends_with('/');
+    let parts: Vec<&str> = stripped
+        .trim()
+        .split('/')
+        .filter(|c| !matches!(*c, "" | "." | ".."))
+        .collect();
+    if parts.is_empty() {
+        "**".to_string()
+    } else if dir_only {
+        format!("{}/", parts.join("/"))
+    } else {
+        parts.join("/")
+    }
+}
+
+fn rule_matches_sample(r: &Rule) -> bool {
+    sample_patterns(&r.pattern)
+        .into_iter()
+        .filter_map(|s| VPath::new(&s).ok().filter(|vp| !vp.is_root()))
+        .any(|vp| r.matches(&vp, r.dir_only) || r.matches(&vp, false))
+}
+
 impl Rule {
     fn new(pattern: &str, tier: Tier, force: bool, builtin: bool, secret: bool) -> Result<Rule, String> {
         // Protective rules match case-insensitively (see the module docs).
@@ -573,14 +653,25 @@ impl Rule {
         // Unicode normalisation form matches a name recorded in the other
         // (macOS file names often come back in NFD).
         let mut p = crate::vpath::nfc(pattern.trim()).into_owned();
+        if !builtin {
+            if let Some(c) = p.chars().find(|c| is_default_ignorable(*c)) {
+                return Err(format!("pattern contains invisible or control character U+{:04X}", c as u32));
+            }
+            if has_unescaped_quote(&p) {
+                return Err(format!("quoted pattern '{pattern}' (do not quote patterns in {POLICY_FILE})"));
+            }
+        }
         let dir_only = p.ends_with('/');
         while p.ends_with('/') {
             p.pop();
         }
-        let anchored = p.starts_with('/');
-        let p = p.trim_start_matches('/').to_string();
+        let (stripped, anchored) = strip_root_prefix(&p);
+        let p = stripped.to_string();
         if p.is_empty() {
             return Err(format!("empty pattern '{pattern}'"));
+        }
+        if !builtin && p.split('/').any(|c| matches!(c, "" | "." | "..")) {
+            return Err(format!("invalid path component in pattern '{pattern}'"));
         }
         let base = if anchored || p.contains('/') || p.starts_with("**") {
             p.clone()
@@ -677,6 +768,9 @@ pub struct Classification {
     /// isolated instead (only secret files are sealed). An editor or backup
     /// artefact of a sealed secret still takes the secret's scope.
     cloak_demoted: bool,
+    /// May this path be sealed by its own name (a built-in secret file, or an
+    /// editor/backup artefact of one, outside VCS metadata)?
+    sealable: bool,
 }
 
 impl Classification {
@@ -767,6 +861,7 @@ impl Policy {
     }
 
     pub fn parse(text: &str) -> Policy {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut policy = Self::builtin();
         for (n, line) in text.lines().enumerate() {
             let parts = fields(line);
@@ -810,22 +905,39 @@ impl Policy {
                     parts[0]
                 ));
             }
+            let isolate_cleaned = |policy: &mut Policy, why: &str| {
+                let cleaned = clean_protective_pattern(&parts[0]);
+                let mut r = Rule::new(&cleaned, Tier::Isolated, false, false, false)
+                    .or_else(|_| Rule::new(&escape_literal(&cleaned), Tier::Isolated, false, false, false))
+                    .unwrap_or_else(|_| Rule::new("**", Tier::Isolated, false, false, false).unwrap());
+                policy.warnings.push(format!("{at}: {why}; treating '{cleaned}' as isolate"));
+                r.pattern = cleaned;
+                policy.rules.push(r);
+            };
             match Rule::new(&parts[0], tier.clone(), force, false, false) {
+                Ok(r) if tier != Tier::Public && !rule_matches_sample(&r) => {
+                    isolate_cleaned(&mut policy, &format!("pattern '{}' matches no valid path", parts[0]));
+                }
                 Ok(mut r) => {
                     r.grantees = grantees;
                     policy.rules.push(r)
                 }
                 // Not a valid glob. A protective rule falls back to the
-                // literal name (`config[prod.yml`), so it still protects
-                // what it names; an exposing one is dropped.
+                // literal name (`config[prod.yml`), or to its cleaned path
+                // when quotes, invisible characters or `.`/`..` components
+                // prevented matching, so it still protects what it names; an
+                // exposing one is dropped.
                 Err(e) if tier != Tier::Public => {
-                    match Rule::new(&escape_literal(&parts[0]), tier, force, false, false) {
-                        Ok(mut r) => {
+                    let literal = (!parts[0].chars().any(is_default_ignorable) && !has_unescaped_quote(&parts[0]))
+                        .then(|| Rule::new(&escape_literal(&parts[0]), tier, force, false, false).ok())
+                        .flatten();
+                    match literal {
+                        Some(mut r) => {
                             policy.warnings.push(format!("{at}: {e}; matching '{}' as a literal name", parts[0]));
                             r.pattern = parts[0].clone();
                             policy.rules.push(r);
                         }
-                        Err(_) => policy.warnings.push(format!("{at}: {e}")),
+                        None => isolate_cleaned(&mut policy, &e),
                     }
                 }
                 Err(e) => policy.warnings.push(format!("{at}: {e}")),
@@ -1060,11 +1172,12 @@ impl Policy {
         if c.tier == Tier::Cloaked(RULE_SCOPE.to_string()) {
             c.tier = Tier::Cloaked(rule_scope(&self.access, &name));
         }
+        c.sealable = secret_file && !c.builtin_vcs && !is_dir;
         // Only secret files are ever sealed: a `cloak` line keeps any other
         // file on the device, failing safe (its parse warned). A directory
         // is not demoted: the secret files under it are sealed, the rest is
         // isolated file by file (what walks directories descends into it).
-        if matches!(c.tier, Tier::Cloaked(_)) && !secret_file && !is_dir {
+        if matches!(c.tier, Tier::Cloaked(_)) && !c.sealable && !is_dir {
             c.tier = Tier::Isolated;
             c.cloak_demoted = true;
         }
@@ -1081,7 +1194,7 @@ impl Policy {
             .chain(BUILTIN_PUBLIC_EXCEPTIONS)
             .flat_map(|p| sample_patterns(p))
             .collect();
-        let mut dirs: Vec<String> = only.iter().filter(|o| !names_secret(o)).cloned().collect();
+        let mut dirs: Vec<String> = only.iter().filter(|o| !seals_secret(o)).cloned().collect();
         for r in &self.access.rules {
             if crate::hub::agent::within(only, &r.path) && !dirs.contains(&r.path) {
                 dirs.push(r.path.clone());
@@ -1102,7 +1215,7 @@ impl Policy {
                 }
                 let parts: Vec<&str> = sp.split('/').filter(|s| !s.is_empty()).collect();
                 let mut paths = vec![sp.clone()];
-                for o in only.iter().filter(|o| !names_secret(o)) {
+                for o in only.iter().filter(|o| !seals_secret(o)) {
                     for k in 0..parts.len() {
                         paths.push(format!("{o}/{}", parts[k..].join("/")));
                     }
@@ -1144,7 +1257,8 @@ impl Policy {
 /// Concrete path strings matching glob pattern `pat` (trimmed of leading and
 /// trailing `/`), for [`Policy::scopes_within`].
 fn sample_patterns(pat: &str) -> Vec<String> {
-    let pat = pat.trim().trim_matches('/');
+    let (pat, _) = strip_root_prefix(pat.trim());
+    let pat = pat.trim_end_matches('/');
     let mut out = Vec::new();
     for b in expand_braces(pat) {
         for empty_star in [false, true] {
@@ -1225,7 +1339,10 @@ fn sample_glob(pat: &str, empty_star: bool) -> String {
                     chars.next();
                     if chars.peek() == Some(&'/') {
                         chars.next();
-                    } else if out.ends_with('/') && chars.peek().is_none() {
+                        if !empty_star {
+                            out.push_str("x/");
+                        }
+                    } else if empty_star && out.ends_with('/') && chars.peek().is_none() {
                         out.pop();
                     } else {
                         out.push('x');
@@ -1259,7 +1376,7 @@ fn sample_glob(pat: &str, empty_star: bool) -> String {
                     .map(|g| g.compile_matcher());
                 let fallback = if neg { 'x' } else { class.first().copied().unwrap_or('x') };
                 let pick = compiled
-                    .and_then(|m| "xabcdefghijklmnopqrstuvwyz0123456789_-.~+=@,".chars().find(|c| m.is_match(c.to_string())))
+                    .and_then(|m| "xabcdefghijklmnopqrstuvwyz0123456789_-.~+=@,é".chars().find(|c| m.is_match(c.to_string())))
                     .unwrap_or(fallback);
                 out.push(pick);
             }
@@ -1273,13 +1390,28 @@ fn sample_glob(pat: &str, empty_star: bool) -> String {
 /// (`.env`, `*.pem`, …)? A `cloak` line whose pattern does not is warned
 /// about (and `vl cloak` refuses it): it seals nothing.
 pub fn names_secret(pattern: &str) -> bool {
-    let name = crate::vpath::nfc(pattern.trim_end_matches('/'));
-    builtin_rules().1.is_match(&*name)
+    let name = crate::vpath::nfc(pattern.trim().trim_end_matches('/'));
+    let (name, _) = strip_root_prefix(&name);
+    builtin_rules().1.is_match(name)
+}
+
+/// May `path` be sealed by its own name (without descending from a parent's
+/// secret)? Decided by [`Policy::classify`] itself (built-in secret files and
+/// their [`editor_artefact`] copies) so the sealing rule and `vl upgrade`
+/// cannot disagree (BUG-1834).
+pub fn seals_secret(path: &str) -> bool {
+    static BUILTIN: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+    let name = path.trim().trim_end_matches('/');
+    let (name, _) = strip_root_prefix(name);
+    match VPath::new(name) {
+        Ok(p) => BUILTIN.get_or_init(Policy::builtin).classify(&p, false).sealable,
+        Err(_) => names_secret(path),
+    }
 }
 
 /// Is a sealed file at `path`, under `scope`, one format 8 itself seals
-/// (`docs/FORMAT.md` §5)? Yes when the path names a secret file
-/// ([`names_secret`]), or when its content descends from a secret: its
+/// (`docs/FORMAT.md` §5)? Yes when the path may be sealed by its own name
+/// ([`seals_secret`]), or when its content descends from a secret: its
 /// object was a secret's before (`known`), a parent held a secret sealed at
 /// the same path (`sealed_in_a_parent(path)`: an edit after a rename), or a
 /// parent's secret of the same scope left its path in this snapshot
@@ -1294,7 +1426,7 @@ pub fn sealed_secret<E>(
     sealed_in_a_parent: impl FnOnce(&str) -> std::result::Result<bool, E>,
     moved_away: impl FnOnce(&str) -> std::result::Result<bool, E>,
 ) -> std::result::Result<bool, E> {
-    Ok(names_secret(path) || known || sealed_in_a_parent(path)? || moved_away(scope)?)
+    Ok(seals_secret(path) || known || sealed_in_a_parent(path)? || moved_away(scope)?)
 }
 
 impl Classification {
@@ -1311,6 +1443,7 @@ impl Classification {
             artefact_of: None,
             held_back: None,
             cloak_demoted: false,
+            sealable: false,
         }
     }
 
@@ -1343,6 +1476,7 @@ impl Classification {
     /// rule of the artefact's own can undo this: only a change of the base's
     /// classification does.
     fn inherit(&mut self, base: &Classification, base_path: &VPath) {
+        self.sealable |= base.sealable;
         let stronger = match (&self.tier, &base.tier) {
             (Tier::Isolated, Tier::Cloaked(_)) if self.cloak_demoted => true,
             (_, Tier::Public) | (Tier::Isolated, _) => false,
@@ -2647,5 +2781,36 @@ mod tests {
         assert_eq!(p.warnings.len(), 7, "{:?}", p.warnings);
         let p = Policy::parse(".env.x[ cloak\n");
         assert_eq!(class(&p, ".env.x["), Tier::Cloaked("team".into()), "a bad glob still seals its literal secret name");
+    }
+
+    #[test]
+    fn accepted_protective_rules_match_a_sample_of_themselves() {
+        for pat in [
+            "/private/",
+            "private",
+            "private/*",
+            "private/**",
+            "src/**",
+            "PRIVATE/",
+            "**/private/",
+            "a/**/b",
+            "**",
+            "./private/",
+            "./private/notes.txt",
+            "{a,b}/*.env",
+            "[a-z]*.pem",
+            "[!0-9]*.key",
+        ] {
+            let line = format!("{pat} isolate\n");
+            let p = Policy::parse(&line);
+            assert!(p.warnings.is_empty(), "{pat}: {:?}", p.warnings);
+            let r = p.rules.iter().find(|r| !r.builtin).unwrap();
+            assert!(rule_matches_sample(r), "{pat} did not match any of {:?}", sample_patterns(&r.pattern));
+        }
+        let p = Policy::parse("src/** cloak rule\n");
+        assert_eq!(p.warnings.len(), 1, "only the non-secret cloak note: {:?}", p.warnings);
+        let r = p.rules.iter().find(|r| !r.builtin).unwrap();
+        assert_eq!(r.tier, Tier::Cloaked(RULE_SCOPE.into()));
+        assert!(rule_matches_sample(r));
     }
 }

@@ -112,6 +112,11 @@ pub struct BuildOptions<'a> {
     pub policy: &'a Policy,
     /// Tree of the snapshot being amended (enables reuse and carry-over).
     pub parent_tree: Option<ObjectId>,
+    /// Tree of the change's committed parent(s) (`None` means `parent_tree`).
+    /// Moved-secret protection and non-secret sealing are judged against this
+    /// tree so a secret created and renamed within one change is classified by
+    /// its final path (BUG-1833).
+    pub base_tree: Option<ObjectId>,
     /// Secret content the engine handed to whoever wrote `fs` (the isolated
     /// files injected into a sandbox). New content containing any of it is
     /// quarantined, whatever its path and tier.
@@ -974,6 +979,10 @@ struct Builder<'a> {
     /// Listings made ahead of the walk, on other threads.
     #[cfg(feature = "os")]
     prefetch: Option<&'a crate::prefetch::Prefetch<'a>>,
+    /// Verified sealed entries deleted from `base_tree` (or `parent_tree`),
+    /// keyed by `(kind, plain_blob_id)`, computed lazily before storing any
+    /// newly added public file (BUG-1832).
+    deleted_secrets: Option<HashMap<(EntryKind, ObjectId), Visibility>>,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -1096,6 +1105,7 @@ pub fn build_tree_watched(
         watch,
         #[cfg(feature = "os")]
         prefetch: prefetch.as_ref().map(|(p, _)| p),
+        deleted_secrets: None,
     };
     let root_parent = parent.clone().zip(opts.parent_tree);
     #[cfg(feature = "os")]
@@ -1127,6 +1137,147 @@ pub fn build_tree_watched(
 }
 
 impl<'a> Builder<'a> {
+    /// Is `path` absent from the tree move protection judges against
+    /// (`base_tree`, or `parent_tree`)?
+    fn absent_in_move_base(&self, path: &VPath, parent_entry: Option<&TreeEntry>) -> Result<bool> {
+        let Some(base) = self.opts.base_tree.or(self.opts.parent_tree) else { return Ok(false) };
+        if self.opts.base_tree.is_none() || self.opts.base_tree == self.opts.parent_tree {
+            return Ok(parent_entry.is_none_or(|e| e.kind == EntryKind::Dir));
+        }
+        Ok(crate::tree::lookup(self.store, &base, path)?.is_none_or(|e| e.kind == EntryKind::Dir))
+    }
+
+    fn has_deleted_secrets(&mut self) -> Result<bool> {
+        Ok(!self.ensure_deleted_secrets()?.is_empty())
+    }
+
+    fn moved_secret_for(&mut self, kind: EntryKind, content: &ObjectId) -> Result<Option<Visibility>> {
+        Ok(self.ensure_deleted_secrets()?.get(&(kind, *content)).cloned())
+    }
+
+    /// Verified sealed entries deleted from `base_tree` (or `parent_tree`),
+    /// computed at most once so moved secrets are classified and sealed before
+    /// storing (BUG-1832).
+    fn ensure_deleted_secrets(&mut self) -> Result<&HashMap<(EntryKind, ObjectId), Visibility>> {
+        let map = match self.deleted_secrets {
+            Some(ref map) => return Ok(map),
+            None => self.compute_deleted_secrets()?,
+        };
+        Ok(self.deleted_secrets.insert(map))
+    }
+
+    fn compute_deleted_secrets(&self) -> Result<HashMap<(EntryKind, ObjectId), Visibility>> {
+        let mut map: HashMap<(EntryKind, ObjectId), Visibility> = HashMap::new();
+        let Some(root_id) = self.opts.base_tree.or(self.opts.parent_tree) else {
+            return Ok(map);
+        };
+        let same_as_parent = self.opts.base_tree.is_none() || self.opts.base_tree == self.opts.parent_tree;
+        let mut stack = vec![(VPath::root(), root_id, 0usize)];
+        while let Some((dir, tid, depth)) = stack.pop() {
+            if same_as_parent {
+                if self.use_hints && self.fs.known_id(&dir) == Some(tid) {
+                    continue;
+                }
+                if self.watch.is_some_and(|w| !w.must_open(&dir)) {
+                    continue;
+                }
+            }
+            let Ok(tree) = self.store.tree(&tid) else { continue };
+            for e in &tree.entries {
+                let p = dir.join(&e.name);
+                if e.kind == EntryKind::Dir {
+                    if depth + 1 < MAX_TREE_DEPTH {
+                        stack.push((p, e.id, depth + 1));
+                    }
+                } else if matches!(e.kind, EntryKind::File | EntryKind::Symlink) && matches!(e.visibility, Visibility::Cloaked { .. }) {
+                    if !self.is_secret_deleted(&p, e)? {
+                        continue;
+                    }
+                    if verify_sealing(self.store, e)? != Sealing::Verified {
+                        continue;
+                    }
+                    match self.store.read_blob(&e.id) {
+                        Ok(plain) if !plain.is_empty() => {
+                            map.entry((e.kind, Object::blob_id(&plain))).or_insert_with(|| e.visibility.clone());
+                        }
+                        Ok(_) | Err(VeilError::Redacted { .. }) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    fn is_secret_deleted(&self, path: &VPath, e: &TreeEntry) -> Result<bool> {
+        if e.kind == EntryKind::Symlink && (!self.links || path.as_str() == POLICY_FILE) {
+            return Ok(false);
+        }
+        if self.opts.materialised.is_some_and(|m| m.hidden(path)) || !self.store.entry_shown(e) {
+            return Ok(false);
+        }
+        // Check ancestor directories for nested repos or ignored rules.
+        let mut anc = VPath::root();
+        let parts: Vec<&str> = path.as_str().split('/').collect();
+        for seg in &parts[..parts.len().saturating_sub(1)] {
+            anc = anc.join(seg);
+            let dc = self.opts.policy.classify(&anc, true);
+            if dc.tier == Tier::Ignored {
+                return Ok(dc.held_back.is_none());
+            }
+            match self.fs.list_dir_full(&anc) {
+                Ok(l) => {
+                    if crate::vfs::holds_repository(&l) {
+                        return Ok(true);
+                    }
+                }
+                Err(err) if err.is_not_found() => return Ok(true),
+                Err(_) => return Ok(false),
+            }
+        }
+        let want_node = match e.kind {
+            EntryKind::Symlink => NodeKind::Symlink,
+            _ => NodeKind::File,
+        };
+        let meta = match self.fs.metadata(path) {
+            Ok(m) => m,
+            Err(err) if err.is_not_found() => None,
+            Err(_) => return Ok(false),
+        };
+        let kind_on_disk = match meta {
+            Some(m) => Some(m.kind),
+            None if self.folding.folds() => {
+                let pdir = path.parent().unwrap_or_else(VPath::root);
+                match self.fs.list_dir_full(&pdir) {
+                    Ok(l) => {
+                        let key = self.folding.key(path.file_name());
+                        l.entries
+                            .iter()
+                            .find(|de| self.folding.key(&de.name) == key)
+                            .map(|de| de.kind)
+                            .or_else(|| {
+                                (e.kind == EntryKind::Symlink && l.special.iter().any(|n| self.folding.key(n) == key))
+                                    .then_some(NodeKind::Symlink)
+                            })
+                    }
+                    Err(_) => return Ok(false),
+                }
+            }
+            None => None,
+        };
+        let Some(disk_kind) = kind_on_disk else { return Ok(true) };
+        if disk_kind == NodeKind::Dir {
+            return Ok(true);
+        }
+        if disk_kind != want_node {
+            return Ok(false);
+        }
+        let c = match e.kind {
+            EntryKind::Symlink => self.opts.policy.classify_link(path),
+            _ => self.opts.policy.classify(path, false),
+        };
+        Ok(matches!(c.tier, Tier::Ignored | Tier::Isolated) && c.held_back.is_none() && !self.keeps_sealing(path, &c, Some(e)))
+    }
     /// Protection follows content across a rename (renames design, builder
     /// hardening): a new public file (or symlink) whose plaintext is
     /// exactly that of a cloaked entry this snapshot deletes is the same
@@ -1138,7 +1289,7 @@ impl<'a> Builder<'a> {
     /// Exact content only; nothing is read unless the snapshot both
     /// deletes a sealed entry and adds a public one.
     fn protect_moves(&mut self, id: ObjectId) -> Result<ObjectId> {
-        let Some(parent) = self.opts.parent_tree.filter(|p| *p != id) else { return Ok(id) };
+        let Some(parent) = self.opts.base_tree.or(self.opts.parent_tree).filter(|p| *p != id) else { return Ok(id) };
         let changes = crate::tree::diff_trees(self.store, Some(&parent), Some(&id))?;
         let blob_kind = |e: &TreeEntry| matches!(e.kind, EntryKind::File | EntryKind::Symlink);
         let deleted: Vec<&TreeEntry> = changes
@@ -1153,51 +1304,104 @@ impl<'a> Builder<'a> {
             .filter_map(|c| c.new.as_ref().map(|e| (&c.path, e)))
             .filter(|(_, e)| blob_kind(e) && e.visibility.is_public())
             .collect();
-        if deleted.is_empty() || added.is_empty() {
-            return Ok(id);
-        }
-        let mut sealed_as: HashMap<(EntryKind, ObjectId), Visibility> = HashMap::new();
-        for d in deleted {
-            if verify_sealing(self.store, d)? != Sealing::Verified {
-                continue;
-            }
-            match self.store.read_blob(&d.id) {
-                Ok(plain) => {
-                    sealed_as.entry((d.kind, Object::blob_id(&plain))).or_insert_with(|| d.visibility.clone());
-                }
-                Err(e) if e.is_unreadable() || e.is_not_found() => {}
-                Err(e) => return Err(e),
-            }
-        }
         let mut tree = id;
-        for (path, e) in added {
-            let Some(vis) = sealed_as.get(&(e.kind, e.id)) else { continue };
-            let class = match e.kind {
-                EntryKind::Symlink => self.opts.policy.classify_link(path),
-                _ => self.opts.policy.classify(path, false),
-            };
-            if class.tier != Tier::Public || class.rule.is_some() {
-                continue;
+        if !deleted.is_empty() && !added.is_empty() {
+            let sealed_as = self.ensure_deleted_secrets()?.clone();
+            for (path, e) in added {
+                let Some(vis) = sealed_as.get(&(e.kind, e.id)) else { continue };
+                let class = match e.kind {
+                    EntryKind::Symlink => self.opts.policy.classify_link(path),
+                    _ => self.opts.policy.classify(path, false),
+                };
+                if class.tier != Tier::Public || class.rule.is_some() {
+                    continue;
+                }
+                let data = self.store.read_blob(&e.id)?;
+                let sealed = match self.store.store_file(&data, vis) {
+                    Ok(s) => s,
+                    Err(VeilError::Redacted { .. }) => continue,
+                    Err(err) => return Err(err),
+                };
+                let entry = TreeEntry {
+                    id: sealed,
+                    visibility: vis.clone(),
+                    ..e.clone()
+                };
+                tree = crate::conflict::set_entry(self.store, &tree, path, Some(entry))?;
+                if let Some(run) = self.cache.as_mut() {
+                    run.forget(path);
+                }
+                self.report.policy_warnings.push(format!(
+                    "{path}: its content was moved from a path sealed as {}; it stays sealed there (protection follows a secret across a rename)",
+                    vis.label()
+                ));
             }
-            let data = self.store.read_blob(&e.id)?;
-            let sealed = match self.store.store_file(&data, vis) {
-                Ok(s) => s,
-                Err(VeilError::Redacted { .. }) => continue,
-                Err(err) => return Err(err),
-            };
-            let entry = TreeEntry {
-                id: sealed,
-                visibility: vis.clone(),
-                ..e.clone()
-            };
-            tree = crate::conflict::set_entry(self.store, &tree, path, Some(entry))?;
-            if let Some(run) = self.cache.as_mut() {
-                run.forget(path);
+        }
+        if self.opts.base_tree.is_some() && self.opts.base_tree != self.opts.parent_tree {
+            for c in &changes {
+                let Some(e) = c.new.as_ref().filter(|e| blob_kind(e)) else { continue };
+                let Visibility::Cloaked { scope } = &e.visibility else { continue };
+                if crate::policy::seals_secret(c.path.as_str()) {
+                    continue;
+                }
+                let in_base = c.old.as_ref().is_some_and(|o| match o.kind {
+                    EntryKind::Conflict => self
+                        .store
+                        .conflict(&o.id)
+                        .ok()
+                        .is_some_and(|cf| cf.adds.iter().chain(&cf.removes).flatten().any(|t| !t.visibility.is_public())),
+                    _ => !o.visibility.is_public(),
+                });
+                let moved = deleted.iter().any(|d| matches!(&d.visibility, Visibility::Cloaked { scope: s } if s == scope));
+                if in_base || moved {
+                    continue;
+                }
+                let data = match self.store.read_blob(&e.id) {
+                    Ok(d) => d,
+                    Err(err) if err.is_unreadable() || err.is_not_found() => continue,
+                    Err(err) => return Err(err),
+                };
+                let class = match e.kind {
+                    EntryKind::Symlink => self.opts.policy.classify_link(&c.path),
+                    _ => self.opts.policy.classify(&c.path, false),
+                };
+                let replacement = match class.tier {
+                    Tier::Public => {
+                        if !class.allow_secrets {
+                            let findings = secrets::scan(&data);
+                            if !findings.is_empty() {
+                                let kept = self.quarantine(&c.path, findings, c.old.as_ref())?;
+                                tree = crate::conflict::set_entry(self.store, &tree, &c.path, kept)?;
+                                if let Some(run) = self.cache.as_mut() {
+                                    run.forget(&c.path);
+                                }
+                                continue;
+                            }
+                        }
+                        let pub_id = self.store.store_file(&data, &Visibility::Public)?;
+                        Some(TreeEntry {
+                            id: pub_id,
+                            visibility: Visibility::Public,
+                            size: data.len() as u64,
+                            ..e.clone()
+                        })
+                    }
+                    Tier::Isolated => {
+                        self.report.isolated.push(c.path.clone());
+                        None
+                    }
+                    Tier::Ignored => {
+                        self.report.ignored += 1;
+                        self.report.ignored_paths.push((c.path.clone(), false));
+                        None
+                    }
+                    Tier::Cloaked(_) => continue,
+                };
+                tree = crate::conflict::set_entry(self.store, &tree, &c.path, replacement)?;
+                if let Some(run) = self.cache.as_mut() {
+                    run.forget(&c.path);
+                }
             }
-            self.report.policy_warnings.push(format!(
-                "{path}: its content was moved from a path sealed as {}; it stays sealed there (protection follows a secret across a rename)",
-                vis.label()
-            ));
         }
         Ok(tree)
     }
@@ -2071,11 +2275,18 @@ impl<'a> Builder<'a> {
         // the object really is (BUG-103). The fast paths in between only
         // ever reuse existing objects.
         let mut desired = self.audience(path, &class, parent_file);
+        let move_candidate = desired.is_public()
+            && class.tier == Tier::Public
+            && class.rule.is_none()
+            && self.absent_in_move_base(path, parent_file)?
+            && self.has_deleted_secrets()?;
 
         // Fast path: overlay/tree-view says the file is byte-identical.
-        if let Some(pe) = parent_file {
-            if self.use_hints && !self.renormalizing(path) && self.fs.known_id(path) == Some(pe.id) {
-                return Ok(Some(pe.clone()));
+        if !move_candidate {
+            if let Some(pe) = parent_file {
+                if self.use_hints && !self.renormalizing(path) && self.fs.known_id(path) == Some(pe.id) {
+                    return Ok(Some(pe.clone()));
+                }
             }
         }
 
@@ -2098,7 +2309,7 @@ impl<'a> Builder<'a> {
         // With injected secrets every changed file must be read and checked.
         // A link's target is read in one call, cheaper than a cache lookup
         // is worth: never cached.
-        let cacheable = self.opts.injected.is_none() && kind == EntryKind::File;
+        let cacheable = self.opts.injected.is_none() && kind == EntryKind::File && !move_candidate;
         let meta = meta.filter(|_| kind == EntryKind::File);
         if let (Some(m), true) = (&meta, cacheable) {
             if let Some(e) = self.cached_entry(path, name, m, &desired, class.allow_secrets, parent_file)? {
@@ -2205,7 +2416,13 @@ impl<'a> Builder<'a> {
         let mut scanned_clean = false;
         if desired.is_public() {
             if let Some(pe) = parent_file {
-                if !self.policy_changed && !self.rescan && pe.id == content && pe.visibility.is_public() && pe.executable == executable {
+                if !self.policy_changed
+                    && !self.rescan
+                    && pe.id == content
+                    && pe.visibility.is_public()
+                    && pe.executable == executable
+                    && !(move_candidate && self.moved_secret_for(kind, &content)?.is_some())
+                {
                     self.learn(path, meta.as_ref(), content, scanned_clean, None);
                     return Ok(Some(pe.clone())); // unchanged; scanned before
                 }
@@ -2216,6 +2433,16 @@ impl<'a> Builder<'a> {
                     return self.quarantine(path, findings, parent_file);
                 }
                 scanned_clean = true;
+            }
+            if move_candidate {
+                if let Some(vis) = self.moved_secret_for(kind, &content)? {
+                    self.report.policy_warnings.push(format!(
+                        "{path}: its content was moved from a path sealed as {}; it stays sealed there (protection follows a secret across a rename)",
+                        vis.label()
+                    ));
+                    desired = vis;
+                    scanned_clean = false;
+                }
             }
         }
 
