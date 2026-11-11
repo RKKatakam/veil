@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 60b5dadcfd5de64fa67377e5b8f8c748a536844ae8d133dd14cf8891b0b65e69 # shrinks to files = [FileCase { old: None, new: Some((Text([4]), false)) }, FileCase { old: None, new: Some((Text([]), false)) }, FileCase { old: None, new: Some((Text([]), false)) }, FileCase { old: Some((Text([4]), false)), new: None }, FileCase { old: Some((Text([]), false)), new: Some((Text([]), false)) }, FileCase { old: None, new: Some((Text([]), false)) }], seed = [0, 0, 63376, 10468298025451536974, 11421064756338796953, 6352151608025287921, 732202154358277423, 14501219273547241775]
