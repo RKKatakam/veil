@@ -1339,7 +1339,10 @@ fn sample_glob(pat: &str, empty_star: bool) -> String {
                     chars.next();
                     if chars.peek() == Some(&'/') {
                         chars.next();
-                    } else if out.ends_with('/') && chars.peek().is_none() {
+                        if !empty_star {
+                            out.push_str("x/");
+                        }
+                    } else if empty_star && out.ends_with('/') && chars.peek().is_none() {
                         out.pop();
                     } else {
                         out.push('x');
@@ -1373,7 +1376,7 @@ fn sample_glob(pat: &str, empty_star: bool) -> String {
                     .map(|g| g.compile_matcher());
                 let fallback = if neg { 'x' } else { class.first().copied().unwrap_or('x') };
                 let pick = compiled
-                    .and_then(|m| "xabcdefghijklmnopqrstuvwyz0123456789_-.~+=@,".chars().find(|c| m.is_match(c.to_string())))
+                    .and_then(|m| "xabcdefghijklmnopqrstuvwyz0123456789_-.~+=@,é".chars().find(|c| m.is_match(c.to_string())))
                     .unwrap_or(fallback);
                 out.push(pick);
             }
@@ -2778,5 +2781,36 @@ mod tests {
         assert_eq!(p.warnings.len(), 7, "{:?}", p.warnings);
         let p = Policy::parse(".env.x[ cloak\n");
         assert_eq!(class(&p, ".env.x["), Tier::Cloaked("team".into()), "a bad glob still seals its literal secret name");
+    }
+
+    #[test]
+    fn accepted_protective_rules_match_a_sample_of_themselves() {
+        for pat in [
+            "/private/",
+            "private",
+            "private/*",
+            "private/**",
+            "src/**",
+            "PRIVATE/",
+            "**/private/",
+            "a/**/b",
+            "**",
+            "./private/",
+            "./private/notes.txt",
+            "{a,b}/*.env",
+            "[a-z]*.pem",
+            "[!0-9]*.key",
+        ] {
+            let line = format!("{pat} isolate\n");
+            let p = Policy::parse(&line);
+            assert!(p.warnings.is_empty(), "{pat}: {:?}", p.warnings);
+            let r = p.rules.iter().find(|r| !r.builtin).unwrap();
+            assert!(rule_matches_sample(r), "{pat} did not match any of {:?}", sample_patterns(&r.pattern));
+        }
+        let p = Policy::parse("src/** cloak rule\n");
+        assert_eq!(p.warnings.len(), 1, "only the non-secret cloak note: {:?}", p.warnings);
+        let r = p.rules.iter().find(|r| !r.builtin).unwrap();
+        assert_eq!(r.tier, Tier::Cloaked(RULE_SCOPE.into()));
+        assert!(rule_matches_sample(r));
     }
 }
