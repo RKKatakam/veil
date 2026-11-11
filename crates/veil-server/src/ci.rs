@@ -672,7 +672,21 @@ const MAX_TESTED_WALK: usize = 1024;
 /// Re-evaluate `<branch>@tested` for every branch of `project`, advancing
 /// `tested` monotonically to the newest snapshot on the branch's
 /// first-parent chain whose required checks have all passed.
+///
+/// `tested.snapshot` is a root: it is written behind GC's guard, and after
+/// a switch the branches are read again under the new epoch (BUG-1881).
 pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
+    for attempt in 0..8 {
+        match advance_tested_once(hub, project).await {
+            Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) && attempt < 7 => continue,
+            r => return r,
+        }
+    }
+    unreachable!("the last attempt returns")
+}
+
+async fn advance_tested_once(hub: &Arc<Hub>, project: &Project) -> Result<()> {
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     let branches: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT name, target, lineage FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL ORDER BY name",
     )
@@ -801,24 +815,33 @@ pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
             reqs.iter().all(|r| states.get(r).map(String::as_str) == Some("pass"))
         });
         if let Some((winner, depth)) = passed {
-            sqlx::query(
-                "INSERT INTO tested (project_id, branch, lineage, snapshot, depth, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT (project_id, branch) DO UPDATE \
-                 SET lineage = EXCLUDED.lineage, \
-                     snapshot = EXCLUDED.snapshot, \
-                     depth = EXCLUDED.depth, \
-                     updated_at = EXCLUDED.updated_at \
-                 WHERE (tested.lineage = EXCLUDED.lineage AND tested.depth < EXCLUDED.depth) \
-                    OR (tested.lineage < EXCLUDED.lineage AND tested.depth < EXCLUDED.depth)",
-            )
-            .bind(project.id)
-            .bind(&branch)
-            .bind(lineage)
-            .bind(winner.hex())
-            .bind(depth)
-            .bind(now)
-            .execute(&hub.db)
+            let (pid, winner) = (project.id, winner.hex());
+            crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+                let (branch, winner) = (branch.clone(), winner.clone());
+                Box::pin(async move {
+                    crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
+                    sqlx::query(
+                        "INSERT INTO tested (project_id, branch, lineage, snapshot, depth, updated_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6) \
+                         ON CONFLICT (project_id, branch) DO UPDATE \
+                         SET lineage = EXCLUDED.lineage, \
+                             snapshot = EXCLUDED.snapshot, \
+                             depth = EXCLUDED.depth, \
+                             updated_at = EXCLUDED.updated_at \
+                         WHERE (tested.lineage = EXCLUDED.lineage AND tested.depth < EXCLUDED.depth) \
+                            OR (tested.lineage < EXCLUDED.lineage AND tested.depth < EXCLUDED.depth)",
+                    )
+                    .bind(pid)
+                    .bind(&branch)
+                    .bind(lineage)
+                    .bind(&winner)
+                    .bind(depth)
+                    .bind(now)
+                    .execute(&mut *c)
+                    .await?;
+                    Ok(())
+                })
+            })
             .await?;
         }
     }

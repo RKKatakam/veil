@@ -2155,3 +2155,117 @@ fn bug_1875_a_ticket_that_landed_an_earlier_tip_never_retires_later_commits_unla
         assert!(body_str(&f).contains(mark), "{}", body_str(&f));
     }
 }
+
+/// BUG-1880 with BUG-1861: a landing batch asks the review rules again in
+/// its own transaction, and for an embargo's release they are the rules its
+/// submit met: the embargo PR's approvals count. A release queued behind
+/// another server's lease, whose approval is taken back while it waits, is
+/// refused: nothing lands, the embargo stays hidden and waits for approval
+/// (it is not left `failed`). Approved again, the same release lands
+/// through the batch under its embargo PR, without being asked for again.
+#[test]
+fn bug_1880_a_queued_release_meets_its_embargo_prs_approval_again_in_the_batch() {
+    const FIX: &str = "QUEUED_RELEASE_FIX_1880";
+    let hub = TestHub::start();
+    let (p, rev1) = protected_project(&hub);
+    let api = hub.api();
+    let (sec, dev) = (p.sec.token(), p.dev.token());
+    let pid: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.hub().db)).unwrap();
+    let before = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "queued-1880",
+        "security",
+        None,
+        &[("src/queued_1880.rs", &format!("pub const FIX: &str = \"{FIX}\";\n"))],
+        "an embargoed fix",
+    );
+    let line = format!("embargo/{eid}");
+    let file_on_main = || api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev=main&path=src/queued_1880.rs", p.name));
+
+    // The line's embargo PR, approved by a member who may write its paths.
+    let pr = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs", p.name), &json!({"head": line, "title": "the fix"}));
+    assert_eq!(pr.status, 200, "{}", body_str(&pr));
+    let pr = pr.json();
+    let pr_id = pr["id"].as_str().unwrap().to_string();
+    let ok = approve(&api, &rev1, &p.name, &pr);
+    assert_eq!(ok.status, 200, "{}", body_str(&ok));
+    assert_eq!(ok.json()["review"]["ready"], true, "{}", body_str(&ok));
+    assert!(released_at(&hub, &eid).is_none(), "an approval alone releases nothing");
+
+    // Another server holds main's landing lease: the release is queued, and waits.
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) \
+                 VALUES ($1, 'main', 'another-server-1880', 1, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 600000) \
+                 ON CONFLICT (project_id, branch) DO UPDATE SET holder = EXCLUDED.holder, epoch = landing_leases.epoch + 1, expires_at = EXCLUDED.expires_at",
+            )
+            .bind(pid)
+            .execute(&hub.hub().db),
+        )
+        .unwrap();
+    let (api_rel, tok_rel, url_rel) = (hub.api(), sec.clone(), format!("/v1/projects/{}/embargoes/{eid}/release", p.name));
+    let release = std::thread::spawn(move || api_rel.post_json(Some(&tok_rel), &url_rel, &json!({})));
+    let until = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let queued: i64 = hub
+            .rt
+            .block_on(
+                sqlx::query_scalar("SELECT COUNT(*) FROM landing_queue WHERE project_id = $1 AND ticket LIKE 'embargo-%' AND state = 'queued'")
+                    .bind(pid)
+                    .fetch_one(&hub.hub().db),
+            )
+            .unwrap();
+        if queued == 1 {
+            break;
+        }
+        assert!(std::time::Instant::now() < until, "the approved release was never queued");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Its reviewer takes the approval back while it waits.
+    let patch = pr["patch"].as_str().unwrap();
+    let sig = sign_review(&rev1, &p.name, &pr_id, patch, "request-changes");
+    let back = api.post_json(
+        Some(&rev1.token()),
+        &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+        &json!({"patch": patch, "verdict": "request-changes", "signature": sig}),
+    );
+    assert_eq!(back.status, 200, "{}", body_str(&back));
+    assert_eq!(back.json()["review"]["ready"], false, "{}", body_str(&back));
+
+    // The lease ends: the batch refuses the release, which is held.
+    hub.rt
+        .block_on(
+            sqlx::query("DELETE FROM landing_leases WHERE project_id = $1 AND branch = 'main' AND holder = 'another-server-1880'")
+                .bind(pid)
+                .execute(&hub.hub().db),
+        )
+        .unwrap();
+    let rel = release.join().unwrap();
+    assert_eq!(rel.status, 409, "{}", body_str(&rel));
+    assert_eq!(rel.json()["code"], "not_ready", "{}", body_str(&rel));
+    assert!(body_str(&rel).contains("waits for approval") && body_str(&rel).contains("not ready to land"), "{}", body_str(&rel));
+    assert!(released_at(&hub, &eid).is_none(), "a release whose approval was withdrawn while queued was released");
+    assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], before, "it landed on protected main");
+    assert_eq!(file_on_main().status, 404, "the fix is public");
+    let sec_tips = api.tips(Some(&sec), &p.name).unwrap();
+    assert!(sec_tips.branches.contains_key(&line), "the line stays");
+    let rec = sec_tips.embargoes.iter().find(|e| e.id == eid).expect("a member sees the held embargo");
+    assert_eq!(rec.state.as_deref(), Some("waiting_for_approval"), "{rec:?}");
+
+    // Approved again: the held release is queued again and lands in a
+    // batch, under its embargo PR's approval.
+    let ok = approve(&api, &rev1, &p.name, &pr);
+    assert_eq!(ok.status, 200, "{}", body_str(&ok));
+    assert!(released_at(&hub, &eid).is_some(), "an approved, held release lands at once");
+    let f = file_on_main();
+    assert_eq!(f.status, 200, "{}", body_str(&f));
+    assert!(body_str(&f).contains(FIX));
+    let shown = api.get(Some(&dev), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+    assert_eq!(shown.status, 200, "{}", body_str(&shown));
+    assert_eq!(shown.json()["state"], "landed", "{}", body_str(&shown));
+}

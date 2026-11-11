@@ -287,6 +287,79 @@ fn bug_1880_an_approval_withdrawn_while_the_entry_is_queued_still_lands() {
     );
 }
 
+/// BUG-1880 with BUG-1884: the batch asks again the whole rule a submit
+/// meets, and that includes, on an unprotected branch too, a person's
+/// approval of a change the server has reverted twice. A change queued for
+/// unprotected `main`, reverted twice by the time its batch runs, is
+/// refused; another change queued with it, never reverted, lands.
+#[test]
+fn bug_1880_a_change_reverted_twice_while_queued_needs_a_person_in_the_batch() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let dev_tok = p.dev.token();
+
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let change = |path: &str| -> ObjectId {
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base.hex(), "edits": [put(path, "pub fn f() {}\n")]}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        serde_json::from_value(r.json()["snapshot"].clone()).unwrap()
+    };
+    let (twice, plain) = (change("src/twice-1880.rs"), change("src/plain-1880.rs"));
+    let log = api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/log?rev={}&n=1", p.name, twice.hex()));
+    assert_eq!(log.status, 200, "{}", String::from_utf8_lossy(&log.body));
+    let twice_cid = log.json()["entries"][0]["change_id"].as_str().expect("the change's id").to_string();
+
+    // Both are queued for unprotected main, and wait.
+    hold_lease(&th, pid, "main");
+    let queue = |snap: ObjectId| -> String {
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({"onto": "main", "snapshot": snap.hex(), "wait": false}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["state"], "queued", "{}", String::from_utf8_lossy(&r.body));
+        r.json()["ticket"].as_str().unwrap().to_string()
+    };
+    let (twice_ticket, plain_ticket) = (queue(twice), queue(plain));
+
+    // Meanwhile the server's second revert of the first change is recorded
+    // (as `bisect` records one that landed).
+    for n in 0..2 {
+        th.rt
+            .block_on(
+                sqlx::query(
+                    "INSERT INTO bisect_reverts (project_id, branch, lineage, culprit, culprit_change_id, check_name, ticket, state, created_at) \
+                     VALUES ($1, 'main', $2, $3, $4, 'ci', $5, 'reverted', 0)",
+                )
+                .bind(pid)
+                .bind(n as i64)
+                .bind(twice.hex())
+                .bind(&twice_cid)
+                .bind(format!("revert-1880-{n}"))
+                .execute(&th.hub().db),
+            )
+            .unwrap();
+    }
+
+    release_lease(&th, pid, "main");
+    let done = outcome(&api, &dev_tok, &p.name, &twice_ticket);
+    assert_eq!(done["state"], "rejected", "a change reverted twice landed without a person's approval: {done}");
+    let msg = done["message"].as_str().unwrap_or_default();
+    assert!(msg.starts_with("not ready to land:") && msg.contains("reverted twice"), "{done}");
+    let done = outcome(&api, &dev_tok, &p.name, &plain_ticket);
+    assert_eq!(done["state"], "landed", "a change never reverted lands on unprotected main: {done}");
+    let file = |path: &str| api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev=main&path={path}", p.name)).status;
+    assert_eq!(file("src/plain-1880.rs"), 200);
+    assert_eq!(file("src/twice-1880.rs"), 404, "the change reverted twice is on main");
+}
+
 /// BUG-1880's fix checks the review again in the batch's transaction, but
 /// reads it without a lock (`READ COMMITTED`): a reviewer who takes the
 /// approval back after that read and before the batch commits is answered

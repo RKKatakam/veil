@@ -398,37 +398,60 @@ pub async fn compute(
 /// Project `reals` for `ask`'s viewer via `sync::projected` (without filling
 /// `view_graph`) and tag any new projected snapshot ids in `embargo_snapshots`
 /// while `embargo_id` remains unreleased.
+///
+/// A tag is a root: its transaction waits in line with GC's switch, the
+/// guard its first statement (BUG-1881), and after a switch the snapshots
+/// are projected again under the new epoch.
 pub async fn projected(
     hub: &Arc<Hub>,
     ask: &Ask,
     embargo_id: &str,
     reals: &[ObjectId],
 ) -> Result<HashMap<ObjectId, ObjectId>> {
-    let mut map = HashMap::with_capacity(reals.len());
-    let mut extra_projected: Vec<String> = Vec::new();
-    for &r in reals {
-        let p = crate::sync::projected(hub, &ask.project, &ask.viewer, r).await?;
-        if p != r {
-            extra_projected.push(p.hex());
+    let pid = ask.project.id;
+    for attempt in 0..8 {
+        let gc_epoch = crate::pack_gc::read_gc_epoch(hub, pid).await?;
+        let mut map = HashMap::with_capacity(reals.len());
+        let mut extra_projected: Vec<String> = Vec::new();
+        for &r in reals {
+            let p = crate::sync::projected(hub, &ask.project, &ask.viewer, r).await?;
+            if p != r {
+                extra_projected.push(p.hex());
+            }
+            map.insert(r, p);
         }
-        map.insert(r, p);
-    }
-    if !extra_projected.is_empty() {
+        if extra_projected.is_empty() {
+            return Ok(map);
+        }
         extra_projected.sort();
         extra_projected.dedup();
-        sqlx::query(
-            "INSERT INTO embargo_snapshots (project_id, snapshot, embargo_id) \
-             SELECT $1, p, $2 FROM UNNEST($3::text[]) AS p \
-             WHERE EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(ask.project.id)
-        .bind(embargo_id)
-        .bind(&extra_projected)
-        .execute(&hub.db)
-        .await?;
+        let eid = embargo_id.to_string();
+        let tagged = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
+            let (eid, extra_projected) = (eid.clone(), extra_projected.clone());
+            Box::pin(async move {
+                crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
+                sqlx::query(
+                    "INSERT INTO embargo_snapshots (project_id, snapshot, embargo_id) \
+                     SELECT $1, p, $2 FROM UNNEST($3::text[]) AS p \
+                     WHERE EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(pid)
+                .bind(&eid)
+                .bind(&extra_projected)
+                .execute(&mut *c)
+                .await?;
+                Ok(())
+            })
+        })
+        .await;
+        match tagged {
+            Ok(()) => return Ok(map),
+            Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) && attempt < 7 => continue,
+            Err(e) => return Err(e),
+        }
     }
-    Ok(map)
+    unreachable!("the last attempt returns")
 }
 
 /// Compute `veil.diff/2` between `from_real` and `to_real` in `ask.viewer`'s
