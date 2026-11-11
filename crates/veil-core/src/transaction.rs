@@ -815,6 +815,27 @@ impl<'r> Transaction<'r> {
         Ok(id)
     }
 
+    /// Record that `old` was superseded by `new`, a snapshot this repository
+    /// already holds: the same change as the server landed it (BUG-1910).
+    /// `old` leaves the view as any rewritten version of a change does (it
+    /// stays in the change's history and resolves by its id), and what
+    /// stands on it (changes, tags, working copies) follows at commit.
+    pub fn supersede(&mut self, old: ObjectId, new: ObjectId) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        if old == self.repo.root_id {
+            return Err(VeilError::repo("the root snapshot cannot be rewritten"));
+        }
+        let prev = self.repo.snapshot(&old)?;
+        let now = self.repo.snapshot(&new)?;
+        self.rewritten.insert(old, Rewrite::Replaced(new));
+        self.view.heads.remove(&old);
+        self.release_parents(&prev.parents, &now.parents)?;
+        self.add_head(new)?;
+        Ok(())
+    }
+
     /// Move this clone to its person's current view (BUG-1509), in this
     /// transaction: after an access change the server names every snapshot
     /// above a folder the person lost under another id (its projection in

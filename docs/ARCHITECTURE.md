@@ -384,7 +384,10 @@ rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → 
   * `unsigned`.
 
   `vl log` marks each snapshot with `✓`, `✓<signer>`, `?signer`,
-  `✗bad-signature` or `unsigned`.
+  `✗bad-signature` or `unsigned`; and with `✓server` one whose valid
+  signature is by the key this device pinned for the clone's server
+  (`docs/HUB.md` §13.4: a landed change, a projection), which the key
+  rings do not hold and `vl` therefore reads from `$VEIL_HOME/hub.json`.
 
 ### The team vault (`team_vault.rs`)
 

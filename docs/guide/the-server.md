@@ -70,6 +70,12 @@ only by you. Your private keys never leave the device.
 too). Your first device is confirmed once, with an invite link (below) or by
 an admin comparing this fingerprint with you, before it receives secret keys.
 
+**Server key** is the key the server signs its own snapshots with (a
+landed change, for one). `vl` pins it at this first sign-in and shows what
+it signs as `✓server` in `vl log`. If the server ever presents another key,
+`vl` refuses to renew the session and says so; if the server's key really
+was replaced, `vl login` again accepts the new one and tells you it changed.
+
 **Another device of yours** signs in with the same command and name. It
 waits until you confirm it from a device you already use, then signs in.
 Run the confirmation in a clone of a project, and that device shares the
@@ -300,8 +306,10 @@ vl daemon start [--cache-size 8G]  turn it on again (default size: 20 GiB or a t
   a branch is a compare-and-swap: if someone moved it first, `vl` tells you
   to pull. Forcing a branch back, or deleting one, needs an admin.
 - Snapshots you receive are signed: by their author, or, where the server
-  left out something you cannot see, by the server's key (`vl log` shows
-  `?signer` for it).
+  made the snapshot itself (a landed change, or one it left something out
+  of that you cannot see), by the server's key. `vl log` shows `✓server`
+  for it: the key is the one `vl login` printed and pinned. A signature by
+  a key nobody knows is still `?signer`.
 - **The server scans what it receives for secrets**, as `vl` does before
   it records a file: a token or password in an ordinary file is refused,
   and the message names the file, the rule and the line, never the secret.
@@ -326,8 +334,11 @@ vl land --status land-4f2a…   # its outcome later
   check is exact, path by path: whatever else moved does not matter.
 - **Each change keeps its own snapshot**, one after another, but the server
   moves the branch once for many changes landing together.
-- **Outcomes:** `landed` (your local tag follows the change to where it
-  landed), `conflict` (it names the paths that changed meanwhile: pull,
+- **Outcomes:** `landed` (the change is now the snapshot the server
+  landed: `vl log` shows it once, marked `✓server`, with your working copy
+  and anything you built on it moved onto it; your own version stays in
+  `vl evolog`, and `vl undo` takes the move back), `conflict` (it names
+  the paths that changed meanwhile: pull,
   redo the change on the new tip and land again), or `rejected` (a check
   refused it; the message says which).
 - **The same checks as a push**, when you submit, and again when it lands

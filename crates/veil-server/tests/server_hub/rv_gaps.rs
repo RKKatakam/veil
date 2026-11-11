@@ -679,26 +679,138 @@ fn rvgaps_a_revoked_persons_thin_clone_and_old_ids_read_nothing_of_the_folder() 
     }
 }
 
-/// BUG-1910: after `vl land`, `vl log` in the clone shows the change
-/// twice: the local version the working copy stays on (`docs/HUB.md`
-/// §13.19: "the working copy stays on REV, a predecessor of the landed
-/// snapshot") and the landed one the server signed, which the local tag
-/// follows, with nothing that says the first became the second. The
-/// landed one is marked `?signer` although it is the server's, whose
-/// answer this clone trusts for every byte it holds. Each later landing
-/// adds a pair. Expected: the landed change is listed once (its local
-/// version hidden, or marked as landed), and a snapshot the clone's own
-/// server signed is not shown as an unknown signer.
+/// The entries of `vl log -r REV --json`.
+fn log_entries(who: &Person, dir: &std::path::Path, rev: &str) -> Vec<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(&who.ok(dir, &["log", "-r", rev, "--json"])).unwrap();
+    v["entries"].as_array().expect("entries").clone()
+}
+
+/// BUG-1910: after `vl land`, `vl log` in the clone showed the change
+/// twice: the local version the working copy stayed on and the landed one
+/// the server signed, with nothing that said the first became the second,
+/// and the landed one as `?signer`. Now the landed snapshot supersedes
+/// the local version, as any rewrite does (recorded when the pull after
+/// the landing brings it): one row, the working copy on it, the local
+/// version still there by its id and in the change's history; and the
+/// server's signature, by the key this device pinned at sign-in, is
+/// `✓server`. One undo takes the pull and the move back.
 #[test]
-#[ignore = "BUG-1910: after `vl land`, `vl log` lists the landed change twice (its local version unmarked), and the server's signature as `?signer`"]
 fn bug_1910_vl_log_after_a_landing_lists_the_landed_change_once() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     write_files(&p.dir, &[("src/landed.txt", "landed\n")]);
     p.admin.ok(&p.dir, &["commit", "-m", "the change that lands b1"]);
+    let local = log_entries(&p.admin, &p.dir, "@-").remove(0);
+    let (local_id, change) = (local["snapshot_id"].as_str().unwrap().to_string(), local["change_id"].as_str().unwrap().to_string());
     let out = p.admin.ok(&p.dir, &["land"]);
     assert!(out.contains("landed main"), "{out}");
     let log = p.admin.ok(&p.dir, &["log"]);
     assert_eq!(log.matches("the change that lands b1").count(), 1, "the landed change, once:\n{log}");
     assert!(!log.contains("?signer"), "the server's own signature is known:\n{log}");
+    let row = log.lines().find(|l| l.contains(&change[..8])).unwrap_or_else(|| panic!("no row of the change:\n{log}"));
+    assert!(row.contains("✓server") && row.contains("main") && row.contains("origin/main"), "the row is the landed snapshot, signed by the server: {row}");
+    // The working copy stands on the landed snapshot, with the file.
+    let at: serde_json::Value = log_entries(&p.admin, &p.dir, "@-").remove(0);
+    assert_eq!(at["change_id"].as_str().unwrap(), change, "the working copy's parent is the landed change");
+    assert_ne!(at["snapshot_id"].as_str().unwrap(), local_id, "as the server landed it");
+    assert_eq!(at["signature"]["status"], "server", "{at}");
+    assert_eq!(std::fs::read_to_string(p.dir.join("src/landed.txt")).unwrap(), "landed\n");
+    assert_eq!(p.admin.ok(&p.dir, &["status"]).matches("landed.txt").count(), 0, "nothing to record: the working copy is clean");
+    // The local version: by its id, and in the change's history.
+    let shown = p.admin.ok(&p.dir, &["show", &local_id]);
+    assert!(shown.contains("the change that lands b1"), "{shown}");
+    let evolog = p.admin.ok(&p.dir, &["evolog", "-r", "@-"]);
+    assert!(evolog.contains(&local_id[..8]), "the local version is in the change's history:\n{evolog}");
+    // The next change lands the same way, and still one row each.
+    write_files(&p.dir, &[("src/landed2.txt", "landed 2\n")]);
+    p.admin.ok(&p.dir, &["commit", "-m", "the change that lands b2"]);
+    let out = p.admin.ok(&p.dir, &["land"]);
+    assert!(out.contains("landed main") && !out.contains("already landed"), "{out}");
+    let log = p.admin.ok(&p.dir, &["log"]);
+    for msg in ["the change that lands b1", "the change that lands b2"] {
+        assert_eq!(log.matches(msg).count(), 1, "{msg}, once:\n{log}");
+    }
+    assert!(!log.contains("?signer"), "{log}");
+    // One undo: the pull and the move, back to the local version.
+    p.admin.ok(&p.dir, &["undo"]);
+    let at: serde_json::Value = log_entries(&p.admin, &p.dir, "@-").remove(0);
+    assert_eq!(at["signature"]["status"], "good", "the local version of the second change again: {at}");
+}
+
+/// BUG-1910: what stands on a landed change follows it, and a change the
+/// server still shows as a branch of its own stays a row.
+#[test]
+fn bug_1910_what_stands_on_a_landed_change_follows_it() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    write_files(&p.dir, &[("src/lower.txt", "lower\n")]);
+    p.admin.ok(&p.dir, &["commit", "-m", "the lower change c1"]);
+    write_files(&p.dir, &[("src/upper.txt", "upper\n")]);
+    p.admin.ok(&p.dir, &["commit", "-m", "the upper change c2"]);
+    write_files(&p.dir, &[("src/draft.txt", "not recorded as a change yet\n")]);
+    // Land the lower change only: the upper one and the working copy follow.
+    let out = p.admin.ok(&p.dir, &["land", "@--"]);
+    assert!(out.contains("landed main"), "{out}");
+    let log = p.admin.ok(&p.dir, &["log"]);
+    for msg in ["the lower change c1", "the upper change c2"] {
+        assert_eq!(log.matches(msg).count(), 1, "{msg}, once:\n{log}");
+    }
+    let rows = log_entries(&p.admin, &p.dir, "@---..@");
+    let by = |msg: &str| rows.iter().find(|r| r["description"].as_str().is_some_and(|d| d.contains(msg))).unwrap_or_else(|| panic!("{msg}: {rows:?}"));
+    assert_eq!(by("the lower change c1")["signature"]["status"], "server");
+    assert_eq!(by("the upper change c2")["signature"]["status"], "good", "the upper change is still this clone's");
+    assert_eq!(by("the upper change c2")["parents"][0]["snapshot_id"], by("the lower change c1")["snapshot_id"], "on the landed change");
+    for (f, text) in [("src/lower.txt", "lower\n"), ("src/upper.txt", "upper\n"), ("src/draft.txt", "not recorded as a change yet\n")] {
+        assert_eq!(std::fs::read_to_string(p.dir.join(f)).unwrap(), text, "{f}");
+    }
+    // The upper change lands on it like any other.
+    let out = p.admin.ok(&p.dir, &["land", "@-"]);
+    assert!(out.contains("landed main") && !out.contains("already landed"), "{out}");
+    let log = p.admin.ok(&p.dir, &["log"]);
+    assert_eq!(log.matches("the upper change c2").count(), 1, "{log}");
+    assert!(!log.contains("?signer"), "{log}");
+}
+
+/// BUG-1910: the server's key is pinned at sign-in. A session `vl` renews
+/// by itself never replaces it: a server presenting another key is
+/// refused, and nothing is signed in. `vl login`, typed by the person,
+/// accepts the new key and says that it changed. A signature by a key
+/// that is neither a member's nor the pinned one still shows as unknown.
+#[test]
+fn bug_1910_the_servers_key_is_pinned_and_a_changed_one_is_refused() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    write_files(&p.dir, &[("src/landed.txt", "landed\n")]);
+    p.admin.ok(&p.dir, &["commit", "-m", "the change that lands k1"]);
+    let out = p.admin.ok(&p.dir, &["land"]);
+    assert!(out.contains("landed main"), "{out}");
+    let log = p.admin.ok(&p.dir, &["log"]);
+    assert!(log.contains("✓server") && !log.contains("?signer"), "control:\n{log}");
+    // The pin is another key (as if the server now presented a new one),
+    // and the session is over.
+    let file = p.admin.home.path().join("veil/hub.json");
+    let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let entry = &mut json["servers"][hub.authority()];
+    let real = entry["hub_key"].as_str().expect("the server's key is pinned at sign-in").to_string();
+    let other = veil_core::Identity::generate("other").verifying_hex();
+    entry["hub_key"] = other.clone().into();
+    entry.as_object_mut().unwrap().remove("token");
+    std::fs::write(&file, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    // The landed snapshot is signed by a key that is not the pinned one: unknown.
+    let log = p.admin.ok(&p.dir, &["log"]);
+    assert!(log.contains("?signer") && !log.contains("✓server"), "a key that is not the pinned one stays unknown:\n{log}");
+    // The renewal is refused, by name, and nothing is signed in.
+    let err = p.admin.fails(&p.dir, &["pull"]);
+    assert!(err.contains("now signs with another key") && err.contains(&real[..16]) && err.contains(&other[..16]) && err.contains("vl login veil://"), "{err}");
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(json["servers"][hub.authority()]["hub_key"], other, "the pin is not replaced");
+    assert!(json["servers"][hub.authority()].get("token").is_none(), "no session was kept");
+    // `vl login` accepts the server's key and says it changed.
+    let out = p.admin.run(&p.dir, &["login", &format!("veil://{}", hub.authority())]);
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("the server's key changed") && text.contains(&other), "{text}");
+    p.admin.ok(&p.dir, &["pull"]);
+    let log = p.admin.ok(&p.dir, &["log"]);
+    assert!(log.contains("✓server") && !log.contains("?signer"), "{log}");
 }

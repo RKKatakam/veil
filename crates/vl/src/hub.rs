@@ -226,6 +226,32 @@ pub fn set_anchor_for(authority: &str, project: &str, fingerprint: &str) -> Resu
 
 /// The servers this device has signed in to (`host:port`), with who it
 /// signed in as.
+/// The signing key of the server at `authority` that this device pinned
+/// when it signed in (`hub_key` in `$VEIL_HOME/hub.json`).
+pub fn pinned_server_key(authority: &str) -> Result<Option<String>> {
+    Ok(load_file()?.servers.get(authority).and_then(|e| e.hub_key.clone()))
+}
+
+/// The pinned signing keys of the servers `repo` syncs with (its remotes):
+/// a snapshot signed by one is the server's (`vl log` shows `✓server`).
+/// Read once a command; nothing if `hub.json` cannot be read.
+pub fn server_keys(repo: &Repo) -> &'static [String] {
+    static KEYS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let Ok(file) = load_file() else { return Vec::new() };
+        let mut keys: Vec<String> = repo
+            .config()
+            .remotes
+            .values()
+            .filter_map(|r| HubUrl::parse(&r.url)?.ok())
+            .filter_map(|u| file.servers.get(&u.authority)?.hub_key.clone())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    })
+}
+
 pub fn signed_in_servers() -> Result<Vec<(String, String)>> {
     Ok(load_file()?.servers.into_iter().filter_map(|(a, e)| Some((a, e.person?))).collect())
 }
@@ -468,7 +494,21 @@ impl Client {
     }
 
     /// Sign in with this device's key; `name` registers it as a new person.
+    /// The server's signing key is pinned at the first sign-in (trust on
+    /// first use) and never replaced by a session `vl` renews by itself:
+    /// a server that presents another key is refused (BUG-1910).
     pub fn login(&self, name: Option<&str>) -> Result<Session> {
+        Ok(self.sign_in(name, false)?.0)
+    }
+
+    /// `vl login`, typed by the person: [`Client::login`], which also
+    /// accepts a server key other than the pinned one. Returns the key
+    /// that was pinned before, when it was another.
+    pub fn login_pinning(&self, name: Option<&str>) -> Result<(Session, Option<String>)> {
+        self.sign_in(name, true)
+    }
+
+    fn sign_in(&self, name: Option<&str>, accept_new_key: bool) -> Result<(Session, Option<String>)> {
         let key = self.identity.verifying_hex();
         let (status, out) = self.send(
             "POST",
@@ -505,6 +545,17 @@ impl Client {
             return Err(Self::error(status, &out));
         }
         let s: Session = serde_json::from_slice(&out)?;
+        let pinned = pinned_server_key(&self.url.authority)?.filter(|p| *p != s.hub_key);
+        if let Some(pinned) = pinned.as_ref().filter(|_| !accept_new_key) {
+            bail!(
+                "the server at {a} now signs with another key ({new}) than the one this device pinned when it signed in ({old}): not signed in. \
+                 If the server's key was replaced on purpose (its data directory was made again), accept the new one with `vl login veil://{a}`; \
+                 otherwise this is not the server you signed in to",
+                a = self.url.authority,
+                new = crate::render::safe(s.hub_key.get(..16).unwrap_or(&s.hub_key)),
+                old = crate::render::safe(pinned.get(..16).unwrap_or(pinned)),
+            );
+        }
         *self.token.borrow_mut() = Some(s.token.clone());
         update_entry(&self.url.authority, |e| {
             e.token = Some(s.token.clone());
@@ -512,7 +563,7 @@ impl Client {
             e.person = Some(s.person.clone());
             e.hub_key = Some(s.hub_key.clone());
         })?;
-        Ok(s)
+        Ok((s, pinned))
     }
 
     /// The branch tips this caller may see; `None` if there is no project
@@ -1353,8 +1404,52 @@ pub fn pull_moving(
         }
         false => None,
     };
+    if moved.is_none() {
+        supersede_landed(&mut tx, &new_snaps, &old_tips)?;
+    }
     tx.commit()?;
     Ok((report, moved))
+}
+
+/// One row for a landed change (BUG-1910). The server lands a change as a
+/// snapshot of its own (on the branch's newest tip, signed by the server),
+/// which names the submitted snapshot as its predecessor. When a pull
+/// brings such a snapshot, the version this clone made is superseded by
+/// it, as by any rewrite: it leaves the log, and what stands on it (the
+/// working copy, later changes, local tags) moves onto the landed one.
+/// Only a version of this clone's own line counts: the same change id,
+/// visible here, and under no remote tag, before this pull (`old_tips`) or
+/// after it. A snapshot the server showed as part of a branch is never
+/// superseded here (a branch someone rewrote and forced, a branch a pull
+/// request landed from): it stays a row of its own.
+fn supersede_landed(tx: &mut veil_core::transaction::Transaction, new_snaps: &[(ObjectId, ObjectId)], old_tips: &[ObjectId]) -> Result<()> {
+    let under = |tx: &veil_core::transaction::Transaction, tips: &[ObjectId], id: &ObjectId| -> Result<bool> {
+        for t in tips {
+            if t == id || tx.repo().is_ancestor(id, t)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let held = |tx: &veil_core::transaction::Transaction, ids: &mut dyn Iterator<Item = ObjectId>| -> Vec<ObjectId> {
+        ids.filter(|t| tx.repo().exact().snapshot(t).ok().flatten().is_some()).collect()
+    };
+    for (id, _) in new_snaps {
+        let Some(s) = tx.repo().exact().snapshot(id).ok().flatten() else { continue };
+        for p in &s.predecessors {
+            let Some(ps) = tx.repo().exact().snapshot(p).ok().flatten() else { continue };
+            if p == id || ps.change_id != s.change_id || ps.abandoned.is_some() {
+                continue;
+            }
+            let heads = held(tx, &mut tx.view.heads.iter().copied());
+            let now = held(tx, &mut tx.view.remote_tags.values().copied());
+            let before = held(tx, &mut old_tips.iter().copied());
+            if under(tx, &heads, p)? && !under(tx, &now, p)? && !under(tx, &before, p)? && under(tx, &now, id)? {
+                tx.supersede(*p, *id)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What a full clone's move to its person's current view asks (BUG-1562).

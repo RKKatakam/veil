@@ -289,7 +289,10 @@ fn log_entry(e: &LogEntry, lanes: &mut Vec<Option<ObjectId>>) {
     if !e.root {
         header.push(yellow(&safe(&author)));
         if let Some(s) = &e.signature {
-            header.push(signature_marker(&status_of(s), &author));
+            header.push(match s.status {
+                "server" => crate::render::server_marker(),
+                _ => signature_marker(&status_of(s), &author),
+            });
         }
         header.push(dim(&fmt_time(e.timestamp_ms)));
     }
@@ -544,7 +547,10 @@ pub fn show(repo: &Repo, s: &Show, r: &Renames) -> Result<()> {
         println!("Abandoned : {}", yellow(&safe(&first_line(r))));
     }
     if let (Some(st), Some(snap)) = (&s.signature_status, &s.snapshot) {
-        println!("Signature : {}", signature_detail(st, snap));
+        match s.signature.as_ref().map(|g| g.status) {
+            Some("server") => println!("Signature : {}", crate::render::server_detail(snap)),
+            _ => println!("Signature : {}", signature_detail(st, snap)),
+        }
     }
     if s.parents.len() > 1 {
         for p in &s.parents {
