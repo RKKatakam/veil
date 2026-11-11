@@ -1263,6 +1263,23 @@ impl WebTransport {
 }
 
 impl Http2 {
+    /// A socket bound to a loopback address of this test server's own
+    /// (`127.x.y.1`, from its port): every test's servers share one database
+    /// and, without this, one client address, so what the server bounds per
+    /// address across a deployment (pending passkey sign-ins, BUG-1902)
+    /// would be bounded across all the tests running at once. `None` where
+    /// the machine has only `127.0.0.1` (the tests then share it).
+    fn own_address(to: std::net::SocketAddr) -> Option<tokio::net::TcpSocket> {
+        let std::net::IpAddr::V4(v4) = to.ip() else { return None };
+        if !v4.is_loopback() {
+            return None;
+        }
+        let own = std::net::Ipv4Addr::new(127, 1 + (to.port() % 250) as u8, (to.port() / 250 % 250) as u8, 1);
+        let socket = tokio::net::TcpSocket::new_v4().ok()?;
+        socket.bind((own, 0).into()).ok()?;
+        Some(socket)
+    }
+
     fn send(&self, req: ureq::http::Request<axum::body::Body>) -> (ureq::http::StatusCode, ureq::http::HeaderMap, Vec<u8>) {
         self.rt.block_on(async {
             // One connection for the client's life, as a browser keeps; a new
@@ -1283,7 +1300,11 @@ impl Http2 {
 
     async fn connect(&self) -> hyper::client::conn::http2::SendRequest<axum::body::Body> {
         let host = self.authority.rsplit_once(':').map_or(self.authority.as_str(), |(h, _)| h).to_string();
-        let tcp = tokio::net::TcpStream::connect(&self.authority).await.unwrap_or_else(|e| panic!("connecting to {}: {e}", self.authority));
+        let tcp = match self.authority.parse::<std::net::SocketAddr>().ok().and_then(|to| Some((to, Self::own_address(to)?))) {
+            Some((to, socket)) => socket.connect(to).await,
+            None => tokio::net::TcpStream::connect(&self.authority).await,
+        }
+        .unwrap_or_else(|e| panic!("connecting to {}: {e}", self.authority));
         let name = rustls::pki_types::ServerName::try_from(host).expect("a server name");
         let tls = self.tls.connect(name, tcp).await.expect("the TLS handshake");
         assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]), "the server chose HTTP/2, as it does for a browser");

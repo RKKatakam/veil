@@ -185,7 +185,8 @@ async fn devices(
 /// that is not removed, with or without device keys (BUG-1901), oldest
 /// first.
 pub(crate) async fn passkeys_of(db: &sqlx::PgPool, person: i64) -> Result<Vec<veil_core::hub::wire::Passkey>> {
-    let rows: Vec<(Option<String>, Option<String>, i64, bool, bool)> = sqlx::query_as(
+    type Row = (Option<String>, Option<String>, i64, bool, bool);
+    let rows: Vec<Row> = sqlx::query_as(
         "SELECT d.fingerprint, w.label, w.created_at, d.prf_supported, d.pending FROM webauthn_credentials w \
          JOIN devices d ON d.id = w.device_id WHERE d.person_id = $1 AND d.browser AND d.removed_at IS NULL ORDER BY d.id",
     )
