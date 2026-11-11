@@ -1388,9 +1388,15 @@ pub fn names_secret(pattern: &str) -> bool {
     builtin_rules().1.is_match(name)
 }
 
+/// May `path` be sealed by its own name (without descending from a parent's
+/// secret)?
+pub fn seals_secret(path: &str) -> bool {
+    names_secret(path)
+}
+
 /// Is a sealed file at `path`, under `scope`, one format 8 itself seals
-/// (`docs/FORMAT.md` §5)? Yes when the path names a secret file
-/// ([`names_secret`]), or when its content descends from a secret: its
+/// (`docs/FORMAT.md` §5)? Yes when the path may be sealed by its own name
+/// ([`seals_secret`]), or when its content descends from a secret: its
 /// object was a secret's before (`known`), a parent held a secret sealed at
 /// the same path (`sealed_in_a_parent(path)`: an edit after a rename), or a
 /// parent's secret of the same scope left its path in this snapshot
@@ -1405,7 +1411,7 @@ pub fn sealed_secret<E>(
     sealed_in_a_parent: impl FnOnce(&str) -> std::result::Result<bool, E>,
     moved_away: impl FnOnce(&str) -> std::result::Result<bool, E>,
 ) -> std::result::Result<bool, E> {
-    Ok(names_secret(path) || known || sealed_in_a_parent(path)? || moved_away(scope)?)
+    Ok(seals_secret(path) || known || sealed_in_a_parent(path)? || moved_away(scope)?)
 }
 
 impl Classification {

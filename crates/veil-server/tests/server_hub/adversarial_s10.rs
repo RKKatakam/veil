@@ -313,7 +313,6 @@ fn bug_1055_a_renamed_secret_that_vl_keeps_sealed_is_accepted() {
 /// the secret: nothing in the pushed history shows where it came from.
 /// The server must take what `vl` itself writes, or `vl` must not write it.
 #[test]
-#[ignore = "BUG-1833: a secret made and renamed within one change is committed sealed, and no push of it is ever accepted"]
 fn bug_1833_a_secret_made_and_renamed_within_one_change_is_accepted() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -322,11 +321,11 @@ fn bug_1833_a_secret_made_and_renamed_within_one_change_is_accepted() {
     p.admin.ok(&p.dir, &["status"]);
     std::fs::rename(p.dir.join(format!("{BILL_DIR}/.env.staging")), p.dir.join("settings-staging.txt")).unwrap();
     p.admin.commit_main(&p.dir, "staging settings");
-    // Control: the member's own vl keeps it sealed at the new path.
+    // Decided from its final path when the change is recorded: not a secret file, so plain.
     let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
     let tree = repo.snapshot(&repo.view().tags["main"].target).unwrap().tree;
     let e = veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new("settings-staging.txt").unwrap()).unwrap().expect("recorded");
-    assert!(!e.visibility.is_public(), "control: vl keeps the renamed secret sealed");
+    assert!(e.visibility.is_public(), "decided from its final path: not a secret file, so recorded plain");
     drop(repo);
     let out = p.admin.run(&p.dir, &["push"]);
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));

@@ -321,7 +321,6 @@ fn named_by_the_only_secrets_rule(repo: &mut Repo) -> Vec<String> {
 /// for that refuses: a secret made and renamed within one change (the
 /// working copy recorded in between, as any command does).
 #[test]
-#[ignore = "BUG-1833: a secret made and renamed within one change is committed sealed at an ordinary path, which the only-secrets rule refuses"]
 fn bug_1833_a_secret_made_and_renamed_within_one_change_is_what_the_rule_accepts() {
     let (mut repo, fs, _) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[(".veilpolicy", ".env cloak team\n"), ("README.md", "hi\n")], "base");
@@ -334,16 +333,16 @@ fn bug_1833_a_secret_made_and_renamed_within_one_change_is_what_the_rule_accepts
     snap(&mut repo, &*fs);
     let (c, _) = repo.commit_working_copy(WS, "settings").unwrap();
     assert_eq!(repo.snapshot(&c).unwrap().parents, vec![base]);
-    assert!(file_entry(&repo, &c, "settings.txt").is_some(), "the renamed file is recorded");
+    assert_eq!(file_entry(&repo, &c, "settings.txt").unwrap().visibility, Visibility::Public, "decided from its final path");
     repo.set_tag("main", c, false).unwrap();
 
     assert_eq!(named_by_the_only_secrets_rule(&mut repo), Vec::<String>::new(), "vl recorded what its own rule calls encrypted non-secret content");
 }
 
 /// The same when the rename is its own change, folded into the change
-/// that added the secret (`vl squash`).
+/// that added the secret (`vl squash`), or rebased directly onto `base`,
+/// and secret-looking content arriving at an ordinary path is still scanned.
 #[test]
-#[ignore = "BUG-1833: a secret made and renamed within one change is committed sealed at an ordinary path, which the only-secrets rule refuses"]
 fn bug_1833_a_rename_squashed_into_the_change_that_added_the_secret_is_what_the_rule_accepts() {
     let (mut repo, fs, _) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[(".veilpolicy", ".env cloak team\n"), ("README.md", "hi\n")], "base");
@@ -357,10 +356,36 @@ fn bug_1833_a_rename_squashed_into_the_change_that_added_the_secret_is_what_the_
     repo.set_tag("main", rename, false).unwrap();
     assert_eq!(named_by_the_only_secrets_rule(&mut repo), Vec::<String>::new(), "control: a renamed secret is accepted");
 
+    // Rebasing an edit of the renamed file onto `base` (past the changes that
+    // added and renamed `.env`) also reconciles sealing from the final path.
+    let edited = commit_files(&mut repo, &*fs, &[("settings.txt", "REGION=updated-0002\n")], "edit settings");
+    let rebased = repo.rebase(edited, vec![base]).unwrap();
+    assert_eq!(repo.snapshot(&rebased).unwrap().parents, vec![base]);
+    repo.set_tag("main", rebased, true).unwrap();
+    assert_eq!(named_by_the_only_secrets_rule(&mut repo), Vec::<String>::new(), "rebased onto base: conflict sides reconciled to public");
+    repo.undo().unwrap();
+    repo.undo().unwrap();
+    repo.undo().unwrap();
+
     let squashed = repo.squash(rename).unwrap();
     assert_eq!(repo.snapshot(&squashed).unwrap().parents, vec![base], "the two changes are one, on the base");
-    assert!(file_entry(&repo, &squashed, "settings.txt").is_some(), "the renamed file is recorded");
+    assert_eq!(file_entry(&repo, &squashed, "settings.txt").unwrap().visibility, Visibility::Public, "decided from its final path");
     repo.set_tag("main", squashed, true).unwrap();
 
     assert_eq!(named_by_the_only_secrets_rule(&mut repo), Vec::<String>::new(), "vl recorded what its own rule calls encrypted non-secret content");
+
+    // Secret-looking content arriving at an ordinary path goes through the scanner.
+    let (mut repo2, fs2, _) = new_repo("alice");
+    commit_files(&mut repo2, &*fs2, &[(".veilpolicy", ".env cloak team\n"), ("README.md", "hi\n")], "base");
+    commit_files(&mut repo2, &*fs2, &[(".env", "REGION=initial\n")], "add secret");
+    fs2.remove_file(&p(".env")).unwrap();
+    fs2.write(&p("settings.txt"), b"REGION=initial\n").unwrap();
+    snap(&mut repo2, &*fs2);
+    let (ren2, _) = repo2.commit_working_copy(WS, "rename").unwrap();
+    assert_eq!(file_entry(&repo2, &ren2, "settings.txt").unwrap().visibility, Visibility::Cloaked { scope: "team".into() });
+    let tok = "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\n";
+    let with_tok = commit_files(&mut repo2, &*fs2, &[("settings.txt", tok)], "put token in sealed settings");
+    let ren2 = repo2.squash(with_tok).unwrap();
+    let err = repo2.squash(ren2).unwrap_err();
+    assert!(matches!(err, veil_core::VeilError::Policy(_)), "scanner must refuse secret token at ordinary path: {err:?}");
 }

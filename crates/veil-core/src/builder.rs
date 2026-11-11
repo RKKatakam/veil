@@ -112,6 +112,11 @@ pub struct BuildOptions<'a> {
     pub policy: &'a Policy,
     /// Tree of the snapshot being amended (enables reuse and carry-over).
     pub parent_tree: Option<ObjectId>,
+    /// Tree of the change's committed parent(s) (`None` means `parent_tree`).
+    /// Moved-secret protection and non-secret sealing are judged against this
+    /// tree so a secret created and renamed within one change is classified by
+    /// its final path (BUG-1833).
+    pub base_tree: Option<ObjectId>,
     /// Secret content the engine handed to whoever wrote `fs` (the isolated
     /// files injected into a sandbox). New content containing any of it is
     /// quarantined, whatever its path and tier.
@@ -1103,7 +1108,7 @@ impl<'a> Builder<'a> {
     /// Exact content only; nothing is read unless the snapshot both
     /// deletes a sealed entry and adds a public one.
     fn protect_moves(&mut self, id: ObjectId) -> Result<ObjectId> {
-        let Some(parent) = self.opts.parent_tree.filter(|p| *p != id) else { return Ok(id) };
+        let Some(parent) = self.opts.base_tree.or(self.opts.parent_tree).filter(|p| *p != id) else { return Ok(id) };
         let changes = crate::tree::diff_trees(self.store, Some(&parent), Some(&id))?;
         let blob_kind = |e: &TreeEntry| matches!(e.kind, EntryKind::File | EntryKind::Symlink);
         let deleted: Vec<&TreeEntry> = changes
@@ -1118,51 +1123,116 @@ impl<'a> Builder<'a> {
             .filter_map(|c| c.new.as_ref().map(|e| (&c.path, e)))
             .filter(|(_, e)| blob_kind(e) && e.visibility.is_public())
             .collect();
-        if deleted.is_empty() || added.is_empty() {
-            return Ok(id);
-        }
-        let mut sealed_as: HashMap<(EntryKind, ObjectId), Visibility> = HashMap::new();
-        for d in deleted {
-            if verify_sealing(self.store, d)? != Sealing::Verified {
-                continue;
-            }
-            match self.store.read_blob(&d.id) {
-                Ok(plain) => {
-                    sealed_as.entry((d.kind, Object::blob_id(&plain))).or_insert_with(|| d.visibility.clone());
-                }
-                Err(e) if e.is_unreadable() || e.is_not_found() => {}
-                Err(e) => return Err(e),
-            }
-        }
         let mut tree = id;
-        for (path, e) in added {
-            let Some(vis) = sealed_as.get(&(e.kind, e.id)) else { continue };
-            let class = match e.kind {
-                EntryKind::Symlink => self.opts.policy.classify_link(path),
-                _ => self.opts.policy.classify(path, false),
-            };
-            if class.tier != Tier::Public || class.rule.is_some() {
-                continue;
+        if !deleted.is_empty() && !added.is_empty() {
+            let mut sealed_as: HashMap<(EntryKind, ObjectId), Visibility> = HashMap::new();
+            for d in &deleted {
+                if verify_sealing(self.store, d)? != Sealing::Verified {
+                    continue;
+                }
+                match self.store.read_blob(&d.id) {
+                    Ok(plain) => {
+                        sealed_as.entry((d.kind, Object::blob_id(&plain))).or_insert_with(|| d.visibility.clone());
+                    }
+                    Err(e) if e.is_unreadable() || e.is_not_found() => {}
+                    Err(e) => return Err(e),
+                }
             }
-            let data = self.store.read_blob(&e.id)?;
-            let sealed = match self.store.store_file(&data, vis) {
-                Ok(s) => s,
-                Err(VeilError::Redacted { .. }) => continue,
-                Err(err) => return Err(err),
-            };
-            let entry = TreeEntry {
-                id: sealed,
-                visibility: vis.clone(),
-                ..e.clone()
-            };
-            tree = crate::conflict::set_entry(self.store, &tree, path, Some(entry))?;
-            if let Some(run) = self.cache.as_mut() {
-                run.forget(path);
+            for (path, e) in added {
+                let Some(vis) = sealed_as.get(&(e.kind, e.id)) else { continue };
+                let class = match e.kind {
+                    EntryKind::Symlink => self.opts.policy.classify_link(path),
+                    _ => self.opts.policy.classify(path, false),
+                };
+                if class.tier != Tier::Public || class.rule.is_some() {
+                    continue;
+                }
+                let data = self.store.read_blob(&e.id)?;
+                let sealed = match self.store.store_file(&data, vis) {
+                    Ok(s) => s,
+                    Err(VeilError::Redacted { .. }) => continue,
+                    Err(err) => return Err(err),
+                };
+                let entry = TreeEntry {
+                    id: sealed,
+                    visibility: vis.clone(),
+                    ..e.clone()
+                };
+                tree = crate::conflict::set_entry(self.store, &tree, path, Some(entry))?;
+                if let Some(run) = self.cache.as_mut() {
+                    run.forget(path);
+                }
+                self.report.policy_warnings.push(format!(
+                    "{path}: its content was moved from a path sealed as {}; it stays sealed there (protection follows a secret across a rename)",
+                    vis.label()
+                ));
             }
-            self.report.policy_warnings.push(format!(
-                "{path}: its content was moved from a path sealed as {}; it stays sealed there (protection follows a secret across a rename)",
-                vis.label()
-            ));
+        }
+        if self.opts.base_tree.is_some() && self.opts.base_tree != self.opts.parent_tree {
+            for c in &changes {
+                let Some(e) = c.new.as_ref().filter(|e| blob_kind(e)) else { continue };
+                let Visibility::Cloaked { scope } = &e.visibility else { continue };
+                if crate::policy::seals_secret(c.path.as_str()) {
+                    continue;
+                }
+                let in_base = c.old.as_ref().is_some_and(|o| match o.kind {
+                    EntryKind::Conflict => self
+                        .store
+                        .conflict(&o.id)
+                        .ok()
+                        .is_some_and(|cf| cf.adds.iter().chain(&cf.removes).flatten().any(|t| !t.visibility.is_public())),
+                    _ => !o.visibility.is_public(),
+                });
+                let moved = deleted.iter().any(|d| matches!(&d.visibility, Visibility::Cloaked { scope: s } if s == scope));
+                if in_base || moved {
+                    continue;
+                }
+                let data = match self.store.read_blob(&e.id) {
+                    Ok(d) => d,
+                    Err(err) if err.is_unreadable() || err.is_not_found() => continue,
+                    Err(err) => return Err(err),
+                };
+                let class = match e.kind {
+                    EntryKind::Symlink => self.opts.policy.classify_link(&c.path),
+                    _ => self.opts.policy.classify(&c.path, false),
+                };
+                let replacement = match class.tier {
+                    Tier::Public => {
+                        if !class.allow_secrets {
+                            let findings = secrets::scan(&data);
+                            if !findings.is_empty() {
+                                let kept = self.quarantine(&c.path, findings, c.old.as_ref())?;
+                                tree = crate::conflict::set_entry(self.store, &tree, &c.path, kept)?;
+                                if let Some(run) = self.cache.as_mut() {
+                                    run.forget(&c.path);
+                                }
+                                continue;
+                            }
+                        }
+                        let pub_id = self.store.store_file(&data, &Visibility::Public)?;
+                        Some(TreeEntry {
+                            id: pub_id,
+                            visibility: Visibility::Public,
+                            size: data.len() as u64,
+                            ..e.clone()
+                        })
+                    }
+                    Tier::Isolated => {
+                        self.report.isolated.push(c.path.clone());
+                        None
+                    }
+                    Tier::Ignored => {
+                        self.report.ignored += 1;
+                        self.report.ignored_paths.push((c.path.clone(), false));
+                        None
+                    }
+                    Tier::Cloaked(_) => continue,
+                };
+                tree = crate::conflict::set_entry(self.store, &tree, &c.path, replacement)?;
+                if let Some(run) = self.cache.as_mut() {
+                    run.forget(&c.path);
+                }
+            }
         }
         Ok(tree)
     }

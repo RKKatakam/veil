@@ -243,6 +243,7 @@ fn exercise_link_tree(entries: Vec<(String, u8, Vec<u8>)>) {
         &veil_core::builder::BuildOptions {
             policy: &veil_core::policy::Policy::builtin(),
             parent_tree: Some(root),
+            base_tree: None,
             injected: None,
             rescan: false,
             materialised: None,

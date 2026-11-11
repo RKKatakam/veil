@@ -461,6 +461,7 @@ fn below_format_5_links_stay_special_files() {
         &veil_core::builder::BuildOptions {
             policy: &veil_core::policy::Policy::builtin(),
             parent_tree: None,
+            base_tree: None,
             injected: None,
             rescan: false,
             materialised: None,
