@@ -166,7 +166,24 @@ fn bug_820_a_merge_cannot_revert_a_file_the_pusher_may_not_write() {
     let r = c.push_merge("main", &[before]);
     assert_eq!(r.status, 403, "the revert landed: {}", String::from_utf8_lossy(&r.body));
     assert_eq!(api.tips(Some(&token), &p.name).unwrap().branches["main"], fixed);
-    // Merging a dev's branch still takes the dev's change of src/.
+    // A merge still takes a change of src/ someone who could write it made,
+    // where that change has landed (BUG-1920): Carol merges `main`, with the
+    // dev's fix, into a branch of her own that is behind it.
+    let r = api.post_json(
+        Some(&token),
+        &format!("/v1/projects/{}/push", p.name),
+        &serde_json::json!({"updates": [{"branch": "carols", "expected": null, "new": before.hex()}]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", String::from_utf8_lossy(&r.body));
+    let mut c = Craft::new(&api, &p.carol, &p.name, "main");
+    c.tip = before;
+    let r = c.push_merge("carols", &[fixed]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", String::from_utf8_lossy(&r.body));
+    // Merging a dev's unlanded branch into `main` would bring the dev's
+    // change of src/ onto `main`: that is its writer's to do, not Carol's
+    // (it was accepted until BUG-1920).
     let mut f = Craft::new(&api, &p.dev, &p.name, "main");
     f.file("src/lib.rs", "the dev's next change");
     let r = f.push_to("feat", None);
@@ -176,8 +193,9 @@ fn bug_820_a_merge_cannot_revert_a_file_the_pusher_may_not_write() {
     let mut c = Craft::new(&api, &p.carol, &p.name, "main");
     c.refer("src/lib.rs", theirs.id, theirs.size);
     let r = c.push_merge("main", &[feat]);
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert!(r.json()["results"][0]["ok"].as_bool().unwrap(), "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("you may not write 'src/lib.rs'"), "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(api.tips(Some(&token), &p.name).unwrap().branches["main"], fixed);
 }
 
 /// BUG-821. Attacker: anyone on Earth who signs up under a likely group
