@@ -733,3 +733,59 @@ fn bug_1837_split_keeps_attempts_on_the_original_change_id() {
     );
 }
 
+/// BUG-1910: `Transaction::supersede` records that a snapshot became one
+/// the repository already holds: a change as the server landed it, made
+/// again on a newer tip, with the local version as its predecessor. The
+/// local version leaves the view (it is still there by its id); what stood
+/// on it, a later change, a tag and the working copy, follows at commit
+/// and holds what else landed; one undo restores the view.
+#[test]
+fn bug_1910_a_superseded_snapshot_leaves_the_view_and_what_stood_on_it_follows() {
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "base");
+    let c = commit_files(&mut repo, &*fs, &[("b.txt", "b\n")], "the change");
+    let d = commit_files(&mut repo, &*fs, &[("c.txt", "c\n")], "on it");
+    repo.set_tag("mine", c, false).unwrap();
+    // The tip moved meanwhile (`other`, on the base) ...
+    repo.create_workspace("o", vec![base]).unwrap();
+    let ov = repo.workspace_overlay("o").unwrap();
+    ov.write(&p("x.txt"), b"x\n").unwrap();
+    repo.snapshot_workspace("o", &ov).unwrap();
+    let (other, _) = repo.commit_working_copy("o", "what else landed").unwrap();
+    // ... and the change was made again on it, as a landing does.
+    let landed = {
+        let tree_of = |id: &ObjectId| repo.snapshot(id).unwrap().tree;
+        let tree = veil_core::merge::merge_trees(repo.store(), Some(tree_of(&base)), tree_of(&other), tree_of(&c)).unwrap().tree;
+        let mut s = (*repo.snapshot(&c).unwrap()).clone();
+        s.parents = vec![other];
+        s.tree = tree;
+        s.predecessors = vec![c];
+        s.signature = None;
+        let mut tx = repo.transaction("what the server landed").unwrap();
+        let id = tx.write_snapshot(&s).unwrap();
+        tx.commit().unwrap();
+        id
+    };
+    assert_ne!(landed, c);
+    let view0 = repo.view().clone();
+
+    let mut tx = repo.transaction("landed").unwrap();
+    tx.supersede(c, landed).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(repo.view().tags["mine"].target, landed, "the tag follows");
+    let wc = repo.workspace_wc(WS).unwrap();
+    let on_it = repo.snapshot(&wc).unwrap().parents.clone();
+    assert_eq!(on_it.len(), 1);
+    let d2 = repo.snapshot(&on_it[0]).unwrap();
+    assert_ne!(on_it[0], d, "the later change was rebased");
+    assert_eq!((repo.description(&d2).as_str(), d2.parents.clone()), ("on it", vec![landed]));
+    for (f, text) in [("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n"), ("x.txt", "x\n")] {
+        assert_eq!(read_at(&repo, &wc, f), text.as_bytes(), "{f}");
+    }
+    let visible = repo.exact().visible().unwrap();
+    assert!(visible.contains(&landed) && !visible.contains(&c) && !visible.contains(&d), "the local versions left the view");
+    assert_eq!(repo.description(&repo.snapshot(&c).unwrap()), "the change", "and are still there by id");
+    repo.undo().unwrap();
+    assert_eq!(repo.view(), &view0, "one undo restores the view");
+}

@@ -234,22 +234,26 @@ pub fn pinned_server_key(authority: &str) -> Result<Option<String>> {
 
 /// The pinned signing keys of the servers `repo` syncs with (its remotes):
 /// a snapshot signed by one is the server's (`vl log` shows `✓server`).
-/// Read once a command; nothing if `hub.json` cannot be read.
-pub fn server_keys(repo: &Repo) -> &'static [String] {
-    static KEYS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    KEYS.get_or_init(|| {
-        let Ok(file) = load_file() else { return Vec::new() };
-        let mut keys: Vec<String> = repo
-            .config()
-            .remotes
-            .values()
-            .filter_map(|r| HubUrl::parse(&r.url)?.ok())
-            .filter_map(|u| file.servers.get(&u.authority)?.hub_key.clone())
-            .collect();
-        keys.sort();
-        keys.dedup();
-        keys
-    })
+/// `hub.json` is read once for a set of remotes (a log asks for every
+/// row); nothing if it cannot be read.
+pub fn server_keys(repo: &Repo) -> Arc<Vec<String>> {
+    type Cached = (Vec<String>, Arc<Vec<String>>);
+    static KEYS: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+    let urls: Vec<String> = repo.config().remotes.values().map(|r| r.url.clone()).collect();
+    let mut cached = KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((of, keys)) = cached.as_ref() {
+        if *of == urls {
+            return keys.clone();
+        }
+    }
+    let file = load_file().unwrap_or_default();
+    let mut keys: Vec<String> =
+        urls.iter().filter_map(|u| HubUrl::parse(u)?.ok()).filter_map(|u| file.servers.get(&u.authority)?.hub_key.clone()).collect();
+    keys.sort();
+    keys.dedup();
+    let keys = Arc::new(keys);
+    *cached = Some((urls, keys.clone()));
+    keys
 }
 
 pub fn signed_in_servers() -> Result<Vec<(String, String)>> {
@@ -1431,13 +1435,15 @@ fn supersede_landed(tx: &mut veil_core::transaction::Transaction, new_snaps: &[(
         }
         Ok(false)
     };
+    // Only what this clone holds is read: a predecessor it does not hold
+    // is no version of its own, and nothing is fetched to find out.
     let held = |tx: &veil_core::transaction::Transaction, ids: &mut dyn Iterator<Item = ObjectId>| -> Vec<ObjectId> {
-        ids.filter(|t| tx.repo().exact().snapshot(t).ok().flatten().is_some()).collect()
+        ids.filter(|t| tx.repo().held().snapshot(t).ok().flatten().is_some()).collect()
     };
     for (id, _) in new_snaps {
-        let Some(s) = tx.repo().exact().snapshot(id).ok().flatten() else { continue };
+        let Some(s) = tx.repo().held().snapshot(id).ok().flatten() else { continue };
         for p in &s.predecessors {
-            let Some(ps) = tx.repo().exact().snapshot(p).ok().flatten() else { continue };
+            let Some(ps) = tx.repo().held().snapshot(p).ok().flatten() else { continue };
             if p == id || ps.change_id != s.change_id || ps.abandoned.is_some() {
                 continue;
             }

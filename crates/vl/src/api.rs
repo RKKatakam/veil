@@ -1332,7 +1332,7 @@ fn thin_query_log<'a>(
                             let e = remote_log_entry(
                                 item,
                                 &helper.signers,
-                                crate::hub::server_keys(repo),
+                                &crate::hub::server_keys(repo),
                                 &mut tags,
                                 &mut remote_tags,
                                 &mut workspaces,
@@ -1380,7 +1380,7 @@ fn thin_query_log<'a>(
                             let e = remote_log_entry(
                                 item,
                                 &helper.signers,
-                                crate::hub::server_keys(repo),
+                                &crate::hub::server_keys(repo),
                                 &mut tags,
                                 &mut remote_tags,
                                 &mut workspaces,
