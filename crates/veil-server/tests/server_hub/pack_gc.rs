@@ -470,37 +470,7 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
         write_files(&p.dir, &[(&format!("src/search_extra_{k}.rs"), &format!("SEARCH_TERM_EXTRA_{k}"))]);
         p.admin.commit_main(&p.dir, &format!("search extra {k}"));
         p.admin.ok(&p.dir, &["push"]);
-        hub.rt.block_on(veil_server::derive::catch_up_project(&hub.hub(), pid)).unwrap();
-        hub.rt.block_on(veil_server::search::index::catch_up_project(&hub.hub(), pid)).unwrap();
     }
-    // Force a full rebuild of the search index so the old segment IDs are replaced.
-    hub.rt
-        .block_on(sqlx::query("DELETE FROM search_heads WHERE project_id = $1").bind(pid).execute(&hub.hub().db))
-        .unwrap();
-    hub.rt
-        .block_on(sqlx::query("DELETE FROM search_shards WHERE project_id = $1").bind(pid).execute(&hub.hub().db))
-        .unwrap();
-    hub.rt.block_on(veil_server::search::index::catch_up_project(&hub.hub(), pid)).unwrap();
-
-    let segs_after: Vec<String> = hub
-        .rt
-        .block_on(sqlx::query_scalar("SELECT segments FROM search_shards WHERE project_id = $1").bind(pid).fetch_all(&hub.hub().db))
-        .unwrap();
-    let mut live_seg_ids = HashSet::new();
-    for s_json in segs_after {
-        let arr: Vec<Value> = serde_json::from_str(&s_json).unwrap();
-        for item in arr {
-            if let Some(hex) = item["id"].as_str() {
-                live_seg_ids.insert(ObjectId::from_hex(hex).unwrap());
-            }
-        }
-    }
-    let dead_seg_id = *initial_seg_ids
-        .iter()
-        .find(|id| !live_seg_ids.contains(id))
-        .expect("superseded S15 search segment");
-    let live_seg_id = *live_seg_ids.iter().next().expect("live S15 search segment");
-    assert!(hub.rt.block_on(hub.hub().objects.exists(pid, &dead_seg_id)).unwrap(), "superseded segment is still in store before GC");
 
     // 3. S11 recorded attempt (`Snapshot.attempts`) on a live commit.
     let api = hub.api();
@@ -563,6 +533,38 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
     p.sec.ok(&sec_dir, &["push"]);
     let (embargo_blob_id, embargo_blob_raw) = make_blob(EMBARGO_BLOB_TEXT);
     assert!(hub.rt.block_on(hub.hub().objects.exists(pid, &embargo_blob_id)).unwrap(), "embargoed blob is stored");
+
+    // Catch up derive and force a clean search-index rebuild AFTER all branch
+    // pushes (`main` will not move again before `r1`/`r2`, so background
+    // `search::index::compact` cannot supersede `live_seg_id`, BUG-1820).
+    hub.rt.block_on(veil_server::derive::catch_up_project(&hub.hub(), pid)).unwrap();
+    hub.rt
+        .block_on(sqlx::query("DELETE FROM search_heads WHERE project_id = $1").bind(pid).execute(&hub.hub().db))
+        .unwrap();
+    hub.rt
+        .block_on(sqlx::query("DELETE FROM search_shards WHERE project_id = $1").bind(pid).execute(&hub.hub().db))
+        .unwrap();
+    hub.rt.block_on(veil_server::search::index::catch_up_project(&hub.hub(), pid)).unwrap();
+
+    let segs_after: Vec<String> = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT segments FROM search_shards WHERE project_id = $1").bind(pid).fetch_all(&hub.hub().db))
+        .unwrap();
+    let mut live_seg_ids = std::collections::BTreeSet::new();
+    for s_json in segs_after {
+        let arr: Vec<Value> = serde_json::from_str(&s_json).unwrap();
+        for item in arr {
+            if let Some(hex) = item["id"].as_str() {
+                live_seg_ids.insert(ObjectId::from_hex(hex).unwrap());
+            }
+        }
+    }
+    let dead_seg_id = *initial_seg_ids
+        .iter()
+        .find(|id| !live_seg_ids.contains(id))
+        .expect("superseded S15 search segment");
+    let live_seg_id = *live_seg_ids.iter().next().expect("live S15 search segment");
+    assert!(hub.rt.block_on(hub.hub().objects.exists(pid, &dead_seg_id)).unwrap(), "superseded segment is still in store before GC");
 
     // 5. Annotated Tag (`Atag`), PR revision (`pr_revisions`), Landing queue
     // entry (`landing_queue`), CI check (`checks`), and Pending Upload (`STAGED`).
