@@ -436,7 +436,7 @@ impl Repo {
         let mut tx = self.transaction("rebase")?;
         tx.keep_attribution();
         let s = tx.repo().snapshot(&source)?;
-        let out = tx.repo().rebase_tree(&s.parents, &dest, s.tree)?;
+        let out = tx.repo().rebase_tree(&s.parents, &dest, s.tree).map_err(|e| Repo::naming_change(e, &s))?;
         let mut ns = (*s).clone();
         ns.parents = dest;
         ns.tree = out.tree;

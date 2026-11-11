@@ -860,11 +860,21 @@ impl<'r> Transaction<'r> {
     /// in [`ViewMove::kept`]. Tags, workspaces and heads follow at commit.
     pub fn move_to_view(&mut self) -> Result<ViewMove> {
         let store = self.repo.store.clone();
+        if !store.is_partial() {
+            return Ok(ViewMove::default());
+        }
+        self.move_to_view_from(&*store)
+    }
+
+    /// [`Transaction::move_to_view`], asking `source` which snapshots are
+    /// the server's and what each is in the current view: a thin clone's
+    /// store (its server reads), or what a full clone's pull knows
+    /// (BUG-1562), whose trees are all held, so what a base lost is read
+    /// from its own trees.
+    pub fn move_to_view_from(&mut self, source: &dyn ViewSource) -> Result<ViewMove> {
+        let store = self.repo.store.clone();
         let root = self.repo.root_id;
         let mut out = ViewMove::default();
-        if !store.is_partial() {
-            return Ok(out);
-        }
         // What the view refers to, and the changes only this clone holds.
         let mut refs: Vec<ObjectId> = self.view.tags.values().filter(|t| t.annotation.is_none()).map(|t| t.target).collect();
         refs.extend(self.view.workspaces.values().map(|w| w.wc));
@@ -888,7 +898,7 @@ impl<'r> Transaction<'r> {
             }
             // A request that fails stops the move, nothing changed: never
             // a server snapshot taken for local work (BUG-1564).
-            if id == root || store.is_servers(&id)? {
+            if id == root || source.is_servers(&id)? {
                 servers.insert(id);
                 continue;
             }
@@ -903,7 +913,7 @@ impl<'r> Transaction<'r> {
             if *s == root {
                 continue;
             }
-            if let Some(n) = store.current_projection(s)? {
+            if let Some(n) = source.current_projection(s)? {
                 if n != *s {
                     map.insert(*s, n);
                 }
@@ -1228,6 +1238,7 @@ impl<'r> Transaction<'r> {
             let (out, attempts) = match self
                 .repo
                 .rebase_tree(&s.parents, &new_parents, s.tree)
+                .map_err(|e| Repo::naming_change(e, &s))
                 .and_then(|o| Ok((o, self.rebase_attempts(&s.attempts, &new_parents, s.change_id)?)))
             {
                 // A merge of concurrent operations never fails for a policy
@@ -2077,6 +2088,27 @@ impl Drop for Transaction<'_> {
                 lock.abandon();
             }
         }
+    }
+}
+
+/// What [`Transaction::move_to_view_from`] asks about a snapshot.
+pub trait ViewSource {
+    /// Is `s` on the server (not a change only this clone holds)? An
+    /// answer that cannot be had is an error, never "no" (BUG-1564).
+    fn is_servers(&self, s: &ObjectId) -> Result<bool>;
+    /// `s` as its person's current view names it, held by this clone: `s`
+    /// itself when the view is the one the clone met it in; `None` for a
+    /// snapshot the server does not know.
+    fn current_projection(&self, s: &ObjectId) -> Result<Option<ObjectId>>;
+}
+
+impl ViewSource for crate::store::ObjectStore {
+    fn is_servers(&self, s: &ObjectId) -> Result<bool> {
+        crate::store::ObjectStore::is_servers(self, s)
+    }
+
+    fn current_projection(&self, s: &ObjectId) -> Result<Option<ObjectId>> {
+        crate::store::ObjectStore::current_projection(self, s)
     }
 }
 

@@ -1684,6 +1684,9 @@ impl Repo {
         let base = self.parents_tree(old_parents)?.tree;
         let onto = self.parents_tree(new_parents)?;
         let out = merge_trees(&self.store, Some(base), onto.tree, tree)?;
+        if !out.conflicts.is_empty() {
+            self.refuse_lost_edit(old_parents, &out.conflicts)?;
+        }
         let mut conflicts = out.conflicts;
         for c in onto.conflicts {
             if conflicts.contains(&c) {
@@ -1695,6 +1698,53 @@ impl Repo {
             }
         }
         Ok(MergeOutcome { tree: out.tree, conflicts, renames: out.renames })
+    }
+
+    /// A change moved off parents that stand in a view its person no longer
+    /// has (the move to their current view kept it there: it edits a folder
+    /// they lost, BUG-1509) conflicts at that folder, which its new parents
+    /// no longer name: a change of the current view naming a folder its
+    /// person cannot see, which no push accepts. Refused instead, by the
+    /// folder's name, as the move refuses it (BUG-1563). Asked only of a
+    /// move that conflicts, in a thin clone: the server says which of the
+    /// old parents' snapshots it names otherwise now, and nothing below a
+    /// folder it refuses is read.
+    fn refuse_lost_edit(&self, old_parents: &[ObjectId], conflicts: &[VPath]) -> Result<()> {
+        let store = &self.store;
+        if !store.is_partial() || !store.may_fetch() {
+            return Ok(());
+        }
+        let mut stack: Vec<ObjectId> = old_parents.to_vec();
+        let mut seen = HashSet::new();
+        while let Some(p) = stack.pop() {
+            if p == self.root_id || !seen.insert(p) || seen.len() > 1_000 {
+                continue;
+            }
+            // Down through the changes only this clone holds, to the
+            // server's snapshots they stand on.
+            if !store.is_servers(&p)? {
+                stack.extend(self.snapshot(&p)?.parents.iter().copied());
+                continue;
+            }
+            let Some(now) = store.current_projection(&p)?.filter(|n| *n != p) else { continue };
+            let Some(lost) = crate::transaction::lost_paths(store, &self.snapshot(&p)?.tree, &self.snapshot(&now)?.tree)? else { continue };
+            if let Some(folder) = lost.iter().find(|l| conflicts.iter().any(|c| c.starts_with(l))) {
+                return Err(crate::tree::no_access(folder, "the change edits it, so it stays in the view it was made in"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `e`, a refusal to move `s` ([`Repo::refuse_lost_edit`]), naming it.
+    pub(crate) fn naming_change(e: VeilError, s: &Snapshot) -> VeilError {
+        match e {
+            VeilError::Policy(m) if crate::tree::is_view_error(&VeilError::Policy(m.clone())) => VeilError::Policy(format!(
+                "change {} ({}) cannot be moved: {m}",
+                s.change_id.short(),
+                s.description.as_str().lines().next().unwrap_or_default()
+            )),
+            e => e,
+        }
     }
 
     /// No content change relative to its parents.

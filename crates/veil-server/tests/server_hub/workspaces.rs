@@ -1986,13 +1986,14 @@ fn bug_1509_access_back_after_a_move_writes_the_folder_whole_and_keeps_edits() {
 }
 
 
-/// BUG-1562: a **full** clone made before its person's access changed is
+/// BUG-1562: a **full** clone made before its person's access changed was
 /// not moved to their current view: it holds every object of the view it
-/// was made in, so nothing it reads is refused, and its pull and push do
-/// not ask (the move reads through a thin clone's server reads). A change
-/// on top of the old view is refused by the push.
+/// was made in, so nothing it reads is refused, and its pull and push did
+/// not ask (the move read through a thin clone's server reads). A change
+/// on top of the old view was refused by the push. Fixed: its pull asks
+/// the server's history of the tips it had, and moves it as a thin clone
+/// moves (`hub::FullView`).
 #[test]
-#[ignore = "BUG-1562: a full clone is not moved to its person's current view; its push is refused"]
 fn bug_1562_a_full_clone_is_not_moved_and_its_push_is_refused() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
@@ -2006,8 +2007,20 @@ fn bug_1562_a_full_clone_is_not_moved_and_its_push_is_refused() {
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     let out = p.fin.ok(&full, &["pull"]);
     assert_eq!(out.matches(MOVED).count(), 1, "{out}");
+    assert!(!out.contains("has diverged") && !out.contains("kept where it is"), "{out}");
+    // The change stands on the current view's `main`, without the folder
+    // fin lost, and `feature` is the current view's.
+    let v = view_state(&full);
+    assert_eq!(v.0["main"], v.3["origin/main"]);
+    assert_eq!(v.0["feature"], v.3["origin/feature"]);
+    assert_eq!(parents_of(&full, "fullc"), vec![v.0["main"]]);
+    assert_eq!(entry_at(&full, "fullc", BILL_DIR), None);
+    assert!(entry_at(&full, "fullc", "src/full.txt").is_some());
     let out = p.fin.ok(&full, &["push", "-t", "fullc"]);
     assert!(out.contains("pushed"), "{out}");
+    // Once: a later pull finds nothing to move.
+    let out = p.fin.ok(&full, &["pull"]);
+    assert!(!out.contains(MOVED), "{out}");
 }
 
 /// BUG-1563: a change the move kept in the old view (it edits a folder its
@@ -2015,7 +2028,6 @@ fn bug_1562_a_full_clone_is_not_moved_and_its_push_is_refused() {
 /// view, with a conflict at that folder, which no push accepts. Expected:
 /// refused by name, as the move refuses it, and left where it is.
 #[test]
-#[ignore = "BUG-1563: a rebase of a change kept in the old view rewrites it with a conflict at the lost folder"]
 fn bug_1563_a_rebase_of_a_kept_change_is_refused_by_name() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
@@ -2029,7 +2041,20 @@ fn bug_1563_a_rebase_of_a_kept_change_is_refused_by_name() {
     let before = view_state(&k);
     let out = p.fin.fails(&k, &["rebase", "-s", "billing", "-d", "main"]);
     assert!(out.contains("no longer have access") && out.contains("billing edit"), "{out}");
+    assert!(out.contains(&format!("{BILL_DIR}/")) && !out.contains("Rebased") && !out.contains("conflicts in"), "by the folder's name: {out}");
     assert_eq!(view_state(&k), before, "nothing changed");
+    // A change made on the kept one that edits nothing there moves: only
+    // the edit inside the lost folder stays behind.
+    p.fin.ok(&k, &["new", "billing"]);
+    write_files(&k, &[("src/after.txt", "after\n")]);
+    p.fin.ok(&k, &["commit", "--no-advance", "-m", "src edit"]);
+    p.fin.ok(&k, &["tag", "set", "after-b1", "-r", "@-"]);
+    let out = p.fin.ok(&k, &["rebase", "-s", "after-b1", "-d", "main"]);
+    assert!(out.contains("Rebased") && !out.contains("conflicts in"), "{out}");
+    assert_eq!(parents_of(&k, "after-b1"), vec![view_state(&k).0["main"]]);
+    assert_eq!(entry_at(&k, "after-b1", BILL_DIR), None);
+    assert!(entry_at(&k, "after-b1", "src/after.txt").is_some());
+    assert_eq!(view_state(&k).0["billing"], before.0["billing"], "the kept change is where it was");
 }
 
 // ---- Review of `s8i` (BUG-1528–1531's fixes): guarantee tests -----------

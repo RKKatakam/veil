@@ -1058,6 +1058,7 @@ pub fn pull_moving(
             client.url.authority
         );
     }
+    let full_clone = !repo.is_partial();
     let mut tx = repo.transaction(format!("pull from {remote}"))?;
     tx.repository_wide();
     let store: Arc<ObjectStore> = tx.repo().store().clone();
@@ -1292,24 +1293,49 @@ pub fn pull_moving(
     }
     // The person's view changed since this clone last pulled: a tip it had
     // is named under another id now (BUG-1509).
-    let moving = thin
-        && match mv {
-            MoveView::No => false,
-            MoveView::Always => true,
-            MoveView::IfChanged => {
-                let mut changed = store.view_changed();
-                for t in old_tips.iter().filter(|t| !tips.branches.values().any(|n| n == *t)) {
-                    if changed {
-                        break;
-                    }
-                    changed = store.current_projection(t)?.is_some_and(|n| n != *t);
+    let moving = match mv {
+        MoveView::No => false,
+        _ if thin => {
+            let mut changed = mv == MoveView::Always || store.view_changed();
+            for t in old_tips.iter().filter(|t| !tips.branches.values().any(|n| n == *t)) {
+                if changed {
+                    break;
                 }
-                changed
+                changed = store.current_projection(t)?.is_some_and(|n| n != *t);
             }
-        };
+            changed
+        }
+        // A full clone reads nothing on demand, so no read of its own shows
+        // the view changed (BUG-1562): the server's history of the tips it
+        // had that are tips no more (one request for all of them) names
+        // each as the current view does, and one it names otherwise, or
+        // not at all, is of a view its person no longer has.
+        _ if full_clone && tips.revision >= HISTORY_PAGES => {
+            let mut were: Vec<ObjectId> = old_tips.iter().copied().filter(|t| !tips.branches.values().any(|n| n == t)).collect();
+            were.sort();
+            were.dedup();
+            match were.is_empty() {
+                true => false,
+                false => {
+                    let named: HashSet<ObjectId> = client.history(were.clone(), Vec::new(), Some(were.len()))?.into_iter().map(|(id, _)| id).collect();
+                    were.iter().any(|t| !named.contains(t))
+                }
+            }
+        }
+        _ => false,
+    };
     let moved = match moving {
         true => {
-            let m = tx.move_to_view()?;
+            let m = match thin {
+                true => tx.move_to_view()?,
+                false => {
+                    let now: Vec<ObjectId> = tips.branches.values().copied().collect();
+                    let current = store.reached_by(&now);
+                    let mut servers = store.reached_by(&old_tips);
+                    servers.extend(current.iter().copied());
+                    tx.move_to_view_from(&FullView { client, store: &store, servers, current, asked: Default::default() })?
+                }
+            };
             // Something moved: the warnings of tags the pull found diverged
             // and the move put on their remote tags are gone.
             if m.moved > 0 || m.mapped > 0 {
@@ -1329,6 +1355,44 @@ pub fn pull_moving(
     };
     tx.commit()?;
     Ok((report, moved))
+}
+
+/// What a full clone's move to its person's current view asks (BUG-1562).
+/// It reads nothing from the server on demand: the server's snapshots are
+/// what its remote tags reached before this pull and reach now, and a
+/// snapshot's current projection is the server's history of it, when this
+/// clone holds it whole (the pull just took the current view). One it does
+/// not hold (of a branch deleted since) is left as it is, with what stands
+/// on it.
+struct FullView<'a> {
+    client: &'a Client,
+    store: &'a ObjectStore,
+    servers: HashSet<ObjectId>,
+    current: HashSet<ObjectId>,
+    asked: std::cell::RefCell<HashMap<ObjectId, Option<ObjectId>>>,
+}
+
+impl veil_core::transaction::ViewSource for FullView<'_> {
+    fn is_servers(&self, s: &ObjectId) -> veil_core::Result<bool> {
+        Ok(self.servers.contains(s))
+    }
+
+    fn current_projection(&self, s: &ObjectId) -> veil_core::Result<Option<ObjectId>> {
+        if self.current.contains(s) {
+            return Ok(Some(*s));
+        }
+        if let Some(n) = self.asked.borrow().get(s) {
+            return Ok(*n);
+        }
+        // A request that fails stops the move, nothing changed (BUG-1564).
+        let page = self
+            .client
+            .history(vec![*s], Vec::new(), Some(1))
+            .map_err(|e| veil_core::VeilError::Unavailable(format!("asking the server for your current view: {e:#}")))?;
+        let n = page.into_iter().next().map(|(id, _)| id).filter(|id| self.current.contains(id) && self.store.has(id));
+        self.asked.borrow_mut().insert(*s, n);
+        Ok(n)
+    }
 }
 
 /// For a clone of one directory: `tree` with only the path to `only` and
