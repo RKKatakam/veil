@@ -2194,6 +2194,11 @@ fn bug_1880_a_queued_release_meets_its_embargo_prs_approval_again_in_the_batch()
     assert_eq!(ok.status, 200, "{}", body_str(&ok));
     assert_eq!(ok.json()["review"]["ready"], true, "{}", body_str(&ok));
     assert!(released_at(&hub, &eid).is_none(), "an approval alone releases nothing");
+    // An embargoed PR records no source branch for its landing to delete
+    // (BUG-1885): its head is the embargo's line, which only the release removes.
+    let source: Option<String> =
+        hub.rt.block_on(sqlx::query_scalar("SELECT source_branch FROM prs WHERE project_id = $1 AND id = $2").bind(pid).bind(&pr_id).fetch_one(&hub.hub().db)).unwrap();
+    assert_eq!(source, None, "an embargoed PR has a source branch to delete");
 
     // Another server holds main's landing lease: the release is queued, and waits.
     hub.rt
@@ -2268,4 +2273,5 @@ fn bug_1880_a_queued_release_meets_its_embargo_prs_approval_again_in_the_batch()
     let shown = api.get(Some(&dev), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
     assert_eq!(shown.status, 200, "{}", body_str(&shown));
     assert_eq!(shown.json()["state"], "landed", "{}", body_str(&shown));
+    assert!(!api.tips(Some(&sec), &p.name).unwrap().branches.contains_key(&line), "the line is retired by the release");
 }
