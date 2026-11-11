@@ -1708,22 +1708,27 @@ impl Repo {
     /// folder's name, as the move refuses it (BUG-1563). Asked only of a
     /// move that conflicts, in a thin clone: the server says which of the
     /// old parents' snapshots it names otherwise now, and nothing below a
-    /// folder it refuses is read.
+    /// folder it refuses is read. At most [`Self::LOST_EDIT_QUESTIONS`]
+    /// snapshots are asked about, the old parents first: a conflicting
+    /// rebase on a long local stack costs no request a commit.
     fn refuse_lost_edit(&self, old_parents: &[ObjectId], conflicts: &[VPath]) -> Result<()> {
         let store = &self.store;
         if !store.is_partial() || !store.may_fetch() {
             return Ok(());
         }
-        let mut stack: Vec<ObjectId> = old_parents.to_vec();
+        let mut queue: VecDeque<ObjectId> = old_parents.iter().copied().collect();
         let mut seen = HashSet::new();
-        while let Some(p) = stack.pop() {
-            if p == self.root_id || !seen.insert(p) || seen.len() > 1_000 {
+        while let Some(p) = queue.pop_front() {
+            if p == self.root_id || !seen.insert(p) {
                 continue;
+            }
+            if seen.len() > Self::LOST_EDIT_QUESTIONS {
+                break;
             }
             // Down through the changes only this clone holds, to the
             // server's snapshots they stand on.
             if !store.is_servers(&p)? {
-                stack.extend(self.snapshot(&p)?.parents.iter().copied());
+                queue.extend(self.snapshot(&p)?.parents.iter().copied());
                 continue;
             }
             let Some(now) = store.current_projection(&p)?.filter(|n| *n != p) else { continue };
@@ -1734,6 +1739,8 @@ impl Repo {
         }
         Ok(())
     }
+
+    const LOST_EDIT_QUESTIONS: usize = 4;
 
     /// `e`, a refusal to move `s` ([`Repo::refuse_lost_edit`]), naming it.
     pub(crate) fn naming_change(e: VeilError, s: &Snapshot) -> VeilError {

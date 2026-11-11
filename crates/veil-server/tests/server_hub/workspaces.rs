@@ -2355,6 +2355,8 @@ fn s8ir_review_a_local_stack_costs_no_request_a_commit() {
         assert_eq!(std::fs::read_to_string(d.join(format!("src/stack/c{:02}.txt", n - 1))).unwrap(), format!("commit {}\n", n - 1));
     }
     eprintln!("s8ir: rebase of a 2-commit stack cost {} requests, of a 30-commit stack {}", cost[0], cost[1]);
+    // (The rebase conflicts, at `src/stack`: BUG-1563's question about the
+    // old parents is bounded, never one request a commit of the stack.)
     assert!(cost[1] <= cost[0] + 8, "a 30-commit stack cost {} requests, a 2-commit one {}", cost[1], cost[0]);
 }
 
