@@ -286,9 +286,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 Err(e) => {
                     // Run again only what the view change made fail, and
                     // never a sandbox's command, which may have run
-                    // already.
+                    // already (one refused before it ran has not,
+                    // BUG-1573).
                     let view = e.chain().any(|c| c.downcast_ref::<veil_core::VeilError>().is_some_and(veil_core::tree::is_view_error));
-                    let exec = matches!(cli.cmd, Cmd::Workspace(WsCmd::Exec { .. }));
+                    let exec = matches!(cli.cmd, Cmd::Workspace(WsCmd::Exec { .. })) && !sandbox::refused_before_its_command();
                     if !moved(hub_cmd::move_if_view_changed(&mut ctx, &cli.cmd)) {
                         return Err(e);
                     }

@@ -936,6 +936,16 @@ fn checkout_changes(store: &ObjectStore, from: Option<&ObjectId>, to: &ObjectId)
     };
     let under = |dir: &VPath, rel: &VPath| if dir.is_root() { rel.clone() } else { VPath::new(&format!("{dir}/{rel}")).expect("a path below a tree's path") };
     for h in hidden {
+        // The root of `to` refused: not a folder to leave out (BUG-1574:
+        // the record cannot name the root, and a working copy of nothing
+        // is no checkout of this tree). The whole tree is of a view its
+        // person no longer has: the reader's own refusal, which the
+        // clone's move to their current view answers (BUG-1573).
+        if h.path.is_root() {
+            if let Some(e) = &h.new {
+                store.tree(&e.id)?;
+            }
+        }
         match (readable(&h.old)?, readable(&h.new)?) {
             (_, Some(new)) => {
                 for (rel, e) in walk_files_hiding(store, &new)?.0 {

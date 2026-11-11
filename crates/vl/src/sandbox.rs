@@ -330,6 +330,16 @@ fn vault_files(repo: &Repo) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(files)
 }
 
+/// Did this process's `vl ws exec` fail on the server's refusal of its
+/// workspace's tree, before its command ran or its sandbox was written?
+/// Only then is a `vl ws exec` run again after the clone moved to its
+/// person's current view (BUG-1573).
+static NOT_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn refused_before_its_command() -> bool {
+    NOT_RUN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confine>) -> Result<ExitCode> {
     // Throwaway sandboxes of dead `vl` processes may hold secrets.
     sweep_stale(&std::env::temp_dir());
@@ -365,6 +375,8 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
                 Loaded::Found(m) if m.pending.is_some() => format!(
                     "it cannot be recorded ({why}); the next run keeps its files aside, whole"
                 ),
+                // Whether it holds a run cannot be told (BUG-1574).
+                Loaded::Corrupt(_) => format!("{why}, so whether it holds an unrecorded run cannot be told; the next run keeps its files aside, whole"),
                 _ => "it holds no unrecorded run".to_string(),
             };
             eprintln!("Nothing to record in the sandbox of workspace {}: {what}", safe(name));
@@ -416,6 +428,15 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
 
     let base = ctx.repo.workspace_wc(name)?;
     let synced = ctx.repo.snapshot(&base)?.tree;
+    // The tree's root, before anything is written or run: one the server
+    // refuses is of a view this person no longer has (the workspace stands
+    // on a snapshot this thin clone never fetched). The command has not
+    // run and nothing names a run, so after the clone's move it runs, once,
+    // on the current view (BUG-1573); never in a sandbox of no files.
+    if let Err(e) = ctx.repo.store().tree(&synced) {
+        NOT_RUN.store(veil_core::tree::refused_tree(ctx.repo.store(), &e), std::sync::atomic::Ordering::SeqCst);
+        return Err(e.into());
+    }
     let set = sparse_set(ctx, a.only, &synced, &format!("workspace '{}'", safe(name)))?;
     let run_id = hex::encode(veil_core::crypto::random_bytes::<8>());
     m.running = Some(run_id.clone());

@@ -75,6 +75,13 @@ fn dir_entry(repo: &Repo, rev: &ObjectId, path: &str) -> TreeEntry {
 }
 
 fn clone_with_a_refused_folder() -> Clone {
+    clone_refusing(false)
+}
+
+/// [`clone_with_a_refused_folder`]; with `root`, the server refuses the
+/// root of `feature`'s tree too (the clone never fetched it, and its
+/// person's view changed since).
+fn clone_refusing(root: bool) -> Clone {
     let (mut server, fs, id) = new_repo("alice");
     let base = commit_files(&mut server, &*fs, &[("bill/acme/q1.txt", "q1\n"), ("src/lib.rs", "one\n")], "base");
     let feature =
@@ -100,7 +107,7 @@ fn clone_with_a_refused_folder() -> Clone {
     repo.store().set_promisor(Arc::new(Server {
         store: server.store().clone(),
         tips: vec![feature, mine],
-        refuse: HashSet::from([base_bill.id, feature_bill.id]),
+        refuse: HashSet::from([base_bill.id, feature_bill.id]).into_iter().chain(root.then(|| server.snapshot(&feature).unwrap().tree)).collect(),
     }));
     // As a clone records them: the server's branches, and their changes.
     let mut tx = repo.transaction("clone").unwrap();
@@ -113,7 +120,8 @@ fn clone_with_a_refused_folder() -> Clone {
     // The fixture's own check: the folder is refused, to a writer by name.
     let tree = repo.snapshot(&feature).unwrap().tree;
     let err = veil_core::tree::walk_files(repo.store(), &tree).unwrap_err().to_string();
-    assert!(err.contains("bill/ is a folder you no longer have access to"), "{err}");
+    let what = if root { "/ is a folder" } else { "bill/ is a folder" };
+    assert!(err.contains(&format!("{what} you no longer have access to")), "{err}");
     Clone { repo, feature, mine, base_bill, feature_bill }
 }
 
@@ -160,4 +168,23 @@ fn bug_1897_a_split_and_a_squash_of_other_paths_keep_a_refused_folder_by_id() {
     let rest = squashed.source.expect("the change keeps the rest");
     assert_eq!(dir_entry(&repo, &rest, BILL), feature_bill, "the change keeps feature's folder by id");
     assert_eq!(read_at(&repo, &rest, "src/lib.rs"), b"two\n");
+}
+
+/// BUG-1573, BUG-1574: a checkout of a tree whose root the server refuses
+/// is the reader's refusal (what a view change makes a command fail with,
+/// so the clone moves and the command runs again), never a working copy of
+/// no files with the root recorded as a folder left out, which the record's
+/// reader rejects. Nothing is written and the record stays as it was.
+#[test]
+fn bug_1574_a_checkout_of_a_refused_root_fails_and_records_no_root() {
+    let Clone { repo, feature, .. } = clone_refusing(true);
+    let to = repo.snapshot(&feature).unwrap().tree;
+    let fs = MemoryBackend::new();
+    let mut record = veil_core::checkout::Materialised::default();
+    let err = repo.checkout_tree_recorded(&fs, None, &to, &mut record, None).unwrap_err();
+    assert!(veil_core::tree::is_view_error(&err), "{err}");
+    assert!(record.is_empty(), "{record:?}");
+    let back: veil_core::checkout::Materialised = serde_json::from_str(&serde_json::to_string(&record).unwrap()).expect("the record reads back");
+    assert_eq!(back, record);
+    assert!(veil_core::StorageBackend::list_dir(&fs, &veil_core::VPath::root()).unwrap().is_empty(), "nothing was written");
 }

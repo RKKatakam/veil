@@ -2833,13 +2833,15 @@ fn s8kr_ws_exec_never_runs_its_command_twice_across_a_move() {
 /// BUG-1573 (review of `s8k`): a workspace whose change stands on a server
 /// snapshot this thin clone never fetched (`vl ws new agent -r feature`,
 /// never run yet), after its person loses a folder. The server refuses the
-/// old root, so the first `vl ws exec agent` runs the command in an empty
-/// sandbox, then fails to record it; the move that follows keeps the
+/// old root. Was: the first `vl ws exec agent` ran the command in an empty
+/// sandbox, then failed to record it; the move that followed kept the
 /// workspace's change (empty: it edits nothing) "where it is" because it
-/// cannot tell what its old parent held (`lost_paths` gives `None`), so
-/// every later `vl ws exec agent` does the same.
+/// could not tell what its old parent held (`lost_paths` gives `None`), so
+/// every later `vl ws exec agent` did the same. Fixed: the refusal of the
+/// root fails the run before its command, the clone moves (an empty change
+/// moves whatever its parent held), and the command runs once, on the
+/// current view.
 #[test]
-#[ignore = "BUG-1573: a workspace on a snapshot the thin clone never fetched runs its command in an empty sandbox after an access change, for ever"]
 fn bug_1573_a_workspace_never_synced_runs_on_the_current_view_after_an_access_change() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
@@ -2848,25 +2850,46 @@ fn bug_1573_a_workspace_never_synced_runs_on_the_current_view_after_an_access_ch
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     let want = format!("{FEATURE_MARK} 0 0");
     for run in 0..2 {
-        let o = p.fin.run(&d, &["ws", "exec", "agent", "--", "sh", "-c", "cat src/wide/f0/s0.txt; echo out > out.txt"]);
+        let o = p.fin.run(&d, &["ws", "exec", "agent", "--", "sh", "-c", "cat src/wide/f0/s0.txt; echo out >> out.txt"]);
         let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         assert!(o.status.success() && all.contains(&want), "run {run}: the command runs on feature's files, and is recorded: {all}");
         assert_eq!(all.matches(MOVED).count(), if run == 0 { 1 } else { 0 }, "run {run}: {all}");
         assert!(!all.contains("kept where it is"), "run {run}: an empty change edits nothing: {all}");
         assert!(!all.contains(FEATURE_BILL) && !all.contains(BILL_MARK), "run {run}: {all}");
+        // Once a run: never in an empty sandbox first, then again.
+        let out = std::fs::read_to_string(d.join(".veil/local/sandboxes/agent/files/out.txt")).unwrap();
+        assert_eq!(out.lines().count(), run + 1, "run {run}: the command ran once: {all}");
+        assert!(!all.contains("Rebuilding"), "run {run}: {all}");
     }
+    // Recorded: the workspace's change holds the output, on the current
+    // view's `feature`, and nothing of the folder fin lost.
+    let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&d)), None, "test").unwrap();
+    let wc = repo.snapshot(&repo.view().workspaces["agent"].wc).unwrap();
+    let at = |path: &str| veil_core::tree::lookup(&open_store(&d), &wc.tree, &veil_core::VPath::new(path).unwrap()).unwrap();
+    assert!(at("out.txt").is_some(), "the output is recorded");
+    assert_eq!(at(BILL_DIR), None);
+    let feature = repo.view().remote_tags["origin/feature"];
+    let mut up = wc.parents.clone();
+    for _ in 0..2 {
+        if !up.contains(&feature) {
+            up = repo.snapshot(&up[0]).unwrap().parents.clone();
+        }
+    }
+    assert!(up.contains(&feature), "on the current view's feature");
 }
 
 /// BUG-1574 (review of `s8k`): a sandbox synced to a tree whose root the
 /// server refuses (here: a workspace never synced, in a view that changed,
-/// with the move off so the record is the sync's alone) records the root
-/// as hidden and refused (`""`), which the record's reader rejects
-/// (`Materialised`'s `TryFrom`: no root). The manifest is then
-/// "unreadable": the run's error says to run `--record-only`, which answers
-/// that the sandbox holds no unrecorded run though the output is there,
-/// and the next run sets the files aside as of an unreadable manifest.
+/// with the move off so the record is the sync's alone). Was: the command
+/// ran in a sandbox of no files, whose record named the root as hidden and
+/// refused (`""`), which the record's reader rejects (`Materialised`'s
+/// `TryFrom`: no root); the manifest was then "unreadable", `--record-only`
+/// answered that the sandbox held no unrecorded run though the output was
+/// there, and the next run set the files aside as of an unreadable
+/// manifest. Fixed: a root the server refuses is never a folder left out:
+/// the run fails before its command, nothing is written, and no record
+/// names the root.
 #[test]
-#[ignore = "BUG-1574: a sandbox whose root tree the server refuses writes a materialisation record it cannot read back (`--record-only` says there is nothing to record)"]
 fn bug_1574_a_sandbox_whose_root_the_server_refuses_keeps_a_readable_record() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
@@ -2874,17 +2897,19 @@ fn bug_1574_a_sandbox_whose_root_the_server_refuses_keeps_a_readable_record() {
     let d = thin_with_agent(&p, &hub, &p.fin, "rootless");
     p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
     p.fin.stay_in_stale_views();
-    let o = p.fin.run(&d, &["ws", "exec", "agent", "--", "sh", "-c", "echo ran >> ran.txt"]);
-    let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     let sb = d.join(".veil/local/sandboxes/agent");
-    assert!(sb.join("files/ran.txt").exists(), "the command ran: {all}");
-    let manifest = std::fs::read_to_string(sb.join("manifest.json")).unwrap();
-    let r = p.fin.run(&d, &["ws", "exec", "agent", "--record-only"]);
-    let rall = format!("{}{}", String::from_utf8_lossy(&r.stdout), String::from_utf8_lossy(&r.stderr));
-    assert!(!rall.contains("holds no unrecorded run"), "the run's output is in the sandbox ({all}); its record reads back ({manifest}): {rall}");
-    let again = p.fin.run(&d, &["ws", "exec", "agent", "--", "true"]);
-    let aall = format!("{}{}", String::from_utf8_lossy(&again.stdout), String::from_utf8_lossy(&again.stderr));
-    assert!(!aall.contains("its manifest is unreadable"), "{manifest}\n{aall}");
+    for cmd in ["echo ran >> ran.txt", "true"] {
+        let all = p.fin.fails(&d, &["ws", "exec", "agent", "--", "sh", "-c", cmd]);
+        assert!(all.contains("is not present in this store"), "the server's refusal of the tree, as every reader says it: {all}");
+        assert!(!all.contains("running sh") && !sb.join("files/ran.txt").exists(), "the command did not run: {all}");
+        assert!(!all.contains("its manifest is unreadable") && !all.contains("Rebuilding"), "{all}");
+        // No record names the root (none is written before a run starts).
+        let manifest = std::fs::read_to_string(sb.join("manifest.json")).unwrap_or_default();
+        assert!(!manifest.contains("\"\""), "{manifest}");
+        // Nothing ran, and `--record-only` says so truthfully.
+        let rall = p.fin.ok(&d, &["ws", "exec", "agent", "--record-only"]);
+        assert!(rall.contains("holds no unrecorded run"), "{rall}");
+    }
 }
 
 /// BUG-1625 (review of `s8k` / `s8kr`; fixed: each tip once, through

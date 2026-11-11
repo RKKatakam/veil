@@ -920,6 +920,9 @@ impl<'r> Transaction<'r> {
             }
         }
         let mut refused: HashMap<ObjectId, VPath> = HashMap::new();
+        // Changes that edit nothing, on a parent whose tree this clone
+        // cannot tell (BUG-1573).
+        let mut blind: HashSet<ObjectId> = HashSet::new();
         for id in &order {
             let c = &local[id];
             let mut paths: Option<Vec<VPath>> = Some(Vec::new());
@@ -937,7 +940,16 @@ impl<'r> Transaction<'r> {
             let paths = match paths {
                 Some(p) => p,
                 None => {
-                    refused.insert(*id, VPath::root());
+                    // What its parent held cannot be told (a server
+                    // snapshot whose tree was never fetched, refused now).
+                    // A change whose tree is its sole parent's edits
+                    // nothing, inside a folder its person lost or
+                    // anywhere: it moves, onto exactly what its new parent
+                    // holds (BUG-1573). Any other stays.
+                    match c.parents.as_slice() {
+                        [p] if self.repo.snapshot(p)?.tree == c.tree => blind.insert(*id),
+                        _ => refused.insert(*id, VPath::root()).is_none(),
+                    };
                     lost.insert(*id, None);
                     continue;
                 }
@@ -986,7 +998,12 @@ impl<'r> Transaction<'r> {
             if parents == s.parents {
                 continue;
             }
-            let merged = self.repo.rebase_tree(&s.parents, &parents, s.tree)?;
+            let merged = match blind.contains(id) {
+                // It edits nothing: its new parent's tree, with no read of
+                // the old one.
+                true => crate::merge::MergeOutcome { tree: self.repo.snapshot(&parents[0])?.tree, conflicts: Vec::new(), renames: Vec::new() },
+                false => self.repo.rebase_tree(&s.parents, &parents, s.tree)?,
+            };
             let mut conflicts: BTreeSet<String> = s.conflicts.iter().cloned().collect();
             conflicts.extend(merged.conflicts.iter().map(|c| c.to_string()));
             let mut ns = (**s).clone();
@@ -2093,7 +2110,7 @@ pub struct KeptChange {
 /// below (a folder the server refuses is not walked,
 /// `tree::diff_trees_hiding`). `None` when `old`'s root is refused (the
 /// clone cannot tell).
-fn lost_paths(store: &crate::store::ObjectStore, old: &ObjectId, new: &ObjectId) -> Result<Option<Vec<VPath>>> {
+pub(crate) fn lost_paths(store: &crate::store::ObjectStore, old: &ObjectId, new: &ObjectId) -> Result<Option<Vec<VPath>>> {
     let (changes, hidden) = crate::tree::diff_trees_hiding(store, Some(old), Some(new))?;
     if hidden.iter().any(|h| h.path.is_root()) {
         return Ok(None);
