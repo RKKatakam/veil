@@ -947,6 +947,8 @@ fn a_sealed_file_moved_to_a_public_path_stays_sealed() {
     d.write("secrets/.env.db", "password: moved-secret-42\n");
     let first = repo.snapshot_workspace(WS, &d.fs).unwrap().snapshot;
     assert_eq!(file_entry(&repo, &first, "secrets/.env.db").unwrap().visibility, team());
+    let (committed, _) = repo.commit_working_copy(WS, "add secret").unwrap();
+    assert_eq!(file_entry(&repo, &committed, "secrets/.env.db").unwrap().visibility, team());
     std::fs::create_dir_all(d.root.join("docs")).unwrap();
     std::fs::rename(d.root.join("secrets/.env.db"), d.root.join("docs/db.yml")).unwrap();
     let s = repo.snapshot_workspace(WS, &d.fs).unwrap();

@@ -1165,7 +1165,7 @@ impl<'a> Builder<'a> {
                         Ok(plain) => {
                             map.entry((e.kind, Object::blob_id(&plain))).or_insert_with(|| e.visibility.clone());
                         }
-                        Err(err) if err.is_unreadable() || err.is_not_found() => {}
+                        Err(VeilError::Redacted { .. }) => {}
                         Err(err) => return Err(err),
                     }
                 }
@@ -1271,19 +1271,7 @@ impl<'a> Builder<'a> {
             .collect();
         let mut tree = id;
         if !deleted.is_empty() && !added.is_empty() {
-            let mut sealed_as: HashMap<(EntryKind, ObjectId), Visibility> = HashMap::new();
-            for d in &deleted {
-                if verify_sealing(self.store, d)? != Sealing::Verified {
-                    continue;
-                }
-                match self.store.read_blob(&d.id) {
-                    Ok(plain) => {
-                        sealed_as.entry((d.kind, Object::blob_id(&plain))).or_insert_with(|| d.visibility.clone());
-                    }
-                    Err(e) if e.is_unreadable() || e.is_not_found() => {}
-                    Err(e) => return Err(e),
-                }
-            }
+            let sealed_as = self.ensure_deleted_secrets()?.clone();
             for (path, e) in added {
                 let Some(vis) = sealed_as.get(&(e.kind, e.id)) else { continue };
                 let class = match e.kind {
@@ -2255,7 +2243,8 @@ impl<'a> Builder<'a> {
         let move_candidate = desired.is_public()
             && class.tier == Tier::Public
             && class.rule.is_none()
-            && self.absent_in_move_base(path, parent_file)?;
+            && self.absent_in_move_base(path, parent_file)?
+            && self.has_deleted_secrets()?;
 
         // Fast path: overlay/tree-view says the file is byte-identical.
         if !move_candidate {
@@ -2285,7 +2274,7 @@ impl<'a> Builder<'a> {
         // With injected secrets every changed file must be read and checked.
         // A link's target is read in one call, cheaper than a cache lookup
         // is worth: never cached.
-        let cacheable = self.opts.injected.is_none() && kind == EntryKind::File && !(move_candidate && self.has_deleted_secrets()?);
+        let cacheable = self.opts.injected.is_none() && kind == EntryKind::File && !move_candidate;
         let meta = meta.filter(|_| kind == EntryKind::File);
         if let (Some(m), true) = (&meta, cacheable) {
             if let Some(e) = self.cached_entry(path, name, m, &desired, class.allow_secrets, parent_file)? {
@@ -2388,12 +2377,16 @@ impl<'a> Builder<'a> {
 
         let mut scanned_clean = false;
         if desired.is_public() {
-            if !move_candidate {
-                if let Some(pe) = parent_file {
-                    if !self.policy_changed && !self.rescan && pe.id == content && pe.visibility.is_public() && pe.executable == executable {
-                        self.learn(path, meta.as_ref(), content, scanned_clean, None);
-                        return Ok(Some(pe.clone())); // unchanged; scanned before
-                    }
+            if let Some(pe) = parent_file {
+                if !self.policy_changed
+                    && !self.rescan
+                    && pe.id == content
+                    && pe.visibility.is_public()
+                    && pe.executable == executable
+                    && !(move_candidate && self.moved_secret_for(kind, &content)?.is_some())
+                {
+                    self.learn(path, meta.as_ref(), content, scanned_clean, None);
+                    return Ok(Some(pe.clone())); // unchanged; scanned before
                 }
             }
             if !class.allow_secrets {
