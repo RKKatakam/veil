@@ -146,3 +146,45 @@ fn bug_1841_an_injected_secret_never_enters_history_through_a_description_set_in
         text(&o)
     );
 }
+
+/// `9-confinement.md`, "Threat review": the command "can change only its
+/// sandbox, and read only the sandbox, the computer's public tools, the
+/// allow-list and what it is given (environment, injected secrets)". The
+/// guide: "`--only` gives the sandbox just the paths you name … plus
+/// `.veilpolicy`"; `docs/VISIBILITY.md`: an agent sees "exactly what the
+/// person running it can see, or less if it's given less".
+///
+/// A sparse sandbox (`--only src`) holds neither `docs/` nor the sealed
+/// `.env`. Through the workspace socket, the command must not read them
+/// either (the `vl` outside opens them, decrypted, on its behalf).
+#[test]
+#[ignore = "BUG-1844: a sparse (--only) sandbox reads the rest of the workspace, sealed secrets in plain text included, through the workspace socket"]
+fn bug_1844_a_sparse_sandbox_reads_only_its_paths_through_the_workspace_socket() {
+    const SECRET: &str = "Zk29vLq8sPzQw7LmTr4Bn6Yc";
+    const DOC: &str = "DOCS-ONLY-MARKER-7f3a91c2";
+    let t = T::new(&[
+        ("src/lib.rs", "pub fn f() {}\n"),
+        ("docs/d.md", &format!("{DOC}\n")),
+        (".env", &format!("K={SECRET}\n")),
+    ]);
+    let o = t.exec(
+        &["--only", "src", "-m", "sparse run"],
+        r#"test -e src/lib.rs || exit 8
+           test ! -e docs && test ! -e .env || exit 9
+           vl status >/dev/null || exit 7
+           vl blame src/lib.rs >/dev/null || exit 6
+           vl blame .env; vl blame docs/d.md
+           vl diff --from root --to @
+           vl show main
+           exit 0"#,
+    );
+    // The sandbox is sparse, the socket answers, and the command's own
+    // paths are readable through it.
+    assert!(o.status.success(), "{}", text(&o));
+    let seen = text(&o);
+    assert!(
+        !seen.contains(SECRET),
+        "a sandbox given only src/ read the sealed .env, decrypted, through the workspace socket:\n{seen}"
+    );
+    assert!(!seen.contains(DOC), "a sandbox given only src/ read docs/d.md through the workspace socket:\n{seen}");
+}
