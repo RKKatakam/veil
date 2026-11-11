@@ -847,21 +847,239 @@ fn bisect_run_aborts_cleanly() {
     assert!(out.contains("No bisection in progress"));
 }
 
-/// Concurrency: two verdicts at once leave a valid state (the repository
-/// lock serialises them, and the state file is replaced atomically).
+/// `.veil/local/bisect.json`.
+fn bisect_state(dir: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(dir.join(".veil/local/bisect.json")).unwrap()).unwrap()
+}
+
+/// The verdicts in a bisection's log, in order: the action, the snapshot
+/// marked and `bisect run`'s exit code.
+fn bisect_verdicts(state: &Value) -> Vec<(String, String, Option<i64>)> {
+    let line = |l: &Value| (l["action"].as_str().unwrap().to_string(), l["snapshot"].as_str().unwrap().to_string(), l["code"].as_i64());
+    state["log"].as_array().unwrap().iter().map(line).filter(|l| ["good", "bad", "skip"].contains(&l.0.as_str())).collect()
+}
+
+/// What a verdict with no snapshot is told when no candidate is being
+/// tested.
+const NOTHING_TESTED: &str = "error: no candidate is being tested: give the snapshot to mark";
+
+/// When only skipped snapshots are left the bisection is over, and a
+/// verdict that names no snapshot is refused: nothing is being tested.
+/// (It is what a verdict gets that was given at once with the last one,
+/// BUG-1914.)
+#[test]
+fn a_bisect_verdict_with_nothing_being_tested_is_refused() {
+    let env = Env::new();
+    let (dir, changes) = bisect_project(&env);
+    env.ok("alice", &dir, &["bisect", "start", "--bad", &changes[11], "--good", &changes[9]]);
+    let out = env.ok("alice", &dir, &["bisect", "skip"]);
+    assert!(out.contains("Only skipped snapshots are left"), "{out}");
+    let ended = bisect_state(&dir);
+    assert!(ended["current"].is_null(), "{ended:#}");
+    let out = env.vl("alice", &dir, &["bisect", "good"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), NOTHING_TESTED);
+    assert_eq!(bisect_state(&dir), ended, "a refused verdict writes nothing");
+    env.ok("alice", &dir, &["bisect", "reset"]);
+}
+
+/// Concurrency (BUG-1914): verdicts given at once are taken one at a
+/// time, each reading the state the one before wrote (the directory's
+/// lock; the state file is replaced atomically). So every verdict that
+/// succeeded is in the log, on a candidate of its own, and the working
+/// copy ends on the candidate the state names.
+///
+/// Two `good`s and a `skip` can end this bisection (only a skipped
+/// snapshot is left), and the fourth verdict is then refused, rightly:
+/// nothing is being tested. That is the only refusal there is.
 #[test]
 fn concurrent_bisect_commands_keep_the_state_valid() {
     let env = Env::new();
     let (dir, changes) = bisect_project(&env);
     env.ok("alice", &dir, &["bisect", "start", "--bad", &changes[11], "--good", &changes[0]]);
-    let kids: Vec<Child> = (0..4).map(|i| env.spawn("alice", &dir, &["bisect", if i % 2 == 0 { "good" } else { "skip" }, "--discard"])).collect();
-    for k in kids {
-        let out = k.wait_with_output().unwrap();
-        assert!(out.status.success(), "{}", text(&out));
+    let asked = ["good", "skip", "good", "skip"];
+    let kids: Vec<Child> = asked.iter().map(|v| env.spawn("alice", &dir, &["bisect", v, "--discard"])).collect();
+    let outs: Vec<Output> = kids.into_iter().map(|k| k.wait_with_output().unwrap()).collect();
+    let refused: Vec<&Output> = outs.iter().filter(|o| !o.status.success()).collect();
+    for o in &refused {
+        assert_eq!(String::from_utf8_lossy(&o.stderr).trim(), NOTHING_TESTED, "{}", text(o));
     }
-    let s: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(".veil/local/bisect.json")).unwrap()).unwrap();
+    // A bisection of 11 snapshots takes three verdicts to end.
+    assert!(refused.len() <= 1, "{:?}", outs.iter().map(text).collect::<Vec<_>>());
+    let s = bisect_state(&dir);
     assert_eq!(s["version"], 1);
+    // No verdict was written over another's: each that succeeded is there.
+    let marked = bisect_verdicts(&s);
+    for v in ["good", "skip"] {
+        let succeeded = asked.iter().zip(&outs).filter(|(a, o)| **a == v && o.status.success()).count();
+        assert_eq!(marked.iter().filter(|m| m.0 == v).count(), succeeded, "{v}: {s:#}");
+    }
+    // Each on the candidate the one before it checked out.
+    let mut snapshots: Vec<&str> = marked.iter().map(|m| m.1.as_str()).collect();
+    snapshots.sort_unstable();
+    snapshots.dedup();
+    assert_eq!(snapshots.len(), marked.len(), "{s:#}");
+    match s["current"].as_str() {
+        // Still bisecting: the candidate being tested is the one checked out.
+        Some(current) => {
+            assert!(refused.is_empty(), "refused while {current} was being tested: {s:#}");
+            assert!(!snapshots.contains(&current), "{s:#}");
+            let testing = change(&env, "alice", &dir, current);
+            assert_eq!(change(&env, "alice", &dir, "@-"), testing);
+            let i = changes.iter().position(|c| *c == testing).expect("a change of the project");
+            assert_eq!(std::fs::read_to_string(dir.join("bug.txt")).unwrap(), format!("{} {i}\n", if i >= 8 { "bad" } else { "fine" }));
+        }
+        // Ended (only then is a verdict refused): by the third or the fourth.
+        None => assert!(marked.len() >= 3, "{s:#}"),
+    }
     env.ok("alice", &dir, &["bisect", "log"]);
+    env.ok("alice", &dir, &["bisect", "reset"]);
+}
+
+/// A `vl bisect run` whose command has started on the first candidate and
+/// waits there, between the run's read of the state and its write, until
+/// the file returned exists.
+fn paused_bisect_run(env: &Env, dir: &Path) -> (Child, PathBuf) {
+    let (started, go) = (env.root.join("run-started"), env.root.join("run-go"));
+    let body = format!("touch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\ngrep -q fine bug.txt", started.display(), go.display());
+    let test = script(&env.root, "paused.sh", &body);
+    let run = env.spawn("alice", dir, &["bisect", "run", "--", &test]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    while !started.exists() {
+        assert!(std::time::Instant::now() < deadline, "`vl bisect run` never ran its command");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (run, go)
+}
+
+const RUN_OVERTAKEN: &str = "the bisection changed while `vl bisect run` was running";
+
+/// BUG-1914: `vl bisect reset` while `vl bisect run`'s command runs ends
+/// the bisection; the run, which read the state before, does not write it
+/// back.
+#[test]
+fn bug_1914_bisect_run_does_not_bring_back_a_bisection_reset_meanwhile() {
+    let env = Env::new();
+    let (dir, changes) = bisect_project(&env);
+    env.ok("alice", &dir, &["bisect", "start", "--bad", &changes[11], "--good", &changes[0]]);
+    let (run, go) = paused_bisect_run(&env, &dir);
+    let out = env.ok("alice", &dir, &["bisect", "reset"]);
+    assert!(out.contains("Bisection ended"), "{out}");
+    std::fs::write(&go, "").unwrap();
+    let out = run.wait_with_output().unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(RUN_OVERTAKEN), "{}", text(&out));
+    assert!(!dir.join(".veil/local/bisect.json").exists(), "the run wrote the state back");
+    let out = env.ok("alice", &dir, &["bisect", "reset"]);
+    assert!(out.contains("No bisection in progress"), "{out}");
+}
+
+/// BUG-1914: a verdict marked by hand while `vl bisect run`'s command runs
+/// stays: the run stops without writing over it, and the next run goes on
+/// from it.
+#[test]
+fn bug_1914_bisect_run_keeps_a_verdict_marked_meanwhile() {
+    let env = Env::new();
+    let (dir, changes) = bisect_project(&env);
+    env.ok("alice", &dir, &["bisect", "start", "--bad", &changes[11], "--good", &changes[0]]);
+    let (run, go) = paused_bisect_run(&env, &dir);
+    env.ok("alice", &dir, &["bisect", "good", &changes[2], "--discard"]);
+    std::fs::write(&go, "").unwrap();
+    let out = run.wait_with_output().unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(RUN_OVERTAKEN), "{}", text(&out));
+    // The verdict by hand, and nothing of the run's.
+    let marked = bisect_verdicts(&bisect_state(&dir));
+    assert_eq!(marked.len(), 1, "{marked:?}");
+    assert_eq!((marked[0].0.as_str(), marked[0].2), ("good", None));
+    assert_eq!(change(&env, "alice", &dir, &marked[0].1), changes[2]);
+    // The next run goes on from it, to the end.
+    let out = env.ok("alice", &dir, &["bisect", "run", "--", &script(&env.root, "test.sh", "grep -q fine bug.txt")]);
+    assert!(out.contains("The first bad snapshot is"), "{out}");
+    let s = bisect_state(&dir);
+    assert_eq!(change(&env, "alice", &dir, s["found"].as_str().expect("found")), changes[8]);
+    let marked = bisect_verdicts(&s);
+    assert_eq!((marked[0].0.as_str(), marked[0].2), ("good", None), "{marked:?}");
+    assert_eq!(change(&env, "alice", &dir, &marked[0].1), changes[2]);
+    env.ok("alice", &dir, &["bisect", "reset"]);
+}
+
+/// A pipe filled to the brim: a process that writes to it waits until it
+/// is read. Returns how much filling it holds.
+fn full_pipe() -> (std::io::PipeReader, std::io::PipeWriter, usize) {
+    use std::os::fd::AsRawFd;
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let fd = writer.as_raw_fd();
+    // SAFETY: the status flags of a descriptor this function owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0);
+    let mut filled = 0;
+    for chunk in [4096, 1] {
+        loop {
+            match writer.write(&vec![b'.'; chunk]) {
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("filling a pipe: {e}"),
+            }
+        }
+    }
+    // The flags are the pipe's, not the descriptor's: the writer blocks again.
+    assert!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } == 0);
+    (reader, writer, filled)
+}
+
+/// Does a process hold the lock of the project directory `dir` (attached
+/// to workspace `default`)?
+fn directory_lock_held(dir: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let lock = std::fs::File::open(dir.join(".veil/local/wc/ws-default.lock")).unwrap();
+    // SAFETY: a descriptor this function owns; closing it gives the lock back.
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+}
+
+/// BUG-1914: a verdict holds the directory's lock from before it reads
+/// the state until it has written it, so a second one waits for that
+/// write and marks the candidate the first one checked out. The first is
+/// stopped in between: it prints the next candidate after it read the
+/// state and before it writes it, and its stdout is a full pipe.
+#[test]
+fn bug_1914_a_bisect_verdict_holds_the_lock_from_its_read_of_the_state_to_its_write() {
+    use std::io::Read as _;
+    let env = Env::new();
+    let (dir, changes) = bisect_project(&env);
+    env.ok("alice", &dir, &["bisect", "start", "--bad", &changes[11], "--good", &changes[0]]);
+    let before = bisect_state(&dir);
+    let (mut reader, writer, filled) = full_pipe();
+    let one = env.cmd("alice", &dir, &["bisect", "skip", "--discard"]).stdout(writer).stderr(Stdio::piped()).spawn().unwrap();
+    // It stops there with the lock in hand (seen held for half a second:
+    // a command that takes it only to record the directory gives it back).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut held = 0;
+    while held < 50 {
+        assert!(std::time::Instant::now() < deadline, "a verdict that has read the state does not hold the directory's lock");
+        held = if directory_lock_held(&dir) { held + 1 } else { 0 };
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let two = env.spawn("alice", &dir, &["bisect", "skip", "--discard"]);
+    assert_eq!(bisect_state(&dir), before, "nothing is written while the first verdict holds the lock");
+    // Let the first one go on.
+    let mut printed = Vec::new();
+    reader.read_to_end(&mut printed).unwrap();
+    let out = one.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(String::from_utf8_lossy(&printed[filled..]).contains("Testing "), "{}", String::from_utf8_lossy(&printed[filled..]));
+    let out = two.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    // Both verdicts are in the log, the second on the first one's candidate.
+    let s = bisect_state(&dir);
+    let marked = bisect_verdicts(&s);
+    assert_eq!(marked.len(), 2, "{s:#}");
+    assert!(marked.iter().all(|m| m.0 == "skip"), "{s:#}");
+    assert_eq!(Some(marked[0].1.as_str()), before["current"].as_str());
+    assert_ne!(marked[1].1, marked[0].1);
+    let current = s["current"].as_str().expect("still bisecting");
+    assert!(marked.iter().all(|m| m.1 != current), "{s:#}");
+    assert_eq!(change(&env, "alice", &dir, "@-"), change(&env, "alice", &dir, current));
     env.ok("alice", &dir, &["bisect", "reset"]);
 }
 
