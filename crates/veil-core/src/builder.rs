@@ -1124,12 +1124,17 @@ impl<'a> Builder<'a> {
     /// computed at most once so moved secrets are classified and sealed before
     /// storing (BUG-1832).
     fn ensure_deleted_secrets(&mut self) -> Result<&HashMap<(EntryKind, ObjectId), Visibility>> {
-        if self.deleted_secrets.is_some() {
-            return Ok(self.deleted_secrets.as_ref().expect("set"));
-        }
+        let map = match self.deleted_secrets {
+            Some(ref map) => return Ok(map),
+            None => self.compute_deleted_secrets()?,
+        };
+        Ok(self.deleted_secrets.insert(map))
+    }
+
+    fn compute_deleted_secrets(&self) -> Result<HashMap<(EntryKind, ObjectId), Visibility>> {
         let mut map: HashMap<(EntryKind, ObjectId), Visibility> = HashMap::new();
         let Some(root_id) = self.opts.base_tree.or(self.opts.parent_tree) else {
-            return Ok(self.deleted_secrets.insert(map));
+            return Ok(map);
         };
         let same_as_parent = self.opts.base_tree.is_none() || self.opts.base_tree == self.opts.parent_tree;
         let mut stack = vec![(VPath::root(), root_id, 0usize)];
@@ -1166,7 +1171,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        Ok(self.deleted_secrets.insert(map))
+        Ok(map)
     }
 
     fn is_secret_deleted(&self, path: &VPath, e: &TreeEntry) -> Result<bool> {
