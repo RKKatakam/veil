@@ -514,7 +514,7 @@ pub async fn reconcile_branch(hub: &Arc<Hub>, project: &Project, branch: &str) -
     let Some((holder, epoch)) = acquire_lease(hub, project.id, branch).await? else {
         return Ok(());
     };
-    let res: Result<()> = async {
+    let step = || async {
         let Some(mut b) = load_bisect(hub, project.id, branch).await? else {
             return Ok(());
         };
@@ -539,8 +539,17 @@ pub async fn reconcile_branch(hub: &Arc<Hub>, project: &Project, branch: &str) -
             .and_then(|(_, t, _)| ObjectId::from_hex(t).ok());
         let rules = sync::blocking(hub, project.id, move |src| crate::landing::rules(src, default_tip)).await?;
         drive_bisect(hub, project, &rules, &mut b, true, &holder, epoch).await
+    };
+    // Again from its reads when garbage collection switched meanwhile
+    // (BUG-1881's guard, BUG-1899), as a report's own step is.
+    let mut res: Result<()> = Ok(());
+    for _ in 0..8 {
+        res = step().await;
+        match &res {
+            Err(e) if crate::pack_gc::is_gc_epoch_changed(e) => continue,
+            _ => break,
+        }
     }
-    .await;
     release_lease(hub, project.id, branch, &holder, epoch).await;
     res
 }
@@ -636,6 +645,49 @@ async fn step_branch(
         );
         return Ok(());
     };
+    let res = step_branch_retrying(
+        hub,
+        project,
+        rules,
+        branch,
+        branch_tip,
+        lineage,
+        reported_snap,
+        check_name,
+        state,
+        session_paths,
+        admin_only,
+        recorded_at,
+        &holder,
+        epoch,
+    )
+    .await;
+    release_lease(hub, project.id, branch, &holder, epoch).await;
+    res
+}
+
+/// [`step_branch_leased`], run again from its reads when garbage collection
+/// switched the project's packs before the step wrote (BUG-1881's guard on
+/// `save_bisect`): by the report's own request, and by the step that runs
+/// once a held lease comes free (BUG-1899: that one ran once, so a switch
+/// at that moment left the result uncounted and the bisect waiting for it).
+#[allow(clippy::too_many_arguments)]
+async fn step_branch_retrying(
+    hub: &Arc<Hub>,
+    project: &Project,
+    rules: &Rules,
+    branch: &str,
+    branch_tip: ObjectId,
+    lineage: i64,
+    reported_snap: ObjectId,
+    check_name: &str,
+    state: CheckState,
+    session_paths: &[String],
+    admin_only: bool,
+    recorded_at: i64,
+    holder: &str,
+    epoch: i64,
+) -> Result<()> {
     let mut res = Ok(());
     for _ in 0..8 {
         res = step_branch_leased(
@@ -651,7 +703,7 @@ async fn step_branch(
             session_paths,
             admin_only,
             recorded_at,
-            &holder,
+            holder,
             epoch,
         )
         .await;
@@ -660,7 +712,6 @@ async fn step_branch(
             _ => break,
         }
     }
-    release_lease(hub, project.id, branch, &holder, epoch).await;
     res
 }
 
@@ -724,7 +775,7 @@ fn spawn_step_after_lease(
             if !is_required || !rules.allows_auto_revert(&branch) {
                 return Ok(());
             }
-            step_branch_leased(
+            step_branch_retrying(
                 &hub,
                 &project,
                 &rules,

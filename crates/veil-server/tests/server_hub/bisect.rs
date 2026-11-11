@@ -42,6 +42,27 @@ fn get_bisect(hub: &TestHub, token: Option<&str>, project: &str, branch: &str) -
     hub.api().get(token, &format!("/v1/projects/{project}/bisect/{branch}"))
 }
 
+/// The bisect status of `branch` once it is in `phase`, asked until then
+/// (at most 30 s; the last answer if it never is, for the caller's
+/// assertion). A result posted while another step holds the branch's bisect
+/// lease (a concurrent report, another server) is answered `200` at once
+/// and counted when the lease comes free, and the status route counts
+/// nothing while the lease is held (`docs/HUB.md` §13.36, "When a result
+/// counts"): after racing reports, the phase is reached a moment after the
+/// last answer.
+fn bisect_in_phase(hub: &TestHub, token: &str, project: &str, branch: &str, phase: &str) -> Value {
+    let began = std::time::Instant::now();
+    loop {
+        let r = get_bisect(hub, Some(token), project, branch);
+        assert_eq!(r.status, 200, "{}", body(&r));
+        let st = r.json();
+        if st["phase"] == phase || began.elapsed() > Duration::from_secs(30) {
+            return st;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn change(hub: &TestHub, token: &str, project: &str, req: &Value) -> Reply {
     hub.api().post_json(Some(token), &format!("/v1/projects/{project}/changes"), req)
 }
@@ -923,8 +944,10 @@ fn bisect_and_revert_are_bounded_and_safe_across_two_servers_and_restarts() {
     post_check(&hub2, Some(&admin_tok), &p.name, &json!({"snapshot": snaps[1].hex(), "name": "ci/src", "state": "fail"}));
     post_check(&hub1, Some(&admin_tok), &p.name, &json!({"snapshot": snaps[0].hex(), "name": "ci/src", "state": "pass"}));
 
-    // Now bisect is in `confirming` for culprit `snaps[1]`!
-    let st_mid = get_bisect(&hub2, Some(&admin_tok), &p.name, "main").json();
+    // Now bisect is in `confirming` for culprit `snaps[1]`: both results
+    // are counted, the two that found the lease held (by the step of one of
+    // the racing reports above, or by each other's) once it came free.
+    let st_mid = bisect_in_phase(&hub2, &admin_tok, &p.name, "main", "confirming");
     assert_eq!(st_mid["phase"], "confirming", "{st_mid}");
     assert_eq!(st_mid["culprit"], snaps[1].hex(), "{st_mid}");
 
@@ -962,14 +985,7 @@ fn bisect_and_revert_are_bounded_and_safe_across_two_servers_and_restarts() {
     });
 
     // Wait for the revert to finish landing.
-    let mut st_end = get_bisect(&hub1, Some(&admin_tok), &p.name, "main").json();
-    for _ in 0..20 {
-        if st_end["phase"] == "reverted" {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        st_end = get_bisect(&hub1, Some(&admin_tok), &p.name, "main").json();
-    }
+    let st_end = bisect_in_phase(&hub1, &admin_tok, &p.name, "main", "reverted");
     assert_eq!(st_end["phase"], "reverted", "{st_end}");
     assert_eq!(st_end["culprit"], snaps[1].hex(), "{st_end}");
 
@@ -993,4 +1009,91 @@ fn bisect_and_revert_are_bounded_and_safe_across_two_servers_and_restarts() {
         .filter(|c| c["description"].as_str() == Some(revert_desc.as_str()))
         .count();
     assert_eq!(revert_count_after, 1);
+}
+
+/// BUG-1899: a result posted while the branch's bisect lease is held is
+/// counted by a step that runs once the lease comes free (BUG-1862). That
+/// step ran once: when garbage collection switched the project's packs
+/// between its reads and its write (BUG-1881's guard refuses the write, for
+/// the step to run again), it gave up, and the bisect went on waiting for a
+/// result it has, until something else touched it. Here the switch is held
+/// at exactly that moment (the guard's lock taken, then the epoch moved),
+/// and nothing but the stored bisect is read afterwards (the status route
+/// counts stored results itself, which would hide it).
+#[test]
+fn bug_1899_a_result_counted_after_the_lease_is_counted_across_a_gc_switch() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+    let s0 = set_rules(
+        &hub,
+        &p,
+        "[branches.main]\nprotected = true\nrequired_checks = [\"ci/src\"]\n\n[checks.\"ci/src\"]\npaths = [\"src/\"]\n",
+    );
+    assert_eq!(post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": s0.hex(), "name": "ci/src", "state": "pass"})).status, 200);
+    let snaps: Vec<ObjectId> = (0..4)
+        .map(|i| land_edit(&hub, &p, &dev_tok, &format!("src/b1899_{i}.rs"), &format!("pub const V: usize = {i};\n"), &format!("b1899 commit {i}")).0)
+        .collect();
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let probes = || -> Vec<String> {
+        let json: String = hub
+            .rt
+            .block_on(sqlx::query_scalar("SELECT probes FROM bisects WHERE project_id = $1 AND branch = 'main'").bind(pid).fetch_one(&h.db))
+            .unwrap();
+        serde_json::from_str(&json).unwrap()
+    };
+
+    // A failure at the tip starts the bisect: it asks for the second landing.
+    assert_eq!(post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": snaps[3].hex(), "name": "ci/src", "state": "fail"})).status, 200);
+    assert_eq!(probes(), vec![snaps[1].hex()]);
+
+    // Another holder has the lease while that probe's result is posted: it
+    // is stored, answered, and left to the step that follows the lease.
+    hub.rt.block_on(async {
+        veil_server::pack_gc::read_gc_epoch(&h, pid).await.unwrap();
+        sqlx::query(
+            "INSERT INTO bisect_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, 'main', 'held-by-other', 1, $2) \
+             ON CONFLICT (project_id, branch) DO UPDATE SET holder = 'held-by-other', epoch = bisect_leases.epoch + 1, expires_at = $2",
+        )
+        .bind(pid)
+        .bind(veil_core::now_millis() + 60_000)
+        .execute(&h.db)
+        .await
+        .unwrap();
+    });
+    assert_eq!(post_check(&hub, Some(&admin_tok), &p.name, &json!({"snapshot": snaps[1].hex(), "name": "ci/src", "state": "fail"})).status, 200);
+    assert_eq!(probes(), vec![snaps[1].hex()], "nothing is counted while the lease is held");
+
+    // A garbage collection switch: its lock first (the guard of every write
+    // of a root waits behind it), then the lease comes free, the step takes
+    // it, reads, and waits at its write; then the epoch moves.
+    hub.rt.block_on(async {
+        let mut tx = h.db.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(0x7665_696c_6763_6774_i64 ^ pid).execute(&mut *tx).await.unwrap();
+        sqlx::query("UPDATE bisect_leases SET expires_at = 0 WHERE project_id = $1 AND branch = 'main'").bind(pid).execute(&h.db).await.unwrap();
+        let began = std::time::Instant::now();
+        loop {
+            let holder: String =
+                sqlx::query_scalar("SELECT holder FROM bisect_leases WHERE project_id = $1 AND branch = 'main'").bind(pid).fetch_one(&h.db).await.unwrap();
+            if holder != "held-by-other" {
+                break;
+            }
+            assert!(began.elapsed() < Duration::from_secs(5), "the step that follows the lease never took it");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let moved = sqlx::query("UPDATE access_epochs SET epoch = epoch + 1 WHERE project_id = $1 AND person_id = -1").bind(pid).execute(&mut *tx).await.unwrap();
+        assert_eq!(moved.rows_affected(), 1);
+        tx.commit().await.unwrap();
+    });
+
+    // The result is counted all the same: the second landing fails, so the
+    // bisect asks for the first.
+    let began = std::time::Instant::now();
+    while probes() != vec![snaps[0].hex()] && began.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(probes(), vec![snaps[0].hex()], "the result posted while the lease was held was never counted");
 }
