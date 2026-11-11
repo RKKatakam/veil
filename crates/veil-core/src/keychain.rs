@@ -2150,6 +2150,26 @@ impl Keychain {
         self.remove_staged(id)
     }
 
+    /// The server holds the release of embargo `id` that this repository
+    /// pushed, until it is approved (BUG-1861): the embargo is not released,
+    /// so its record is unreleased again and says why, as the server's own
+    /// record does (BUG-1894). Whether a release was recorded here.
+    pub fn hold_release(&self, id: &str, why: &str) -> Result<bool> {
+        let _lock = self.lock_meta()?;
+        if Self::embargo_path(id).is_err() {
+            return Ok(false);
+        }
+        let Some(mut rec) = self.load_embargo(id)? else { return Ok(false) };
+        if rec.released_at.is_none() {
+            return Ok(false);
+        }
+        rec.released_at = None;
+        rec.state = Some("waiting_for_approval".to_string());
+        rec.reason = Some(why.to_string());
+        self.save_embargo(&rec)?;
+        Ok(true)
+    }
+
     fn staged_path(id: &str) -> Result<VPath> {
         Self::embargo_path(id)?;
         VPath::new(&format!("{STAGED_RELEASES}/{id}.json"))

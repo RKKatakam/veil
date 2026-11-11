@@ -96,6 +96,14 @@ Released embargo 77932133a2 in this repository. Your next push publishes it; unt
 In a script, pass `--yes` (without it, a release from a non-terminal is
 refused).
 
+**Onto a protected branch, a release needs the approvals any landing
+needs.** Without them the push succeeds and warns that the embargo "is not
+released: it waits for approval", and nothing turns public. `vl embargo
+list` then shows `waiting_for_approval` and what is missing. Open a pull
+request of the embargo's line (`embargo/ID`) for its group to approve: the
+server releases the embargo as soon as it is approved, with nothing more to
+run, and your next `vl pull` shows it as released.
+
 **Released by mistake?** Until your next push, the release exists only in
 your repository. `vl undo` right after it takes it back completely:
 

@@ -1402,7 +1402,7 @@ async fn release_one_once(
                 Error::new(
                     axum::http::StatusCode::CONFLICT,
                     "not_ready",
-                    format!("embargo {embargo_id} is not released: it waits for approval, and releases once it is approved ({message})"),
+                    veil_core::embargo::held_release_warning(embargo_id, message),
                 )
             };
             match crate::prs::check_landing_review_for_embargo(

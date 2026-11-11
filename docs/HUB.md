@@ -5168,7 +5168,8 @@ vl embargo release ID
     the release is **held**: nothing lands, nothing turns public, `released_at` stays `NULL`, the record says
     `waiting_for_approval` with the refusal a direct landing gets, and `until_ms` becomes now (the release was
     asked for: it is due from then on). The route answers `409 not_ready`; a push that carries the release
-    succeeds with a warning. An approval of one of the embargo's PRs (`prs::add_review`), or a dismissal
+    succeeds with a warning, from which `vl` records the hold in the clone that asked (its record is unreleased
+    again, with the server's state and reason, and it keeps the line: BUG-1894). An approval of one of the embargo's PRs (`prs::add_review`), or a dismissal
     (`prs::dismiss`), tries the release again at once, so it lands once approved. The landing is queued through
     `landing::insert` (the submitter's outstanding-landing bounds, §13.32): its submitter is the person
     releasing if they may write every path of it, else the embargo's creator, else the project's first admin.

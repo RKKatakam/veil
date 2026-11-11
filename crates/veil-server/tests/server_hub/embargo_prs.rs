@@ -2275,3 +2275,66 @@ fn bug_1880_a_queued_release_meets_its_embargo_prs_approval_again_in_the_batch()
     assert_eq!(shown.json()["state"], "landed", "{}", body_str(&shown));
     assert!(!api.tips(Some(&sec), &p.name).unwrap().branches.contains_key(&line), "the line is retired by the release");
 }
+
+/// BUG-1894: `vl embargo release` and a push, when the server holds the
+/// release for approval (BUG-1861). The server keeps the embargo unreleased
+/// and says so in the push's warning; the clone that asked recorded its
+/// release before pushing and went on showing the embargo as released. It
+/// now takes the hold from the push's answer: `vl embargo list` says that
+/// the embargo waits for approval and why, as the server's record does,
+/// after a pull too, and says released once the approved release lands.
+#[test]
+fn bug_1894_a_release_the_server_holds_shows_as_held_in_the_clone_that_asked() {
+    let hub = TestHub::start();
+    let (p, rev1) = protected_project(&hub);
+    let api = hub.api();
+    let dev = &p.dev;
+    let dir = dev.dir("held-1894");
+    dev.ok(dev.home.path(), &["clone", &hub.url(&p.name), dir.to_str().unwrap()]);
+    write_files(&dir, &[("src/held_1894.rs", "pub fn held() -> u32 { 1894 }\n")]);
+    dev.ok(&dir, &["commit", "--no-advance", "-m", "a fix nobody approved yet"]);
+    let out = dev.ok(&dir, &["merge", "@-", "--into", "main", "--embargo-for", "devs", "-m", "embargoed fix"]);
+    let eid = out
+        .split_whitespace()
+        .map(|w| w.trim_end_matches(':'))
+        .find(|w| w.len() == 10 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| panic!("no embargo id in {out}"))
+        .to_string();
+    dev.ok(&dir, &["push"]);
+    // What `vl embargo list` says of it.
+    let listed = |when: &str| {
+        let list = dev.ok(&dir, &["embargo", "list"]);
+        let line = list.lines().find(|l| l.contains(&eid)).unwrap_or_else(|| panic!("{when}: {eid} is not in {list}"));
+        line.split_once("scope:devs").unwrap_or_else(|| panic!("{when}: {line}")).1.trim().to_string()
+    };
+    assert_eq!(listed("before the release"), "manual release");
+
+    // dev releases it and pushes: the push succeeds, the server holds the release.
+    dev.ok(&dir, &["embargo", "release", &eid, "--yes"]);
+    let pushed = dev.ok(&dir, &["push"]);
+    assert!(pushed.contains(&format!("embargo {eid} is not released: it waits for approval")), "{pushed}");
+    assert!(released_at(&hub, &eid).is_none(), "the server holds the release");
+    let theirs = api.tips(Some(&dev.token()), &p.name).unwrap();
+    let rec = theirs.embargoes.iter().find(|e| e.id == eid).expect("dev sees the held embargo");
+    assert_eq!(rec.state.as_deref(), Some("waiting_for_approval"), "{rec:?}");
+    let why = rec.reason.clone().expect("the server says why");
+
+    // The clone says what the server's record says, after a pull too.
+    let held = format!("waiting_for_approval: {why}");
+    assert_eq!(listed("after the held release was pushed"), held);
+    dev.ok(&dir, &["pull"]);
+    assert_eq!(listed("after a pull"), held);
+    // Another push does not ask again, and changes nothing.
+    dev.ok(&dir, &["push"]);
+    assert!(released_at(&hub, &eid).is_none());
+    assert_eq!(listed("after another push"), held);
+
+    // Approved, the held release lands, and the clone learns it by pulling.
+    let pr = api.post_json(Some(&dev.token()), &format!("/v1/projects/{}/prs", p.name), &json!({"head": format!("embargo/{eid}"), "title": "the fix"}));
+    assert_eq!(pr.status, 200, "{}", body_str(&pr));
+    let ok = approve(&api, &rev1, &p.name, &pr.json());
+    assert_eq!(ok.status, 200, "{}", body_str(&ok));
+    assert!(released_at(&hub, &eid).is_some(), "an approved, held release lands at once");
+    dev.ok(&dir, &["pull"]);
+    assert_eq!(listed("after the approved release"), "released");
+}

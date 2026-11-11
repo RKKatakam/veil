@@ -1769,6 +1769,15 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             created,
         };
         not_deleted(&mut out.rejected);
+        // A release the server holds for approval is not a release
+        // (BUG-1861): this clone's record says what the server's does, and
+        // the embargo's line stays (BUG-1894).
+        let mut held = Vec::new();
+        for (id, why) in result.warnings.iter().filter_map(|w| veil_core::embargo::held_release(w)) {
+            if repo.keys().hold_release(id, why)? {
+                held.push(id.to_string());
+            }
+        }
         let mut tx = repo.transaction(format!("push to {remote}"))?;
         tx.repository_wide();
         let mut missing = false;
@@ -1826,7 +1835,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         for (name, _) in out.rejected.iter().filter(|(name, _)| deletions.contains(name)) {
             veil_core::remote::clear_tag_deletion(&**tx.repo().backend(), name)?;
         }
-        for id in &newly_released {
+        for id in newly_released.iter().filter(|id| !held.contains(id)) {
             let eb = veil_core::embargo::embargo_branch(id);
             tx.view.remote_tags.remove(&format!("{prefix}{eb}"));
             if tx.view.tags.get(&eb).is_some_and(|t| t.annotation.is_none()) {

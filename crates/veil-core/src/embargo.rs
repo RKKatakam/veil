@@ -354,6 +354,19 @@ pub fn embargo_id_of_branch(branch: &str) -> Option<&str> {
     branch.strip_prefix(EMBARGO_BRANCH_PREFIX).filter(|id| !id.is_empty() && !id.contains('/'))
 }
 
+/// What a push is told of a release the server holds for approval
+/// (BUG-1861): the embargo stays unreleased until it is approved. `vl` reads
+/// it back with [`held_release`] to record the hold (BUG-1894).
+pub fn held_release_warning(id: &str, why: &str) -> String {
+    format!("embargo {id} is not released: it waits for approval, and releases once it is approved ({why})")
+}
+
+/// The embargo and the reason of a [`held_release_warning`].
+pub fn held_release(warning: &str) -> Option<(&str, &str)> {
+    let (id, why) = warning.strip_prefix("embargo ")?.split_once(" is not released: it waits for approval, and releases once it is approved (")?;
+    Some((id, why.strip_suffix(')')?))
+}
+
 /// What [`follow`] did for one embargo.
 #[derive(Debug, Clone)]
 pub struct FollowResult {
