@@ -210,7 +210,6 @@ fn bug_1834_a_sealed_backup_of_a_secret_does_not_block_the_upgrade() {
 /// BLAKE3 of its bytes, like an object, and a file that no longer matches
 /// its name is not read as the repository's state.
 #[test]
-#[ignore = "BUG-1835: an operation file whose bytes do not match its id is read and used; only `vl fsck` notices"]
 fn bug_1835_an_operation_that_does_not_match_its_id_is_refused() {
     let (mut repo, fs, alice) = new_repo("alice");
     let a = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "A");

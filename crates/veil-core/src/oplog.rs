@@ -279,7 +279,15 @@ impl OpStore {
     /// (e.g. pruned by `vl gc --keep-ops-days`).
     pub fn try_get(&self, id: &ObjectId) -> Result<Option<Operation>> {
         match self.backend.read_opt(&Self::op_path(id))? {
-            Some(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+            Some(raw) => {
+                if ObjectId::hash(&raw) != *id {
+                    return Err(VeilError::Corrupt(
+                        format!("operation {}", id.short()),
+                        "content does not match its id".into(),
+                    ));
+                }
+                Ok(Some(serde_json::from_slice(&raw)?))
+            }
             None => Ok(None),
         }
     }
