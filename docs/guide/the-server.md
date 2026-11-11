@@ -113,8 +113,9 @@ Sent 8 object(s) to origin
 
 ## Groups and folder access
 
-Admins create groups, add people, and choose managers; a group's managers
-add and remove other people in it, never themselves:
+Admins create groups, add people, choose managers, and add or remove other
+admins (never the last admin); a group's managers add and remove other people
+in it, never themselves:
 
 ```sh
 vl group create finance
@@ -122,6 +123,8 @@ vl invite alice --to finance       # someone new, or a remote teammate
 vl group add finance bob           # someone whose device is confirmed already
 vl group manager finance carol
 vl group list
+vl admin add dave                  # make dave an admin too (--confirm FINGERPRINT first time)
+vl admin list
 ```
 
 **An invite** is the easy way to bring someone in:

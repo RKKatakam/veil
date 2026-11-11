@@ -97,6 +97,9 @@ pub enum Cmd {
     /// Groups of people on the Veil server (the origin remote's project).
     #[command(subcommand)]
     Group(GroupCmd),
+    /// Admins of the project on the Veil server (the origin remote's project).
+    #[command(subcommand)]
+    Admin(AdminCmd),
     /// Commit through the Veil server's API, without a checkout (scripts,
     /// CI, agents).
     #[command(subcommand)]
@@ -1384,6 +1387,35 @@ pub enum GroupCmd {
     /// Let people manage a group: add and remove its people (admins only).
     Manager {
         group: String,
+        #[arg(required = true)]
+        people: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminCmd {
+    /// List the project's admins.
+    List,
+    /// Make people admins of the project (admins only). An admin device
+    /// also grants them the keys of the project's secrets, on their
+    /// confirmed devices only.
+    ///
+    /// A person's first device must be confirmed by you: `vl` shows
+    /// `confirm alice's device: 4F2A-…`; compare it with what `vl identity
+    /// show` prints on alice's device, then run the command again with
+    /// `--confirm`. Their later devices are confirmed by themselves
+    /// (`vl identity confirm`).
+    Add {
+        #[arg(required = true)]
+        people: Vec<String>,
+        /// A device fingerprint you have checked with its owner (one
+        /// person at a time).
+        #[arg(long, value_name = "FINGERPRINT")]
+        confirm: Vec<String>,
+    },
+    /// Remove people as admins of the project (admins only; never the last
+    /// admin).
+    Remove {
         #[arg(required = true)]
         people: Vec<String>,
     },

@@ -695,6 +695,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Watch { interval_ms } => cmd_watch(ctx, *interval_ms)?,
         Cmd::Remote(c) => cmd_remote(ctx, c)?,
         Cmd::Group(c) => hub_cmd::group(ctx, c)?,
+        Cmd::Admin(c) => hub_cmd::admin(ctx, c)?,
         Cmd::Invite { person, to } => hub_cmd::invite(ctx, person, to)?,
         Cmd::ShareKeys => hub_cmd::share_keys(ctx)?,
         Cmd::Access { path, who } => hub_cmd::access(ctx, path, who)?,

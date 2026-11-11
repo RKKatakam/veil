@@ -467,22 +467,65 @@ fn bug_1855_work_landed_on_top_of_an_embargoed_change_stays_hidden() {
 /// has exactly one admin for ever, and when that person leaves or loses
 /// their devices nobody can change its groups, access or keys.
 #[test]
-#[ignore = "BUG-1856: an admin cannot make anyone else an admin: no route and no command adds one, so a project has its creator as its only admin for ever"]
 fn bug_1856_an_admin_makes_someone_else_an_admin() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let api = hub.api();
     let (admin_tok, dev_tok) = (p.admin.token(), p.dev.token());
     assert!(!api.tips(Some(&dev_tok), &p.name).unwrap().admin, "control: dev is no admin yet");
+    // Cannot remove the sole admin.
+    let last = api.post_json(Some(&admin_tok), &format!("/v1/projects/{}/admins/remove", p.name), &json!({"people": [p.admin.name]}));
+    assert_eq!(last.status, 400, "removing the last admin must be refused: {}", body(&last));
     // The route that mirrors `…/groups/{g}/members`.
     let r = api.post_json(Some(&admin_tok), &format!("/v1/projects/{}/admins", p.name), &json!({"people": [p.dev.name]}));
     assert_eq!(r.status, 200, "an admin cannot add an admin: {} {}", r.status, body(&r));
     assert!(api.tips(Some(&dev_tok), &p.name).unwrap().admin, "dev is an admin from the next request");
     let made = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/groups/ops", p.name), &json!({}));
     assert_eq!(made.status, 200, "the new admin creates a group: {}", body(&made));
-    // Not anyone's to take: someone who is no admin adds none.
+    // Not anyone's to take: someone who is no admin adds or removes none.
     let no = api.post_json(Some(&p.fin.token()), &format!("/v1/projects/{}/admins", p.name), &json!({"people": [p.fin.name]}));
     assert_eq!(no.status, 403, "{}", body(&no));
+    let no_rm = api.post_json(Some(&p.fin.token()), &format!("/v1/projects/{}/admins/remove", p.name), &json!({"people": [p.admin.name]}));
+    assert_eq!(no_rm.status, 403, "{}", body(&no_rm));
+    // Cannot remove both admins at once either.
+    let both = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/admins/remove", p.name),
+        &json!({"people": [p.admin.name, p.dev.name]}),
+    );
+    assert_eq!(both.status, 400, "{}", body(&both));
+    // Removing one admin while another remains works at the very next request.
+    let rm = api.post_json(Some(&admin_tok), &format!("/v1/projects/{}/admins/remove", p.name), &json!({"people": [p.dev.name]}));
+    assert_eq!(rm.status, 200, "{}", body(&rm));
+    assert!(!api.tips(Some(&dev_tok), &p.name).unwrap().admin, "dev is no longer an admin");
+}
+
+#[test]
+fn bug_1856_vl_admin_adds_and_removes_admins_and_never_removes_the_last() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let err = p.admin.fails(&p.dir, &["admin", "remove", &p.admin.name]);
+    assert!(err.contains("at least one admin"), "{err}");
+
+    let out = p.admin.ok(&p.dir, &["admin", "add", &p.dev.name, "--confirm", &p.dev.fingerprint()]);
+    assert!(out.contains(&p.dev.name), "{out}");
+    let listed = p.admin.ok(&p.dir, &["admin", "list"]);
+    assert!(listed.contains(&p.admin.name) && listed.contains(&p.dev.name), "{listed}");
+
+    // The new admin clones, trusts the project's fingerprint, opens secrets, and manages groups.
+    let pfp = p.admin.project_fingerprint(&p.dir);
+    let dclone = p.dev.dir("admin-clone");
+    p.dev.clone_trusting(&hub.url(&p.name), &dclone, &pfp);
+    p.dev.ok(&dclone, &["pull"]);
+    let env = std::fs::read_to_string(dclone.join(format!("{BILL_DIR}/.env"))).unwrap();
+    assert!(env.contains(ENV_MARK), "new admin opened billing/.env: {env}");
+    p.dev.ok(&dclone, &["group", "create", "ops"]);
+
+    // Removing the creator leaves `dev` as sole admin; removing `dev` too is refused.
+    p.dev.ok(&dclone, &["admin", "remove", &p.admin.name]);
+    assert!(!hub.api().tips(Some(&p.admin.token()), &p.name).unwrap().admin);
+    let err = p.dev.fails(&dclone, &["admin", "remove", &p.dev.name]);
+    assert!(err.contains("at least one admin"), "{err}");
 }
 
 fn project_id(hub: &TestHub, name: &str) -> i64 {

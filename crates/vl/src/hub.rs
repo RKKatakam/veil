@@ -30,7 +30,7 @@ use veil_core::{
     crypto::domains::{SIG_CONTEXT_HUB_DEVICE, SIG_CONTEXT_HUB_LOGIN},
     hub::encoding,
     hub::wire::{
-        device_fingerprint, put_frame, vouch_message, AccessInfo, BranchUpdate, Challenge, ChallengeRequest, Devices, ErrorBody,
+        device_fingerprint, put_frame, vouch_message, AccessInfo, AdminsInfo, BranchUpdate, Challenge, ChallengeRequest, Devices, ErrorBody,
         FetchRequest, GroupChange, GroupInfo, HistoryRequest, LoginRequest, PushRequest, PushResult, Session, Tips, VouchRequest, Want,
     },
     identity::parse_public_identity,
@@ -744,6 +744,18 @@ impl Client {
         self.json(
             method,
             &self.url.project_path(&format!("/groups/{group}{what}")),
+            Some(&GroupChange { people: people.to_vec() }),
+        )
+    }
+
+    pub fn admins_list(&self) -> Result<AdminsInfo> {
+        self.json("GET", &self.url.project_path("/admins"), None::<&()>)
+    }
+
+    pub fn admins(&self, what: &str, people: &[String]) -> Result<AdminsInfo> {
+        self.json(
+            "POST",
+            &self.url.project_path(&format!("/admins{what}")),
             Some(&GroupChange { people: people.to_vec() }),
         )
     }

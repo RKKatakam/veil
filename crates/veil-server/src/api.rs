@@ -15,8 +15,8 @@ use sqlx::PgConnection;
 use veil_core::{
     hub::encoding,
     hub::wire::{
-        join_valid, vouch_valid, AccessInfo, Devices, FetchRequest, GroupChange, GroupInfo, HistoryRequest, InviteRequest, Join, JoinRequest,
-        Joined, PendingDevice, PushRequest, PushResult, RemoveDevice, Tips, Vouch, VouchRequest, MAX_WANTS,
+        join_valid, vouch_valid, AccessInfo, AdminsInfo, Devices, FetchRequest, GroupChange, GroupInfo, HistoryRequest, InviteRequest, Join,
+        JoinRequest, Joined, PendingDevice, PushRequest, PushResult, RemoveDevice, Tips, Vouch, VouchRequest, MAX_WANTS,
     },
     keychain::{validate_scope_name, KeyRing, Keychain, RingMerge},
     policy::valid_principal_name,
@@ -62,6 +62,8 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/groups/{g}/members", post(add_members))
         .route("/v1/projects/{p}/groups/{g}/members/remove", post(remove_members))
         .route("/v1/projects/{p}/groups/{g}/managers", post(add_managers))
+        .route("/v1/projects/{p}/admins", get(list_admins).post(add_admins))
+        .route("/v1/projects/{p}/admins/remove", post(remove_admins))
         .route("/v1/projects/{p}/rings", get(get_rings))
         .route("/v1/projects/{p}/rings/{scope}", post(post_ring).get(get_ring))
         .route("/v1/projects/{p}/shares", get(crate::shares::list).post(crate::shares::put))
@@ -1022,6 +1024,82 @@ async fn remove_members(State(hub): State<HubState>, caller: Caller, Path((p, g)
 
 async fn add_managers(State(hub): State<HubState>, caller: Caller, Path((p, g)): Path<(String, String)>, Json(req): Json<GroupChange>) -> Result<Json<GroupInfo>> {
     change_group(hub, caller, p, g, Op::AddManager, req).await
+}
+
+async fn list_admins(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<AdminsInfo>> {
+    caller.signed_in()?;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
+    if !project.participant(&viewer) {
+        return Err(Error::forbidden("you are not in this project"));
+    }
+    let mut c = hub.db.acquire().await?;
+    Ok(Json(AdminsInfo {
+        admins: names_of(&mut c, "admins", project.id).await?,
+    }))
+}
+
+/// Add or remove project admins (`BUG-1856`). Admins only (`person_only`),
+/// locking the project row in `ReadCommitted` so concurrent removals cannot
+/// both pass and leave the project with no admin.
+async fn change_admins(hub: HubState, caller: Caller, p: String, add: bool, req: GroupChange) -> Result<Json<AdminsInfo>> {
+    let me = caller.person_only()?.id;
+    let (project, viewer) = perm::open(&hub, &p, &caller).await?;
+    require_admin(&viewer)?;
+    let pid = project.id;
+    let people = req.people.clone();
+    let info = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+        let people = people.clone();
+        Box::pin(async move {
+            let _: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+                .bind(pid)
+                .fetch_one(&mut *c)
+                .await?;
+            let current: Vec<i64> = sqlx::query_scalar("SELECT person_id FROM project_admins WHERE project_id = $1 FOR UPDATE")
+                .bind(pid)
+                .fetch_all(&mut *c)
+                .await?;
+            if !current.contains(&me) {
+                return Err(Error::forbidden("only an admin of this project may do that"));
+            }
+            let ids = people_ids(c, &people).await?;
+            if add {
+                for (_, id) in &ids {
+                    sqlx::query("INSERT INTO project_admins (project_id, person_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                        .bind(pid)
+                        .bind(id)
+                        .execute(&mut *c)
+                        .await?;
+                    queue_key_request(c, *id, pid).await?;
+                }
+            } else {
+                let removing: std::collections::HashSet<i64> = ids.iter().map(|(_, id)| *id).collect();
+                if current.iter().all(|id| removing.contains(id)) {
+                    return Err(Error::bad_request("a project must have at least one admin"));
+                }
+                for (_, id) in &ids {
+                    sqlx::query("DELETE FROM project_admins WHERE project_id = $1 AND person_id = $2")
+                        .bind(pid)
+                        .bind(id)
+                        .execute(&mut *c)
+                        .await?;
+                }
+            }
+            Ok(AdminsInfo {
+                admins: names_of(c, "admins", pid).await?,
+            })
+        })
+    })
+    .await?;
+    crate::audit(&hub.db, Some(pid), Some(me), if add { "admin add" } else { "admin remove" }, &format!("{:?}", req.people)).await;
+    Ok(Json(info))
+}
+
+async fn add_admins(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<GroupChange>) -> Result<Json<AdminsInfo>> {
+    change_admins(hub, caller, p, true, req).await
+}
+
+async fn remove_admins(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<GroupChange>) -> Result<Json<AdminsInfo>> {
+    change_admins(hub, caller, p, false, req).await
 }
 
 /// Scopes of key rings `viewer` may read in `project` (`None`: all of them,

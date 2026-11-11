@@ -16,7 +16,7 @@ use veil_core::{
 };
 
 use crate::{
-    cli::GroupCmd,
+    cli::{AdminCmd, GroupCmd},
     ctx::{load_identity, user_for, Ctx},
     hub::{self, Client, HubUrl},
     render::{bold, cyan, dim, green, safe, warn_untrusted, yellow},
@@ -495,6 +495,36 @@ pub fn group(ctx: &mut Ctx, c: &GroupCmd) -> Result<()> {
             crate::hub_keys::group_removed(ctx, &client, group, people)?;
         }
         GroupCmd::Manager { group, people } => show(&client.group("POST", group, "/managers", people)?),
+    }
+    Ok(())
+}
+
+pub fn admin(ctx: &mut Ctx, c: &AdminCmd) -> Result<()> {
+    let (client, _) = client_for(ctx, "origin")?;
+    let show = |a: &veil_core::hub::wire::AdminsInfo| {
+        println!(
+            "{}  {}",
+            bold("admins:"),
+            if a.admins.is_empty() {
+                "-".into()
+            } else {
+                a.admins.iter().map(|s| safe(s)).collect::<Vec<_>>().join(", ")
+            }
+        );
+    };
+    match c {
+        AdminCmd::List => show(&client.admins_list()?),
+        AdminCmd::Add { people, confirm } => {
+            if !confirm.is_empty() && people.len() > 1 {
+                bail!("--confirm confirms one person's devices: add {} one at a time", people.join(", "));
+            }
+            show(&client.admins("", people)?);
+            crate::hub_keys::admin_added(ctx, &client, people, confirm)?;
+        }
+        AdminCmd::Remove { people } => {
+            show(&client.admins("/remove", people)?);
+            crate::hub_keys::admin_removed(ctx, &client, people)?;
+        }
     }
     Ok(())
 }

@@ -18,6 +18,7 @@
 //! POST /v1/projects/{p}/push              PushRequest       → PushResult
 //! GET  /v1/projects/{p}/access?path=P                       → AccessInfo
 //! POST /v1/projects/{p}/groups/…          GroupChange       → GroupInfo
+//! GET|POST /v1/projects/{p}/admins…       GroupChange       → AdminsInfo
 //! GET|POST /v1/projects/{p}/rings/{scope} ring JSON
 //! GET  /v1/objects/{p}/{id}               headers Veil-Grant, Veil-Chain, Veil-Signature → the object
 //! POST /v1/objects/{p}:batch              grant::BatchRequest → frames (those served)
@@ -484,6 +485,11 @@ pub struct GroupInfo {
     pub name: String,
     pub members: Vec<String>,
     pub managers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AdminsInfo {
+    pub admins: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
