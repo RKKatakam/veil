@@ -1,6 +1,20 @@
 //! The re-check of the server's review fixes (`rc-server`, 2026-11-11):
-//! the fixes of BUG-1850 to BUG-1907 as merged on `integration`, each asked
-//! whether it closes its row's whole class on every route.
+//! the fixes of BUG-1850 to BUG-1907, BUG-1524 and BUG-1590 as merged on
+//! `integration` (`1d545689`), each asked whether it closes its row's whole
+//! class on every route, whether its test fails without it, and whether it
+//! holds beside the others. Each test here is the reproduction of one
+//! `docs/BUGS.md` row (BUG-1920 to BUG-1925), ignored until its fix, and was
+//! run and seen to fail for the reason its row gives.
+//!
+//! Read and found sound, with no test added (the fixes' own tests fail when
+//! their key lines are made inert: BUG-1850, 1852, 1853, 1855, 1858, 1860,
+//! 1861, 1880, 1884, 1906, 1907): who releases an embargo, by push, route
+//! and deadline; the review rule a submit and the landing batch share
+//! (`prs::verify_landing_review`) for a protected branch, a change reverted
+//! twice and an embargo's PR; every writer of a GC root table inside a
+//! guarded transaction; key rings by readable scope, S26's route included;
+//! the same-origin check with `Origin: null` (admitted only beside
+//! `Sec-Fetch-Site: same-origin`); the database's `sslmode`.
 
 use serde_json::{json, Value};
 use veil_core::ObjectId;
@@ -102,7 +116,8 @@ fn land(hub: &TestHub, token: &str, project: &str, snapshot: &str) -> Reply {
 }
 
 /// One edit of `path` on `main`'s tip, landed by `token` with no change id
-/// named (the server gives it a new one): the change id and the real tip.
+/// named (the server gives it a new one): the landing's reply and the
+/// change id.
 fn land_new_change(hub: &TestHub, token: &str, project: &str, path: &str, text: &str) -> (Reply, String) {
     let base = main_tip(hub, Some(token), project);
     let c = change(hub, token, project, &json!({"base": base.hex(), "description": "feature", "edits": [{"path": path, "put": {"text": text}}]}));
