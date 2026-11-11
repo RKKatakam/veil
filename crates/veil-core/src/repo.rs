@@ -1107,18 +1107,54 @@ impl Repo {
                 // where the shared history does not (a rewrite from the
                 // shared history, recorded again by a settler's merge on the
                 // other side: the side showing `old` brought it back).
+                // The second holds only for a rewrite that is from the
+                // shared history. A merge's own rebase of a snapshot made
+                // since (one side commits, the other's merge rebases that
+                // commit onto a concurrent describe) is shown by the side
+                // that made it, which brought nothing back: taking that for
+                // an undo dropped the rebase, and what followed the commit
+                // (a workspace on its old version) was left on the stale
+                // one, below the describe (BUG-1503).
                 let live: Vec<Rewritten> = seen.iter().filter(|(k, r)| r.commands.is_empty() && !undone.contains(*k)).map(|(k, _)| k.clone()).collect();
                 if !live.is_empty() {
                     let mut olds: Vec<ObjectId> = live.iter().map(|k| k.0).collect();
                     olds.dedup();
                     let in_shared = self.shown(&shared, &olds)?;
+                    // A rewrite is from the shared history when the shared
+                    // history shows what it made (or what the rewrites seen
+                    // made of that in turn), or when it made nothing (an
+                    // abandon).
+                    let mut next: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+                    for (o, ns) in seen.keys() {
+                        next.entry(*o).or_default().extend(ns.iter().copied());
+                    }
+                    let made: Vec<Vec<ObjectId>> = live
+                        .iter()
+                        .map(|k| {
+                            let mut chain = k.1.clone();
+                            let mut i = 0;
+                            while i < chain.len() && chain.len() < 64 {
+                                for n in next.get(&chain[i]).into_iter().flatten() {
+                                    if !chain.contains(n) {
+                                        chain.push(*n);
+                                    }
+                                }
+                                i += 1;
+                            }
+                            chain
+                        })
+                        .collect();
+                    let all: Vec<ObjectId> = made.iter().flatten().copied().collect();
+                    let made_in_shared = self.shown(&shared, &all)?;
+                    let from_shared: std::collections::HashSet<&Rewritten> =
+                        live.iter().zip(&made).filter(|(k, chain)| k.1.is_empty() || chain.iter().any(|n| made_in_shared.contains(n))).map(|(k, _)| k).collect();
                     let only_a: std::collections::HashSet<&ObjectId> = split.only_a.iter().collect();
                     for (side, head) in [(&acc, false), (&op.view, true)] {
                         let shown = self.shown(side, &olds)?;
                         for k in live.iter().filter(|k| shown.contains(&k.0)) {
                             let r = &seen[k];
                             let saw = head && r.ops.iter().any(|o| !only_a.contains(o));
-                            if saw || !in_shared.contains(&k.0) {
+                            if saw || (!in_shared.contains(&k.0) && from_shared.contains(k)) {
                                 undone.insert(k.clone());
                             }
                         }

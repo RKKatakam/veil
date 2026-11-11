@@ -2170,7 +2170,7 @@ fn bug_1488_a_second_version_of_a_change_is_divergent_in_the_merge() {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: review_cases(300),
+        cases: review_cases(40),
         failure_persistence: None,
         rng_seed: proptest::test_runner::RngSeed::Fixed(20261108),
         ..ProptestConfig::default()
@@ -2178,14 +2178,47 @@ proptest! {
 
     /// BUG-1503: the long runs of the auto-rebase model check (with and
     /// without tags and workspaces on old versions, 120 to 300 steps), at
-    /// a pinned seed. The
-    /// ids within a case are random (identities, change ids), so the
-    /// pinned inputs fail some runs, not every one: about 3 runs in 8.
+    /// a pinned seed. The ids within a case are random (identities, change
+    /// ids), so the pinned inputs failed some runs, not every one: about 1
+    /// to 3 runs in 8 of 300 cases. 40 cases by default;
+    /// `PROPTEST_CASES=300` is the long run of a review (about 3 minutes).
     #[test]
-    #[ignore = "BUG-1503: the long runs of the auto-rebase model check fail now and then (an old snapshot visible below a head); not traced; about 3 runs in 8 at this seed"]
     fn bug_1503_rewrites_follow_in_long_runs(nw in 2usize..5, old_refs in any::<bool>(), steps in prop::collection::vec(any::<u16>(), 120..300)) {
         check_rewrites_follow_through_merges(false, nw, false, old_refs, &steps)?;
     }
+}
+
+/// BUG-1503, the case the long runs found, shrunk (37 steps, four writers,
+/// workspaces on old versions). A writer commits its working copy (`W`
+/// becomes the snapshot `I`, described as the commit `C`); concurrently a
+/// describe rewrites the commit below (`X` into `X'`); a third command,
+/// which saw the commit and not the describe, puts a workspace on the old
+/// version `I`. One merge of the commit and the describe rebases `C` onto
+/// `X'` (`C'`). The next merge, with the workspace's side, saw that side
+/// show `C` where the shared history (older than the commit) did not, took
+/// the rebase of `C` for undone ("the side showing `old` brought it back")
+/// and dropped it, although that side had made `C`, not restored it. The
+/// workspace then followed `I` to the stale `C`, below `X`, and the next
+/// merges kept it there for the same reason: `X`, which the describe
+/// rewrote, stayed visible under it. The engine was wrong, not the model:
+/// a change left on a stale parent. The failure depends on the random ids
+/// (which commit the describes pick, the order heads merge in), so the
+/// input is replayed: it failed about 1 replay in 12, and must pass every
+/// time.
+#[test]
+fn bug_1503_a_merge_rebase_of_a_commit_made_since_the_shared_history_is_not_taken_for_undone() {
+    let steps: Vec<u16> = vec![
+        38976, 22496, 50557, 34786, 48366, 19737, 39998, 8773, 41458, 13773, 30999, 37549, 15616, 675,
+        59886, 16540, 17868, 55986, 26704, 4418, 64383, 1245, 4366, 50977, 21098, 7692, 61628, 39892,
+        11438, 41440, 18067, 21447, 33646, 49770, 22220, 15473, 28086,
+    ];
+    let mut failed = Vec::new();
+    for n in 0..160 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 4, false, true, &steps) {
+            failed.push((n, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 160 failed; the first: {:?}", failed.len(), failed.first());
 }
 
 /// BUG-1489 (op log merges review, cycle 3): the model check of the
