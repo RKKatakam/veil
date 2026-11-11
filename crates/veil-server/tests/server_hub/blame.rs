@@ -2008,26 +2008,37 @@ mod s14rd_review {
             }
         }
         let started = jobs_started(&one.hub);
-        let mut refused = 0;
+        let (mut refused, mut most) = (0, 0);
         for (i, s) in snaps.iter().enumerate() {
             for follow in [false, true] {
                 let q = || BlameParams { rev: Some(s.hex()), path: path.into(), follow: Some(follow), n: Some(10), ..Default::default() };
                 let full = (jobs_started(&one.hub) - started) as usize >= veil_server::query::files::MAX_PENDING_JOBS;
-                // Asked until its job starts (a 5 ms deadline can pass
-                // before the request reaches the table, under load).
                 let before = jobs_started(&one.hub);
-                for _ in 0..if full { 1 } else { 50 } {
-                    assert!(once(&th, &one.hub, &a1, q(), limits(5, BlameLimits::default())).is_none(), "version {i} answered under another server's lease");
-                    if jobs_started(&one.hub) > before {
-                        break;
-                    }
-                }
                 if full {
+                    // Refused where it would queue, at once: asked with a
+                    // deadline that does not pass before the request
+                    // reaches the table.
+                    assert!(once(&th, &one.hub, &a1, q(), limits(2000, BlameLimits::default())).is_none(), "version {i} answered under another server's lease");
                     assert_eq!(jobs_started(&one.hub), before, "project one queued past its share");
                     refused += 1;
+                    continue;
                 }
+                // Asked until its job starts: a 5 ms deadline can pass
+                // before the request reaches the table, for as long as the
+                // database is slow. (At most 50 requests a version before:
+                // on YugabyteDB a version takes up to 43 on a quiet machine,
+                // and 253 of the 256 jobs started under the full suite.)
+                let end = Instant::now() + Duration::from_secs(60);
+                let mut asked = 0;
+                while jobs_started(&one.hub) == before {
+                    assert!(Instant::now() < end, "version {i}'s job did not start in 60 s ({asked} requests)");
+                    assert!(once(&th, &one.hub, &a1, q(), limits(5, BlameLimits::default())).is_none(), "version {i} answered under another server's lease");
+                    asked += 1;
+                }
+                most = most.max(asked);
             }
         }
+        println!("bug_1306: at most {most} requests before a version's job started");
         assert_eq!(jobs_started(&one.hub) - started, veil_server::query::files::MAX_PENDING_JOBS as u64, "project one's share is full");
         assert_eq!(refused, 260 - veil_server::query::files::MAX_PENDING_JOBS, "the rest refused");
         // Project two, on the same server: an ordinary first blame, by a
