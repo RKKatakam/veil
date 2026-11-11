@@ -396,8 +396,12 @@ impl<'r> Transaction<'r> {
         let Some(first_parent) = self.repo.exact().snapshot(&s.parents[0]).ok().flatten() else {
             return Ok(());
         };
-        let changes = match crate::tree::diff_trees(store, Some(&first_parent.tree), Some(&s.tree)) {
-            Ok(c) => c,
+        // A folder the server refuses to this thin clone is carried by its
+        // id (a merge where one side changed it, a squash of other paths):
+        // its entries are not this command's to re-decide, and the command
+        // does not need its content (BUG-1897).
+        let changes = match crate::tree::diff_trees_hiding(store, Some(&first_parent.tree), Some(&s.tree)) {
+            Ok((c, _refused)) => c,
             Err(e) if tolerated(&e) => return Ok(()),
             Err(e) => return Err(e),
         };

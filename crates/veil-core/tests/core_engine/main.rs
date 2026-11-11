@@ -21,6 +21,7 @@ mod graph_index;
 mod history_rename;
 mod history_tools;
 mod mount_recording;
+mod refused_folder;
 mod rename_merge;
 mod review_core;
 mod sandbox;
