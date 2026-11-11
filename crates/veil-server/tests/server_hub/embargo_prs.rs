@@ -788,9 +788,13 @@ fn guarantee_2_only_embargo_members_review_and_protected_branch_and_agent_rules_
     assert_eq!(modified.json()["review"]["ready"], false);
 }
 
-/// Guarantee 3: At release it becomes visible exactly as an ordinary PR, once,
-/// across two servers. If it was set to land at release, it lands through S17
-/// once, with S21's review rules met.
+/// Guarantee 3: At release the line lands through S17 once, with S21's
+/// review rules met (its own PR's approvals count), and its PR is landed; a
+/// PR onto the line becomes visible exactly as an ordinary PR, once, across
+/// two servers (or lands too, if it was set to land at release and is
+/// ready). Unapproved, a release onto a protected branch is held: nothing
+/// lands, nothing turns public, and it lands once approved (BUG-1861,
+/// BUG-1875).
 #[test]
 fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     let hub1 = TestHub::start();
@@ -832,7 +836,8 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     let mut ord_keys: Vec<String> = ord_pr.as_object().unwrap().keys().cloned().collect();
     ord_keys.sort();
 
-    // ---- Case A: `land_at_release = false` -> becomes an ordinary open PR once across 2 servers ----
+    // ---- Case A: the line lands at release with its approved PR, armed or not (BUG-1875); a PR onto the
+    //      line, not armed, becomes an ordinary open PR once across 2 servers ----
     let main_before_a = api1.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
     let until_a = veil_core::now_millis() + 60_000;
     let (eid_a, _, _, _) = push_embargo(
@@ -851,20 +856,14 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
         &json!({
             "head": format!("embargo/{eid_a}"),
             "title": "Case A embargo PR",
-            "body": "Stays open at release",
+            "body": "Lands with the line",
         }),
     );
     assert_eq!(pr_a.status, 200, "{}", body_str(&pr_a));
     let pr_a_id = pr_a.json()["id"].as_str().unwrap().to_string();
     let patch_a = pr_a.json()["patch"].as_str().unwrap().to_string();
 
-    // Add a thread & approval on `pr_a`, keeping `land_at_release = false`.
-    let th_a = api1.post_json(
-        Some(&sec_tok),
-        &format!("/v1/projects/{}/prs/{pr_a_id}/threads", p.name),
-        &json!({"body": "Thread preserved across release"}),
-    );
-    assert_eq!(th_a.status, 200);
+    // An approval of `pr_a` (the line's own PR), keeping `land_at_release = false`.
     let sig_a = sign_review(&rev1, &p.name, &pr_a_id, &patch_a, "approve");
     let app_a = api1.post_json(
         Some(&rev1_tok),
@@ -873,6 +872,35 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     );
     assert_eq!(app_a.status, 200);
     assert_eq!(app_a.json()["review"]["ready"], true);
+
+    // A follow-up built on the line's tip, as a PR onto the line: not armed, with a thread.
+    let line_a = api1.tips(Some(&sec_tok), &p.name).unwrap().branches[&format!("embargo/{eid_a}")];
+    let follow_a = api1.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": line_a.hex(),
+            "description": "case A follow-up",
+            "edits": [{"path": "src/release_followup.rs", "put": {"text": "pub const FOLLOW_UP: &str = \"CASE-A-FOLLOWUP-3304\";\n"}}],
+        }),
+    );
+    assert_eq!(follow_a.status, 200, "{}", body_str(&follow_a));
+    let follow_a_snap = follow_a.json()["snapshot"].as_str().unwrap().to_string();
+    let pr_a2 = api1.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"head": follow_a_snap, "onto": format!("embargo/{eid_a}"), "title": "Case A follow-up PR", "body": "Stays open at release"}),
+    );
+    assert_eq!(pr_a2.status, 200, "{}", body_str(&pr_a2));
+    assert_eq!(pr_a2.json()["embargo"], eid_a.as_str(), "{}", body_str(&pr_a2));
+    let pr_a2_id = pr_a2.json()["id"].as_str().unwrap().to_string();
+    let patch_a2 = pr_a2.json()["patch"].as_str().unwrap().to_string();
+    let th_a = api1.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/prs/{pr_a2_id}/threads", p.name),
+        &json!({"body": "Thread preserved across release"}),
+    );
+    assert_eq!(th_a.status, 200);
 
     // Expire `until_a` in PostgreSQL (`release_due` strictly uses `clock_timestamp()`) and race `release_due` across both servers!
     hub1.rt.block_on(async {
@@ -896,16 +924,26 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
         .unwrap();
     assert!(rel_a.is_some(), "eid_a must be marked released");
 
-    // `main` did NOT move because `land_at_release` was false!
-    assert_eq!(
-        api1.tips(Some(&dev_tok), &p.name).unwrap().branches["main"],
-        main_before_a,
-        "embargoed PR with land_at_release=false must not auto-land on main"
-    );
+    // The line landed on `main`, once, under `pr_a`'s approval: the release never drops it (BUG-1875).
+    let main_after_a = api1.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_ne!(main_after_a, main_before_a, "the released line must land on main");
+    let main_file_a = api1.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/release_ordinary.rs", p.name));
+    assert_eq!(main_file_a.status, 200, "{}", body_str(&main_file_a));
+    assert!(body_str(&main_file_a).contains("CASE-A-3301"));
+    // The follow-up did not land with it (not armed, not approved).
+    let no_follow = api1.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/release_followup.rs", p.name));
+    assert_eq!(no_follow.status, 404, "{}", body_str(&no_follow));
+    assert!(!api1.tips(Some(&sec_tok), &p.name).unwrap().branches.contains_key(&format!("embargo/{eid_a}")), "the line is retired");
 
-    // Outsider `p.dev` now sees `pr_a` on BOTH `hub1` and `hub2`, with the exact keys of an ordinary PR!
     for (srv, api) in [("hub1", &api1), ("hub2", &api2)] {
+        // `pr_a` landed with the line.
         let sh = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_a_id}", p.name));
+        assert_eq!(sh.status, 200, "{srv} outsider show after release: {}", body_str(&sh));
+        assert_eq!(sh.json()["state"], "landed", "{srv}: {}", body_str(&sh));
+        assert!(sh.json().get("embargo").is_none(), "{srv}: {}", body_str(&sh));
+
+        // Outsider `p.dev` now sees the follow-up PR, with the exact keys of an ordinary PR!
+        let sh = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_a2_id}", p.name));
         assert_eq!(sh.status, 200, "{srv} outsider show after release: {}", body_str(&sh));
         let sj = sh.json();
         let mut keys: Vec<String> = sj.as_object().unwrap().keys().cloned().collect();
@@ -913,21 +951,39 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
         assert_eq!(keys, ord_keys, "{srv} released PR must have exact ordinary PR JSON shape: {sj}");
         assert_eq!(sj["state"], "open", "{srv}");
         assert_eq!(sj["open_threads"], 1, "{srv}");
-        assert_eq!(sj["review"]["ready"], true, "{srv}");
+        assert_eq!(sj["review"]["ready"], false, "{srv}");
+        assert_eq!(sj["patch"], patch_a2.as_str(), "{srv}: the PR's revision is the one that was reviewable before release");
 
-        let df = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_a_id}/diff", p.name));
+        let df = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_a2_id}/diff", p.name));
         assert_eq!(df.status, 200, "{srv} diff after release: {}", body_str(&df));
-        assert!(body_str(&df).contains("CASE-A-3301"), "{srv}");
+        assert!(body_str(&df).contains("CASE-A-FOLLOWUP-3304"), "{srv}");
+        assert!(!body_str(&df).contains("CASE-A-3301"), "{srv}: the follow-up PR is its own change only");
     }
 
-    // And `pr_a` can now be landed as an ordinary PR via `POST /prs/{id}/land`!
+    // And the follow-up PR, retargeted at `main`, lands as an ordinary PR via `POST /prs/{id}/land`
+    // once approved: exactly its own change, on top of the line's.
+    let unapproved = api2.post_json(Some(&sec_tok), &format!("/v1/projects/{}/prs/{pr_a2_id}/land", p.name), &json!({}));
+    assert_eq!(unapproved.status, 409, "an unapproved ordinary PR does not land on protected main: {}", body_str(&unapproved));
+    let sig_a2 = sign_review(&rev1, &p.name, &pr_a2_id, &patch_a2, "approve");
+    let app_a2 = api2.post_json(
+        Some(&rev1_tok),
+        &format!("/v1/projects/{}/prs/{pr_a2_id}/reviews", p.name),
+        &json!({"patch": patch_a2, "verdict": "approve", "signature": sig_a2}),
+    );
+    assert_eq!(app_a2.status, 200, "{}", body_str(&app_a2));
     let land_a = api2.post_json(
         Some(&sec_tok),
-        &format!("/v1/projects/{}/prs/{pr_a_id}/land", p.name),
+        &format!("/v1/projects/{}/prs/{pr_a2_id}/land", p.name),
         &json!({}),
     );
     assert_eq!(land_a.status, 200, "ordinary land after release failed: {}", body_str(&land_a));
     assert_eq!(land_a.json()["state"], "landed");
+    let log_a = api2.get(Some(&dev_tok), &format!("/v1/projects/{}/q/log?rev=main&n=2", p.name)).json();
+    assert_eq!(
+        log_a["entries"][1]["snapshot_id"].as_str().unwrap(),
+        main_after_a.hex(),
+        "the retargeted PR lands its own change only, on the released line: {log_a}"
+    );
 
     // ---- Case B: `land_at_release = true` with S21 review rules met -> lands once via S17 across 2 servers ----
     let main_before_b = api1.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
@@ -1051,7 +1107,8 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
         assert!(sh.get("embargo").is_none(), "{srv} landed ordinary PR must have no embargo field: {sh}");
     }
 
-    // ---- Case C: `land_at_release = true` WITHOUT S21 approval -> does NOT land on protected `main`! ----
+    // ---- Case C: WITHOUT S21 approval the release is held: nothing lands on protected `main`, nothing turns
+    //      public, the embargo's groups are told, and it lands once approved (BUG-1861) ----
     let main_before_c = main_after_b;
     let until_c = veil_core::now_millis() + 3_600_000;
     let (eid_c, _, _, _) = push_embargo(
@@ -1087,24 +1144,58 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
         .await
         .unwrap();
     });
-    let c_rel = hub1.rt.block_on(veil_server::embargo::release_due(&hub1.hub())).unwrap();
-    assert!(c_rel <= 1);
-    let rel_c: Option<i64> = hub1
-        .rt
-        .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE embargo_id = $1").bind(&eid_c).fetch_one(&hub1.hub().db))
-        .unwrap();
-    assert!(rel_c.is_some(), "eid_c must be marked released");
+    // (The service is the whole database's: what it released of other tests is not counted.)
+    hub1.rt.block_on(veil_server::embargo::release_due(&hub1.hub())).unwrap();
+    let released_c = || -> Option<i64> {
+        hub1.rt
+            .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE embargo_id = $1").bind(&eid_c).fetch_one(&hub1.hub().db))
+            .unwrap()
+    };
+    assert!(released_c().is_none(), "eid_c is held, not released");
 
-    // Protected `main` did NOT accept the unapproved PR! Instead `pr_c` became an ordinary open PR.
+    // Protected `main` did NOT accept the unapproved change, and nothing turned public.
     assert_eq!(
         api1.tips(Some(&dev_tok), &p.name).unwrap().branches["main"],
         main_before_c,
-        "unapproved land_at_release PR must never bypass S21 review rules on protected main"
+        "an unapproved release must never bypass S21 review rules on protected main"
     );
+    let dev_tips = api2.tips(Some(&dev_tok), &p.name).unwrap();
+    assert!(dev_tips.embargoes.is_empty(), "an outsider saw the held embargo: {:?}", dev_tips.embargoes);
+    assert!(!dev_tips.branches.contains_key(&format!("embargo/{eid_c}")));
+    let hidden_pr = api2.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_c_id}", p.name));
+    assert_eq!(hidden_pr.status, 404, "a held embargo's PR stays hidden: {}", body_str(&hidden_pr));
+    let hidden_file = api2.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/unapproved_release.rs", p.name));
+    assert_eq!(hidden_file.status, 404, "{}", body_str(&hidden_file));
+    // The embargo's groups are told why it waits (on both servers).
+    let sec_tips = api2.tips(Some(&sec_tok), &p.name).unwrap();
+    let rec_c = sec_tips.embargoes.iter().find(|e| e.id == eid_c).expect("a member still sees the held embargo");
+    assert_eq!(rec_c.state.as_deref(), Some("waiting_for_approval"), "{rec_c:?}");
+    assert!(rec_c.reason.as_deref().is_some_and(|r| r.contains("approval")), "{rec_c:?}");
+    assert!(rec_c.released_at.is_none(), "{rec_c:?}");
+    assert!(sec_tips.branches.contains_key(&format!("embargo/{eid_c}")), "the held line stays");
+    // Trying again changes nothing while it is unapproved.
+    hub2.rt.block_on(veil_server::embargo::release_due(&hub2.hub())).unwrap();
+    assert!(released_c().is_none());
+
+    // Approved (on the other server), it lands at once and is released.
+    let patch_c = pr_c.json()["patch"].as_str().unwrap().to_string();
+    let sig_c = sign_review(&rev1, &p.name, &pr_c_id, &patch_c, "approve");
+    let app_c = api2.post_json(
+        Some(&rev1_tok),
+        &format!("/v1/projects/{}/prs/{pr_c_id}/reviews", p.name),
+        &json!({"patch": patch_c, "verdict": "approve", "signature": sig_c}),
+    );
+    assert_eq!(app_c.status, 200, "{}", body_str(&app_c));
+    assert!(released_c().is_some(), "an approved, held release lands at once");
+    let main_file_c = api1.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/unapproved_release.rs", p.name));
+    assert_eq!(main_file_c.status, 200, "{}", body_str(&main_file_c));
+    assert!(body_str(&main_file_c).contains("CASE-C-3303"));
     let sh_c = api1.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_c_id}", p.name)).json();
-    assert_eq!(sh_c["state"], "open");
-    assert_eq!(sh_c["review"]["ready"], false);
+    assert_eq!(sh_c["state"], "landed", "{sh_c}");
     assert!(sh_c.get("embargo").is_none());
+    let sec_after = api1.tips(Some(&sec_tok), &p.name).unwrap();
+    let rec_after = sec_after.embargoes.iter().find(|e| e.id == eid_c);
+    assert!(rec_after.is_none_or(|r| r.released_at.is_some() && r.state.is_none()), "{rec_after:?}");
 }
 
 /// Guarantee 4: Nothing about it leaks into public search, blame, history or
@@ -1539,4 +1630,528 @@ fn guarantee_5_ci_runners_refused_on_writes_and_narrowed_agents_restricted_to_th
     );
     assert_eq!(bad_upd.status, 403, "narrowed agent update outside paths must 403: {}", body_str(&bad_upd));
     assert_eq!(bad_upd.json()["code"], "agent_session", "{}", body_str(&bad_upd));
+}
+
+// ---- review rv-new (BUG-1875) -------------------------------------------------------
+
+/// BUG-1875: an embargo that ever had a PR (`embargo_lines.has_pr`, never
+/// cleared) releases through `prs::embargo::release_embargo_prs`, which lands
+/// only armed, approved, open PRs and then deletes the `embargo/<id>`
+/// branch. With its PR closed (opened by mistake, or replaced), the fix
+/// lands nowhere and no branch holds it any more: at the release an
+/// embargoed fix silently leaves every branch. Without a PR the same
+/// embargo lands on its target (S22).
+#[test]
+fn bug_1875_a_released_embargo_whose_pr_was_closed_keeps_its_fix_on_a_branch() {
+    const FIX: &str = "RVNEW_EMBARGOED_FIX_1875";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "rv-1875",
+        "security",
+        Some(veil_core::now_millis() + 3_600_000),
+        &[("src/fix_1875.rs", &format!("pub const FIX: &str = \"{FIX}\";\n"))],
+        "an embargoed fix",
+    );
+    let (admin, sec) = (p.admin.token(), p.sec.token());
+    let file_on = |branch: &str| api.get(Some(&admin), &format!("/v1/projects/{}/q/file?rev={branch}&path=src/fix_1875.rs", p.name));
+
+    // A PR on the embargoed fix, opened and closed again.
+    let pr = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs", p.name), &json!({"head": format!("embargo/{eid}"), "title": "the fix"}));
+    assert_eq!(pr.status, 200, "{}", body_str(&pr));
+    let id = pr.json()["id"].as_str().unwrap().to_string();
+    let closed = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs/{id}/close", p.name), &json!({}));
+    assert_eq!(closed.status, 200, "{}", body_str(&closed));
+    assert_eq!(closed.json()["state"], "closed", "{}", body_str(&closed));
+
+    // The admin releases the embargo.
+    let rel = api.post_json(Some(&admin), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+    assert_eq!(rel.status, 200, "{}", body_str(&rel));
+    let released: Option<i64> = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE embargo_id = $1").bind(&eid).fetch_one(&hub.hub().db))
+        .unwrap();
+    assert!(released.is_some(), "the embargo is released");
+
+    // The fix is on a branch: its target's, or at least the line it was on.
+    let tips = api.tips(Some(&admin), &p.name).unwrap();
+    let holders: Vec<&String> = tips
+        .branches
+        .keys()
+        .filter(|b| {
+            let r = file_on(b);
+            r.status == 200 && String::from_utf8_lossy(&r.body).contains(FIX)
+        })
+        .collect();
+    assert!(!holders.is_empty(), "the released fix is on no branch (branches: {:?})", tips.branches.keys().collect::<Vec<_>>());
+}
+
+/// BUG-1875, the other way round: a PR **onto** the embargo line from an
+/// ordinary branch. The release never lands the line (it has a PR), lands
+/// at most the PR's own changes, and deletes `embargo/<id>`: the embargoed
+/// fix is then on no branch and no PR revision names it (the PR's head is
+/// the ordinary branch), so nothing keeps it from the collector.
+#[test]
+fn bug_1875_a_released_embargo_with_a_pr_onto_its_line_keeps_its_fix_on_a_branch() {
+    const FIX: &str = "RVNEW_EMBARGOED_FIX_ONTO_1875";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    // An ordinary branch, before the embargo.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/followup_1875.rs", "pub const FOLLOWUP: u8 = 1;\n");
+    let pushed = c.push_to("followup-1875", None);
+    assert_eq!(pushed.status, 200, "{}", body_str(&pushed));
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "rv-1875-onto",
+        "security",
+        Some(veil_core::now_millis() + 3_600_000),
+        &[("src/fix_onto_1875.rs", &format!("pub const FIX: &str = \"{FIX}\";\n"))],
+        "an embargoed fix",
+    );
+    let (admin, sec) = (p.admin.token(), p.sec.token());
+
+    // A PR of the ordinary branch onto the embargo line.
+    let pr = api.post_json(
+        Some(&sec),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"head": "followup-1875", "onto": format!("embargo/{eid}"), "title": "a follow-up for the fix"}),
+    );
+    assert_eq!(pr.status, 200, "{}", body_str(&pr));
+    assert_eq!(pr.json()["embargo"], eid.as_str(), "{}", body_str(&pr));
+
+    // The admin releases the embargo.
+    let rel = api.post_json(Some(&admin), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+    assert_eq!(rel.status, 200, "{}", body_str(&rel));
+    let released: Option<i64> = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE embargo_id = $1").bind(&eid).fetch_one(&hub.hub().db))
+        .unwrap();
+    assert!(released.is_some(), "the embargo is released");
+
+    // The fix is on a branch.
+    let tips = api.tips(Some(&admin), &p.name).unwrap();
+    let holders: Vec<&String> = tips
+        .branches
+        .keys()
+        .filter(|b| {
+            let r = api.get(Some(&admin), &format!("/v1/projects/{}/q/file?rev={b}&path=src/fix_onto_1875.rs", p.name));
+            r.status == 200 && String::from_utf8_lossy(&r.body).contains(FIX)
+        })
+        .collect();
+    assert!(!holders.is_empty(), "the released fix is on no branch (branches: {:?})", tips.branches.keys().collect::<Vec<_>>());
+}
+
+// ---- BUG-1861 and BUG-1875: a release lands the line, approved, or it is held ---------
+
+/// A project whose `main` is protected with the default review rules (a
+/// change of source code needs one approval), and `rev1`: like `sec`, in
+/// `security` (the embargoes' group) and in `devs` (who write `src/`).
+fn protected_project(hub: &TestHub) -> (Project, Person) {
+    let p = setup_project(hub);
+    let rev1 = hub.person("rev1");
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    p.admin.ok(&p.dir, &["group", "add", "security", &rev1.name]);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &rev1.name]);
+    set_main_file(hub, &p, ".veilrules", "[branches.main]\nprotected = true\n", "protect main");
+    (p, rev1)
+}
+
+/// `who` approves the current revision of the PR `pr` (its JSON).
+fn approve(api: &Api, who: &Person, project: &str, pr: &Value) -> Reply {
+    let (id, patch) = (pr["id"].as_str().unwrap(), pr["patch"].as_str().unwrap());
+    let sig = sign_review(who, project, id, patch, "approve");
+    api.post_json(
+        Some(&who.token()),
+        &format!("/v1/projects/{project}/prs/{id}/reviews"),
+        &json!({"patch": patch, "verdict": "approve", "signature": sig}),
+    )
+}
+
+fn released_at(hub: &TestHub, eid: &str) -> Option<i64> {
+    hub.rt
+        .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE embargo_id = $1").bind(eid).fetch_one(&hub.hub().db))
+        .unwrap()
+}
+
+/// BUG-1861: a release onto a protected branch meets S21's review rules like
+/// any landing. Asked for early by a member, with no approval, it is held:
+/// nothing lands, the embargo stays hidden, its groups are told that it
+/// waits for approval, and it lands once an embargo PR of the line is
+/// approved, without being asked for again.
+#[test]
+fn bug_1861_an_unapproved_release_is_held_hidden_and_lands_once_approved() {
+    const FIX: &str = "HELD_RELEASE_FIX_1861";
+    let hub = TestHub::start();
+    let (p, rev1) = protected_project(&hub);
+    let api = hub.api();
+    let (sec, dev) = (p.sec.token(), p.dev.token());
+    let before = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    // An embargo with no deadline.
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "held-1861",
+        "security",
+        None,
+        &[("src/held_1861.rs", &format!("pub const FIX: &str = \"{FIX}\";\n"))],
+        "an embargoed fix",
+    );
+    let line = format!("embargo/{eid}");
+    let file_on_main = || api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev=main&path=src/held_1861.rs", p.name));
+    let release = || api.post_json(Some(&sec), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+
+    // A member asks for its release: held, with the refusal a direct landing gets.
+    let rel = release();
+    assert_eq!(rel.status, 409, "{}", body_str(&rel));
+    assert_eq!(rel.json()["code"], "not_ready", "{}", body_str(&rel));
+    assert!(body_str(&rel).contains("waits for approval") && body_str(&rel).contains("not ready to land"), "{}", body_str(&rel));
+    let held = |when: &str| {
+        assert!(released_at(&hub, &eid).is_none(), "{when}: held, not released");
+        assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], before, "{when}: nothing landed");
+        assert_eq!(file_on_main().status, 404, "{when}: the fix is not public");
+        let dev_tips = api.tips(Some(&dev), &p.name).unwrap();
+        assert!(dev_tips.embargoes.is_empty() && !dev_tips.branches.contains_key(&line), "{when}: an outsider saw the held embargo");
+        // Its groups are told.
+        let sec_tips = api.tips(Some(&sec), &p.name).unwrap();
+        assert!(sec_tips.branches.contains_key(&line), "{when}: the line stays");
+        let rec = sec_tips.embargoes.iter().find(|e| e.id == eid).expect("a member sees the held embargo");
+        assert_eq!(rec.state.as_deref(), Some("waiting_for_approval"), "{when}: {rec:?}");
+        assert!(rec.reason.as_deref().is_some_and(|r| r.contains("needs 1 approval")), "{when}: {rec:?}");
+        assert!(rec.released_at.is_none(), "{when}: {rec:?}");
+    };
+    held("after the release was asked for");
+    // The release service tries it again and holds it again; asking again changes nothing.
+    hub.rt.block_on(veil_server::embargo::release_due(&hub.hub())).unwrap();
+    held("after the release service ran");
+    assert_eq!(release().status, 409);
+
+    // An embargo PR of the line; while it is unapproved the release stays held.
+    let pr = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs", p.name), &json!({"head": line, "title": "the fix"}));
+    assert_eq!(pr.status, 200, "{}", body_str(&pr));
+    let pr_id = pr.json()["id"].as_str().unwrap().to_string();
+    hub.rt.block_on(veil_server::embargo::release_due(&hub.hub())).unwrap();
+    held("with an unapproved PR");
+
+    // Approved: the held release lands, with nobody asking again.
+    let ok = approve(&api, &rev1, &p.name, &pr.json());
+    assert_eq!(ok.status, 200, "{}", body_str(&ok));
+    assert!(released_at(&hub, &eid).is_some(), "an approved, held release lands at once");
+    let f = file_on_main();
+    assert_eq!(f.status, 200, "{}", body_str(&f));
+    assert!(body_str(&f).contains(FIX));
+    let log = api.get(Some(&dev), &format!("/v1/projects/{}/q/log?rev=main&n=2", p.name)).json();
+    assert_eq!(log["entries"][1]["snapshot_id"].as_str().unwrap(), before.hex(), "the fix landed once: {log}");
+    let shown = api.get(Some(&dev), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+    assert_eq!(shown.status, 200, "{}", body_str(&shown));
+    assert_eq!(shown.json()["state"], "landed", "{}", body_str(&shown));
+    assert!(!api.tips(Some(&sec), &p.name).unwrap().branches.contains_key(&line), "the line is retired");
+}
+
+/// BUG-1875, the review's lead: a PR **onto** the embargo line holds only
+/// the changes on top of the line, and its approval is of those. A release
+/// never lands the line's own changes under that review: with the top PR
+/// approved and armed but the line itself unapproved, the release is held
+/// and nothing lands; once the line's own PR is approved, the line lands
+/// under it, and then the armed PR lands its own change.
+#[test]
+fn bug_1875_a_pr_onto_the_line_never_lands_the_lines_changes_under_its_own_review() {
+    const FIX: &str = "LINE_FIX_UNDER_ITS_OWN_REVIEW_1875";
+    const TOP: &str = "TOP_CHANGE_1875";
+    let hub = TestHub::start();
+    let (p, rev1) = protected_project(&hub);
+    let api = hub.api();
+    let (sec, dev) = (p.sec.token(), p.dev.token());
+    let before = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "lead-1875",
+        "security",
+        Some(veil_core::now_millis() + 3_600_000),
+        &[("src/line_1875.rs", &format!("pub const FIX: &str = \"{FIX}\";\n"))],
+        "an embargoed fix",
+    );
+    let line = format!("embargo/{eid}");
+    let on_main = |path: &str| api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev=main&path={path}", p.name));
+
+    // A change on top of the line's tip, as a PR onto the line: approved, and armed to land at release.
+    let tip = api.tips(Some(&sec), &p.name).unwrap().branches[&line];
+    let top = api.post_json(
+        Some(&sec),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": tip.hex(),
+            "description": "on top of the fix",
+            "edits": [{"path": "src/top_1875.rs", "put": {"text": format!("pub const TOP: &str = \"{TOP}\";\n")}}],
+        }),
+    );
+    assert_eq!(top.status, 200, "{}", body_str(&top));
+    let top_snap = top.json()["snapshot"].as_str().unwrap().to_string();
+    let top_pr = api.post_json(
+        Some(&sec),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"head": top_snap, "onto": line, "title": "on top of the fix"}),
+    );
+    assert_eq!(top_pr.status, 200, "{}", body_str(&top_pr));
+    let top_id = top_pr.json()["id"].as_str().unwrap().to_string();
+    let diff = api.get(Some(&sec), &format!("/v1/projects/{}/prs/{top_id}/diff", p.name));
+    assert_eq!(diff.status, 200, "{}", body_str(&diff));
+    assert!(body_str(&diff).contains(TOP) && !body_str(&diff).contains(FIX), "the PR onto the line is the top change only");
+    let ok = approve(&api, &rev1, &p.name, &top_pr.json());
+    assert_eq!(ok.status, 200, "{}", body_str(&ok));
+    assert_eq!(ok.json()["review"]["ready"], true, "{}", body_str(&ok));
+    let armed = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs/{top_id}/land", p.name), &json!({"at_release": true}));
+    assert_eq!(armed.status, 200, "{}", body_str(&armed));
+    assert_eq!(armed.json()["land_at_release"], true, "{}", body_str(&armed));
+
+    // The release is held: the line's own changes have no approval, whatever the PR on top has.
+    let rel = api.post_json(Some(&sec), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+    assert_eq!(rel.status, 409, "{}", body_str(&rel));
+    assert_eq!(rel.json()["code"], "not_ready", "{}", body_str(&rel));
+    assert!(released_at(&hub, &eid).is_none(), "held, not released");
+    assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], before, "nothing landed under the top change's review");
+    assert_eq!((on_main("src/line_1875.rs").status, on_main("src/top_1875.rs").status), (404, 404));
+    let hidden = api.get(Some(&dev), &format!("/v1/projects/{}/prs/{top_id}", p.name));
+    assert_eq!(hidden.status, 404, "the held embargo's PR stays hidden: {}", body_str(&hidden));
+
+    // The line's own PR, approved: the line lands under it, then the armed PR lands its own change.
+    let line_pr = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs", p.name), &json!({"head": line, "title": "the fix"}));
+    assert_eq!(line_pr.status, 200, "{}", body_str(&line_pr));
+    let line_id = line_pr.json()["id"].as_str().unwrap().to_string();
+    let ok = approve(&api, &rev1, &p.name, &line_pr.json());
+    assert_eq!(ok.status, 200, "{}", body_str(&ok));
+    assert!(released_at(&hub, &eid).is_some(), "approved, the held release lands");
+    let (f, t) = (on_main("src/line_1875.rs"), on_main("src/top_1875.rs"));
+    assert_eq!((f.status, t.status), (200, 200), "{} {}", body_str(&f), body_str(&t));
+    assert!(body_str(&f).contains(FIX) && body_str(&t).contains(TOP));
+    for id in [&line_id, &top_id] {
+        let shown = api.get(Some(&dev), &format!("/v1/projects/{}/prs/{id}", p.name));
+        assert_eq!(shown.status, 200, "{}", body_str(&shown));
+        assert_eq!(shown.json()["state"], "landed", "{}", body_str(&shown));
+    }
+}
+
+/// BUG-1875: a PR onto the line is never retargeted at release to land
+/// changes its revision does not list. An admin moves the line off the fix
+/// the PR stands on; at release the PR's landing would carry that fix under
+/// the review of the top change only, so the PR is closed and nothing of it
+/// lands.
+#[test]
+fn bug_1875_a_pr_onto_a_rewritten_line_is_closed_at_release_and_lands_nothing_unreviewed() {
+    const FIX: &str = "DROPPED_LINE_FIX_1875";
+    let hub = TestHub::start();
+    let (p, rev1) = protected_project(&hub);
+    let api = hub.api();
+    let (admin, sec, dev) = (p.admin.token(), p.sec.token(), p.dev.token());
+    let before = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "rewritten-1875",
+        "security",
+        Some(veil_core::now_millis() + 3_600_000),
+        &[("src/dropped_1875.rs", &format!("pub const FIX: &str = \"{FIX}\";\n"))],
+        "an embargoed fix",
+    );
+    let line = format!("embargo/{eid}");
+    let tip = api.tips(Some(&sec), &p.name).unwrap().branches[&line];
+    let top = api.post_json(
+        Some(&sec),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": tip.hex(),
+            "description": "on top of the fix",
+            "edits": [{"path": "src/top_rewritten_1875.rs", "put": {"text": "pub const TOP: u8 = 1;\n"}}],
+        }),
+    );
+    assert_eq!(top.status, 200, "{}", body_str(&top));
+    let top_pr = api.post_json(
+        Some(&sec),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"head": top.json()["snapshot"], "onto": line, "title": "on top of the fix", "land_at_release": true}),
+    );
+    assert_eq!(top_pr.status, 200, "{}", body_str(&top_pr));
+    let top_id = top_pr.json()["id"].as_str().unwrap().to_string();
+    let ok = approve(&api, &rev1, &p.name, &top_pr.json());
+    assert_eq!(ok.status, 200, "{}", body_str(&ok));
+    assert_eq!(ok.json()["review"]["ready"], true, "{}", body_str(&ok));
+
+    // The admin takes the fix off the line (the line is main's tip again).
+    let admin_tip = api.tips(Some(&admin), &p.name).unwrap();
+    let moved = api.post_json(
+        Some(&admin),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": line, "expected": admin_tip.branches[&line].hex(), "new": admin_tip.branches["main"].hex()}], "force": true}),
+    );
+    assert_eq!(moved.status, 200, "{}", body_str(&moved));
+    assert_eq!(api.tips(Some(&admin), &p.name).unwrap().branches[&line], admin_tip.branches["main"], "{}", body_str(&moved));
+
+    // The release: the line holds nothing to land; the PR on the dropped fix is closed, not landed.
+    let rel = api.post_json(Some(&sec), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+    assert_eq!(rel.status, 200, "{}", body_str(&rel));
+    assert!(released_at(&hub, &eid).is_some(), "released");
+    assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], before, "the dropped fix landed under the top change's review");
+    let f = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev=main&path=src/dropped_1875.rs", p.name));
+    assert_eq!(f.status, 404, "{}", body_str(&f));
+    let shown = api.get(Some(&dev), &format!("/v1/projects/{}/prs/{top_id}", p.name));
+    assert_eq!(shown.status, 200, "{}", body_str(&shown));
+    assert_eq!(shown.json()["state"], "closed", "{}", body_str(&shown));
+    let land = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs/{top_id}/land", p.name), &json!({}));
+    assert_eq!(land.status, 409, "a closed PR does not land: {}", body_str(&land));
+    assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], before);
+}
+
+/// BUG-1875: the collector's roots keep an embargoed fix until it has
+/// landed. The embargo's only PR is closed and its release is held (no
+/// approval); garbage collection, past its retention window, keeps the fix
+/// (the held line is a root), and once approved it lands whole.
+#[test]
+fn bug_1875_the_collector_keeps_a_held_embargos_fix_until_it_lands() {
+    use veil_server::pack_gc::{self, Options};
+    const FIX_FILE: &str = "pub const FIX: &str = \"GC_KEEPS_HELD_FIX_1875\";\n";
+    let hub = TestHub::start();
+    let (p, rev1) = protected_project(&hub);
+    let api = hub.api();
+    let (sec, dev) = (p.sec.token(), p.dev.token());
+    let h = hub.hub();
+    let pid: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&h.db)).unwrap();
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "gc-1875",
+        "security",
+        Some(veil_core::now_millis() + 3_600_000),
+        &[("src/gc_1875.rs", FIX_FILE)],
+        "an embargoed fix",
+    );
+    let line = format!("embargo/{eid}");
+    let blob = ObjectId::hash(&veil_core::object::Object::Blob(FIX_FILE.as_bytes().to_vec()).encode());
+
+    // The embargo's PR, closed again; then its release is asked for, and held.
+    let pr = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs", p.name), &json!({"head": line, "title": "the fix"}));
+    assert_eq!(pr.status, 200, "{}", body_str(&pr));
+    let closed = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs/{}/close", p.name, pr.json()["id"].as_str().unwrap()), &json!({}));
+    assert_eq!(closed.status, 200, "{}", body_str(&closed));
+    let rel = api.post_json(Some(&sec), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+    assert_eq!(rel.status, 409, "{}", body_str(&rel));
+    assert!(released_at(&hub, &eid).is_none(), "held, not released");
+
+    // Two collections, the second past the retention window.
+    for now_offset_ms in [0, 180_000] {
+        let opts = Options { min_packs_to_merge: 2, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms, ..Options::default() };
+        let r = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).unwrap();
+        assert!(!r.skipped, "{r:?}");
+    }
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    assert!(hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "the collector deleted a held embargo's fix");
+    assert!(api.tips(Some(&sec), &p.name).unwrap().branches.contains_key(&line), "the held line stays");
+
+    // A new PR of the line, approved: the fix lands whole.
+    let pr2 = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs", p.name), &json!({"head": line, "title": "the fix, again"}));
+    assert_eq!(pr2.status, 200, "{}", body_str(&pr2));
+    let ok = approve(&api, &rev1, &p.name, &pr2.json());
+    assert_eq!(ok.status, 200, "{}", body_str(&ok));
+    assert!(released_at(&hub, &eid).is_some(), "approved, the held release lands");
+    let f = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev=main&path=src/gc_1875.rs", p.name));
+    assert_eq!(f.status, 200, "{}", body_str(&f));
+    assert!(body_str(&f).contains("GC_KEEPS_HELD_FIX_1875"), "{}", body_str(&f));
+}
+
+/// BUG-1875: a release's landing ticket is of one tip of the line. A ticket
+/// that landed (a release that landed and did not finish; made here by
+/// renaming two landed tickets of the project: to the ticket's name before
+/// the fix, and to the first tip's) never stands in for commits pushed to
+/// the line since: the release lands them too, and only then retires the
+/// line.
+#[test]
+fn bug_1875_a_ticket_that_landed_an_earlier_tip_never_retires_later_commits_unlanded() {
+    const FIX: &str = "FIRST_TIP_FIX_1875";
+    const MORE: &str = "PUSHED_SINCE_1875";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let api = hub.api();
+    let (sec, dev) = (p.sec.token(), p.dev.token());
+    let h = hub.hub();
+    let pid: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&h.db)).unwrap();
+    // Two ordinary landings: their tickets are renamed below.
+    set_main_file(&hub, &p, "docs/a_1875.md", "a\n", "an ordinary landing");
+    set_main_file(&hub, &p, "docs/b_1875.md", "b\n", "another");
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "ticket-1875",
+        "security",
+        Some(veil_core::now_millis() + 3_600_000),
+        &[("src/first_tip_1875.rs", &format!("pub const FIX: &str = \"{FIX}\";\n"))],
+        "an embargoed fix",
+    );
+    let line = format!("embargo/{eid}");
+    let tip1 = api.tips(Some(&sec), &p.name).unwrap().branches[&line];
+    let real_tip1: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2").bind(pid).bind(&line).fetch_one(&h.db))
+        .unwrap();
+    let landed: Vec<String> = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT ticket FROM landing_queue WHERE project_id = $1 AND state = 'landed' ORDER BY created_at DESC LIMIT 2")
+                .bind(pid)
+                .fetch_all(&h.db),
+        )
+        .unwrap();
+    assert_eq!(landed.len(), 2, "{landed:?}");
+    for (old, new) in landed.iter().zip([format!("embargo-{pid}-{eid}"), format!("embargo-{pid}-{eid}-{}", &real_tip1[..16])]) {
+        let n = hub
+            .rt
+            .block_on(sqlx::query("UPDATE landing_queue SET ticket = $1 WHERE project_id = $2 AND ticket = $3").bind(&new).bind(pid).bind(old).execute(&h.db))
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 1, "{old} -> {new}");
+    }
+
+    // More work, pushed onto the line since.
+    let more = api.post_json(
+        Some(&sec),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": tip1.hex(),
+            "description": "more of the fix",
+            "edits": [{"path": "src/pushed_since_1875.rs", "put": {"text": format!("pub const MORE: &str = \"{MORE}\";\n")}}],
+        }),
+    );
+    assert_eq!(more.status, 200, "{}", body_str(&more));
+    let more_snap = more.json()["snapshot"].as_str().unwrap().to_string();
+    let pushed = api.post_json(
+        Some(&sec),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": line, "expected": tip1.hex(), "new": more_snap}]}),
+    );
+    assert_eq!(pushed.status, 200, "{}", body_str(&pushed));
+    assert_eq!(api.tips(Some(&sec), &p.name).unwrap().branches[&line].hex(), more_snap, "{}", body_str(&pushed));
+
+    // The release lands the whole line.
+    let rel = api.post_json(Some(&sec), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+    assert_eq!(rel.status, 200, "{}", body_str(&rel));
+    assert!(released_at(&hub, &eid).is_some(), "released");
+    for (path, mark) in [("src/first_tip_1875.rs", FIX), ("src/pushed_since_1875.rs", MORE)] {
+        let f = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev=main&path={path}", p.name));
+        assert_eq!(f.status, 200, "{path} is on no branch after the release: {}", body_str(&f));
+        assert!(body_str(&f).contains(mark), "{}", body_str(&f));
+    }
 }

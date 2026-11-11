@@ -1647,6 +1647,8 @@ fn embargoed_stack_across_guess_windows_stays_on_hidden_line_until_release_and_p
         until: Some(veil_core::now_millis() + 3_600_000),
         created: veil_core::now_millis(),
         released_at: None,
+        state: None,
+        reason: None,
     };
 
     let (listed_before, discarded_before) = pack_rows(&hub, pid);

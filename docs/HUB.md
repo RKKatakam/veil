@@ -5141,7 +5141,8 @@ vl embargo release ID
     server's local clock.
   * **Landing onto the target branch:** for each due embargo whose hidden
     branch still exists, `release_one` queues a deterministic landing ticket
-    (`embargo-<project_id>-<embargo_id>`) onto `target_branch` (`main`) with
+    (`embargo-<project_id>-<embargo_id>-<line tip>`: one per tip of the line, so a ticket that landed an earlier
+    tip never stands in for commits pushed to the line since) onto `target_branch` (`main`) with
     `ON CONFLICT (ticket) DO NOTHING` and waits for S17's fenced landing service
     to land the embargoed stack onto `target_branch` once, recording each
     server-signed snapshot's author in `snapshots.author` (BUG-1581).
@@ -5151,10 +5152,27 @@ vl embargo release ID
     deletes the embargo's `embargo_snapshots` rows, notifies `pg_notify` on
     `TIPS_CHANNEL`, and wakes `derive::landed` so derived history and search
     catch up on `main`.
-  * **Retries and conflicts:** if a release attempt fails before finalizing or
-    hits a content conflict on `target_branch`, `released_at` remains `NULL`, so
-    a transient failure is retried on the next tick and a conflicted line is
-    kept on `embargo/<id>` for a member to rebase and push again.
+  * **Retries and conflicts:** each due embargo is released on its own (BUG-1857). If a release attempt fails
+    before finalizing or hits a content conflict on `target_branch`, `released_at` remains `NULL` and the
+    embargo's record says `failed` and why (`state`, `reason`: read only by its groups and admins); a conflicted
+    line is kept on `embargo/<id>` for a member to rebase and push again (the push clears the state). The loop
+    tries stuck releases (failed, or held for approval) again every 30 s (`RETRY_STUCK`), after the fresh ones,
+    so a stuck embargo neither delays another's deadline nor is forgotten.
+  * **Review rules and the hold (BUG-1861):** a release is a landing. Onto a protected branch `release_one`
+    asks `prs::check_landing_review_for_embargo` before it queues, as every other route does (§13.24), and an
+    open PR of the embargo whose current revision is the line's patch counts with its approvals. Unapproved,
+    the release is **held**: nothing lands, nothing turns public, `released_at` stays `NULL`, the record says
+    `waiting_for_approval` with the refusal a direct landing gets, and `until_ms` becomes now (the release was
+    asked for: it is due from then on). The route answers `409 not_ready`; a push that carries the release
+    succeeds with a warning. An approval of one of the embargo's PRs (`prs::add_review`), or a dismissal
+    (`prs::dismiss`), tries the release again at once, so it lands once approved. The landing is queued through
+    `landing::insert` (the submitter's outstanding-landing bounds, §13.32): its submitter is the person
+    releasing if they may write every path of it, else the embargo's creator, else the project's first admin.
+  * **The line always lands (BUG-1875):** whatever PRs the embargo has, and whatever their state, the release
+    first lands the line under the ticket above, then finishes in `prs::embargo::finish_release` (§13.38). The
+    hidden branch is deleted in the release transaction only at the tip that landed (a push that moved it
+    meanwhile refuses the release, which is tried again), so the collector's roots (the hidden branch, then
+    the target branch) hold the fix throughout.
   * **Early release (`vl embargo release <id>` and `POST …/embargoes/{id}/release`):**
     when a member of the embargo (or an admin) pushes an `EmbargoRecord` with
     `released_at` set or calls `release_route` (which drops bulkhead gates via
@@ -5423,7 +5441,7 @@ Design: [`docs/design/server/phase-4-agent-scale.md` §4.9, decision 8, §8](des
 * **Schema (`migrations/0028_embargo_prs.sql`, migration 28).**
   * `pr_classes.embargo TEXT NOT NULL DEFAULT ''`: extends each PR visibility class to hash `(policy_key, deciding_lines, embargo_id)` (`class::put_class_for`, `class::satisfies_with_embargoes`). A viewer satisfies an embargoed class iff they satisfy the path class (`admin` or every touched path readable, and inside `viewer.only` for S11 narrowed sessions) **and** can see `embargo` (`viewer.admin` or live membership in `embargo_lines.group_names`). Reclassification when `.veilpolicy` changes (`class::reclassify`) preserves `embargo`.
   * `prs.embargo TEXT NOT NULL DEFAULT ''` (indexed by `prs_by_embargo (project_id, embargo)`) and `prs.land_at_release BOOLEAN NOT NULL DEFAULT FALSE`: record the unreleased embargo governing the PR and whether it is armed to land when the embargo releases.
-  * `embargo_lines.has_pr BOOLEAN NOT NULL DEFAULT FALSE`: sticky marker set in the PR creation transaction so `embargo::release_one` never auto-lands an `embargo/<id>` line directly once a PR has been opened on it (even if that PR is later closed).
+  * `embargo_lines.has_pr BOOLEAN NOT NULL DEFAULT FALSE`: set in the PR creation transaction. No longer read: since BUG-1875 a release lands the line whether or not the embargo ever had a PR.
   * `pr_embargo_holds (project_id, embargo, person, path, pr, at, PRIMARY KEY (project_id, embargo, person, path))` (indexed by `pr_embargo_holds_by_path`): isolates `request-changes` path holds on unreleased embargoed PRs from public `pr_holds`, preventing an embargoed review hold from leaking onto an outsider's public PR touching the same file before release.
 * **Non-existence to outsiders and zero derived-index footprint before release.**
   * Every read and write PR route (`list`, `search`, `count`, `show`, `diff`, `threads`, `revisions`, `close`, `reviews`, `dismiss`, `land`), SSE `pr.*` fan-out (`events::emit_pr`), and CI check/tested resolution (`ci.rs`, BUG-1760) filters by `prs::visible` / `embargo::can_see` / `embargo::is_withheld_from_viewer`. Outsiders receive the exact `404` status and body of a missing PR (`pr-00000000`) and see unchanged counts and empty search/event results.
@@ -5434,17 +5452,20 @@ Design: [`docs/design/server/phase-4-agent-scale.md` §4.9, decision 8, §8](des
   * Protected branch `.veilrules` (`approvals`, `people_only`, `request-changes` holds, patch-bound dismissal, survival across rebases / `vl embargo follow`) apply identically. S11 agent sessions never approve (`403 agent_session`), narrowed agent sessions see and mutate embargoed PRs only when every touched path across all revisions lies inside `only` (and never touch `.veilpolicy` or `.veilrules`), and S19 CI runners may read embargoed PRs and post `POST /checks` when in the embargo group while being refused (`403 ci_runner`) on all PR write and embargo release routes.
 * **Arming and release across servers (`vl pr create --land-at-release`, `vl pr land --at-release|--no-at-release`).**
   * Before release, `POST /v1/projects/{p}/prs/{id}/land` with empty body refuses immediate landing (`409`); passing `{"at_release": true}` or `{"at_release": false}` arms or disarms `prs.land_at_release` (requiring target-branch write permission and `landing::agent_stack` for agent sessions) without inserting into `landing_queue`.
-  * When `embargo::release_one` fires (at `until_ms <= clock_timestamp()` via `release_due` or via `POST /embargoes/{id}/release` / pushed `EmbargoRecord`), `prs::embargo::release_embargo_prs` coordinates across concurrent servers:
-    1. Each open PR on the embargo with `land_at_release = true` re-evaluates its revision and S21 `review::gate` against the live target branch; if ready, it queues deterministic ticket `embargo-pr-<project_id>-<pr_id>` (`ON CONFLICT (ticket) DO NOTHING`) and awaits S17 (`snapshots.author` recorded). If unapproved or held at deadline release, it does **not** land on a protected branch.
-    2. In one `READ COMMITTED` transaction guarded by `UPDATE embargo_lines ... WHERE released_at IS NULL`, the winning server transitions each PR to its plain visibility class (`embargo = ''`, `land_at_release = FALSE`, `state = 'landed'` for those that landed and `'open'` otherwise, retargeting `embargo/<id>` to `target_branch`), promotes remaining open `pr_embargo_holds` into `pr_holds`, deletes `branches` (`embargo/<id>`) and `embargo_snapshots`, triggers `derive::landed` when a branch moved, and emits `embargo.released` and `pr.landed` / `pr.opened` once.
+  * When `embargo::release_one` fires (at `until_ms <= clock_timestamp()` via `release_due`, or via `POST /embargoes/{id}/release` / a pushed `EmbargoRecord`), it first lands the line itself on `target_branch` under S21's rules, or holds the release (§13.31, BUG-1861, BUG-1875); a PR of the line counts there with its approvals, armed or not. Then `prs::embargo::finish_release` coordinates across concurrent servers:
+    1. Each open PR of the embargo is judged against the branch it lands on (a PR onto `embargo/<id>`: `target_branch`). Nothing of it left to land (the line carried it): it is `landed`. A PR onto the line whose landing would carry a change its revision does not list (the line was rewritten under it) is `closed`, never retargeted: its review covered the top changes only. Armed (`land_at_release = true`) and ready under S21 `review::gate`: it lands under the deterministic ticket `embargo-pr-<project_id>-<pr_id>-<head>` through S17 (`snapshots.author` recorded). Otherwise it becomes an ordinary open PR. None of this stops the release: the line has landed.
+    2. In one `READ COMMITTED` transaction guarded by `UPDATE embargo_lines ... WHERE released_at IS NULL`, the winning server transitions each PR to its plain visibility class (`embargo = ''`, `land_at_release = FALSE`, `state = 'landed'`, `'closed'` or `'open'` as above, retargeting `embargo/<id>` to `target_branch`), promotes remaining open `pr_embargo_holds` into `pr_holds`, deletes `branches` (`embargo/<id>`, only at the tip that landed) and `embargo_snapshots`, triggers `derive::landed`, and emits `embargo.released` and `pr.landed` / `pr.closed` / `pr.opened` once.
 
 | # | Guarantee | Test (`server_hub::embargo_prs`) |
 |---|---|---|
 | 1 | Until release, an embargoed PR is visible only to embargo members (with path read access) and project admins across every route and event; to outsiders it does not exist and reads byte-for-byte like a missing PR | `guarantee_1_embargoed_pr_is_visible_only_to_members_and_admins_and_nonexistent_to_outsiders` |
 | 2 | Only embargo members with write access review and approve it, live removal drops approval count, protected-branch `.veilrules` hold, and agent sessions never approve | `guarantee_2_only_embargo_members_review_and_protected_branch_and_agent_rules_hold` |
-| 3 | At release it transitions once across two concurrent servers to an ordinary open PR, or lands once through S17 (`snapshots.author` recorded) when `land_at_release` is set and S21's review rules are met | `guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers` |
+| 3 | At release the line lands once through S17 across two concurrent servers when S21's review rules are met (`snapshots.author` recorded) and its PR is `landed`; a PR onto the line becomes an ordinary open PR once (or lands too, armed and ready); unapproved, the release is held and lands once approved | `guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers` |
 | 4 | Nothing about an unreleased embargoed PR leaks into `q/search`, `q/blame`, `q/history`, `q/log`, `q/generations`, `q/resolve`, public `pr_holds`, SSE events, or `landing_queue` | `guarantee_4_nothing_leaks_into_search_blame_history_or_landing_queue_before_release` |
 | 5 | S19 CI runners in the embargo group may post checks but are refused (`403 ci_runner`) on all PR writes and release; S11 narrowed agent sessions act only within their narrowed paths | `guarantee_5_ci_runners_refused_on_writes_and_narrowed_agents_restricted_to_their_paths` |
+| 6 | A release onto a protected branch never lands unapproved and never turns public without landing: it is held, hidden, its groups are told, and it lands once an embargo PR of the line is approved (BUG-1861) | `bug_1861_an_unapproved_release_is_held_hidden_and_lands_once_approved`, `rv_landing::bug_1861_an_embargo_release_never_lands_an_unapproved_change_on_a_protected_branch` |
+| 7 | A release lands the line whatever the state of its PRs (closed, or onto the line), and the collector keeps a held fix (BUG-1875) | `bug_1875_a_released_embargo_whose_pr_was_closed_keeps_its_fix_on_a_branch`, `bug_1875_a_released_embargo_with_a_pr_onto_its_line_keeps_its_fix_on_a_branch`, `bug_1875_the_collector_keeps_a_held_embargos_fix_until_it_lands`, `bug_1875_a_ticket_that_landed_an_earlier_tip_never_retires_later_commits_unlanded` |
+| 8 | A PR onto the line never lands the line's changes under its own review: not at a held release, and not retargeted onto a rewritten line (BUG-1875) | `bug_1875_a_pr_onto_the_line_never_lands_the_lines_changes_under_its_own_review`, `bug_1875_a_pr_onto_a_rewritten_line_is_closed_at_release_and_lands_nothing_unreviewed` |
 
 ### 13.39 S25: the web client, first version, with no secrets (`crates/veil-core/src/hub/web.rs`, `crates/veil-server/src/web/`, built)
 

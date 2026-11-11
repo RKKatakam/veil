@@ -588,11 +588,13 @@ async fn commit(
     person: i64,
     mv: Option<Move>,
     land: Option<&(crate::landing::Submitter, crate::landing::Queued)>,
+    base_embargo: Option<&str>,
 ) -> Result<Option<bool>> {
     let pid = who.project.id;
     // A landing: the change (and what it stacks on: `landing::stack`) joins
     // the queue in this same commit.
     let land = land.cloned();
+    let base_embargo = base_embargo.map(str::to_string);
     let view_key = (!who.viewer.admin).then(|| who.project.view(&who.viewer).key());
     let mut snaps: Vec<(String, String)> = restacked.iter().map(|(n, _, m)| (n.hex(), m.hex())).collect();
     snaps.push((built.real.hex(), built.mine.hex()));
@@ -625,7 +627,7 @@ async fn commit(
         }
     };
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-        let (real, cid, accept, policy_text_update, mv, view_key, snaps, moved_refs, land, on_branch, expected_prev) = (
+        let (real, cid, accept, policy_text_update, mv, view_key, snaps, moved_refs, land, on_branch, expected_prev, base_embargo) = (
             real.clone(),
             cid.clone(),
             accept.clone(),
@@ -637,6 +639,7 @@ async fn commit(
             land.clone(),
             on_branch.clone(),
             expected_prev.clone(),
+            base_embargo.clone(),
         );
         let rules_landing = rules_landing.clone();
         Box::pin(async move {
@@ -685,6 +688,16 @@ async fn commit(
                     .bind(person)
                     .execute(&mut *c)
                     .await?;
+                if let Some(eid) = &base_embargo {
+                    for s_id in [snap.as_str(), mine.as_str()] {
+                        sqlx::query("INSERT INTO embargo_snapshots (project_id, snapshot, embargo_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                            .bind(pid)
+                            .bind(s_id)
+                            .bind(eid)
+                            .execute(&mut *c)
+                            .await?;
+                    }
+                }
                 if let Some(key) = &view_key {
                     let n = sqlx::query(
                         // The caller's own changes: in their history (never collapsed).
@@ -1043,6 +1056,21 @@ pub(crate) async fn create_with(
     };
     let target = onto.as_ref().map(|o| o.branch.clone()).or_else(|| land.as_ref().map(|(_, q)| q.branch.clone()));
     let base_real = resolve_base(hub, project, viewer, req.base, target.as_deref(), land.is_some()).await?;
+    let base_eids = crate::embargo::active_embargoes_of(hub, project.id, &[base_real], &HashMap::new(), None).await?;
+    for eid in &base_eids {
+        if !crate::embargo::can_see(hub, project, viewer, eid).await? {
+            return Err(Error::not_found(format!("no snapshot {} that you can see", req.base.short())));
+        }
+    }
+    if base_eids.len() > 1 {
+        return Err(bad("a change cannot build on multiple active embargoes"));
+    }
+    let base_embargo: Option<String> = base_eids.into_iter().next();
+    if let (Some(eid), Some((_, q))) = (&base_embargo, &land) {
+        if veil_core::embargo::embargo_id_of_branch(&q.branch) != Some(eid.as_str()) {
+            return Err(bad(format!("cannot land work built on unreleased embargo {eid} onto '{}'", q.branch)));
+        }
+    }
     let base_proj = if req.base == ObjectId([0; 32]) {
         sync::projected(hub, project, viewer, base_real).await?
     } else {
@@ -1086,8 +1114,13 @@ pub(crate) async fn create_with(
     // stack of the caller's own unlanded changes on it); the change is
     // still made and kept on its ref. All judged on the caller's view.
     let mut rejected: Option<String> = None;
+    if let (Some(eid), Some(o)) = (&base_embargo, &onto) {
+        if veil_core::embargo::embargo_id_of_branch(&o.branch) != Some(eid.as_str()) {
+            rejected = Some(format!("cannot put work built on unreleased embargo {eid} onto '{}'", o.branch));
+        }
+    }
     // Only the landing service moves a protected branch (S17).
-    if let Some(o) = &onto {
+    if let (None, Some(o)) = (&rejected, &onto) {
         let default_tip = tip(hub, project.id, &project.default_branch).await?;
         let protected = sync::blocking(hub, project.id, move |src| crate::landing::protected(src, default_tip)).await?;
         if protected.contains(&o.branch) {
@@ -1096,7 +1129,7 @@ pub(crate) async fn create_with(
     }
     let (mut parent, mut pparent) = (base_real, base_proj);
     let mut restacked = Vec::new();
-    if let (Some(o), Some(c)) = (&onto, cur) {
+    if let (None, Some(o), Some(c)) = (&rejected, &onto, cur) {
         if let Expected::Tip(t) = o.expected {
             if sync::projected(hub, project, viewer, c).await? != t {
                 rejected = Some("the branch has moved since you last saw it".into());
@@ -1171,7 +1204,7 @@ pub(crate) async fn create_with(
                 },
                 Err(why) => return Err(bad(why)),
             };
-            // S11's agent rule (`agent_tip`) on the stack's edits before the
+            // S11's agent rule (`agent_stack`) on the stack's edits before the
             // landing is queued (BUG-1636).
             crate::landing::agent_stack(hub, &who.project, &who.viewer, &q.branch, &judged, built.real, false, None).await?;
             *q.skipped.lock().unwrap() = judged.skipped;
@@ -1261,7 +1294,7 @@ pub(crate) async fn create_with(
             },
             _ => None,
         };
-        match commit(hub, &plan, &who, &built, &restacked, person.id, mv, land.as_ref()).await {
+        match commit(hub, &plan, &who, &built, &restacked, person.id, mv, land.as_ref(), base_embargo.as_deref()).await {
             Ok(m) => break (built, m),
             // The tip moved during the request: try again on the new one,
             // with the access as it is now (BUG-1051).

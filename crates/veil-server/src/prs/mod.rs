@@ -1481,6 +1481,9 @@ pub async fn add_review(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
         return Err(Error::conflict("the PR changed meanwhile: look at it again"));
     }
     crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.review").await;
+    if !pr.embargo.is_empty() && q.verdict == "approve" {
+        crate::embargo::try_release_waiting(hub, ask.project.id, &pr.embargo).await;
+    }
     show(hub, ask, id).await
 }
 
@@ -1504,6 +1507,7 @@ pub async fn dismiss(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: Di
     if review::dismiss(hub, ask.project.id, &pr, person).await? == 0 {
         return Err(Error::not_found(format!("{} has no request for changes on this PR", q.person)));
     }
+    crate::embargo::try_release_waiting_in_project(hub, ask.project.id).await;
     show(hub, ask, id).await
 }
 
@@ -1517,14 +1521,46 @@ pub async fn dismiss_route(
     Ok(Json(dismiss(&hub, &ask, &caller, &id, q).await?))
 }
 
+/// Paths touched by `stack` when applied onto its entries' bases.
+pub async fn stack_touched_paths(
+    hub: &Arc<Hub>,
+    project_id: i64,
+    stack: &[crate::landing::Entry],
+    staged: Option<Arc<crate::sync::Staged>>,
+) -> Result<Vec<String>> {
+    if stack.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries = stack.to_vec();
+    crate::sync::blocking_staged(hub, project_id, staged, move |src| {
+        let mut touched = BTreeSet::new();
+        for e in &entries {
+            let s = src.snapshot(&e.id)?;
+            let parent = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) {
+                e.base
+            } else {
+                s.parents.first().copied().unwrap_or_else(crate::sync::root_snapshot_id)
+            };
+            let ptree = src.snapshot(&parent)?.tree;
+            let (leaves, dirs) = crate::derive::changes::diff(src, ptree, s.tree)?;
+            for c in &leaves {
+                touched.insert(c.path.clone());
+            }
+            touched.extend(dirs.into_iter().filter(|d| !d.is_empty()));
+        }
+        Ok(touched.into_iter().collect())
+    })
+    .await
+}
+
 /// Check the review rules in force for a landing `stack` onto a protected
 /// `branch` (S17 + S21, `docs/HUB.md` §13.24): every landing onto a protected
 /// branch meets the review rules by every route (push, `POST …/land`, API
-/// commit with land, and `POST …/prs/{id}/land`). If an open PR on `branch`
-/// has `stack`'s patch as its current revision (and covers its paths), its
-/// gate decides (and its id is returned so it is marked `landed` when the
-/// landing commits); otherwise `stack` is rated directly under the rules in
-/// force with 0 approvals.
+/// commit with land, `POST …/prs/{id}/land`, and embargo release). If an open
+/// PR on `branch` has `stack`'s patch as its current revision (and covers its
+/// paths), its gate decides (and its id is returned so it is marked `landed`
+/// when the landing commits); otherwise `stack` is rated directly under the
+/// rules in force with 0 approvals.
 pub async fn check_landing_review(
     hub: &Arc<Hub>,
     project: &crate::perm::Project,
@@ -1533,6 +1569,22 @@ pub async fn check_landing_review(
     stack: &[crate::landing::Entry],
     staged: Option<Arc<crate::sync::Staged>>,
     branch_protected: bool,
+) -> Result<Option<String>> {
+    check_landing_review_for_embargo(hub, project, viewer, branch, stack, staged, branch_protected, None).await
+}
+
+/// [`check_landing_review`] for an embargo's release: a PR of that embargo
+/// may carry the approvals (BUG-1861).
+#[allow(clippy::too_many_arguments)]
+pub async fn check_landing_review_for_embargo(
+    hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    viewer: &Viewer,
+    branch: &str,
+    stack: &[crate::landing::Entry],
+    staged: Option<Arc<crate::sync::Staged>>,
+    branch_protected: bool,
+    embargo_id: Option<&str>,
 ) -> Result<Option<String>> {
     if stack.is_empty() {
         return Ok(None);
@@ -1552,7 +1604,8 @@ pub async fn check_landing_review(
                 e.base
             } else {
                 s.parents.first().copied().unwrap_or_else(crate::sync::root_snapshot_id)
-            };
+            }
+            ;
             let ptree = src.snapshot(&parent)?.tree;
             let (leaves, dirs) = crate::derive::changes::diff(src, ptree, s.tree)?;
             if !leaves.is_empty() {
@@ -1591,21 +1644,24 @@ pub async fn check_landing_review(
         return Ok(None);
     }
 
-    type Cand = (String, i64, String, String, String, i32, i64, i64);
+    type Cand = (String, i64, String, String, String, i32, i64, i64, String, bool);
     let cands: Vec<Cand> = sqlx::query_as(
-        "SELECT p.id, p.author, pe.name, p.title, p.body, p.revision, p.created_at, p.updated_at \
+        "SELECT p.id, p.author, pe.name, p.title, p.body, p.revision, p.created_at, p.updated_at, p.embargo, p.land_at_release \
          FROM prs p JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = p.revision \
          JOIN people pe ON pe.id = p.author \
-         WHERE p.project_id = $1 AND p.target = $2 AND p.state = 'open' AND p.embargo = '' AND r.patch = $3 \
+         WHERE p.project_id = $1 AND p.target = $2 AND p.state = 'open' \
+           AND (p.embargo = '' OR ($4::text IS NOT NULL AND p.embargo = $4)) \
+           AND r.patch = $3 \
          ORDER BY p.updated_at DESC, p.id DESC",
     )
     .bind(project.id)
     .bind(branch)
     .bind(&patch)
+    .bind(embargo_id)
     .fetch_all(&hub.db)
     .await?;
     let mut not_ready_reasons: Option<Vec<String>> = None;
-    for (id, author, author_name, title, body, revision, created_at, updated_at) in cands {
+    for (id, author, author_name, title, body, revision, created_at, updated_at, pr_embargo, land_at_release) in cands {
         let pr_paths: BTreeSet<String> = review::paths_of(hub, project.id, &id).await?.into_iter().collect();
         if !touched.is_subset(&pr_paths) {
             continue;
@@ -1621,8 +1677,8 @@ pub async fn check_landing_review(
             revision,
             created_at,
             updated_at,
-            embargo: String::new(),
-            land_at_release: false,
+            embargo: pr_embargo,
+            land_at_release,
         };
         let revs = rated(hub, project.id, &pr.id, &rules).await?;
         let pr_risk = revs
@@ -1657,7 +1713,11 @@ pub async fn check_landing_review(
     }
     let paths: Vec<String> = touched.into_iter().collect();
     let held: Vec<String> = if branch_protected {
-        review::holds_on(hub, project.id, &paths).await?.into_iter().map(|(_, n, _)| n).collect()
+        review::holds_for_pr(hub, project.id, embargo_id.unwrap_or(""), &paths)
+            .await?
+            .into_iter()
+            .map(|(_, n, _)| n)
+            .collect()
     } else {
         Vec::new()
     };

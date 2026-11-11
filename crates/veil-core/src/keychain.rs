@@ -919,12 +919,19 @@ pub struct EmbargoRecord {
     pub until: Option<i64>,
     pub released_at: Option<i64>,
     pub created: i64,
+    /// Server-recorded hold or failure state when release could not complete (e.g. `"failed"`, `"waiting_for_approval"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Human-readable reason accompanying `state`, shown only to the embargo's groups and admins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl EmbargoRecord {
-    /// Released: by `vl embargo release`, or its deadline has passed.
+    /// Released: by `vl embargo release`, or its deadline has passed without a server hold/failure.
     pub fn is_released(&self) -> bool {
-        self.released_at.is_some() || self.until.is_some_and(|u| u <= crate::now_millis())
+        self.released_at.is_some()
+            || (self.state.is_none() && self.until.is_some_and(|u| u <= crate::now_millis()))
     }
 
     /// The groups that may see the embargoed work before release.
@@ -2121,6 +2128,8 @@ impl Keychain {
             until,
             released_at: None,
             created: crate::now_millis(),
+            state: None,
+            reason: None,
         };
         self.save_embargo(&rec)?;
         Ok(id)
@@ -2274,6 +2283,14 @@ impl Keychain {
         }
         if local.released_at.is_none() && incoming.released_at.is_some() {
             local.released_at = incoming.released_at;
+            local.state = None;
+            local.reason = None;
+            self.save_embargo(&local)?;
+        } else if local.released_at.is_none()
+            && (local.state != incoming.state || local.reason != incoming.reason)
+        {
+            local.state = incoming.state.clone();
+            local.reason = incoming.reason.clone();
             self.save_embargo(&local)?;
         }
         Ok(None)

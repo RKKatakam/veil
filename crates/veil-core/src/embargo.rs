@@ -489,6 +489,8 @@ pub fn follow(
         until: None,
         released_at: None,
         created: merge_snap.timestamp,
+        state: None,
+        reason: None,
     });
 
     let mut tx = repo.transaction(format!("follow embargo {id}"))?;

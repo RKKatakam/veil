@@ -38,11 +38,10 @@ use super::{
     state, PrRow, DEADLINE,
 };
 use crate::{
-    auth::{Caller, Person},
     db::{transaction, Isolation},
     derive::changes,
     error::{Error, Result},
-    perm::{self, Project, Viewer},
+    perm::{Project, Viewer},
     query::{
         self,
         graph::{blocking, ensure, G},
@@ -193,6 +192,16 @@ pub async fn resolve_head(
 
     // 3. Ordinary revision resolution (which withholds unreleased embargo snapshots as 404).
     let (_, real) = query::resolve_real(hub, ask, head_spec, deadline).await?;
+    let eids = crate::embargo::active_embargoes_of(hub, ask.project.id, &[real], &HashMap::new(), None).await?;
+    if eids.len() > 1 {
+        return Err(Error::bad_request("a pull request cannot combine multiple active embargoes"));
+    }
+    if let Some(eid) = eids.into_iter().next() {
+        if !crate::embargo::can_see(hub, &ask.project, &ask.viewer, &eid).await? {
+            return Err(not_found());
+        }
+        return Ok((real, Some(eid)));
+    }
     Ok((real, None))
 }
 
@@ -467,6 +476,9 @@ pub async fn land_embargoed(
     pr: &PrRow,
     at_release: Option<bool>,
 ) -> Result<Value> {
+    if !crate::embargo::can_see(hub, &ask.project, &ask.viewer, &pr.embargo).await? {
+        return Err(super::not_a_pr());
+    }
     let paths = review::paths_of(hub, ask.project.id, &pr.id).await?;
     if pr.author != me && !review::writes_all(&ask.project, &ask.viewer, &paths) {
         return Err(Error::forbidden(
@@ -521,63 +533,92 @@ pub async fn land_embargoed(
     }
 }
 
-/// Release an embargo (`has_pr = true`) whose changes are tracked by one or
-/// more embargoed PRs.
+/// S11, when an agent session asks for an embargo's release: every path of
+/// the embargo's PRs lies inside its narrowing, and none decides access
+/// (the line's own changes: `landing::agent_stack`, in `release_one`).
+pub async fn agent_may_release(hub: &Arc<Hub>, project: &Project, embargo_id: &str, viewer: &Viewer) -> Result<()> {
+    if viewer.only.is_none() && !viewer.agent {
+        return Ok(());
+    }
+    let prs: Vec<String> = sqlx::query_scalar("SELECT id FROM prs WHERE project_id = $1 AND embargo = $2 ORDER BY id")
+        .bind(project.id)
+        .bind(embargo_id)
+        .fetch_all(&hub.db)
+        .await?;
+    for pr_id in &prs {
+        let paths = review::paths_of(hub, project.id, pr_id).await?;
+        if viewer.only.is_some() && paths.iter().any(|p| !viewer.within_narrowing(p)) {
+            return Err(crate::sync::agent_refusal(crate::sync::NARROWED_MOVE));
+        }
+        if viewer.agent && paths.iter().any(|p| veil_core::hub::agent::decides_access(p)) {
+            return Err(crate::sync::agent_refusal(crate::sync::AGENT_ACCESS_MOVE));
+        }
+    }
+    Ok(())
+}
+
+/// The last step of an embargo's release (`embargo::release_one`), once the
+/// line's own changes are on `target_branch` (BUG-1875: every release lands
+/// the line first, whatever PRs the embargo has):
+///
+/// 1. Each **open** PR of the embargo is judged against the branch it lands
+///    on (a PR onto `embargo/<id>`: `target_branch`):
+///    * nothing of it is left to land (the line carried it): it is `landed`;
+///    * a PR onto the line whose landing would carry a change its revision
+///      does not list (the line was rewritten under it) is `closed`: it is
+///      never retargeted to land changes under a review that did not cover
+///      them;
+///    * armed (`land_at_release`) and ready under S21's rules: it lands,
+///      under the deterministic ticket `embargo-pr-<project>-<pr>-<head>`;
+///    * otherwise it becomes an ordinary open PR.
+///
+///    Nothing here stops the release: the line has landed, so it finishes.
+/// 2. In one transaction guarded by `released_at IS NULL` (one server wins):
+///    `released_at`, the PRs' plain classes and states, the holds, and the
+///    hidden line and the embargo's snapshot rows. The line is deleted only
+///    at `etip`, the tip that landed: if a push moved it meanwhile the
+///    release is refused whole and tried again (its commits are never left
+///    on no branch).
 #[allow(clippy::too_many_arguments)]
-pub async fn release_embargo_prs(
+pub async fn finish_release(
     hub: &Arc<Hub>,
     project: &Project,
     embargo_id: &str,
     target_branch: &str,
     ebranch: &str,
-    person_id: i64,
-    person_name: &str,
-    device_key: &str,
+    etip: Option<&str>,
+    creator: &(i64, String, String),
     pushed_record: Option<EmbargoRecord>,
     record_json: &str,
-    agent_viewer: Option<&Viewer>,
+    submitter: Option<(&Viewer, &crate::landing::Submitter)>,
 ) -> Result<bool> {
-    type CandRow = (String, String, i64, String, String, String, String, i32, i64, i64, bool);
+    type CandRow = (String, String, i64, String, String, String, i32, i64, i64, bool);
     let prs: Vec<CandRow> = sqlx::query_as(
-        "SELECT p.id, p.target, p.author, pe.name, p.title, p.body, p.state, p.revision, p.created_at, p.updated_at, p.land_at_release \
+        "SELECT p.id, p.target, p.author, pe.name, p.title, p.body, p.revision, p.created_at, p.updated_at, p.land_at_release \
          FROM prs p JOIN people pe ON pe.id = p.author \
-         WHERE p.project_id = $1 AND p.embargo = $2 ORDER BY p.created_at, p.id",
+         WHERE p.project_id = $1 AND p.embargo = $2 AND p.state = 'open' ORDER BY p.created_at, p.id",
     )
     .bind(project.id)
     .bind(embargo_id)
     .fetch_all(&hub.db)
     .await?;
 
-    // Enforce S11 agent narrowing & access-file rules if an agent session asked for early release.
-    if let Some(v) = agent_viewer {
-        for (pr_id, ..) in &prs {
-            let paths = review::paths_of(hub, project.id, pr_id).await?;
-            if v.only.is_some() && paths.iter().any(|p| !v.within_narrowing(p)) {
-                return Err(crate::sync::agent_refusal(crate::sync::NARROWED_MOVE));
-            }
-            if v.agent && paths.iter().any(|p| veil_core::hub::agent::decides_access(p)) {
-                return Err(crate::sync::agent_refusal(crate::sync::AGENT_ACCESS_MOVE));
-            }
-        }
-    }
-
     let admin_viewer = Viewer {
-        person: Some(person_id),
+        person: Some(creator.0),
         admin: true,
         groups: HashSet::new(),
         only: None,
         agent: false,
     };
-
     let rules = state::rules_in_force(hub, project, &project.default_branch).await?;
     let mut landed_prs: HashSet<String> = HashSet::new();
+    let mut closed_prs: HashSet<String> = HashSet::new();
     let mut touched_branches: BTreeSet<String> = BTreeSet::new();
+    touched_branches.insert(target_branch.to_string());
+    let manual_retry = submitter.is_some() || pushed_record.is_some();
 
-    for (id, pr_target, author, author_name, title, body, state_str, revision, created_at, updated_at, land_at_release) in &prs {
-        if state_str != "open" || !*land_at_release {
-            continue;
-        }
-        // Re-check that the embargo has not already been finalized by another server.
+    for (id, pr_target, author, author_name, title, body, revision, created_at, updated_at, land_at_release) in &prs {
+        // Another server may have finished the release meanwhile.
         let still_unreleased: Option<bool> = sqlx::query_scalar(
             "SELECT released_at IS NULL FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
         )
@@ -596,7 +637,7 @@ pub async fn release_embargo_prs(
             author_name: author_name.clone(),
             title: title.clone(),
             body: body.clone(),
-            state: state_str.clone(),
+            state: "open".into(),
             revision: *revision,
             created_at: *created_at,
             updated_at: *updated_at,
@@ -607,6 +648,37 @@ pub async fn release_embargo_prs(
         let Some(current) = revs.iter().find(|r| r.n == pr_row.revision) else {
             continue;
         };
+        let onto_line = pr_target == ebranch;
+        let land_branch = if onto_line { target_branch.to_string() } else { pr_target.clone() };
+        let judged = match crate::landing::stack_for_embargo(
+            hub,
+            project,
+            &admin_viewer,
+            &land_branch,
+            current.head,
+            &HashMap::new(),
+            None,
+            Some(embargo_id),
+        )
+        .await
+        {
+            Ok(Ok(j)) if j.branch => j,
+            _ => continue,
+        };
+        if judged.stack.is_empty() {
+            landed_prs.insert(id.clone());
+            continue;
+        }
+        if onto_line {
+            let listed: HashSet<ObjectId> = current.changes.iter().map(StackChange::snapshot_id).collect();
+            if judged.stack.iter().any(|e| !listed.contains(&e.id)) {
+                closed_prs.insert(id.clone());
+                continue;
+            }
+        }
+        if !*land_at_release {
+            continue;
+        }
         // BUG-1884: a change the server reverted twice needs a person's
         // approval here too, as on every other route that lands a PR.
         let cids: Vec<String> = current.changes.iter().map(|c| c.change.clone()).collect();
@@ -614,7 +686,7 @@ pub async fn release_embargo_prs(
         let gate = review::gate(
             hub,
             project,
-            &admin_viewer,
+            submitter.map(|(v, _)| v).unwrap_or(&admin_viewer),
             &pr_row,
             &current.patch,
             Risk::parse(&current.risk),
@@ -623,134 +695,40 @@ pub async fn release_embargo_prs(
         )
         .await?;
         if !gate.ready {
-            // S21's review rules are not met: do not land onto the branch;
-            // the PR will release as an ordinary open PR instead.
             continue;
         }
-
-        let land_branch = if pr_target == ebranch {
-            target_branch.to_string()
-        } else {
-            pr_target.clone()
-        };
-        let ticket = format!("embargo-pr-{}-{id}", project.id);
-        let existing_outcome = crate::landing::read(hub, project.id, person_id, &ticket).await?;
-        let need_queue = existing_outcome.is_none();
-        if need_queue || agent_viewer.is_some_and(|v| v.agent) {
-            let judged = match crate::landing::stack(
-                hub,
-                project,
-                &admin_viewer,
-                &land_branch,
-                current.head,
-                &HashMap::new(),
-                None,
-            )
-            .await?
-            {
-                Ok(j) if j.branch => j,
-                Ok(_) => continue,
-                Err(why) => {
-                    if pushed_record.is_some() || agent_viewer.is_some() {
-                        return Err(Error::conflict(why));
-                    }
-                    continue;
-                }
-            };
-            if let Some(v) = agent_viewer {
-                crate::landing::agent_stack(hub, project, v, &land_branch, &judged, current.head, false, None).await?;
-            }
-            if need_queue && judged.stack.is_empty() {
-                landed_prs.insert(id.clone());
+        if let Some((v, _)) = submitter {
+            if crate::landing::agent_stack(hub, project, v, &land_branch, &judged, current.head, false, None).await.is_err() {
                 continue;
             }
-            if need_queue && !judged.stack.is_empty() {
-                let (_, _, epochs) = perm::open_at(
-                    hub,
-                    &project.name,
-                    &Caller {
-                        person: Some(Person {
-                            id: person_id,
-                            name: person_name.to_string(),
-                            device_key: device_key.to_string(),
-                            agent: None,
-                        }),
-                        epochs: crate::caches::Epochs::default(),
-                    },
-                )
-                .await?;
-                let who = crate::landing::Submitter {
-                    person: Person {
-                        id: person_id,
-                        name: person_name.to_string(),
-                        device_key: device_key.to_string(),
-                        agent: None,
-                    },
-                    epochs,
-                };
-                let q = crate::landing::Queued {
-                    ticket: ticket.clone(),
-                    branch: land_branch.clone(),
-                    stack: judged.stack,
-                    lineage: judged.lineage,
-                    skipped: Arc::new(std::sync::Mutex::new(judged.skipped)),
-                };
-                sqlx::query(
-                    "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, \
-                     project_epoch, state, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued', \
-                     (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT) ON CONFLICT (ticket) DO NOTHING",
-                )
-                .bind(project.id)
-                .bind(&q.branch)
-                .bind(&q.ticket)
-                .bind(who.person.id)
-                .bind(&who.person.name)
-                .bind(&who.person.device_key)
-                .bind(crate::landing::encode_stack(&q.stack))
-                .bind(q.lineage)
-                .bind(who.epochs.person)
-                .bind(who.epochs.project.map_or(0, |(_, e)| e))
-                .execute(&hub.db)
-                .await?;
-            }
         }
-
-        let w = hub.landing.register(&ticket);
-        if let Some((_, cur)) = crate::landing::read(hub, project.id, person_id, &ticket).await? {
-            let outcome = if cur.state == LandState::Queued {
-                crate::limits::leave_gates();
-                crate::landing::ensure(hub, project.id, &land_branch);
-                let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
-                crate::landing::wait(hub, project.id, person_id, &land_branch, w, deadline).await?
-            } else {
-                crate::landing::abandon(hub, w);
-                cur
-            };
-            if outcome.state == LandState::Landed {
-                landed_prs.insert(id.clone());
-                touched_branches.insert(land_branch);
-            } else if pushed_record.is_some() || agent_viewer.is_some() {
-                return Err(Error::conflict(
-                    outcome
-                        .message
-                        .unwrap_or_else(|| "embargo PR landing did not complete".into()),
-                ));
-            }
-        } else {
-            crate::landing::abandon(hub, w);
+        let (_, who) = crate::embargo::choose_submitter(hub, project, &judged.stack, creator, submitter).await?;
+        // (Per revision: a ticket that landed an earlier head never stands in for this one.)
+        let ticket = format!("embargo-pr-{}-{id}-{}", project.id, &current.head.hex()[..16]);
+        let outcome = crate::embargo::queue_and_wait_embargo_landing(
+            hub,
+            project,
+            embargo_id,
+            &ticket,
+            &land_branch,
+            judged,
+            &who,
+            manual_retry,
+        )
+        .await;
+        if matches!(&outcome, Ok(o) if o.state == LandState::Landed) {
+            landed_prs.insert(id.clone());
+            touched_branches.insert(land_branch);
         }
     }
 
     let now_ms: i64 = sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
         .fetch_one(&hub.db)
         .await?;
-    let mut rec: EmbargoRecord = match pushed_record {
-        Some(r) => r,
-        None => serde_json::from_str(record_json).map_err(|e| Error::Other(e.into()))?,
-    };
-    if rec.released_at.is_none() {
-        rec.released_at = Some(now_ms);
-    }
+    let mut rec: EmbargoRecord = serde_json::from_str(record_json).map_err(|e| Error::Other(e.into()))?;
+    rec.released_at = Some(pushed_record.and_then(|r| r.released_at).unwrap_or(now_ms));
+    rec.state = None;
+    rec.reason = None;
     let new_json = serde_json::to_string(&rec).unwrap_or_else(|_| record_json.to_string());
     let pid = project.id;
     let policy = project.policy.clone();
@@ -758,18 +736,22 @@ pub async fn release_embargo_prs(
     let eid = embargo_id.to_string();
     let ebranch2 = ebranch.to_string();
     let tbranch2 = target_branch.to_string();
+    let etip2 = etip.map(str::to_string);
     let landed_set = landed_prs.clone();
+    let closed_set = closed_prs.clone();
     let notify = hub.caches.notices.load(Ordering::SeqCst);
 
-    let (updated, transitioned): (bool, Vec<(String, bool)>) =
+    let (updated, transitioned): (bool, Vec<(String, &'static str)>) =
         transaction(&hub.db, Isolation::ReadCommitted, move |c| {
             let policy = policy.clone();
             let policy_key = policy_key.clone();
             let eid = eid.clone();
             let ebranch2 = ebranch2.clone();
             let tbranch2 = tbranch2.clone();
+            let etip2 = etip2.clone();
             let new_json = new_json.clone();
             let landed_set = landed_set.clone();
+            let closed_set = closed_set.clone();
             Box::pin(async move {
                 let n = sqlx::query(
                     "UPDATE embargo_lines SET released_at = COALESCE(released_at, $1), record_json = $2 \
@@ -786,8 +768,21 @@ pub async fn release_embargo_prs(
                     return Ok((false, Vec::new()));
                 }
 
-                let pr_ids: Vec<String> = sqlx::query_scalar(
-                    "SELECT id FROM prs WHERE project_id = $1 AND embargo = $2 ORDER BY id",
+                // The line goes only at the tip that landed (BUG-1875).
+                let line_now: Option<String> =
+                    sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2 FOR UPDATE")
+                        .bind(pid)
+                        .bind(&ebranch2)
+                        .fetch_optional(&mut *c)
+                        .await?;
+                if line_now != etip2 {
+                    return Err(Error::conflict(format!(
+                        "embargo {eid}'s line moved while it was being released; the release is tried again"
+                    )));
+                }
+
+                let pr_rows: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT id, state FROM prs WHERE project_id = $1 AND embargo = $2 ORDER BY id",
                 )
                 .bind(pid)
                 .bind(&eid)
@@ -795,7 +790,7 @@ pub async fn release_embargo_prs(
                 .await?;
 
                 let mut done = Vec::new();
-                for pr_id in pr_ids {
+                for (pr_id, pr_state) in pr_rows {
                     let paths: Vec<String> = sqlx::query_scalar(
                         "SELECT path FROM pr_paths WHERE project_id = $1 AND pr = $2",
                     )
@@ -805,7 +800,13 @@ pub async fn release_embargo_prs(
                     .await?;
                     let lines = class::lines_of(&policy, paths.iter().map(String::as_str));
                     let plain_class = class::put_class_for(&mut *c, pid, &policy_key, &lines, "").await?;
-                    let did_land = landed_set.contains(&pr_id);
+                    let (new_state, event) = match pr_state.as_str() {
+                        "open" if landed_set.contains(&pr_id) => ("landed", "pr.landed"),
+                        "open" if closed_set.contains(&pr_id) => ("closed", "pr.closed"),
+                        "open" => ("open", "pr.opened"),
+                        "landed" => ("landed", "pr.landed"),
+                        _ => ("closed", "pr.closed"),
+                    };
                     sqlx::query(
                         "UPDATE prs SET \
                            embargo = '', \
@@ -813,7 +814,7 @@ pub async fn release_embargo_prs(
                            class_id = $1, \
                            policy_key = $2, \
                            target = CASE WHEN target = $3 THEN $4 ELSE target END, \
-                           state = CASE WHEN $5 AND state = 'open' THEN 'landed' ELSE state END, \
+                           state = CASE WHEN state = 'open' THEN $5 ELSE state END, \
                            updated_at = $6 \
                          WHERE project_id = $7 AND id = $8",
                     )
@@ -821,13 +822,13 @@ pub async fn release_embargo_prs(
                     .bind(&policy_key)
                     .bind(&ebranch2)
                     .bind(&tbranch2)
-                    .bind(did_land)
+                    .bind(new_state)
                     .bind(now_ms)
                     .bind(pid)
                     .bind(&pr_id)
                     .execute(&mut *c)
                     .await?;
-                    done.push((pr_id, did_land));
+                    done.push((pr_id, event));
                 }
 
                 // Retarget any remaining PRs that targeted `embargo/<id>`.
@@ -874,20 +875,17 @@ pub async fn release_embargo_prs(
                         .execute(&mut *c)
                         .await?;
                 }
-                Ok((n > 0, done))
+                Ok((true, done))
             })
         })
         .await?;
 
     hub.caches.tips_changed(project.id);
-    if !touched_branches.is_empty() {
-        crate::derive::landed(hub, project.id, touched_branches.into_iter().collect());
-    }
+    crate::derive::landed(hub, project.id, touched_branches.into_iter().collect());
     if updated {
         crate::events::emit_embargo_released(hub, project.id, embargo_id).await;
-        for (pr_id, did_land) in transitioned {
-            let ev = if did_land { "pr.landed" } else { "pr.opened" };
-            crate::events::emit_pr(hub, project.id, &pr_id, ev).await;
+        for (pr_id, event) in transitioned {
+            crate::events::emit_pr(hub, project.id, &pr_id, event).await;
         }
     }
     Ok(updated)

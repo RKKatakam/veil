@@ -217,7 +217,14 @@ pub async fn project_overview_route(
             if i > 0 {
                 body.push_str(", ");
             }
-            let _ = write!(body, "<code>{}</code> (scope <code>{}</code>)", esc(&e.id), esc(&e.scope));
+            let _ = write!(body, "<code>{}</code> (scope <code>{}</code>", esc(&e.id), esc(&e.scope));
+            if let Some(st) = &e.state {
+                let _ = write!(body, ", {}", esc(st));
+                if let Some(why) = &e.reason {
+                    let _ = write!(body, ": {}", esc(why));
+                }
+            }
+            body.push(')');
         }
         body.push_str("</p>");
     }

@@ -161,7 +161,6 @@ fn embargoed_fix(hub: &TestHub, p: &Project) -> String {
 /// it: here someone who was in `security` when the fix was pushed, and was
 /// then removed from it.
 #[test]
-#[ignore = "BUG-1851: anyone in any group who knows an embargo's id releases it with a push of a record that names their own group"]
 fn bug_1851_only_the_embargos_own_groups_release_it_through_a_push() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -203,12 +202,114 @@ fn bug_1851_only_the_embargos_own_groups_release_it_through_a_push() {
     // The guarantee: the embargo stays as it was (its hidden line, the
     // public main, the fix unread by anyone outside), and the push is refused.
     let answered = format!("the push answered {} {}", r.status, body(&r));
+    assert_eq!(r.status, 404, "someone outside the embargo received a non-404 answer: {answered}");
     assert!(api.tips(Some(&sec_tok), &p.name).unwrap().branches.contains_key(&line), "the embargo's hidden line is gone: it was released ({answered})");
     assert_eq!(main_tip(&hub, None, &p.name), main_before, "the public main moved: the embargoed fix landed on it before its deadline ({answered})");
     let file = api.get(None, &format!("/v1/projects/{}/q/file?path=src/embargo_fix.rs", p.name));
     assert!(!body(&file).contains(FIX_MARK), "everyone on Earth reads the embargoed fix: {}", body(&file));
     assert_eq!(file.status, 404, "{}", body(&file));
-    assert!(matches!(r.status, 400 | 403 | 404), "someone outside the embargo changed it with a push: {answered}");
+}
+
+#[test]
+fn bug_1851_push_cannot_rewrite_deadline_or_scope_of_stored_embargo() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let eid = embargoed_fix(&hub, &p);
+    let api = hub.api();
+    let (fin_tok, sec_tok) = (p.fin.token(), p.sec.token());
+    let stored = api
+        .tips(Some(&sec_tok), &p.name)
+        .unwrap()
+        .embargoes
+        .into_iter()
+        .find(|e| e.id == eid)
+        .expect("security member sees the stored embargo record");
+    let main_before = main_tip(&hub, None, &p.name);
+
+    // 1. Outsider pushes a past `until` with no `released_at` naming their own group (`finance`).
+    let r_out = api.post_json(
+        Some(&fin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [],
+            "embargoes": [{
+                "format": veil_core::keychain::EMBARGO_FORMAT,
+                "id": eid,
+                "scope": "finance",
+                "until": 1_000,
+                "released_at": null,
+                "created": stored.created,
+            }],
+        }),
+    );
+    assert_eq!(r_out.status, 404, "outsider deadline rewrite must return 404: {}", body(&r_out));
+
+    // 2. Fake embargo id returns the identical 404 status and format (no existence oracle).
+    let r_fake = api.post_json(
+        Some(&fin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [],
+            "embargoes": [{
+                "format": veil_core::keychain::EMBARGO_FORMAT,
+                "id": "0123456789",
+                "scope": "finance",
+                "until": 1_000,
+                "released_at": null,
+                "created": stored.created,
+            }],
+        }),
+    );
+    assert_eq!(r_fake.status, 404, "unknown standalone embargo id must return 404: {}", body(&r_fake));
+
+    // 3. Member of `security` tries to rewrite `until` to the past or change `scope`.
+    let r_deadline = api.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [],
+            "embargoes": [{
+                "format": veil_core::keychain::EMBARGO_FORMAT,
+                "id": eid,
+                "scope": stored.scope,
+                "until": 1_000,
+                "released_at": null,
+                "created": stored.created,
+            }],
+        }),
+    );
+    assert_eq!(r_deadline.status, 400, "member deadline rewrite must be refused: {}", body(&r_deadline));
+
+    let r_scope = api.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [],
+            "embargoes": [{
+                "format": veil_core::keychain::EMBARGO_FORMAT,
+                "id": eid,
+                "scope": "security,finance",
+                "until": stored.until,
+                "released_at": null,
+                "created": stored.created,
+            }],
+        }),
+    );
+    assert_eq!(r_scope.status, 400, "member scope rewrite must be refused: {}", body(&r_scope));
+
+    // Running `release_due` must not release the embargo: its stored deadline was untouched.
+    let released = hub.rt.block_on(veil_server::embargo::release_due(&hub.hub())).unwrap();
+    assert_eq!(released, 0, "stored deadline must remain untouched");
+    assert_eq!(main_tip(&hub, None, &p.name), main_before);
+    let after = api
+        .tips(Some(&sec_tok), &p.name)
+        .unwrap()
+        .embargoes
+        .into_iter()
+        .find(|e| e.id == eid)
+        .expect("embargo still active");
+    assert_eq!(after.until, stored.until);
+    assert_eq!(after.scope, stored.scope);
 }
 
 fn change(hub: &TestHub, token: &str, project: &str, req: &Value) -> Reply {
@@ -420,7 +521,6 @@ fn bug_1850_a_check_posted_by_a_session_that_reads_billing_is_not_shown_to_publi
 /// where nothing marks it as embargoed, and everyone who reads its folder
 /// receives it.
 #[test]
-#[ignore = "BUG-1855: work built on an embargoed change and landed on an ordinary branch (POST …/changes, POST …/land) is not hidden: everyone who reads its folder receives the embargoed change"]
 fn bug_1855_work_landed_on_top_of_an_embargoed_change_stays_hidden() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -455,6 +555,80 @@ fn bug_1855_work_landed_on_top_of_an_embargoed_change_stays_hidden() {
         assert!(!body(&file).contains(FIX_MARK), "{who} reads the embargoed fix on the branch 'work' (landing answered {}): {}", body(&l), body(&file));
         assert_eq!(file.status, 404, "{who}: {}", body(&file));
     }
+}
+
+#[test]
+fn bug_1855_embargoed_change_followup_diverts_push_and_refuses_onto_and_plain_pr() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let eid = embargoed_fix(&hub, &p);
+    let api = hub.api();
+    let (dev_tok, sec_tok) = (p.dev.token(), p.sec.token());
+
+    let dev_main = main_tip(&hub, Some(&dev_tok), &p.name);
+    let made = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/push", p.name), &json!({"updates": [{"branch": "work", "expected": null, "new": dev_main.hex()}]}));
+    assert_eq!(made.status, 200, "{}", body(&made));
+
+    let hidden_tip = api.tips(Some(&sec_tok), &p.name).unwrap().branches[&format!("embargo/{eid}")];
+
+    // 1. `POST …/changes` with `onto` naming an ordinary branch refuses the branch move
+    //    (even with `expected: "rebase"`) and tags the resulting snapshot under the embargo.
+    let c = change(
+        &hub,
+        &sec_tok,
+        &p.name,
+        &json!({
+            "base": hidden_tip.hex(),
+            "onto": {"branch": "work", "expected": "rebase"},
+            "description": "follow-up on embargoed base",
+            "edits": [{"path": "src/followup.rs", "put": {"text": "pub const FOLLOW_UP: u32 = 2;\n"}}]
+        }),
+    );
+    assert_eq!(c.status, 200, "{}", body(&c));
+    assert_eq!(c.json()["branch"]["status"], json!("rejected"), "ordinary branch move must be refused: {}", body(&c));
+    let followup_snap = c.json()["snapshot"].as_str().unwrap().to_string();
+
+    // Outsiders cannot read the follow-up snapshot directly via query routes either.
+    let q_out = api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev={followup_snap}&path=src/embargo_fix.rs", p.name));
+    assert_eq!(q_out.status, 404, "outsider must not resolve follow-up snapshot: {}", body(&q_out));
+
+    // 2. Inline `POST …/land` with edits on `hidden_tip` onto `work` is refused.
+    let inline_land = api.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({
+            "onto": "work",
+            "base": hidden_tip.hex(),
+            "description": "inline land on embargoed base",
+            "edits": [{"path": "src/inline.rs", "put": {"text": "pub const INLINE: u32 = 3;\n"}}],
+            "wait": true
+        }),
+    );
+    assert_eq!(inline_land.status, 400, "inline land onto ordinary branch must be refused: {}", body(&inline_land));
+
+    // 3. Opening a PR from `followup_snap` onto `main` makes an embargoed PR (invisible to `dev`).
+    let pr = api.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"head": followup_snap, "onto": "main", "title": "embargo follow-up"}),
+    );
+    assert_eq!(pr.status, 200, "{}", body(&pr));
+    let pr_id = pr.json()["id"].as_str().unwrap().to_string();
+    assert_eq!(pr.json()["embargo"], json!(eid), "PR on follow-up must carry embargo id: {}", body(&pr));
+    let dev_pr = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+    assert_eq!(dev_pr.status, 404, "outsider must not see PR built on embargo follow-up: {}", body(&dev_pr));
+
+    // 4. Pushing `followup_snap` to ordinary branch `work` diverts to `embargo/<eid>`, leaving `work` untouched.
+    let pushed = api.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "work", "expected": dev_main.hex(), "new": followup_snap}]}),
+    );
+    assert_eq!(pushed.status, 200, "{}", body(&pushed));
+    let work_tip_dev = api.tips(Some(&dev_tok), &p.name).unwrap().branches["work"];
+    assert_eq!(work_tip_dev, dev_main, "ordinary branch 'work' must not advance to embargoed work");
+    let emb_tip_sec = api.tips(Some(&sec_tok), &p.name).unwrap().branches[&format!("embargo/{eid}")];
+    assert_eq!(emb_tip_sec.hex(), followup_snap, "push of follow-up to ordinary branch diverts to embargo/<id>");
 }
 
 /// `docs/VISIBILITY.md`, "Who can do what": an admin is "the creator, and
@@ -573,7 +747,6 @@ impl Drop for NoDeadline<'_> {
 /// any project on the server is released at its deadline**. Anyone can make
 /// one: a project of their own, an embargo, a conflicting change on `main`.
 #[test]
-#[ignore = "BUG-1857: one embargo whose release conflicts stops the deadline service for every later embargo of every project: they are never released at their deadline"]
 fn bug_1857_one_projects_conflicted_embargo_does_not_keep_another_projects_from_its_deadline() {
     let hub = TestHub::start();
     // Someone's own project, with an embargo whose release will conflict:
@@ -600,8 +773,19 @@ fn bug_1857_one_projects_conflicted_embargo_does_not_keep_another_projects_from_
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     let at_its_deadline = released_at(&hub, ours_id, &due).is_some();
-    // Control: the first embargo is the conflicted one, kept for its members.
+    // Control: the first embargo is the conflicted one, kept for its members,
+    // with its failure state and reason recorded on that embargo and shown to its groups (never outsiders).
     assert_eq!(released_at(&hub, theirs_id, &stuck), None, "control: the conflicted embargo is not released ({last})");
+    let sec_embs = hub.api().tips(Some(&theirs.sec.token()), &theirs.name).unwrap().embargoes;
+    let stuck_rec = sec_embs.iter().find(|r| r.id == stuck).expect("member sees stuck embargo record");
+    assert_eq!(stuck_rec.state.as_deref(), Some("failed"), "stuck embargo records failed state: {stuck_rec:?}");
+    assert!(
+        stuck_rec.reason.as_deref().is_some_and(|m| !m.is_empty()),
+        "stuck embargo records failure reason: {stuck_rec:?}"
+    );
+    let dev_embs = hub.api().tips(Some(&theirs.dev.token()), &theirs.name).unwrap().embargoes;
+    assert!(dev_embs.is_empty(), "outsiders never see the conflicted embargo or its reason: {dev_embs:?}");
+
     // Control: nothing is wrong with ours. With the conflicted one out of
     // the deadline service, the same service releases it at once.
     set_deadline(&hub, theirs_id, &stuck, None);

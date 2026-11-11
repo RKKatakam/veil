@@ -294,6 +294,8 @@ fn embargo_record_with_path_like_id_does_not_crash_pull() {
         until: None,
         released_at: Some(1),
         created: 1,
+        state: None,
+        reason: None,
     };
     let remote = remote_with_meta(&[(".veil/meta/embargoes/x.json", serde_json::to_vec(&rec).unwrap())]);
     let (mut victim, _fs, _) = new_repo("v");
