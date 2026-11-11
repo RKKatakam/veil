@@ -48,3 +48,4 @@ mod bisect;
 mod pack_gc;
 mod phase2_review;
 mod web;
+mod rv_new;
