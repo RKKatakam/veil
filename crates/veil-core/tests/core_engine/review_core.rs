@@ -132,25 +132,36 @@ fn bug_1831_a_file_under_a_dot_slash_rule_is_not_recorded() {
 /// rule names stays sealed, and its plain text is never written to the
 /// object store on the way.
 #[test]
-#[ignore = "BUG-1832: a moved secret is first stored as a plain-text blob, which stays in the object store"]
 fn bug_1832_a_moved_secret_is_never_stored_as_plain_text() {
     // Not token-shaped: the scanner has nothing to say about it (a moved
     // file it flags is quarantined, never recorded).
     const SECRET: &str = "REGION=review-marker-of-a-moved-secret-0001\nTIER=review-marker-of-a-moved-secret-0002\n";
+    const LINK_TARGET: &[u8] = b"internal/review-marker-of-a-moved-link-0003";
     let (mut repo, fs, _) = new_repo("alice");
-    commit_files(&mut repo, &*fs, &[(".veilpolicy", ".env cloak team\n"), (".env", SECRET)], "base");
+    fs.write_link(&p(".env.link"), LINK_TARGET).unwrap();
+    commit_files(&mut repo, &*fs, &[(".veilpolicy", ".env* cloak team\n"), (".env", SECRET)], "base");
     let hits = |fs: &veil_core::MemoryBackend| -> Vec<String> {
-        backend_contains(fs, b"review-marker-of-a-moved-secret-0001").into_iter().filter(|f| f.starts_with(".veil/")).collect()
+        let mut h: Vec<String> = backend_contains(fs, b"review-marker-of-a-moved-secret-0001")
+            .into_iter()
+            .chain(backend_contains(fs, b"review-marker-of-a-moved-link-0003"))
+            .filter(|f| f.starts_with(".veil/"))
+            .collect();
+        h.sort();
+        h
     };
     assert_eq!(hits(&fs), Vec::<String>::new(), "the committed secret is stored sealed only");
 
-    // `mv .env conf/settings.txt`.
+    // `mv .env conf/settings.txt` and `mv .env.link conf/settings.link`.
     fs.remove_file(&p(".env")).unwrap();
     fs.write(&p("conf/settings.txt"), SECRET.as_bytes()).unwrap();
+    fs.remove_file(&p(".env.link")).unwrap();
+    fs.write_link(&p("conf/settings.link"), LINK_TARGET).unwrap();
     let wc = snap(&mut repo, &*fs);
     let e = file_entry(&repo, &wc, "conf/settings.txt").expect("the moved file is recorded");
     assert_eq!(e.visibility, Visibility::Cloaked { scope: "team".into() }, "protection followed the content");
     assert_eq!(repo.store().read_entry(&e).unwrap(), SECRET.as_bytes());
+    let le = veil_core::tree::lookup(repo.store(), &repo.snapshot(&wc).unwrap().tree, &p("conf/settings.link")).unwrap().expect("moved link");
+    assert_eq!(le.visibility, Visibility::Cloaked { scope: "team".into() }, "protection followed the link target");
 
     assert_eq!(hits(&fs), Vec::<String>::new(), "the secret's plain text is in the object store");
 }
