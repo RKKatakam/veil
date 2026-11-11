@@ -288,7 +288,7 @@ pub async fn gate(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<(Vec<RevRow>,
     let rules = rules(hub, ask).await?;
     let revs = rated(hub, ask.project.id, &pr.id, &rules).await?;
     let current = revs.iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
-    let cids: Vec<String> = current.changes.iter().map(|c| c.change.clone()).collect();
+    let cids = revert_identities(hub, ask.project.id, &current.changes).await?;
     let rev_twice = crate::bisect::any_reverted_twice(hub, ask.project.id, &cids).await?;
     let gate = review::gate(hub, &ask.project, &ask.viewer, pr, &current.patch, Risk::parse(&current.risk), &rules, rev_twice).await?;
     Ok((revs, gate))
@@ -1604,9 +1604,52 @@ pub struct StackReviewDiff {
     pub touched: BTreeSet<String>,
     pub files: Vec<rules::FileChange>,
     pub patch: String,
-    /// The change ids of the stack's entries (the rule for a change the
-    /// server reverted twice: BUG-1884).
+    /// What "reverted twice" counts the stack's entries by (BUG-1884,
+    /// BUG-1921): each one's change id, and what its edits are whatever
+    /// change id carries them ([`edits_id`]).
     pub changes: Vec<String>,
+}
+
+/// What a change's edits are, whatever change id it is given (BUG-1921):
+/// a hash of the leaves its tree differs at from its base's (each path,
+/// with the entry before and after), in a domain of its own. The same edit
+/// made again as a new change has the same one; a rebased version whose
+/// files differ has another, and is known by its change id. `None` for a
+/// change with no edits.
+fn edits_id_of(leaves: &[veil_core::hub::project::Change]) -> Option<String> {
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut h = blake3::Hasher::new_derive_key("veil 2026 hub change edits v1");
+    h.update(&(leaves.len() as u64).to_le_bytes());
+    for c in leaves {
+        h.update(&(c.path.len() as u64).to_le_bytes());
+        h.update(c.path.as_bytes());
+        revision::entry_bytes(&mut h, c.old.as_ref());
+        revision::entry_bytes(&mut h, c.new.as_ref());
+    }
+    Some(format!("edits:{}", h.finalize().to_hex()))
+}
+
+/// [`edits_id_of`] the edits of `snapshot` against `parent`.
+pub fn edits_id(src: &crate::sync::Source, snapshot: ObjectId, parent: ObjectId) -> Result<Option<String>> {
+    let (leaves, _) = crate::derive::changes::diff(src, src.snapshot(&parent)?.tree, src.snapshot(&snapshot)?.tree)?;
+    Ok(edits_id_of(&leaves))
+}
+
+/// What "reverted twice" counts the changes of a PR's revision by: their
+/// change ids and their edits ([`edits_id`]).
+pub(crate) async fn revert_identities(hub: &Arc<Hub>, project: i64, changes: &[StackChange]) -> Result<Vec<String>> {
+    let stack = changes.to_vec();
+    crate::sync::blocking(hub, project, move |src| {
+        let mut ids = Vec::with_capacity(stack.len() * 2);
+        for c in &stack {
+            ids.push(c.change.clone());
+            ids.extend(edits_id(src, c.snapshot_id(), c.parent_id())?);
+        }
+        Ok(ids)
+    })
+    .await
 }
 
 /// Compute [`StackReviewDiff`] for `stack` from `src`.
@@ -1625,6 +1668,7 @@ pub fn stack_review_diff(src: &crate::sync::Source, stack: &[crate::landing::Ent
         };
         let ptree = src.snapshot(&parent)?.tree;
         let (leaves, dirs) = crate::derive::changes::diff(src, ptree, s.tree)?;
+        changes.extend(edits_id_of(&leaves));
         if !leaves.is_empty() {
             patch.update(&s.change_id.0);
             patch.update(&(leaves.len() as u64).to_le_bytes());

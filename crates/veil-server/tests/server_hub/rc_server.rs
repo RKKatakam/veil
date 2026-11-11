@@ -371,7 +371,6 @@ fn fail_until_reverted(hub: &TestHub, admin: &str, project: &str, culprit: Objec
 /// first change id is refused: "reverted twice: needs a person's approval"
 /// (`rv_landing::bug_1884_change_reverted_twice_needs_a_persons_approval`).
 #[test]
-#[ignore = "BUG-1921: a change the server reverted twice lands again unapproved under a new change id"]
 fn bug_1921_an_edit_reverted_twice_needs_a_person_whatever_change_id_it_is_given() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
