@@ -91,7 +91,9 @@ fn set_request_authority(req: &mut Request) {
 /// (the request's authority: `set_request_authority`).
 ///
 /// `Sec-Fetch-Site`, when the browser sends it, must be `same-origin`; an
-/// `Origin` must name the request's authority. **`Origin: null` beside
+/// `Origin` must be the server's whole origin: `https://` (the only scheme
+/// this server speaks) and the request's authority. A page of the same host
+/// over `http://` is another origin (BUG-1927). **`Origin: null` beside
 /// `Sec-Fetch-Site: same-origin` is a browser's own form (BUG-1907):** the
 /// pages are served with `Referrer-Policy: no-referrer`, under which a
 /// browser sends `Origin: null` with every form it submits (Fetch,
@@ -116,10 +118,7 @@ pub fn check_same_origin(headers: &HeaderMap) -> Result<()> {
 
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     if let Some(orig) = origin.filter(|o| !(verified && *o == "null")) {
-        let orig_host = orig
-            .strip_prefix("https://")
-            .or_else(|| orig.strip_prefix("http://"))
-            .unwrap_or("");
+        let orig_host = orig.strip_prefix("https://").unwrap_or("");
         if orig_host.is_empty() || orig_host.contains('/') || host.is_empty() || normal_host(orig_host) != host {
             return Err(csrf_err("request Origin does not match Host"));
         }
