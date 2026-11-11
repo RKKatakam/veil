@@ -576,6 +576,11 @@ vl stats --json      # the server's answer (veil.health/1)
 Each device may send a burst of 200 requests a second within 50,000 an
 hour (your agents on that device share it); requests without a session
 (anyone on Earth, sign-in) 20 a second within 1,000 an hour per address.
+All of your devices and agent sessions together have ten times a device's
+rate. So have, together, the people at one address whom no project but
+their own names: signing up again from the same address gains nothing.
+Once another project's admin puts you in a group or names you in a rule,
+you count alone, however many colleagues share your address.
 Past it the server answers `429` and says when to come back, and `vl` waits
 and tries again. One busy project leaves the others room: it runs at most
 three quarters of the server's database connections at once.
