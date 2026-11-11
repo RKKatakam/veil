@@ -73,7 +73,6 @@ fn bug_1870_an_id_made_from_another_views_row_resolves_for_nobody_else() {
 /// `vl` reaches (another remote, a clone of someone else's project). A
 /// stored session is kept per server and goes only to that one.
 #[test]
-#[ignore = "BUG-1874: vl presents the token in VEIL_TOKEN to every server, not only the one that issued it"]
 fn bug_1874_vl_presents_no_token_to_a_server_that_did_not_issue_it() {
     let hub = TestHub::start();
     let alice = hub.person("alice");
@@ -103,5 +102,30 @@ fn bug_1874_vl_presents_no_token_to_a_server_that_did_not_issue_it() {
         "vl sent another server's token to this one: {}{}",
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
+    );
+
+    // And a session stored in hub.json for another authority is never sent here either.
+    let veil_home = anyone.home.path().join("veil");
+    std::fs::create_dir_all(&veil_home).unwrap();
+    std::fs::write(
+        veil_home.join("hub.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "servers": {
+                "other.example:4443": {
+                    "token": "cd".repeat(32),
+                    "expires_at": veil_core::now_millis() + 3_600_000,
+                    "person": "someone"
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let o2 = anyone.run(&base, &["clone", "--full", &hub.url(&proj), anyone.dir("c2").to_str().unwrap()]);
+    assert!(
+        o2.status.success(),
+        "vl sent another authority's stored token to this server: {}{}",
+        String::from_utf8_lossy(&o2.stdout),
+        String::from_utf8_lossy(&o2.stderr)
     );
 }

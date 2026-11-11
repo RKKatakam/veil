@@ -2086,11 +2086,28 @@ fn s16_vl_queries_equal_the_viewers_own_view_without_paging_history() {
         }),
     );
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    let agent_tok = r.json()["token"].as_str().unwrap().to_string();
+    let r_json = r.json();
+    let agent_tok = r_json["token"].as_str().unwrap().to_string();
+    let agent_exp = r_json["expires_at"].as_i64().unwrap();
+    let agent_home = p.dev.dir("s16-agent-home");
+    std::fs::create_dir_all(&agent_home).unwrap();
+    std::fs::write(
+        agent_home.join("hub.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "servers": {
+                hub.authority(): {
+                    "token": agent_tok,
+                    "expires_at": agent_exp,
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let dev_thin = p.dev.dir("s16-thin-dev");
     let run_agent = |args: &[&str]| -> (bool, String) {
         let mut c = p.dev.command(&dev_thin, args);
-        c.env("VEIL_TOKEN", &agent_tok);
+        c.env("VEIL_HOME", &agent_home);
         let o = c.output().unwrap();
         let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         (o.status.success(), out)
@@ -2144,18 +2161,31 @@ fn s16_unreachable_or_warming_server_is_reported_clearly() {
     });
     hub.hub().query.rows.clear();
 
-    for cmd in [&["log"][..], &["log", "--", "src/lib.rs"][..], &["blame", "src/lib.rs", "-r", "main"][..], &["grep", "fn", "-r", "main"][..]] {
-        let mut c = admin.command(&thin, cmd);
-        c.env("VEIL_QUERY_RETRIES", "0");
-        let o = c.output().unwrap();
-        let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-        assert!(!o.status.success(), "`vl {}` succeeded on a warming server:\n{out}", cmd.join(" "));
-        assert!(
-            out.contains("being prepared") || out.contains("warming") || out.contains("try again"),
-            "`vl {}` did not clearly report warming:\n{out}",
-            cmd.join(" ")
-        );
-    }
+    let warming_cmds: &[&[&str]] = &[
+        &["--no-snapshot", "log"],
+        &["--no-snapshot", "log", "--", "src/lib.rs"],
+        &["--no-snapshot", "blame", "src/lib.rs", "-r", "main"],
+        &["--no-snapshot", "grep", "fn", "-r", "main"],
+    ];
+    std::thread::scope(|s| {
+        let handles: Vec<_> = warming_cmds
+            .iter()
+            .map(|&cmd| {
+                let mut c = admin.command(&thin, cmd);
+                s.spawn(move || (cmd, c.output().unwrap()))
+            })
+            .collect();
+        for h in handles {
+            let (cmd, o) = h.join().unwrap();
+            let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            assert!(!o.status.success(), "`vl {}` succeeded on a warming server:\n{out}", cmd.join(" "));
+            assert!(
+                out.contains("being prepared") || out.contains("warming") || out.contains("try again"),
+                "`vl {}` did not clearly report warming:\n{out}",
+                cmd.join(" ")
+            );
+        }
+    });
 
     // 2. Server is unreachable: every query command fails naming the server
     // (`could not be reached`) and never prints a partial history as complete.

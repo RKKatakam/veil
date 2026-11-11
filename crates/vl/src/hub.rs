@@ -357,14 +357,11 @@ impl Client {
         let file = load_file()?;
         let entry = file.servers.get(&url.authority).cloned();
         let agent = agent_config(entry.as_ref())?.timeout_global(Some(Duration::from_secs(600))).build().new_agent();
-        let env_token = std::env::var("VEIL_TOKEN").ok().filter(|s| !s.is_empty());
-        let known = env_token.is_none() && entry.as_ref().is_some_and(|e| e.person.is_some());
-        let token = env_token.or_else(|| {
-            entry
-                .as_ref()
-                .filter(|e| e.expires_at > veil_core::now_millis() + 30_000)
-                .and_then(|e| e.token.clone())
-        });
+        let known = entry.as_ref().is_some_and(|e| e.person.is_some());
+        let token = entry
+            .as_ref()
+            .filter(|e| e.expires_at > veil_core::now_millis() + 30_000)
+            .and_then(|e| e.token.clone());
         Ok(Client {
             agent,
             url: url.clone(),
