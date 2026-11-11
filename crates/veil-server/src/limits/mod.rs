@@ -42,7 +42,10 @@ pub mod landing;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -237,34 +240,96 @@ pub const DERIVE_PAUSE: Duration = Duration::from_secs(10);
 
 type Places = Arc<Mutex<Option<(Option<gate::Place>, gate::Place)>>>;
 
-tokio::task_local! {
+/// Every task-local value a request carries: kept in one struct so
+/// [`in_request`] clones all of them together and a newly added field cannot
+/// be missed across `tokio::spawn` (BUG-1668, BUG-1863).
+#[derive(Clone, Default)]
+pub(crate) struct RequestLocals {
+    /// Set when a [`crate::db::transaction`] of the current request attempt
+    /// committed (or tried to): from then on [`crate::db::retry_requests`]
+    /// does not run the request again.
+    pub committed: Option<Arc<AtomicBool>>,
+    /// The landing queue bounds (`(max_session_outstanding, max_person_outstanding)`)
+    /// of the server handling the current request.
+    pub bounds: Option<(usize, usize)>,
     /// The bulkhead places held by the request being served: dropped when
     /// the route answers, or sooner ([`leave_gates`]) before a wait for
     /// something other than the request's own work (BUG-1635).
-    static PLACES: Places;
-    /// The landing queue bounds (`(max_session_outstanding, max_person_outstanding)`)
-    /// of the server handling the current request.
-    pub(crate) static BOUNDS: std::cell::Cell<(usize, usize)>;
+    pub places: Places,
+    /// Cache hits and misses of the request being served.
+    pub layers: Option<Arc<health::LayerCounts>>,
+    /// Whether storage writes made here count in [`crate::store::Objects::own_writes`].
+    pub own_writes: bool,
+}
+
+tokio::task_local! {
+    pub(crate) static REQUEST: RequestLocals;
+}
+
+pub(crate) fn current_request() -> RequestLocals {
+    REQUEST.try_with(Clone::clone).unwrap_or_default()
+}
+
+pub(crate) fn with_committed<F: std::future::Future>(
+    committed: Arc<AtomicBool>,
+    f: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let mut ctx = current_request();
+    ctx.committed = Some(committed);
+    REQUEST.scope(ctx, f)
+}
+
+pub(crate) fn mark_committed() {
+    let _ = REQUEST.try_with(|r| {
+        if let Some(c) = &r.committed {
+            c.store(true, Ordering::Release);
+        }
+    });
+}
+
+pub(crate) fn with_own_writes<F: std::future::Future>(
+    own_writes: bool,
+    f: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let mut ctx = current_request();
+    ctx.own_writes = own_writes;
+    REQUEST.scope(ctx, f)
+}
+
+pub(crate) fn is_own_write() -> bool {
+    REQUEST.try_with(|r| r.own_writes).unwrap_or(false)
+}
+
+pub(crate) fn record_layer_hit(layer: health::Layer, hit: bool) {
+    let _ = REQUEST.try_with(|r| {
+        if let Some(l) = &r.layers {
+            l.hit(layer, hit);
+        }
+    });
+}
+
+pub(crate) fn request_bounds() -> Option<(usize, usize)> {
+    REQUEST.try_with(|r| r.bounds).ok().flatten()
 }
 
 /// Give back the bulkhead places of the request being served before it
 /// waits for something other than its own work (a landing's outcome, a
 /// ticket, BUG-1635; nothing outside a request).
 pub fn leave_gates() {
-    let _ = PLACES.try_with(|p| {
-        p.lock().unwrap().take();
+    let _ = REQUEST.try_with(|r| {
+        r.places.lock().unwrap().take();
     });
 }
 
-/// Carry the current request's landing bounds and bulkhead places into a
-/// spawned task that finishes the request's own work (`sync::push_with`,
-/// BUG-1668).
+/// Carry every request task-local ([`RequestLocals`]) into a spawned task
+/// that finishes the request's own work (`sync::push_with`, BUG-1668,
+/// BUG-1863).
 pub fn in_request<F: std::future::Future>(hub: &crate::Hub, f: F) -> impl std::future::Future<Output = F::Output> {
-    let bounds = BOUNDS
-        .try_with(|b| b.get())
-        .unwrap_or_else(|_| landing::settings_bounds(&hub.limits.settings));
-    let places = PLACES.try_with(|p| p.clone()).unwrap_or_default();
-    BOUNDS.scope(std::cell::Cell::new(bounds), PLACES.scope(places, f))
+    let mut ctx = current_request();
+    if ctx.bounds.is_none() {
+        ctx.bounds = Some(landing::settings_bounds(&hub.limits.settings));
+    }
+    REQUEST.scope(ctx, f)
 }
 
 /// `s` percent-decoded, as the routes' `Path` decodes it; `None` if it does
@@ -548,18 +613,13 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     let mut req = Request::from_parts(parts, Body::from(bytes));
     req.extensions_mut().insert(answers::For(body_key));
     let bounds = landing::settings_bounds(&limits.settings);
-    let (resp, layers) = BOUNDS
-        .scope(
-            std::cell::Cell::new(bounds),
-            PLACES.scope(
-                Arc::new(Mutex::new(Some((project_place, server_place)))),
-                health::LAYERS.scope(std::cell::Cell::new(health::Counts::default()), async {
-                    let r = next.run(req).await;
-                    (r, health::LAYERS.with(|c| c.get()))
-                }),
-            ),
-        )
-        .await;
+    let mut ctx = current_request();
+    ctx.bounds = Some(bounds);
+    ctx.places = Arc::new(Mutex::new(Some((project_place, server_place))));
+    let layer_counts = Arc::new(health::LayerCounts::default());
+    ctx.layers = Some(layer_counts.clone());
+    let resp = REQUEST.scope(ctx, next.run(req)).await;
+    let layers = layer_counts.snapshot();
     let resp = match limits.answers.budget(body_key, resp, class != Class::Write).await {
         Some(r) => r,
         None => busy(false),

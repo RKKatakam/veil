@@ -41,9 +41,7 @@ const RETRY_AFTER_MS: u64 = 1_000;
 /// The bounds in effect for the current request's server (set by
 /// [`super::admit`]; defaults outside a request).
 pub fn bounds() -> (usize, usize) {
-    super::BOUNDS
-        .try_with(|b| b.get())
-        .unwrap_or((MAX_SESSION_OUTSTANDING, MAX_PERSON_OUTSTANDING))
+    super::request_bounds().unwrap_or((MAX_SESSION_OUTSTANDING, MAX_PERSON_OUTSTANDING))
 }
 
 /// The session key stored in `landing_queue.session` for `who`: the stored

@@ -376,7 +376,6 @@ fn bug_1862_a_first_failure_during_another_bisect_step_still_starts_bisect() {
 /// fails once with a retryable error), in the request's task and then in a
 /// task spawned through `limits::in_request`.
 #[test]
-#[ignore = "BUG-1863: work committed in the task a push runs in is not noted as committed (task-local db::COMMITTED is not carried by limits::in_request): a retryable error after the commit runs the push again"]
 fn bug_1863_what_a_push_committed_in_its_own_task_is_never_run_again() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -442,4 +441,27 @@ fn bug_1863_what_a_push_committed_in_its_own_task_is_never_run_again() {
     assert_eq!(outcome(false), (1, 1), "(runs, rows committed) in the request's task");
     // In the task a push runs in: the same.
     assert_eq!(outcome(true), (1, 1), "(runs, rows committed) in a task spawned through limits::in_request: the request ran again after its commit");
+
+    // Before any commit in the spawned task, a retryable error still retries.
+    async fn uncommitted_first(State((hub, runs, _key, _own)): State<Shared>) -> Result<&'static str, Error> {
+        let h = hub.clone();
+        tokio::spawn(limits::in_request(&hub, async move {
+            if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                sqlx::query("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = '40001', MESSAGE = 'restart before commit'; END $$")
+                    .execute(&h.db)
+                    .await?;
+            }
+            Ok::<_, Error>("ok")
+        }))
+        .await
+        .map_err(|e| Error::Other(e.into()))?
+    }
+    let runs = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/uncommitted", post(uncommitted_first))
+        .with_state((h.clone(), runs.clone(), String::new(), true))
+        .layer(axum::middleware::from_fn(db::retry_requests));
+    let resp = hub.rt.block_on(app.oneshot(Request::post("/uncommitted").body(Body::empty()).unwrap())).unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "uncommitted retryable failure in spawned task must still retry");
 }

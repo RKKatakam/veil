@@ -20,7 +20,15 @@
 //!   catalog changed by a migration) before anything it did was committed
 //!   ([`retry_requests`]).
 
-use std::{cell::Cell, future::Future, pin::Pin, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -241,7 +249,7 @@ where
                     let r = tx.commit().await.map(|_| v).map_err(Error::from);
                     // Whatever the outcome, the request may have changed
                     // something now: [`retry_requests`] does not run it again.
-                    let _ = COMMITTED.try_with(|c| c.set(true));
+                    crate::limits::mark_committed();
                     // A commit that timed out may have committed: neither is
                     // `f` run again (BUG-890).
                     match r {
@@ -274,12 +282,6 @@ where
             r => return r,
         }
     }
-}
-
-tokio::task_local! {
-    /// Set when a [`transaction`] of the current request committed (or
-    /// tried to): from then on the request is not run again.
-    static COMMITTED: Cell<bool>;
 }
 
 /// A response that failed on a retryable database error
@@ -316,13 +318,9 @@ pub async fn retry_requests(req: Request, next: Next) -> Response {
     loop {
         attempt += 1;
         let req = Request::from_parts(parts.clone(), Body::from(body.clone()));
-        let (committed, response) = COMMITTED
-            .scope(Cell::new(false), async {
-                let r = next.clone().run(req).await;
-                (COMMITTED.with(|c| c.get()), r)
-            })
-            .await;
-        if response.extensions().get::<Retryable>().is_none() || committed {
+        let committed = Arc::new(AtomicBool::new(false));
+        let response = crate::limits::with_committed(committed.clone(), next.clone().run(req)).await;
+        if response.extensions().get::<Retryable>().is_none() || committed.load(Ordering::Acquire) {
             return response;
         }
         let cap = 5u64 << attempt.min(6);
