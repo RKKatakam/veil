@@ -519,41 +519,113 @@ pub async fn file_route(
                 let _ = writeln!(body, "<p class=\"muted\">Non-UTF-8 binary file ({len} bytes).</p>");
             }
             Ok(text) => {
-                let all_lines: Vec<&str> = text.lines().collect();
-                let total = all_lines.len();
-                let page = q.page.unwrap_or(1).max(1);
-                let start = (page - 1).saturating_mul(WEB_FILE_LINES_PER_PAGE);
-                let mut end = start;
-                let mut used_bytes = 0usize;
-                while end < total && (end - start) < WEB_FILE_LINES_PER_PAGE {
-                    let line_len = all_lines[end].len();
-                    if end > start && used_bytes + line_len > WEB_FILE_BYTES_PER_PAGE {
-                        break;
+                let total_bytes = bytes.len();
+                let line_cost = |s: &str| -> usize {
+                    if s.len() > WEB_FILE_BYTES_PER_PAGE {
+                        return WEB_FILE_BYTES_PER_PAGE + 1;
                     }
-                    used_bytes += line_len;
-                    end += 1;
+                    let mut n = 0usize;
+                    for b in s.bytes() {
+                        n += match b {
+                            b'&' => 5,
+                            b'<' | b'>' => 4,
+                            b'"' | b'\'' => 6,
+                            _ => 1,
+                        };
+                        if n > WEB_FILE_BYTES_PER_PAGE {
+                            return n;
+                        }
+                    }
+                    n
+                };
+                let page = q.page.unwrap_or(1).max(1);
+                let mut total = 0usize;
+                let mut cur_page = 1usize;
+                let mut page_start = 0usize;
+                let mut target_start = 0usize;
+                let mut used_bytes = 0usize;
+                let mut page_lines: Vec<&str> = Vec::new();
+                for line in text.lines() {
+                    if cur_page <= page {
+                        let cost = line_cost(line);
+                        let count_on_page = total - page_start;
+                        if count_on_page >= WEB_FILE_LINES_PER_PAGE
+                            || (count_on_page > 0 && used_bytes + cost > WEB_FILE_BYTES_PER_PAGE)
+                        {
+                            cur_page += 1;
+                            page_start = total;
+                            used_bytes = 0;
+                            if cur_page == page {
+                                target_start = total;
+                            }
+                        }
+                        if cur_page == page {
+                            page_lines.push(line);
+                        }
+                        if cur_page <= page {
+                            used_bytes = used_bytes.saturating_add(cost).min(WEB_FILE_BYTES_PER_PAGE + 1);
+                        }
+                    }
+                    total += 1;
                 }
+                let (start, end) = if cur_page < page || page_lines.is_empty() {
+                    (total, total)
+                } else {
+                    (target_start, target_start + page_lines.len())
+                };
 
                 let _ = writeln!(
                     body,
-                    "<p class=\"muted\">Showing lines {}–{} of {} ({} bytes total)</p>",
+                    "<p class=\"muted\">Showing lines {}–{} of {} ({total_bytes} bytes total)</p>",
                     if total == 0 { 0 } else { start + 1 },
                     end,
                     total,
-                    bytes.len()
                 );
                 body.push_str("<table class=\"code-table mono\"><tbody>");
-                if start < total {
-                    for (idx, line) in all_lines[start..end].iter().enumerate() {
-                        let ln = start + idx + 1;
-                        let _ = writeln!(
-                            body,
-                            "<tr id=\"L{ln}\"><td class=\"ln\">{ln}</td><td>{}</td></tr>",
-                            esc(line)
-                        );
+                let mut remaining = WEB_FILE_BYTES_PER_PAGE;
+                let mut any_truncated = false;
+                for (idx, line) in page_lines.iter().enumerate() {
+                    let ln = start + idx + 1;
+                    let _ = write!(body, "<tr id=\"L{ln}\"><td class=\"ln\">{ln}</td><td>");
+                    let mut written = 0usize;
+                    let mut cut = false;
+                    for ch in line.chars() {
+                        let rep: Option<&str> = match ch {
+                            '&' => Some("&amp;"),
+                            '<' => Some("&lt;"),
+                            '>' => Some("&gt;"),
+                            '"' => Some("&quot;"),
+                            '\'' => Some("&#x27;"),
+                            _ => None,
+                        };
+                        let need = rep.map_or_else(|| ch.len_utf8(), str::len);
+                        if written + need > remaining {
+                            cut = true;
+                            break;
+                        }
+                        match rep {
+                            Some(r) => body.push_str(r),
+                            None => body.push(ch),
+                        }
+                        written += need;
                     }
+                    remaining = remaining.saturating_sub(written);
+                    if cut {
+                        any_truncated = true;
+                        let _ = write!(body, " <span class=\"muted\">… (line truncated; {} bytes)</span>", line.len());
+                    }
+                    body.push_str("</td></tr>\n");
                 }
+                drop(page_lines);
+                drop(bytes);
                 body.push_str("</tbody></table>");
+                if any_truncated {
+                    let _ = writeln!(
+                        body,
+                        "<p class=\"muted\">Line truncated to stay within the {} KiB page bound.</p>",
+                        WEB_FILE_BYTES_PER_PAGE / 1024
+                    );
+                }
 
                 if page > 1 || end < total {
                     body.push_str("<div class=\"pager\">");

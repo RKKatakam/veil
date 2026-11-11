@@ -320,14 +320,10 @@ impl HubPromisor {
     }
 
     /// A query route (`/v1/projects/{p}/q/{route}`, S16, `docs/HUB.md`
-    /// §13.34), retrying `warming` and `deadline` (`503`) up to 20 times
-    /// (or `VEIL_QUERY_RETRIES`).
+    /// §13.34), retrying `warming` and `deadline` (`503`) up to 20 times.
     fn query_direct(&self, route: &str, params: &[(&str, String)]) -> veil_core::Result<std::result::Result<serde_json::Value, (String, String)>> {
-        let retries = std::env::var("VEIL_QUERY_RETRIES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(19);
-        for attempt in 0..=retries {
+        const RETRIES: usize = 19;
+        for attempt in 0..=RETRIES {
             let r = {
                 let c = self.client()?;
                 c.as_ref().expect("made").query(route, params).map_err(|e| unavailable(&self.url, format!("{e:#}")))?
@@ -335,7 +331,7 @@ impl HubPromisor {
             match r {
                 Ok(v) => return Ok(Ok(v)),
                 Err((code, msg)) if matches!(code.as_str(), "warming" | "deadline" | "indexing") => {
-                    if attempt < retries {
+                    if attempt < RETRIES {
                         std::thread::sleep(std::time::Duration::from_millis(500));
                         continue;
                     }

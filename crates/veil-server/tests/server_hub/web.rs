@@ -1453,3 +1453,129 @@ fn extract_next_href(html: &str, prefix: &str) -> String {
     }
     panic!("no next-page href starting with {prefix:?} in HTML:\n{html}");
 }
+
+// ---- review rv-new (BUG-1871 to BUG-1873) ---------------------------------------
+
+/// BUG-1871: the web client asks for the device's `identity.json` (sign-in
+/// "option 2" and every review). That file holds the device's signing seed
+/// **and** its X25519 secret, the key that opens the secret key rings: a
+/// personal private key in the browser, which the server's code runs in
+/// (`docs/design/server/phase-4-agent-scale.md` §6 row 18, decision 13).
+#[test]
+#[ignore = "BUG-1871: the web client asks for the device identity file (its private keys) in the browser"]
+fn bug_1871_the_web_client_never_asks_for_a_device_identity_file() {
+    let hub = TestHub::start();
+    let web = WebClient::new(&hub);
+    let login = web.get("/login");
+    assert_eq!(login.status, 200, "{}", login.text());
+    let js = web.get("/static/app.js");
+    assert_eq!(js.status, 200, "{}", js.text());
+    let asks = [
+        "veil-identity-json",
+        "veil-review-identity",
+        "identity JSON",
+        "veil_web_sign_login",
+        "veil_web_sign_review",
+        "veil_web_generate_identity",
+    ];
+    assert_absent(&login.text(), &asks, "GET /login");
+    assert_absent(&js.text(), &asks, "GET /static/app.js");
+}
+
+/// BUG-1872: a file page is bounded in lines only. A line is rendered whole
+/// whatever its length, so a minified bundle (one line) comes back as one
+/// page of the file's whole size (`docs/HUB.md` §13.39: 200 lines /
+/// `<= 64 KiB` per page).
+#[test]
+fn bug_1872_a_file_page_is_bounded_whatever_the_length_of_a_line() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let proj = unique("longline");
+    let dir = alice.dir("l");
+    std::fs::create_dir_all(&dir).unwrap();
+    alice.ok(&dir, &["init"]);
+    alice.ok(&dir, &["remote", "add", "origin", &hub.url(&proj)]);
+    let bundle = format!("{}\n", "var a=1;".repeat(600 * 1024 / 8));
+    let amps = format!("{}\n", "&".repeat(50 * 1024));
+    let mut med = String::new();
+    for i in 1..=80 {
+        med.push_str(&format!("MED_LINE_{i:03}:{}\n", "x".repeat(2048)));
+    }
+    write_files(
+        &dir,
+        &[
+            (".veilpolicy", "public/ public\n"),
+            ("public/bundle.min.js", &bundle),
+            ("public/amps.txt", &amps),
+            ("public/med.txt", &med),
+        ],
+    );
+    alice.commit_main(&dir, "a minified bundle");
+    alice.ok(&dir, &["push"]);
+    catch_up(&hub, &proj);
+
+    let mut web = WebClient::new(&hub);
+    web.sign_in_derived(&hub, &alice);
+    let page = web.get(&format!("/p/{proj}/file/public/bundle.min.js"));
+    assert_eq!(page.status, 200, "{}", page.text().chars().take(400).collect::<String>());
+    // The same bound as `guarantee_5` holds a 650-line file's page to.
+    assert!(page.body.len() < 96 * 1024, "a file page of {} bytes", page.body.len());
+    let text = page.text();
+    assert!(text.contains("var a=1;"), "prefix missing");
+    assert!(text.contains("line truncated"), "truncation note missing");
+
+    // HTML-escape expansion (& -> &amp;) is also bounded within the page budget.
+    let amp_page = web.get(&format!("/p/{proj}/file/public/amps.txt"));
+    assert_eq!(amp_page.status, 200);
+    assert!(amp_page.body.len() < 96 * 1024, "escaped file page of {} bytes", amp_page.body.len());
+    assert!(amp_page.text().contains("line truncated"));
+
+    // Multi-line file under 200 lines whose bytes exceed one page pages without skipping lines.
+    let m1 = web.get(&format!("/p/{proj}/file/public/med.txt"));
+    assert_eq!(m1.status, 200);
+    assert!(m1.body.len() < 96 * 1024, "med page 1 of {} bytes", m1.body.len());
+    assert!(m1.text().contains("MED_LINE_001") && m1.text().contains("page=2"));
+    assert!(!m1.text().contains("MED_LINE_080"));
+    let m2 = web.get(&format!("/p/{proj}/file/public/med.txt?page=2"));
+    assert_eq!(m2.status, 200);
+    assert!(m2.body.len() < 96 * 1024, "med page 2 of {} bytes", m2.body.len());
+    assert!(m2.text().contains("MED_LINE_030"), "page 2 skipped byte-bounded lines");
+}
+
+/// BUG-1873: `docs/HUB.md` §13.39 and the server agree on web session
+/// lifetimes (1 hour default, up to 4 hours max), routes, and CSP header.
+#[test]
+fn bug_1873_a_web_session_lasts_as_long_as_the_design_says() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let before = veil_core::now_millis();
+    let r = hub.api().post_json(Some(&alice.token()), "/v1/sessions/web", &json!({}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let lasts = r.json()["expires_at"].as_i64().expect("expires_at") - before;
+    let hour = 3600 * 1000;
+    assert!(
+        (hour - 60_000..=hour + 60_000).contains(&lasts),
+        "a default web session lasts {} minutes",
+        lasts / 60_000
+    );
+
+    // Note: TestHub's device session itself lasts 1h, so requesting >4h is bounded by min(parent, 4h);
+    // verify the constants and `docs/HUB.md` §13.39 agree on 1h default and 4h max, routes, and CSP.
+    assert_eq!(veil_core::hub::web::DEFAULT_WEB_SESSION_MS, hour);
+    assert_eq!(veil_core::hub::web::MAX_WEB_SESSION_MS, 4 * hour);
+
+    let hub_doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/HUB.md")).unwrap();
+    let sec = hub_doc.split("### 13.39 ").nth(1).expect("§13.39 in docs/HUB.md");
+    for expected in [
+        "<= 4h`, default `1h`",
+        "/p/{project}/log",
+        "/p/{project}/prs/{id}/threads/{t}",
+        "/p/{project}/admin/groups/{g}/delete",
+        veil_server::web::html::CSP_HEADER,
+    ] {
+        assert!(sec.contains(expected), "docs/HUB.md §13.39 missing `{expected}`");
+    }
+    for stale in ["<= 12h", "default `8h`", "Max-Age=28800", "reopen", "/groups/{g}/remove", "X-Veil-Web"] {
+        assert!(!sec.contains(stale), "docs/HUB.md §13.39 still contains stale `{stale}`");
+    }
+}
