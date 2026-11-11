@@ -344,10 +344,11 @@ Found and filed by the rehearsal:
   database that requires TLS, which ruled out managed PostgreSQL (§2).
 - **BUG-1591**: `veil-bench load --via cache` cannot measure a running
   cache, so the cache gate runs on the hub in its same-machine form (§6).
-- **BUG-1592**: the cache advertises HTTP/2 but serves HTTP/1 only; HTTP/2
-  clients (curl, by default) get a broken stream. The health check and the
-  smoke tests use `--http1.1`; `vl` and `veil-bench` are HTTP/1.1 and
-  unaffected.
+- **BUG-1592** (fixed since): the cache advertised HTTP/2 but serves
+  HTTP/1 only; HTTP/2 clients (curl, by default) got a broken stream. It
+  offers only HTTP/1.1 now. The health check and the smoke tests still pass
+  `--http1.1`, which an image from before the fix needs; `vl` and
+  `veil-bench` are HTTP/1.1 and were unaffected.
 - **BUG-1593**: 9 to 13 database commits per landing on `integration`
   (gate 1).
 

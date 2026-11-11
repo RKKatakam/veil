@@ -1715,16 +1715,15 @@ mod s9_cycle2 {
     }
 }
 
-/// BUG-1592: the cache's TLS advertises HTTP/2 (ALPN `h2`, `tls.rs` sets it
+/// BUG-1592: the cache's TLS advertised HTTP/2 (ALPN `h2`, `tls.rs` sets it
 /// for the server and the cache alike) while its connections are served
 /// HTTP/1-only (`serve_tls` with connection limits), so an HTTP/2 client
-/// (curl, reqwest with http2) negotiates h2 and gets a broken stream:
+/// (curl, reqwest with http2) negotiated h2 and got a broken stream:
 /// `curl: (18) HTTP/2 stream 1 was not closed cleanly` (found by the
 /// deployment kit's health check; `vl` and `veil-bench` use HTTP/1.1 and
-/// never saw it). A listener that speaks HTTP/1 only must offer only
-/// `http/1.1`.
+/// never saw it). Fixed: a listener that speaks HTTP/1 only offers only
+/// `http/1.1` (`serve`), and an HTTP/2 client's request is answered.
 #[test]
-#[ignore = "BUG-1592: the cache advertises h2 in ALPN but serves HTTP/1 only, so HTTP/2 clients fail"]
 fn bug_1592_the_cache_offers_only_the_protocol_it_serves() {
     use rustls::pki_types::pem::PemObject;
     let hub = TestHub::start();
@@ -1746,6 +1745,15 @@ fn bug_1592_the_cache_offers_only_the_protocol_it_serves() {
         conn.complete_io(&mut tcp).expect("the handshake completes");
     }
     assert_eq!(conn.alpn_protocol(), Some(&b"http/1.1"[..]), "a client offering h2 and http/1.1 must get http/1.1, the only protocol the cache serves");
+    // And its request, in the protocol agreed, gets an HTTP answer (a
+    // refusal: it carries no grant).
+    use std::io::{Read as _, Write as _};
+    let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+    tls.write_all(b"GET /v1/objects/p/x HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+    let mut answer = Vec::new();
+    let _ = tls.read_to_end(&mut answer);
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 4"), "{answer}");
 }
 
 /// BUG-1332 (S24): what a regional cache forwards counted against the

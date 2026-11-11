@@ -43,9 +43,9 @@ VOLUME ["/var/lib/veil"]
 EXPOSE 8443
 # Healthy when the server answers HTTPS on its port with 2xx or 4xx (the
 # route needs a grant, so an unauthenticated 401 means "up", while 000 or
-# 5xx fails). A cache sets VEIL_HEALTH_URL to its own port. HTTP/1.1: the
-# cache advertises h2 but serves HTTP/1 only, which breaks an HTTP/2
-# client's stream (BUG-1592).
+# 5xx fails). A cache sets VEIL_HEALTH_URL to its own port. HTTP/1.1: a
+# cache from before BUG-1592's fix advertises h2 but serves HTTP/1 only,
+# which breaks an HTTP/2 client's stream.
 ENV VEIL_HEALTH_URL=https://127.0.0.1:8443/v1/epochs
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
     CMD case "$(curl -ksS --http1.1 -o /dev/null -w '%{http_code}' --max-time 2 "$VEIL_HEALTH_URL")" in 2*|4*) exit 0;; *) exit 1;; esac

@@ -397,6 +397,16 @@ pub(crate) async fn serve(
     limits: Option<ConnectionLimits>,
     server: Option<Arc<limits::Connections>>,
 ) {
+    // A listener offers only what it serves (BUG-1592): a client that was
+    // offered `h2` here and took it got a broken stream.
+    let tls = match server {
+        Some(_) => tls,
+        None => {
+            let mut only = (*tls).clone();
+            only.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Arc::new(only)
+        }
+    };
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
     let open = limits.map(|l| Arc::new(tokio::sync::Semaphore::new(l.max_connections.max(1))));
     loop {
