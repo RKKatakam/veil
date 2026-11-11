@@ -371,3 +371,58 @@ print(json.dumps({
         "workspace socket allowed cross-workspace / network-reaching `vl log -r` under --no-network: res={res}, remote_hits={hits:?}"
     );
 }
+
+/// Review `rv-client` (2026-11-10). BUG-1803's guarantee, `ws_socket.rs`:
+/// "a thin clone never asks its server to place a revision a sandboxed
+/// command named … and `--no-network` holds for the check too."
+///
+/// `NAME@tested` is a second way a revision reaches the server: `Ctx::rev`
+/// asks `GET /v1/projects/{p}/tested/NAME` when the clone holds no such
+/// remote tag, outside the store's `without_fetching`. The workspace's own
+/// name passes the "names another workspace" check (`agent@tested`), and
+/// `describe -r` and `new` are not checked for names at all.
+#[test]
+#[ignore = "BUG-1842: a sandboxed `vl show WS@tested` (or `describe -r X@tested`) makes the vl outside ask the server, under --no-network"]
+fn bug_1842_a_tested_revision_named_inside_a_sandbox_never_reaches_the_server_under_no_network() {
+    let env = Env::new();
+    let _daemon = DaemonStop { env: &env, user: "alice" };
+    let runtime = short_runtime();
+
+    let proj = env.project("alice", "proj", &[("a.txt", "v1\n")]);
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
+
+    let recorder = OfflineRecorder::start(&env, "rec-1842");
+    let veil_home = env.root.join("home-alice");
+    recorder.seed_login(&veil_home);
+    let add_out = env
+        .cmd("alice", &proj, &["remote", "add", "origin", &format!("veil://127.0.0.1:{}/proj", recorder.port)])
+        .env("VEIL_KEY_SHARE", "0")
+        .output()
+        .unwrap();
+    assert!(add_out.status.success(), "{}", text(&add_out));
+    let before = recorder.hits();
+
+    let script = r#"
+vl show 'agent@tested' >/dev/null 2>&1; echo "show=$?"
+vl describe -r 'RVCLIENTBRANCH@tested' -m x >/dev/null 2>&1; echo "describe=$?"
+vl status >/dev/null 2>&1; echo "status=$?"
+"#;
+    let out = env
+        .cmd("alice", &proj, &["ws", "exec", "agent", "--no-network", "--", "bash", "-c", script])
+        .env("HOME", env.dir("fakehome-1842"))
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("VEIL_KEY_SHARE", "0")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    // The socket works in this run, and refuses both names.
+    assert!(stdout.contains("status=0"), "the workspace socket answers: {}", text(&out));
+    assert!(!stdout.contains("show=0") && !stdout.contains("describe=0"), "neither name is a revision of the workspace: {}", text(&out));
+    let hits: Vec<String> = recorder.hits().into_iter().skip(before.len()).collect();
+    assert!(
+        hits.is_empty(),
+        "under --no-network, revisions named inside the sandbox made the vl outside ask the server: {hits:?}"
+    );
+}

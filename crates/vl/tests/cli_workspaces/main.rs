@@ -17,6 +17,8 @@ mod confine_cli;
 mod p1pass_confine_cli;
 #[cfg(target_os = "linux")]
 mod ports_seed_cli;
+#[cfg(target_os = "linux")]
+mod rv_client_cli;
 mod guide_library;
 mod mount_cli;
 mod mount_props;
