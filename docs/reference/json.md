@@ -172,7 +172,7 @@ Content this reader cannot see, and why. It never carries the content.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `status` | string | `good` (by a known member), `unknown` (valid, but by a key no key ring knows), `bad` (does not match the snapshot) or `unsigned` |
+| `status` | string | `good` (by a known member), `server` (valid, by the signing key of the clone's server, pinned when this device signed in: a snapshot the server made, such as a landed change), `unknown` (valid, but by a key no key ring knows), `bad` (does not match the snapshot) or `unsigned` |
 | `signer` | string or null | The member's name, for `good`. It differs from the author when someone else rewrote the snapshot (a rebase) |
 | `key` | string or null | The signing public key, in hex; null if unsigned |
 | `key_short` | string or null | Its first 16 digits, as `vl show` prints them |

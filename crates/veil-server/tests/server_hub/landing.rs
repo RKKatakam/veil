@@ -419,11 +419,14 @@ fn protected_branches_move_only_by_landing_and_push_lands_instead() {
     p.dev.ok(&d1, &["commit", "-m", "three"]);
     let out = p.dev.ok(&d1, &["land"]);
     assert!(out.contains("landed main"), "{out}");
-    // An overlapping push is a conflict, and main is untouched.
-    write_files(&d1, &[("src/two.rs", "not two\n")]);
-    p.dev.commit_main(&d1, "overlap");
-    let out = p.dev.fails(&d1, &["push"]);
-    assert!(out.contains("conflict") && out.contains("src/two.rs"), "{out}");
+    // An overlapping push is a conflict, and main is untouched. From the
+    // other clone, which is a change behind: the clone that landed stands
+    // on what landed (BUG-1910), `src/two.rs` and all.
+    assert_eq!(std::fs::read_to_string(d1.join("src/two.rs")).unwrap(), "two\n", "the working copy moved onto the landed change");
+    write_files(&d2, &[("src/three.rs", "not three\n")]);
+    p.dev.commit_main(&d2, "overlap");
+    let out = p.dev.fails(&d2, &["push"]);
+    assert!(out.contains("conflict") && out.contains("src/three.rs"), "{out}");
     let check = p.dev.dir("check");
     p.dev.ok(p.dev.home.path(), &["clone", &hub.url(&p.name), check.to_str().unwrap()]);
     for (f, c) in [("one", "one\n"), ("two", "two\n"), ("three", "three\n")] {

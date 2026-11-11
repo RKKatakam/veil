@@ -48,10 +48,16 @@ pub fn login(url: &str, name: Option<&str>, ca: Option<&Path>) -> Result<ExitCod
     let identity = load_identity()?;
     let fp = hub::fingerprint(&identity.public_id()).unwrap_or_default();
     let client = Client::new(&u, identity)?;
-    let s = client.login(name)?;
+    let (s, replaced) = client.login_pinning(name)?;
     println!("Signed in to {} as {}", safe(&u.authority), bold(&safe(&s.person)));
     println!("  this device {}", bold(&fp));
     println!("  server key  {}", dim(&s.hub_key));
+    if let Some(old) = replaced {
+        crate::render::warn(&format!(
+            "the server's key changed (it was {}): snapshots it signed with the old key now show as `?signer`",
+            safe(&old)
+        ));
+    }
     Ok(ExitCode::SUCCESS)
 }
 

@@ -293,8 +293,10 @@ fn snapshot_ref_thin(
 /// A snapshot signature.
 #[derive(Serialize, Debug, Clone)]
 pub struct Sig {
-    /// `good`, `unknown` (valid, by a key no key ring knows), `bad` or
-    /// `unsigned`.
+    /// `good`, `server` (valid, by the signing key of this clone's server,
+    /// pinned when this device signed in: a snapshot the server made, such
+    /// as a landed change), `unknown` (valid, by a key no key ring
+    /// knows), `bad` or `unsigned`.
     pub status: &'static str,
     /// The member who signed (`good` only).
     pub signer: Option<String>,
@@ -303,11 +305,15 @@ pub struct Sig {
     pub key_short: Option<String>,
 }
 
-fn sig(status: &SignatureStatus, s: &Snapshot) -> Sig {
+fn sig(repo: &Repo, status: &SignatureStatus, s: &Snapshot) -> Sig {
     let key = s.signature.as_ref().map(|g| g.key.clone());
     let key_short = s.signature.as_ref().map(|g| g.key.get(..16).unwrap_or(&g.key).to_string());
     let (status, signer) = match status {
         SignatureStatus::Good { name, .. } => ("good", Some(name.clone())),
+        // A signature that verifies, by the key this device pinned for the
+        // clone's server (BUG-1910). Any other key no ring knows stays
+        // unknown.
+        SignatureStatus::Unknown { key } if crate::hub::server_keys(repo).contains(key) => ("server", None),
         SignatureStatus::Unknown { .. } => ("unknown", None),
         SignatureStatus::Bad => ("bad", None),
         SignatureStatus::Unsigned => ("unsigned", None),
@@ -1059,6 +1065,7 @@ fn thin_log_route(q: &LogQuery) -> Option<Option<(VPath, bool)>> {
 fn remote_log_entry(
     v: &serde_json::Value,
     signers: &std::collections::BTreeMap<String, (String, String)>,
+    server_keys: &[String],
     tags: &mut HashMap<ObjectId, Vec<TagLabel>>,
     remote_tags: &mut HashMap<ObjectId, Vec<String>>,
     workspaces: &mut HashMap<ObjectId, Vec<String>>,
@@ -1079,6 +1086,9 @@ fn remote_log_entry(
                 let key_short = key_hex.get(..16).unwrap_or(&key_hex).to_string();
                 let (status, signer) = match signers.get(&key_hex) {
                     Some((member, name)) if member == signer_hex => ("good", Some(name.clone())),
+                    // The key this device pinned for the clone's server, as
+                    // a clone that holds the snapshot shows it (BUG-1910).
+                    _ if server_keys.contains(&key_hex) => ("server", None),
                     _ => ("unknown", None),
                 };
                 Sig { status, signer, key: Some(key_hex), key_short: Some(key_short) }
@@ -1272,7 +1282,7 @@ fn thin_query_log<'a>(
             author: (!is_root).then(|| s.author.clone()),
             agent: s.agent.clone(),
             timestamp: if is_root { None } else { rfc3339(s.timestamp) },
-            signature: (!is_root).then(|| sig(&repo.keys().snapshot_status_with(&s, &helper.signers), &s)),
+            signature: (!is_root).then(|| sig(repo, &repo.keys().snapshot_status_with(&s, &helper.signers), &s)),
             workspaces: workspaces.remove(id).unwrap_or_default(),
             tags: tags.remove(id).unwrap_or_default(),
             remote_tags: remote_tags.remove(id).unwrap_or_default(),
@@ -1322,6 +1332,7 @@ fn thin_query_log<'a>(
                             let e = remote_log_entry(
                                 item,
                                 &helper.signers,
+                                &crate::hub::server_keys(repo),
                                 &mut tags,
                                 &mut remote_tags,
                                 &mut workspaces,
@@ -1369,6 +1380,7 @@ fn thin_query_log<'a>(
                             let e = remote_log_entry(
                                 item,
                                 &helper.signers,
+                                &crate::hub::server_keys(repo),
                                 &mut tags,
                                 &mut remote_tags,
                                 &mut workspaces,
@@ -1766,7 +1778,7 @@ impl LogEntries<'_> {
             author: (!root).then(|| s.author.clone()),
             agent: s.agent.clone(),
             timestamp: if root { None } else { rfc3339(s.timestamp) },
-            signature: (!root).then(|| sig(&repo.keys().snapshot_status_with(&s, &self.signers), &s)),
+            signature: (!root).then(|| sig(repo, &repo.keys().snapshot_status_with(&s, &self.signers), &s)),
             workspaces: self.workspaces.remove(&id).unwrap_or_default(),
             tags: self.tags.remove(&id).unwrap_or_default(),
             remote_tags: self.remote_tags.remove(&id).unwrap_or_default(),
@@ -2280,7 +2292,7 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
         root,
         author: s.author.clone(),
         timestamp: rfc3339(s.timestamp),
-        signature: status.as_ref().map(|st| sig(st, &s)),
+        signature: status.as_ref().map(|st| sig(repo, st, &s)),
         parents: s.parents.iter().map(|p| snapshot_ref(repo, p)).collect(),
         tags: repo.view().tags.iter().filter(|(_, t)| t.target == id).map(|(n, _)| n.clone()).collect(),
         embargo,

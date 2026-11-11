@@ -384,7 +384,10 @@ rotation = { generation, key_id, previous: [{key_id, sealed}], wrapped: {id → 
   * `unsigned`.
 
   `vl log` marks each snapshot with `✓`, `✓<signer>`, `?signer`,
-  `✗bad-signature` or `unsigned`.
+  `✗bad-signature` or `unsigned`; and with `✓server` one whose valid
+  signature is by the key this device pinned for the clone's server
+  (`docs/HUB.md` §13.4: a landed change, a projection), which the key
+  rings do not hold and `vl` therefore reads from `$VEIL_HOME/hub.json`.
 
 ### The team vault (`team_vault.rs`)
 
@@ -1063,7 +1066,10 @@ snapshot (and with it every command), and nothing is dropped silently:
   builder hardening): a new public file or link whose plaintext equals
   that of a cloaked entry the same snapshot deletes (verified sealing,
   key held) is sealed as that entry was, unless a rule of the policy
-  explicitly classifies the new path (`Builder::protect_moves`).
+  explicitly classifies the new path (`Builder::protect_moves`). It
+  stays sealed only while its history shows the secret it came from: a
+  rewrite that leaves it on parents that do not explain it records it by
+  its path again (§5, "A secret's rename taken apart").
 * A path the working copy's filesystem refuses (a name too long for it,
   a character it cannot hold, permission denied on one directory) never
   stops a checkout and never wedges the working copy: it is reported
@@ -1421,6 +1427,22 @@ struct Snapshot {
     files are whole. A conflict therefore moves whole, keeping its
     entry and its place in the conflict index; it cannot be split by hunk
     (resolve it first).
+  * **A secret's rename taken apart** (BUG-1911). A file is sealed at a
+    path that is not a secret's only as a secret renamed (§4, "Protection
+    follows content across a rename"), and the one rule for that
+    (`policy::sealed_secret`, which the server's push check asks) reads a
+    snapshot against its parents: a parent holds the sealed file at that
+    path, or the snapshot moves a secret of that scope away. A selection
+    that takes the new name apart from the deletion of the old one leaves
+    a half the rule does not explain: the new name on a parent that no
+    longer holds the secret, or a copy beside the secret. That file is
+    recorded as `vl commit` would record it there: the same content as an
+    ordinary file, plain, and scanned like any new file (a refusal that
+    changes nothing if it looks like a secret). `Transaction::reconcile_sealing`
+    decides this for every snapshot a split, a squash or a rebase writes,
+    by that same rule (BUG-1833), so `vl` never writes a history the
+    server refuses; what is built on the change follows it. Nothing else
+    of either half differs from `selection::halves`.
   * Each is one transaction: `vl undo` restores the view exactly. A
     selection is made before the transaction (an interactive pick can take
     minutes), so the transaction re-checks that the change and destination
@@ -1428,7 +1450,9 @@ struct Snapshot {
     A property test (`veil-core/tests/core_engine/split_squash.rs`) checks, over random
     edits (text, binary, adds, deletes, executable bits, sealed secrets) and
     random selections, that the halves are the selection and its complement,
-    that every entry keeps one of its versions' audiences, that squashing
+    that every entry keeps one of its versions' audiences, that each
+    snapshot a split or a squash writes is its half as the rule above
+    records it and nothing the push check refuses, that squashing
     the halves together gives the original tree, and that undo restores the
     view. Another (`vl/tests/adversarial7/rewrites.rs`) runs random
     sequences of squash, split, rebase, restore and resolve through the

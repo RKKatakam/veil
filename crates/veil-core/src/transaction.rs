@@ -114,8 +114,6 @@ pub struct Transaction<'r> {
     kept_dir: Option<VPath>,
     /// [`Transaction::keep_attribution`].
     keep_attribution: bool,
-    /// [`Transaction::keep_sealing`].
-    keep_sealing: bool,
     /// Paths whose sealed entries a command (`vl restore`) carried into the
     /// directory it records (BUG-492).
     carried_sealed: HashSet<VPath>,
@@ -187,7 +185,6 @@ impl<'r> Transaction<'r> {
             done: false,
             kept_dir: None,
             keep_attribution: false,
-            keep_sealing: false,
             carried_sealed: HashSet::new(),
         })
     }
@@ -386,11 +383,19 @@ impl<'r> Transaction<'r> {
     /// `s.parents` do not explain (`policy::sealed_secret`, BUG-1833): its
     /// content arrived at an ordinary path and is classified (and scanned)
     /// there, across commits, squashes, splits, rebases and duplicates.
+    ///
+    /// The rule is asked exactly as the server's push check asks it
+    /// (`known = false`: a parent holds a sealed entry at the path, or the
+    /// snapshot moves a secret of that scope away), for every command, so
+    /// `vl` writes nothing the server refuses. A laxer question here (any
+    /// object a parent holds sealed; `split` exempt) let a split and a
+    /// partial squash write a renamed secret the push check refused
+    /// (BUG-1911).
     fn reconcile_sealing(&self, s: &mut Snapshot, tolerated: &impl Fn(&VeilError) -> bool) -> Result<()> {
         use crate::object::{EntryKind, TermKind, TreeEntry, Visibility};
         use crate::policy::{Policy, Tier};
         let store = &self.repo.store;
-        if self.keep_sealing || store.format() < crate::repo::ONLY_SECRETS_REPO_FORMAT || s.parents.is_empty() {
+        if store.format() < crate::repo::ONLY_SECRETS_REPO_FORMAT || s.parents.is_empty() {
             return Ok(());
         }
         let Some(first_parent) = self.repo.exact().snapshot(&s.parents[0]).ok().flatten() else {
@@ -419,32 +424,6 @@ impl<'r> Transaction<'r> {
         });
         if !has_candidate {
             return Ok(());
-        }
-        let mut known_secret_ids: HashSet<ObjectId> = HashSet::new();
-        for p in &s.parents {
-            let Some(ps) = self.repo.exact().snapshot(p).ok().flatten() else { continue };
-            if let Ok((pfiles, _)) = crate::tree::walk_files_hiding(store, &ps.tree) {
-                for (_, pe) in pfiles {
-                    if !pe.visibility.is_public() {
-                        known_secret_ids.insert(pe.id);
-                    } else if pe.kind == EntryKind::Conflict {
-                        if let Ok(cf) = store.conflict(&pe.id) {
-                            for t in cf.adds.iter().chain(&cf.removes).flatten() {
-                                if !t.visibility.is_public() {
-                                    known_secret_ids.insert(t.id);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Ok((sfiles, _)) = crate::tree::walk_files_hiding(store, &s.tree) {
-            for (sp, se) in sfiles {
-                if !se.visibility.is_public() && crate::policy::seals_secret(sp.as_str()) {
-                    known_secret_ids.insert(se.id);
-                }
-            }
         }
         let sealed_in_a_parent = |path: &VPath| -> bool {
             if self.carried_sealed.contains(path) {
@@ -522,7 +501,7 @@ impl<'r> Transaction<'r> {
                 let ok = crate::policy::sealed_secret::<std::convert::Infallible>(
                     c.path.as_str(),
                     scope,
-                    known_secret_ids.contains(&e.id),
+                    false,
                     |_| Ok(sealed_in_a_parent(&c.path)),
                     |_| Ok(moved_away(scope)),
                 )
@@ -545,7 +524,7 @@ impl<'r> Transaction<'r> {
                 for slot in cf.adds.iter_mut().chain(cf.removes.iter_mut()) {
                     let Some(t) = slot.as_mut() else { continue };
                     let Visibility::Cloaked { scope } = &t.visibility else { continue };
-                    if known_secret_ids.contains(&t.id) || moved_away(scope.as_str()) {
+                    if moved_away(scope.as_str()) {
                         continue;
                     }
                     let pol = load_policy()?;
@@ -596,13 +575,6 @@ impl<'r> Transaction<'r> {
                 self.carried_sealed.insert(path.clone());
             }
         }
-    }
-
-    /// Snapshots this transaction writes keep their entries' sealing as
-    /// recorded ([`Repo::split`]: dividing one change never widens any entry's
-    /// audience).
-    pub(crate) fn keep_sealing(&mut self) {
-        self.keep_sealing = true;
     }
 
     /// Snapshots this transaction writes keep their own attribution
@@ -841,6 +813,27 @@ impl<'r> Transaction<'r> {
         self.release_parents(&prev.parents, &new.parents)?;
         self.add_head(id)?;
         Ok(id)
+    }
+
+    /// Record that `old` was superseded by `new`, a snapshot this repository
+    /// already holds: the same change as the server landed it (BUG-1910).
+    /// `old` leaves the view as any rewritten version of a change does (it
+    /// stays in the change's history and resolves by its id), and what
+    /// stands on it (changes, tags, working copies) follows at commit.
+    pub fn supersede(&mut self, old: ObjectId, new: ObjectId) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        if old == self.repo.root_id {
+            return Err(VeilError::repo("the root snapshot cannot be rewritten"));
+        }
+        let prev = self.repo.snapshot(&old)?;
+        let now = self.repo.snapshot(&new)?;
+        self.rewritten.insert(old, Rewrite::Replaced(new));
+        self.view.heads.remove(&old);
+        self.release_parents(&prev.parents, &now.parents)?;
+        self.add_head(new)?;
+        Ok(())
     }
 
     /// Move this clone to its person's current view (BUG-1509), in this

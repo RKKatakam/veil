@@ -946,8 +946,19 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
   from a pusher's own snapshot `N` (below) and `P(S)` equals `N`, `v` gets
   `N`, again with its author's signature. Otherwise `P(S)` is a new
   snapshot **signed by the server's key** (`vl log` shows it as
-  `?signer`). The server is trusted with code (§3.1), so its signature on
-  a projection is within the trust boundary. Projections are deterministic
+  `✓server`). The server is trusted with code (§3.1), so its signature on
+  a projection is within the trust boundary. **The key is pinned per
+  server** (BUG-1910): the session answer carries it (`Session::hub_key`),
+  `vl login` prints it and keeps it in `$VEIL_HOME/hub.json` (trust on
+  first use), and a valid signature by the pinned key of one of the
+  clone's servers is shown as the server's (`✓server`; `server` in JSON),
+  as for a landed change (§13.19). Nothing else changes: a signature that
+  does not verify is `✗bad-signature`, and one that verifies under a key
+  that is neither a member's nor the pinned one is still `?signer`. A
+  session `vl` renews by itself never replaces the pin: a server that
+  presents another key is refused ("now signs with another key"), and
+  only `vl login`, typed by the person, accepts the new one, saying that
+  it changed (snapshots signed with the old key are then `?signer`). Projections are deterministic
   (Ed25519 signatures are), memoised per view key (a hash of what the
   viewer may read), and identical for viewers who read the same paths.
 * **Pushing from a projection (the graft).** A pusher's snapshot `N` has
@@ -2710,9 +2721,22 @@ opt-in.
 **`vl land [REV] [--onto BRANCH] [--no-wait] [--status TICKET]`** uploads
 REV (default `@-`) and what the server lacks under it, submits it, and on
 `landed` pulls and moves the local tag of the branch to where the change
-landed if it was at REV or below. The working copy stays on REV, a
-predecessor of the landed snapshot with the same content at every path it
-edits; the next change made on it lands the same way.
+landed if it was at REV or below. **The landed snapshot supersedes REV in
+the clone** (BUG-1910): the server lands a change as a snapshot of its own
+(on the branch's newest tip, signed by the server's key, naming REV as its
+predecessor), and when a pull brings it (the one `vl land` makes on
+`landed`, or any later one after `--no-wait`), `vl` records that REV became
+it, as for any rewrite (`Transaction::supersede`, in the pull's operation).
+So `vl log` lists the landed change once, as the server landed it; REV
+leaves the log and stays in `vl evolog` and under its id; and what stood on
+REV (the working copy, later changes, local tags) is rebased onto the
+landed snapshot, which holds REV's content at every path it edits plus
+whatever else landed below it. The next change is made on it and lands the
+same way; `vl undo` takes the pull and the move back together. Only a
+version of the clone's own line is superseded: the same change id, visible
+there, and under no branch of the server's before the pull or after it (a
+branch someone rewrote and forced, or one a pull request landed from,
+stays a row of its own).
 
 **Measured** (`docs/design/scale/LOAD.md`, "The landing service", after the
 cycle-3 redesign): into one `main`, **993 landings/s with 1,000 agents at a

@@ -387,6 +387,18 @@ pub fn signature_marker(status: &SignatureStatus, author: &str) -> String {
     }
 }
 
+/// The marker of a snapshot signed by the clone's own server (its key
+/// pinned at sign-in), in `vl log`.
+pub fn server_marker() -> String {
+    green("✓server")
+}
+
+/// The same, for `vl show`.
+pub fn server_detail(s: &Snapshot) -> String {
+    let key = s.signature.as_ref().map(|g| dim(&format!(" (key {})", safe(g.key.get(..16).unwrap_or(&g.key))))).unwrap_or_default();
+    format!("{}{key}", green(&format!("good, signed by the server (author {})", safe(&s.author))))
+}
+
 /// One-line signature description for `vl show`.
 pub fn signature_detail(status: &SignatureStatus, s: &Snapshot) -> String {
     let key = s
