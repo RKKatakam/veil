@@ -1453,3 +1453,75 @@ fn extract_next_href(html: &str, prefix: &str) -> String {
     }
     panic!("no next-page href starting with {prefix:?} in HTML:\n{html}");
 }
+
+// ---- review rv-new (BUG-1871 to BUG-1873) ---------------------------------------
+
+/// BUG-1871: the web client asks for the device's `identity.json` (sign-in
+/// "option 2" and every review). That file holds the device's signing seed
+/// **and** its X25519 secret, the key that opens the secret key rings: a
+/// personal private key in the browser, which the server's code runs in
+/// (`docs/design/server/phase-4-agent-scale.md` §6 row 18, decision 13).
+#[test]
+#[ignore = "BUG-1871: the web client asks for the device identity file (its private keys) in the browser"]
+fn bug_1871_the_web_client_never_asks_for_a_device_identity_file() {
+    let hub = TestHub::start();
+    let web = WebClient::new(&hub);
+    let login = web.get("/login");
+    assert_eq!(login.status, 200, "{}", login.text());
+    let js = web.get("/static/app.js");
+    assert_eq!(js.status, 200, "{}", js.text());
+    let asks = [
+        "veil-identity-json",
+        "veil-review-identity",
+        "identity JSON",
+        "veil_web_sign_login",
+        "veil_web_sign_review",
+        "veil_web_generate_identity",
+    ];
+    assert_absent(&login.text(), &asks, "GET /login");
+    assert_absent(&js.text(), &asks, "GET /static/app.js");
+}
+
+/// BUG-1872: a file page is bounded in lines only. A line is rendered whole
+/// whatever its length, so a minified bundle (one line) comes back as one
+/// page of the file's whole size (`docs/HUB.md` §13.39: 200 lines /
+/// `<= 64 KiB` per page).
+#[test]
+#[ignore = "BUG-1872: a file page renders a long line whole: its size is not bounded"]
+fn bug_1872_a_file_page_is_bounded_whatever_the_length_of_a_line() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let proj = unique("longline");
+    let dir = alice.dir("l");
+    std::fs::create_dir_all(&dir).unwrap();
+    alice.ok(&dir, &["init"]);
+    alice.ok(&dir, &["remote", "add", "origin", &hub.url(&proj)]);
+    let bundle = format!("{}\n", "var a=1;".repeat(600 * 1024 / 8));
+    write_files(&dir, &[(".veilpolicy", "public/ public\n"), ("public/bundle.min.js", &bundle)]);
+    alice.commit_main(&dir, "a minified bundle");
+    alice.ok(&dir, &["push"]);
+    catch_up(&hub, &proj);
+
+    let mut web = WebClient::new(&hub);
+    web.sign_in_derived(&hub, &alice);
+    let page = web.get(&format!("/p/{proj}/file/public/bundle.min.js"));
+    assert_eq!(page.status, 200, "{}", page.text().chars().take(400).collect::<String>());
+    // The same bound as `guarantee_5` holds a 650-line file's page to.
+    assert!(page.body.len() < 96 * 1024, "a file page of {} bytes", page.body.len());
+}
+
+/// BUG-1873: `docs/HUB.md` §13.39 says a web session lasts 8 hours by
+/// default (12 at most; the cookie's `Max-Age=28800`); the server gives 1
+/// hour (4 at most).
+#[test]
+#[ignore = "BUG-1873: a web session lasts 1 hour by default, not the 8 hours docs/HUB.md §13.39 says"]
+fn bug_1873_a_web_session_lasts_as_long_as_the_design_says() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let before = veil_core::now_millis();
+    let r = hub.api().post_json(Some(&alice.token()), "/v1/sessions/web", &json!({}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let lasts = r.json()["expires_at"].as_i64().expect("expires_at") - before;
+    let hour = 3600 * 1000;
+    assert!((8 * hour - 60_000..=8 * hour + 60_000).contains(&lasts), "a default web session lasts {} minutes", lasts / 60_000);
+}
