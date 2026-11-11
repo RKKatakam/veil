@@ -1324,8 +1324,8 @@ pub enum IdentityCmd {
         server: Option<String>,
     },
     /// Remove a device on a Veil server: a lost laptop, say, or a browser
-    /// you enrolled with `vl web` (its passkey: `vl identity list` shows
-    /// them). Run it on
+    /// you enrolled with `vl web` (`vl identity list` shows its passkey's
+    /// fingerprint). Run it on
     /// another of your devices to remove it everywhere; an admin may remove
     /// anyone's device from their project only (run it in a clone of the
     /// project).

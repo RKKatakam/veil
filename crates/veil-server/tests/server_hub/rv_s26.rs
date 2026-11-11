@@ -333,6 +333,47 @@ fn bug_1902_expired_login_challenges_are_deleted() {
     );
 }
 
+/// BUG-1902, the bound: one address holds at most
+/// `MAX_PENDING_LOGINS_PER_ADDRESS` sign-ins started and not finished; one
+/// more is refused (`429`) and stores nothing, until some finish or expire.
+/// And a sign-in that starts counts against its address's anonymous rate
+/// (S24), like any request without a session.
+#[test]
+fn bug_1902_pending_sign_ins_are_bounded_per_address_and_under_the_anonymous_rate() {
+    use veil_server::limits::{bucket::Rate, Settings};
+    let cap = veil_server::web::passkey::MAX_PENDING_LOGINS_PER_ADDRESS;
+    let hub = TestHub::start();
+    let web = BrowserClient::new(&hub);
+    let pending = "SELECT count(*) FROM webauthn_challenges WHERE kind = 'login' AND origin = $1";
+    for _ in 0..cap {
+        login_challenge(&web, None);
+    }
+    assert_eq!(count(&hub, pending, &web.origin), cap);
+    let over = web.post_json("/web/passkey/login/begin", &json!({}), false);
+    assert_eq!(over.status, 429, "{}", over.text());
+    assert!(over.text().contains("not finished"), "refused for another reason: {}", over.text());
+    assert_eq!(count(&hub, pending, &web.origin), cap, "a refused sign-in stored a challenge");
+    // The rows carry the address they are counted against.
+    assert_eq!(count(&hub, "SELECT count(DISTINCT address) FROM webauthn_challenges WHERE origin = $1 AND address <> ''", &web.origin), 1);
+    // Two expire: two more start, and no third.
+    assert_eq!(exec(&hub, "UPDATE webauthn_challenges SET expires_at = 1 WHERE challenge IN (SELECT challenge FROM webauthn_challenges WHERE origin = $1 LIMIT 2)", &web.origin), 2);
+    login_challenge(&web, None);
+    login_challenge(&web, None);
+    let over = web.post_json("/web/passkey/login/begin", &json!({}), false);
+    assert_eq!(over.status, 429, "{}", over.text());
+    assert_eq!(count(&hub, pending, &web.origin), cap);
+
+    // The anonymous rate: 3 a second for this server's addresses.
+    let hub = TestHub::start_with_limits(Settings { anonymous: Rate { per_second: 3, per_hour: 1000 }, ..TestHub::limits() });
+    let web = BrowserClient::new(&hub);
+    let answers: Vec<u16> = (0..8).map(|_| web.post_json("/web/passkey/login/begin", &json!({}), false).status).collect();
+    assert_eq!(answers[0], 200, "{answers:?}");
+    assert!(answers.iter().all(|s| *s == 200 || *s == 429), "{answers:?}");
+    let admitted = answers.iter().filter(|s| **s == 200).count() as i64;
+    assert!((1..8).contains(&admitted), "eight sign-ins at once at 3 a second: {answers:?}");
+    assert_eq!(count(&hub, pending, &web.origin), admitted, "a rate-limited sign-in stored a challenge");
+}
+
 // ---------------------------------------------------------------------------
 // BUG-1903: the client asks for user verification; the server never checks it.
 // ---------------------------------------------------------------------------
