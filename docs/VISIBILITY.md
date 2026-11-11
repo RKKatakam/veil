@@ -76,6 +76,7 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 - The groups named get the fix right away: code, message and history. Everyone else, the public included, sees nothing of it until it's released.
 - Anything built on top of it stays hidden too.
 - `vl embargo release`, or the deadline, makes it public.
+- Releasing it lands it on its branch. If that branch is protected, it needs its approval like any other change: until someone in its groups approves it, the release waits, it stays hidden, and its groups see that it's waiting. Once approved, it lands and is public.
 - **Embargoes are permissions, not encryption** (owner, 2026-11-06). An embargoed change is plain text on the server, visible only to the groups and people named. **The server makes it public at the deadline,** or when someone with the right runs `vl embargo release`. Outside partners (e.g. distro maintainers) get accounts and are named like anyone else.
 
 ## Who can see a PR

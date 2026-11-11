@@ -678,9 +678,11 @@ pub(crate) async fn record_in_tx(
 /// How often a release that is stuck is tried again: one that failed (a
 /// conflict waits for a member to rebase; a database error passes), or one
 /// that waits for an approval (BUG-1857, BUG-1861). An approval tries it at
-/// once ([`try_release_waiting`]); this is for whatever else lets it through
-/// (a rule change, a dismissal on another server).
-const RETRY_STUCK: Duration = Duration::from_secs(5);
+/// once ([`try_release_waiting`]), and a push to the line makes it fresh
+/// (`record_in_tx`); this is for whatever else lets it through (a rule
+/// change, a change of who is in a group). Seldom, so that embargoes left
+/// stuck cost every server next to nothing.
+const RETRY_STUCK: Duration = Duration::from_secs(30);
 
 /// Background loop that releases embargoes at their deadlines
 /// ([`release_due`]), and tries the stuck ones again every [`RETRY_STUCK`].
@@ -1169,7 +1171,10 @@ async fn release_pending(hub: &Arc<Hub>, stuck: bool) -> Result<usize> {
     )
     .fetch_all(&hub.db)
     .await?;
-    let due: Vec<(i64, String)> = due.into_iter().filter(|(_, _, json)| stuck || !is_stuck(json)).map(|(p, e, _)| (p, e)).collect();
+    // The fresh ones first, each in the order of its deadline: a stuck one
+    // never delays a deadline.
+    let (fresh, old): (Vec<_>, Vec<_>) = due.into_iter().partition(|(_, _, json)| !is_stuck(json));
+    let due: Vec<(i64, String)> = fresh.into_iter().chain(old.into_iter().filter(|_| stuck)).map(|(p, e, _)| (p, e)).collect();
 
     if due.is_empty() {
         return Ok(0);
@@ -1226,7 +1231,8 @@ pub async fn release_one(
     pushed_record: Option<EmbargoRecord>,
     submitter: Option<(&Viewer, &crate::landing::Submitter)>,
 ) -> Result<bool> {
-    let row: Option<(Vec<String>, String, String, Option<i64>, String, String)> = sqlx::query_as(
+    type Line = (Vec<String>, String, String, Option<i64>, String, String);
+    let row: Option<Line> = sqlx::query_as(
         "SELECT group_names, target_branch, embargo_branch, released_at, record_json, created_by \
          FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
     )

@@ -169,7 +169,10 @@ fn bug_1861_an_embargo_release_never_lands_an_unapproved_change_on_a_protected_b
     // dev releases it. Whether the release is refused or waits for an
     // approval, main never gets the unapproved change.
     let _ = p.dev.run(&dir, &["embargo", "release", &eid, "--yes"]);
-    let _ = p.dev.run(&dir, &["push"]);
+    // (The fix: the push itself is fine, and says that the release waits.)
+    let pushed = p.dev.run(&dir, &["push"]);
+    let said = format!("{}{}", String::from_utf8_lossy(&pushed.stdout), String::from_utf8_lossy(&pushed.stderr));
+    assert!(pushed.status.success() && said.contains("waits for approval"), "{said}");
     let mut f = file_on_main(&hub, &admin, &p.name, "src/unreviewed_1861.rs");
     for _ in 0..40 {
         if f.status == 200 {

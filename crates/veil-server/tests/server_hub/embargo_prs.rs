@@ -1144,8 +1144,8 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
         .await
         .unwrap();
     });
-    let c_rel = hub1.rt.block_on(veil_server::embargo::release_due(&hub1.hub())).unwrap();
-    assert_eq!(c_rel, 0, "an unapproved release onto protected main is held");
+    // (The service is the whole database's: what it released of other tests is not counted.)
+    hub1.rt.block_on(veil_server::embargo::release_due(&hub1.hub())).unwrap();
     let released_c = || -> Option<i64> {
         hub1.rt
             .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE embargo_id = $1").bind(&eid_c).fetch_one(&hub1.hub().db))
@@ -1174,7 +1174,7 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     assert!(rec_c.released_at.is_none(), "{rec_c:?}");
     assert!(sec_tips.branches.contains_key(&format!("embargo/{eid_c}")), "the held line stays");
     // Trying again changes nothing while it is unapproved.
-    assert_eq!(hub2.rt.block_on(veil_server::embargo::release_due(&hub2.hub())).unwrap(), 0);
+    hub2.rt.block_on(veil_server::embargo::release_due(&hub2.hub())).unwrap();
     assert!(released_c().is_none());
 
     // Approved (on the other server), it lands at once and is released.
@@ -1832,7 +1832,7 @@ fn bug_1861_an_unapproved_release_is_held_hidden_and_lands_once_approved() {
     };
     held("after the release was asked for");
     // The release service tries it again and holds it again; asking again changes nothing.
-    assert_eq!(hub.rt.block_on(veil_server::embargo::release_due(&hub.hub())).unwrap(), 0);
+    hub.rt.block_on(veil_server::embargo::release_due(&hub.hub())).unwrap();
     held("after the release service ran");
     assert_eq!(release().status, 409);
 
@@ -1840,7 +1840,7 @@ fn bug_1861_an_unapproved_release_is_held_hidden_and_lands_once_approved() {
     let pr = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs", p.name), &json!({"head": line, "title": "the fix"}));
     assert_eq!(pr.status, 200, "{}", body_str(&pr));
     let pr_id = pr.json()["id"].as_str().unwrap().to_string();
-    assert_eq!(hub.rt.block_on(veil_server::embargo::release_due(&hub.hub())).unwrap(), 0);
+    hub.rt.block_on(veil_server::embargo::release_due(&hub.hub())).unwrap();
     held("with an unapproved PR");
 
     // Approved: the held release lands, with nobody asking again.
