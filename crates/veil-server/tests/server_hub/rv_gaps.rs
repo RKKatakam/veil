@@ -678,3 +678,27 @@ fn rvgaps_a_revoked_persons_thin_clone_and_old_ids_read_nothing_of_the_folder() 
         assert_eq!((got.status, body.as_str()), (none.status, String::from_utf8_lossy(&none.body).as_ref()), "{q}");
     }
 }
+
+/// BUG-1910: after `vl land`, `vl log` in the clone shows the change
+/// twice: the local version the working copy stays on (`docs/HUB.md`
+/// §13.19: "the working copy stays on REV, a predecessor of the landed
+/// snapshot") and the landed one the server signed, which the local tag
+/// follows, with nothing that says the first became the second. The
+/// landed one is marked `?signer` although it is the server's, whose
+/// answer this clone trusts for every byte it holds. Each later landing
+/// adds a pair. Expected: the landed change is listed once (its local
+/// version hidden, or marked as landed), and a snapshot the clone's own
+/// server signed is not shown as an unknown signer.
+#[test]
+#[ignore = "BUG-1910: after `vl land`, `vl log` lists the landed change twice (its local version unmarked), and the server's signature as `?signer`"]
+fn bug_1910_vl_log_after_a_landing_lists_the_landed_change_once() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    write_files(&p.dir, &[("src/landed.txt", "landed\n")]);
+    p.admin.ok(&p.dir, &["commit", "-m", "the change that lands b1"]);
+    let out = p.admin.ok(&p.dir, &["land"]);
+    assert!(out.contains("landed main"), "{out}");
+    let log = p.admin.ok(&p.dir, &["log"]);
+    assert_eq!(log.matches("the change that lands b1").count(), 1, "the landed change, once:\n{log}");
+    assert!(!log.contains("?signer"), "the server's own signature is known:\n{log}");
+}
