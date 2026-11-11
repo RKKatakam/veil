@@ -291,7 +291,8 @@ fn bug_1880_an_approval_withdrawn_while_the_entry_is_queued_still_lands() {
 /// reads it without a lock (`READ COMMITTED`): a reviewer who takes the
 /// approval back after that read and before the batch commits is answered
 /// `ready: false`, and the change still lands. The window is the batch's
-/// transaction (milliseconds; longer when it waits for a row, as here).
+/// transaction after that read (milliseconds; longer when it waits for a
+/// row, as here).
 #[test]
 #[ignore = "BUG-1886: an approval withdrawn while the landing batch commits still lands"]
 fn bug_1886_an_approval_withdrawn_while_the_batch_commits_still_lands() {
@@ -333,13 +334,8 @@ fn bug_1886_an_approval_withdrawn_while_the_batch_commits_still_lands() {
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.json()["review"]["ready"], true);
 
-    // The batch that lands it checks the review in its transaction, and is
-    // then held at the branch's row (as by a push to the branch).
-    let h = th.hub();
-    let mut held = th.rt.block_on(h.db.begin()).unwrap();
-    th.rt
-        .block_on(sqlx::query("SELECT 1 FROM branches WHERE project_id = $1 AND name = 'main' FOR UPDATE").bind(pid).fetch_one(&mut *held))
-        .unwrap();
+    // The approved change is queued, and waits behind another server's lease.
+    hold_lease(&th, pid, "main");
     let r = api.post_json(
         Some(&dev_tok),
         &format!("/v1/projects/{}/land", p.name),
@@ -349,7 +345,15 @@ fn bug_1886_an_approval_withdrawn_while_the_batch_commits_still_lands() {
     let queued = r.json();
     assert_eq!(queued["state"], "queued", "{queued}");
     let ticket = queued["ticket"].as_str().unwrap().to_string();
-    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE branches SET target%", "the batch never reached its branch move"));
+    // The batch that lands it checks the review in its transaction, and is
+    // then held at the entry's row, which it writes after that check.
+    let h = th.hub();
+    let mut held = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt
+        .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
+        .unwrap();
+    release_lease(&th, pid, "main");
+    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
 
     // Its reviewer takes the approval back, and is told the PR is not ready.
     let r = review("request-changes");
