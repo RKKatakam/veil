@@ -1487,7 +1487,6 @@ fn bug_1871_the_web_client_never_asks_for_a_device_identity_file() {
 /// page of the file's whole size (`docs/HUB.md` §13.39: 200 lines /
 /// `<= 64 KiB` per page).
 #[test]
-#[ignore = "BUG-1872: a file page renders a long line whole: its size is not bounded"]
 fn bug_1872_a_file_page_is_bounded_whatever_the_length_of_a_line() {
     let hub = TestHub::start();
     let alice = hub.person("alice");
@@ -1497,7 +1496,20 @@ fn bug_1872_a_file_page_is_bounded_whatever_the_length_of_a_line() {
     alice.ok(&dir, &["init"]);
     alice.ok(&dir, &["remote", "add", "origin", &hub.url(&proj)]);
     let bundle = format!("{}\n", "var a=1;".repeat(600 * 1024 / 8));
-    write_files(&dir, &[(".veilpolicy", "public/ public\n"), ("public/bundle.min.js", &bundle)]);
+    let amps = format!("{}\n", "&".repeat(50 * 1024));
+    let mut med = String::new();
+    for i in 1..=80 {
+        med.push_str(&format!("MED_LINE_{i:03}:{}\n", "x".repeat(2048)));
+    }
+    write_files(
+        &dir,
+        &[
+            (".veilpolicy", "public/ public\n"),
+            ("public/bundle.min.js", &bundle),
+            ("public/amps.txt", &amps),
+            ("public/med.txt", &med),
+        ],
+    );
     alice.commit_main(&dir, "a minified bundle");
     alice.ok(&dir, &["push"]);
     catch_up(&hub, &proj);
@@ -1508,6 +1520,26 @@ fn bug_1872_a_file_page_is_bounded_whatever_the_length_of_a_line() {
     assert_eq!(page.status, 200, "{}", page.text().chars().take(400).collect::<String>());
     // The same bound as `guarantee_5` holds a 650-line file's page to.
     assert!(page.body.len() < 96 * 1024, "a file page of {} bytes", page.body.len());
+    let text = page.text();
+    assert!(text.contains("var a=1;"), "prefix missing");
+    assert!(text.contains("line truncated"), "truncation note missing");
+
+    // HTML-escape expansion (& -> &amp;) is also bounded within the page budget.
+    let amp_page = web.get(&format!("/p/{proj}/file/public/amps.txt"));
+    assert_eq!(amp_page.status, 200);
+    assert!(amp_page.body.len() < 96 * 1024, "escaped file page of {} bytes", amp_page.body.len());
+    assert!(amp_page.text().contains("line truncated"));
+
+    // Multi-line file under 200 lines whose bytes exceed one page pages without skipping lines.
+    let m1 = web.get(&format!("/p/{proj}/file/public/med.txt"));
+    assert_eq!(m1.status, 200);
+    assert!(m1.body.len() < 96 * 1024, "med page 1 of {} bytes", m1.body.len());
+    assert!(m1.text().contains("MED_LINE_001") && m1.text().contains("page=2"));
+    assert!(!m1.text().contains("MED_LINE_080"));
+    let m2 = web.get(&format!("/p/{proj}/file/public/med.txt?page=2"));
+    assert_eq!(m2.status, 200);
+    assert!(m2.body.len() < 96 * 1024, "med page 2 of {} bytes", m2.body.len());
+    assert!(m2.text().contains("MED_LINE_030"), "page 2 skipped byte-bounded lines");
 }
 
 /// BUG-1873: `docs/HUB.md` §13.39 says a web session lasts 8 hours by
