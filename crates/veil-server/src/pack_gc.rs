@@ -471,7 +471,7 @@ async fn lock_gc_epoch_tx(c: &mut PgConnection, project: i64) -> Result<()> {
 
 /// The root columns of the registry ([`OBJECT_SCHEMA_COLUMNS`]: `GcRoot` and
 /// `GcConditionalLeafRoot`) that the reference stamp does not read: their
-/// table is not in [`STAMP_TABLES`], or its stamped row leaves the column
+/// table is not in `STAMP_TABLES`, or its stamped row leaves the column
 /// out. Empty, or GC would not give way to a row written right before its
 /// switch (BUG-1923); a test holds it empty, so a root table registered
 /// later cannot be left unstamped.

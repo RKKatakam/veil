@@ -1670,7 +1670,7 @@ fn edits_id_of(leaves: &[veil_core::hub::project::Change]) -> Option<String> {
     Some(format!("edits:{}", h.finalize().to_hex()))
 }
 
-/// [`edits_id_of`] the edits of `snapshot` against `parent`.
+/// `edits_id_of`: the edits of `snapshot` against `parent`.
 pub fn edits_id(src: &crate::sync::Source, snapshot: ObjectId, parent: ObjectId) -> Result<Option<String>> {
     let (leaves, _) = crate::derive::changes::diff(src, src.snapshot(&parent)?.tree, src.snapshot(&snapshot)?.tree)?;
     Ok(edits_id_of(&leaves))
