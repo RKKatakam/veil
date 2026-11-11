@@ -229,7 +229,8 @@ fn rows_bytes(rows: &[(String, String)]) -> usize {
 
 pub struct Caches {
     sessions: LruCache<Arc<SessionEntry>>,
-    /// Immutable `devices.signing_key` (32 bytes) -> `person_id` for non-pending devices.
+    /// Immutable `devices.signing_key` (32 bytes) -> `person_id` for non-pending devices;
+    /// and the people someone else vouches for ([`Caches::put_vouched`]).
     devices: LruCache<i64>,
     projects: LruCache<Arc<ProjectEntry>>,
     viewers: LruCache<Arc<ViewerEntry>>,
@@ -321,6 +322,21 @@ impl Caches {
 
     pub fn put_device_person(&self, signing_key: [u8; 32], person_id: i64) {
         self.devices.insert(key("device", &[&signing_key]), person_id, ENTRY + 8);
+    }
+
+    /// Whether this server has seen that someone else vouches for `person`
+    /// ([`Caches::put_vouched`]).
+    pub fn vouched(&self, person: i64) -> bool {
+        self.devices.get(&key("vouched", &[&person.to_le_bytes()])).is_some()
+    }
+
+    /// `person` is in a group of, or named by a rule of, a project they do
+    /// not administer: its admin vouches for them, so their requests count
+    /// against them alone (`limits`, BUG-1890). Kept beside the devices
+    /// (as small, as long-lived); forgotten, it is seen again at the
+    /// person's next request to such a project.
+    pub fn put_vouched(&self, person: i64) {
+        self.devices.insert(key("vouched", &[&person.to_le_bytes()]), person, ENTRY + 8);
     }
 
     pub fn project(&self, name: &str) -> Option<Arc<ProjectEntry>> {

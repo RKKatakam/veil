@@ -111,17 +111,21 @@ fn signed_up(api: &Api) -> String {
 /// a new device. A person's devices and agent sessions share an umbrella of
 /// ten times the device rate; anyone on Earth has their address's rate
 /// (1,000 an hour). One address that signs up new people (an unknown key
-/// under a new name: two anonymous requests each) is served each one's
-/// whole device rate: here 20 sign-ups, each then sending its 20 an hour.
+/// under a new name: two anonymous requests each) was served each one's
+/// whole device rate (BUG-1890): here 20 sign-ups, each then sending its 20
+/// an hour, 400 served. People nobody else vouches for now also pay their
+/// address's bucket, a person's umbrella: the first has their whole device
+/// rate, all of them together an umbrella, and a new person past it is
+/// refused from their first request.
 #[test]
-#[ignore = "BUG-1890: every sign-up from one address gets a fresh device and person bucket, so one address is served any multiple of a person's rate"]
 fn bug_1890_one_address_signing_up_new_people_stays_within_a_persons_rate() {
     let device = Rate { per_second: 20, per_hour: 20 };
     let hub = TestHub::start_with_limits(Settings { device, ..Settings::default() });
     let api = hub.api();
     // What one person gets from any number of devices: ten times a device.
     let umbrella = 10 * device.per_hour as usize;
-    let mut served = 0;
+    let started = std::time::Instant::now();
+    let (mut served, mut refused_at_once) = (0, 0);
     // 20 sign-ups are 40 anonymous requests: within the address's 1,000 an
     // hour, paced within its 20 a second.
     for person in 0..20 {
@@ -130,19 +134,146 @@ fn bug_1890_one_address_signing_up_new_people_stays_within_a_persons_rate() {
         for i in 0..device.per_hour {
             std::thread::sleep(std::time::Duration::from_millis(55));
             let r = api.get(Some(&token), "/v1/projects/no-such-project/tips");
-            if i == 0 {
-                assert_ne!(r.status, 429, "person {person}: a new person's first request is served: {}", String::from_utf8_lossy(&r.body));
+            if person == 0 {
+                assert_ne!(r.status, 429, "the first person has their whole device rate (request {i}): {}", String::from_utf8_lossy(&r.body));
             }
             match r.status {
-                429 => break,
+                429 => {
+                    refused_at_once += usize::from(i == 0);
+                    break;
+                }
                 _ => served += 1,
             }
         }
     }
+    // The address's bucket refills over the hour while the test runs.
+    let refilled = (started.elapsed().as_secs_f64() * umbrella as f64 / 3600.0).ceil() as usize;
     assert!(
-        served <= umbrella,
+        served <= umbrella + refilled,
         "one address was served {served} signed-in requests within a minute through 20 sign-ups; a person's devices together get {umbrella} an hour, and an address without a session 1,000"
     );
+    assert!(served >= device.per_hour as usize, "{served} served");
+    assert!(refused_at_once >= 8, "past the umbrella a new person is refused from their first request: {refused_at_once} of the last 10 were ({served} served)");
+}
+
+/// New people from this test's address, each sending requests until one is
+/// refused, until one is refused from their first request: how many were
+/// served. The address's bucket for people nobody vouches for is then empty.
+fn address_spent_by_sign_ups(api: &Api, device: Rate) -> usize {
+    let mut served = 0;
+    for _ in 0..40 {
+        let token = signed_up(api);
+        let mine = (0..device.per_hour).take_while(|_| api.get(Some(&token), "/v1/projects/no-such-project/tips").status != 429).count();
+        served += mine;
+        if mine == 0 {
+            return served;
+        }
+    }
+    panic!("40 new people from one address were served {served} requests and none was refused at once");
+}
+
+/// BUG-1890's fix counts only people nobody vouches for against their
+/// address. Someone a project's admin put in a group (dev) or named in a
+/// rule (carol) counts alone: when sign-ups from their own address (an
+/// office's NAT) have spent the address's bucket, each still has their
+/// whole rate, and the new people are still refused.
+#[test]
+fn bug_1890_people_a_project_vouches_for_keep_their_rate_behind_a_spent_address() {
+    let device = Rate { per_second: 100_000, per_hour: 500 };
+    let hub = TestHub::start_with_limits(Settings { device, ..TestHub::limits() });
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let tips = format!("/v1/projects/{}/tips", p.name);
+    let members = [("dev", p.dev.token()), ("carol", p.carol.token())];
+    // The server meets each of them in the project (its permissions for
+    // them are in memory from the first request on).
+    for (who, token) in &members {
+        for _ in 0..2 {
+            assert_eq!(api.get(Some(token), &tips).status, 200, "{who} reads the project's tips");
+        }
+    }
+    let umbrella = 10 * device.per_hour as usize;
+    let started = std::time::Instant::now();
+    let served = address_spent_by_sign_ups(&api, device);
+    let refilled = (started.elapsed().as_secs_f64() * umbrella as f64 / 3600.0).ceil() as usize;
+    assert!(served <= umbrella + refilled, "new people from one address were served {served}; together they get a person's {umbrella} an hour");
+    for (who, token) in &members {
+        let answers: Vec<u16> = (0..100).map(|_| api.get(Some(token), &tips).status).collect();
+        assert!(answers.iter().all(|s| *s == 200), "{who}, in the project by its admin's choice, has their own rate behind the spent address: {answers:?}");
+    }
+    // Those 200 did not come out of the address's bucket: it is still empty
+    // for someone new (but for what refills meanwhile, under 2 a second).
+    let token = signed_up(&api);
+    let answers: Vec<u16> = (0..100).map(|_| api.get(Some(&token), "/v1/projects/no-such-project/tips").status).collect();
+    let refused = answers.iter().filter(|s| **s == 429).count();
+    assert!(refused >= 80, "a new person behind the spent address is still refused: {refused} of 100: {answers:?}");
+}
+
+/// BUG-1890's second instance: a request under a read grant paid the
+/// grant's device alone, never the person's umbrella, so the object routes
+/// gave a person each device's whole rate again. dev's agent sessions (ten,
+/// each within its own rate) use dev's umbrella; a read under dev's grant,
+/// whose device has nearly all of its own rate left, is then refused as
+/// dev's own session is.
+#[test]
+fn bug_1890_requests_under_a_read_grant_pay_the_persons_umbrella() {
+    use veil_core::hub::grant::{sign_request, Grant};
+    let device = Rate { per_second: 100_000, per_hour: 500 };
+    let hub = TestHub::start_with_limits(Settings { device, ..TestHub::limits() });
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let tips_path = format!("/v1/projects/{}/tips", p.name);
+    let tips = api.tips(Some(&dev), &p.name).expect("dev sees the project");
+    let grant = tips.grants.get("main").expect("a grant").clone();
+    let verified = Grant::verify(&grant, tips.grant_key.as_deref().expect("the server's grant key")).expect("the grant verifies");
+    assert!(verified.body.device.is_some(), "the grant names dev's device");
+    let (root, identity) = (verified.body.root, p.dev.identity());
+    let object = format!("/v1/objects/{}/{}", p.name, root.hex());
+    // dev's device signs each read, as `vl` does.
+    let under_grant = || {
+        let ts = veil_core::now_millis();
+        let signature = format!("{ts}.{}", sign_request(&identity, &verified, ts, &[root]));
+        api.get_with(&object, &[("veil-grant", &grant), ("veil-chain", ""), ("veil-signature", &signature)]).status
+    };
+    assert_eq!(under_grant(), 200, "dev reads the root under the grant");
+    // A batch names its grant in its body: counted once the body is read.
+    let batch = serde_json::to_vec(&serde_json::json!({ "grant": grant })).unwrap();
+    let in_a_batch = || api.post(None, &format!("/v1/objects/{}:batch", p.name), &batch, true).status;
+    assert_ne!(in_a_batch(), 429, "a batch under the grant is within dev's rates");
+    let sessions: Vec<String> = (0..10)
+        .map(|i| {
+            let r = api.post_json(Some(&dev), "/v1/sessions/agent", &serde_json::json!({"project": p.name, "attribution": {"agent": "rv-gaps/1", "task": format!("BUG-1890-{i}")}}));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            r.json()["token"].as_str().unwrap().to_string()
+        })
+        .collect();
+    // Each agent session sends its whole rate: together, dev's umbrella.
+    let served: Vec<usize> = std::thread::scope(|s| {
+        let sent: Vec<_> = sessions
+            .iter()
+            .map(|t| {
+                let (api, tips_path) = (hub.api(), &tips_path);
+                s.spawn(move || (0..device.per_hour).take_while(|_| api.get(Some(t), tips_path).status != 429).count())
+            })
+            .collect();
+        sent.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(served.iter().all(|n| *n > 0), "each agent session was served: {served:?}");
+    let umbrella = 10 * device.per_hour as usize;
+    assert!(served.iter().sum::<usize>() <= umbrella, "dev's agent sessions together stay within dev's umbrella: {served:?}");
+    // The umbrella is spent (it refills under 2 a second): dev's own
+    // session is refused, and so is a read under dev's grant.
+    let own: Vec<u16> = (0..20).map(|_| api.get(Some(&dev), &tips_path).status).collect();
+    assert!(own.iter().filter(|s| **s == 429).count() >= 15, "dev's own session, past dev's umbrella: {own:?}");
+    let granted: Vec<u16> = (0..20).map(|_| under_grant()).collect();
+    assert!(granted.iter().all(|s| *s == 200 || *s == 429), "{granted:?}");
+    assert!(
+        granted.iter().filter(|s| **s == 429).count() >= 15,
+        "reads under dev's grant were served past dev's umbrella (the grant's device has its own rate left): {granted:?}"
+    );
+    let batches: Vec<u16> = (0..20).map(|_| in_a_batch()).collect();
+    assert!(batches.iter().filter(|s| **s == 429).count() >= 15, "batches under dev's grant were served past dev's umbrella: {batches:?}");
 }
 
 // ---- derived data after access changes -----------------------------------------------------

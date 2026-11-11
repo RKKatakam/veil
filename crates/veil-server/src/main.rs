@@ -61,7 +61,9 @@ struct Args {
     db_connections: u32,
     /// Requests per signed-in device (one person's agents share it): a
     /// burst a second, then the most an hour (`429` with `retry_after_ms`
-    /// past it).
+    /// past it). A person's devices and agent sessions together have ten
+    /// times it, and so have the people of one address whom no project
+    /// but their own names.
     #[arg(long, default_value = "200/50000", value_parser = rate)]
     device_rate: veil_server::limits::bucket::Rate,
     /// Requests per address without a session this server knows
@@ -69,7 +71,7 @@ struct Args {
     #[arg(long, default_value = "20/1000", value_parser = rate)]
     anonymous_rate: veil_server::limits::bucket::Rate,
     /// Most client connections open at once (the next waits until one
-    /// closes; one address, an IPv6 /64, opens at most an eighth of them,
+    /// closes; one address, an IPv6 /56, opens at most an eighth of them,
     /// a regional cache's as many as it needs).
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,

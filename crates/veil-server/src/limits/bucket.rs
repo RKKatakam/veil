@@ -45,18 +45,25 @@ pub enum Key {
     /// A signed-in person (`people.id`): the 10× umbrella bucket over all
     /// of their devices and agent sessions.
     Person(i64),
-    /// An address without a known session: IPv4, or an IPv6 /64 (one
-    /// subscriber's usual allocation).
+    /// An address: IPv4, or an IPv6 /56 (one subscriber's usual delegated
+    /// prefix, RFC 6177: every /64 of it is routed to the one caller,
+    /// BUG-1891).
     Ip(u128),
 }
 
+/// The bits of an IPv6 address below the prefix that counts as one caller
+/// (a /56).
+const IPV6_HOST_BITS: u32 = 128 - 56;
+
 impl Key {
+    /// The one key of an address, for every limit an address has (the
+    /// rates, the body and answer shares, the connection share).
     pub fn ip(ip: IpAddr) -> Key {
         match ip {
             IpAddr::V4(v4) => Key::Ip(u128::from(u32::from(v4))),
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
                 Some(v4) => Key::Ip(u128::from(u32::from(v4))),
-                None => Key::Ip((u128::from(v6) >> 64) << 64 | 1 << 32),
+                None => Key::Ip((u128::from(v6) >> IPV6_HOST_BITS) << IPV6_HOST_BITS | 1 << 32),
             },
         }
     }
@@ -254,9 +261,11 @@ mod tests {
         assert!(Rate::parse("0/5").is_err() && Rate::parse("60").is_err() && Rate::parse("a/b").is_err());
         let a: IpAddr = "2001:db8::1".parse().unwrap();
         let b: IpAddr = "2001:db8::ffff:2".parse().unwrap();
-        let c: IpAddr = "2001:db8:0:1::1".parse().unwrap();
+        let c: IpAddr = "2001:db8:0:ff::1".parse().unwrap();
+        let d: IpAddr = "2001:db8:0:100::1".parse().unwrap();
         assert_eq!(Key::ip(a), Key::ip(b), "one /64");
-        assert_ne!(Key::ip(a), Key::ip(c));
+        assert_eq!(Key::ip(a), Key::ip(c), "one /56 (BUG-1891)");
+        assert_ne!(Key::ip(a), Key::ip(d), "another /56");
         let v4: IpAddr = "10.0.0.1".parse().unwrap();
         let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
         assert_eq!(Key::ip(v4), Key::ip(mapped));
