@@ -401,7 +401,7 @@ pub fn plain_text_line_ranges_from_parent(
     let mut s_idx = p_lines + bsearch_start_lt(&parent_lines[p_lines..], parent_suf_start);
     while s_idx < parent_lines.len() {
         // Where that line of the shared end starts in `data`: a line of
-        // `data` only at its start or after a newline (BUG-1893: taken for
+        // `data` only at its start or after a newline (BUG-1896: taken for
         // one at the start of `parent`, whatever `data` had before it; and
         // the byte before the start of `data` was read).
         let at = data.len() - (parent.len() - parent_lines[s_idx].0);
@@ -591,7 +591,7 @@ fn common_suffix_len(a: &[u8], b: &[u8]) -> usize {
 /// occurs nowhere between (`trimmed`). Between, the lines that differ are
 /// none of the other text's lines, so only the unchanged ones can pair, all
 /// of them in one way, and no edit has a line equal to its own to slide
-/// past (BUG-1893: lines that differ were compared only with each other
+/// past (BUG-1895: lines that differ were compared only with each other
 /// and their neighbours, so a changed line equal to an unchanged one
 /// further on could pair with it in the diff, and not here).
 pub fn isolated_replacements(old: &[u8], old_lines: &[(usize, usize)], new: &[u8], new_lines: &[(usize, usize)]) -> Option<Vec<usize>> {
@@ -1445,7 +1445,7 @@ mod tests {
         assert!(one > 1_000 && several > 1_000, "isolated_replacements answered: {one} times with one line, {several} with several");
     }
 
-    /// BUG-1893's class, for the lines themselves: line ranges reused from
+    /// BUG-1896 (BUG-1893's class, for the lines themselves): line ranges reused from
     /// a parent version ([`plain_text_line_ranges_from_parent`], the
     /// server's blame jobs) are the text's own, whether or not either text
     /// ends with a newline, on long texts of repeated lines (it reuses
