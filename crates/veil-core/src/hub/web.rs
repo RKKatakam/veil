@@ -108,6 +108,66 @@ pub fn csrf_for_session(session_hash: &str) -> String {
     hex::encode(blake3::derive_key(HUB_WEB_CSRF, session_hash.as_bytes()))
 }
 
+/// SHA-256 digest (used by WebAuthn `rpIdHash` and `clientDataHash`).
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// URL-safe Base64 without padding (RFC 4648 §5, WebAuthn binary fields).
+pub fn b64url_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Decode URL-safe Base64 (with or without `=` padding).
+pub fn b64url_decode(s: &str) -> Result<Vec<u8>> {
+    let trimmed = s.trim().trim_end_matches('=');
+    if trimmed.len() % 4 == 1 {
+        return Err(VeilError::Corrupt("base64url".into(), "invalid length".into()));
+    }
+    let val = |b: u8| -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((b - b'0' + 52) as u32),
+            b'-' | b'+' => Some(62),
+            b'_' | b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(trimmed.len() * 3 / 4);
+    for chunk in trimmed.as_bytes().chunks(4) {
+        let c0 = val(chunk[0]).ok_or_else(|| VeilError::Corrupt("base64url".into(), "invalid character".into()))?;
+        let c1 = val(chunk[1]).ok_or_else(|| VeilError::Corrupt("base64url".into(), "invalid character".into()))?;
+        out.push(((c0 << 2) | (c1 >> 4)) as u8);
+        if chunk.len() > 2 {
+            let c2 = val(chunk[2]).ok_or_else(|| VeilError::Corrupt("base64url".into(), "invalid character".into()))?;
+            out.push((((c1 & 0x0f) << 4) | (c2 >> 2)) as u8);
+            if chunk.len() > 3 {
+                let c3 = val(chunk[3]).ok_or_else(|| VeilError::Corrupt("base64url".into(), "invalid character".into()))?;
+                out.push((((c2 & 0x03) << 6) | c3) as u8);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Constant-time byte slice equality.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {

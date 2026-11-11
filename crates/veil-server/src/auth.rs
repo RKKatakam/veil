@@ -224,26 +224,6 @@ pub async fn login(State(hub): State<HubState>, headers: HeaderMap, Json(req): J
     }))
 }
 
-/// Verify a single-use `hub-login` challenge-response and mint a short-lived
-/// `web-` session directly for browser sign-in (`POST /web/login`).
-pub(crate) async fn login_web_direct(
-    hub: &HubState,
-    headers: &HeaderMap,
-    req: LoginRequest,
-    ttl_ms: i64,
-) -> Result<(String, String, i64, String)> {
-    let token = format!(
-        "{}{}",
-        veil_core::hub::web::WEB_TOKEN_PREFIX,
-        hex::encode(veil_core::crypto::random_bytes::<32>())
-    );
-    let hash = veil_core::hub::web::web_token_hash(&token);
-    let csrf = veil_core::hub::web::csrf_for_session(&hash);
-    let ttl = ttl_ms.min(hub.session_ttl_ms);
-    let (person_name, expires_at) = finish_login(hub, headers, req, hash, ttl, "web login").await?;
-    Ok((token, person_name, expires_at, csrf))
-}
-
 async fn finish_login(
     hub: &HubState,
     headers: &HeaderMap,
@@ -346,14 +326,17 @@ async fn signed_in(
     public_identity: &str,
     fingerprint: &str,
 ) -> Result<Result<(i64, i64, String), String>> {
-    let row: Option<(i64, i64, String, bool)> = sqlx::query_as(
-        "SELECT d.id, p.id, p.name, d.pending FROM devices d JOIN people p ON p.id = d.person_id \
+    let row: Option<(i64, i64, String, bool, bool)> = sqlx::query_as(
+        "SELECT d.id, p.id, p.name, d.pending, d.browser FROM devices d JOIN people p ON p.id = d.person_id \
          WHERE d.signing_key = $1 AND d.removed_at IS NULL",
     )
     .bind(key)
     .fetch_optional(&mut *c)
     .await?;
-    if let Some((device, person, name, pending)) = row {
+    if let Some((device, person, name, pending, browser)) = row {
+        if browser {
+            return Err(Error::unauthorized("browser devices sign in with a passkey in the web client"));
+        }
         if pending {
             // Signing in again renews the wait.
             sqlx::query("UPDATE devices SET created_at = $1 WHERE id = $2").bind(veil_core::now_millis()).bind(device).execute(&mut *c).await?;
@@ -414,7 +397,8 @@ async fn prune_pending(db: &sqlx::PgPool, name: &str) {
     let now = veil_core::now_millis();
     let unreferenced = "NOT EXISTS (SELECT 1 FROM sessions s WHERE s.device_id = d.id) \
          AND NOT EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
-         AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id)";
+         AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.device_id = d.id) \
+         AND NOT EXISTS (SELECT 1 FROM webauthn_credentials w WHERE w.device_id = d.id)";
     let expired = sqlx::query(&format!(
         "DELETE FROM devices d WHERE d.person_id = (SELECT id FROM people WHERE name = $1) AND d.pending \
          AND d.created_at < $2 AND {unreferenced}"
@@ -502,13 +486,15 @@ pub(crate) async fn authenticate_parts(parts: &mut Parts, hub: &HubState, enforc
              s.agent, s.agent_project, s.agent_only, s.agent_runner \
              FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
              LEFT JOIN sessions par ON par.token_hash = s.parent_hash \
-             WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL AND NOT d.pending \
+             WHERE s.token_hash = $1 AND s.expires_at > $2 AND d.removed_at IS NULL \
+             AND (NOT d.pending OR ($5 AND d.browser)) \
              AND (s.agent IS NOT NULL) = $4 AND (s.parent_hash IS NULL OR par.expires_at > $2)",
         )
         .bind(&hash)
         .bind(now)
         .bind(project.unwrap_or(-1))
         .bind(agent_token)
+        .bind(web_token)
         .fetch_optional(&hub.db)
         .await?;
         match row {
@@ -803,6 +789,74 @@ pub async fn web_session(
         token,
         person: me.name,
         csrf,
+        expires_at,
+    }))
+}
+
+/// `POST /v1/sessions/web-enroll`: mint a short-lived single-use browser
+/// enrollment code from a person's confirmed `vl` device (`docs/HUB.md` §13.40).
+pub async fn web_enroll_session(
+    State(hub): State<HubState>,
+    headers: HeaderMap,
+    caller: Caller,
+    body: axum::body::Bytes,
+) -> Result<Json<veil_core::hub::web::WebEnrollResponse>> {
+    caller.not_web()?;
+    let me = caller.person_only()?.clone();
+    let req: veil_core::hub::web::WebEnrollRequest = if body.is_empty() {
+        veil_core::hub::web::WebEnrollRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| Error::bad_request(format!("invalid web enroll request: {e}")))?
+    };
+    if let Some(lbl) = &req.label {
+        if lbl.chars().count() > 64 {
+            return Err(Error::bad_request("label is at most 64 characters"));
+        }
+    }
+    let parent = headers
+        .get("authorization")
+        .and_then(|a| a.to_str().ok())
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .map(token_hash)
+        .ok_or_else(|| Error::unauthorized("expected a bearer token"))?;
+    let now = veil_core::now_millis();
+    let want = match req.seconds {
+        None => veil_core::hub::web::DEFAULT_WEB_ENROLL_MS,
+        Some(s) if s > 0 => s.saturating_mul(1000).min(veil_core::hub::web::MAX_WEB_ENROLL_MS),
+        Some(_) => return Err(Error::bad_request("seconds must be positive")),
+    };
+    let code = format!(
+        "{}{}",
+        veil_core::hub::web::WEB_ENROLL_PREFIX,
+        hex::encode(veil_core::crypto::random_bytes::<24>())
+    );
+    let hash = veil_core::hub::web::web_enroll_hash(&code);
+    let expires_at: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO web_enrollments (code_hash, person_id, label, created_at, expires_at) \
+         SELECT $1, s.person_id, $2, $3, LEAST(s.expires_at, $4) \
+         FROM sessions s JOIN devices d ON d.id = s.device_id \
+         WHERE s.token_hash = $5 AND s.person_id = $6 AND s.agent IS NULL AND s.parent_hash IS NULL \
+         AND s.expires_at > $3 AND d.removed_at IS NULL AND NOT d.pending AND NOT d.browser \
+         RETURNING expires_at",
+    )
+    .bind(&hash)
+    .bind(&req.label)
+    .bind(now)
+    .bind(now + want)
+    .bind(&parent)
+    .bind(me.id)
+    .fetch_optional(&hub.db)
+    .await?;
+    let expires_at = expires_at.ok_or_else(|| Error::unauthorized("session expired or unknown; sign in again"))?;
+    let _ = sqlx::query("DELETE FROM web_enrollments WHERE person_id = $1 AND expires_at < $2")
+        .bind(me.id)
+        .bind(now)
+        .execute(&hub.db)
+        .await;
+    crate::audit(&hub.db, None, Some(me.id), "web enroll", "passkey enrollment code").await;
+    Ok(Json(veil_core::hub::web::WebEnrollResponse {
+        code,
+        person: me.name,
         expires_at,
     }))
 }

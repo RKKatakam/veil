@@ -5,7 +5,7 @@ use std::cell::RefCell;
 
 use axum::{
     body::Bytes,
-    extract::{Request, State},
+    extract::{Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -13,10 +13,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use veil_core::hub::{
-    web::{csrf_for_session, csrf_matches, web_token_hash, MAX_WEB_SESSION_MS, WEB_TOKEN_PREFIX},
-    wire::LoginRequest,
-};
+use veil_core::hub::web::{csrf_for_session, csrf_matches, web_token_hash, WEB_TOKEN_PREFIX};
 
 use crate::{
     auth::{self, CSRF_FAILED},
@@ -127,7 +124,7 @@ pub async fn layer(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let is_api = path.starts_with("/v1/");
     let wants_json = is_api
-        || (path.starts_with("/web/")
+        || ((path.starts_with("/web/") || path.contains("/web/"))
             && req
                 .headers()
                 .get(header::ACCEPT)
@@ -215,29 +212,47 @@ pub fn parse_form(bytes: &[u8]) -> std::collections::BTreeMap<String, String> {
     map
 }
 
-pub async fn login_page_route() -> Response {
-    let body = r#"<div class="card">
+#[derive(Default, Deserialize)]
+pub struct LoginPageQuery {
+    #[serde(default)]
+    pub enroll: Option<String>,
+}
+
+pub async fn login_page_route(Query(q): Query<LoginPageQuery>) -> Response {
+    let prefill = q.enroll.as_deref().map(str::trim).unwrap_or("");
+    let body = format!(
+        r#"<div class="card">
   <div class="card-header">Sign in to Veil</div>
   <div class="card-body">
-    <p>Sign in with a short-lived web session derived from your <code>vl</code> device session, or sign a single-use challenge in browser memory with your device identity.</p>
-    <p class="muted">Secret files (<code>.env</code>, keys) are never decrypted or served in the browser — open them locally with <code>vl</code>.</p>
-    <h3>Option 1: Short-lived web token</h3>
+    <p>Sign in with your passkey. Personal <code>vl</code> private keys never leave the machine they were made on.</p>
+    <h3>Sign in with passkey</h3>
+    <form id="veil-passkey-login-form">
+      <div class="form-row">
+        <input id="veil-passkey-person" type="text" placeholder="Username (optional)" autocomplete="username webauthn">
+        <button type="submit">Sign in with passkey</button>
+      </div>
+    </form>
+    <h3>Enroll this browser (<code>vl web</code>)</h3>
+    <p class="muted">Run <code>vl web</code> on a signed-in computer to mint a single-use enrollment code. If this browser supports WebAuthn PRF, a fresh browser device key is generated inside a Web Worker and encrypted in IndexedDB under your passkey; confirm its fingerprint with <code>vl identity confirm &lt;FINGERPRINT&gt;</code> before opening secrets.</p>
+    <form id="veil-passkey-enroll-form">
+      <div class="form-row">
+        <input id="veil-enroll-code" type="text" value="{}" placeholder="web-enroll-…" autocomplete="off" required>
+        <button type="submit">Register passkey</button>
+      </div>
+    </form>
+    <p id="veil-login-status" class="muted"></p>
+    <hr>
+    <h4>Short-lived session token</h4>
     <form method="post" action="/web/session">
       <div class="form-row">
         <input type="text" name="token" placeholder="web-…" autocomplete="off" required>
         <button type="submit">Activate web session</button>
       </div>
     </form>
-    <h3>Option 2: Device-signed challenge (in-memory WASM)</h3>
-    <form id="veil-device-login-form">
-      <textarea id="veil-identity-json" placeholder="Paste device identity JSON (kept in WASM memory only, never sent over the network)"></textarea>
-      <div class="form-row">
-        <button type="submit">Sign challenge &amp; sign in</button>
-        <span id="veil-login-status" class="muted"></span>
-      </div>
-    </form>
   </div>
-</div>"#;
+</div>"#,
+        esc(prefill)
+    );
     page_shell(
         PageCtx {
             title: "Sign in — Veil",
@@ -247,7 +262,7 @@ pub async fn login_page_route() -> Response {
             csrf: None,
             admin_link: false,
         },
-        body,
+        &body,
     )
 }
 
@@ -282,7 +297,7 @@ pub async fn adopt_session_route(State(hub): State<HubState>, headers: HeaderMap
          JOIN people p ON p.id = s.person_id \
          LEFT JOIN sessions par ON par.token_hash = s.parent_hash \
          WHERE s.token_hash = $1 AND s.expires_at > $2 AND s.agent IS NULL \
-         AND d.removed_at IS NULL AND NOT d.pending \
+         AND d.removed_at IS NULL AND (NOT d.pending OR d.browser) \
          AND (s.parent_hash IS NULL OR par.expires_at > $2)",
     )
     .bind(&hash)
@@ -314,47 +329,64 @@ pub async fn adopt_session_route(State(hub): State<HubState>, headers: HeaderMap
     Ok(resp)
 }
 
-/// `POST /web/login`: verify a single-use `hub-login` signature and issue a
-/// short-lived `web-` session directly into `__Host-veil_session`.
-pub async fn device_login_route(State(hub): State<HubState>, headers: HeaderMap, Json(req): Json<LoginRequest>) -> Result<Response> {
-    check_same_origin(&headers)?;
-    let (token, person, expires_at, csrf) = auth::login_web_direct(&hub, &headers, req, MAX_WEB_SESSION_MS).await?;
-    let now = veil_core::now_millis();
-    let max_age = ((expires_at - now) / 1000).max(1);
-    let cookie = session_cookie_value(&token, max_age);
-    let mut resp = Json(json!({
-        "person": person,
-        "expires_at": expires_at,
-        "csrf": csrf,
-    }))
-    .into_response();
-    resp.headers_mut().append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&cookie).map_err(|e| Error::Other(e.into()))?,
-    );
-    attach_security_headers(&mut resp, true);
-    Ok(resp)
-}
-
-/// `POST /web/logout`: verify same-origin + CSRF, delete the session row in
-/// PostgreSQL (bumping `access_epochs` across all servers immediately), and
-/// clear `__Host-veil_session`.
+/// `POST /web/logout`: verify same-origin + CSRF, clear `__Host-veil_session`,
+/// and if the session belongs to an enrolled browser device (`d.browser`),
+/// revoke that browser device immediately (deleting its wrapped rings & passkey
+/// credential and queuing key rotation across all projects, matching S2 device
+/// removal).
 pub async fn logout_route(State(hub): State<HubState>, headers: HeaderMap, body: Bytes) -> Result<Response> {
     let tok = auth::cookie_token(&headers).ok_or_else(|| Error::unauthorized("not signed in"))?;
     let hash = auth::session_hash(tok);
     let form = parse_form(&body);
     require_csrf(&headers, Some(&hash), form.get("_csrf").map(String::as_str))?;
 
-    sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
-        .bind(&hash)
-        .execute(&hub.db)
+    let dev_row: Option<(i64, i64, bool)> = sqlx::query_as(
+        "SELECT d.id, s.person_id, d.browser \
+         FROM sessions s JOIN devices d ON d.id = s.device_id \
+         WHERE s.token_hash = $1",
+    )
+    .bind(&hash)
+    .fetch_optional(&hub.db)
+    .await?;
+
+    if let Some((device_id, person_id, true)) = dev_row {
+        let now = veil_core::now_millis();
+        crate::db::serializable(&hub.db, move |c| {
+            Box::pin(async move {
+                sqlx::query("UPDATE devices SET removed_at = $1, pending = FALSE WHERE id = $2")
+                    .bind(now)
+                    .bind(device_id)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("DELETE FROM sessions WHERE device_id = $1")
+                    .bind(device_id)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("DELETE FROM webauthn_credentials WHERE device_id = $1")
+                    .bind(device_id)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("DELETE FROM browser_device_rings WHERE device_id = $1")
+                    .bind(device_id)
+                    .execute(&mut *c)
+                    .await?;
+                Ok(())
+            })
+        })
         .await?;
+        crate::api::queue_key_requests_for_person(&hub.db, person_id).await?;
+        crate::audit(&hub.db, None, Some(person_id), "sign out browser device", "revoked").await;
+    } else {
+        sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+            .bind(&hash)
+            .execute(&hub.db)
+            .await?;
+    }
 
     let mut resp = redirect_see_other("/");
     resp.headers_mut().append(
         header::SET_COOKIE,
         HeaderValue::from_str(&clear_session_cookie_value()).map_err(|e| Error::Other(e.into()))?,
     );
-    let _ = esc;
     Ok(resp)
 }

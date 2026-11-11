@@ -1332,7 +1332,8 @@ pub struct ReviewRequest {
     pub patch: String,
     pub verdict: String,
     pub body: Option<String>,
-    pub signature: String,
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 pub async fn add_review(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: ReviewRequest) -> Result<Value> {
@@ -1365,11 +1366,23 @@ pub async fn add_review(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q:
     if q.patch != current.patch {
         return Err(Error::conflict("the PR's files changed since you looked at it: look at it again"));
     }
-    let msg = review_message(&ask.project.name, &pr.id, &current.patch, &q.verdict);
-    if !verify_signature(&person.device_key, SIG_CONTEXT_HUB_PR_REVIEW, &msg, &q.signature) {
-        return Err(Error::unauthorized("the review's signature is not this device's over this revision"));
-    }
-    let stored = review::put_verdict(hub, ask.project.id, &pr.id, pr.revision, me, &q.verdict, &current.patch, agent, &person.device_key, &q.signature, &body, true).await?;
+    let recorded_sig: String = match q.signature.as_deref().filter(|s| !s.is_empty()) {
+        Some(sig) => {
+            let msg = review_message(&ask.project.name, &pr.id, &current.patch, &q.verdict);
+            if !verify_signature(&person.device_key, SIG_CONTEXT_HUB_PR_REVIEW, &msg, sig) {
+                return Err(Error::unauthorized("the review's signature is not this device's over this revision"));
+            }
+            sig.to_string()
+        }
+        None => {
+            if !caller.is_web() {
+                return Err(Error::unauthorized("a review outside the web client must be signed by this device"));
+            }
+            caller.person_only()?;
+            "web-session".to_string()
+        }
+    };
+    let stored = review::put_verdict(hub, ask.project.id, &pr.id, pr.revision, me, &q.verdict, &current.patch, agent, &person.device_key, &recorded_sig, &body, true).await?;
     if !stored {
         return Err(Error::conflict("the PR changed meanwhile: look at it again"));
     }

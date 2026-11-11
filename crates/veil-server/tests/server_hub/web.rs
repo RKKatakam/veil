@@ -25,9 +25,9 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use serde_json::{json, Value};
 use veil_core::{
     crypto::Envelope,
-    hub::web::{sign_web_login, sign_web_pr_review, WEB_TOKEN_PREFIX},
+    hub::web::WEB_TOKEN_PREFIX,
     object::{EntryKind, Object, Snapshot, Tree, TreeEntry, Visibility},
-    Identity, ObjectId,
+    ObjectId,
 };
 
 use crate::support::*;
@@ -73,6 +73,7 @@ struct WebClient {
     agent: ureq::Agent,
     base: String,
     origin: String,
+    #[allow(dead_code)]
     authority: String,
     cookie: Option<String>,
     csrf: Option<String>,
@@ -243,33 +244,6 @@ impl WebClient {
         self.capture_cookie(&adopt);
         self.csrf = Some(csrf);
         ws
-    }
-
-    /// Sign in directly with device key (`POST /v1/auth/challenge` + `sign_web_login` -> `POST /web/login`).
-    fn sign_in_device(&mut self, id: &Identity, name: Option<&str>) -> WebReply {
-        let ch = self.post_json_web(
-            "/v1/auth/challenge",
-            &json!({ "key": id.verifying_hex() }),
-            None,
-            Some(&self.origin.clone()),
-            Some("same-origin"),
-        );
-        assert_eq!(ch.status, 200, "challenge failed: {}", ch.text());
-        let chal = ch.json()["challenge"].as_str().unwrap().to_string();
-        let signed = sign_web_login(&id.to_json(), &self.authority, &chal, name).unwrap();
-        let r = self.post_json_web(
-            "/web/login",
-            &serde_json::to_value(&signed).unwrap(),
-            None,
-            Some(&self.origin.clone()),
-            Some("same-origin"),
-        );
-        if r.status == 200 {
-            assert_strict_session_cookie(&r);
-            self.capture_cookie(&r);
-            self.csrf = r.json()["csrf"].as_str().map(str::to_string);
-        }
-        r
     }
 }
 
@@ -945,10 +919,9 @@ fn guarantee_3_session_safety_csrf_cookies_csp_and_xss_escaping() {
     assert_eq!(cross_adopt.status, 403);
     assert_eq!(cross_adopt.json()["code"], "csrf_failed");
 
-    // 3. Direct device-signed login (`POST /web/login`, signed via `veil_core::hub::web::sign_web_login`).
-    let login_res = alice_web.sign_in_device(&alice.identity(), None);
-    assert_eq!(login_res.status, 200, "device-signed web login failed: {}", login_res.text());
-    assert_eq!(login_res.json()["person"], alice.name);
+    // 3. Derived web session sign-in (`POST /v1/sessions/web` -> `POST /web/session`; passkey sign-in is tested in `web_secrets`).
+    let login_ws = alice_web.sign_in_derived(&hub, &alice);
+    assert_eq!(login_ws["person"], alice.name);
 
     let mut bob_web = WebClient::new(&hub);
     bob_web.sign_in_derived(&hub, &bob);
@@ -1021,19 +994,18 @@ fn guarantee_3_session_safety_csrf_cookies_csp_and_xss_escaping() {
     );
     assert_eq!(ok_comment.status, 303, "expected 303 posting thread: {}", ok_comment.text());
 
-    // Also test device-signed PR review submitted from browser (`/v1/projects/{p}/prs/{id}/reviews` with cookie + CSRF)!
+    // Server-recorded PR review submitted from browser (`/v1/projects/{p}/prs/{id}/reviews` with cookie + CSRF, no `identity.json`!).
     let pr_json = alice_web.get_with(&format!("/v1/projects/{proj}/prs/{pr_id}"), &[("accept", "application/json")]).json();
     let patch_hash = pr_json["patch"].as_str().unwrap().to_string();
-    let review_sig = sign_web_pr_review(&bob.identity().to_json(), &proj, &pr_id, &patch_hash, "approve").unwrap();
     let bob_orig = bob_web.origin.clone();
     let rev_submit = bob_web.post_json_web(
         &format!("/v1/projects/{proj}/prs/{pr_id}/reviews"),
-        &json!({ "patch": patch_hash, "verdict": "approve", "body": format!("LGTM {XSS_SCRIPT}"), "signature": review_sig }),
+        &json!({ "patch": patch_hash, "verdict": "approve", "body": format!("LGTM {XSS_SCRIPT}") }),
         Some(&bob_csrf),
         Some(&bob_orig),
         Some("same-origin"),
     );
-    assert_eq!(rev_submit.status, 200, "WASM-signed review via cookie+CSRF failed: {}", rev_submit.text());
+    assert_eq!(rev_submit.status, 200, "server-recorded web review via cookie+CSRF failed: {}", rev_submit.text());
 
     // 6. Inspect every HTML page where hostile payloads were placed: strict CSP, `text/html`, and ZERO unescaped payloads!
     for page_url in [
@@ -1462,7 +1434,6 @@ fn extract_next_href(html: &str, prefix: &str) -> String {
 /// personal private key in the browser, which the server's code runs in
 /// (`docs/design/server/phase-4-agent-scale.md` §6 row 18, decision 13).
 #[test]
-#[ignore = "BUG-1871: the web client asks for the device identity file (its private keys) in the browser"]
 fn bug_1871_the_web_client_never_asks_for_a_device_identity_file() {
     let hub = TestHub::start();
     let web = WebClient::new(&hub);

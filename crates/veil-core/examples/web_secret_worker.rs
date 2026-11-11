@@ -89,7 +89,8 @@ fn build_fixture() -> Result<Fixture, String> {
     kc.grant("team", &bundle.public_identity, "alice").map_err(|e| e.to_string())?;
     let (label, key) = kc.sealing_key("team").map_err(|e| e.to_string())?;
     let expected_plaintext = "DATABASE_URL=postgres://worker-secret-canary\n".to_string();
-    let env = Envelope::seal_deterministic(&key, &label, expected_plaintext.as_bytes()).map_err(|e| e.to_string())?;
+    let inner_blob = Object::Blob(expected_plaintext.as_bytes().to_vec()).encode();
+    let env = Envelope::seal_deterministic(&key, &label, &inner_blob).map_err(|e| e.to_string())?;
     let raw_obj = Object::Sealed(env).encode();
     let object_id = ObjectId::hash(&raw_obj).hex();
 
@@ -101,7 +102,8 @@ fn build_fixture() -> Result<Fixture, String> {
     // Revoke browser device -> rotates to generation 1; browser device must NOT open new secrets!
     kc.revoke("team", &bundle.public_identity).map_err(|e| e.to_string())?;
     let (rot_label, rot_key) = kc.sealing_key("team").map_err(|e| e.to_string())?;
-    let rot_env = Envelope::seal_deterministic(&rot_key, &rot_label, b"POST_REVOKE_SECRET\n").map_err(|e| e.to_string())?;
+    let rot_blob = Object::Blob(b"POST_REVOKE_SECRET\n".to_vec()).encode();
+    let rot_env = Envelope::seal_deterministic(&rot_key, &rot_label, &rot_blob).map_err(|e| e.to_string())?;
     let rot_raw = Object::Sealed(rot_env).encode();
     let rotated_object_id = ObjectId::hash(&rot_raw).hex();
 

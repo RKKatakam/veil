@@ -284,7 +284,16 @@ pub fn open_secret_in_worker(
         .get(want_kid)
         .ok_or_else(|| VeilError::Redacted { scope: env.scope.clone() })?;
 
-    let plain = Zeroizing::new(env.open(key)?);
+    let decrypted = Zeroizing::new(env.open(key)?);
+    let plain = match Object::decode(&decrypted)? {
+        Object::Blob(b) => Zeroizing::new(b),
+        o => {
+            return Err(VeilError::Corrupt(
+                "sealed-object".into(),
+                format!("expected blob inside sealed secret, found {}", o.kind_name()),
+            ));
+        }
+    };
     let size = plain.len();
     if plain.contains(&0) || size > MAX_WEB_DIFF_BYTES {
         return Ok(OpenedBrowserSecret {

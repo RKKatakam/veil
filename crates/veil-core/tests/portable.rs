@@ -1180,19 +1180,22 @@ fn web_browser_device_prf_sealing_and_worker_secret_decryption() {
     kc.grant(&billing_scope, &browser.public_identity, "bob").unwrap();
 
     let (bill_label_g0, bill_key_g0) = kc.sealing_key(&billing_scope).unwrap();
-    let bill_env_g0 = Envelope::seal_deterministic(&bill_key_g0, &bill_label_g0, b"STRIPE_KEY=sk_live_portable_g0\n").unwrap();
+    let bill_blob_g0 = Object::Blob(b"STRIPE_KEY=sk_live_portable_g0\n".to_vec()).encode();
+    let bill_env_g0 = Envelope::seal_deterministic(&bill_key_g0, &bill_label_g0, &bill_blob_g0).unwrap();
     let bill_raw_g0 = Object::Sealed(bill_env_g0).encode();
     let bill_oid_g0 = ObjectId::hash(&bill_raw_g0).hex();
 
     // Rotate while keeping browser device: browser device must open both g0 (via backward walk) and g1.
     kc.rotate(&billing_scope).unwrap();
     let (bill_label_g1, bill_key_g1) = kc.sealing_key(&billing_scope).unwrap();
-    let bill_env_g1 = Envelope::seal_deterministic(&bill_key_g1, &bill_label_g1, b"STRIPE_KEY=sk_live_portable_g1\n").unwrap();
+    let bill_blob_g1 = Object::Blob(b"STRIPE_KEY=sk_live_portable_g1\n".to_vec()).encode();
+    let bill_env_g1 = Envelope::seal_deterministic(&bill_key_g1, &bill_label_g1, &bill_blob_g1).unwrap();
     let bill_raw_g1 = Object::Sealed(bill_env_g1).encode();
     let bill_oid_g1 = ObjectId::hash(&bill_raw_g1).hex();
 
     let (infra_label, infra_key) = kc.sealing_key(&infra_scope).unwrap();
-    let infra_raw = Object::Sealed(Envelope::seal_deterministic(&infra_key, &infra_label, b"ROOT_KEY=secret\n").unwrap()).encode();
+    let infra_blob = Object::Blob(b"ROOT_KEY=secret\n".to_vec()).encode();
+    let infra_raw = Object::Sealed(Envelope::seal_deterministic(&infra_key, &infra_label, &infra_blob).unwrap()).encode();
     let infra_oid = ObjectId::hash(&infra_raw).hex();
 
     // Browser receives ONLY `billing` ring (no `team`, no `infra`).
@@ -1246,7 +1249,7 @@ fn web_browser_device_prf_sealing_and_worker_secret_decryption() {
         &bill_raw_g1,
     )
     .is_err());
-    let vault_forged = Object::Sealed(Envelope::seal_random(&bill_key_g1, &format!("vault:{bill_label_g1}"), b"forged").unwrap()).encode();
+    let vault_forged = Object::Sealed(Envelope::seal_random(&bill_key_g1, &format!("vault:{bill_label_g1}"), &Object::Blob(b"forged".to_vec()).encode()).unwrap()).encode();
     let vault_oid = ObjectId::hash(&vault_forged).hex();
     assert!(open_secret_in_worker(
         cred_id,
@@ -1262,8 +1265,9 @@ fn web_browser_device_prf_sealing_and_worker_secret_decryption() {
     // Revoke browser device -> rotates to g2; browser device cannot open g2, and empty rings open nothing.
     kc.revoke(&billing_scope, &browser.public_identity).unwrap();
     let (bill_label_g2, bill_key_g2) = kc.sealing_key(&billing_scope).unwrap();
+    let bill_blob_g2 = Object::Blob(b"STRIPE_KEY=post_revoke\n".to_vec()).encode();
     let bill_raw_g2 = Object::Sealed(
-        Envelope::seal_deterministic(&bill_key_g2, &bill_label_g2, b"STRIPE_KEY=post_revoke\n").unwrap(),
+        Envelope::seal_deterministic(&bill_key_g2, &bill_label_g2, &bill_blob_g2).unwrap(),
     )
     .encode();
     let bill_oid_g2 = ObjectId::hash(&bill_raw_g2).hex();

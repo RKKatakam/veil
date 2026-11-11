@@ -564,7 +564,7 @@ fn pr_reviews_and_the_gate() {
     let sign_for = |who: &Person, pr: &str, patch: &str, verdict: &str| who.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, pr, patch, verdict));
     let sign = |who: &Person, _rev: i64, patch: &str, verdict: &str| sign_for(who, &id, patch, verdict);
     let review = |who: &Person, _rev: i64, patch: &str, verdict: &str, sig: String| {
-        th.rt.block_on(prs::add_review(&hub, &ask_of(who), &caller_of(who), &id, prs::ReviewRequest { patch: patch.into(), verdict: verdict.into(), body: None, signature: sig }))
+        th.rt.block_on(prs::add_review(&hub, &ask_of(who), &caller_of(who), &id, prs::ReviewRequest { patch: patch.into(), verdict: verdict.into(), body: None, signature: Some(sig) }))
     };
     let patch1 = pr["patch"].as_str().unwrap().to_string();
     // The author cannot approve; the finance member may not write src/.
