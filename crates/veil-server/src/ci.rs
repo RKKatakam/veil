@@ -212,9 +212,14 @@ pub async fn post_check_route(
                     )));
                 }
             }
+            let initial_run_count: i64 = if counts && matches!(state_str.as_str(), "pass" | "fail") {
+                1
+            } else {
+                0
+            };
             sqlx::query(
-                "INSERT INTO checks (project_id, snapshot, name, state, summary, url, log, runner_id, runner_name, session_paths, admin_only, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                "INSERT INTO checks (project_id, snapshot, name, state, summary, url, log, runner_id, runner_name, session_paths, admin_only, updated_at, run_count) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
                  ON CONFLICT (project_id, snapshot, name) DO UPDATE \
                  SET state = EXCLUDED.state, \
                      summary = EXCLUDED.summary, \
@@ -224,7 +229,16 @@ pub async fn post_check_route(
                      runner_name = EXCLUDED.runner_name, \
                      session_paths = EXCLUDED.session_paths, \
                      admin_only = EXCLUDED.admin_only, \
-                     updated_at = EXCLUDED.updated_at",
+                     updated_at = EXCLUDED.updated_at, \
+                     run_count = CASE \
+                         WHEN NOT $14 THEN 0 \
+                         WHEN EXCLUDED.state = 'pass' THEN \
+                             CASE WHEN checks.state = 'pass' THEN checks.run_count + 1 ELSE 1 END \
+                         WHEN EXCLUDED.state = 'fail' THEN \
+                             CASE WHEN checks.state IN ('fail', 'pending', 'error') THEN checks.run_count + 1 ELSE 1 END \
+                         ELSE \
+                             CASE WHEN checks.state IN ('fail', 'pending', 'error') THEN checks.run_count ELSE 0 END \
+                     END",
             )
             .bind(pid)
             .bind(&real_hex)
@@ -238,6 +252,8 @@ pub async fn post_check_route(
             .bind(&paths_json)
             .bind(admin_only)
             .bind(now)
+            .bind(initial_run_count)
+            .bind(counts)
             .execute(&mut *c)
             .await?;
 

@@ -404,8 +404,67 @@ pub async fn resume(hub: Arc<Hub>) {
         if phase == "reverting" || ticket.is_some() {
             crate::landing::ensure(&hub, pid, &branch);
             let _ = sync_revert_outcome(&hub, pid, &branch).await;
+        } else if matches!(phase.as_str(), "searching" | "confirming") {
+            if let Ok(Some(name)) = sqlx::query_scalar::<_, String>("SELECT name FROM projects WHERE id = $1")
+                .bind(pid)
+                .fetch_optional(&hub.db)
+                .await
+            {
+                if let Ok(mut conn) = hub.db.acquire().await {
+                    if let Ok(Some(project)) = perm::load_project(&mut conn, &name).await {
+                        drop(conn);
+                        let _ = reconcile_branch(&hub, &project, &branch).await;
+                    }
+                }
+            }
         }
     }
+}
+
+/// Reconcile an active (`searching` or `confirming`) bisect on `branch` against
+/// stored `checks` rows if its lease is currently free.
+pub async fn reconcile_branch(hub: &Arc<Hub>, project: &Project, branch: &str) -> Result<()> {
+    if branch.starts_with("embargo/") {
+        return Ok(());
+    }
+    let Some(peek) = load_bisect(hub, project.id, branch).await? else {
+        return Ok(());
+    };
+    if !matches!(peek.phase.as_str(), "searching" | "confirming") {
+        return Ok(());
+    }
+    let Some((holder, epoch)) = acquire_lease(hub, project.id, branch).await? else {
+        return Ok(());
+    };
+    let res: Result<()> = async {
+        let Some(mut b) = load_bisect(hub, project.id, branch).await? else {
+            return Ok(());
+        };
+        if !matches!(b.phase.as_str(), "searching" | "confirming") {
+            return Ok(());
+        }
+        let branches: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT name, target, lineage FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL",
+        )
+        .bind(project.id)
+        .fetch_all(&hub.db)
+        .await?;
+        let Some((_, _, lineage)) = branches.iter().find(|(n, _, _)| n == branch) else {
+            return Ok(());
+        };
+        if b.lineage != *lineage {
+            return Ok(());
+        }
+        let default_tip = branches
+            .iter()
+            .find(|(n, _, _)| n == &project.default_branch)
+            .and_then(|(_, t, _)| ObjectId::from_hex(t).ok());
+        let rules = sync::blocking(hub, project.id, move |src| crate::landing::rules(src, default_tip)).await?;
+        drive_bisect(hub, project, &rules, &mut b, true, &holder, epoch).await
+    }
+    .await;
+    release_lease(hub, project.id, branch, &holder, epoch).await;
+    res
 }
 
 /// Called by `ci::post_check_route` whenever a `pass` or `fail` check result is
@@ -486,6 +545,17 @@ async fn step_branch(
     recorded_at: i64,
 ) -> Result<()> {
     let Some((holder, epoch)) = acquire_lease(hub, project.id, branch).await? else {
+        spawn_step_after_lease(
+            hub.clone(),
+            project.clone(),
+            branch.to_string(),
+            reported_snap,
+            check_name.to_string(),
+            state,
+            session_paths.to_vec(),
+            admin_only,
+            recorded_at,
+        );
         return Ok(());
     };
     let res = step_branch_leased(
@@ -510,6 +580,90 @@ async fn step_branch(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn spawn_step_after_lease(
+    hub: Arc<Hub>,
+    project: Project,
+    branch: String,
+    reported_snap: ObjectId,
+    check_name: String,
+    state: CheckState,
+    session_paths: Vec<String>,
+    admin_only: bool,
+    recorded_at: i64,
+) {
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis((BISECT_LEASE_MS as u64) + 1_500);
+        let mut leased = None;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            match acquire_lease(&hub, project.id, &branch).await {
+                Ok(Some(pair)) => {
+                    leased = Some(pair);
+                    break;
+                }
+                Ok(None) => continue,
+                Err(_) => return,
+            }
+        }
+        let Some((holder, epoch)) = leased else {
+            return;
+        };
+        let res: Result<()> = async {
+            let mut conn = hub.db.acquire().await?;
+            let Some(project) = perm::load_project(&mut conn, &project.name).await? else {
+                return Ok(());
+            };
+            drop(conn);
+            let branches: Vec<(String, String, i64)> = sqlx::query_as(
+                "SELECT name, target, lineage FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL",
+            )
+            .bind(project.id)
+            .fetch_all(&hub.db)
+            .await?;
+            let Some((_, target_hex, lineage)) = branches.iter().find(|(n, _, _)| n == &branch) else {
+                return Ok(());
+            };
+            let Ok(target) = ObjectId::from_hex(target_hex) else {
+                return Ok(());
+            };
+            let default_tip = branches
+                .iter()
+                .find(|(n, _, _)| n == &project.default_branch)
+                .and_then(|(_, t, _)| ObjectId::from_hex(t).ok());
+            let rules = sync::blocking(&hub, project.id, move |src| crate::landing::rules(src, default_tip)).await?;
+            let is_required = rules
+                .required_checks
+                .get(&branch)
+                .is_some_and(|reqs| reqs.iter().any(|r| r == &check_name));
+            if !is_required || !rules.allows_auto_revert(&branch) {
+                return Ok(());
+            }
+            step_branch_leased(
+                &hub,
+                &project,
+                &rules,
+                &branch,
+                target,
+                *lineage,
+                reported_snap,
+                &check_name,
+                state,
+                &session_paths,
+                admin_only,
+                recorded_at,
+                &holder,
+                epoch,
+            )
+            .await
+        }
+        .await;
+        let _ = res;
+        release_lease(&hub, project.id, &branch, &holder, epoch).await;
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn step_branch_leased(
     hub: &Arc<Hub>,
     project: &Project,
@@ -522,7 +676,7 @@ async fn step_branch_leased(
     state: CheckState,
     session_paths: &[String],
     admin_only: bool,
-    recorded_at: i64,
+    _recorded_at: i64,
     holder: &str,
     epoch: i64,
 ) -> Result<()> {
@@ -554,18 +708,7 @@ async fn step_branch_leased(
                 || b.culprit == Some(reported_snap)
                 || b.culprit_parent == Some(reported_snap))
         {
-            advance_active_bisect(
-                hub,
-                project,
-                rules,
-                b,
-                reported_snap,
-                state,
-                recorded_at,
-                holder,
-                epoch,
-            )
-            .await?;
+            drive_bisect(hub, project, rules, b, true, holder, epoch).await?;
             return Ok(());
         }
     }
@@ -589,10 +732,14 @@ async fn step_branch_leased(
         }
     }
 
-    // If there is still an active bisect (`searching` or `confirming`) on this branch, wait for it.
-    if let Some(b) = cur {
+    // If there is still an active bisect (`searching` or `confirming`) on this branch,
+    // reconcile it with stored `checks` rows first; if it remains active, wait for it.
+    if let Some(mut b) = cur {
         if matches!(b.phase.as_str(), "searching" | "confirming") {
-            return Ok(());
+            drive_bisect(hub, project, rules, &mut b, true, holder, epoch).await?;
+            if matches!(b.phase.as_str(), "searching" | "confirming" | "reverting") {
+                return Ok(());
+            }
         }
     }
 
@@ -673,7 +820,7 @@ async fn step_branch_leased(
 
     // Incorporate any existing check results on `b.candidates` and drive the state machine
     // until it needs a runner probe or finishes.
-    drive_bisect(hub, project, rules, &mut b, Some((reported_snap, state, recorded_at)), holder, epoch).await
+    drive_bisect(hub, project, rules, &mut b, false, holder, epoch).await
 }
 
 fn is_first_parent_above(src: &sync::Source, top: ObjectId, bottom: ObjectId) -> Result<bool> {
@@ -797,28 +944,60 @@ fn collect_candidates(
     Ok(Some(out))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn advance_active_bisect(
+async fn load_known_checks(
     hub: &Arc<Hub>,
     project: &Project,
     rules: &Rules,
-    b: &mut BisectRow,
-    reported_snap: ObjectId,
-    state: CheckState,
-    recorded_at: i64,
-    holder: &str,
-    epoch: i64,
-) -> Result<()> {
-    drive_bisect(
-        hub,
-        project,
-        rules,
-        b,
-        Some((reported_snap, state, recorded_at)),
-        holder,
-        epoch,
+    check_name: &str,
+    snaps: &[String],
+) -> Result<HashMap<ObjectId, (CheckState, i64)>> {
+    if snaps.is_empty() {
+        return Ok(HashMap::new());
+    }
+    type BisectCheckRow = (String, String, i64, i64, String, bool);
+    let rows: Vec<BisectCheckRow> = sqlx::query_as(
+        "SELECT snapshot, state, run_count, runner_id, session_paths, admin_only \
+         FROM checks WHERE project_id = $1 AND name = $2 AND snapshot = ANY($3)",
     )
-    .await
+    .bind(project.id)
+    .bind(check_name)
+    .bind(snaps)
+    .fetch_all(&hub.db)
+    .await?;
+
+    let people: Vec<i64> = rows
+        .iter()
+        .map(|r| r.3)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let roles = if people.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        let mut conn = hub.db.acquire().await?;
+        crate::ci::load_poster_roles(&mut conn, project.id, &people).await?
+    };
+
+    let mut known: HashMap<ObjectId, (CheckState, i64)> = HashMap::new();
+    for (s_hex, st_str, run_count, runner_id, paths_json, admin_only) in rows {
+        if run_count <= 0 {
+            continue;
+        }
+        let (adm, grps) = roles.get(&runner_id).cloned().unwrap_or_default();
+        let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+        if !crate::ci::stored_check_counts(project, runner_id, adm, &grps, &paths, admin_only, rules, check_name) {
+            continue;
+        }
+        let (Ok(id), Some(st)) = (ObjectId::from_hex(&s_hex), CheckState::parse(&st_str)) else {
+            continue;
+        };
+        let effective = match st {
+            CheckState::Pass => CheckState::Pass,
+            CheckState::Fail | CheckState::Pending | CheckState::Error => CheckState::Fail,
+        };
+        known.insert(id, (effective, run_count));
+    }
+    Ok(known)
 }
 
 /// Drive the bisect state machine forward as far as stored check results allow,
@@ -829,11 +1008,10 @@ async fn drive_bisect(
     project: &Project,
     rules: &Rules,
     b: &mut BisectRow,
-    mut latest_report: Option<(ObjectId, CheckState, i64)>,
+    persisted: bool,
     holder: &str,
     epoch: i64,
 ) -> Result<()> {
-    // Load existing check results for `b.check_name` on `b.candidates` and `b.good`.
     let mut query_snaps: Vec<String> = b.candidates.iter().map(ObjectId::hex).collect();
     query_snaps.push(b.good.hex());
     if let Some(p) = b.culprit_parent {
@@ -842,39 +1020,11 @@ async fn drive_bisect(
     query_snaps.sort();
     query_snaps.dedup();
 
-    type BisectCheckRow = (String, String, i64, i64, String, bool);
-    let rows: Vec<BisectCheckRow> = sqlx::query_as(
-        "SELECT snapshot, state, updated_at, runner_id, session_paths, admin_only FROM checks WHERE project_id = $1 AND name = $2 AND snapshot = ANY($3)",
-    )
-    .bind(project.id)
-    .bind(&b.check_name)
-    .bind(&query_snaps)
-    .fetch_all(&hub.db)
-    .await?;
-
-    let people: Vec<i64> = rows.iter().map(|r| r.3).collect::<std::collections::HashSet<_>>().into_iter().collect();
-    let roles = if people.is_empty() {
-        std::collections::BTreeMap::new()
-    } else {
-        let mut conn = hub.db.acquire().await?;
-        crate::ci::load_poster_roles(&mut conn, project.id, &people).await?
-    };
-
-    let mut known: HashMap<ObjectId, (CheckState, i64)> = HashMap::new();
-    for (s_hex, st_str, ts, runner_id, paths_json, admin_only) in rows {
-        let (adm, grps) = roles.get(&runner_id).cloned().unwrap_or_default();
-        let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-        if !crate::ci::stored_check_counts(project, runner_id, adm, &grps, &paths, admin_only, rules, &b.check_name) {
-            continue;
-        }
-        if let (Ok(id), Some(st)) = (ObjectId::from_hex(&s_hex), CheckState::parse(&st_str)) {
-            if matches!(st, CheckState::Pass | CheckState::Fail) {
-                known.insert(id, (st, ts));
-            }
-        }
-    }
+    let mut known = load_known_checks(hub, project, rules, &b.check_name, &query_snaps).await?;
+    let mut transitioned_to_confirming = false;
 
     if b.phase == "searching" {
+        let prev_search = (b.good, b.bad, b.lo, b.hi, b.probes.clone());
         // Apply any known pass/fail results inside `lo..=hi` to tighten `[lo, hi]`.
         loop {
             let mut progressed = false;
@@ -924,7 +1074,10 @@ async fn drive_bisect(
                 .filter(|p| !b.probes.contains(p))
                 .collect();
             b.probes = new_probes;
-            if save_bisect(hub, b, holder, epoch).await? {
+            let changed = !persisted
+                || (b.good, b.bad, b.lo, b.hi, &b.probes)
+                    != (prev_search.0, prev_search.1, prev_search.2, prev_search.3, &prev_search.4);
+            if changed && save_bisect(hub, b, holder, epoch).await? {
                 for probe in to_request {
                     crate::events::emit_check_requested(
                         hub,
@@ -954,108 +1107,61 @@ async fn drive_bisect(
         })
         .await?;
 
+        let parent_target = choose_confirm_parent(hub, project.id, parent, b.good, &b.session_paths, b.admin_only).await?;
+        let parent_hex = parent_target.hex();
+        if parent_target != sync::root_snapshot_id() && !query_snaps.contains(&parent_hex) {
+            let extra = load_known_checks(hub, project, rules, &b.check_name, &[parent_hex]).await?;
+            known.extend(extra);
+        }
+
         b.phase = "confirming".to_string();
         b.probes.clear();
         b.culprit = Some(culprit);
-        b.culprit_parent = Some(parent);
-        // `culprit` has failed once if `known` has `Fail` on `culprit`:
-        b.culprit_fails = match known.get(&culprit).map(|(s, _)| *s) {
-            Some(CheckState::Fail) => 1,
-            Some(CheckState::Pass) => {
-                b.phase = "flaky".to_string();
-                save_bisect(hub, b, holder, epoch).await?;
-                return Ok(());
-            }
-            _ => 0,
-        };
-        // If `parent` is ` root_snapshot_id()`, it needs no runner check (2 passes implicitly).
-        // If `parent == b.good` and `known` has `Pass` on `parent`, it already passed once;
-        // if `parent` is an un-narrowed commit between `b.good` and `culprit` (because `parent`
-        // didn't touch the check's paths), its tree on the check's paths is identical to `b.good`,
-        // so we verify `parent` if the runner can see it, or `b.good` if `parent` collapsed for the runner!
-        let parent_target = choose_confirm_parent(hub, project.id, parent, b.good, &b.session_paths, b.admin_only).await?;
         b.culprit_parent = Some(parent_target);
-        if parent_target == sync::root_snapshot_id() {
-            b.parent_passes = 2;
-        } else {
-            b.parent_passes = match known.get(&parent_target).map(|(s, _)| *s) {
-                Some(CheckState::Pass) => 1,
-                Some(CheckState::Fail) => {
-                    b.phase = "flaky".to_string();
-                    save_bisect(hub, b, holder, epoch).await?;
-                    return Ok(());
-                }
-                _ => 0,
-            };
-        }
-        // Consume `latest_report` if it was the report that triggered transition into `confirming`,
-        // so that the same single report doesn't count twice!
-        if let Some((rep_snap, _, _)) = latest_report {
-            if (rep_snap == culprit && b.culprit_fails == 1)
-                || (rep_snap == parent_target && b.parent_passes == 1)
-            {
-                latest_report = None;
-            }
-        }
+        b.culprit_fails = 0;
+        b.parent_passes = if parent_target == sync::root_snapshot_id() { 2 } else { 0 };
+        transitioned_to_confirming = true;
     }
 
     if b.phase == "confirming" {
         let Some(culprit) = b.culprit else { return Ok(()) };
         let parent_target = b.culprit_parent.unwrap_or_else(sync::root_snapshot_id);
+        let prev_confirm = (b.culprit_fails, b.parent_passes, b.probes.clone());
 
-        if let Some((rep_snap, rep_state, _)) = latest_report {
-            if rep_snap == culprit {
-                match rep_state {
-                    CheckState::Fail => {
-                        b.culprit_fails += 1;
-                    }
-                    CheckState::Pass => {
-                        // Failed first, passed on confirmation re-run -> flaky! (Threat 14)
-                        b.phase = "flaky".to_string();
-                        b.probes.clear();
-                        save_bisect(hub, b, holder, epoch).await?;
-                        return Ok(());
-                    }
-                    _ => {}
+        match known.get(&culprit).copied() {
+            Some((CheckState::Pass, _)) => {
+                // Failed first, passed on confirmation re-run -> flaky! (Threat 14)
+                b.phase = "flaky".to_string();
+                b.probes.clear();
+                save_bisect(hub, b, holder, epoch).await?;
+                return Ok(());
+            }
+            Some((CheckState::Fail, count)) => {
+                b.culprit_fails = b.culprit_fails.max(count.min(i32::MAX as i64) as i32);
+            }
+            _ => {}
+        }
+
+        if parent_target == sync::root_snapshot_id() {
+            b.parent_passes = b.parent_passes.max(2);
+        } else {
+            match known.get(&parent_target).copied() {
+                Some((CheckState::Fail, _)) => {
+                    // Parent failed -> not introduced by `culprit` (or flaky check)!
+                    b.phase = "flaky".to_string();
+                    b.probes.clear();
+                    save_bisect(hub, b, holder, epoch).await?;
+                    return Ok(());
                 }
-            } else if rep_snap == parent_target && parent_target != sync::root_snapshot_id() {
-                match rep_state {
-                    CheckState::Pass => {
-                        b.parent_passes += 1;
-                    }
-                    CheckState::Fail => {
-                        // Parent failed -> not introduced by `culprit` (or flaky check)!
-                        b.phase = "flaky".to_string();
-                        b.probes.clear();
-                        save_bisect(hub, b, holder, epoch).await?;
-                        return Ok(());
-                    }
-                    _ => {}
+                Some((CheckState::Pass, count)) => {
+                    b.parent_passes = b.parent_passes.max(count.min(i32::MAX as i64) as i32);
                 }
+                _ => {}
             }
         }
 
-        // Check if we still need confirmation runs on `culprit` (needs 2 fails)
-        // or `parent_target` (needs 2 passes, or 1 pass when `parent_target == b.good`?
-        // Wait: Guarantee 3 says: "Only a confirmed culprit is reverted: its failure
-        // reproduces on a re-run, and its parent passes. A flaky check never reverts anything."
-        // Note: if `parent_target` already passed (`b.parent_passes >= 1`), wait — what if a test
-        // only re-runs `culprit` (because `good` already passed before bisect started), OR what if
-        // `parent` was an intermediate commit that passed once during bisect?
-        // Let's check!
-        // Look at Guarantee 3 in the user prompt:
-        // "3. Only a **confirmed** culprit is reverted: its failure reproduces on a re-run, and its parent passes. A flaky check never reverts anything."
-        // And look at `phase-4-agent-scale.md`:
-        // - §3.2: "Only a confirmed culprit is reverted — its failure reproduced on a re-run and its parent passed — so a flaky check never reverts anything."
-        // - §4.7: "Wait for a second failure on the candidate (and a pass on its parent) before reverting, so a flaky test never triggers a revert."
-        // - §5.1: "Once a single commit is isolated, the server re-runs the failing check on that commit (and, if not yet run, on its parent) before reverting: a culprit is reverted only when its failure reproduces and its parent passes."
-        // - §8 S20: "Only a confirmed culprit is reverted: its failure reproduces on a re-run, and its parent passes. A flaky check never reverts anything."
-        // HOLD ON! Read §4.7 and §5.1 again!
-        // "Once a single commit is isolated, the server re-runs the failing check on that commit (and, if not yet run, on its parent) before reverting: a culprit is reverted only when its failure reproduces and its parent passes."
-        // That means:
-        // - `culprit` must fail TWICE (`b.culprit_fails >= 2`: the initial failure + 1 confirmation re-run on `culprit`)!
-        // - `parent` must pass AT LEAST ONCE (`b.parent_passes >= 1`: if `parent` already passed as `good` or during bisect, it already has `b.parent_passes == 1`; if `parent` has not yet run, bisect requests a check on `parent` and waits for `parent` to pass!).
-        // And what if someone re-runs `parent` and it fails? If `parent` fails at any point before revert, it aborts as `flaky`!
+        // `culprit` must fail at least twice (`checks.run_count >= 2` with `state = 'fail'`)
+        // and `parent_target` must pass at least once (`state = 'pass'`).
         let mut needed_probes = Vec::new();
         if b.parent_passes < 1 && parent_target != sync::root_snapshot_id() {
             needed_probes.push(parent_target);
@@ -1065,21 +1171,32 @@ async fn drive_bisect(
         }
 
         if !needed_probes.is_empty() {
-            b.probes = needed_probes.clone();
-            b.confirm_requested_at = veil_core::now_millis();
-            if save_bisect(hub, b, holder, epoch).await? {
-                for p in needed_probes {
-                    crate::events::emit_check_requested(
-                        hub,
-                        project.id,
-                        &b.branch,
-                        p,
-                        &b.check_name,
-                        &b.session_paths,
-                        b.admin_only,
-                        "confirm",
-                    )
-                    .await;
+            let to_request: Vec<ObjectId> = needed_probes
+                .iter()
+                .copied()
+                .filter(|p| !b.probes.contains(p))
+                .collect();
+            b.probes = needed_probes;
+            let changed = !persisted
+                || transitioned_to_confirming
+                || (b.culprit_fails, b.parent_passes, &b.probes)
+                    != (prev_confirm.0, prev_confirm.1, &prev_confirm.2);
+            if changed {
+                b.confirm_requested_at = veil_core::now_millis();
+                if save_bisect(hub, b, holder, epoch).await? {
+                    for p in to_request {
+                        crate::events::emit_check_requested(
+                            hub,
+                            project.id,
+                            &b.branch,
+                            p,
+                            &b.check_name,
+                            &b.session_paths,
+                            b.admin_only,
+                            "confirm",
+                        )
+                        .await;
+                    }
                 }
             }
             return Ok(());
@@ -1479,7 +1596,8 @@ pub async fn status_route(
     Path((p, branch)): Path<(String, String)>,
 ) -> Result<Json<BisectStatus>> {
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
-    // Ensure any pending revert outcome is synced before answering.
+    // Reconcile any stored check results or pending revert outcome before answering.
+    let _ = reconcile_branch(&hub, &project, &branch).await;
     let _ = sync_revert_outcome(&hub, project.id, &branch).await;
 
     let Some(b) = load_bisect(&hub, project.id, &branch).await? else {

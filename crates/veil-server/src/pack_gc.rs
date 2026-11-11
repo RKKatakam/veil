@@ -1396,7 +1396,7 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("branches", &["project_id", "name", "lineage", "hidden_for_embargo"]),
     ("challenges", &["challenge", "signing_key", "expires_at"]),
     ("change_refs", &["project_id", "change_id", "created_by", "created_at"]),
-    ("checks", &["project_id", "name", "state", "summary", "url", "log", "runner_id", "runner_name", "session_paths", "admin_only", "updated_at"]),
+    ("checks", &["project_id", "name", "state", "summary", "url", "log", "runner_id", "runner_name", "session_paths", "admin_only", "updated_at", "run_count"]),
     ("derive_progress", &["project_id", "index_name", "index_version", "branch"]),
     ("device_bars", &["project_id", "device_id", "created_at"]),
     ("device_expected", &["person_id", "fingerprint", "expires_at"]),

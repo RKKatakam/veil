@@ -252,7 +252,6 @@ fn bug_1861_an_embargo_release_never_lands_an_unapproved_change_on_a_protected_b
 /// the bisect waits for ever for a result it already has, and while it
 /// waits no other bisect starts on the branch.
 #[test]
-#[ignore = "BUG-1862: a check result that arrives while the branch's bisect lease is held is recorded and never counted: the bisect stalls in `confirming` and nothing is reverted"]
 fn bug_1862_a_check_result_that_arrives_during_another_bisect_step_still_counts() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -304,6 +303,64 @@ fn bug_1862_a_check_result_that_arrives_during_another_bisect_step_still_counts(
     }
     assert_eq!(st["phase"], "reverted", "the culprit failed twice and its parent passed, and every result was accepted: {st}");
     assert_ne!(tip(&hub, &admin, &p.name), c1, "the revert landed");
+}
+
+#[test]
+fn bug_1862_a_first_failure_during_another_bisect_step_still_starts_bisect() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (admin, dev) = (p.admin.token(), p.dev.token());
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+
+    let s0 = land_edit(&hub, &p, &admin, ".veilrules", RULES_CI, "protect main, require ci/src");
+    assert_eq!(post_check(&hub, &admin, &p.name, s0, "ci/src", "pass").status, 200);
+    let c1 = land_edit(&hub, &p, &dev, "src/first_fail_1862.rs", "pub fn broken() {}\n", "break");
+
+    // Hold `bisect_leases` when the very first failure (after `pending`) arrives.
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO bisect_leases (project_id, branch, holder, epoch, expires_at) \
+                 VALUES ($1, 'main', 'another-request', 1, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + 4000) \
+                 ON CONFLICT (project_id, branch) DO UPDATE SET holder = EXCLUDED.holder, epoch = bisect_leases.epoch + 1, expires_at = EXCLUDED.expires_at",
+            )
+            .bind(pid)
+            .execute(&h.db),
+        )
+        .unwrap();
+    assert_eq!(post_check(&hub, &admin, &p.name, c1, "ci/src", "pending").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, c1, "ci/src", "fail").status, 200);
+    hub.rt
+        .block_on(sqlx::query("UPDATE bisect_leases SET expires_at = 0 WHERE project_id = $1 AND branch = 'main' AND holder = 'another-request'").bind(pid).execute(&h.db))
+        .unwrap();
+
+    let mut st = bisect_status(&hub, &admin, &p.name);
+    for _ in 0..50 {
+        if st.status == 200 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        st = bisect_status(&hub, &admin, &p.name);
+    }
+    assert_eq!(st.status, 200, "{}", body(&st));
+    let stj: Value = st.json();
+    assert_eq!(stj["phase"], "confirming", "{stj}");
+    assert_eq!(stj["culprit"], c1.hex(), "{stj}");
+
+    // Runner posts `pending` before the confirming `fail`: must still count as run 2 and revert!
+    assert_eq!(post_check(&hub, &admin, &p.name, c1, "ci/src", "pending").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, c1, "ci/src", "fail").status, 200);
+    let mut stj: Value = bisect_status(&hub, &admin, &p.name).json();
+    for _ in 0..50 {
+        if stj["phase"] == "reverted" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        stj = bisect_status(&hub, &admin, &p.name).json();
+    }
+    assert_eq!(stj["phase"], "reverted", "{stj}");
+    assert_ne!(tip(&hub, &admin, &p.name), c1);
 }
 
 /// The guarantee: a request runs again only while nothing it did was
