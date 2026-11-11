@@ -77,7 +77,6 @@ const RULES_CI: &str = "[branches.main]\nprotected = true\nrequired_checks = [\"
 /// may not write it. Three check results posted by `fin` make the server
 /// revert a developer's landing in `src/`.
 #[test]
-#[ignore = "BUG-1860: anyone in the project, with no write access to a folder, makes the server revert a landing there by posting check results"]
 fn bug_1860_someone_who_cannot_write_a_folder_never_reverts_a_landing_there() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -124,6 +123,62 @@ fn bug_1860_someone_who_cannot_write_a_folder_never_reverts_a_landing_there() {
         now.short(),
         body(&st)
     );
+}
+
+#[test]
+fn bug_1852_1860_ci_runner_sessions_follow_their_minters_write_authority() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (admin, dev, fin) = (p.admin.token(), p.dev.token(), p.fin.token());
+
+    let s0 = land_edit(&hub, &p, &admin, ".veilrules", RULES_CI, "protect main, require ci/src");
+    let fin_sess = hub
+        .api()
+        .post_json(Some(&fin), "/v1/sessions/ci", &json!({"project": p.name, "check": "ci/src"}));
+    assert_eq!(fin_sess.status, 200, "{}", body(&fin_sess));
+    let fin_runner = fin_sess.json()["token"].as_str().unwrap().to_string();
+
+    let dev_sess = hub
+        .api()
+        .post_json(Some(&dev), "/v1/sessions/ci", &json!({"project": p.name, "check": "ci/src"}));
+    assert_eq!(dev_sess.status, 200, "{}", body(&dev_sess));
+    let dev_runner = dev_sess.json()["token"].as_str().unwrap().to_string();
+
+    // `fin`'s runner cannot advance `main@tested` for `ci/src`.
+    let s0_fin = tip(&hub, &fin_runner, &p.name);
+    let r_fin_pass = post_check(&hub, &fin_runner, &p.name, s0_fin, "ci/src", "pass");
+    assert_eq!(r_fin_pass.status, 403, "{}", body(&r_fin_pass));
+    assert_eq!(hub.api().get(Some(&admin), &format!("/v1/projects/{}/tested/main", p.name)).status, 404);
+
+    // `dev`'s runner (minted by someone who writes `src/`, though the runner itself
+    // is refused code writes by `not_runner()`) advances `main@tested` and drives bisect.
+    let s0_dev = tip(&hub, &dev_runner, &p.name);
+    let r_dev_pass = post_check(&hub, &dev_runner, &p.name, s0_dev, "ci/src", "pass");
+    assert_eq!(r_dev_pass.status, 200, "{}", body(&r_dev_pass));
+    assert_eq!(hub.api().get(Some(&admin), &format!("/v1/projects/{}/tested/main", p.name)).status, 200);
+
+    let c1 = land_edit(&hub, &p, &dev, "src/runner_check.rs", "pub fn broken() {}\n", "land src change");
+    let c1_fin = tip(&hub, &fin_runner, &p.name);
+    for _ in 0..2 {
+        let r = post_check(&hub, &fin_runner, &p.name, c1_fin, "ci/src", "fail");
+        assert_eq!(r.status, 403, "{}", body(&r));
+    }
+    assert_eq!(tip(&hub, &admin, &p.name), c1, "fin's runner never reverts src/");
+
+    let c1_dev = tip(&hub, &dev_runner, &p.name);
+    for _ in 0..2 {
+        let r = post_check(&hub, &dev_runner, &p.name, c1_dev, "ci/src", "fail");
+        assert_eq!(r.status, 200, "{}", body(&r));
+    }
+    let mut now = tip(&hub, &admin, &p.name);
+    for _ in 0..40 {
+        if now != c1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        now = tip(&hub, &admin, &p.name);
+    }
+    assert_ne!(now, c1, "dev's runner still drives bisect and reverts the failing src/ landing");
 }
 
 /// The guarantee: a landing onto a protected branch meets the review rules

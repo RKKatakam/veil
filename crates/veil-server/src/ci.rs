@@ -118,6 +118,20 @@ pub async fn post_check_route(
     };
     let proj_id = req.snapshot;
 
+    let rules = default_branch_rules(&hub, &project).await?;
+    let counts = can_post_check_results(&project, &viewer, &rules, &req.name);
+    let required_on_protected = rules.protected.iter().any(|b| {
+        rules
+            .required_checks
+            .get(b)
+            .is_some_and(|reqs| reqs.iter().any(|r| r == &req.name))
+    });
+    if required_on_protected && !counts {
+        return Err(Error::forbidden(
+            "only an admin or someone who may write every path this check covers may report it",
+        ));
+    }
+
     let (session_paths, admin_only) = readable_footprint(&hub, &project, &viewer, real_id, &req.name).await?;
 
     let now = veil_core::now_millis();
@@ -131,6 +145,8 @@ pub async fn post_check_route(
     let runner_id = me.id;
     let runner_name = me.name.clone();
     let paths_json = serde_json::to_string(&session_paths).map_err(|e| Error::Other(e.into()))?;
+    let project_for_tx = project.clone();
+    let rules_for_tx = rules.clone();
 
     crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let real_hex = real_hex.clone();
@@ -141,14 +157,38 @@ pub async fn post_check_route(
         let log = log.clone();
         let runner_name = runner_name.clone();
         let paths_json = paths_json.clone();
+        let project_for_tx = project_for_tx.clone();
+        let rules_for_tx = rules_for_tx.clone();
         Box::pin(async move {
-            let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM checks WHERE project_id = $1 AND snapshot = $2 AND name = $3")
-                .bind(pid)
-                .bind(&real_hex)
-                .bind(&name)
-                .fetch_optional(&mut *c)
-                .await?;
-            if exists.is_none() {
+            let existing: Option<(i64, String, bool)> = sqlx::query_as(
+                "SELECT runner_id, session_paths, admin_only FROM checks WHERE project_id = $1 AND snapshot = $2 AND name = $3",
+            )
+            .bind(pid)
+            .bind(&real_hex)
+            .bind(&name)
+            .fetch_optional(&mut *c)
+            .await?;
+            if let Some((ex_runner, ex_paths_json, ex_admin_only)) = &existing {
+                if !counts {
+                    let roles = load_poster_roles(&mut *c, pid, &[*ex_runner]).await?;
+                    let (ex_adm, ex_grps) = roles.get(ex_runner).cloned().unwrap_or_default();
+                    let ex_paths: Vec<String> = serde_json::from_str(ex_paths_json).unwrap_or_default();
+                    if stored_check_counts(
+                        &project_for_tx,
+                        *ex_runner,
+                        ex_adm,
+                        &ex_grps,
+                        &ex_paths,
+                        *ex_admin_only,
+                        &rules_for_tx,
+                        &name,
+                    ) {
+                        return Err(Error::forbidden(
+                            "only an admin or someone who may write every path this check covers may replace its result",
+                        ));
+                    }
+                }
+            } else {
                 let tip_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checks WHERE project_id = $1 AND snapshot = $2")
                     .bind(pid)
                     .bind(&real_hex)
@@ -253,10 +293,10 @@ pub async fn post_check_route(
     })
     .await?;
 
-    if req.state == CheckState::Pass {
+    if counts && req.state == CheckState::Pass {
         advance_tested(&hub, &project).await?;
     }
-    if matches!(req.state, CheckState::Pass | CheckState::Fail) {
+    if counts && matches!(req.state, CheckState::Pass | CheckState::Fail) {
         crate::bisect::on_check_recorded(
             &hub,
             &project,
@@ -703,30 +743,43 @@ pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
         return Ok(());
     }
     let cand_vec: Vec<String> = all_cands.into_iter().collect();
-    let check_rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT snapshot, name, state FROM checks WHERE project_id = $1 AND snapshot = ANY($2)",
+    type CheckRow = (String, String, String, i64, String, bool);
+    let check_rows: Vec<CheckRow> = sqlx::query_as(
+        "SELECT snapshot, name, state, runner_id, session_paths, admin_only FROM checks WHERE project_id = $1 AND snapshot = ANY($2)",
     )
     .bind(project.id)
     .bind(&cand_vec)
     .fetch_all(&hub.db)
     .await?;
 
+    let people: Vec<i64> = check_rows.iter().map(|r| r.3).collect::<HashSet<_>>().into_iter().collect();
+    let roles = if people.is_empty() {
+        BTreeMap::new()
+    } else {
+        let mut conn = hub.db.acquire().await?;
+        load_poster_roles(&mut conn, project.id, &people).await?
+    };
+
     let mut by_snap: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    for (snap, name, state) in check_rows {
+    for (snap, name, state, runner_id, paths_json, admin_only) in check_rows {
+        let (adm, grps) = roles.get(&runner_id).cloned().unwrap_or_default();
+        let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+        if !stored_check_counts(project, runner_id, adm, &grps, &paths, admin_only, &rules, &name) {
+            continue;
+        }
         by_snap.entry(snap).or_default().insert(name, state);
     }
 
     let now = veil_core::now_millis();
     for (branch, (lineage, chain)) in chains {
-        let required = rules.required_checks.get(&branch);
+        let Some(reqs) = rules.required_checks.get(&branch).filter(|r| !r.is_empty()) else {
+            continue;
+        };
         // `chain` is newest first (`target` first): pick the first snapshot
         // whose required checks all passed.
         let passed = chain.into_iter().find(|(id, _)| {
             let Some(states) = by_snap.get(&id.hex()) else { return false };
-            match required {
-                Some(reqs) if !reqs.is_empty() => reqs.iter().all(|r| states.get(r).map(String::as_str) == Some("pass")),
-                _ => !states.is_empty() && states.values().all(|s| s == "pass"),
-            }
+            reqs.iter().all(|r| states.get(r).map(String::as_str) == Some("pass"))
         });
         if let Some((winner, depth)) = passed {
             sqlx::query(
@@ -751,4 +804,100 @@ pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `.veilrules` on `project`'s default branch.
+pub(crate) async fn default_branch_rules(hub: &Arc<Hub>, project: &Project) -> Result<crate::landing::rules::Rules> {
+    let target: Option<String> = sqlx::query_scalar(
+        "SELECT target FROM branches WHERE project_id = $1 AND name = $2 AND hidden_for_embargo IS NULL",
+    )
+    .bind(project.id)
+    .bind(&project.default_branch)
+    .fetch_optional(&hub.db)
+    .await?;
+    let tip = target.and_then(|t| ObjectId::from_hex(&t).ok());
+    sync::blocking(hub, project.id, move |src| crate::landing::rules(src, tip)).await
+}
+
+/// May `viewer` (a person, agent, or CI runner session) post authoritative
+/// results for `check_name` — results that count toward `<branch>@tested`,
+/// bisect, and automatic revert?
+///
+/// Allowed when the caller's person (narrowed by `viewer.only`, if any) may
+/// write every path `[checks.<check_name>].paths` names, or is an unnarrowed
+/// admin when the check names no paths (so it covers the whole tree). CI
+/// runner sessions (`Caller::is_runner`) keep their minting person's write
+/// scope (`for_agent(false)`), even though code-writing routes refuse them.
+pub(crate) fn can_post_check_results(
+    project: &Project,
+    viewer: &Viewer,
+    rules: &crate::landing::rules::Rules,
+    check_name: &str,
+) -> bool {
+    let write_view = project.view(viewer).for_agent(false);
+    match rules.checks.get(check_name).filter(|p| !p.is_empty()) {
+        Some(paths) => paths.iter().all(|p| write_view.write(p)),
+        None => viewer.admin && viewer.only.is_none(),
+    }
+}
+
+/// Whether a stored `checks` row (recorded by `poster_id` with
+/// `(session_paths, admin_only)`) counts under the current permissions and
+/// `rules`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stored_check_counts(
+    project: &Project,
+    poster_id: i64,
+    poster_admin: bool,
+    poster_groups: &HashSet<i64>,
+    session_paths: &[String],
+    admin_only: bool,
+    rules: &crate::landing::rules::Rules,
+    check_name: &str,
+) -> bool {
+    let v = Viewer {
+        person: Some(poster_id),
+        admin: poster_admin,
+        groups: poster_groups.clone(),
+        only: (!admin_only).then(|| Arc::new(session_paths.to_vec())),
+        agent: false,
+    };
+    can_post_check_results(project, &v, rules, check_name)
+}
+
+/// Current `(admin, groups)` in `project_id` for `people`.
+pub(crate) async fn load_poster_roles(
+    c: &mut sqlx::PgConnection,
+    project_id: i64,
+    people: &[i64],
+) -> Result<BTreeMap<i64, (bool, HashSet<i64>)>> {
+    let mut out: BTreeMap<i64, (bool, HashSet<i64>)> = people.iter().map(|&p| (p, (false, HashSet::new()))).collect();
+    if people.is_empty() {
+        return Ok(out);
+    }
+    let admins: Vec<i64> =
+        sqlx::query_scalar("SELECT person_id FROM project_admins WHERE project_id = $1 AND person_id = ANY($2)")
+            .bind(project_id)
+            .bind(people)
+            .fetch_all(&mut *c)
+            .await?;
+    for a in admins {
+        if let Some(entry) = out.get_mut(&a) {
+            entry.0 = true;
+        }
+    }
+    let members: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT m.person_id, m.group_id FROM group_members m JOIN groups g ON g.id = m.group_id \
+         WHERE g.project_id = $1 AND m.person_id = ANY($2)",
+    )
+    .bind(project_id)
+    .bind(people)
+    .fetch_all(&mut *c)
+    .await?;
+    for (p, g) in members {
+        if let Some(entry) = out.get_mut(&p) {
+            entry.1.insert(g);
+        }
+    }
+    Ok(out)
 }

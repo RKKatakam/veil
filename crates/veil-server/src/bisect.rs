@@ -842,8 +842,9 @@ async fn drive_bisect(
     query_snaps.sort();
     query_snaps.dedup();
 
-    let rows: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT snapshot, state, updated_at FROM checks WHERE project_id = $1 AND name = $2 AND snapshot = ANY($3)",
+    type BisectCheckRow = (String, String, i64, i64, String, bool);
+    let rows: Vec<BisectCheckRow> = sqlx::query_as(
+        "SELECT snapshot, state, updated_at, runner_id, session_paths, admin_only FROM checks WHERE project_id = $1 AND name = $2 AND snapshot = ANY($3)",
     )
     .bind(project.id)
     .bind(&b.check_name)
@@ -851,8 +852,21 @@ async fn drive_bisect(
     .fetch_all(&hub.db)
     .await?;
 
+    let people: Vec<i64> = rows.iter().map(|r| r.3).collect::<std::collections::HashSet<_>>().into_iter().collect();
+    let roles = if people.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        let mut conn = hub.db.acquire().await?;
+        crate::ci::load_poster_roles(&mut conn, project.id, &people).await?
+    };
+
     let mut known: HashMap<ObjectId, (CheckState, i64)> = HashMap::new();
-    for (s_hex, st_str, ts) in rows {
+    for (s_hex, st_str, ts, runner_id, paths_json, admin_only) in rows {
+        let (adm, grps) = roles.get(&runner_id).cloned().unwrap_or_default();
+        let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+        if !crate::ci::stored_check_counts(project, runner_id, adm, &grps, &paths, admin_only, rules, &b.check_name) {
+            continue;
+        }
         if let (Ok(id), Some(st)) = (ObjectId::from_hex(&s_hex), CheckState::parse(&st_str)) {
             if matches!(st, CheckState::Pass | CheckState::Fail) {
                 known.insert(id, (st, ts));

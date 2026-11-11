@@ -245,7 +245,6 @@ fn land_edit(hub: &TestHub, p: &Project, token: &str, path: &str, text: &str, de
 /// public, and may not write it) has the server take a developer's landed
 /// change out of `src/`.
 #[test]
-#[ignore = "BUG-1852: anyone who takes part in a project has the server revert a landed change in a folder they may not write, by posting failing check results"]
 fn bug_1852_someone_who_may_not_write_a_folder_cannot_have_a_landed_change_in_it_reverted() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
