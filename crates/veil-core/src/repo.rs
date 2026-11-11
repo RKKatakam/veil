@@ -697,7 +697,7 @@ impl Repo {
     /// fails with [`VeilError::Unavailable`]; it never answers from the
     /// part of the graph it holds alone.
     fn run_exact<R>(&self, mut f: impl FnMut(&Repo) -> Result<R>) -> Result<R> {
-        if !self.store.is_partial() || EXACT.with(|d| d.get() > 0) {
+        if !self.store.may_fetch() || EXACT.with(|d| d.get() > 0) {
             return f(self);
         }
         EXACT.with(|d| d.set(d.get() + 1));
@@ -741,6 +741,9 @@ impl Repo {
     /// held snapshot, or a name what the server's branches or this clone's
     /// own refs reach, BUG-1319); the others are not found, as there.
     pub fn deepen(&self, tips: &[ObjectId], limit: usize) -> Result<usize> {
+        if !self.store.may_fetch() {
+            return Ok(0);
+        }
         let Some(promisor) = self.store.promisor() else {
             return Err(VeilError::Unavailable(
                 "this command needs history this thin clone does not hold, and has no connection to its server".into(),

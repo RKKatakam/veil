@@ -382,7 +382,6 @@ print(json.dumps({
 /// name passes the "names another workspace" check (`agent@tested`), and
 /// `describe -r` and `new` are not checked for names at all.
 #[test]
-#[ignore = "BUG-1842: a sandboxed `vl show WS@tested` (or `describe -r X@tested`) makes the vl outside ask the server, under --no-network"]
 fn bug_1842_a_tested_revision_named_inside_a_sandbox_never_reaches_the_server_under_no_network() {
     let env = Env::new();
     let _daemon = DaemonStop { env: &env, user: "alice" };
@@ -390,6 +389,7 @@ fn bug_1842_a_tested_revision_named_inside_a_sandbox_never_reaches_the_server_un
 
     let proj = env.project("alice", "proj", &[("a.txt", "v1\n")]);
     env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
+    env.ok("alice", &proj, &["ws", "new", "other", "-r", "@-"]);
 
     let recorder = OfflineRecorder::start(&env, "rec-1842");
     let veil_home = env.root.join("home-alice");
@@ -400,29 +400,49 @@ fn bug_1842_a_tested_revision_named_inside_a_sandbox_never_reaches_the_server_un
         .output()
         .unwrap();
     assert!(add_out.status.success(), "{}", text(&add_out));
-    let before = recorder.hits();
 
-    let script = r#"
+    // Also test as a thin clone (`partial`) so 64-hex snapshot IDs and
+    // snapshot/change prefixes would hit `deepen` / `server_names` if not
+    // offline-gated.
+    for partial in [false, true] {
+        if partial {
+            let cfg_path = proj.join(".veil/repo.json");
+            let mut cfg: RepoConfig = serde_json::from_slice(&std::fs::read(&cfg_path).unwrap()).unwrap();
+            cfg.partial = Some(PartialConfig { remote: "origin".into(), cache_limit: 32 << 20 });
+            std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+        }
+        let before = recorder.hits();
+
+        let script = r#"
 vl show 'agent@tested' >/dev/null 2>&1; echo "show=$?"
+vl show 'origin/RVCLIENT@tested-' >/dev/null 2>&1; echo "show_origin=$?"
 vl describe -r 'RVCLIENTBRANCH@tested' -m x >/dev/null 2>&1; echo "describe=$?"
+vl new 'RVCLIENTNEW@tested' >/dev/null 2>&1; echo "new_tested=$?"
+vl describe -r 'other@' -m x >/dev/null 2>&1; echo "describe_other=$?"
+vl new 'other@' >/dev/null 2>&1; echo "new_other=$?"
+vl show '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' >/dev/null 2>&1; echo "hex64=$?"
+vl show '01234567' >/dev/null 2>&1; echo "prefix=$?"
 vl status >/dev/null 2>&1; echo "status=$?"
 "#;
-    let out = env
-        .cmd("alice", &proj, &["ws", "exec", "agent", "--no-network", "--", "bash", "-c", script])
-        .env("HOME", env.dir("fakehome-1842"))
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env("VEIL_KEY_SHARE", "0")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{}", text(&out));
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    // The socket works in this run, and refuses both names.
-    assert!(stdout.contains("status=0"), "the workspace socket answers: {}", text(&out));
-    assert!(!stdout.contains("show=0") && !stdout.contains("describe=0"), "neither name is a revision of the workspace: {}", text(&out));
-    let hits: Vec<String> = recorder.hits().into_iter().skip(before.len()).collect();
-    assert!(
-        hits.is_empty(),
-        "under --no-network, revisions named inside the sandbox made the vl outside ask the server: {hits:?}"
-    );
+        let out = env
+            .cmd("alice", &proj, &["ws", "exec", "agent", "--no-network", "--", "bash", "-c", script])
+            .env("HOME", env.dir(&format!("fakehome-1842-{partial}")))
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("VEIL_KEY_SHARE", "0")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "partial={partial}: {}", text(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        // The socket works in this run, and refuses every unheld / cross-workspace name.
+        assert!(stdout.contains("status=0"), "partial={partial}: the workspace socket answers: {}", text(&out));
+        for ok_zero in ["show=0", "show_origin=0", "describe=0", "new_tested=0", "describe_other=0", "new_other=0", "hex64=0", "prefix=0"] {
+            assert!(!stdout.contains(ok_zero), "partial={partial}: {ok_zero} unexpectedly succeeded: {}", text(&out));
+        }
+        let hits: Vec<String> = recorder.hits().into_iter().skip(before.len()).collect();
+        assert!(
+            hits.is_empty(),
+            "partial={partial}: under --no-network, revisions named inside the sandbox made the vl outside ask the server: {hits:?}"
+        );
+    }
 }

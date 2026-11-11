@@ -127,10 +127,16 @@ fn check_revisions(ctx: &Ctx, ws: &str, cli: &Cli) -> Result<()> {
 }
 
 /// Names another workspace's revision (`name@`, `name@-`, …): any `@`
-/// preceded by a name other than `ws`.
+/// preceded by a name other than `ws` (excluding `<branch>@tested` tags).
 fn names_other_workspace(spec: &str, ws: &str) -> bool {
     let b = spec.as_bytes();
     (0..b.len()).filter(|&i| b[i] == b'@').any(|i| {
+        if let Some(rest) = spec[i + 1..].strip_prefix("tested") {
+            let rest = rest.trim_start_matches('-').trim();
+            if rest.is_empty() || rest.starts_with("..") {
+                return false;
+            }
+        }
         let start = spec[..i].rfind(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))).map_or(0, |j| j + 1);
         let name = &spec[start..i];
         !name.is_empty() && name != ws
@@ -189,12 +195,26 @@ fn check_revisions_here(ctx: &Ctx, ws: &str, cli: &Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::Describe { rev, .. } => match ctx.rev(rev)? == wc {
-            true => Ok(()),
-            false => bail!("inside a sandbox, `vl describe` describes the workspace's working-copy change (@) only"),
-        },
+        Cmd::Describe { rev, .. } => {
+            if names_other_workspace(rev, ws) {
+                bail!(
+                    "inside a sandbox, `vl describe` describes this workspace's working-copy change (@) only: {} names another workspace",
+                    safe(rev)
+                );
+            }
+            match ctx.rev(rev)? == wc {
+                true => Ok(()),
+                false => bail!("inside a sandbox, `vl describe` describes the workspace's working-copy change (@) only"),
+            }
+        }
         Cmd::New { revs, .. } => {
             for r in revs {
+                if names_other_workspace(r, ws) {
+                    bail!(
+                        "inside a sandbox, `vl new` starts a change on top of this workspace's working-copy change (@) only: {} names another workspace",
+                        safe(r)
+                    );
+                }
                 if ctx.rev(r)? != wc {
                     bail!("inside a sandbox, `vl new` starts a change on top of the workspace's working-copy change (@) only");
                 }
