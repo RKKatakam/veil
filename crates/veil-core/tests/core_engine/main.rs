@@ -22,5 +22,6 @@ mod history_rename;
 mod history_tools;
 mod mount_recording;
 mod rename_merge;
+mod review_core;
 mod sandbox;
 mod split_squash;
