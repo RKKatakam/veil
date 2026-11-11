@@ -3786,13 +3786,13 @@ fn a_push_on_main_as_seen_is_made_on_main_even_when_another_branch_s_tip_looks_t
     assert_eq!(got, h, "the dev's push on main as they see it is made on {}", if got == d { "w2's tip D".to_string() } else { got.short() });
 }
 
-/// BUG-1524: `landed_changes` is written for what a move brings; a
-/// fast-forward to snapshots the server held already (here main moved to
-/// the tip of another branch) records nothing for them, so a rebased
-/// revision of one of their changes (emptied: main holds its edits) lands
-/// again as an empty change with that change id.
+/// BUG-1524 (fixed): `landed_changes` was written only for the snapshots a
+/// move brought new; a fast-forward to snapshots the server held already
+/// (here main moved to the tip of another branch) recorded nothing for
+/// them, so a rebased revision of one of their changes (emptied: main holds
+/// its edits) landed again as an empty change with that change id. The move
+/// now records the held snapshots it reaches (`landing::reached`).
 #[test]
-#[ignore = "BUG-1524: a rebased revision of a change that reached the branch by a fast-forward to held snapshots lands again"]
 fn bug_1524_a_rebased_revision_of_a_change_fast_forwarded_onto_main_is_not_landed_again() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -3830,6 +3830,8 @@ fn bug_1524_a_rebased_revision_of_a_change_fast_forwarded_onto_main_is_not_lande
     assert_eq!(v["state"], "landed", "{v}");
     let ids: Vec<_> = chain(&hub, pid, veil_server::sync::root_snapshot_id()).into_iter().map(|(_, s)| s.change_id).collect();
     assert_eq!(ids.iter().filter(|i| **i == cid).count(), 1, "the change is on main twice");
+    // By the row the move wrote: main's changes are still all recorded.
+    assert_eq!(sql_i64(&hub, "SELECT count(*) FROM branches WHERE project_id = $1 AND name = 'main' AND changes_recorded", pid), 1);
 }
 
 // ---- S17 re-check (s17r5): guarantees and findings -------------------------------------------
@@ -7083,3 +7085,451 @@ fn a_narrowed_sessions_events_and_conflict_reports_name_nothing_outside_its_path
     }
 }
 
+
+// ---- BUG-1524: a change lands on a branch once, by whatever route its first version got there ----
+
+/// `branch`'s real tip.
+fn branch_tip(hub: &TestHub, pid: i64, branch: &str) -> ObjectId {
+    let h = hub.hub();
+    let t: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2").bind(pid).bind(branch).fetch_one(&h.db))
+        .unwrap();
+    ObjectId::from_hex(&t).unwrap()
+}
+
+/// `branches.changes_recorded`: every change on `branch` has its
+/// `landed_changes` row.
+fn changes_recorded(hub: &TestHub, pid: i64, branch: &str) -> bool {
+    let h = hub.hub();
+    hub.rt
+        .block_on(sqlx::query_scalar("SELECT changes_recorded FROM branches WHERE project_id = $1 AND name = $2").bind(pid).bind(branch).fetch_one(&h.db))
+        .unwrap()
+}
+
+/// How many snapshots at or below `branch`'s real tip (by every parent) are
+/// of change `cid`.
+fn times_on(hub: &TestHub, pid: i64, branch: &str, cid: veil_core::ChangeId) -> usize {
+    let src = source(hub, pid);
+    let root = veil_server::sync::root_snapshot_id();
+    let (mut seen, mut todo, mut n) = (HashSet::new(), vec![branch_tip(hub, pid, branch)], 0);
+    while let Some(x) = todo.pop() {
+        if x == root || !seen.insert(x) {
+            continue;
+        }
+        let s = src.snapshot(&x).unwrap();
+        n += usize::from(s.change_id == cid);
+        todo.extend(s.parents.iter().copied());
+    }
+    n
+}
+
+/// Upload what `c` made and move `branch` from `expected` to `new`.
+fn push_update(c: &Craft<'_>, branch: &str, expected: ObjectId, new: ObjectId) -> Reply {
+    let up = c.api.upload(&c.token, &c.project, &c.objects);
+    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+    let receipts = up.json()["receipts"].as_array().unwrap().clone();
+    let map: serde_json::Map<String, Value> = c.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
+    c.api.post_json(
+        Some(&c.token),
+        &format!("/v1/projects/{}/push", c.project),
+        &json!({"updates": [{"branch": branch, "expected": expected.hex(), "new": new.hex()}], "receipts": map}),
+    )
+}
+
+/// `person` submits, to land on `branch`, a revision of change `cid` rebased
+/// on the branch's tip with no edits of its own left (the branch holds
+/// them), and a new change on it (a file at `path`); kept on the new branch
+/// `tag`. The landing's answer.
+fn land_rebased(api: &Api, person: &Person, project: &str, branch: &str, cid: veil_core::ChangeId, path: &str, tag: &str) -> Value {
+    let mut c = Craft::new(api, person, project, branch);
+    let tip = c.tip;
+    let p2 = snap_at(&mut c, tip, cid, "rebased", veil_core::now_millis(), vec![]);
+    c.file(path, "further work\n");
+    let q2 = crafted_on(&mut c, p2, veil_core::ChangeId::random(), "further", "");
+    let r = push_new(&c, &[(tag, q2)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held_onto(api, &person.token(), project, branch, q2);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    r.json()
+}
+
+/// A merge of `c`'s tip (first parent) and `other`, with `c`'s tree.
+fn merge_of(c: &mut Craft<'_>, other: ObjectId) -> ObjectId {
+    let mut s = Snapshot {
+        parents: vec![c.tip, other],
+        change_id: veil_core::ChangeId::random(),
+        tree: c.root,
+        description: Text::Plain("merge the side branch".into()),
+        author: "crafter".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s.sign(&c.identity);
+    c.put(O::Snapshot(s))
+}
+
+/// BUG-1524, a merge of another branch landed by the landing service: the
+/// merged line's changes (snapshots the server held) are on main by the
+/// merge's other parent, and the service records them with its own. A
+/// rebased revision of one of them is not landed again.
+#[test]
+fn bug_1524_a_change_merged_onto_main_by_the_landing_service_is_not_landed_again() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let side = push_chain(&api, &p.dev, &p.name, "side", "main", 2, Some("src/side"));
+    let base = tip_for(&hub, &token, &p.name);
+    let v = land(&api, &token, &p.name, base, json!([put("src/main_moved.rs", "moved\n")]), true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/side/0.rs", "0\n");
+    c.file("src/side/1.rs", "1\n");
+    let m = merge_of(&mut c, side);
+    let r = push_new(&c, &[("merge-side", m)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let v = land_held(&api, &token, &p.name, m, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let src = source(&hub, pid);
+    let tip = src.snapshot(&real_tip(&hub, pid)).unwrap();
+    assert_eq!(tip.parents.len(), 2, "the merge landed as a merge");
+    // The side branch's first change, as it is on main.
+    let first = src.snapshot(&tip.parents[1]).unwrap().parents[0];
+    let cid = src.snapshot(&first).unwrap().change_id;
+    assert_eq!(times_on(&hub, pid, "main", cid), 1);
+    assert!(changes_recorded(&hub, pid, "main"), "the merge's reach was recorded");
+    assert_eq!(sql_i64_text(&hub, "SELECT count(*) FROM landed_changes WHERE project_id = $1 AND branch = 'main' AND landed = $2", pid, &first.hex()), 1);
+    let before = real_tip(&hub, pid);
+    let v = land_rebased(&api, &p.dev, &p.name, "main", cid, "src/after_merge.rs", "rebased-side");
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_ne!(real_tip(&hub, pid), before, "the further change landed");
+    assert_eq!(times_on(&hub, pid, "main", cid), 1, "the merged change is on main twice");
+}
+
+/// BUG-1524, a merge of another branch pushed to (unprotected) main: the
+/// push brings the merge, and the merged line's snapshots were held; the
+/// push records them with its own.
+#[test]
+fn bug_1524_a_change_merged_onto_main_by_a_push_is_not_landed_again() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let side = push_chain(&api, &p.dev, &p.name, "side", "main", 2, Some("src/side"));
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/side/0.rs", "0\n");
+    c.file("src/side/1.rs", "1\n");
+    let m = merge_of(&mut c, side);
+    let r = push_update(&c, "main", c.tip, m);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let src = source(&hub, pid);
+    let tip = src.snapshot(&real_tip(&hub, pid)).unwrap();
+    assert_eq!(tip.parents.len(), 2, "main is at the merge");
+    let first = src.snapshot(&tip.parents[1]).unwrap().parents[0];
+    let cid = src.snapshot(&first).unwrap().change_id;
+    assert!(changes_recorded(&hub, pid, "main"), "the merge's reach was recorded");
+    assert_eq!(sql_i64_text(&hub, "SELECT count(*) FROM landed_changes WHERE project_id = $1 AND branch = 'main' AND landed = $2", pid, &first.hex()), 1);
+    let before = real_tip(&hub, pid);
+    let v = land_rebased(&api, &p.dev, &p.name, "main", cid, "src/after_merge.rs", "rebased-side");
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_ne!(real_tip(&hub, pid), before, "the further change landed");
+    assert_eq!(times_on(&hub, pid, "main", cid), 1, "the merged change is on main twice");
+}
+
+/// BUG-1524, a new branch made on history the server held: nothing of it is
+/// read at the move (it may be the whole project's), the branch's changes
+/// are not all recorded, and "already landed" asks the derived graph for
+/// the change's revisions: while the graph has not reached the tip (the
+/// branch is read down to what it holds), once it has, and with no graph at
+/// all (a short history is read whole).
+#[test]
+fn bug_1524_a_change_on_a_branch_made_on_held_history_is_not_landed_again_there() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let main0 = tip_for(&hub, &token, &p.name);
+    let first = push_chain(&api, &p.dev, &p.name, "side", "main", 1, Some("src/once"));
+    move_branch(&api, &token, &p.name, "main", Some(main0), Some(first), false);
+    let cid = source(&hub, pid).snapshot(&real_tip(&hub, pid)).unwrap().change_id;
+    move_branch(&api, &token, &p.name, "rel-1", None, Some(first), false);
+    assert!(!changes_recorded(&hub, pid, "rel-1"), "a branch made on held history");
+    // At once: the deriver has reached the new tip, or not yet.
+    let v = land_rebased(&api, &p.dev, &p.name, "rel-1", cid, "src/rel/a.rs", "rebased-a");
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(times_on(&hub, pid, "rel-1", cid), 1, "the change is on rel-1 twice");
+    // The derived graph holds the tip.
+    let tip = branch_tip(&hub, pid, "rel-1");
+    wait_derived(&hub, pid, tip);
+    let v = land_rebased(&api, &p.dev, &p.name, "rel-1", cid, "src/rel/b.rs", "rebased-b");
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_ne!(branch_tip(&hub, pid, "rel-1"), tip, "the further change landed");
+    assert_eq!(times_on(&hub, pid, "rel-1", cid), 1, "the change is on rel-1 twice");
+    // No graph at all: the branch is read.
+    wait_derived(&hub, pid, branch_tip(&hub, pid, "rel-1"));
+    let h = hub.hub();
+    hub.rt.block_on(sqlx::query("DELETE FROM graph WHERE project_id = $1").bind(pid).execute(&h.db)).unwrap();
+    h.derive.clear_cache();
+    let v = land_rebased(&api, &p.dev, &p.name, "rel-1", cid, "src/rel/c.rs", "rebased-c");
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(times_on(&hub, pid, "rel-1", cid), 1, "the change is on rel-1 twice");
+    assert!(!changes_recorded(&hub, pid, "rel-1"));
+}
+
+/// BUG-1524, a forced move: the branch's lineage is new and no row of the
+/// old one counts, so its changes are not all recorded. A change still on
+/// main is not landed again; one the move dropped lands again.
+#[test]
+fn bug_1524_after_a_forced_move_a_change_still_on_main_is_not_landed_again_and_a_dropped_one_lands() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let main0 = tip_for(&hub, &token, &p.name);
+    let two = push_chain(&api, &p.dev, &p.name, "side", "main", 2, Some("src/kept"));
+    move_branch(&api, &token, &p.name, "main", Some(main0), Some(two), false);
+    assert!(changes_recorded(&hub, pid, "main"));
+    let src = source(&hub, pid);
+    let y = real_tip(&hub, pid);
+    let (cid_y, x) = {
+        let s = src.snapshot(&y).unwrap();
+        (s.change_id, s.parents[0])
+    };
+    let cid_x = src.snapshot(&x).unwrap().change_id;
+    // The admin rewinds main to the first of the two.
+    move_branch(&api, &p.admin.token(), &p.name, "main", Some(y), Some(x), true);
+    assert_eq!(real_tip(&hub, pid), x);
+    assert!(!changes_recorded(&hub, pid, "main"), "a new lineage has no rows");
+    let v = land_rebased(&api, &p.dev, &p.name, "main", cid_x, "src/after_rewind.rs", "rebased-kept");
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(times_on(&hub, pid, "main", cid_x), 1, "the change still on main is there twice");
+    assert_eq!(times_on(&hub, pid, "main", cid_y), 0);
+    // The dropped change, its edits again on the new tip.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/kept/1.rs", "1\n");
+    let tip = c.tip;
+    let again = snap_at(&mut c, tip, cid_y, "again", veil_core::now_millis(), vec![]);
+    let r = push_new(&c, &[("dropped-again", again)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let v = land_held(&api, &token, &p.name, again, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(times_on(&hub, pid, "main", cid_y), 1, "the dropped change landed again");
+    assert!(real_file(&hub, pid, "src/kept/1.rs").is_some());
+}
+
+/// BUG-1524, the bound: a fast-forward to more held snapshots than one move
+/// reads (`landing::REACH_BUDGET`) writes none of their rows and turns
+/// main's `changes_recorded` off; "already landed" is then answered by the
+/// derived graph, for the oldest of them too.
+#[test]
+fn bug_1524_a_fast_forward_past_the_bound_reads_no_more_and_is_answered_by_the_derived_graph() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let main0 = tip_for(&hub, &token, &p.name);
+    let real0 = real_tip(&hub, pid);
+    let n = veil_server::landing::REACH_BUDGET + 3;
+    let rows = sql_i64(&hub, "SELECT count(*) FROM landed_changes WHERE project_id = $1 AND branch = 'main'", pid);
+    let long = push_chain(&api, &p.dev, &p.name, "side", "main", n, Some("src/long"));
+    move_branch(&api, &token, &p.name, "main", Some(main0), Some(long), false);
+    assert!(!changes_recorded(&hub, pid, "main"), "the move reached more than the bound");
+    assert_eq!(sql_i64(&hub, "SELECT count(*) FROM landed_changes WHERE project_id = $1 AND branch = 'main'", pid), rows, "no row of a move past the bound");
+    let line = chain(&hub, pid, real0);
+    assert_eq!(line.len(), n);
+    let oldest = line.last().unwrap().1.change_id;
+    let v = land_rebased(&api, &p.dev, &p.name, "main", oldest, "src/after_long.rs", "rebased-long");
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(chain(&hub, pid, real0).len(), n + 1, "the further change landed, and only it");
+    assert_eq!(times_on(&hub, pid, "main", oldest), 1, "the oldest change of the fast-forward is on main twice");
+}
+
+/// BUG-1524's rule for whose change it is, on a branch the derived graph
+/// answers for: a revision by someone else with the same change id is not
+/// the submitter's (as a `landed_changes` row with another author is not,
+/// BUG-1527): their own change lands, and nothing is said of the other.
+#[test]
+fn bug_1524_a_revision_by_someone_else_on_an_unrecorded_branch_never_blocks_the_submitter_s() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let admin = p.admin.token();
+    let main0 = tip_for(&hub, &admin, &p.name);
+    let theirs = push_chain(&api, &p.admin, &p.name, "side", "main", 1, Some("src/theirs"));
+    move_branch(&api, &admin, &p.name, "main", Some(main0), Some(theirs), false);
+    let cid = source(&hub, pid).snapshot(&real_tip(&hub, pid)).unwrap().change_id;
+    move_branch(&api, &admin, &p.name, "rel-1", None, Some(theirs), false);
+    assert!(!changes_recorded(&hub, pid, "rel-1"));
+    wait_derived(&hub, pid, branch_tip(&hub, pid, "rel-1"));
+    let mut c = Craft::new(&api, &p.dev, &p.name, "rel-1");
+    c.file("src/mine.rs", "the dev's own change\n");
+    let tip = c.tip;
+    let mine = snap_at(&mut c, tip, cid, "mine", veil_core::now_millis(), vec![]);
+    let r = push_new(&c, &[("mine-1", mine)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let r = land_held_onto(&api, &p.dev.token(), &p.name, "rel-1", mine);
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert!(!body.contains("already landed"), "{body}");
+    assert_eq!(times_on(&hub, pid, "rel-1", cid), 2, "the dev's change with that id landed beside the admin's");
+}
+
+/// BUG-1524's other bound: on a branch the derived graph answers for, a
+/// change with more revisions by its author than are looked through
+/// (`landing::MAX_REVISIONS`) is refused, saying so, never landed unjudged;
+/// on a branch whose changes are all recorded it lands (one lookup).
+#[test]
+fn bug_1524_a_change_with_too_many_revisions_is_refused_on_an_unrecorded_branch_and_lands_on_a_recorded_one() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let main0 = tip_for(&hub, &token, &p.name);
+    move_branch(&api, &token, &p.name, "rel-1", None, Some(main0), false);
+    assert!(!changes_recorded(&hub, pid, "rel-1"));
+    // One change id on every snapshot of a long line of the dev's.
+    let cid = veil_core::ChangeId::random();
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    let mut at = c.tip;
+    for i in 0..=veil_server::landing::MAX_REVISIONS {
+        c.file("src/many.rs", &format!("revision {i}\n"));
+        at = snap_at(&mut c, at, cid, "revision", veil_core::now_millis() + i as i64, vec![]);
+    }
+    let r = push_new(&c, &[("many-1", at)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    wait_derived(&hub, pid, branch_tip(&hub, pid, "many-1"));
+    let submit = |branch: &str, tag: &str| {
+        let mut c = Craft::new(&api, &p.dev, &p.name, branch);
+        c.file("src/one_more.rs", "one more\n");
+        let tip = c.tip;
+        let x = snap_at(&mut c, tip, cid, "one more", veil_core::now_millis(), vec![]);
+        let r = push_new(&c, &[(tag, x)]);
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        land_held_onto(&api, &token, &p.name, branch, x)
+    };
+    let before = branch_tip(&hub, pid, "rel-1");
+    let r = submit("rel-1", "more-a");
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 400, "{body}");
+    assert!(body.contains("revisions on the server") && body.contains("make a new change"), "{body}");
+    assert_eq!(branch_tip(&hub, pid, "rel-1"), before, "{body}");
+    let r = submit("main", "more-b");
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    assert_eq!(r.status, 200, "{body}");
+    assert_eq!(r.json()["state"], "landed", "{body}");
+    assert_eq!(times_on(&hub, pid, "main", cid), 1);
+}
+
+/// BUG-1524, a PR's landing (the landing service, from the PR's head): the
+/// change is recorded as it lands, and a later rebased revision of it is
+/// not landed again.
+#[test]
+fn bug_1524_a_change_landed_by_a_pr_is_not_landed_again() {
+    use veil_core::{crypto::domains::SIG_CONTEXT_HUB_PR_REVIEW, hub::pr::review_message};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let token = p.dev.token();
+    let main0 = tip_for(&hub, &token, &p.name);
+    let real0 = real_tip(&hub, pid);
+    let head = kept_change(&api, &token, &p.name, main0, json!([put("src/pr/a.rs", "by a PR\n")]));
+    move_branch(&api, &token, &p.name, "task-1", None, Some(head), false);
+    let r = api.post_json(Some(&token), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "task-1", "onto": "main", "title": "a PR"}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let pr = r.json();
+    let (id, patch) = (pr["id"].as_str().unwrap(), pr["patch"].as_str().unwrap());
+    let sig = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, id, patch, "approve"));
+    let r = api.post_json(
+        Some(&p.admin.token()),
+        &format!("/v1/projects/{}/prs/{id}/reviews", p.name),
+        &json!({"patch": patch, "verdict": "approve", "signature": sig}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = api.post_json(Some(&token), &format!("/v1/projects/{}/prs/{id}/land", p.name), &json!({}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(real_file(&hub, pid, "src/pr/a.rs").as_deref(), Some(&b"by a PR\n"[..]), "the PR landed: {}", String::from_utf8_lossy(&r.body));
+    let line = chain(&hub, pid, real0);
+    assert_eq!(line.len(), 1, "the PR's one change");
+    let cid = line[0].1.change_id;
+    assert!(changes_recorded(&hub, pid, "main"));
+    let v = land_rebased(&api, &p.dev, &p.name, "main", cid, "src/pr/b.rs", "rebased-pr");
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(chain(&hub, pid, real0).len(), 2, "the further change landed, and only it");
+    assert_eq!(times_on(&hub, pid, "main", cid), 1, "the PR's change is on main twice");
+}
+
+/// BUG-1524, an embargo's release (the landing service, from the embargo
+/// line): each change is recorded as it lands on main, and a later rebased
+/// revision of it by its author is not landed again.
+#[test]
+fn bug_1524_a_change_landed_at_an_embargo_s_release_is_not_landed_again() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let real0 = real_tip(&hub, pid);
+    write_files(&p.dir, &[("src/fix_a.rs", "an embargoed fix\n")]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "embargoed fix"]);
+    let out = p.admin.ok(&p.dir, &["merge", "@-", "--into", "main", "--embargo-for", "devs", "-m", "merge embargoed fix"]);
+    let eid = out
+        .split_whitespace()
+        .map(|w| w.trim_end_matches(':'))
+        .find(|w| w.len() == 10 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| panic!("no embargo id in {out}"))
+        .to_string();
+    p.admin.ok(&p.dir, &["push"]);
+    assert_eq!(real_tip(&hub, pid), real0, "nothing of the embargo is on main before its release");
+    p.admin.ok(&p.dir, &["embargo", "release", &eid, "--yes"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let h = hub.hub();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        hub.rt.block_on(veil_server::embargo::release_due(&h)).unwrap();
+        let released: Option<i64> = hub
+            .rt
+            .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2").bind(pid).bind(&eid).fetch_optional(&h.db))
+            .unwrap()
+            .flatten();
+        if released.is_some() && real_file(&hub, pid, "src/fix_a.rs").is_some() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the embargo was never released onto main");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(real_file(&hub, pid, "src/fix_a.rs").as_deref(), Some(&b"an embargoed fix\n"[..]));
+    // Every change the release landed (the admin's): a rebased revision of
+    // each, with no edits left, under one further change.
+    let landed: Vec<veil_core::ChangeId> = chain(&hub, pid, real0).into_iter().map(|(_, s)| s.change_id).collect();
+    assert!(!landed.is_empty());
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let mut at = c.tip;
+    for cid in &landed {
+        at = snap_at(&mut c, at, *cid, "rebased", veil_core::now_millis(), vec![]);
+    }
+    c.file("src/after_release.rs", "further work\n");
+    let q = crafted_on(&mut c, at, veil_core::ChangeId::random(), "further", "");
+    let r = push_new(&c, &[("rebased-fix", q)]);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let v = land_held(&api, &p.admin.token(), &p.name, q, true).json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(chain(&hub, pid, real0).len(), landed.len() + 1, "the further change landed, and only it");
+    for cid in &landed {
+        assert_eq!(times_on(&hub, pid, "main", *cid), 1, "a change the release landed is on main twice");
+    }
+}

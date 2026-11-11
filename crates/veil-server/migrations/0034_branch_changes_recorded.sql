@@ -1,0 +1,11 @@
+-- BUG-1524: whether `landed_changes` holds a row for every change on the
+-- branch in its lineage. True while every move writes the rows of what it
+-- brings: the landing service's snapshots, a push's new ones, an API
+-- commit's, and the snapshots the server already held that a fast-forward or
+-- a merge reaches (read at the move, at most `landing::REACH_BUDGET`). False
+-- (the default: every branch from before this column, and one an older
+-- server makes) when a move reached more than that: a new branch made on
+-- held history, a forced move (a new lineage), a long fast-forward. "Already
+-- landed" then also asks the derived graph for the change's revisions
+-- (`graph_by_change`) and whether one is on the branch.
+ALTER TABLE branches ADD COLUMN IF NOT EXISTS changes_recorded BOOLEAN NOT NULL DEFAULT FALSE;
