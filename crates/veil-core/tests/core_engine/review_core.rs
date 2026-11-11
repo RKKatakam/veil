@@ -262,16 +262,23 @@ fn amended_away_then_pushed(attempt: bool) -> Vec<String> {
     let remote: std::sync::Arc<veil_core::MemoryBackend> = std::sync::Arc::new(veil_core::MemoryBackend::new());
     Repo::init_bare(remote.clone()).unwrap();
     veil_core::remote::push(&mut repo, remote.clone(), false, &[], false).unwrap();
-    assert_eq!(Repo::open_remote(remote.clone()).unwrap().view().tags["main"].target, x_now, "the push moved main");
+    let remote_repo = Repo::open_remote(remote.clone()).unwrap();
+    assert_eq!(remote_repo.view().tags["main"].target, x_now, "the push moved main");
+    if attempt {
+        let att_id = remote_repo.snapshot(&x_now).unwrap().attempts[0];
+        let att_entry = file_entry(&remote_repo, &att_id, "x.txt").expect("the attempt still holds what it recorded on purpose");
+        assert_eq!(remote_repo.store().read_entry(&att_entry).unwrap(), b"first try\n");
+        assert!(file_entry(&remote_repo, &att_id, "notes.txt").is_none(), "amended-away ancestor file left the attempt");
+    }
     backend_contains(&*remote, MARKER)
 }
 
 /// Rewritten snapshots stop being reachable, so what a change's author
 /// amends away before a push never leaves the device: also when a change
 /// built on it keeps a recorded attempt (`vl attempt drop`) made on the
-/// earlier version.
+/// earlier version, or when the change itself is rebased off an unpushed
+/// parent.
 #[test]
-#[ignore = "BUG-1836: a recorded attempt keeps the old version of an amended ancestor, and a push sends it"]
 fn bug_1836_content_amended_away_under_a_recorded_attempt_is_not_pushed() {
     assert_eq!(amended_away_then_pushed(false), Vec::<String>::new(), "control: without an attempt the amended-away text is not pushed");
     assert_eq!(
@@ -279,6 +286,25 @@ fn bug_1836_content_amended_away_under_a_recorded_attempt_is_not_pushed() {
         Vec::<String>::new(),
         "the remote received the text its author amended out of P before pushing"
     );
+
+    // Direct rebase of X off an unpushed parent P onto `base`: P's text is not pushed,
+    // while X's attempt keeps its own `x.txt`.
+    const DIRECT_MARKER: &[u8] = b"review-marker-rebased-off-parent-0002";
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[("README.md", "hi\n")], "base");
+    commit_files(&mut repo, &*fs, &[("draft.txt", "review-marker-rebased-off-parent-0002\n")], "draft P");
+    let x = commit_files(&mut repo, &*fs, &[("x.txt", "attempt content\n")], "X");
+    let dropped = repo.drop_attempt(x, "retry").unwrap();
+    let rebased = repo.rebase(dropped.change, vec![base]).unwrap();
+    repo.set_tag("main", rebased, false).unwrap();
+    let remote: std::sync::Arc<veil_core::MemoryBackend> = std::sync::Arc::new(veil_core::MemoryBackend::new());
+    Repo::init_bare(remote.clone()).unwrap();
+    veil_core::remote::push(&mut repo, remote.clone(), false, &[], false).unwrap();
+    let remote_repo = Repo::open_remote(remote.clone()).unwrap();
+    assert_eq!(remote_repo.view().tags["main"].target, rebased);
+    let att_id = remote_repo.snapshot(&rebased).unwrap().attempts[0];
+    assert_eq!(remote_repo.store().read_entry(&file_entry(&remote_repo, &att_id, "x.txt").unwrap()).unwrap(), b"attempt content\n");
+    assert_eq!(backend_contains(&*remote, DIRECT_MARKER), Vec::<String>::new());
 }
 
 /// What a clone of `repo`'s tagged history holds that only the removed

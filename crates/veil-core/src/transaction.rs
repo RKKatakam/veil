@@ -507,8 +507,39 @@ impl<'r> Transaction<'r> {
         Ok(())
     }
 
+    /// Rebase each recorded attempt in `attempts` whose parents differ from
+    /// `new_parents` onto `new_parents`, keeping what the attempt itself
+    /// changed relative to its former parents.
+    fn rebase_attempts(&self, attempts: &[ObjectId], new_parents: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        if attempts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(attempts.len());
+        for a in attempts {
+            let att = self.repo.snapshot(a)?;
+            let id = if att.parents == new_parents {
+                *a
+            } else {
+                let merged = self.repo.rebase_tree(&att.parents, new_parents, att.tree)?;
+                let mut conflicts: BTreeSet<String> = att.conflicts.iter().cloned().collect();
+                conflicts.extend(merged.conflicts.iter().map(|c| c.to_string()));
+                let mut na = (*att).clone();
+                na.parents = new_parents.to_vec();
+                na.tree = merged.tree;
+                na.predecessors = vec![*a];
+                na.conflicts = conflicts.into_iter().collect();
+                let na = self.indexed(na)?;
+                self.repo.store.put_snapshot(&self.sign(&na))?
+            };
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Replace `old` with `new` (same change, new content/metadata).
-    pub fn rewrite(&mut self, old: ObjectId, new: Snapshot) -> Result<ObjectId> {
+    pub fn rewrite(&mut self, old: ObjectId, mut new: Snapshot) -> Result<ObjectId> {
         if old == self.repo.root_id {
             return Err(VeilError::repo("the root snapshot cannot be rewritten"));
         }
@@ -519,6 +550,7 @@ impl<'r> Transaction<'r> {
         // nothing (BUG-246).
         let prev = self.repo.snapshot(&old)?;
         self.check_parents(&new)?;
+        new.attempts = self.rebase_attempts(&new.attempts, &new.parents)?;
         let new = self.stamped(self.indexed(new)?);
         let mut same = new.clone();
         same.predecessors = prev.predecessors.clone();
@@ -686,6 +718,7 @@ impl<'r> Transaction<'r> {
             ns.tree = merged.tree;
             ns.predecessors = vec![*id];
             ns.conflicts = conflicts.into_iter().collect();
+            ns.attempts = self.rebase_attempts(&s.attempts, &ns.parents)?;
             let ns = self.indexed(ns)?;
             let nid = store.put_snapshot(&self.sign(&ns))?;
             self.rewritten.insert(*id, Rewrite::Replaced(nid));
@@ -899,7 +932,11 @@ impl<'r> Transaction<'r> {
             // relative to the merge of its old ones. A merge one of whose
             // parents moved is re-merged, never rebased by one parent's diff
             // (that dropped what the other parents hold, BUG-251).
-            let out = match self.repo.rebase_tree(&s.parents, &new_parents, s.tree) {
+            let (out, attempts) = match self
+                .repo
+                .rebase_tree(&s.parents, &new_parents, s.tree)
+                .and_then(|o| Ok((o, self.rebase_attempts(&s.attempts, &new_parents)?)))
+            {
                 // A merge of concurrent operations never fails for a policy
                 // reason (threat 18; two embargoes combined, say): this
                 // snapshot, and what is built on it, stay where their side
@@ -918,6 +955,7 @@ impl<'r> Transaction<'r> {
             ns.tree = tree;
             ns.predecessors = vec![id];
             ns.conflicts = conflicts.into_iter().collect();
+            ns.attempts = attempts;
             // Rebasing someone else's change: `author` stays theirs, the
             // signature becomes ours, and `predecessors` keeps the original.
             let ns = self.indexed(ns)?;
