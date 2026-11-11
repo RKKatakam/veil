@@ -244,7 +244,7 @@ ok('the browser speaks HTTP/2 to the server');
 if ((await evaluate(`document.getElementById('veil-enroll-code').value`)) !== enrollment.code) throw new Error('the link did not fill in the enrollment code');
 await evaluate(`document.querySelector('#veil-passkey-enroll-form button').click(); true`);
 const enrolled = await until(
-  `(function () { var s = (document.getElementById('veil-login-status') || {}).textContent || ''; return /Passkey enrolled|Signed in with passkey|can't open secrets/.test(s) ? s : (location.pathname === '/' ? 'redirected' : (/…$/.test(s) || !s ? '' : 'ERROR: ' + s)); })()`,
+  `(function () { var s = (document.getElementById('veil-login-status') || {}).textContent || ''; return /Passkey enrolled|Signed in with passkey|can't open secrets/.test(s) ? s : (location.pathname === '/devices' ? 'redirected' : (/…$/.test(s) || !s ? '' : 'ERROR: ' + s)); })()`,
   'the enrollment to finish',
   60000,
 );
@@ -253,7 +253,9 @@ const { credentials } = await page('WebAuthn.getCredentials', { authenticatorId 
 if (credentials.length !== 1) throw new Error(`the authenticator holds ${credentials.length} credentials after the enrollment`);
 const prf = !/can't open secrets/.test(enrolled);
 ok(`enrolled a passkey with a vl web code (${prf ? 'with PRF: the browser made device keys in a Worker' : 'WITHOUT PRF: this Chromium\'s virtual authenticator has none'})`);
-if (prf) await until(`location.pathname === '/'`, 'the page after a PRF enrollment');
+// After a PRF enrollment the page goes to "Your devices", which shows the
+// fingerprint to confirm for as long as it waits.
+if (prf) await until(`location.pathname === '/devices' && document.body.innerText.includes('vl identity confirm')`, '"Your devices" after a PRF enrollment');
 
 // 2. "Your devices" lists it, by its fingerprint and label.
 await goto('/devices');

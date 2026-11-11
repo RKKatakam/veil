@@ -1028,8 +1028,28 @@ fn agent_and_runner_sessions_use_no_route_of_s26() {
     let own = as_browser(&bob.token(), Some(&review), &review_route);
     assert_eq!(own.status, 200, "{}", String::from_utf8_lossy(&own.body));
 
+    // A passkey of the admin's: no agent or runner of hers lists or removes it.
+    let mut admin_web = BrowserClient::new(&hub);
+    let mut admin_pk = VirtualPasskey::new_without_prf(94);
+    admin_pk.enroll(&mut admin_web, &alice.name, &mint_enroll_code(&hub, &alice));
+    let admin_fp = veil_core::hub::wire::passkey_fingerprint(&admin_pk.cred_id_b64);
+    let passkeys = "SELECT count(*) FROM devices d JOIN people p ON p.id = d.person_id WHERE p.name = $1 AND d.browser AND d.removed_at IS NULL";
+
     // The setting, the enrollment code, the rings, the bytes, the Worker.
     for (token, who) in sessions(&alice).iter().zip(["the admin's agent", "the admin's runner"]) {
+        let page = as_browser(token, None, "/devices");
+        assert_eq!(page.status, 403, "{who}, Your devices: {}", String::from_utf8_lossy(&page.body));
+        assert!(!String::from_utf8_lossy(&page.body).contains(&admin_fp), "{who} read the passkey's fingerprint");
+        let listed = api.get(Some(token), &format!("/v1/people/{}/devices", alice.name));
+        assert!(!String::from_utf8_lossy(&listed.body).contains(&admin_fp), "{who} was listed the passkey: {}", String::from_utf8_lossy(&listed.body));
+        let remove = api.post_with(
+            "/web/devices/remove",
+            format!("fingerprint={admin_fp}").as_bytes(),
+            &[("authorization", &format!("Bearer {token}")), ("origin", &origin), ("sec-fetch-site", "same-origin"), ("content-type", "application/x-www-form-urlencoded"), ("accept", "application/json")],
+        );
+        refused(remove, &format!("{who}, removing a browser"));
+        refused(api.post_json(Some(token), "/v1/devices/remove", &json!({ "device": admin_fp })), &format!("{who}, removing a passkey"));
+        assert_eq!(count(&hub, passkeys, &alice.name), 1, "{who} removed the admin's passkey");
         refused(as_browser(token, Some(&json!({ "enabled": true })), &format!("/v1/projects/{proj}/web-secrets")), &format!("{who}, the setting"));
         // (An enrollment code is `vl`'s to ask for: no browser headers.)
         let signed = signed_enroll_request(&hub, &alice.identity(), SIG_CONTEXT_HUB_WEB_ENROLL);

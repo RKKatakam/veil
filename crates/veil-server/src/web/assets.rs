@@ -381,7 +381,8 @@ pub const APP_JS: &str = r#"'use strict';
           if (!r.ok) throw new Error(j.message || 'Passkey registration failed');
           if (statusEl) statusEl.textContent = j.message || 'Passkey enrolled.';
           if (j.prf_supported) {
-            window.setTimeout(function () { window.location.assign('/'); }, 1500);
+            // "Your devices" keeps showing the fingerprint to confirm.
+            window.setTimeout(function () { window.location.assign('/devices'); }, 1500);
           }
         });
       }).catch(function (err) {
