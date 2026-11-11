@@ -1540,3 +1540,124 @@ fn guarantee_5_ci_runners_refused_on_writes_and_narrowed_agents_restricted_to_th
     assert_eq!(bad_upd.status, 403, "narrowed agent update outside paths must 403: {}", body_str(&bad_upd));
     assert_eq!(bad_upd.json()["code"], "agent_session", "{}", body_str(&bad_upd));
 }
+
+// ---- review rv-new (BUG-1875) -------------------------------------------------------
+
+/// BUG-1875: an embargo that ever had a PR (`embargo_lines.has_pr`, never
+/// cleared) releases through `prs::embargo::release_embargo_prs`, which lands
+/// only armed, approved, open PRs and then deletes the `embargo/<id>`
+/// branch. With its PR closed (opened by mistake, or replaced), the fix
+/// lands nowhere and no branch holds it any more: at the release an
+/// embargoed fix silently leaves every branch. Without a PR the same
+/// embargo lands on its target (S22).
+#[test]
+#[ignore = "BUG-1875: an embargo whose PR was closed releases by deleting its line: the fix is on no branch"]
+fn bug_1875_a_released_embargo_whose_pr_was_closed_keeps_its_fix_on_a_branch() {
+    const FIX: &str = "RVNEW_EMBARGOED_FIX_1875";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "rv-1875",
+        "security",
+        Some(veil_core::now_millis() + 3_600_000),
+        &[("src/fix_1875.rs", &format!("pub const FIX: &str = \"{FIX}\";\n"))],
+        "an embargoed fix",
+    );
+    let (admin, sec) = (p.admin.token(), p.sec.token());
+    let file_on = |branch: &str| api.get(Some(&admin), &format!("/v1/projects/{}/q/file?rev={branch}&path=src/fix_1875.rs", p.name));
+
+    // A PR on the embargoed fix, opened and closed again.
+    let pr = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs", p.name), &json!({"head": format!("embargo/{eid}"), "title": "the fix"}));
+    assert_eq!(pr.status, 200, "{}", body_str(&pr));
+    let id = pr.json()["id"].as_str().unwrap().to_string();
+    let closed = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs/{id}/close", p.name), &json!({}));
+    assert_eq!(closed.status, 200, "{}", body_str(&closed));
+    assert_eq!(closed.json()["state"], "closed", "{}", body_str(&closed));
+
+    // The admin releases the embargo.
+    let rel = api.post_json(Some(&admin), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+    assert_eq!(rel.status, 200, "{}", body_str(&rel));
+    let released: Option<i64> = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE embargo_id = $1").bind(&eid).fetch_one(&hub.hub().db))
+        .unwrap();
+    assert!(released.is_some(), "the embargo is released");
+
+    // The fix is on a branch: its target's, or at least the line it was on.
+    let tips = api.tips(Some(&admin), &p.name).unwrap();
+    let holders: Vec<&String> = tips
+        .branches
+        .keys()
+        .filter(|b| {
+            let r = file_on(b);
+            r.status == 200 && String::from_utf8_lossy(&r.body).contains(FIX)
+        })
+        .collect();
+    assert!(!holders.is_empty(), "the released fix is on no branch (branches: {:?})", tips.branches.keys().collect::<Vec<_>>());
+}
+
+/// BUG-1875, the other way round: a PR **onto** the embargo line from an
+/// ordinary branch. The release never lands the line (it has a PR), lands
+/// at most the PR's own changes, and deletes `embargo/<id>`: the embargoed
+/// fix is then on no branch and no PR revision names it (the PR's head is
+/// the ordinary branch), so nothing keeps it from the collector.
+#[test]
+#[ignore = "BUG-1875: an embargo with a PR onto its line releases by deleting the line: the fix is on no branch"]
+fn bug_1875_a_released_embargo_with_a_pr_onto_its_line_keeps_its_fix_on_a_branch() {
+    const FIX: &str = "RVNEW_EMBARGOED_FIX_ONTO_1875";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    // An ordinary branch, before the embargo.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/followup_1875.rs", "pub const FOLLOWUP: u8 = 1;\n");
+    let pushed = c.push_to("followup-1875", None);
+    assert_eq!(pushed.status, 200, "{}", body_str(&pushed));
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "rv-1875-onto",
+        "security",
+        Some(veil_core::now_millis() + 3_600_000),
+        &[("src/fix_onto_1875.rs", &format!("pub const FIX: &str = \"{FIX}\";\n"))],
+        "an embargoed fix",
+    );
+    let (admin, sec) = (p.admin.token(), p.sec.token());
+
+    // A PR of the ordinary branch onto the embargo line.
+    let pr = api.post_json(
+        Some(&sec),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"head": "followup-1875", "onto": format!("embargo/{eid}"), "title": "a follow-up for the fix"}),
+    );
+    assert_eq!(pr.status, 200, "{}", body_str(&pr));
+    assert_eq!(pr.json()["embargo"], eid.as_str(), "{}", body_str(&pr));
+
+    // The admin releases the embargo.
+    let rel = api.post_json(Some(&admin), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+    assert_eq!(rel.status, 200, "{}", body_str(&rel));
+    let released: Option<i64> = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE embargo_id = $1").bind(&eid).fetch_one(&hub.hub().db))
+        .unwrap();
+    assert!(released.is_some(), "the embargo is released");
+
+    // The fix is on a branch.
+    let tips = api.tips(Some(&admin), &p.name).unwrap();
+    let holders: Vec<&String> = tips
+        .branches
+        .keys()
+        .filter(|b| {
+            let r = api.get(Some(&admin), &format!("/v1/projects/{}/q/file?rev={b}&path=src/fix_onto_1875.rs", p.name));
+            r.status == 200 && String::from_utf8_lossy(&r.body).contains(FIX)
+        })
+        .collect();
+    assert!(!holders.is_empty(), "the released fix is on no branch (branches: {:?})", tips.branches.keys().collect::<Vec<_>>());
+}
