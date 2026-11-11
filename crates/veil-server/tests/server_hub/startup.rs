@@ -386,6 +386,52 @@ fn drop_database(rt: &tokio::runtime::Runtime, name: &str) {
     });
 }
 
+/// BUG-1928: an operator who asks for TLS to the database in words the
+/// driver does not know got a connection with no TLS and no word about it
+/// (`ssl=true`, a misspelt `sslmode`: the driver ignores parameters it does
+/// not know). Each is refused before any connection is made, naming the
+/// parameter and never the rest of the URL; a certificate file with no mode
+/// and a mode that is no mode are refused too. The control, `sslmode=require`
+/// and the verifying modes over TLS: `bug_1590_…` below.
+#[test]
+fn bug_1928_a_database_url_that_asks_for_tls_in_words_the_server_does_not_know_is_refused() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    // A listener that counts connections: none is made.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connect = |query: &str| {
+        let url = format!("postgres://someone:PASSWORD-9c1e@127.0.0.1:{port}/veil?{query}");
+        let refused = rt.block_on(veil_server::db::connect(&url, 1)).map(|_| ()).map_err(|e| format!("{e:#}")).unwrap_err();
+        assert!(!refused.contains("PASSWORD-9c1e") && !refused.contains("someone"), "the refusal names the URL: {refused}");
+        assert!(listener.accept().is_err(), "a connection was made for `{query}`");
+        refused
+    };
+    for (query, param) in [
+        ("ssl=true", "ssl"),
+        ("tls=1", "tls"),
+        ("sslmod=require", "sslmod"),
+        ("SSLMODE=require", "SSLMODE"),
+        ("ssl_mode=require", "ssl_mode"),
+        ("application_name=veil&useSSL=true", "useSSL"),
+        ("requiressl=1", "requiressl"),
+    ] {
+        let refused = connect(query);
+        assert!(
+            refused.contains(&format!("the database URL's parameter '{param}' is not one this server knows")) && refused.contains("sslmode=require"),
+            "`{query}`: {refused}"
+        );
+    }
+    // A certificate file and no mode: the driver would not verify with it.
+    if std::env::var_os("PGSSLMODE").is_none() {
+        let refused = connect("sslrootcert=/nowhere/ca.pem");
+        assert!(refused.contains("the database URL gives 'sslrootcert' and no sslmode"), "{refused}");
+    }
+    // A mode that is no mode.
+    let refused = connect("sslmode=requrie");
+    assert!(refused.contains("requrie"), "{refused}");
+}
+
 /// BUG-1590: the server could not use a database that requires TLS (managed
 /// PostgreSQL services do: DigitalOcean's, for one). `veil-server`'s sqlx
 /// was built without a TLS feature, so `sslmode=require` failed with "TLS

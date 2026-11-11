@@ -86,7 +86,37 @@ pub fn connect_lazy(url: &str, max: u32) -> anyhow::Result<PgPool> {
     Ok(pool.connect_lazy_with(opts))
 }
 
+/// The database URL's parameters about TLS that this server's driver reads:
+/// the mode, and the certificate files.
+const TLS_PARAMS: &[&str] = &["sslmode", "ssl-mode", "sslrootcert", "ssl-root-cert", "ssl-ca", "sslcert", "ssl-cert", "sslkey", "ssl-key"];
+
+/// An operator who asked for TLS to the database in any recognisable way
+/// gets TLS or a refusal at start-up (BUG-1928): the driver ignores a
+/// parameter it does not know, so `ssl=true`, `tls=1`, `SSLMODE=require` or
+/// a misspelt `sslmod=require` would connect with no TLS and say nothing.
+/// Any parameter whose name speaks of TLS and is not one of [`TLS_PARAMS`]
+/// is refused, and so is a certificate file given with no mode (the
+/// driver's default would not verify with it). The refusal names the
+/// parameter only, never its value or the rest of the URL.
+fn tls_params_known(url: &str) -> anyhow::Result<()> {
+    let query = url.split_once('?').map_or("", |(_, q)| q.split('#').next().unwrap_or(""));
+    let keys: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').map_or(p, |(k, _)| k)).collect();
+    const HOW: &str = "for TLS to the database say sslmode=require, or sslmode=verify-ca or sslmode=verify-full with sslrootcert=<file>";
+    for k in &keys {
+        let lower = k.to_ascii_lowercase();
+        if (lower.contains("ssl") || lower.contains("tls")) && !TLS_PARAMS.contains(k) {
+            anyhow::bail!("the database URL's parameter '{k}' is not one this server knows, and no TLS would come of it: {HOW}");
+        }
+    }
+    let mode = keys.iter().any(|k| matches!(*k, "sslmode" | "ssl-mode")) || std::env::var_os("PGSSLMODE").is_some();
+    if let (false, Some(k)) = (mode, keys.iter().find(|k| TLS_PARAMS.contains(k))) {
+        anyhow::bail!("the database URL gives '{k}' and no sslmode, so no TLS would come of it: {HOW}");
+    }
+    Ok(())
+}
+
 fn options(url: &str, max: u32) -> anyhow::Result<(PgPoolOptions, sqlx::postgres::PgConnectOptions)> {
+    tls_params_known(url)?;
     let opts: sqlx::postgres::PgConnectOptions = url.parse()?;
     // TLS to the database is the operator's choice (BUG-1590): `sslmode=` in
     // the URL (or `PGSSLMODE`) says `require`, `verify-ca` or `verify-full`.
