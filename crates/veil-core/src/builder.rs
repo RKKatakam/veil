@@ -1162,10 +1162,10 @@ impl<'a> Builder<'a> {
                         continue;
                     }
                     match self.store.read_blob(&e.id) {
-                        Ok(plain) => {
+                        Ok(plain) if !plain.is_empty() => {
                             map.entry((e.kind, Object::blob_id(&plain))).or_insert_with(|| e.visibility.clone());
                         }
-                        Err(VeilError::Redacted { .. }) => {}
+                        Ok(_) | Err(VeilError::Redacted { .. }) => {}
                         Err(err) => return Err(err),
                     }
                 }

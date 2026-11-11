@@ -403,7 +403,9 @@ $ vl evolog                          # the attempt, with its reason, in the chan
 - **An attempt never lands:** it is never a head, a workspace's change, a
   tag's or branch's target or anyone's parent, here or on the server. It
   travels with its change (push, pull) and goes when the change is
-  abandoned.
+  abandoned; squashing a change into another carries its attempts onto the
+  destination once the source is emptied (refusing if the total would pass
+  32), while `vl split` keeps them on the part that keeps the change id.
 - A change keeps at most 32 attempts, each reason at most 64 KiB.
 - Visibility is the change's: who sees the change sees its attempts'
   reasons and what they changed (as much of it as they may see).

@@ -164,3 +164,55 @@ fn a_dropped_attempt_is_kept_shown_and_never_built_on() {
     assert!(!out.status.success(), "{}", text(&out));
     assert!(!text(&out).contains('\u{1b}'));
 }
+
+#[test]
+fn bug_1837_squash_carries_attempts_and_show_prints_them() {
+    let env = Env::new();
+    let proj = env.project("alice", "p", &[("README", "hi\n")]);
+
+    // Destination change with one attempt by claude-code.
+    write(&proj, "src/dest_try.rs", "fn dest_dead_end() {}\n");
+    let out = with_env(&env, &proj, &[("VEIL_AGENT", "claude-code/1"), ("VEIL_AGENT_TASK", "dest-task")], &["attempt", "drop", "--reason", "dest dead end"]);
+    assert!(out.status.success(), "{}", text(&out));
+    write(&proj, "src/dest.rs", "pub fn dest() {}\n");
+    let out = env.vl("alice", &proj, &["commit", "-m", "dest change"]);
+    assert!(out.status.success(), "{}", text(&out));
+
+    // Source change (`@` on `dest`) with one attempt by codex.
+    write(&proj, "src/src_try.rs", "fn src_dead_end() {}\n");
+    let out = with_env(&env, &proj, &[("VEIL_AGENT", "codex/2"), ("VEIL_AGENT_TASK", "src-task")], &["attempt", "drop", "--reason", "src dead end"]);
+    assert!(out.status.success(), "{}", text(&out));
+    write(&proj, "src/src.rs", "pub fn src() {}\n");
+    let out = env.vl("alice", &proj, &["describe", "-m", "src change"]);
+    assert!(out.status.success(), "{}", text(&out));
+
+    // Squash `@` into `@-`: `vl show @-` prints both attempts in order.
+    let out = env.vl("alice", &proj, &["squash"]);
+    assert!(out.status.success(), "{}", text(&out));
+
+    let show_json = json(&env, &proj, &["show", "--json", "@-"]);
+    let attempts = show_json["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2, "{show_json}");
+    assert_eq!(attempts[0]["reason"], "dest dead end");
+    assert_eq!(attempts[0]["agent"]["agent"], "claude-code/1");
+    assert_eq!(attempts[0]["files"], serde_json::json!(["src/dest_try.rs"]));
+    assert_eq!(attempts[1]["reason"], "src dead end");
+    assert_eq!(attempts[1]["agent"]["agent"], "codex/2");
+    assert_eq!(attempts[1]["files"], serde_json::json!(["src/src_try.rs"]));
+
+    let text_show = env.stdout("alice", &proj, &["show", "@-"]);
+    assert!(text_show.contains("Discarded attempts (2):"), "{text_show}");
+    let p_dest = text_show.find("dest dead end").expect("dest reason in show");
+    let p_src = text_show.find("src dead end").expect("src reason in show");
+    assert!(p_dest < p_src, "dest attempt printed before src attempt:\n{text_show}");
+    assert!(text_show.contains("changed: src/dest_try.rs") && text_show.contains("changed: src/src_try.rs"), "{text_show}");
+
+    // `vl undo` restores both changes' attempts.
+    let out = env.vl("alice", &proj, &["undo"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let dest_after = json(&env, &proj, &["show", "--json", "@-"]);
+    let src_after = json(&env, &proj, &["show", "--json", "@"]);
+    assert_eq!(dest_after["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(src_after["attempts"].as_array().unwrap().len(), 1);
+}
+

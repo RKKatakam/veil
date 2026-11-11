@@ -307,8 +307,8 @@ fn bug_1836_content_amended_away_under_a_recorded_attempt_is_not_pushed() {
     const DIRECT_MARKER: &[u8] = b"review-marker-rebased-off-parent-0002";
     let (mut repo, fs, _) = new_repo("alice");
     let base = commit_files(&mut repo, &*fs, &[("README.md", "hi\n")], "base");
-    commit_files(&mut repo, &*fs, &[("draft.txt", "review-marker-rebased-off-parent-0002\n")], "draft P");
-    let x = commit_files(&mut repo, &*fs, &[("x.txt", "attempt content\n")], "X");
+    commit_files(&mut repo, &*fs, &[("sub/draft.txt", "review-marker-rebased-off-parent-0002\n")], "draft P");
+    let x = commit_files(&mut repo, &*fs, &[("sub/x.txt", "attempt content\n")], "X");
     let dropped = repo.drop_attempt(x, "retry").unwrap();
     let rebased = repo.rebase(dropped.change, vec![base]).unwrap();
     repo.set_tag("main", rebased, false).unwrap();
@@ -318,7 +318,8 @@ fn bug_1836_content_amended_away_under_a_recorded_attempt_is_not_pushed() {
     let remote_repo = Repo::open_remote(remote.clone()).unwrap();
     assert_eq!(remote_repo.view().tags["main"].target, rebased);
     let att_id = remote_repo.snapshot(&rebased).unwrap().attempts[0];
-    assert_eq!(remote_repo.store().read_entry(&file_entry(&remote_repo, &att_id, "x.txt").unwrap()).unwrap(), b"attempt content\n");
+    assert_eq!(remote_repo.store().read_entry(&file_entry(&remote_repo, &att_id, "sub/x.txt").unwrap()).unwrap(), b"attempt content\n");
+    assert!(file_entry(&remote_repo, &att_id, "sub/draft.txt").is_none());
     assert_eq!(backend_contains(&*remote, DIRECT_MARKER), Vec::<String>::new());
 }
 
@@ -373,14 +374,13 @@ fn bug_1833_a_rename_squashed_into_the_change_that_added_the_secret_is_what_the_
 
     // Rebasing an edit of the renamed file onto `base` (past the changes that
     // added and renamed `.env`) also reconciles sealing from the final path.
+    let saved_op = repo.op_id();
     let edited = commit_files(&mut repo, &*fs, &[("settings.txt", "REGION=updated-0002\n")], "edit settings");
     let rebased = repo.rebase(edited, vec![base]).unwrap();
     assert_eq!(repo.snapshot(&rebased).unwrap().parents, vec![base]);
     repo.set_tag("main", rebased, true).unwrap();
     assert_eq!(named_by_the_only_secrets_rule(&mut repo), Vec::<String>::new(), "rebased onto base: conflict sides reconciled to public");
-    repo.undo().unwrap();
-    repo.undo().unwrap();
-    repo.undo().unwrap();
+    repo.restore_operation(saved_op).unwrap();
 
     let squashed = repo.squash(rename).unwrap();
     assert_eq!(repo.snapshot(&squashed).unwrap().parents, vec![base], "the two changes are one, on the base");
@@ -404,3 +404,332 @@ fn bug_1833_a_rename_squashed_into_the_change_that_added_the_secret_is_what_the_
     let err = repo2.squash(ren2).unwrap_err();
     assert!(matches!(err, veil_core::VeilError::Policy(_)), "scanner must refuse secret token at ordinary path: {err:?}");
 }
+
+type AttemptSummary = (String, Option<veil_core::object::Attribution>, Vec<(String, Vec<u8>)>);
+
+fn attempt_summary(repo: &Repo, att_id: &ObjectId) -> AttemptSummary {
+    let at = repo.snapshot(att_id).unwrap();
+    let base = repo.parents_tree(&at.parents).unwrap().tree;
+    let diffs = veil_core::tree::diff_trees(repo.store(), Some(&base), Some(&at.tree)).unwrap();
+    let files = diffs
+        .into_iter()
+        .map(|c| {
+            let bytes = c
+                .new
+                .as_ref()
+                .map(|e| repo.store().read_blob(&e.id).unwrap())
+                .unwrap_or_default();
+            (c.path.to_string(), bytes)
+        })
+        .collect();
+    (at.abandoned.clone().unwrap_or_default(), at.agent.clone(), files)
+}
+
+fn agent_attr(name: &str, task: &str) -> veil_core::object::Attribution {
+    veil_core::object::Attribution {
+        agent: name.to_string(),
+        task: Some(task.to_string()),
+        prompt: None,
+        run: None,
+    }
+}
+
+/// BUG-1837: squashing an emptied change (whole, `--into DEST`, by paths or by
+/// hunks) carries its recorded attempts onto the destination after the
+/// destination's own, keeping each attempt's reason, attribution and changed
+/// files, and `undo` restores both changes' attempts exactly.
+#[test]
+fn bug_1837_squash_carries_attempts_after_destinations_and_undo_restores_them() {
+    use veil_core::selection::{Pick, Selection};
+
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[("hunk.txt", "a\n1\n2\n3\n4\nz\n")], "base");
+
+    // Destination change `dest`, with one recorded attempt of its own.
+    repo.new_change(WS, vec![base], "dest").unwrap();
+    repo.set_attribution(Some(agent_attr("claude-code/1", "dest-task")));
+    fs.write(&p("dest_try.txt"), b"dest dead end\n").unwrap();
+    let tried_d = snap(&mut repo, &*fs);
+    let d_drop = repo.drop_attempt(tried_d, "dest approach deadlocked").unwrap();
+    fs.remove_file(&p("dest_try.txt")).unwrap();
+    fs.write(&p("dest.txt"), b"dest ok\n").unwrap();
+    let dest = snap(&mut repo, &*fs);
+    repo.set_attribution(None);
+    let orig_dest_attempts = repo.snapshot(&dest).unwrap().attempts.clone();
+    assert_eq!(orig_dest_attempts, vec![d_drop.attempt]);
+
+    // Source change `src` on `dest`, with two recorded attempts by distinct agents,
+    // and two hunks in `hunk.txt` so whole, path and hunk squashes can all empty it.
+    repo.new_change(WS, vec![dest], "src").unwrap();
+    repo.set_attribution(Some(agent_attr("codex/2", "src-task-1")));
+    fs.write(&p("src_try1.txt"), b"first dead end\n").unwrap();
+    let tried_s1 = snap(&mut repo, &*fs);
+    let s_drop1 = repo.drop_attempt(tried_s1, "first try overflowed").unwrap();
+    fs.remove_file(&p("src_try1.txt")).unwrap();
+
+    repo.set_attribution(Some(agent_attr("gemini/3", "src-task-2")));
+    fs.write(&p("src_try2.txt"), b"second dead end\n").unwrap();
+    let tried_s2 = snap(&mut repo, &*fs);
+    let s_drop2 = repo.drop_attempt(tried_s2, "second try timed out").unwrap();
+    fs.remove_file(&p("src_try2.txt")).unwrap();
+
+    repo.set_attribution(Some(agent_attr("merger-bot", "squash-run")));
+    fs.write(&p("hunk.txt"), b"A\n1\n2\n3\n4\nZ\n").unwrap();
+    let src = snap(&mut repo, &*fs);
+    let orig_src_attempts = repo.snapshot(&src).unwrap().attempts.clone();
+    assert_eq!(orig_src_attempts, vec![s_drop1.attempt, s_drop2.attempt]);
+
+    let expected = vec![
+        (
+            "dest approach deadlocked".to_string(),
+            Some(agent_attr("claude-code/1", "dest-task")),
+            vec![("dest_try.txt".to_string(), b"dest dead end\n".to_vec())],
+        ),
+        (
+            "first try overflowed".to_string(),
+            Some(agent_attr("codex/2", "src-task-1")),
+            vec![("src_try1.txt".to_string(), b"first dead end\n".to_vec())],
+        ),
+        (
+            "second try timed out".to_string(),
+            Some(agent_attr("gemini/3", "src-task-2")),
+            vec![("src_try2.txt".to_string(), b"second dead end\n".to_vec())],
+        ),
+    ];
+
+    let check_dest_and_undo = |repo: &mut Repo, new_dest: ObjectId, label: &str| {
+        let ds = repo.snapshot(&new_dest).unwrap();
+        assert_eq!(ds.attempts.len(), 3, "{label}: destination must list dest's + src's attempts");
+        assert_eq!(ds.attempts[0], d_drop.attempt, "{label}: dest's own attempt stays first");
+        for a in &ds.attempts {
+            let at = repo.snapshot(a).unwrap();
+            assert_eq!(at.change_id, ds.change_id, "{label}: attempt change_id matches destination");
+            assert_eq!(at.parents, ds.parents, "{label}: attempt stands on destination's parents");
+        }
+        let got: Vec<_> = ds.attempts.iter().map(|a| attempt_summary(repo, a)).collect();
+        assert_eq!(got, expected, "{label}: reason, attribution and changed files preserved");
+
+        repo.undo().unwrap();
+        assert_eq!(repo.snapshot(&dest).unwrap().attempts, orig_dest_attempts, "{label}: undo restores dest attempts");
+        assert_eq!(repo.snapshot(&src).unwrap().attempts, orig_src_attempts, "{label}: undo restores src attempts");
+        assert!(repo.held().visible().unwrap().contains(&src), "{label}: undo restores src in view");
+    };
+
+    // 1a. Whole squash into parent (`vl squash`).
+    let new_dest = repo.squash(src).unwrap();
+    check_dest_and_undo(&mut repo, new_dest, "whole squash");
+
+    // 1b. Squash by path (`vl squash hunk.txt`).
+    let parts = repo.change_parts(&src, false).unwrap();
+    let path_sel = Selection::from([(p("hunk.txt"), Pick { whole: true, ..Pick::default() })]);
+    let res = repo.squash_into(src, None, Some((&parts, &path_sel))).unwrap();
+    assert!(res.emptied);
+    check_dest_and_undo(&mut repo, res.destination, "path squash");
+
+    // 1c. Squash by hunks (`vl squash -i` choosing all hunks).
+    let hparts = repo.change_parts(&src, true).unwrap();
+    let hunk_sel = Selection::from([(p("hunk.txt"), hparts.units[0].everything())]);
+    let res = repo.squash_into(src, None, Some((&hparts, &hunk_sel))).unwrap();
+    assert!(res.emptied);
+    check_dest_and_undo(&mut repo, res.destination, "hunk squash");
+
+    // 1d. `--into DEST` across an intermediate change (`dest -> mid -> leaf`),
+    // forward into a descendant (`dest --into src`), and across sibling branches.
+    repo.set_attribution(None);
+    let saved_op = repo.op_id();
+
+    let mid = change_on(&mut repo, dest, "mid.txt");
+    let leaf_rebased = repo.rebase(src, vec![mid]).unwrap();
+    let leaf_attempts = repo.snapshot(&leaf_rebased).unwrap().attempts.clone();
+    let res = repo.squash_into(leaf_rebased, Some(dest), None).unwrap();
+    assert!(res.emptied);
+    let got: Vec<_> = repo.snapshot(&res.destination).unwrap().attempts.iter().map(|a| attempt_summary(&repo, a)).collect();
+    assert_eq!(got, expected, "--into ancestor across middle change");
+    repo.undo().unwrap();
+    assert_eq!(repo.snapshot(&dest).unwrap().attempts, orig_dest_attempts);
+    assert_eq!(repo.snapshot(&leaf_rebased).unwrap().attempts, leaf_attempts);
+    repo.restore_operation(saved_op).unwrap();
+
+    // Forward `--into` descendant (`dest` squashed into `src`).
+    let res_fwd = repo.squash_into(dest, Some(src), None).unwrap();
+    assert!(res_fwd.emptied);
+    let fwd_snap = repo.snapshot(&res_fwd.destination).unwrap();
+    let got_fwd: Vec<_> = fwd_snap.attempts.iter().map(|a| attempt_summary(&repo, a)).collect();
+    assert_eq!(
+        got_fwd,
+        vec![expected[1].clone(), expected[2].clone(), expected[0].clone()],
+        "--into descendant lists destination's attempts first, then source's"
+    );
+    for a in &fwd_snap.attempts {
+        assert_eq!(repo.snapshot(a).unwrap().change_id, fwd_snap.change_id);
+    }
+    repo.undo().unwrap();
+    assert_eq!(repo.snapshot(&dest).unwrap().attempts, orig_dest_attempts);
+    assert_eq!(repo.snapshot(&src).unwrap().attempts, orig_src_attempts);
+
+    // Unrelated branch (`src` rebased onto `base` as a sibling of `dest`, then `--into dest`).
+    let sib = repo.rebase(src, vec![base]).unwrap();
+    let sib_attempts = repo.snapshot(&sib).unwrap().attempts.clone();
+    let res_sib = repo.squash_into(sib, Some(dest), None).unwrap();
+    assert!(res_sib.emptied);
+    let sib_dest_snap = repo.snapshot(&res_sib.destination).unwrap();
+    let got_sib: Vec<_> = sib_dest_snap.attempts.iter().map(|a| attempt_summary(&repo, a)).collect();
+    assert_eq!(got_sib, expected, "--into unrelated sibling change");
+    for a in &sib_dest_snap.attempts {
+        assert_eq!(repo.snapshot(a).unwrap().change_id, sib_dest_snap.change_id);
+    }
+    repo.undo().unwrap();
+    assert_eq!(repo.snapshot(&dest).unwrap().attempts, orig_dest_attempts);
+    assert_eq!(repo.snapshot(&sib).unwrap().attempts, sib_attempts);
+}
+
+/// BUG-1837 guarantee 2: if a partial squash does not empty the source (by
+/// path or by hunk), the source keeps its attempts and the destination gets
+/// none of them.
+#[test]
+fn bug_1837_partial_squash_leaves_attempts_on_the_source() {
+    use veil_core::selection::{Pick, Selection};
+
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[("multi.txt", "top\n1\n2\n3\n4\nbot\n")], "base");
+
+    repo.new_change(WS, vec![base], "dest").unwrap();
+    fs.write(&p("d_try.txt"), b"d dead end\n").unwrap();
+    let td = snap(&mut repo, &*fs);
+    let d_att = repo.drop_attempt(td, "dest try").unwrap().attempt;
+    fs.remove_file(&p("d_try.txt")).unwrap();
+    fs.write(&p("dest.txt"), b"dest\n").unwrap();
+    let dest = snap(&mut repo, &*fs);
+
+    repo.new_change(WS, vec![dest], "src").unwrap();
+    repo.set_attribution(Some(agent_attr("codex/2", "partial")));
+    fs.write(&p("s_try.txt"), b"s dead end\n").unwrap();
+    let ts = snap(&mut repo, &*fs);
+    let _s_att = repo.drop_attempt(ts, "src try").unwrap().attempt;
+    fs.remove_file(&p("s_try.txt")).unwrap();
+    repo.set_attribution(None);
+
+    fs.write(&p("multi.txt"), b"TOP\n1\n2\n3\n4\nBOT\n").unwrap();
+    fs.write(&p("stay.txt"), b"stays on src\n").unwrap();
+    let src = snap(&mut repo, &*fs);
+
+    // Partial by path: move `multi.txt`, leave `stay.txt`.
+    let parts = repo.change_parts(&src, false).unwrap();
+    let sel = Selection::from([(p("multi.txt"), Pick { whole: true, ..Pick::default() })]);
+    let res = repo.squash_into(src, None, Some((&parts, &sel))).unwrap();
+    assert!(!res.emptied);
+    let new_src = res.source.expect("source remains");
+    assert_eq!(repo.snapshot(&res.destination).unwrap().attempts, vec![d_att], "destination gets none of src's attempts");
+    let src_atts = &repo.snapshot(&new_src).unwrap().attempts;
+    assert_eq!(src_atts.len(), 1, "source keeps its attempt");
+    assert_eq!(
+        attempt_summary(&repo, &src_atts[0]),
+        ("src try".into(), Some(agent_attr("codex/2", "partial")), vec![("s_try.txt".into(), b"s dead end\n".to_vec())])
+    );
+    repo.undo().unwrap();
+
+    // Partial by hunk: move only the first block of `multi.txt`.
+    let hparts = repo.change_parts(&src, true).unwrap();
+    let multi_unit = hparts.units.iter().find(|u| u.path == p("multi.txt")).unwrap();
+    let first_block = *multi_unit.text().unwrap().diff.all_blocks().iter().next().unwrap();
+    let hsel = Selection::from([(
+        p("multi.txt"),
+        Pick { whole: false, mode: false, blocks: [first_block].into_iter().collect() },
+    )]);
+    let res = repo.squash_into(src, None, Some((&hparts, &hsel))).unwrap();
+    assert!(!res.emptied);
+    let new_src = res.source.expect("source remains");
+    assert_eq!(repo.snapshot(&res.destination).unwrap().attempts, vec![d_att]);
+    assert_eq!(repo.snapshot(&new_src).unwrap().attempts.len(), 1);
+}
+
+/// BUG-1837 guarantee 3: the 32-attempt cap (`object::MAX_ATTEMPTS`) holds;
+/// exceeding it refuses with a clear message naming how many would be kept and
+/// changes nothing.
+#[test]
+fn bug_1837_squash_refuses_when_attempts_would_exceed_cap() {
+    use veil_core::object::MAX_ATTEMPTS;
+
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[("README.md", "hi\n")], "base");
+
+    repo.new_change(WS, vec![base], "dest").unwrap();
+    for i in 0..20 {
+        fs.write(&p("d.txt"), format!("d try {i}\n").as_bytes()).unwrap();
+        let t = snap(&mut repo, &*fs);
+        repo.drop_attempt(t, &format!("dest try {i}")).unwrap();
+    }
+    fs.write(&p("d.txt"), b"dest ok\n").unwrap();
+    let dest = snap(&mut repo, &*fs);
+    assert_eq!(repo.snapshot(&dest).unwrap().attempts.len(), 20);
+
+    repo.new_change(WS, vec![dest], "src").unwrap();
+    for i in 0..15 {
+        fs.write(&p("s.txt"), format!("s try {i}\n").as_bytes()).unwrap();
+        let t = snap(&mut repo, &*fs);
+        repo.drop_attempt(t, &format!("src try {i}")).unwrap();
+    }
+    fs.write(&p("s.txt"), b"src ok\n").unwrap();
+    let src = snap(&mut repo, &*fs);
+    assert_eq!(repo.snapshot(&src).unwrap().attempts.len(), 15);
+
+    let view_before = repo.view().clone();
+    let op_before = repo.op_id();
+
+    let err = repo.squash(src).unwrap_err().to_string();
+    assert!(err.contains("35") && err.contains(&MAX_ATTEMPTS.to_string()), "expected total (35) and cap ({MAX_ATTEMPTS}) in refusal: {err}");
+    assert_eq!(repo.view(), &view_before, "refused squash must change nothing in the view");
+    assert_eq!(repo.op_id(), op_before, "refused squash must record no operation");
+    assert_eq!(repo.snapshot(&dest).unwrap().attempts.len(), 20);
+    assert_eq!(repo.snapshot(&src).unwrap().attempts.len(), 15);
+
+    // Exact cap (20 + 12 = 32) succeeds without dropping any attempt.
+    repo.new_change(WS, vec![dest], "src32").unwrap();
+    for i in 0..12 {
+        fs.write(&p("s32.txt"), format!("s32 try {i}\n").as_bytes()).unwrap();
+        let t = snap(&mut repo, &*fs);
+        repo.drop_attempt(t, &format!("src32 try {i}")).unwrap();
+    }
+    fs.write(&p("s32.txt"), b"src32 ok\n").unwrap();
+    let src32 = snap(&mut repo, &*fs);
+    let combined = repo.squash(src32).unwrap();
+    assert_eq!(repo.snapshot(&combined).unwrap().attempts.len(), MAX_ATTEMPTS);
+}
+
+/// BUG-1837 split check: `split` leaves `first` with no attempts and keeps the
+/// original change's attempts on `second` (the half that keeps its change id).
+#[test]
+fn bug_1837_split_keeps_attempts_on_the_original_change_id() {
+    use veil_core::selection::{Pick, Selection};
+
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[("README.md", "hi\n")], "base");
+    repo.new_change(WS, vec![base], "both").unwrap();
+    repo.set_attribution(Some(agent_attr("claude-code/1", "split-task")));
+    fs.write(&p("try.txt"), b"dead end\n").unwrap();
+    let tried = snap(&mut repo, &*fs);
+    let _drop = repo.drop_attempt(tried, "dead end before split").unwrap();
+    fs.remove_file(&p("try.txt")).unwrap();
+    repo.set_attribution(None);
+
+    fs.write(&p("first.txt"), b"first\n").unwrap();
+    fs.write(&p("second.txt"), b"second\n").unwrap();
+    let orig = snap(&mut repo, &*fs);
+    let orig_cid = repo.snapshot(&orig).unwrap().change_id;
+
+    let parts = repo.change_parts(&orig, false).unwrap();
+    let sel = Selection::from([(p("first.txt"), Pick { whole: true, ..Pick::default() })]);
+    let split = repo.split(&parts, &sel, Some("first half")).unwrap();
+
+    let first = repo.snapshot(&split.first).unwrap();
+    let second = repo.snapshot(&split.second).unwrap();
+    assert_ne!(first.change_id, orig_cid);
+    assert_eq!(second.change_id, orig_cid);
+    assert!(first.attempts.is_empty(), "first part gets a new change id and no attempts");
+    assert_eq!(second.attempts.len(), 1, "second part keeps the original change's attempts");
+    assert_eq!(
+        attempt_summary(&repo, &second.attempts[0]),
+        ("dead end before split".into(), Some(agent_attr("claude-code/1", "split-task")), vec![("try.txt".into(), b"dead end\n".to_vec())])
+    );
+}
+

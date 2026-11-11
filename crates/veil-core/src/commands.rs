@@ -492,6 +492,7 @@ impl Repo {
     pub fn split(&mut self, parts: &ChangeParts, sel: &Selection, message: Option<&str>) -> Result<SplitResult> {
         let id = parts.id;
         let mut tx = self.transaction("split")?;
+        tx.keep_sealing();
         let s = tx.repo().snapshot(&id)?;
         check_current(tx.repo(), &[id], parts, &s)?;
         if s.embargo.is_some() {
@@ -536,9 +537,9 @@ impl Repo {
 
     /// `vl squash`: move what `part` chooses of change `id` (all of it for
     /// `None`) into `into`, by default its single parent. The source keeps
-    /// its change id and description and holds the rest; when nothing is
-    /// left it is abandoned and its description is joined to the
-    /// destination's, as a whole squash always did.
+    /// its change id, description and recorded attempts and holds the rest;
+    /// when nothing is left it is abandoned and its description and attempts
+    /// are joined to the destination's.
     ///
     /// * into its **parent**: the parent gets the chosen part; the source's
     ///   own tree is unchanged (it already held everything);
@@ -597,8 +598,21 @@ impl Repo {
             }
         };
         let d = tx.repo().snapshot(&dest)?;
+        if all && !s.attempts.is_empty() {
+            let total = d.attempts.len() + s.attempts.iter().filter(|a| !d.attempts.contains(a)).count();
+            if total > crate::object::MAX_ATTEMPTS {
+                return Err(VeilError::repo(format!(
+                    "cannot squash {} into {}: the destination would keep {total} attempts ({} + {}), more than the {} a change keeps",
+                    s.change_id.short(),
+                    d.change_id.short(),
+                    d.attempts.len(),
+                    s.attempts.len(),
+                    crate::object::MAX_ATTEMPTS,
+                )));
+            }
+        }
         // The destination as it ends up: `tree`, conflicts, and (if the
-        // source is emptied) the joined description.
+        // source is emptied) the joined description and attempts.
         let finish_dest = |tx: &Transaction, cur: ObjectId, tree: ObjectId, extra: Vec<String>| -> Result<Snapshot> {
             let now = tx.repo().snapshot(&cur)?;
             let mut nd = (*now).clone();
@@ -624,6 +638,20 @@ impl Repo {
                 if !sd.trim().is_empty() {
                     let joined = if pd.trim().is_empty() { sd } else { format!("{pd}\n\n{sd}") };
                     nd.description = Text::Plain(joined);
+                }
+                for a in &s.attempts {
+                    if !nd.attempts.contains(a) {
+                        nd.attempts.push(*a);
+                    }
+                }
+                if nd.attempts.len() > crate::object::MAX_ATTEMPTS {
+                    return Err(VeilError::repo(format!(
+                        "cannot squash {} into {}: the destination would keep {} attempts, more than the {} a change keeps",
+                        s.change_id.short(),
+                        d.change_id.short(),
+                        nd.attempts.len(),
+                        crate::object::MAX_ATTEMPTS,
+                    )));
                 }
             }
             Ok(nd)
