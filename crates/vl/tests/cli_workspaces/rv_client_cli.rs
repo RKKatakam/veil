@@ -274,3 +274,49 @@ fn bug_1844_a_sparse_sandbox_reads_only_its_paths_through_the_workspace_socket()
     let mounted = t.exec(&["--mount"], "vl blame docs/other.md");
     assert!(mounted.status.success() && text(&mounted).contains("dirty-outside"), "{}", text(&mounted));
 }
+
+/// Re-check of BUG-1840's fix (`rc-client`). The guard keeps a sealed
+/// secret's values out of *other* files a sandboxed command writes. A
+/// value a tracked file already held before the run was not written by
+/// the command: a sealed `.env` carries plain settings beside its secrets
+/// (`APP_URL=…`, a database URL also in `docker-compose.yml` or the
+/// README), and an agent must still be able to edit those files. "Normal
+/// use works"; `docs/VISIBILITY.md`: "If an agent writes a secret into
+/// some other file, Veil refuses to commit it and removes it after the
+/// run": this file's edit wrote none.
+#[test]
+#[ignore = "BUG-1931: a sandboxed edit of a file that already held a value of a sealed secret file is discarded"]
+fn bug_1931_a_sandbox_edit_of_a_file_that_already_held_a_sealed_files_value_is_recorded() {
+    const URL: &str = "http://localhost:3000/app";
+    const SECRET: &str = "Xk29vLq8sPzQw7LmTr4Bn6Yc";
+    let mut lost = Vec::new();
+    for flags in [&[][..], &["--mount"]] {
+        let t = T::new(&[
+            ("README.md", &format!("# Demo\n\nRun the app at {URL} after `make up`.\n")),
+            ("src/lib.rs", "pub fn f() {}\n"),
+            (".env", &format!("APP_URL={URL}\nAPI_KEY={SECRET}\n")),
+        ]);
+        let ls = t.ok(&["ls", "-r", "main"]);
+        assert!(ls.lines().any(|l| l.contains("cloaked") && l.ends_with(".env")), "the .env is a sealed secret:\n{ls}");
+        // The command edits the README (its URL line untouched), edits the
+        // code, and copies the real secret into a new file.
+        let o = t.exec(
+            flags,
+            r#"set -e
+               echo 'More docs.' >> README.md
+               echo '// x' >> src/lib.rs
+               v=$(grep API_KEY .env | cut -d= -f2); test -n "$v"; printf '%s\n' "$v" > val.txt"#,
+        );
+        assert!(o.status.success(), "{flags:?}: the run itself works:\n{}", text(&o));
+        // Control: the guard holds (BUG-1840), and a clean edit is recorded.
+        let listed = t.ok(&["ls", "-r", "agent@"]);
+        assert!(!listed.lines().any(|l| l.ends_with("val.txt")), "{flags:?}: the copy of the secret is not recorded:\n{listed}");
+        assert!(t.ok(&["cat", "-r", "agent@", "src/lib.rs"]).contains("// x"), "{flags:?}: the edit of the code is recorded");
+        // The README's edit is recorded too.
+        let readme = t.ok(&["cat", "-r", "agent@", "README.md"]);
+        if !readme.contains("More docs.") {
+            lost.push(format!("{flags:?}: the edit of README.md was not recorded:\n{}", text(&o)));
+        }
+    }
+    assert!(lost.is_empty(), "{lost:#?}");
+}
