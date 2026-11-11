@@ -868,21 +868,21 @@ impl GraphIndex {
         })
     }
 
-    /// Snapshots reachable from `roots`, children before parents, newest
-    /// first among unrelated snapshots: exactly the order of
-    /// [`crate::repo::Held::topo_children_first`], produced lazily (an incremental
-    /// topological walk, as Git's `--topo-order` since 2.20).
+    /// Snapshots reachable from `roots`, newest first by generation (the
+    /// corrected commit date: strictly greater than every parent's, so
+    /// children always come before their parents), ties by id: the same
+    /// order as the server's `q/log` (`docs/design/server/phase-3-server-history.md`
+    /// §11), produced lazily.
     pub fn topo_iter<'r>(&'r self, repo: &'r Repo, roots: impl IntoIterator<Item = ObjectId>) -> TopoIter<'r> {
+        let mut pending: Vec<ObjectId> = roots.into_iter().collect();
+        pending.reverse();
+        let queued: HashSet<ObjectId> = pending.iter().copied().collect();
         TopoIter {
             index: self,
             repo,
-            roots: Some(roots.into_iter().collect()),
-            unexamined: Vec::new(),
-            explore: BinaryHeap::new(),
-            indegree: HashMap::new(),
-            ready: BinaryHeap::new(),
-            queued: HashSet::new(),
-            nodes: HashMap::new(),
+            heap: BinaryHeap::new(),
+            queued,
+            pending,
             failed: false,
         }
     }
@@ -985,113 +985,37 @@ impl Walker<'_> {
 
 /// See [`GraphIndex::topo_iter`].
 ///
-/// Kahn's algorithm, newest first among the snapshots whose children are
-/// all emitted, made lazy two ways. A node's count of children is complete
-/// once every node of a larger generation is explored, so exploration goes
-/// only as deep as the next node to emit. And a root (which no emitted node
-/// will free) is examined only once its timestamp could be the next one
-/// emitted: an old tag costs nothing until the walk reaches its time.
+/// Newest first by generation, ties by id (as the server's `LogWalk`):
+/// every child of a snapshot has a strictly larger generation than the
+/// snapshot itself, so every reachable child of `id` is popped (and queues
+/// `id`) before `id` is popped. Each step reads only the parents of the
+/// emitted snapshot.
 pub struct TopoIter<'r> {
     index: &'r GraphIndex,
     repo: &'r Repo,
-    roots: Option<Vec<ObjectId>>,
-    /// Roots not examined yet, oldest first (the newest is popped).
-    unexamined: Vec<(i64, ObjectId)>,
-    /// Nodes to explore (count their parents' children), highest generation first.
-    explore: BinaryHeap<(Gen, ObjectId)>,
-    /// Children counted so far, per discovered node.
-    indegree: HashMap<ObjectId, usize>,
-    /// Nodes whose children are all emitted, newest first.
-    ready: BinaryHeap<(i64, ObjectId)>,
-    /// Nodes ever put in `ready`.
+    heap: BinaryHeap<(Gen, ObjectId)>,
     queued: HashSet<ObjectId>,
-    /// Discovered nodes: generation and snapshot.
-    nodes: HashMap<ObjectId, (Gen, Arc<Snapshot>)>,
+    pending: Vec<ObjectId>,
     failed: bool,
 }
 
 impl TopoIter<'_> {
-    fn discover(&mut self, w: &mut Walker<'_>, id: ObjectId) -> Result<bool> {
-        if self.nodes.contains_key(&id) {
-            return Ok(true);
-        }
-        let Some(e) = w.entry(&id)? else { return Ok(false) };
-        let Some(s) = w.snapshot(&id)? else { return Ok(false) };
-        self.nodes.insert(id, (e.generation, s));
-        self.indegree.insert(id, 0);
-        self.explore.push((e.generation, id));
-        Ok(true)
-    }
-
-    /// Explore every discovered node of generation `>= floor` (count it
-    /// as a child of each of its parents, discovering them). Afterwards the
-    /// count of every node of generation `< floor` whose children all have
-    /// generation `>= floor` is complete: in particular, of every node of
-    /// generation `floor - 1`.
-    fn explore_to(&mut self, w: &mut Walker<'_>, floor: Gen) -> Result<()> {
-        while let Some(&(g, id)) = self.explore.peek() {
-            if g < floor {
-                break;
-            }
-            self.explore.pop();
-            let parents = self.nodes[&id].1.parents.clone();
-            for p in parents {
-                if self.discover(w, p)? {
-                    *self.indegree.get_mut(&p).unwrap() += 1;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Queue `id` if its count is complete and zero.
-    fn settle(&mut self, w: &mut Walker<'_>, id: ObjectId) -> Result<()> {
-        if self.queued.contains(&id) {
-            return Ok(());
-        }
-        let g = self.nodes[&id].0;
-        self.explore_to(w, g + 1)?;
-        if self.indegree[&id] == 0 {
-            self.queued.insert(id);
-            self.ready.push((self.nodes[&id].1.timestamp, id));
-        }
-        Ok(())
-    }
-
     fn step(&mut self) -> Result<Option<ObjectId>> {
         let (index, repo) = (self.index, self.repo);
         index.with(repo, |w| {
-            if let Some(roots) = self.roots.take() {
-                for r in roots {
-                    if self.discover(w, r)? {
-                        self.unexamined.push((self.nodes[&r].1.timestamp, r));
+            while let Some(id) = self.pending.pop() {
+                if let Some(e) = w.entry(&id)? {
+                    if w.snapshot(&id)?.is_some() {
+                        self.heap.push((e.generation, id));
                     }
                 }
-                self.unexamined.sort();
-                self.unexamined.dedup();
             }
-            // A root newer than the best ready node might be ready itself.
-            while let Some(&key) = self.unexamined.last() {
-                if self.ready.peek().is_some_and(|top| *top > key) {
-                    break;
-                }
-                self.unexamined.pop();
-                self.settle(w, key.1)?;
-            }
-            let Some((_, id)) = self.ready.pop() else { return Ok(None) };
-            // Explored itself, so its parents are discovered and counted.
-            self.explore_to(w, self.nodes[&id].0)?;
-            let parents = self.nodes[&id].1.parents.clone();
-            for p in parents {
-                if !self.nodes.contains_key(&p) {
-                    continue;
-                }
-                let c = self.indegree.get_mut(&p).unwrap();
-                *c -= 1;
-                if *c == 0 {
-                    // Every child of `p` has a larger generation: once
-                    // those are explored, its count is final.
-                    self.settle(w, p)?;
+            let Some((_, id)) = self.heap.pop() else { return Ok(None) };
+            if let Some(s) = w.snapshot(&id)? {
+                for p in &s.parents {
+                    if self.queued.insert(*p) {
+                        self.pending.push(*p);
+                    }
                 }
             }
             Ok(Some(id))

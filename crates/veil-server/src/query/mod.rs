@@ -204,7 +204,11 @@ pub async fn resolve_real(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instan
             if crate::embargo::is_withheld_for_query(hub, project, &id).await? {
                 return Err(no_revision());
             }
-            if let Some(r) = row_of(id).await? {
+            let cached_or_db = match graph::cached_row(hub, project, &vk, &id) {
+                Some(r) => Some(r),
+                None => row_of(id).await?,
+            };
+            if let Some(r) = cached_or_db {
                 if r.withheld() || crate::embargo::is_withheld_for_query(hub, project, &r.real).await? {
                     return Err(no_revision());
                 }
@@ -267,7 +271,11 @@ pub async fn resolve_real(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instan
         }
     };
     let p = ensure(hub, &ask.project, &ask.viewer, &[real], Some(deadline)).await?[0];
-    match row_of(p).await? {
+    let r_opt = match graph::cached_row(hub, project, &vk, &p) {
+        Some(r) => Some(r),
+        None => row_of(p).await?,
+    };
+    match r_opt {
         Some(r)
             if !r.withheld()
                 && (parse_id(rev).is_none() || parse_id(rev) == Some(p))
@@ -448,6 +456,7 @@ const STORED_CURSOR: &str = "frontier-";
 /// now (BUG-1413, `files::sweep_keys`). A cursor so dropped is refused when sent
 /// back (`invalid cursor`): the log is asked for again from its start.
 fn keep_cursor(cx: &crate::derive::Cx, vk: &str, id: &str, text: &str, limits: &Limits) -> Result<()> {
+    cx.src.rt.block_on(files::sweep_keys(cx.hub(), cx.project()))?;
     let now = veil_core::now_millis();
     let pool = &cx.hub().db;
     cx.db(|| {
@@ -539,7 +548,21 @@ pub async fn log(hub: &Arc<Hub>, ask: &Ask, q: LogParams, limits: Limits) -> Res
             }
             out
         }
-        None => vec![resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?],
+        None => {
+            let rev = q.rev.as_deref().unwrap_or(&ask.project.default_branch);
+            let parts: Vec<&str> = rev.split(',').filter(|s| !s.is_empty()).collect();
+            if parts.is_empty() {
+                return Err(no_revision());
+            }
+            if parts.len() > limits.cursor {
+                return Err(Error::bad_request("cursor too long"));
+            }
+            let mut out = Vec::with_capacity(parts.len());
+            for r in parts {
+                out.push(resolve(hub, ask, r, deadline).await?);
+            }
+            out
+        }
     };
     on_graph(hub, ask, deadline, move |g, t| {
         let mut roots = roots;
@@ -1204,30 +1227,39 @@ pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) ->
     let not_text = || Error::bad_request("not a plain-text file of at most 1 MiB: nothing to blame line by line");
     // The answer from the kept blame of the version asked for; else the
     // version, whose blame job the request waits for (S14 cycle 3).
-    let answer = |path: String| {
+    let seeded_win = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let answer = |path: String, take_win: bool| {
+        let seeded_win = seeded_win.clone();
         on_graph(hub, ask, deadline, move |g, t| {
             let e = file_entry(g, t, &id, &path)?.ok_or_else(no_path)?;
             if !e.visibility.is_public() {
                 return Err(Error::bad_request("a secret: its content is encrypted, and the server cannot read it"));
             }
             let f = files::Files::new(g);
+            f.set_fast_pages(take_win && limits.blame.held >= 4 << 20);
             let (depth, x) = f.intro(id, &path)?.ok_or_else(|| Error::Other(anyhow::anyhow!("file history: no version of a file present")))?;
             let start = files::Version { id: x, depth, path: Arc::from(path.as_str()) };
             match files::kept_answer(&f, t, id, &start, follow, after, n, limits.blame)? {
                 Some(v) => Ok(v),
-                None => Ok(json!({ "pending": start })),
+                None => {
+                    if take_win && limits.blame.held >= 4 << 20 {
+                        *seeded_win.lock().unwrap() = f.take_window(&path);
+                    }
+                    Ok(json!({ "pending": start }))
+                }
             }
         })
     };
-    let v = answer(path.clone()).await?;
+    let v = answer(path.clone(), true).await?;
     let Some(pending) = v.get("pending") else { return Ok(v) };
     let start: files::Version = serde_json::from_value(pending.clone()).map_err(|e| Error::Other(e.into()))?;
-    match files::wait_for_blame(hub, &ask.project, &ask.viewer, &start, follow, limits.blame, deadline).await? {
+    let win = seeded_win.lock().unwrap().take();
+    match files::wait_for_blame(hub, &ask.project, &ask.viewer, &start, follow, limits.blame, deadline, win).await? {
         files::JobEnd::Kept => {}
         files::JobEnd::NoText => return Err(not_text()),
         files::JobEnd::Failed(status, code, message) => return Err(Error::Api { status, code, message }),
     }
-    let v = answer(path).await?;
+    let v = answer(path, false).await?;
     if v.get("pending").is_some() {
         // Kept, then dropped by the project's cap (or another server's job
         // found it kept before it was): ask again.

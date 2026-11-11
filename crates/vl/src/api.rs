@@ -239,6 +239,57 @@ pub fn snapshot_ref(repo: &Repo, id: &ObjectId) -> SnapshotRef {
     }
 }
 
+/// [`snapshot_ref`] in a thin clone when `empty` is known from the server
+/// (or by comparing held trees), so `repo.is_empty_change` never pages in
+/// unheld parent snapshots.
+fn snapshot_ref_thin(
+    repo: &Repo,
+    promisor: &dyn veil_core::promisor::Promisor,
+    id: &ObjectId,
+) -> SnapshotRef {
+    if let Ok(Some(s)) = repo.held().snapshot(id) {
+        let description = description(repo, &s);
+        let empty = if s.parents.is_empty() {
+            false
+        } else if let Some(Some(ps)) = s.parents.first().map(|p| repo.held().snapshot(p).ok().flatten()) {
+            s.tree == ps.tree
+        } else if let Ok(Ok(v)) = promisor.query("show", &[("rev", id.hex()), ("stat", "true".into())]) {
+            v["empty"].as_bool().unwrap_or(false)
+        } else {
+            false
+        };
+        return SnapshotRef {
+            snapshot_id: id.hex(),
+            snapshot_short: id.short(),
+            change_id: Some(s.change_id.display()),
+            change_short: Some(s.change_id.short()),
+            available: true,
+            empty,
+            description,
+        };
+    }
+    if let Ok(Ok(v)) = promisor.query("show", &[("rev", id.hex()), ("stat", "true".into())]) {
+        return SnapshotRef {
+            snapshot_id: id.hex(),
+            snapshot_short: id.short(),
+            change_id: v["change_id"].as_str().map(str::to_string),
+            change_short: v["change_short"].as_str().map(str::to_string),
+            available: true,
+            empty: !v["root"].as_bool().unwrap_or(false) && v["empty"].as_bool().unwrap_or(false),
+            description: v["description"].as_str().map(str::to_string),
+        };
+    }
+    SnapshotRef {
+        snapshot_id: id.hex(),
+        snapshot_short: id.short(),
+        change_id: None,
+        change_short: None,
+        available: false,
+        empty: false,
+        description: None,
+    }
+}
+
 /// A snapshot signature.
 #[derive(Serialize, Debug, Clone)]
 pub struct Sig {
@@ -905,7 +956,7 @@ pub struct LogEntry {
     pub(crate) timestamp_ms: i64,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct TagLabel {
     pub name: String,
 }
@@ -932,6 +983,7 @@ pub struct ParentRef {
 /// (`vl log | head`).
 pub struct LogEntries<'a> {
     repo: &'a Repo,
+    precomputed: Option<std::vec::IntoIter<LogEntry>>,
     ids: std::iter::Peekable<Box<dyn Iterator<Item = veil_core::error::Result<ObjectId>> + 'a>>,
     signers: std::collections::BTreeMap<String, (String, String)>,
     tags: HashMap<ObjectId, Vec<TagLabel>>,
@@ -944,6 +996,7 @@ pub struct LogEntries<'a> {
     limit: Option<usize>,
     yielded: usize,
     searcher: Option<Searcher<'a>>,
+    precomputed_search: Option<LogSearch>,
     show_skipped: bool,
     max_changes: Option<usize>,
     skipped: usize,
@@ -958,16 +1011,571 @@ pub struct LogQuery {
     /// Snapshot ids in log order (`revset::resolve_set`); all visible
     /// snapshots when `None`.
     pub ids: Option<Vec<ObjectId>>,
+    /// Starting roots for `::REV` in a thin clone (when `ids` is `None`).
+    pub roots: Option<Vec<ObjectId>>,
     pub filter: Option<LogFilter>,
     pub show_skipped: bool,
     /// Stop searching after this many snapshots.
     pub max_changes: Option<usize>,
 }
 
+/// Can `q` be answered in a thin clone by S13's `q/log` or S14's
+/// `q/history` without paging history into `.veil/objects/` (S16,
+/// `docs/HUB.md` §13.34)?
+fn thin_log_route(q: &LogQuery) -> Option<Option<(VPath, bool)>> {
+    if q.ids.is_some() || q.max_changes.is_some() {
+        return None;
+    }
+    let Some(f) = &q.filter else { return Some(None) };
+    if f.author.is_some() || f.agent.is_some() || f.signed_by.is_some() || f.pickaxe.is_some() {
+        return None;
+    }
+    match f.paths.as_slice() {
+        [] => Some(None),
+        [p] => Some(Some((p.clone(), f.follow))),
+        _ => None,
+    }
+}
+
+/// A snapshot entry from the server's `q/log` or `q/history` turned into a
+/// [`LogEntry`] with this clone's tags, workspaces and signers.
+#[allow(clippy::too_many_arguments)]
+fn remote_log_entry(
+    v: &serde_json::Value,
+    signers: &std::collections::BTreeMap<String, (String, String)>,
+    tags: &mut HashMap<ObjectId, Vec<TagLabel>>,
+    remote_tags: &mut HashMap<ObjectId, Vec<String>>,
+    workspaces: &mut HashMap<ObjectId, Vec<String>>,
+    current: Option<ObjectId>,
+    root: ObjectId,
+) -> Result<LogEntry> {
+    let snap_hex = v["snapshot_id"].as_str().unwrap_or_default();
+    let id = ObjectId::from_hex(snap_hex)?;
+    let is_root = id == root || v["root"].as_bool().unwrap_or(false);
+    let ts = v["timestamp"].as_i64().unwrap_or(0);
+    let sig_val = if is_root {
+        None
+    } else {
+        Some(match v.get("signature").filter(|s| !s.is_null()) {
+            Some(s) => {
+                let signer_hex = s["signer"].as_str().unwrap_or_default();
+                let key_hex = s["key"].as_str().unwrap_or_default().to_string();
+                let key_short = key_hex.get(..16).unwrap_or(&key_hex).to_string();
+                let (status, signer) = match signers.get(&key_hex) {
+                    Some((member, name)) if member == signer_hex => ("good", Some(name.clone())),
+                    _ => ("unknown", None),
+                };
+                Sig { status, signer, key: Some(key_hex), key_short: Some(key_short) }
+            }
+            None => Sig { status: "unsigned", signer: None, key: None, key_short: None },
+        })
+    };
+    let parents = v["parents"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let ph = p["snapshot_id"].as_str()?;
+                    let pid = ObjectId::from_hex(ph).ok()?;
+                    let change_short = p["change_short"].as_str().map(str::to_string);
+                    Some(ParentRef {
+                        snapshot_id: pid.hex(),
+                        snapshot_short: pid.short(),
+                        withheld: change_short.is_none(),
+                        change_short,
+                        id: pid,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let agent = v.get("agent").filter(|a| !a.is_null()).and_then(|a| serde_json::from_value(a.clone()).ok());
+    let conflicts = v["conflicts"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    Ok(LogEntry {
+        snapshot_id: id.hex(),
+        snapshot_short: id.short(),
+        change_id: v["change_id"].as_str().unwrap_or_default().to_string(),
+        change_short: v["change_short"].as_str().unwrap_or_default().to_string(),
+        root: is_root,
+        current: Some(id) == current,
+        author: (!is_root).then(|| v["author"].as_str().unwrap_or_default().to_string()),
+        agent,
+        timestamp: if is_root { None } else { rfc3339(ts) },
+        signature: sig_val,
+        workspaces: workspaces.remove(&id).unwrap_or_default(),
+        tags: tags.remove(&id).unwrap_or_default(),
+        remote_tags: remote_tags.remove(&id).unwrap_or_default(),
+        empty: !is_root && v["empty"].as_bool().unwrap_or(false),
+        conflicts,
+        embargo: None,
+        description: Some(v["description"].as_str().unwrap_or_default().to_string()),
+        parents,
+        files: None,
+        not_searched: None,
+        id,
+        timestamp_ms: ts,
+    })
+}
+
+/// Run a thin clone's `vl log`, `vl log -- PATH` or `vl log --follow --
+/// PATH` over the server's query routes (`q/log`, `q/history`), merging the
+/// clone's own local commits on top without paging history into
+/// `.veil/objects/` (S16, `docs/HUB.md` §13.34).
+#[allow(clippy::too_many_arguments)]
+fn thin_query_log<'a>(
+    repo: &'a Repo,
+    promisor: &dyn veil_core::promisor::Promisor,
+    explicit_roots: Option<Vec<ObjectId>>,
+    path_filter: Option<(VPath, bool)>,
+    limit: Option<usize>,
+    show_skipped: bool,
+    signers: std::collections::BTreeMap<String, (String, String)>,
+    mut tags: HashMap<ObjectId, Vec<TagLabel>>,
+    mut remote_tags: HashMap<ObjectId, Vec<String>>,
+    mut workspaces: HashMap<ObjectId, Vec<String>>,
+    current: Option<ObjectId>,
+    root: ObjectId,
+) -> Result<Option<LogEntries<'a>>> {
+    // Partition the view's visible heads (or `explicit_roots`) into commits
+    // only this clone holds and snapshots on the server (including server
+    // bases below local commits).
+    let mut local_ids: Vec<ObjectId> = Vec::new();
+    let mut server_roots: Vec<ObjectId> = Vec::new();
+    let mut seen_local: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    let mut stack: Vec<ObjectId> = explicit_roots.unwrap_or_else(|| repo.view().refs());
+    while let Some(x) = stack.pop() {
+        if !seen_local.insert(x) {
+            continue;
+        }
+        if repo.store().is_servers(&x)? {
+            if !server_roots.contains(&x) {
+                server_roots.push(x);
+            }
+        } else if let Some(s) = repo.held().snapshot(&x)? {
+            local_ids.push(x);
+            stack.extend(s.parents.iter().copied());
+        }
+    }
+    server_roots.sort();
+    server_roots.dedup();
+    if server_roots.len() > 1 {
+        server_roots.retain(|id| *id != root);
+    }
+
+    let empty_ids: Box<dyn Iterator<Item = veil_core::error::Result<ObjectId>> + 'a> = Box::new(std::iter::empty());
+    let mut helper = LogEntries {
+        repo,
+        precomputed: None,
+        ids: empty_ids.peekable(),
+        signers,
+        tags: HashMap::new(),
+        remote_tags: HashMap::new(),
+        workspaces: HashMap::new(),
+        current,
+        root,
+        truncated: false,
+        limit,
+        yielded: 0,
+        searcher: None,
+        precomputed_search: None,
+        show_skipped,
+        max_changes: None,
+        skipped: 0,
+        stopped: false,
+    };
+    let mut local_searcher = path_filter.as_ref().map(|(p, follow)| {
+        Searcher::new(
+            repo,
+            LogFilter {
+                paths: vec![p.clone()],
+                follow: *follow,
+                ..LogFilter::default()
+            },
+        )
+    });
+
+    // Build `LogEntry` and `(generation, parents)` for every local commit.
+    let mut local_entries: HashMap<ObjectId, (veil_core::graph_index::Gen, Vec<ObjectId>, Option<LogEntry>)> = HashMap::new();
+    let mut searched = 0usize;
+    for id in &local_ids {
+        let g = repo.held().generation(id)?.unwrap_or(0);
+        let Some(s) = repo.held().snapshot(id)? else { continue };
+        let matches_filter = match &mut local_searcher {
+            Some(sr) => matches!(sr.check(id)?, Match::Yes { .. }),
+            None => true,
+        };
+        if !matches_filter {
+            local_entries.insert(*id, (g, s.parents.clone(), None));
+            continue;
+        }
+        let is_root = *id == root;
+        let description = description(repo, &s);
+        let empty = if is_root || s.parents.is_empty() {
+            false
+        } else if s.parents.len() == 1 {
+            let p = &s.parents[0];
+            let parent_tree = match repo.held().snapshot(p)? {
+                Some(ps) => Some(ps.tree),
+                None => {
+                    let w = veil_core::promisor::Located { snapshot: *p, path: String::new(), id: *p, chain: None };
+                    promisor
+                        .fetch_objects(&[w])?
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .and_then(|raw| match veil_core::object::Object::decode(&raw).ok()? {
+                            veil_core::object::Object::Snapshot(ps) => Some(ps.tree),
+                            _ => None,
+                        })
+                }
+            };
+            parent_tree == Some(s.tree)
+        } else {
+            repo.is_empty_change(id).unwrap_or(false)
+        };
+        let parents = s
+            .parents
+            .iter()
+            .map(|p| {
+                let change_short = repo.held().snapshot(p).ok().flatten().map(|ps| ps.change_id.short());
+                ParentRef { snapshot_id: p.hex(), snapshot_short: p.short(), withheld: change_short.is_none(), change_short, id: *p }
+            })
+            .collect();
+        let e = LogEntry {
+            snapshot_id: id.hex(),
+            snapshot_short: id.short(),
+            change_id: s.change_id.display(),
+            change_short: s.change_id.short(),
+            root: is_root,
+            current: Some(*id) == current,
+            author: (!is_root).then(|| s.author.clone()),
+            agent: s.agent.clone(),
+            timestamp: if is_root { None } else { rfc3339(s.timestamp) },
+            signature: (!is_root).then(|| sig(&repo.keys().snapshot_status_with(&s, &helper.signers), &s)),
+            workspaces: workspaces.remove(id).unwrap_or_default(),
+            tags: tags.remove(id).unwrap_or_default(),
+            remote_tags: remote_tags.remove(id).unwrap_or_default(),
+            empty,
+            conflicts: s.conflicts.clone(),
+            embargo: s.embargo.as_ref().map(|e| LogEmbargo { id: e.clone(), released: repo.keys().embargo_released(e) }),
+            description,
+            parents,
+            files: None,
+            not_searched: None,
+            id: *id,
+            timestamp_ms: s.timestamp,
+        };
+        if path_filter.is_some() {
+            searched += 1;
+        }
+        local_entries.insert(*id, (g, s.parents.clone(), Some(e)));
+    }
+
+    let mut server_entries: Vec<LogEntry> = Vec::new();
+    let mut server_has_more = false;
+    if !server_roots.is_empty() {
+        let want = limit.map(|l| l.saturating_add(1));
+        match &path_filter {
+            Some((p, true)) => {
+                // `vl log --follow -- PATH`: `q/history?follow=true` takes
+                // one starting revision; ask from the newest server root
+                // (or `main` when on it).
+                let rev = server_roots[0].hex();
+                let mut after: Option<String> = None;
+                let mut seen_srv: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+                while want.is_none_or(|w| server_entries.len() < w) {
+                    let page_n = want.map(|w| (w - server_entries.len()).clamp(1, 500)).unwrap_or(500);
+                    let mut params = vec![("path", p.as_str().to_string()), ("follow", "true".into()), ("n", page_n.to_string())];
+                    match &after {
+                        Some(a) => params.push(("after", a.clone())),
+                        None => params.push(("rev", rev.clone())),
+                    }
+                    let v = match promisor.query("history", &params)? {
+                        Ok(v) => v,
+                        Err((code, msg)) if code == "not_found" && msg.contains("revision") => return Ok(None),
+                        Err((code, _)) if code == "no_path" || code == "not_found" => break,
+                        Err((code, msg)) => anyhow::bail!("{msg} (server: {code})"),
+                    };
+                    if let Some(arr) = v["entries"].as_array() {
+                        for item in arr {
+                            let e = remote_log_entry(
+                                item,
+                                &helper.signers,
+                                &mut tags,
+                                &mut remote_tags,
+                                &mut workspaces,
+                                current,
+                                root,
+                            )?;
+                            if !local_entries.contains_key(&e.id) && seen_srv.insert(e.id) {
+                                server_entries.push(e);
+                                searched += 1;
+                                if want.is_some_and(|w| server_entries.len() >= w) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    after = v["next"].as_str().map(str::to_string);
+                    if after.is_none() {
+                        break;
+                    }
+                }
+                server_has_more = after.is_some();
+            }
+            path_opt => {
+                let rev = server_roots.iter().map(ObjectId::hex).collect::<Vec<_>>().join(",");
+                let mut after: Option<String> = None;
+                let mut seen_srv: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+                while want.is_none_or(|w| server_entries.len() < w) {
+                    let page_n = want.map(|w| (w - server_entries.len()).clamp(1, 500)).unwrap_or(500);
+                    let mut params = vec![("n", page_n.to_string())];
+                    if let Some((p, _)) = path_opt {
+                        params.push(("path", p.as_str().to_string()));
+                    }
+                    match &after {
+                        Some(a) => params.push(("after", a.clone())),
+                        None => params.push(("rev", rev.clone())),
+                    }
+                    let v = match promisor.query("log", &params)? {
+                        Ok(v) => v,
+                        Err((code, msg)) if code == "not_found" && msg.contains("revision") => return Ok(None),
+                        Err((code, _)) if code == "no_path" || code == "not_found" => break,
+                        Err((code, msg)) => anyhow::bail!("{msg} (server: {code})"),
+                    };
+                    if let Some(arr) = v["entries"].as_array() {
+                        for item in arr {
+                            let e = remote_log_entry(
+                                item,
+                                &helper.signers,
+                                &mut tags,
+                                &mut remote_tags,
+                                &mut workspaces,
+                                current,
+                                root,
+                            )?;
+                            if !local_entries.contains_key(&e.id) && seen_srv.insert(e.id) {
+                                server_entries.push(e);
+                                if path_opt.is_some() {
+                                    searched += 1;
+                                }
+                                if want.is_some_and(|w| server_entries.len() >= w) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    after = v["next"].as_str().map(str::to_string);
+                    if after.is_none() {
+                        break;
+                    }
+                }
+                server_has_more = after.is_some();
+            }
+        }
+    }
+
+    // Merge `local_entries` and `server_entries` in topological children-first
+    // order (using exact generations from the server for `server_entries` when
+    // local commits exist alongside them, as `GraphIndex::topo_iter` does).
+    let mut entries: Vec<LogEntry> = if local_entries.is_empty() {
+        server_entries
+    } else if server_entries.is_empty() {
+        let mut in_deg: HashMap<ObjectId, usize> = local_entries.keys().map(|id| (*id, 0)).collect();
+        for (_, parents, _) in local_entries.values() {
+            for p in parents {
+                if let Some(d) = in_deg.get_mut(p) {
+                    *d += 1;
+                }
+            }
+        }
+        let mut heap: std::collections::BinaryHeap<(veil_core::graph_index::Gen, ObjectId)> = in_deg
+            .iter()
+            .filter(|(_, &d)| d == 0)
+            .map(|(&id, _)| (local_entries[&id].0, id))
+            .collect();
+        let mut out = Vec::new();
+        while let Some((_, id)) = heap.pop() {
+            let (_, parents, entry) = local_entries.remove(&id).unwrap();
+            if let Some(e) = entry {
+                out.push(e);
+            }
+            for p in parents {
+                if let Some(d) = in_deg.get_mut(&p) {
+                    *d -= 1;
+                    if *d == 0 {
+                        heap.push((local_entries[&p].0, p));
+                    }
+                }
+            }
+        }
+        out
+    } else {
+        let srv_ids: Vec<ObjectId> = server_entries.iter().map(|e| e.id).collect();
+        let srv_gens = promisor.generations(&srv_ids)?.unwrap_or_default();
+        let mut nodes: HashMap<ObjectId, (veil_core::graph_index::Gen, Vec<ObjectId>, Option<LogEntry>)> = local_entries;
+        for (idx, e) in server_entries.into_iter().enumerate() {
+            let g = srv_gens
+                .get(idx)
+                .copied()
+                .flatten()
+                .or_else(|| repo.held().generation(&e.id).ok().flatten())
+                .unwrap_or(e.timestamp_ms.max(0) as u64);
+            let parents: Vec<ObjectId> = e.parents.iter().map(|p| p.id).collect();
+            nodes.insert(e.id, (g, parents, Some(e)));
+        }
+        let mut in_deg: HashMap<ObjectId, usize> = nodes.keys().map(|id| (*id, 0)).collect();
+        for (_, parents, _) in nodes.values() {
+            for p in parents {
+                if let Some(d) = in_deg.get_mut(p) {
+                    *d += 1;
+                }
+            }
+        }
+        let mut heap: std::collections::BinaryHeap<(veil_core::graph_index::Gen, ObjectId)> = in_deg
+            .iter()
+            .filter(|(_, &d)| d == 0)
+            .map(|(&id, _)| (nodes[&id].0, id))
+            .collect();
+        let mut out = Vec::new();
+        while let Some((_, id)) = heap.pop() {
+            let (_, parents, entry) = nodes.remove(&id).unwrap();
+            if let Some(e) = entry {
+                out.push(e);
+            }
+            for p in parents {
+                if let Some(d) = in_deg.get_mut(&p) {
+                    *d -= 1;
+                    if *d == 0 {
+                        heap.push((nodes[&p].0, p));
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    let mut truncated = server_has_more;
+    if let Some(l) = limit {
+        if entries.len() > l {
+            truncated = true;
+            if path_filter.is_some() {
+                searched = searched.saturating_sub(entries.len() - l);
+            }
+            entries.truncate(l);
+        }
+    }
+    if path_filter.is_some() && !truncated && !server_roots.is_empty() {
+        // When a path-filtered log walks to the root without stopping at
+        // `-n`, a full clone's `Searcher` visits every visible snapshot;
+        // ask `q/log` for the total visible snapshots from `server_roots`
+        // so `search.searched` matches.
+        let rev = server_roots.iter().map(ObjectId::hex).collect::<Vec<_>>().join(",");
+        let mut server_total = 0usize;
+        let mut after: Option<String> = None;
+        loop {
+            let mut params = vec![("n", "500".into())];
+            match &after {
+                Some(a) => params.push(("after", a.clone())),
+                None => params.push(("rev", rev.clone())),
+            }
+            let Ok(Ok(v)) = promisor.query("log", &params) else { break };
+            server_total += v["entries"].as_array().map_or(0, Vec::len);
+            after = v["next"].as_str().map(str::to_string);
+            if after.is_none() {
+                break;
+            }
+        }
+        if server_total > 0 {
+            searched = local_searcher.as_ref().map_or(0, |s| s.searched) + server_total;
+        }
+    }
+    // Fill in `change_short` on every parent from the entries we already
+    // have (or held snapshots), asking `q/show?stat=true` only for any
+    // parent beyond the page.
+    let mut known_changes: HashMap<ObjectId, String> = entries.iter().map(|e| (e.id, e.change_short.clone())).collect();
+    for e in &mut entries {
+        for p in &mut e.parents {
+            if p.change_short.is_some() {
+                continue;
+            }
+            if let Some(c) = known_changes.get(&p.id) {
+                p.change_short = Some(c.clone());
+                p.withheld = false;
+                continue;
+            }
+            if let Ok(Some(s)) = repo.held().snapshot(&p.id) {
+                let c = s.change_id.short();
+                known_changes.insert(p.id, c.clone());
+                p.change_short = Some(c);
+                p.withheld = false;
+                continue;
+            }
+            if let Ok(Ok(v)) = promisor.query("show", &[("rev", p.id.hex()), ("stat", "true".into())]) {
+                if let Some(c) = v["change_short"].as_str() {
+                    let c = c.to_string();
+                    known_changes.insert(p.id, c.clone());
+                    p.change_short = Some(c);
+                    p.withheld = false;
+                }
+            }
+        }
+    }
+    helper.truncated = truncated;
+    helper.precomputed_search = path_filter.map(|_| LogSearch { searched, skipped: 0, stopped: false });
+    helper.precomputed = Some(entries.into_iter());
+    Ok(Some(helper))
+}
+
 pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, mut q: LogQuery) -> Result<LogEntries<'a>> {
-    // A thin clone: the history it shows is a full clone's, paged in from
-    // the server where the walk reaches what it does not hold (`Exact`;
-    // `vl log` and `vl serve --local`'s `log` alike, BUG-1290).
+    let mut tags: HashMap<ObjectId, Vec<TagLabel>> = HashMap::new();
+    for (name, t) in &repo.view().tags {
+        tags.entry(t.target).or_default().push(TagLabel { name: name.clone() });
+    }
+    let mut remote_tags: HashMap<ObjectId, Vec<String>> = HashMap::new();
+    for (name, t) in &repo.view().remote_tags {
+        remote_tags.entry(*t).or_default().push(name.clone());
+    }
+    let mut workspaces: HashMap<ObjectId, Vec<String>> = HashMap::new();
+    for (name, w) in &repo.view().workspaces {
+        workspaces.entry(w.wc).or_default().push(name.clone());
+    }
+    let current = repo.view().workspaces.get(ws).map(|w| w.wc);
+    let root = repo.root_id();
+    let signers = repo.keys().known_signers();
+
+    if repo.is_partial() {
+        if let Some(path_filter) = thin_log_route(&q) {
+            let promisor = repo
+                .store()
+                .promisor()
+                .ok_or_else(|| veil_core::VeilError::Unavailable("this thin clone has no connection to its server".into()))?;
+            if let Some(entries) = thin_query_log(
+                repo,
+                &*promisor,
+                q.roots.clone(),
+                path_filter,
+                q.limit,
+                q.show_skipped,
+                signers.clone(),
+                tags.clone(),
+                remote_tags.clone(),
+                workspaces.clone(),
+                current,
+                root,
+            )? {
+                return Ok(entries);
+            }
+        }
+    }
+
+    // A thin clone with a local-only filter (`-r`, `-S`, `-G`, `--author`,
+    // `--signed-by`, `--agent`, multiple paths): the history it shows is a
+    // full clone's, paged in from the server where the walk reaches what it
+    // does not hold (`Exact`; BUG-1290).
     if repo.is_partial() && q.ids.is_none() {
         let most = if q.filter.as_ref().is_some_and(|f| !f.is_empty()) { None } else { q.limit.map(|l| l + 1) };
         q.ids = Some(repo.exact().run(|r| {
@@ -1003,32 +1611,22 @@ pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, mut q: LogQuery) -> Result
         first.truncate(l);
         ids = Box::new(first.into_iter().map(Ok));
     }
-    let mut tags: HashMap<ObjectId, Vec<TagLabel>> = HashMap::new();
-    for (name, t) in &repo.view().tags {
-        tags.entry(t.target).or_default().push(TagLabel { name: name.clone() });
-    }
-    let mut remote_tags: HashMap<ObjectId, Vec<String>> = HashMap::new();
-    for (name, t) in &repo.view().remote_tags {
-        remote_tags.entry(*t).or_default().push(name.clone());
-    }
-    let mut workspaces: HashMap<ObjectId, Vec<String>> = HashMap::new();
-    for (name, w) in &repo.view().workspaces {
-        workspaces.entry(w.wc).or_default().push(name.clone());
-    }
     Ok(LogEntries {
         repo,
+        precomputed: None,
         ids: ids.peekable(),
-        signers: repo.keys().known_signers(),
+        signers,
         tags,
         remote_tags,
         workspaces,
         // None in a bare repository (no workspace).
-        current: repo.view().workspaces.get(ws).map(|w| w.wc),
-        root: repo.root_id(),
+        current,
+        root,
         truncated,
         limit: q.limit,
         yielded: 0,
         searcher,
+        precomputed_search: None,
         show_skipped: q.show_skipped,
         max_changes: q.max_changes,
         skipped: 0,
@@ -1040,6 +1638,9 @@ impl Iterator for LogEntries<'_> {
     type Item = Result<LogEntry>;
 
     fn next(&mut self) -> Option<Result<LogEntry>> {
+        if let Some(pre) = &mut self.precomputed {
+            return pre.next().map(Ok);
+        }
         if self.searcher.is_none() {
             return Some(self.ids.next()?.map_err(Into::into).and_then(|id| self.entry(id)));
         }
@@ -1095,6 +1696,9 @@ impl LogEntries<'_> {
     /// How the search went (`None` without a filter). Complete once the
     /// iterator is done.
     pub fn search(&self) -> Option<LogSearch> {
+        if let Some(s) = &self.precomputed_search {
+            return Some(s.clone());
+        }
         self.searcher.as_ref().map(|s| LogSearch { searched: s.searched, skipped: self.skipped, stopped: self.stopped })
     }
 
@@ -2622,11 +3226,199 @@ pub struct BlameRequest<'a> {
     pub public: bool,
 }
 
+/// `vl blame` in a thin clone when `id` is on the server (S16,
+/// `docs/HUB.md` §13.34): answered from `q/blame` (paged if needed)
+/// without paging history into `.veil/objects/`. Returns `Ok(None)` if the
+/// file is a secret or a conflict on the server (so the local blame runs).
+fn thin_query_blame(
+    repo: &Repo,
+    promisor: &dyn veil_core::promisor::Promisor,
+    id: &ObjectId,
+    p: &VPath,
+    req: &BlameRequest<'_>,
+) -> Result<Option<BlameDoc>> {
+    let mut after = req.lines.map(|(a, _)| a.saturating_sub(1)).unwrap_or(0);
+    let to_line = req.lines.map(|(_, b)| b);
+    let mut lines: Vec<BlameLineDoc> = Vec::new();
+    let mut changes_by_id: HashMap<String, (i64, ObjectId, SnapshotRef)> = HashMap::new();
+    let mut coarse = false;
+    let mut visited = 0usize;
+    loop {
+        if let Some(to) = to_line {
+            if after >= to {
+                break;
+            }
+        }
+        let mut params = vec![
+            ("path", path(p)),
+            ("rev", id.hex()),
+            ("follow", req.follow.to_string()),
+            ("after", after.to_string()),
+        ];
+        if let Some(to) = to_line {
+            params.push(("n", (to - after).to_string()));
+        }
+        let v = match promisor.query("blame", &params)? {
+            Ok(v) => v,
+            Err((code, _)) if code == "bad_request" => return Ok(None),
+            Err((code, msg)) if code == "not_found" && msg.contains("revision") => return Ok(None),
+            Err((code, _)) if code == "no_path" || code == "not_found" => {
+                anyhow::bail!("{} does not exist in {}", crate::render::safe(p.as_str()), id.short());
+            }
+            Err((code, msg)) => anyhow::bail!("{msg} (server: {code})"),
+        };
+        coarse |= v["coarse"].as_bool().unwrap_or(false);
+        visited = visited.max(v["visited"].as_u64().unwrap_or(0) as usize);
+        let line_count = v["line_count"].as_u64().unwrap_or(0) as usize;
+        if let Some((a, _)) = req.lines {
+            if line_count < a && a > 1 {
+                anyhow::bail!("-L {a},…: {} has fewer than {a} lines", crate::render::safe(p.as_str()));
+            }
+        }
+        let mut authors_by_id: HashMap<String, String> = HashMap::new();
+        if let Some(ch_arr) = v["changes"].as_array() {
+            for c in ch_arr {
+                let Some(sid) = c["snapshot_id"].as_str() else { continue };
+                let Ok(oid) = ObjectId::from_hex(sid) else { continue };
+                if let Some(a) = c["author"].as_str() {
+                    authors_by_id.insert(sid.to_string(), a.to_string());
+                }
+                let sshort = c["snapshot_short"].as_str().unwrap_or_default().to_string();
+                let cid = c["change_id"].as_str().map(str::to_string);
+                let cshort = c["change_short"].as_str().map(str::to_string);
+                let ts = c["timestamp"].as_i64().unwrap_or(0);
+                let desc = c["description"]
+                    .as_str()
+                    .or_else(|| c["summary"].as_str())
+                    .map(str::to_string);
+                changes_by_id.entry(sid.to_string()).or_insert_with(|| {
+                    (
+                        ts,
+                        oid,
+                        SnapshotRef {
+                            snapshot_id: sid.to_string(),
+                            snapshot_short: sshort,
+                            change_id: cid,
+                            change_short: cshort,
+                            available: true,
+                            empty: false,
+                            description: desc,
+                        },
+                    )
+                });
+            }
+        }
+        if let Some(l_arr) = v["lines"].as_array() {
+            for r in l_arr {
+                let line_no = r["line"].as_u64().unwrap_or(1) as usize;
+                let text = r["text"].as_str().unwrap_or_default().to_string();
+                let snap = r["snapshot"]
+                    .as_str()
+                    .or_else(|| r["snapshot_id"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let cshort = r["change_short"].as_str().map(str::to_string);
+                let orig_path = r["path"].as_str().unwrap_or(p.as_str()).to_string();
+                let ch_entry = changes_by_id.get(&snap);
+                let cid = r["change"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| ch_entry.and_then(|(_, _, sr)| sr.change_id.clone()));
+                let ts_ms = ch_entry.map(|(ts, _, _)| *ts).unwrap_or(0);
+                let author = authors_by_id.get(&snap).cloned();
+                lines.push(BlameLineDoc {
+                    line: line_no,
+                    text,
+                    change: cid,
+                    change_short: cshort,
+                    snapshot: Some(snap),
+                    path: Some(orig_path),
+                    author,
+                    timestamp: rfc3339(ts_ms),
+                    unattributed: None,
+                    timestamp_ms: ts_ms,
+                });
+            }
+        }
+        match v["next"].as_u64() {
+            Some(next) => after = next as usize,
+            None => break,
+        }
+    }
+    let rev_ref = snapshot_ref_thin(repo, promisor, id);
+    if !changes_by_id.is_empty() {
+        // A full clone's `blame` walks every snapshot along the history
+        // down to the snapshot where the last line was attributed,
+        // including commits that did not touch this file; ask `q/log` from
+        // `id` down to the oldest change in `changes_by_id` so `visited`
+        // matches.
+        let mut remaining: std::collections::HashSet<&str> = changes_by_id.keys().map(String::as_str).collect();
+        let mut walk_count = 0usize;
+        let mut log_after: Option<String> = None;
+        let mut found_all = false;
+        'log_walk: loop {
+            let mut params = vec![("n", "500".into())];
+            match &log_after {
+                Some(a) => params.push(("after", a.clone())),
+                None => params.push(("rev", id.hex())),
+            }
+            let Ok(Ok(v)) = promisor.query("log", &params) else { break };
+            if let Some(arr) = v["entries"].as_array() {
+                for item in arr {
+                    walk_count += 1;
+                    if let Some(sid) = item["snapshot_id"].as_str() {
+                        remaining.remove(sid);
+                        if remaining.is_empty() {
+                            found_all = true;
+                            break 'log_walk;
+                        }
+                    }
+                }
+            }
+            log_after = v["next"].as_str().map(str::to_string);
+            if log_after.is_none() {
+                break;
+            }
+        }
+        if found_all {
+            visited = walk_count;
+        }
+    }
+    let mut stamped: Vec<(i64, ObjectId, SnapshotRef)> = changes_by_id.into_values().collect();
+    stamped.sort_by_key(|a| std::cmp::Reverse((a.0, a.1)));
+    Ok(Some(BlameDoc {
+        schema: BLAME_SCHEMA,
+        path: path(p),
+        rev: rev_ref,
+        public: req.public,
+        coarse,
+        stopped: None,
+        visited,
+        unattributed: 0,
+        lines,
+        changes: stamped.into_iter().map(|(_, _, sr)| sr).collect(),
+    }))
+}
+
 pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
     use veil_core::blame::{BlameOptions, Origin, Stop, Unattributed};
     let repo = &ctx.repo;
     let id = ctx.rev(req.rev)?;
     let p = ctx.repo_path(req.path)?;
+    if let Some((a, b)) = req.lines {
+        if a == 0 || b < a {
+            anyhow::bail!("-L {a},{b}: give START,END with 1 <= START <= END");
+        }
+    }
+    if repo.is_partial() && !req.public && req.max_changes >= 100_000 && repo.store().is_servers(&id)? {
+        let promisor = repo
+            .store()
+            .promisor()
+            .ok_or_else(|| veil_core::VeilError::Unavailable("this thin clone has no connection to its server".into()))?;
+        if let Some(doc) = thin_query_blame(repo, &*promisor, &id, &p, req)? {
+            return Ok(doc);
+        }
+    }
     let tree = repo.snapshot(&id)?.tree;
     let reader = if req.public { Reader::Public } else { Reader::Me };
     let e = match crate::render::lookup_shown(repo, &tree, &p)? {
@@ -2643,11 +3435,6 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
             "{}",
             why.unwrap_or_else(|| format!("{} cannot be read as the public sees it (it is not public)", crate::render::safe(p.as_str())))
         );
-    }
-    if let Some((a, b)) = req.lines {
-        if a == 0 || b < a {
-            anyhow::bail!("-L {a},{b}: give START,END with 1 <= START <= END");
-        }
     }
     let o = BlameOptions {
         reader,
@@ -2795,14 +3582,194 @@ pub struct GrepRequest<'a> {
     pub opts: veil_core::grep::GrepOptions,
 }
 
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '#' | '&' | '-' | '~') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `vl grep` in a thin clone when `id` is on the server (S16,
+/// `docs/HUB.md` §13.34): answered from `q/grep` (paged through every page)
+/// without fetching every file into `.veil/cache/`.
+fn thin_query_grep(
+    repo: &Repo,
+    promisor: &dyn veil_core::promisor::Promisor,
+    id: &ObjectId,
+    pattern: &str,
+    opts: &veil_core::grep::GrepOptions,
+) -> Result<Option<GrepDoc>> {
+    if opts.text || opts.paths.len() > 1 {
+        return Ok(None);
+    }
+    let body = if opts.fixed { regex_escape(pattern) } else { pattern.to_string() };
+    let body = if opts.word { format!("(?-u:(?:^|[^A-Za-z0-9_]))(?:{body})(?-u:(?:[^A-Za-z0-9_]|$))") } else { body };
+    if body.len() > 4_096 {
+        return Ok(None);
+    }
+    let rev_arg = id.hex();
+    let path_arg = opts.paths.first().filter(|p| !p.is_root()).map(|p| p.as_str().to_string());
+
+    let mut matches: Vec<GrepMatchDoc> = Vec::new();
+    let mut files: Vec<GrepFileDoc> = Vec::new();
+    let mut searched = 0usize;
+    let mut server_sealed = 0usize;
+    let mut after: Option<String> = None;
+    loop {
+        let mut params = vec![("pattern", body.clone()), ("rev", rev_arg.clone()), ("n", "1000".into())];
+        if opts.ignore_case {
+            params.push(("i", "true".into()));
+        }
+        if let Some(p) = &path_arg {
+            params.push(("path", p.clone()));
+        }
+        if let Some(a) = &after {
+            params.push(("after", a.clone()));
+        }
+        let v = match promisor.query("grep", &params)? {
+            Ok(v) => v,
+            Err((code, msg)) if code == "not_found" && msg.contains("revision") => return Ok(None),
+            Err((code, _)) if code == "no_path" || code == "not_found" => break,
+            Err((code, msg)) => anyhow::bail!("{msg} (server: {code})"),
+        };
+        searched += v["searched"].as_u64().unwrap_or(0) as usize;
+        server_sealed += v["sealed"].as_u64().unwrap_or(0) as usize;
+        if let Some(f_arr) = v["files"].as_array() {
+            for f in f_arr {
+                let Some(fp) = f["path"].as_str() else { continue };
+                let file_matches = f["matches"].as_u64().unwrap_or(0) as usize;
+                if file_matches == 0 {
+                    continue;
+                }
+                let max = opts.max_count.unwrap_or(usize::MAX);
+                if max == 0 {
+                    continue;
+                }
+                let count = file_matches.min(max);
+                files.push(GrepFileDoc {
+                    path: fp.to_string(),
+                    tier: "public",
+                    scope: None,
+                    count,
+                    binary: false,
+                    conflict: false,
+                });
+                if let Some(l_arr) = f["lines"].as_array() {
+                    for l in l_arr.iter().take(count) {
+                        let line_no = l["line"].as_u64().unwrap_or(1) as usize;
+                        let text = l["text"].as_str().unwrap_or_default().to_string();
+                        matches.push(GrepMatchDoc {
+                            path: fp.to_string(),
+                            line: line_no,
+                            text,
+                            tier: "public",
+                            truncated: false,
+                        });
+                    }
+                }
+            }
+        }
+        after = v["next"].as_str().map(str::to_string);
+        if after.is_none() {
+            break;
+        }
+    }
+    let mut skipped_sealed = 0usize;
+    let mut skipped_binary = 0usize;
+    let mut skipped_too_large = 0usize;
+    if server_sealed > 0 {
+        let re = veil_core::grep::compile(pattern, opts)?;
+        // The server never decrypts secret files; walk the snapshot's tree
+        // (held or fetched via `fetch`, never paging history via `history`)
+        // to grep only the sealed entries locally with our keys.
+        let tree_id = match repo.held().snapshot(id)? {
+            Some(s) => Some(s.tree),
+            None => {
+                let w = veil_core::promisor::Located { snapshot: *id, path: String::new(), id: *id, chain: None };
+                promisor
+                    .fetch_objects(&[w])?
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .and_then(|raw| match veil_core::object::Object::decode(&raw).ok()? {
+                        veil_core::object::Object::Snapshot(s) => Some(s.tree),
+                        _ => None,
+                    })
+            }
+        };
+        if let Some(tree_id) = tree_id {
+            let (all_files, _) = veil_core::tree::walk_files_hiding(repo.store(), &tree_id)?;
+            let sealed_entries: Vec<(VPath, TreeEntry)> = all_files
+                .into_iter()
+                .filter(|(p, e)| !e.visibility.is_public() && under(&opts.paths, p, false))
+                .collect();
+            for (fp, _e) in sealed_entries {
+                let mut single_opts = opts.clone();
+                single_opts.paths = vec![fp.clone()];
+                let g = veil_core::grep::grep(repo.store(), &tree_id, &re, &single_opts)?;
+                skipped_sealed += g.skipped.sealed;
+                skipped_binary += g.skipped.binary;
+                skipped_too_large += g.skipped.too_large;
+                for f in &g.files {
+                    let scope = match &f.tier {
+                        veil_core::grep::Tier::Cloaked(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    let tier = f.tier.as_str();
+                    files.push(GrepFileDoc {
+                        path: path(&f.path),
+                        tier,
+                        scope,
+                        count: f.count,
+                        binary: f.binary,
+                        conflict: f.conflict,
+                    });
+                    for l in &f.lines {
+                        matches.push(GrepMatchDoc {
+                            path: path(&f.path),
+                            line: l.number,
+                            text: String::from_utf8_lossy(&l.text).into_owned(),
+                            tier,
+                            truncated: l.truncated,
+                        });
+                    }
+                }
+            }
+            files.sort_by(|a, b| a.path.split('/').cmp(b.path.split('/')));
+            matches.sort_by(|a, b| a.path.split('/').cmp(b.path.split('/')).then_with(|| a.line.cmp(&b.line)));
+        }
+    }
+    Ok(Some(GrepDoc {
+        schema: GREP_SCHEMA,
+        rev: snapshot_ref_thin(repo, promisor, id),
+        matches,
+        files,
+        skipped: GrepSkipped { sealed: skipped_sealed, binary: skipped_binary, too_large: skipped_too_large, hidden_folders: 0 },
+        searched,
+    }))
+}
+
 pub fn grep(ctx: &Ctx, req: GrepRequest<'_>) -> Result<GrepDoc> {
     use veil_core::grep::Tier;
     let repo = &ctx.repo;
     let id = ctx.rev(req.rev)?;
-    let tree = repo.snapshot(&id)?.tree;
     let mut o = req.opts;
     o.paths = req.paths.iter().map(|p| ctx.repo_path(p)).collect::<Result<_>>()?;
     let re = veil_core::grep::compile(req.pattern, &o)?;
+    if repo.is_partial() && o.reader == Reader::Me && repo.store().is_servers(&id)? {
+        let promisor = repo
+            .store()
+            .promisor()
+            .ok_or_else(|| veil_core::VeilError::Unavailable("this thin clone has no connection to its server".into()))?;
+        if let Some(doc) = thin_query_grep(repo, &*promisor, &id, req.pattern, &o)? {
+            return Ok(doc);
+        }
+    }
+    let tree = repo.snapshot(&id)?.tree;
     let g = veil_core::grep::grep(repo.store(), &tree, &re, &o)?;
     let embargo = EmbargoTiers::of(repo, &id)?;
     let mut matches = Vec::new();

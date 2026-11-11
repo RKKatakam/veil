@@ -1955,3 +1955,214 @@ fn s3rd3_a_thin_clone_names_its_old_versions_after_the_viewer_graph_is_cleared()
     sql(&admin_url, format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"));
     assert!(diffs.is_empty(), "after the viewer graph is cleared, a thin clone names its old versions otherwise than a full clone:\n{}", diffs.join("\n"));
 }
+
+// ---- S16: `vl` over the server's query API (`docs/HUB.md` §13.34) ---------------
+
+/// Guarantees 1 and 2 of S16: on a server project, `vl log`, `vl log --
+/// PATH`, `vl log --follow -- PATH`, `vl blame`, and `vl grep` in a thin
+/// clone are answered by the server's query API (`/q/…`) without paging
+/// history in (the thin clone's store continues to hold only the branch tip
+/// and its own working copy), and every answer equals the answer computed
+/// from the viewer's own full clone (their projected view), for an admin, a
+/// member, an outsider, and a narrowed agent session (which gets only its
+/// paths, and nothing hidden reaches the client: paths, names, counts, or
+/// content).
+#[test]
+fn s16_vl_queries_equal_the_viewers_own_view_without_paging_history() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    // Build a richer history on `p.dir` with renames, multiple files in
+    // `src/api/` and `src/other/`, and hidden changes in `bill-…/`.
+    write_files(
+        &p.dir,
+        &[
+            ("src/api/old.rs", "pub fn handle() -> usize {\n    let token = \"API-TOKEN-101\";\n    42\n}\n"),
+            ("src/other/util.rs", "pub fn helper() -> &'static str {\n    \"OUTSIDE-NARROW-202\"\n}\n"),
+        ],
+    );
+    p.admin.commit_main(&p.dir, "add api and other");
+    write_files(
+        &p.dir,
+        &[(
+            "src/api/old.rs",
+            "pub fn handle() -> usize {\n    let token = \"API-TOKEN-101\";\n    let step = 2;\n    42 + step\n}\n",
+        )],
+    );
+    p.admin.commit_main(&p.dir, "refine api handle");
+    std::fs::remove_file(p.dir.join("src/api/old.rs")).unwrap();
+    write_files(
+        &p.dir,
+        &[(
+            "src/api/handler.rs",
+            "pub fn handle() -> usize {\n    let token = \"API-TOKEN-101\";\n    let step = 3;\n    42 + step\n}\n",
+        )],
+    );
+    p.admin.commit_main(&p.dir, "rename old.rs to handler.rs");
+    write_files(&p.dir, &[(&format!("{BILL_DIR}/acme/invoice.txt"), &format!("{BILL_MARK}\nthird-secret-line\n"))]);
+    p.admin.commit_main(&p.dir, DESC_MARK);
+    for i in 0..4 {
+        write_files(
+            &p.dir,
+            &[(
+                "src/api/handler.rs",
+                &format!("pub fn handle() -> usize {{\n    let token = \"API-TOKEN-101\";\n    let step = {};\n    42 + step\n}}\n", 10 + i),
+            )],
+        );
+        p.admin.commit_main(&p.dir, &format!("api iteration {i}"));
+    }
+    p.admin.ok(&p.dir, &["push"]);
+
+    let snapshots_held = |dir: &Path| -> usize {
+        let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(dir)), None, "test").unwrap();
+        let main_snaps = repo
+            .store()
+            .list_objects()
+            .unwrap()
+            .into_iter()
+            .filter(|id| matches!(repo.store().get(id), Ok(Object::Snapshot(_))))
+            .count();
+        let cache_snaps = repo
+            .store()
+            .cache()
+            .map(|c| c.list_objects().unwrap().into_iter().filter(|id| matches!(c.get(id), Ok(Object::Snapshot(_)))).count())
+            .unwrap_or(0);
+        main_snaps + cache_snaps
+    };
+
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    let cmds = vec![
+        s(&["log", "--json"]),
+        s(&["log", "--json", "-n", "3"]),
+        s(&["log", "--json", "-r", "::main"]),
+        s(&["log", "--json", "--", "src/api/handler.rs"]),
+        s(&["log", "--json", "--follow", "--", "src/api/handler.rs"]),
+        s(&["blame", "src/api/handler.rs", "-r", "main", "--json"]),
+        s(&["blame", "--follow", "src/api/handler.rs", "-r", "main", "--json"]),
+        s(&["grep", "API-TOKEN-101", "-r", "main", "--json"]),
+        s(&["grep", "-i", "api-token-101", "-r", "main", "--json"]),
+        s(&["grep", "step", "-r", "main", "--json", "src/api"]),
+    ];
+
+    let anyone = hub.anyone();
+    for (label, who, forbidden) in [
+        ("admin", &p.admin, Vec::<&str>::new()),
+        ("dev", &p.dev, restricted_markers()),
+        ("anyone", &anyone, restricted_markers()),
+    ] {
+        let full = who.dir(&format!("s16-full-{label}"));
+        who.ok(who.home.path(), &["clone", "--full", &hub.url(&p.name), full.to_str().unwrap()]);
+        let thin = who.dir(&format!("s16-thin-{label}"));
+        who.ok(who.home.path(), &["clone", &hub.url(&p.name), thin.to_str().unwrap()]);
+        let before_snaps = snapshots_held(&thin);
+        assert!(before_snaps <= 4, "{label}: thin clone starts with {before_snaps} snapshots");
+        for cmd in &cmds {
+            let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            let want = answer(who, &full, &args);
+            let got = answer(who, &thin, &args);
+            assert!(want.0, "{label}: `vl {}` failed in full clone:\n{}", args.join(" "), want.1);
+            assert_eq!(got, want, "{label}: `vl {}` in thin clone differs from full clone", args.join(" "));
+            let mut seen = everything_in(&thin);
+            seen.push((format!("stdout of vl {}", args.join(" ")), got.1.into_bytes()));
+            assert_no_marker(&seen, &forbidden, label);
+        }
+        let after_snaps = snapshots_held(&thin);
+        assert_eq!(
+            after_snaps, before_snaps,
+            "{label}: query commands paged history into the thin clone ({before_snaps} -> {after_snaps} snapshots)"
+        );
+    }
+
+    // A narrowed agent session of `dev` (narrowed to `src/api/`): sees
+    // `src/api/handler.rs` and is refused on `src/other/util.rs` or whole-tree
+    // queries outside its narrowing, never leaking `OUTSIDE-NARROW-202` or any
+    // restricted marker.
+    let r = hub.api().post_json(
+        Some(&p.dev.token()),
+        "/v1/sessions/agent",
+        &serde_json::json!({
+            "project": p.name,
+            "attribution": {"agent": "claude-code/2.3", "task": "TASK-S16"},
+            "only": ["src/api/"]
+        }),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let agent_tok = r.json()["token"].as_str().unwrap().to_string();
+    let dev_thin = p.dev.dir("s16-thin-dev");
+    let run_agent = |args: &[&str]| -> (bool, String) {
+        let mut c = p.dev.command(&dev_thin, args);
+        c.env("VEIL_TOKEN", &agent_tok);
+        let o = c.output().unwrap();
+        let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        (o.status.success(), out)
+    };
+    let (ok, grep_in) = run_agent(&["--no-snapshot", "grep", "202|101", "-r", "main", "--json", "src/api"]);
+    assert!(ok, "agent grep inside its paths failed: {grep_in}");
+    assert!(grep_in.contains("API-TOKEN-101"), "agent grep missed its own path: {grep_in}");
+    assert!(!grep_in.contains("OUTSIDE-NARROW-202") && !grep_in.contains("src/other"), "agent grep leaked outside path: {grep_in}");
+    let (ok_wide, wide_err) = run_agent(&["--no-snapshot", "grep", "202|101", "-r", "main", "--json"]);
+    assert!(!ok_wide && wide_err.contains("narrowed"), "agent grep without path should be refused: {wide_err}");
+    let (ok_outside, outside_err) = run_agent(&["--no-snapshot", "blame", "src/other/util.rs", "-r", "main"]);
+    assert!(!ok_outside && outside_err.contains("narrowed"), "agent blame outside its paths should be refused: {outside_err}");
+    let mut agent_forbidden = restricted_markers();
+    agent_forbidden.push("OUTSIDE-NARROW-202");
+    agent_forbidden.push("util.rs");
+    let seen = vec![
+        ("agent grep in".into(), grep_in.into_bytes()),
+        ("agent grep wide err".into(), wide_err.into_bytes()),
+        ("agent blame err".into(), outside_err.into_bytes()),
+    ];
+    assert_no_marker(&seen, &agent_forbidden, "narrowed agent");
+}
+
+/// Guarantee 3 of S16: when the server is unreachable or answers `warming`
+/// (`503`), `vl log`, `vl blame`, and `vl grep` say so clearly and never
+/// show a partial history as complete.
+#[test]
+fn s16_unreachable_or_warming_server_is_reported_clearly() {
+    let hub = TestHub::start();
+    let (admin, _dir, name) = project_with_history(&hub, 6, 10);
+    let thin = admin.dir("thin-s16-err");
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+
+    // 1. Server answers `503 warming` when the viewer graph is cleared and
+    // synchronous derivation is held back by an active lease in `view_fills`.
+    let pid: i64 = hub.rt.block_on(async {
+        sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+            .bind(&name)
+            .fetch_one(&hub.hub().db)
+            .await
+            .unwrap()
+    });
+    hub.rt.block_on(async {
+        sqlx::query("DELETE FROM view_graph WHERE project_id = $1").bind(pid).execute(&hub.hub().db).await.unwrap();
+        sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, 'admin', 'other-server', $2)")
+            .bind(pid)
+            .bind(veil_core::now_millis() + 600_000)
+            .execute(&hub.hub().db)
+            .await
+            .unwrap();
+    });
+    hub.hub().query.rows.clear();
+
+    for cmd in [&["log"][..], &["log", "--", "src/lib.rs"][..], &["blame", "src/lib.rs", "-r", "main"][..], &["grep", "fn", "-r", "main"][..]] {
+        let mut c = admin.command(&thin, cmd);
+        c.env("VEIL_QUERY_RETRIES", "0");
+        let o = c.output().unwrap();
+        let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(!o.status.success(), "`vl {}` succeeded on a warming server:\n{out}", cmd.join(" "));
+        assert!(
+            out.contains("being prepared") || out.contains("warming") || out.contains("try again"),
+            "`vl {}` did not clearly report warming:\n{out}",
+            cmd.join(" ")
+        );
+    }
+
+    // 2. Server is unreachable: every query command fails naming the server
+    // (`could not be reached`) and never prints a partial history as complete.
+    drop(hub);
+    for cmd in [&["log"][..], &["log", "--", "src/lib.rs"][..], &["blame", "src/lib.rs", "-r", "main"][..], &["grep", "fn", "-r", "main"][..]] {
+        let err = admin.fails(&thin, cmd);
+        assert!(err.contains("could not be reached"), "`vl {}` with unreachable server:\n{err}", cmd.join(" "));
+    }
+}
+

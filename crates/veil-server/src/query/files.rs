@@ -59,7 +59,7 @@ use super::{
 };
 use crate::{
     derive::{
-        blame::{step, Blame, Meta, Origin, Text},
+        blame::{Blame, Meta, Origin, Text},
         changes::{self, path_key},
     },
     error::{Error, Result},
@@ -76,7 +76,7 @@ pub const CHECKPOINT: u64 = 32;
 const MAX_LINES: usize = MAX_TEXT_BYTES as usize;
 /// Rows of one path read per statement: few first (the version asked for
 /// is usually near), then more.
-const PAGES: [i64; 4] = [8, 64, 512, 1000];
+const PAGES: [i64; 3] = [64, 512, 10_000];
 /// Rows per insert statement.
 const ROWS_PER_STATEMENT: usize = 500;
 /// Rows a fill remembers before it forgets them (they are written by
@@ -96,6 +96,86 @@ pub struct FChange {
     /// snapshot that last changed the path along that parent's first
     /// parents (`None`: never).
     pub prev: Vec<Option<(i64, ObjectId)>>,
+}
+
+impl FChange {
+    fn parse(s: &str) -> Result<FChange> {
+        if let Some(fc) = Self::parse_fast(s) {
+            return Ok(fc);
+        }
+        serde_json::from_str(s).map_err(bad)
+    }
+
+    fn parse_fast(s: &str) -> Option<FChange> {
+        let rest = s.strip_prefix("{\"old\":")?;
+        let (old, rest) = Self::parse_opt_entry(rest)?;
+        let rest = rest.strip_prefix(",\"new\":")?;
+        let (new, rest) = Self::parse_opt_entry(rest)?;
+        let rest = rest.strip_prefix(",\"prev\":[")?;
+        let rest = rest.strip_suffix("]}")?;
+        let mut prev = Vec::with_capacity(1);
+        if !rest.is_empty() {
+            for item in rest.split("],[") {
+                let item = item.trim_start_matches('[').trim_end_matches(']');
+                if item == "null" {
+                    prev.push(None);
+                } else {
+                    let (d_str, id_str) = item.split_once(',')?;
+                    let d: i64 = d_str.parse().ok()?;
+                    let hex = id_str.strip_prefix('"')?.strip_suffix('"')?;
+                    let id = ObjectId::from_hex(hex).ok()?;
+                    prev.push(Some((d, id)));
+                }
+            }
+        }
+        Some(FChange { old, new, prev })
+    }
+
+    fn parse_opt_entry(s: &str) -> Option<(Option<TreeEntry>, &str)> {
+        if let Some(rest) = s.strip_prefix("null") {
+            return Some((None, rest));
+        }
+        let rest = s.strip_prefix("{\"name\":\"")?;
+        let name_end = rest.find('"')?;
+        let name = &rest[..name_end];
+        if name.as_bytes().contains(&b'\\') {
+            return None;
+        }
+        let rest = &rest[name_end + 1..];
+        let rest = rest.strip_prefix(",\"kind\":\"")?;
+        let kind_end = rest.find('"')?;
+        let kind = match &rest[..kind_end] {
+            "file" => EntryKind::File,
+            "dir" => EntryKind::Dir,
+            "symlink" => EntryKind::Symlink,
+            _ => return None,
+        };
+        let rest = &rest[kind_end + 1..];
+        let rest = rest.strip_prefix(",\"id\":\"")?;
+        if rest.len() < 65 || rest.as_bytes()[64] != b'"' {
+            return None;
+        }
+        let id = ObjectId::from_hex(&rest[..64]).ok()?;
+        let mut rest = &rest[65..];
+        let mut size = 0u64;
+        if let Some(r) = rest.strip_prefix(",\"size\":") {
+            let end = r.find([',', '}'])?;
+            size = r[..end].parse().ok()?;
+            rest = &r[end..];
+        }
+        let rest = rest.strip_prefix('}')?;
+        Some((
+            Some(TreeEntry {
+                name: name.to_string(),
+                kind,
+                id,
+                size,
+                executable: false,
+                visibility: veil_core::object::Visibility::Public,
+            }),
+            rest,
+        ))
+    }
 }
 
 // ---- filling ----------------------------------------------------------------------
@@ -222,7 +302,8 @@ impl Fill {
 // ---- reading ----------------------------------------------------------------------
 
 /// Rows of one path read so far, from below `top` down, deepest first.
-struct Window {
+#[derive(Clone)]
+pub struct Window {
     top: (i64, ObjectId),
     rows: Vec<(i64, ObjectId, Arc<FChange>)>,
     at: HashMap<ObjectId, usize>,
@@ -237,6 +318,9 @@ pub struct Files<'g, 'a> {
     /// About the bytes of the rows its windows hold (a blame job counts
     /// them against its bound: BUG-1219).
     loaded: std::cell::Cell<usize>,
+    /// Start windows at page size `PAGES[1]` (512 rows) instead of `PAGES[0]` (64)
+    /// when a blame job has ample memory budget.
+    fast_pages: std::cell::Cell<bool>,
 }
 
 fn top_of(depth: i64) -> (i64, ObjectId) {
@@ -249,12 +333,29 @@ impl<'g, 'a> Files<'g, 'a> {
             g,
             windows: RefCell::new(HashMap::new()),
             loaded: std::cell::Cell::new(0),
+            fast_pages: std::cell::Cell::new(false),
         }
+    }
+
+    pub fn set_fast_pages(&self, fast: bool) {
+        self.fast_pages.set(fast);
+    }
+
+    pub fn take_window(&self, path: &str) -> Option<(Window, usize)> {
+        let key = path_key(path);
+        self.windows.borrow_mut().remove(&key).map(|w| (w, self.loaded.get()))
+    }
+
+    pub fn seed_window(&self, path: &str, w: Window, loaded: usize) {
+        let key = path_key(path);
+        self.loaded.set(self.loaded.get() + loaded);
+        self.windows.borrow_mut().insert(key, w);
     }
 
     /// Read the next page of `path`'s window.
     fn more(&self, w: &mut Window, key: &str) -> Result<()> {
-        let limit = PAGES[w.pages.min(PAGES.len() - 1)];
+        let p_idx = if self.fast_pages.get() { PAGES.len() - 1 } else { w.pages.min(PAGES.len() - 1) };
+        let limit = PAGES[p_idx];
         w.pages += 1;
         let (d, s) = w.rows.last().map(|(d, s, _)| (*d, *s)).unwrap_or(w.top);
         let cx = self.g.cx;
@@ -279,7 +380,7 @@ impl<'g, 'a> Files<'g, 'a> {
             // The row as held: its entries' names, its parents and the
             // window's slot and index entry.
             self.loaded.set(self.loaded.get() + 192 + c.len());
-            let c: FChange = serde_json::from_str(&c).map_err(bad)?;
+            let c = FChange::parse(&c)?;
             w.at.insert(s, w.rows.len());
             w.rows.push((d, s, Arc::new(c)));
         }
@@ -335,7 +436,7 @@ impl<'g, 'a> Files<'g, 'a> {
                 .bind(id.hex())
                 .fetch_optional(&cx.hub().db)
             })?;
-            return c.map(|c| serde_json::from_str(&c).map(Arc::new).map_err(bad)).transpose();
+            return c.map(|c| FChange::parse(&c).map(Arc::new)).transpose();
         }
         let mut w = self.window(path, depth);
         // Far below the rows read so far: a window of its own, so that
@@ -566,6 +667,8 @@ pub struct Blamer<'f, 'g, 'a, 'h, 'b> {
     /// Every path the job's blames name, interned once (S14 cycle 3), and
     /// the bytes they take.
     paths: HashMap<String, Arc<str>>,
+    /// Cached `path_key` per interned path pointer.
+    path_keys: HashMap<*const u8, String>,
     path_bytes: usize,
     /// What an answer shows of each snapshot the job's blames name.
     metas: HashMap<ObjectId, Arc<Meta>>,
@@ -583,6 +686,7 @@ pub struct Blamer<'f, 'g, 'a, 'h, 'b> {
     writes: Vec<(String, ObjectId, Vec<u8>, String)>,
     write_paths: HashMap<String, String>,
     pending_bytes: usize,
+    total_kept_bytes: Option<i64>,
 }
 
 impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
@@ -594,6 +698,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             limits,
             kept: HashMap::new(),
             paths: HashMap::new(),
+            path_keys: HashMap::new(),
             path_bytes: 0,
             metas: HashMap::new(),
             renames: HashMap::new(),
@@ -602,6 +707,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             writes: Vec::new(),
             write_paths: HashMap::new(),
             pending_bytes: 0,
+            total_kept_bytes: None,
         }
     }
 
@@ -621,6 +727,9 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     .bind(self.follow)
                     .fetch_all(&cx.hub().db)
             })?;
+            if self.total_kept_bytes.is_none() && rows.is_empty() && self.kept.is_empty() {
+                self.total_kept_bytes = Some(0);
+            }
             let set = rows.iter().map(|s| ObjectId::from_hex(s).map_err(bad)).collect::<Result<_>>()?;
             self.kept.insert(key.clone(), set);
         }
@@ -651,6 +760,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         }
         let a: Arc<str> = Arc::from(p);
         self.path_bytes += 64 + p.len();
+        self.path_keys.insert(Arc::as_ptr(&a) as *const u8, path_key(p));
         self.paths.insert(p.to_string(), a.clone());
         a
     }
@@ -722,10 +832,10 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         }
         let e = e.as_ref().unwrap();
         let (blob, bytes) = self.t.content(&e.id)?;
-        if !blob || bytes.len() as u64 > MAX_TEXT_BYTES || bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+        if !blob || bytes.len() as u64 > MAX_TEXT_BYTES {
             return Ok(None);
         }
-        Ok(Some(Text::new(e.id, bytes)))
+        Ok(Text::try_plain(e.id, bytes))
     }
 
     /// A blame job: blame version `start` (and keep it), walking down to
@@ -740,7 +850,9 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         Ok(out)
     }
 
+    #[allow(clippy::type_complexity)]
     fn run(&mut self, start: &Version) -> Result<Done> {
+        self.f.fast_pages.set(self.limits.held >= 4 << 20);
         // Down: the versions to compute, parents before children, each
         // once, stopping at kept blames.
         let mut nodes: HashMap<Version, Node> = HashMap::new();
@@ -805,56 +917,578 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         // version above it is computed; kept as it goes.
         let mut done: HashMap<Version, Done> = HashMap::new();
         let computed = nodes.values().filter(|n| !n.kept).count() as u64;
-        for v in order {
-            let (change, parents, kept) = {
-                let n = &nodes[&v];
-                (n.change.clone(), n.parents.clone(), n.kept)
-            };
-            let out: Done = if kept {
-                match (self.kept_blame(&v)?, self.text(&change.new)?) {
-                    (Some(b), Some(t)) if t.lines.len() == b.lines.len() => Some((t, Arc::new(b))),
-                    (Some(_), Some(_)) => return Err(bad("a kept blame does not match its version")),
-                    (_, None) => None,
-                    // Dropped since (the view key's cap): computed again,
-                    // from scratch below it.
-                    (None, Some(_)) => return Err(Error::new(StatusCode::SERVICE_UNAVAILABLE, "warming", "this blame is being prepared; try again in a few seconds")),
-                }
-            } else {
-                match self.text(&change.new)? {
-                    None => None,
-                    Some(text) => {
-                        let inputs: Vec<Option<(&Text, &Blame)>> =
-                            parents.iter().map(|p| p.as_ref().and_then(|p| done.get(p)).and_then(|d| d.as_ref()).map(|(t, b)| (&**t, &**b))).collect();
-                        self.stopped()?;
-                        let me: Origin = (v.id, self.intern(&v.path), self.meta(&v.id)?);
-                        let (b, _) = step(&me, &text, &inputs);
-                        self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let b = Arc::new(b);
-                        if (b.vd % spacing(computed, b.stored_estimate()) == 0 || v == *start) && !self.keep(&v, &b) && v == *start {
-                            return Err(too_large());
-                        }
-                        Some((text, b))
-                    }
-                }
+        // First load the kept blames at the bottom of the walk.
+        for v in &order {
+            let n = &nodes[v];
+            if !n.kept {
+                continue;
+            }
+            let out: Done = match (self.kept_blame(v)?, self.text(&n.change.new)?) {
+                (Some(b), Some(t)) if t.lines.len() == b.lines.len() => Some((t, Arc::new(b))),
+                (Some(_), Some(_)) => return Err(bad("a kept blame does not match its version")),
+                (_, None) => None,
+                // Dropped since (the view key's cap): computed again,
+                // from scratch below it.
+                (None, Some(_)) => return Err(Error::new(StatusCode::SERVICE_UNAVAILABLE, "warming", "this blame is being prepared; try again in a few seconds")),
             };
             if let Some((t, b)) = &out {
                 held += t.weight() + b.weight();
-            }
-            for p in parents.iter().flatten() {
-                let pn = nodes.get_mut(p).unwrap();
-                pn.left -= 1;
-                if pn.left == 0 && p != start {
-                    if let Some(Some((t, b))) = done.remove(p) {
-                        held -= t.weight() + b.weight();
-                    }
-                }
             }
             done.insert(v.clone(), out);
             if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held {
                 return Err(too_wide());
             }
-            if self.writes.len() >= BATCH_BLAMES || self.pending_bytes >= self.batch_bytes() {
-                self.write()?;
+        }
+        // Process unkept versions in chunks so texts, snapshot metadata, and
+        // parent-to-child line diffs are computed in parallel across a bounded
+        // pool while keeping memory strictly within `self.limits.held`.
+        let unkept: Vec<Version> = order.into_iter().filter(|v| !nodes[v].kept).collect();
+        const CHUNK: usize = 2500;
+        const WORKERS: usize = 32;
+        let src = &self.t.g.cx.src;
+        let load_raw = |e: &Option<TreeEntry>| -> Result<Option<(ObjectId, bytes::Bytes)>> {
+            if !texty(e) {
+                return Ok(None);
+            }
+            let e = e.as_ref().unwrap();
+            let raw = src.raw_ephemeral(&e.id)?;
+            if !veil_core::object::Object::is_blob_raw(&raw) {
+                return Ok(None);
+            }
+            let body_len = raw.len() - 10;
+            if body_len as u64 > MAX_TEXT_BYTES {
+                return Ok(None);
+            }
+            Ok(Some((e.id, raw.slice(10..))))
+        };
+        let mut gens: HashMap<ObjectId, i64> = HashMap::new();
+        if self.limits.held >= 4 << 20 && !unkept.is_empty() {
+            let cx = self.f.g.cx;
+            cx.src.rt.block_on(cx.hub().objects.warm_packs(cx.project()))?;
+        }
+        let dummy_meta = Arc::new(Meta {
+            change_id: String::new(),
+            author: String::new(),
+            timestamp: 0,
+            summary: String::new(),
+            generation: 0,
+        });
+        let mut pending_keeps: Vec<(Version, Arc<Blame>)> = Vec::new();
+        let max_chunk = if self.limits.held >= 32 << 20 { 5000 } else if self.limits.held >= 4 << 20 { CHUNK } else { 512 };
+        let mut idx = 0usize;
+        let mut chain_last: Option<Version> = None;
+        let mut chain_counts: Vec<u32> = Vec::new();
+        while idx < unkept.len() {
+            self.stopped()?;
+            // Take up to `max_chunk` versions. For linear single-parent chains
+            // under a normal held budget (`>= 4 MiB`), the worker pool holds only a
+            // sliding window of `WORKERS` texts in memory at once and drops each
+            // version's text as soon as its child's diff is computed.
+            let mut end = idx;
+            let mut chunk_text_est = 0usize;
+            let mut max_entry_sz = 0usize;
+            let mut all_linear = self.limits.held >= 4 << 20;
+            while end < unkept.len() && end - idx < max_chunk {
+                let v = &unkept[end];
+                let n = &nodes[v];
+                let sz = n.change.new.as_ref().map_or(0, |e| {
+                    if self.limits.held >= 4 << 20 {
+                        e.size as usize + 256
+                    } else {
+                        e.size as usize * 3 / 2 + 256
+                    }
+                });
+                max_entry_sz = max_entry_sz.max(sz);
+                if all_linear {
+                    let linear_step = n.parents.len() <= 1
+                        && n.left <= 1
+                        && (end == idx || n.parents.first().and_then(|p| p.as_ref()) == Some(&unkept[end - 1]));
+                    if !linear_step {
+                        all_linear = false;
+                    }
+                }
+                let est = if all_linear {
+                    max_entry_sz.saturating_mul(WORKERS * 2)
+                } else {
+                    chunk_text_est + sz
+                };
+                let budget_used = held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes();
+                if end > idx && budget_used + est > self.limits.held.saturating_sub(self.limits.held / 8) {
+                    break;
+                }
+                chunk_text_est += sz;
+                end += 1;
+            }
+            let slice = &unkept[idx..end];
+            idx = end;
+            // 1. Load texts and parent-to-child line diffs for all versions in `slice` in a single thread-pool scope.
+            self.f.g.tick()?;
+            let load_meta = |id: ObjectId, gen: i64| -> Result<(ObjectId, Meta)> {
+                if !src.pending.contains_key(&id) {
+                    let raw = src.raw(&id)?;
+                    if let Some(m) = Meta::from_raw_snapshot(&raw, gen) {
+                        return Ok((id, m));
+                    }
+                }
+                let sn = src.snapshot(&id)?;
+                Ok((id, Meta::of(&sn, gen)))
+            };
+            let entries: Vec<Option<TreeEntry>> = slice.iter().map(|v| nodes[v].change.new.clone()).collect();
+            let parent_done: Option<Arc<Text>> = entries.iter().position(texty).and_then(|fi| {
+                nodes[&slice[fi]]
+                    .parents
+                    .iter()
+                    .flatten()
+                    .find_map(|p| done.get(p).and_then(|d| d.as_ref().map(|(t, _)| t.clone())))
+            });
+            let mut slice_idx: HashMap<&Version, usize> = HashMap::with_capacity(slice.len());
+            for (vi, v) in slice.iter().enumerate() {
+                slice_idx.insert(v, vi);
+            }
+            let mut diff_specs: Vec<(usize, usize, Option<usize>, Option<Arc<Text>>)> = Vec::new();
+            let mut uses_left: Vec<usize> = slice
+                .iter()
+                .enumerate()
+                .map(|(vi, v)| if vi + 1 == slice.len() || nodes[v].left > 1 || *v == *start { 1 } else { 0 })
+                .collect();
+            for (vi, v) in slice.iter().enumerate() {
+                if !texty(&entries[vi]) {
+                    continue;
+                }
+                for (pi, p) in nodes[v].parents.iter().enumerate() {
+                    let Some(p) = p else { continue };
+                    if let Some(&p_idx) = slice_idx.get(p) {
+                        if texty(&entries[p_idx]) {
+                            diff_specs.push((vi, pi, Some(p_idx), None));
+                            uses_left[vi] += 1;
+                            uses_left[p_idx] += 1;
+                        }
+                    } else if let Some(pt) = done.get(p).and_then(|d| d.as_ref().map(|(t, _)| t.clone())) {
+                        diff_specs.push((vi, pi, None, Some(pt)));
+                        uses_left[vi] += 1;
+                    }
+                }
+            }
+            // Stored per version: `Some((id, line_count))` if plain text, plus `Option<Arc<Text>>` if retained past the chunk.
+            let mut chunk_info: Vec<Option<(ObjectId, usize, Option<Arc<Text>>)>> = Vec::with_capacity(slice.len());
+            let mut pre_maps: Vec<Vec<Option<crate::derive::blame::ParentMap>>> = slice.iter().map(|v| vec![None; nodes[v].parents.len()]).collect();
+            let used_pool = !(slice.len() <= 2 && diff_specs.len() <= 1);
+            if !used_pool {
+                let mut loaded: Vec<Option<Arc<Text>>> = Vec::with_capacity(slice.len());
+                let mut prev_text: Option<Arc<Text>> = parent_done.clone();
+                for e in &entries {
+                    self.stopped()?;
+                    let t = load_raw(e)?.and_then(|(id, bytes)| match &prev_text {
+                        Some(bt) => Text::try_plain_from_parent(id, bytes, bt),
+                        None => Text::try_plain(id, bytes),
+                    });
+                    if let Some(ref tr) = t {
+                        prev_text = Some(tr.clone());
+                    }
+                    loaded.push(t);
+                }
+                for (vi, pi, p_idx, done_pt) in diff_specs {
+                    let child_opt = loaded[vi].as_ref();
+                    let parent_opt = match p_idx {
+                        Some(pi_idx) => loaded[pi_idx].as_ref(),
+                        None => done_pt.as_ref(),
+                    };
+                    if let (Some(pt), Some(text)) = (parent_opt, child_opt) {
+                        pre_maps[vi][pi] = Some(crate::derive::blame::diff_parent(pt, text));
+                    }
+                }
+                for t in loaded {
+                    chunk_info.push(t.map(|arc| (arc.id, arc.lines.len(), Some(arc))));
+                }
+            } else {
+                let n_workers = WORKERS.min(slice.len().max(diff_specs.len()).max(1));
+                let next_i = std::sync::atomic::AtomicUsize::new(0);
+                let diffs_done = std::sync::atomic::AtomicUsize::new(0);
+                let out_meta: Vec<std::sync::OnceLock<Result<Option<(ObjectId, usize)>>>> = (0..slice.len()).map(|_| std::sync::OnceLock::new()).collect();
+                let out_text: Vec<std::sync::Mutex<Option<Arc<Text>>>> = (0..slice.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                let rem_uses: Vec<std::sync::atomic::AtomicUsize> = uses_left.iter().map(|&u| std::sync::atomic::AtomicUsize::new(u)).collect();
+                let out_d: Vec<std::sync::Mutex<Option<crate::derive::blame::ParentMap>>> = (0..diff_specs.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                let mut diffs_by_max: Vec<Vec<usize>> = vec![Vec::new(); slice.len()];
+                for (di, &(vi, _, p_idx, _)) in diff_specs.iter().enumerate() {
+                    let trigger = p_idx.map_or(vi, |pi| vi.max(pi));
+                    diffs_by_max[trigger].push(di);
+                }
+                let aborted = std::sync::atomic::AtomicBool::new(false);
+                let lease_ref = self.lease.as_deref();
+                let steps_counter = &self.f.g.cx.hub().query.blame_steps;
+                let base_ref = &parent_done;
+                let specs_ref = &diff_specs;
+                let by_max_ref = &diffs_by_max;
+                let get_text = |idx: usize| -> Option<Arc<Text>> {
+                    loop {
+                        if let Some(res) = out_meta[idx].get() {
+                            res.as_ref().ok().and_then(|o| *o)?;
+                            return out_text[idx].lock().unwrap().clone();
+                        }
+                        if aborted.load(std::sync::atomic::Ordering::Acquire) {
+                            return None;
+                        }
+                        std::hint::spin_loop();
+                    }
+                };
+                let release_use = |idx: usize| {
+                    if rem_uses[idx].fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                        *out_text[idx].lock().unwrap() = None;
+                    }
+                };
+                std::thread::scope(|s| {
+                    for _ in 0..n_workers {
+                        s.spawn(|| {
+                            let mut prev_text: Option<Arc<Text>> = base_ref.clone();
+                            loop {
+                                if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                    aborted.store(true, std::sync::atomic::Ordering::Release);
+                                    return;
+                                }
+                                let i = next_i.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if i >= entries.len() {
+                                    break;
+                                }
+                                if all_linear {
+                                    while i > diffs_done.load(std::sync::atomic::Ordering::Acquire) + WORKERS * 2 {
+                                        if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                            aborted.store(true, std::sync::atomic::Ordering::Release);
+                                            return;
+                                        }
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                                let r = load_raw(&entries[i]).map(|opt| {
+                                    opt.and_then(|(id, bytes)| match &prev_text {
+                                        Some(bt) => Text::try_plain_from_parent(id, bytes, bt),
+                                        None => Text::try_plain(id, bytes),
+                                    })
+                                });
+                                if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                    aborted.store(true, std::sync::atomic::Ordering::Release);
+                                    return;
+                                }
+                                let meta_res = match r {
+                                    Ok(Some(t)) => {
+                                        let m = Some((t.id, t.lines.len()));
+                                        prev_text = Some(t.clone());
+                                        if rem_uses[i].load(std::sync::atomic::Ordering::Acquire) > 0 {
+                                            *out_text[i].lock().unwrap() = Some(t);
+                                        }
+                                        Ok(m)
+                                    }
+                                    Ok(None) => Ok(None),
+                                    Err(e) => Err(e),
+                                };
+                                let is_text = matches!(meta_res, Ok(Some(_)));
+                                let _ = out_meta[i].set(meta_res);
+                                for &di in &by_max_ref[i] {
+                                    if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                        aborted.store(true, std::sync::atomic::Ordering::Release);
+                                        return;
+                                    }
+                                    let (vi, _, p_idx, ref done_pt) = specs_ref[di];
+                                    let child_opt = get_text(vi);
+                                    let parent_opt = match p_idx {
+                                        Some(pi_idx) => get_text(pi_idx),
+                                        None => done_pt.clone(),
+                                    };
+                                    if let (Some(pt), Some(text)) = (parent_opt, child_opt) {
+                                        let m = crate::derive::blame::diff_parent(&pt, &text);
+                                        if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                            aborted.store(true, std::sync::atomic::Ordering::Release);
+                                            return;
+                                        }
+                                        *out_d[di].lock().unwrap() = Some(m);
+                                    }
+                                    release_use(vi);
+                                    if let Some(pi_idx) = p_idx {
+                                        release_use(pi_idx);
+                                    }
+                                    diffs_done.fetch_add(1, std::sync::atomic::Ordering::Release);
+                                }
+                                if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
+                                    aborted.store(true, std::sync::atomic::Ordering::Release);
+                                    return;
+                                }
+                                if is_text {
+                                    steps_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        });
+                    }
+                });
+                if aborted.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(warming());
+                }
+                self.stopped()?;
+                for (m, t_lock) in out_meta.into_iter().zip(out_text) {
+                    let meta_opt = m.into_inner().unwrap()?;
+                    let t_opt = t_lock.into_inner().unwrap();
+                    chunk_info.push(meta_opt.map(|(id, n_lines)| (id, n_lines, t_opt)));
+                }
+                for ((vi, pi, _, _), m) in diff_specs.into_iter().zip(out_d) {
+                    if let Some(pm) = m.into_inner().unwrap() {
+                        pre_maps[vi][pi] = Some(pm);
+                    }
+                }
+            }
+            // 2. Propagate blames sequentially in topological order and maintain exact held accounting.
+            for (vi, v) in slice.iter().enumerate() {
+                if vi & 15 == 0 {
+                    self.stopped()?;
+                }
+                let parents = nodes[v].parents.clone();
+                // If `v` has a single parent `p` whose blame is ready to be
+                // consumed (`pn.left == 1 && p != start`), take `p` from `done`
+                // up front so we can mutate its `Blame` in place via
+                // `Arc::make_mut` without cloning `lines` or `origins`.
+                let mut single_taken: Option<(Version, Done)> = None;
+                if parents.len() == 1 {
+                    if let Some(p) = &parents[0] {
+                        if nodes[p].left == 1 && p != start {
+                            if let Some(d) = done.remove(p) {
+                                if let Some((ref t, ref b)) = d {
+                                    held -= t.weight() + b.weight();
+                                }
+                                nodes.get_mut(p).unwrap().left = 0;
+                                single_taken = Some((p.clone(), d));
+                            }
+                        }
+                    }
+                }
+                let out: Done = match chunk_info[vi].take() {
+                    None => {
+                        chain_last = None;
+                        chain_counts.clear();
+                        None
+                    }
+                    Some((text_id, n_lines, opt_text)) => {
+                        if parents.len() != 1 || parents[0].as_ref() != chain_last.as_ref() {
+                            chain_counts.clear();
+                        }
+                        let meta_for_v = if self.limits.held >= 4 << 20 {
+                            self.metas.get(&v.id).cloned().unwrap_or_else(|| dummy_meta.clone())
+                        } else {
+                            self.meta(&v.id)?
+                        };
+                        let me: Origin = (v.id, self.intern(&v.path), meta_for_v);
+                        let b: Arc<Blame> = if let Some((ref p, Some((_, mut pb_arc)))) = single_taken.take() {
+                            if let Some(pm) = pre_maps[vi][0].take() {
+                                let pb_mut = Arc::make_mut(&mut pb_arc);
+                                crate::derive::blame::step_mapped_in_place(pb_mut, &me, n_lines, &pm, &mut chain_counts);
+                                pb_arc
+                            } else {
+                                let inputs = [None];
+                                let (b, _) = crate::derive::blame::step_mapped_with_counts(&me, n_lines, &inputs, &mut chain_counts);
+                                let _ = p;
+                                Arc::new(b)
+                            }
+                        } else {
+                            let inputs: Vec<Option<(&Blame, crate::derive::blame::ParentMap)>> = parents
+                                .iter()
+                                .enumerate()
+                                .map(|(pi, p)| {
+                                    let p = p.as_ref()?;
+                                    let (_, pb) = done.get(p)?.as_ref()?;
+                                    let pm = pre_maps[vi][pi].take()?;
+                                    Some((&**pb, pm))
+                                })
+                                .collect();
+                            let (b, _) = crate::derive::blame::step_mapped_with_counts(&me, n_lines, &inputs, &mut chain_counts);
+                            Arc::new(b)
+                        };
+                        chain_last = Some(v.clone());
+                        if !used_pool {
+                            self.f.g.cx.hub().query.blame_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let should_keep = *v == *start || (b.vd.is_multiple_of(CHECKPOINT) && b.vd.is_multiple_of(spacing(computed, b.stored_estimate())));
+                        if should_keep {
+                            if self.limits.held >= 4 << 20 {
+                                pending_keeps.push((v.clone(), b.clone()));
+                            } else if !self.keep(v, &b) && *v == *start {
+                                return Err(too_large());
+                            }
+                        }
+                        let text = opt_text.unwrap_or_else(|| {
+                            Arc::new(Text {
+                                id: text_id,
+                                data: bytes::Bytes::new(),
+                                lines: Vec::new(),
+                            })
+                        });
+                        Some((text, b))
+                    }
+                };
+                if let Some((t, b)) = &out {
+                    held += t.weight() + b.weight();
+                }
+                for p in parents.iter().flatten() {
+                    let pn = nodes.get_mut(p).unwrap();
+                    if pn.left > 0 {
+                        pn.left -= 1;
+                        if pn.left == 0 && p != start {
+                            if let Some(Some((t, b))) = done.remove(p) {
+                                held -= t.weight() + b.weight();
+                            }
+                        }
+                    }
+                }
+                done.insert(v.clone(), out);
+                if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held && !self.writes.is_empty() {
+                    self.write()?;
+                }
+                if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held {
+                    return Err(too_wide());
+                }
+                if self.writes.len() >= BATCH_BLAMES || self.pending_bytes >= self.batch_bytes() {
+                    self.write()?;
+                }
+            }
+            if !pending_keeps.is_empty() && (idx == unkept.len() || pending_keeps.len() >= BATCH_BLAMES) {
+                self.stopped()?;
+                let mut needed_ids: Vec<ObjectId> = Vec::new();
+                for (_, kb) in &pending_keeps {
+                    for &(o, _) in &kb.lines {
+                        let (oid, _, m) = &kb.origins[o as usize];
+                        if Arc::ptr_eq(m, &dummy_meta) && !self.metas.contains_key(oid) {
+                            needed_ids.push(*oid);
+                        }
+                    }
+                }
+                needed_ids.sort_unstable();
+                needed_ids.dedup();
+                if !needed_ids.is_empty() {
+                    let mut db_ids: Vec<String> = Vec::new();
+                    for &id in &needed_ids {
+                        if let std::collections::hash_map::Entry::Vacant(e) = gens.entry(id) {
+                            if id == super::graph::root() {
+                                e.insert(0);
+                            } else if let Some(g) = self.f.g.cached_generation(&id) {
+                                e.insert(g);
+                            } else {
+                                db_ids.push(id.hex());
+                            }
+                        }
+                    }
+                    if !db_ids.is_empty() {
+                        let cx = self.f.g.cx;
+                        let rows: Vec<(String, i64)> = cx.db(|| {
+                            sqlx::query_as("SELECT snapshot, generation FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = ANY($3)")
+                                .bind(cx.project())
+                                .bind(self.f.g.vk)
+                                .bind(&db_ids)
+                                .fetch_all(&cx.hub().db)
+                        })?;
+                        for (s, g) in rows {
+                            if let Ok(id) = ObjectId::from_hex(&s) {
+                                gens.insert(id, g);
+                            }
+                        }
+                    }
+                    for &id in &needed_ids {
+                        if let std::collections::hash_map::Entry::Vacant(e) = gens.entry(id) {
+                            e.insert(self.f.g.get(&id)?.generation);
+                        }
+                    }
+                    if needed_ids.len() <= 2 {
+                        for &id in &needed_ids {
+                            let (id, m) = load_meta(id, gens[&id])?;
+                            self.metas.insert(id, Arc::new(m));
+                        }
+                    } else {
+                        let n_m = WORKERS.min(needed_ids.len());
+                        let next_m = std::sync::atomic::AtomicUsize::new(0);
+                        let out_m: Vec<std::sync::Mutex<Option<Result<(ObjectId, Meta)>>>> = (0..needed_ids.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                        let gens_ref = &gens;
+                        let ids_ref = &needed_ids;
+                        std::thread::scope(|s| {
+                            for _ in 0..n_m {
+                                s.spawn(|| loop {
+                                    let j = next_m.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if j >= ids_ref.len() {
+                                        break;
+                                    }
+                                    let id = ids_ref[j];
+                                    let r = load_meta(id, gens_ref[&id]);
+                                    *out_m[j].lock().unwrap() = Some(r);
+                                });
+                            }
+                        });
+                        for m in out_m {
+                            let (id, meta) = m.into_inner().unwrap().unwrap()?;
+                            self.metas.insert(id, Arc::new(meta));
+                        }
+                    }
+                }
+                for (kv, kb) in &mut pending_keeps {
+                    if kb.origins.iter().any(|(_, _, m)| Arc::ptr_eq(m, &dummy_meta)) {
+                        let b_mut = Arc::make_mut(kb);
+                        for (oid, _, m) in &mut b_mut.origins {
+                            if Arc::ptr_eq(m, &dummy_meta) {
+                                if let Some(found) = self.metas.get(oid) {
+                                    *m = found.clone();
+                                }
+                            }
+                        }
+                        if let Some(Some((_, ref mut done_b))) = done.get_mut(kv) {
+                            *done_b = kb.clone();
+                        }
+                    }
+                }
+                let encoded: Vec<Vec<u8>> = if pending_keeps.len() == 1 {
+                    let p_keys = &self.path_keys;
+                    vec![pending_keeps[0].1.encode(|p| {
+                        p_keys
+                            .get(&(p.as_ptr()))
+                            .cloned()
+                            .unwrap_or_else(|| path_key(p))
+                    })]
+                } else {
+                    let mut pk_by_str: HashMap<&str, &str> = HashMap::with_capacity(self.paths.len());
+                    for (s, arc) in &self.paths {
+                        if let Some(k) = self.path_keys.get(&(Arc::as_ptr(arc) as *const u8)) {
+                            pk_by_str.insert(s.as_str(), k.as_str());
+                        }
+                    }
+                    let n_enc = WORKERS.min(pending_keeps.len());
+                    let next_k = std::sync::atomic::AtomicUsize::new(0);
+                    let out_k: Vec<std::sync::Mutex<Option<Vec<u8>>>> = (0..pending_keeps.len()).map(|_| std::sync::Mutex::new(None)).collect();
+                    let keeps_ref = &pending_keeps;
+                    let pk_ref = &pk_by_str;
+                    std::thread::scope(|s| {
+                        for _ in 0..n_enc {
+                            s.spawn(|| loop {
+                                let k = next_k.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if k >= keeps_ref.len() {
+                                    break;
+                                }
+                                let raw = keeps_ref[k].1.encode(|p| {
+                                    pk_ref
+                                        .get(p)
+                                        .map(|&s| s.to_string())
+                                        .unwrap_or_else(|| path_key(p))
+                                });
+                                *out_k[k].lock().unwrap() = Some(raw);
+                            });
+                        }
+                    });
+                    out_k.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
+                };
+                for ((kv, kb), raw) in std::mem::take(&mut pending_keeps).into_iter().zip(encoded) {
+                    if !self.keep_encoded(&kv, &kb, raw) && kv == *start {
+                        return Err(too_large());
+                    }
+                    if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held && !self.writes.is_empty() {
+                        self.write()?;
+                    }
+                    if held + done.capacity() * (std::mem::size_of::<(Version, Done)>() + 1) + self.pending_bytes + self.side_bytes() > self.limits.held {
+                        return Err(too_wide());
+                    }
+                    if self.writes.len() >= BATCH_BLAMES || self.pending_bytes >= self.batch_bytes() {
+                        self.write()?;
+                    }
+                }
             }
         }
         Ok(done.remove(start).flatten())
@@ -877,7 +1511,17 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
     /// Keep blame `b` of version `v` (written with the next batch); `false`
     /// when it is larger than [`Blamer::one_kept`] (not kept).
     fn keep(&mut self, v: &Version, b: &Blame) -> bool {
-        let raw = b.encode(path_key);
+        let p_keys = &self.path_keys;
+        let raw = b.encode(|p| {
+            p_keys
+                .get(&(p.as_ptr()))
+                .cloned()
+                .unwrap_or_else(|| path_key(p))
+        });
+        self.keep_encoded(v, b, raw)
+    }
+
+    fn keep_encoded(&mut self, v: &Version, b: &Blame, raw: Vec<u8>) -> bool {
         if raw.len() > self.one_kept() {
             return false;
         }
@@ -885,10 +1529,15 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         let mut named: Vec<String> = Vec::new();
         let mut seen: HashSet<*const u8> = HashSet::new();
         for (_, p, _) in &b.origins {
-            if !seen.insert(Arc::as_ptr(p) as *const u8) {
+            let ptr = Arc::as_ptr(p) as *const u8;
+            if !seen.insert(ptr) {
                 continue;
             }
-            let k = path_key(p);
+            let k = self
+                .path_keys
+                .get(&ptr)
+                .cloned()
+                .unwrap_or_else(|| path_key(p));
             if !self.write_paths.contains_key(&k) {
                 self.pending_bytes += p.len() + 64;
                 self.write_paths.insert(k.clone(), p.to_string());
@@ -898,7 +1547,12 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         named.sort();
         named.dedup();
         self.pending_bytes += named.len() * 33;
-        self.writes.push((path_key(&v.path), v.id, raw, named.join(",")));
+        let vk = self
+            .path_keys
+            .get(&(Arc::as_ptr(&v.path) as *const u8))
+            .cloned()
+            .unwrap_or_else(|| path_key(&v.path));
+        self.writes.push((vk, v.id, raw, named.join(",")));
         true
     }
 
@@ -911,6 +1565,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
         if self.writes.is_empty() {
             return Ok(());
         }
+        self.stopped()?;
         let w = std::mem::take(&mut self.writes);
         let paths = std::mem::take(&mut self.write_paths);
         self.pending_bytes = 0;
@@ -926,13 +1581,12 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     .execute(pool)
             })?;
         }
-        // One statement for the batch, one for the records, one for the
-        // view key's cap.
         let now = veil_core::now_millis();
         let keys: Vec<&str> = w.iter().map(|r| r.0.as_str()).collect();
         let snaps: Vec<String> = w.iter().map(|r| r.1.hex()).collect();
         let bodies: Vec<&[u8]> = w.iter().map(|r| r.2.as_slice()).collect();
         let sizes: Vec<i64> = w.iter().map(|r| r.2.len() as i64).collect();
+        let batch_sum: i64 = sizes.iter().sum();
         let named: Vec<&str> = w.iter().map(|r| r.3.as_str()).collect();
         cx.db(|| {
             sqlx::query(
@@ -965,27 +1619,40 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
             .bind(&kept_paths)
             .execute(pool)
         })?;
+        let prev_total = match self.total_kept_bytes {
+            Some(t) => t,
+            None => cx.db(|| {
+                sqlx::query_scalar("SELECT COALESCE(SUM(bytes)::bigint, 0) FROM blame_memo WHERE project_id = $1 AND view_key = $2")
+                    .bind(project)
+                    .bind(vk)
+                    .fetch_one(pool)
+            })?,
+        };
+        let new_total = if self.total_kept_bytes.is_some() { prev_total + batch_sum } else { prev_total };
+        self.total_kept_bytes = Some(new_total.min(self.limits.kept_bytes as i64));
         // The rows just written are counted first (newest) and never
         // dropped: they take at most half the cap (`batch_bytes`).
-        cx.db(|| {
-            sqlx::query(
-                "DELETE FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND (path_key, follow, snapshot) IN ( \
-                     SELECT path_key, follow, snapshot FROM ( \
-                         SELECT path_key, follow, snapshot, \
-                             SUM(bytes) OVER (ORDER BY (follow = $4 AND (path_key, snapshot) IN (SELECT * FROM UNNEST($5::text[], $6::text[]))) DESC, \
-                                 created_at DESC, path_key, follow, snapshot) AS kept, \
-                             (follow = $4 AND (path_key, snapshot) IN (SELECT * FROM UNNEST($5::text[], $6::text[]))) AS mine \
-                         FROM blame_memo WHERE project_id = $1 AND view_key = $2) t \
-                     WHERE kept > $3 AND NOT mine)",
-            )
-            .bind(project)
-            .bind(vk)
-            .bind(self.limits.kept_bytes as i64)
-            .bind(self.follow)
-            .bind(&keys)
-            .bind(&snaps)
-            .execute(pool)
-        })?;
+        if new_total > self.limits.kept_bytes as i64 {
+            cx.db(|| {
+                sqlx::query(
+                    "DELETE FROM blame_memo WHERE project_id = $1 AND view_key = $2 AND (path_key, follow, snapshot) IN ( \
+                         SELECT path_key, follow, snapshot FROM ( \
+                             SELECT path_key, follow, snapshot, \
+                                 SUM(bytes) OVER (ORDER BY (follow = $4 AND (path_key, snapshot) IN (SELECT * FROM UNNEST($5::text[], $6::text[]))) DESC, \
+                                     created_at DESC, path_key, follow, snapshot) AS kept, \
+                                 (follow = $4 AND (path_key, snapshot) IN (SELECT * FROM UNNEST($5::text[], $6::text[]))) AS mine \
+                             FROM blame_memo WHERE project_id = $1 AND view_key = $2) t \
+                         WHERE kept > $3 AND NOT mine)",
+                )
+                .bind(project)
+                .bind(vk)
+                .bind(self.limits.kept_bytes as i64)
+                .bind(self.follow)
+                .bind(&keys)
+                .bind(&snaps)
+                .execute(pool)
+            })?;
+        }
         for (k, s, _, _) in w {
             self.kept.entry(k).or_default().insert(s);
         }
@@ -1036,7 +1703,7 @@ const KEPT_ENDS: i64 = 4096;
 /// How a blame job ended, for every request waiting on it.
 #[derive(Clone, Debug)]
 pub enum JobEnd {
-    /// Kept (or found kept, by another server's job).
+    /// Kept in `blame_memo` (re-read by the caller: BUG-1715).
     Kept,
     /// The version holds no plain text.
     NoText,
@@ -1221,7 +1888,7 @@ impl Slots {
 
     /// A slot for `who`; a waiter that leaves before its turn (a job
     /// refused at the ceiling) gives its turn to the next.
-    async fn take(self: &Arc<Self>, who: Requester) -> Slot {
+    async fn take(self: &Arc<Self>, who: Requester) -> (Slot, bool) {
         let rx = {
             let mut st = self.state.lock().unwrap();
             // A free slot means nobody (still) waits: a freed one goes to a
@@ -1229,14 +1896,14 @@ impl Slots {
             if st.free > 0 {
                 st.free -= 1;
                 st.last = Some(who);
-                return Slot { slots: Some(self.clone()) };
+                return (Slot { slots: Some(self.clone()) }, false);
             }
             let (tx, rx) = tokio::sync::oneshot::channel();
             st.queues.entry(who).or_default().push_back(tx);
             rx
         };
         // A sender is dropped only once sent.
-        rx.await.expect("a blame slot")
+        (rx.await.expect("a blame slot"), true)
     }
 
     fn give(me: Arc<Self>) {
@@ -1293,6 +1960,7 @@ fn warming() -> Error {
 /// from a record that it is too wide (BUG-1309), or start its job, or join
 /// the one running here (and through its lease, another server's). The
 /// job goes on when the wait ends (`warming`).
+#[allow(clippy::too_many_arguments)]
 pub async fn wait_for_blame(
     hub: &Arc<crate::Hub>,
     project: &crate::perm::Project,
@@ -1301,6 +1969,7 @@ pub async fn wait_for_blame(
     follow: bool,
     limits: BlameLimits,
     deadline: std::time::Instant,
+    seeded_window: Option<(Window, usize)>,
 ) -> Result<JobEnd> {
     let vk = project.view(viewer).key();
     let key: JobKey = (project.id, vk, path_key(&start.path), follow, start.id);
@@ -1328,7 +1997,7 @@ pub async fn wait_for_blame(
                     hub.query.jobs.started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (hub, project, viewer, start) = (hub.clone(), project.clone(), viewer.clone(), start.clone());
                     tokio::spawn(async move {
-                        let r = leased_job(&hub, &project, &viewer, &key, &start, follow, limits, &ticket).await;
+                        let r = leased_job(&hub, &project, &viewer, &key, &start, follow, limits, &ticket, seeded_window).await;
                         if let Err(e) = &r {
                             if !matches!(e, Error::Api { code: "warming" | "too_wide", .. }) {
                                 eprintln!("veil-server: a blame job of project {}: {e:?}", project.id);
@@ -1527,6 +2196,7 @@ async fn leased_job(
     follow: bool,
     limits: BlameLimits,
     ticket: &Ticket,
+    mut seeded_window: Option<(Window, usize)>,
 ) -> Result<bool> {
     let holder = hex::encode(veil_core::crypto::random_bytes::<16>());
     let take = || async {
@@ -1553,14 +2223,16 @@ async fn leased_job(
         JobEnd::NoText => Ok(false),
         JobEnd::Failed(status, code, message) => Err(Error::Api { status, code, message }),
     };
-    if let Some(end) = settled(hub, key, limits).await? {
-        return ended(end);
-    }
     let wait = tokio::time::Instant::now() + limits.wait;
     let mut pause = Duration::from_millis(250);
+    let mut waited_lease = false;
     let taken = loop {
         if let Some(at) = take().await? {
             break at;
+        }
+        waited_lease = true;
+        if let Some(end) = settled(hub, key, limits).await? {
+            return ended(end);
         }
         if tokio::time::Instant::now() >= wait {
             return Err(warming());
@@ -1612,11 +2284,14 @@ async fn leased_job(
     let mut since = i64::MAX;
     let r: Result<Outcome> = async {
         let who: Requester = viewer.person;
-        let _slot = tokio::select! {
+        let (_slot, waited_slot) = tokio::select! {
             s = hub.query.jobs.slots.take(who) => s,
             // Refused at the ceiling while it waits for a slot.
             _ = ticket.wake.notified() => return Err(warming()),
         };
+        if waited_lease || waited_slot {
+            seeded_window = None;
+        }
         if let Some(end) = settled(hub, key, limits).await? {
             return ended(end).map(Outcome::Done);
         }
@@ -1632,6 +2307,10 @@ async fn leased_job(
             }
             ticket.computing.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // Sweep any prior access change before writing under this job's key,
+        // so the post-job sweep does not record an earlier change after the
+        // write and drop rows written after that change (BUG-1711).
+        sweep_keys(hub, key.0).await?;
         // Kept blames written from here on are this job's or another's of
         // the same key: a too-wide record is written only if none of a path
         // the walk reached was (BUG-1555); the margin is for clocks.
@@ -1642,6 +2321,9 @@ async fn leased_job(
             let view = project.view(&viewer);
             let t = Trees::new(&g, &view);
             let f = Files::new(&g);
+            if let Some((w, loaded)) = seeded_window {
+                f.seed_window(&start.path, w, loaded);
+            }
             let mut b = Blamer::new(&f, &t, follow, limits);
             b.lease = Some(lease);
             match b.blame(&start) {
@@ -1691,21 +2373,22 @@ pub fn blame_json(_g: &G, rev: ObjectId, path: &str, follow: bool, text: &Text, 
     let mut lines = Vec::with_capacity(to - from);
     // What an answer shows of each change is kept with the blame (S14
     // cycle 3): no snapshot is read here.
-    let mut named: HashMap<ObjectId, Arc<Meta>> = HashMap::new();
+    let mut named: HashMap<ObjectId, Arc<Meta>> = HashMap::with_capacity(b.origins.len());
+    let origin_hex: Vec<String> = b.origins.iter().map(|(id, _, _)| id.hex()).collect();
     for i in from..to {
-        let (id, p, l) = b.origin(i);
-        let m = b.meta(i);
+        let (o, l) = b.lines[i];
+        let (id, p, m) = &b.origins[o as usize];
         named.entry(*id).or_insert_with(|| m.clone());
         let raw = text.line(i);
         let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         lines.push(json!({
             "line": i + 1,
-            "text": String::from_utf8_lossy(raw),
-            "snapshot": id.hex(),
-            "change": m.change_id,
+            "text": std::str::from_utf8(raw).unwrap_or(""),
+            "snapshot": &origin_hex[o as usize],
+            "change": &m.change_id,
             "change_short": m.change_id.get(..8).unwrap_or(&m.change_id),
-            "path": p,
+            "path": &**p,
             "origin_line": l,
         }));
     }
@@ -1715,14 +2398,15 @@ pub fn blame_json(_g: &G, rev: ObjectId, path: &str, follow: bool, text: &Text, 
         .iter()
         .map(|(_, id)| {
             let m = &named[id];
+            let hex = id.hex();
             json!({
-                "snapshot_id": id.hex(),
-                "snapshot_short": id.short(),
-                "change_id": m.change_id,
+                "snapshot_id": &hex,
+                "snapshot_short": &hex[..8],
+                "change_id": &m.change_id,
                 "change_short": m.change_id.get(..8).unwrap_or(&m.change_id),
-                "author": m.author,
+                "author": &m.author,
                 "timestamp": m.timestamp,
-                "summary": m.summary,
+                "summary": &m.summary,
             })
         })
         .collect();
@@ -1733,6 +2417,7 @@ pub fn blame_json(_g: &G, rev: ObjectId, path: &str, follow: bool, text: &Text, 
         "rev": { "snapshot_id": rev.hex(), "snapshot_short": rev.short() },
         "follow": follow,
         "coarse": b.coarse,
+        "visited": b.vd,
         "line_count": total,
         "lines": lines,
         "changes": changes,

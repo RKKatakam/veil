@@ -237,28 +237,44 @@ const S3_MOST_WAIT: Duration = Duration::from_secs(1);
 /// every request the store sends is idempotent (GET, HEAD, DELETE, and PUT
 /// of a key that names its content or a pack's fresh random name).
 async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
-    s3_send_with_headers(make).await.map(|(status, _, body)| (status, body))
+    s3_send_inner(make, false).await.map(|(status, _, body)| (status, body))
 }
 
 /// [`s3_send`], with the answer's headers.
 async fn s3_send_with_headers(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
-    let deadline = tokio::time::Instant::now() + S3_RETRY_FOR;
+    s3_send_inner(make, true).await
+}
+
+async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers: bool) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
+    let mut deadline: Option<tokio::time::Instant> = None;
     let mut wait = S3_FIRST_WAIT;
     for tries in 1.. {
         let answer = match make().send().await {
             Ok(resp) => {
-                let (status, headers) = (resp.status(), resp.headers().clone());
+                let status = resp.status();
+                let headers = if need_headers { resp.headers().clone() } else { reqwest::header::HeaderMap::new() };
                 resp.bytes().await.map(|body| (status, headers, body))
             }
             Err(e) => Err(e),
         };
+        if let Ok((status, headers, body)) = answer {
+            if !(status.is_server_error() || status.as_u16() == 429) {
+                return Ok((status.as_u16(), headers, body));
+            }
+            let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
+            let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
+            if tokio::time::Instant::now() + wait + jitter >= dl {
+                return Ok((status.as_u16(), headers, body));
+            }
+            tokio::time::sleep(wait + jitter).await;
+            wait = (wait * 2).min(S3_MOST_WAIT);
+            continue;
+        }
+        let e = answer.unwrap_err();
+        let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
         let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
-        let last = tokio::time::Instant::now() + wait + jitter >= deadline;
-        match answer {
-            // 429: the store asks for fewer requests (BUG-1005, BUG-1053).
-            Ok((status, headers, body)) if !(status.is_server_error() || status.as_u16() == 429) || last => return Ok((status.as_u16(), headers, body)),
-            Err(e) if last || e.is_builder() => return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times"))),
-            _ => {}
+        if tokio::time::Instant::now() + wait + jitter >= dl || e.is_builder() {
+            return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times")));
         }
         tokio::time::sleep(wait + jitter).await;
         wait = (wait * 2).min(S3_MOST_WAIT);
@@ -453,6 +469,9 @@ pub struct Objects {
     store: Arc<dyn BlobStore>,
     /// Encodings, checked against their ids.
     cache: LruCache<Bytes>,
+    /// Decoded canonical bytes for objects up to [`RAW_CACHE_MAX_OBJECT`],
+    /// checked against their ids.
+    raw_cache: LruCache<Bytes>,
     /// The listed packs of every project, as this server knows them.
     packs: crate::pack::Packs,
     /// Per-project GC epoch observed from `access_epochs (project_id, -1)`.
@@ -473,10 +492,21 @@ pub struct Objects {
 /// The largest object the store holds, decoded: the largest a frame
 /// carries.
 const MAX_OBJECT: u64 = veil_core::hub::wire::MAX_FRAME_OBJECT as u64;
+/// Largest decoded object cached in [`Objects::raw_cache`].
+const RAW_CACHE_MAX_OBJECT: usize = 1 << 20;
 
 /// The object `id` decoded from its encoding `enc`, checked.
 fn decoded(id: &ObjectId, enc: &Bytes) -> Result<Bytes> {
     match encoding::decode(id, enc, MAX_OBJECT).map_err(|_| anyhow!("stored object {} does not match its id", id.short()))? {
+        Cow::Borrowed(_) => Ok(enc.clone()),
+        Cow::Owned(raw) => Ok(Bytes::from(raw)),
+    }
+}
+
+/// [`decoded`] for an entry in [`Objects::cache`], which was already checked
+/// against `id` before insertion.
+fn decoded_cached(id: &ObjectId, enc: &Bytes) -> Result<Bytes> {
+    match encoding::decode_trusted(id, enc, MAX_OBJECT).map_err(|_| anyhow!("stored object {} does not match its id", id.short()))? {
         Cow::Borrowed(_) => Ok(enc.clone()),
         Cow::Owned(raw) => Ok(Bytes::from(raw)),
     }
@@ -556,9 +586,12 @@ impl Objects {
 
     /// Objects in `store`, with the packs listed in `db`.
     pub fn with_db(store: Arc<dyn BlobStore>, cache_bytes: usize, db: Option<sqlx::PgPool>) -> Objects {
+        let raw_bytes = (cache_bytes / 4).max(1);
+        let enc_bytes = cache_bytes.saturating_sub(raw_bytes).max(1);
         Objects {
             store,
-            cache: LruCache::new(cache_bytes),
+            cache: LruCache::new(enc_bytes),
+            raw_cache: LruCache::new(raw_bytes),
             packs: crate::pack::Packs::new(db),
             gc_epochs: Default::default(),
             writes: Default::default(),
@@ -646,6 +679,15 @@ impl Objects {
     /// meanwhile (BUG-1495).
     async fn in_pack(&self, project: i64, id: &ObjectId, again: bool, since: Instant) -> Result<Option<(Arc<str>, Slot)>> {
         self.packs.locate(&self.store, project, id, again, since, &self.reads).await
+    }
+
+    /// Ensure `project`'s listed packs have been loaded at least once on this
+    /// server so concurrent lookups do not queue on the listing mutex.
+    pub async fn warm_packs(&self, project: i64) -> Result<()> {
+        if matches!(self.packs.find(project, &ObjectId([0; 32])), Found::Unloaded) {
+            self.packs.refresh(&self.store, project, Instant::now(), &self.reads).await?;
+        }
+        Ok(())
     }
 
     /// Bytes `start..=end` of the encoding of object `id` at slot `s` of
@@ -746,8 +788,17 @@ impl Objects {
     /// against its id.
     pub async fn get(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
         let ck = self.cache_key(project, id);
+        if let Some(raw) = self.raw_cache.get(&ck) {
+            return Ok(Some(raw));
+        }
         match self.cache.get(&ck) {
-            Some(enc) => decoded(id, &enc).map(Some),
+            Some(enc) => {
+                let raw = decoded_cached(id, &enc)?;
+                if raw.len() <= RAW_CACHE_MAX_OBJECT {
+                    self.raw_cache.insert(ck, raw.clone(), raw.len());
+                }
+                Ok(Some(raw))
+            }
             None => {
                 let enc = self.load_encoding(project, id).await?;
                 self.load(ck, id, enc)
@@ -777,8 +828,11 @@ impl Objects {
             return Ok(None);
         };
         let enc = owned(&enc);
-        decoded(id, &enc)?;
+        let raw = decoded(id, &enc)?;
         self.cache.insert(ck, enc.clone(), enc.len());
+        if raw.len() <= RAW_CACHE_MAX_OBJECT {
+            self.raw_cache.insert(ck, raw.clone(), raw.len());
+        }
         Ok(Some(enc))
     }
 
@@ -788,6 +842,9 @@ impl Objects {
         let enc = owned(&enc);
         let raw = decoded(id, &enc)?;
         self.cache.insert(ck, enc.clone(), enc.len());
+        if raw.len() <= RAW_CACHE_MAX_OBJECT {
+            self.raw_cache.insert(ck, raw.clone(), raw.len());
+        }
         Ok(Some(raw))
     }
 
@@ -796,8 +853,15 @@ impl Objects {
     /// through `rt`.
     pub fn get_blocking(&self, rt: &tokio::runtime::Handle, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
         let ck = self.cache_key(project, id);
+        if let Some(raw) = self.raw_cache.get(&ck) {
+            return Ok(Some(raw));
+        }
         if let Some(enc) = self.cache.get(&ck) {
-            return decoded(id, &enc).map(Some);
+            let raw = decoded_cached(id, &enc)?;
+            if raw.len() <= RAW_CACHE_MAX_OBJECT {
+                self.raw_cache.insert(ck, raw.clone(), raw.len());
+            }
+            return Ok(Some(raw));
         }
         let direct = match self.packs.find(project, id) {
             Found::At(n, s) => self.store.get_range_blocking(&crate::pack::key(project, &n), s.offset, s.last()).and_then(|r| {
@@ -830,10 +894,59 @@ impl Objects {
         self.load(ck, id, r?)
     }
 
+    /// Read and verify object `id` from a blocking thread without inserting
+    /// into the shared LRU caches on a miss, so a sequential history scan
+    /// (such as a cold blame job) neither evicts warm snapshots/trees nor
+    /// thrashes the cache before reaching recent versions.
+    pub fn get_ephemeral_blocking(&self, rt: &tokio::runtime::Handle, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
+        let ck = self.cache_key(project, id);
+        if let Some(raw) = self.raw_cache.get(&ck) {
+            return Ok(Some(raw));
+        }
+        if let Some(enc) = self.cache.get(&ck) {
+            return Ok(Some(decoded_cached(id, &enc)?));
+        }
+        let direct = match self.packs.find(project, id) {
+            Found::At(n, s) => self.store.get_range_blocking(&crate::pack::key(project, &n), s.offset, s.last()).and_then(|r| {
+                match r {
+                    Ok(Some((b, _))) if b.len() == s.len as usize => Some({
+                        let r = crate::pack::entry(id, s, &b).map(|_| Some(b.slice(crate::pack::ENTRY_HEAD as usize..)));
+                        r
+                    }),
+                    Ok(None) => {
+                        self.packs.forget(project, &[n]);
+                        None
+                    }
+                    Ok(Some(_)) => Some(Err(anyhow!("pack {n} is shorter than its index"))),
+                    Err(e) => Some(Err(e)),
+                }
+            }),
+            Found::Absent => self.store.get_blocking(&object_key(project, id)).and_then(|r| match r {
+                Ok(None) => None,
+                r => Some(r),
+            }),
+            Found::Paged | Found::Unloaded => None,
+        };
+        let enc = match direct {
+            Some(r) => {
+                bump(&self.reads);
+                r?
+            }
+            None => rt.block_on(self.load_encoding(project, id))?,
+        };
+        let Some(enc) = enc else { return Ok(None) };
+        Ok(Some(decoded(id, &enc)?))
+    }
+
     /// Store object `id` (its canonical encoding `raw`) loose, compressed
     /// when that is smaller.
     pub async fn put(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {
-        self.put_encoded(project, id, encode(raw)).await
+        let small = (raw.len() <= RAW_CACHE_MAX_OBJECT).then(|| raw.clone());
+        self.put_encoded(project, id, encode(raw)).await?;
+        if let Some(raw) = small {
+            self.raw_cache.insert(self.cache_key(project, id), raw.clone(), raw.len());
+        }
+        Ok(())
     }
 
     /// Store `enc`, an encoding of object `id` the caller has checked, loose.

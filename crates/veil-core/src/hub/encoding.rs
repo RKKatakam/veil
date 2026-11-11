@@ -200,6 +200,30 @@ pub fn decode<'a>(id: &ObjectId, enc: &'a [u8], limit: u64) -> Result<Cow<'a, [u
     Ok(raw)
 }
 
+/// [`decode`] for an encoding already checked against `id` (such as an entry
+/// in `veil_server::store::Objects`'s verified cache): decompresses a zstd
+/// frame without re-hashing the decoded bytes with BLAKE3 on every cache hit.
+pub fn decode_trusted<'a>(id: &ObjectId, enc: &'a [u8], limit: u64) -> Result<Cow<'a, [u8]>> {
+    let bad = |m: &str| VeilError::Corrupt(id.hex(), m.to_string());
+    match enc.first() {
+        Some(&PLAIN) => {
+            if enc.len() as u64 > limit {
+                return Err(bad("object larger than the limit"));
+            }
+            Ok(Cow::Borrowed(enc))
+        }
+        Some(&ZSTD) => {
+            let frame = &enc[1..];
+            let size = header_content_size(frame).ok_or_else(|| bad("not one zstd frame that declares its size"))?;
+            if size > limit {
+                return Err(bad("compressed object expands past the limit"));
+            }
+            Ok(Cow::Owned(crate::pack::decompress_trusted(frame, size, None).map_err(|e| bad(&e))?))
+        }
+        _ => Err(bad("unknown object encoding")),
+    }
+}
+
 /// Split a body of encoded frames into ids and encodings, checking only
 /// the framing (each encoding at most [`super::wire::MAX_FRAME_OBJECT`]).
 pub fn split_frames(mut body: &[u8]) -> Result<Vec<(ObjectId, &[u8])>> {

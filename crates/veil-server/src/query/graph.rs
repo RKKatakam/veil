@@ -165,6 +165,14 @@ fn cache_key(project: i64, gc_epoch: i64, vk: &str, id: &ObjectId) -> ObjectId {
     ObjectId(*h.finalize().as_bytes())
 }
 
+/// Return a cached [`VRow`] if already present in `hub.query.rows`.
+pub fn cached_row(hub: &crate::Hub, project: i64, vk: &str, id: &ObjectId) -> Option<Arc<VRow>> {
+    if *id == root() {
+        return Some(Arc::new(VRow::root()));
+    }
+    hub.query.rows.get(&cache_key(project, hub.caches.gc_epoch(project), vk, id))
+}
+
 /// Reads of one viewer's graph, on a blocking thread.
 pub struct G<'a> {
     pub cx: &'a Cx,
@@ -241,8 +249,27 @@ impl<'a> G<'a> {
         Ok(Some(r))
     }
 
+    /// The cached generation of `id`, if already in `local` or `hub.query.rows`.
+    pub fn cached_generation(&self, id: &ObjectId) -> Option<i64> {
+        if *id == root() {
+            return Some(0);
+        }
+        if let Some(r) = self.local.borrow().get(id) {
+            return Some(r.generation);
+        }
+        let hub = self.cx.hub();
+        let k = cache_key(self.cx.project(), hub.caches.gc_epoch(self.cx.project()), self.vk, id);
+        if let Some(r) = hub.query.rows.get(&k) {
+            let g = r.generation;
+            self.local.borrow_mut().insert(*id, r);
+            return Some(g);
+        }
+        None
+    }
+
     /// Keep `row` of `id`, computed and not written yet (a fill's), for
-    /// the walks of this reader.
+    /// the walks of this reader only (BUG-1714: `hub.query.rows` holds only
+    /// rows whose `view_file_history` and `view_graph` rows are written).
     pub fn keep(&self, id: ObjectId, row: Arc<VRow>) {
         self.local.borrow_mut().insert(id, row);
     }
@@ -762,6 +789,7 @@ impl Walk<'_, '_, '_> {
         let files = std::mem::take(&mut self.fill.pending);
         let graph = std::mem::take(&mut self.pending);
         self.fill.forget_if_large();
+        let gce = hub.caches.gc_epoch(project);
         // File history first: a graph row's presence means its file
         // history is there.
         cx.db(|| async {
@@ -770,7 +798,11 @@ impl Walk<'_, '_, '_> {
             G::write_rows_tx(&mut tx, project, vk, &graph).await?;
             tx.commit().await?;
             Ok(())
-        })
+        })?;
+        for (i, r, _) in &graph {
+            hub.query.rows.insert(cache_key(project, gce, vk, i), r.clone(), 320);
+        }
+        Ok(())
     }
 }
 

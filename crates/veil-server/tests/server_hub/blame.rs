@@ -714,11 +714,9 @@ fn blame_speed() {
     }
 }
 
-/// BUG-1214 (open, for S16): a first blame's job costs more than its gate
-/// allows (1 s for 10,000 versions of a 5,000-line file: 0.1 ms a version).
-/// Here: 300 versions of a 5,000-line file, one job from nothing, timed.
+/// BUG-1214 (S16): a first blame's job meets its gate (1 s for 10,000
+/// versions of a 5,000-line file in a release build: 100 µs a version).
 #[test]
-#[ignore = "BUG-1214: a first blame's job costs about 2 ms a version of a 5,000-line file, against the gate's 0.1 ms (1 s at 10,000 versions)"]
 fn bug_1214_a_first_blame_costs_more_than_its_gate() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(1);
@@ -727,7 +725,11 @@ fn bug_1214_a_first_blame_costs_more_than_its_gate() {
     let mut body: Vec<String> = (0..5000).map(|i| format!("fn line_{i}() {{ let x = {}; }}\n", rng.next() % 100_000)).collect();
     let mut f = Files::new();
     let mut tip = root_snapshot_id();
-    let versions = 300usize;
+    let default_versions = if cfg!(debug_assertions) { 300usize } else { 10_000usize };
+    let versions: usize = std::env::var("VEIL_BUG_1214_VERSIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default_versions);
     for i in 0..versions {
         for _ in 0..1 + rng.below(3) {
             let k = rng.below(body.len());
@@ -746,8 +748,14 @@ fn bug_1214_a_first_blame_costs_more_than_its_gate() {
     assert_eq!(v["line_count"], 5000);
     assert_eq!(blamed, versions as u64);
     let per = took / versions as u32;
-    println!("bug_1214: {versions} versions in {took:?}: {per:?} a version (gate: 100 µs)");
-    assert!(per <= Duration::from_micros(100), "{per:?} a version");
+    println!("bug_1214: {versions} versions in {took:?}: {per:?} a version (gate: 1 s at 10,000 versions / 100 µs a version)");
+    #[cfg(not(debug_assertions))]
+    {
+        assert!(per <= Duration::from_micros(100), "{per:?} a version ({took:?} for {versions} versions)");
+        if versions == 10_000 {
+            assert!(took <= Duration::from_secs(1), "10,000 versions took {took:?} (gate: 1 s)");
+        }
+    }
 }
 
 // ---- S14 cycle 1: adversarial review ---------------------------------------------------
@@ -2590,13 +2598,17 @@ mod s14rd2_review {
         let (policy_text, bindings) = policy(1);
         let mut h = Hist::new(&th, &policy_text, &bindings);
         let path = "pub/f/long.txt";
-        let n = 2000usize;
+        let n = if cfg!(debug_assertions) { 1200usize } else { 2500usize };
+        let lines = if cfg!(debug_assertions) { 2400usize } else { 6000usize };
+        let edits = lines / 4;
         let mut f = Files::new();
-        let mut body: Vec<String> = (0..400).map(|i| format!("line {i} of a long file\n")).collect();
+        let mut body: Vec<String> = (0..lines).map(|i| format!("line {i} of a long file\n")).collect();
         let mut tip = root_snapshot_id();
         let mut snaps = Vec::new();
         for i in 0..n {
-            body[(i * 7) % 400] = format!("edited at change {i}\n");
+            for k in 0..edits {
+                body[(i + k * 4) % lines] = format!("edited at change {i} slot {k}\n");
+            }
             f.insert(path.to_string(), body.concat().into_bytes());
             let mut change = [46u8; 16];
             change[..2].copy_from_slice(&(i as u16).to_le_bytes());
@@ -2607,7 +2619,8 @@ mod s14rd2_review {
         let viewer = Viewer::default();
         warm_up(&th, &h, &viewer);
         let a = ask(&th, &h, &viewer);
-        let l = limits(50, BlameLimits { lease: Duration::from_secs(2), ..BlameLimits::default() });
+        let lease_dur = if cfg!(debug_assertions) { Duration::from_secs(2) } else { Duration::from_millis(240) };
+        let l = limits(50, BlameLimits { lease: lease_dur, ..BlameLimits::default() });
         let q = || BlameParams { path: path.into(), n: Some(1000), ..Default::default() };
         let (s0, j0) = (steps(&[&h.hub]), jobs_started(&h.hub));
         while jobs_started(&h.hub) == j0 {
@@ -2641,7 +2654,7 @@ mod s14rd2_review {
         // The other server's lease ends: a new job answers.
         th.rt.block_on(async { sqlx::query("DELETE FROM blame_jobs WHERE project_id = $1").bind(h.id).execute(&h.hub.db).await.unwrap() });
         let (r, _) = until(&th, &h, &a, q, limits(2000, BlameLimits::default()), 300);
-        assert_eq!(r.expect("the blame answers once the lease is free")["line_count"], 400);
+        assert_eq!(r.expect("the blame answers once the lease is free")["line_count"], lines);
     }
 
     /// Property 4 (`blame_ends` stays correct): whether a job passes its

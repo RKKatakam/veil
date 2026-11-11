@@ -22,10 +22,11 @@ impl ObjectId {
     }
 
     pub fn from_hex(s: &str) -> Result<Self> {
-        let bytes = hex::decode(s).map_err(|_| VeilError::Revset(format!("invalid object id '{s}'")))?;
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| VeilError::Revset(format!("object id '{s}' has the wrong length")))?;
+        if s.len() != 64 {
+            return Err(VeilError::Revset(format!("object id '{s}' has the wrong length")));
+        }
+        let mut arr = [0u8; 32];
+        hex::decode_to_slice(s, &mut arr).map_err(|_| VeilError::Revset(format!("invalid object id '{s}'")))?;
         Ok(ObjectId(arr))
     }
 }

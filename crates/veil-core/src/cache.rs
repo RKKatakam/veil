@@ -5,35 +5,72 @@
 //! entries, bytes, …). Once the total weight exceeds the capacity, the least
 //! recently used entries are evicted. Lookups and inserts are O(log n).
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Mutex,
-};
+use std::{collections::HashMap, sync::Mutex};
 
 use crate::id::ObjectId;
 
 struct Slot<V> {
+    id: ObjectId,
     value: V,
-    tick: u64,
     weight: usize,
+    prev: usize,
+    next: usize,
 }
 
+const NONE: usize = usize::MAX;
+
 struct Inner<V> {
-    map: HashMap<ObjectId, Slot<V>>,
-    /// Recency order: oldest tick first.
-    order: BTreeMap<u64, ObjectId>,
-    tick: u64,
+    map: HashMap<ObjectId, usize>,
+    slots: Vec<Option<Slot<V>>>,
+    free: Vec<usize>,
+    /// Oldest entry index (LRU), or `NONE`.
+    head: usize,
+    /// Newest entry index (MRU), or `NONE`.
+    tail: usize,
     weight: usize,
     capacity: usize,
 }
 
 impl<V> Inner<V> {
+    fn detach(&mut self, idx: usize) {
+        let (prev, next) = {
+            let s = self.slots[idx].as_ref().unwrap();
+            (s.prev, s.next)
+        };
+        if prev != NONE {
+            self.slots[prev].as_mut().unwrap().next = next;
+        } else {
+            self.head = next;
+        }
+        if next != NONE {
+            self.slots[next].as_mut().unwrap().prev = prev;
+        } else {
+            self.tail = prev;
+        }
+    }
+
+    fn push_tail(&mut self, idx: usize) {
+        let old_tail = self.tail;
+        if let Some(s) = self.slots[idx].as_mut() {
+            s.prev = old_tail;
+            s.next = NONE;
+        }
+        if old_tail != NONE {
+            self.slots[old_tail].as_mut().unwrap().next = idx;
+        } else {
+            self.head = idx;
+        }
+        self.tail = idx;
+    }
+
     fn evict_to(&mut self, limit: usize) {
-        while self.weight > limit {
-            let Some((_, id)) = self.order.pop_first() else { break };
-            if let Some(slot) = self.map.remove(&id) {
-                self.weight -= slot.weight;
-            }
+        while self.weight > limit && self.head != NONE {
+            let idx = self.head;
+            self.detach(idx);
+            let slot = self.slots[idx].take().unwrap();
+            self.free.push(idx);
+            self.map.remove(&slot.id);
+            self.weight -= slot.weight;
         }
     }
 }
@@ -55,8 +92,10 @@ impl<V: Clone> LruCache<V> {
         LruCache {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
-                order: BTreeMap::new(),
-                tick: 0,
+                slots: Vec::new(),
+                free: Vec::new(),
+                head: NONE,
+                tail: NONE,
                 weight: 0,
                 capacity,
             }),
@@ -66,12 +105,13 @@ impl<V: Clone> LruCache<V> {
     pub fn get(&self, id: &ObjectId) -> Option<V> {
         let mut g = self.inner.lock().unwrap();
         let inner = &mut *g;
-        let slot = inner.map.get_mut(id)?;
-        inner.tick += 1;
-        inner.order.remove(&slot.tick);
-        slot.tick = inner.tick;
-        inner.order.insert(slot.tick, *id);
-        Some(slot.value.clone())
+        let idx = *inner.map.get(id)?;
+        let val = inner.slots[idx].as_ref().unwrap().value.clone();
+        if inner.tail != idx {
+            inner.detach(idx);
+            inner.push_tail(idx);
+        }
+        Some(val)
     }
 
     /// Insert (or replace) an entry. Entries heavier than the whole capacity
@@ -82,15 +122,36 @@ impl<V: Clone> LruCache<V> {
         if weight > inner.capacity {
             return;
         }
-        if let Some(old) = inner.map.remove(&id) {
-            inner.order.remove(&old.tick);
-            inner.weight -= old.weight;
+        if let Some(&idx) = inner.map.get(&id) {
+            inner.detach(idx);
+            let old_w = inner.slots[idx].as_ref().unwrap().weight;
+            inner.weight -= old_w;
+            inner.evict_to(inner.capacity - weight);
+            let s = inner.slots[idx].as_mut().unwrap();
+            s.value = value;
+            s.weight = weight;
+            inner.push_tail(idx);
+            inner.weight += weight;
+            return;
         }
         inner.evict_to(inner.capacity - weight);
-        inner.tick += 1;
-        let tick = inner.tick;
-        inner.order.insert(tick, id);
-        inner.map.insert(id, Slot { value, tick, weight });
+        let slot = Slot {
+            id,
+            value,
+            weight,
+            prev: NONE,
+            next: NONE,
+        };
+        let idx = if let Some(free_idx) = inner.free.pop() {
+            inner.slots[free_idx] = Some(slot);
+            free_idx
+        } else {
+            let i = inner.slots.len();
+            inner.slots.push(Some(slot));
+            i
+        };
+        inner.map.insert(id, idx);
+        inner.push_tail(idx);
         inner.weight += weight;
     }
 
@@ -103,7 +164,10 @@ impl<V: Clone> LruCache<V> {
     pub fn clear(&self) {
         let mut g = self.inner.lock().unwrap();
         g.map.clear();
-        g.order.clear();
+        g.slots.clear();
+        g.free.clear();
+        g.head = NONE;
+        g.tail = NONE;
         g.weight = 0;
     }
 

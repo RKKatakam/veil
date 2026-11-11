@@ -1322,6 +1322,20 @@ impl Object {
         }
     }
 
+    /// Decode a snapshot from `raw` when `raw` has already been verified on
+    /// write (skipping the redundant `serde_json::to_vec` canonical re-encode).
+    pub fn decode_snapshot_trusted(raw: &[u8]) -> Result<Snapshot> {
+        let Some(b) = raw.strip_prefix(SNAP_TAG) else {
+            return match Object::decode(raw)? {
+                Object::Snapshot(s) => Ok(s),
+                o => Err(VeilError::Corrupt("snapshot".into(), format!("expected a snapshot, found a {}", o.kind_name()))),
+            };
+        };
+        let s: Snapshot = serde_json::from_slice(b)?;
+        s.validate_format_10()?;
+        Ok(s)
+    }
+
     /// Encoding of a raw tree object, `None` if `raw` is not a tree in an
     /// encoding this build knows.
     pub fn tree_encoding(raw: &[u8]) -> Option<TreeEncoding> {

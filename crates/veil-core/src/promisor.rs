@@ -138,6 +138,20 @@ pub trait Promisor: Send + Sync {
     fn generations(&self, _snapshots: &[ObjectId]) -> Result<Option<Vec<Option<u64>>>> {
         Ok(None)
     }
+
+    /// A query route (`/v1/projects/{p}/q/{route}`, S16, `docs/HUB.md`
+    /// §13.34): its JSON answer (`Ok(Ok(v))`), the server's API error code
+    /// and message (`Ok(Err((code, message)))`), or `Unavailable` when the
+    /// server cannot be reached or keeps answering `warming` / `deadline`.
+    fn query(&self, _route: &str, _params: &[(&str, String)]) -> Result<std::result::Result<serde_json::Value, (String, String)>> {
+        Err(VeilError::Unavailable("this promisor does not serve queries".into()))
+    }
+
+    /// Fetch `wants` on demand from the server (`POST …/fetch`) without
+    /// paging history (`POST …/history`).
+    fn fetch_objects(&self, wants: &[Located]) -> Result<Vec<Option<Vec<u8>>>> {
+        self.fetch(wants)
+    }
 }
 
 /// The location of every object met in a decoded tree, compactly (16 bytes

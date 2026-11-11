@@ -66,21 +66,33 @@ pub const MAX_BRANCHES: usize = 10_000;
 /// Most snapshots one history answer holds.
 pub const MAX_HISTORY: usize = 200_000;
 
+fn builtins() -> &'static ((ObjectId, Bytes), (ObjectId, Bytes)) {
+    static B: std::sync::OnceLock<((ObjectId, Bytes), (ObjectId, Bytes))> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        let empty = Bytes::from(Object::Tree(Tree::default()).encode());
+        let empty_id = ObjectId::hash(&empty);
+        let root = Bytes::from(Object::Snapshot(Snapshot::root(empty_id)).encode());
+        let root_id = ObjectId::hash(&root);
+        ((empty_id, empty), (root_id, root))
+    })
+}
+
 /// The id of the universal root snapshot (every history starts there).
 pub fn root_snapshot_id() -> ObjectId {
-    let empty = ObjectId::hash(&Object::Tree(Tree::default()).encode());
-    ObjectId::hash(&Object::Snapshot(Snapshot::root(empty)).encode())
+    builtins().1 .0
 }
 
 /// Every history starts at the universal root and its empty tree, which no
 /// project stores.
 pub(crate) fn builtin(id: &ObjectId) -> Option<Bytes> {
-    let empty = Object::Tree(Tree::default()).encode();
-    if *id == ObjectId::hash(&empty) {
-        return Some(Bytes::from(empty));
+    let ((empty_id, empty), (root_id, root)) = builtins();
+    if *id == *empty_id {
+        return Some(empty.clone());
     }
-    let root = Object::Snapshot(Snapshot::root(ObjectId::hash(&empty))).encode();
-    (*id == ObjectId::hash(&root)).then(|| Bytes::from(root))
+    if *id == *root_id {
+        return Some(root.clone());
+    }
+    None
 }
 
 /// Objects of one project, read synchronously (for the projection code,
@@ -207,6 +219,23 @@ impl Source {
             .ok_or(VeilError::Missing(*id))
     }
 
+    pub fn raw_ephemeral(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
+        if let Some(raw) = self.pending.get(id) {
+            return Ok(raw.clone());
+        }
+        if let Some(b) = builtin(id) {
+            return Ok(b);
+        }
+        if self.staged.is_some() {
+            return self.raw(id);
+        }
+        self.hub
+            .objects
+            .get_ephemeral_blocking(&self.rt, self.project, id)
+            .map_err(store_err)?
+            .ok_or(VeilError::Missing(*id))
+    }
+
     /// Object `id` as stored ([`crate::store::Objects::get_encoded`]).
     pub fn encoded(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
         if let Some(b) = builtin(id) {
@@ -219,10 +248,17 @@ impl Source {
     }
 
     pub fn snapshot(&self, id: &ObjectId) -> veil_core::Result<Arc<Snapshot>> {
-        match Object::decode(&self.raw(id)?)? {
-            Object::Snapshot(s) => Ok(Arc::new(s)),
-            o => Err(VeilError::Corrupt(id.hex(), format!("expected a snapshot, found a {}", o.kind_name()))),
+        if self.pending.contains_key(id) {
+            return match Object::decode(&self.raw(id)?)? {
+                Object::Snapshot(s) => Ok(Arc::new(s)),
+                o => Err(VeilError::Corrupt(id.hex(), format!("expected a snapshot, found a {}", o.kind_name()))),
+            };
         }
+        let raw = self.raw(id)?;
+        Object::decode_snapshot_trusted(&raw).map(Arc::new).map_err(|e| match e {
+            VeilError::Corrupt(_, m) => VeilError::Corrupt(id.hex(), m),
+            e => e,
+        })
     }
 }
 

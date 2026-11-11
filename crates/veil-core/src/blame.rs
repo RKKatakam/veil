@@ -260,13 +260,222 @@ fn hidden(store: &ObjectStore, e: &TreeEntry, reader: Reader) -> Hidden {
 /// Byte ranges of the lines of `data`, as diffy splits them (each with its
 /// `\n`; a last line without one is a line too).
 pub fn line_ranges(data: &[u8]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(data.len() / 32 + 1);
     let mut start = 0;
-    for l in data.split_inclusive(|b| *b == b'\n') {
-        out.push((start, start + l.len()));
-        start += l.len();
+    let mut i = 0;
+    let len = data.len();
+    while i + 8 <= len {
+        let chunk = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let x = chunk ^ 0x0a0a_0a0a_0a0a_0a0au64;
+        let mut mask = x.wrapping_sub(0x0101_0101_0101_0101u64) & !x & 0x8080_8080_8080_8080u64;
+        while mask != 0 {
+            let byte_pos = i + (mask.trailing_zeros() as usize >> 3);
+            out.push((start, byte_pos + 1));
+            start = byte_pos + 1;
+            mask &= mask - 1;
+        }
+        i += 8;
+    }
+    while i < len {
+        if data[i] == b'\n' {
+            out.push((start, i + 1));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if start < len {
+        out.push((start, len));
     }
     out
+}
+
+/// Checks that `data` contains no NUL byte (`0x00`) and is valid UTF-8, and
+/// returns its [`line_ranges`], in a single 64-bit word pass when `data` is
+/// pure non-NUL ASCII (falling back to `std::str::from_utf8` only when a high
+/// bit is present).
+pub fn plain_text_line_ranges(data: &[u8]) -> Option<Vec<(usize, usize)>> {
+    let mut out = Vec::with_capacity(data.len() / 32 + 1);
+    let mut start = 0;
+    let mut i = 0;
+    let len = data.len();
+    let mut non_ascii = false;
+    while i + 8 <= len {
+        let chunk = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let nul = chunk.wrapping_sub(0x0101_0101_0101_0101u64) & !chunk & 0x8080_8080_8080_8080u64;
+        if nul != 0 {
+            return None;
+        }
+        if (chunk & 0x8080_8080_8080_8080u64) != 0 {
+            non_ascii = true;
+        }
+        let x = chunk ^ 0x0a0a_0a0a_0a0a_0a0au64;
+        let mut mask = x.wrapping_sub(0x0101_0101_0101_0101u64) & !x & 0x8080_8080_8080_8080u64;
+        while mask != 0 {
+            let byte_pos = i + (mask.trailing_zeros() as usize >> 3);
+            out.push((start, byte_pos + 1));
+            start = byte_pos + 1;
+            mask &= mask - 1;
+        }
+        i += 8;
+    }
+    while i < len {
+        let b = data[i];
+        if b == 0 {
+            return None;
+        }
+        if b >= 0x80 {
+            non_ascii = true;
+        }
+        if b == b'\n' {
+            out.push((start, i + 1));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if non_ascii && std::str::from_utf8(data).is_err() {
+        return None;
+    }
+    if start < len {
+        out.push((start, len));
+    }
+    Some(out)
+}
+
+/// Binary search `lines` for the first index `i` where `lines[i].1 > target_end`
+/// (equivalent to `lines.partition_point(|&(_, b)| b <= target_end)` without closure call overhead).
+#[inline(always)]
+fn bsearch_end_le(lines: &[(usize, usize)], target_end: usize) -> usize {
+    let mut lo = 0usize;
+    let mut hi = lines.len();
+    while lo < hi {
+        let mid = lo + ((hi - lo) >> 1);
+        if lines[mid].1 <= target_end {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Binary search `lines` for the first index `i` where `lines[i].0 >= target_start`
+/// (equivalent to `lines.partition_point(|&(a, _)| a < target_start)` without closure call overhead).
+#[inline(always)]
+fn bsearch_start_lt(lines: &[(usize, usize)], target_start: usize) -> usize {
+    let mut lo = 0usize;
+    let mut hi = lines.len();
+    while lo < hi {
+        let mid = lo + ((hi - lo) >> 1);
+        if lines[mid].0 < target_start {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Like [`plain_text_line_ranges`], but when `data` shares long unchanged spans
+/// with an already-validated plain-text `parent`, reuses `parent_lines` for
+/// the unchanged spans via `extend_from_slice` and scans only the differing
+/// lines for NUL, UTF-8, and line boundaries.
+pub fn plain_text_line_ranges_from_parent(
+    data: &[u8],
+    parent: &[u8],
+    parent_lines: &[(usize, usize)],
+) -> Option<Vec<(usize, usize)>> {
+    if data.len() < 4096 || parent_lines.len() < 64 {
+        return plain_text_line_ranges(data);
+    }
+    let eq_pre = common_prefix_len(parent, data);
+    let mut p_lines = bsearch_end_le(parent_lines, eq_pre);
+    if p_lines > 0 {
+        let (_, b) = parent_lines[p_lines - 1];
+        if parent[b - 1] != b'\n' {
+            p_lines -= 1;
+        }
+    }
+    let pre_byte = if p_lines > 0 { parent_lines[p_lines - 1].1 } else { 0 };
+    let eq_suf = common_suffix_len(&parent[pre_byte..], &data[pre_byte..]);
+    let parent_suf_start = parent.len() - eq_suf;
+    let mut s_idx = p_lines + bsearch_start_lt(&parent_lines[p_lines..], parent_suf_start);
+    while s_idx < parent_lines.len() {
+        let (a, _) = parent_lines[s_idx];
+        if a == 0 || (a > pre_byte && data[data.len() - (parent.len() - a) - 1] == b'\n') {
+            break;
+        }
+        s_idx += 1;
+    }
+    let s_lines = parent_lines.len() - s_idx;
+    let suf_len_bytes = if s_lines > 0 {
+        parent.len() - parent_lines[s_idx].0
+    } else {
+        0
+    };
+    let mid_end = data.len() - suf_len_bytes;
+    let parent_mid_end = parent.len() - suf_len_bytes;
+    // Only lines in `parent_lines[..safe_end]` that end with `\n` can be copied piecewise.
+    let mut safe_end = s_idx;
+    if safe_end > 0 && parent[parent_lines[safe_end - 1].1 - 1] != b'\n' {
+        safe_end -= 1;
+    }
+    let mut out = Vec::with_capacity(parent_lines.len() + 8);
+    out.extend_from_slice(&parent_lines[..p_lines]);
+    let mut cur_byte = pre_byte;
+    let mut cur_p = p_lines;
+    while cur_byte < mid_end {
+        if cur_p < safe_end {
+            let (pa, _) = parent_lines[cur_p];
+            let eq = common_prefix_len(&parent[pa..parent_mid_end], &data[cur_byte..mid_end]);
+            if eq > 0 {
+                let k = bsearch_end_le(&parent_lines[cur_p..safe_end], pa + eq);
+                if k > 0 {
+                    let matched_bytes = parent_lines[cur_p + k - 1].1 - pa;
+                    let delta = cur_byte as isize - pa as isize;
+                    if delta == 0 {
+                        out.extend_from_slice(&parent_lines[cur_p..cur_p + k]);
+                    } else {
+                        let base_out = out.len();
+                        out.extend_from_slice(&parent_lines[cur_p..cur_p + k]);
+                        for (a, b) in &mut out[base_out..] {
+                            *a = (*a as isize + delta) as usize;
+                            *b = (*b as isize + delta) as usize;
+                        }
+                    }
+                    cur_byte += matched_bytes;
+                    cur_p += k;
+                    continue;
+                }
+            }
+        }
+        let line_end = match memchr::memchr(b'\n', &data[cur_byte..mid_end]) {
+            Some(pos) => cur_byte + pos + 1,
+            None => mid_end,
+        };
+        let line_slice = &data[cur_byte..line_end];
+        if memchr::memchr(0, line_slice).is_some() || std::str::from_utf8(line_slice).is_err() {
+            return None;
+        }
+        out.push((cur_byte, line_end));
+        cur_byte = line_end;
+        if cur_p < safe_end {
+            cur_p += 1;
+        }
+    }
+    if s_lines > 0 {
+        let delta = data.len() as isize - parent.len() as isize;
+        if delta == 0 {
+            out.extend_from_slice(&parent_lines[s_idx..]);
+        } else {
+            let cur_len = out.len();
+            out.extend_from_slice(&parent_lines[s_idx..]);
+            for (a, b) in &mut out[cur_len..] {
+                *a = (*a as isize + delta) as usize;
+                *b = (*b as isize + delta) as usize;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Where each line of `new` comes from in `old` (`None`: not there), and
@@ -314,6 +523,240 @@ pub fn map_lines(old: &[u8], new: &[u8], new_lines: usize) -> (Vec<Option<u32>>,
         map[b.len() - 1 - k] = Some((a.len() - 1 - k) as u32);
     }
     (map, false)
+}
+
+/// Length of the longest common byte prefix of `a` and `b`, using `==` on
+/// slices (`memcmp`) so even unoptimized builds scan at C speed.
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let min_len = a.len().min(b.len());
+    let mut lo = 0usize;
+    let mut step = 64usize;
+    while lo + step <= min_len && a[lo..lo + step] == b[lo..lo + step] {
+        lo += step;
+        step *= 2;
+    }
+    let mut hi = (lo + step).min(min_len);
+    while hi - lo > 16 {
+        let mid = lo + (hi - lo) / 2;
+        if a[lo..mid] == b[lo..mid] {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    while lo < hi && a[lo] == b[lo] {
+        lo += 1;
+    }
+    lo
+}
+
+/// Length of the longest common byte suffix of `a` and `b`, using `==` on
+/// slices (`memcmp`).
+fn common_suffix_len(a: &[u8], b: &[u8]) -> usize {
+    let min_len = a.len().min(b.len());
+    let mut lo = 0usize;
+    let mut step = 64usize;
+    while lo + step <= min_len && a[a.len() - (lo + step)..a.len() - lo] == b[b.len() - (lo + step)..b.len() - lo] {
+        lo += step;
+        step *= 2;
+    }
+    let mut hi = (lo + step).min(min_len);
+    while hi - lo > 16 {
+        let mid = lo + (hi - lo) / 2;
+        if a[a.len() - mid..a.len() - lo] == b[b.len() - mid..b.len() - lo] {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    while lo < hi && a[a.len() - 1 - lo] == b[b.len() - 1 - lo] {
+        lo += 1;
+    }
+    lo
+}
+
+/// When `old` and `new` have the same number of lines (`m == n`) and differ at
+/// between 1 and 8 isolated line indices (none of whose old or new lines appear
+/// elsewhere in the differing span or equal their immediate neighbors), returns
+/// the differing line indices `diffs[..ndiffs]`.
+pub fn isolated_replacements(old: &[u8], old_lines: &[(usize, usize)], new: &[u8], new_lines: &[(usize, usize)]) -> Option<Vec<usize>> {
+    let n = new_lines.len();
+    let m = old_lines.len();
+    if m != n || n == 0 {
+        return None;
+    }
+    let mut diffs = Vec::with_capacity(8);
+    let mut cur = 0;
+    while cur < n {
+        let (oa, ob) = old_lines[cur];
+        let (na, nb) = new_lines[cur];
+        if ob - oa == nb - na && old[oa..ob] == new[na..nb] {
+            let eq = common_prefix_len(&old[oa..], &new[na..]);
+            let target_byte = oa + eq;
+            let jump = bsearch_end_le(&old_lines[cur..], target_byte);
+            cur += jump.max(1);
+        } else {
+            if diffs.len() >= 8 {
+                return None;
+            }
+            diffs.push(cur);
+            cur += 1;
+        }
+    }
+    for &d in &diffs {
+        let (oa, ob) = old_lines[d];
+        let (na, nb) = new_lines[d];
+        let ol = &old[oa..ob];
+        let nl = &new[na..nb];
+        if d > 0 {
+            let (poa, pob) = old_lines[d - 1];
+            let (pna, pnb) = new_lines[d - 1];
+            if ol == &old[poa..pob] || ol == &new[pna..pnb] || nl == &old[poa..pob] || nl == &new[pna..pnb] {
+                return None;
+            }
+        }
+        if d + 1 < n {
+            let (noa, nob) = old_lines[d + 1];
+            let (nna, nnb) = new_lines[d + 1];
+            if ol == &old[noa..nob] || ol == &new[nna..nnb] || nl == &old[noa..nob] || nl == &new[nna..nnb] {
+                return None;
+            }
+        }
+        for &d2 in &diffs {
+            let (na2, nb2) = new_lines[d2];
+            if ol == &new[na2..nb2] {
+                return None;
+            }
+        }
+    }
+    Some(diffs)
+}
+
+/// [`map_lines`] returning `(prefix_len, mid_map, suffix_len, coarse)` without
+/// allocating an `n`-element vector for the unchanged prefix and suffix.
+pub fn map_lines_trimmed(old: &[u8], old_lines: &[(usize, usize)], new: &[u8], new_lines: &[(usize, usize)]) -> (usize, Vec<Option<u32>>, usize, bool) {
+    let n = new_lines.len();
+    let m = old_lines.len();
+    if n == 0 || m == 0 {
+        return (0, vec![None; n], 0, false);
+    }
+    let min_len = m.min(n);
+    // Find first differing byte between `old` and `new`, then binary search `old_lines` for the line containing it.
+    let eq_prefix_bytes = common_prefix_len(old, new);
+    let mut p0 = old_lines[..min_len].partition_point(|&(_, b)| b <= eq_prefix_bytes);
+    while p0 < min_len {
+        let (oa, ob) = old_lines[p0];
+        let (na, nb) = new_lines[p0];
+        if ob - oa != nb - na || old[oa..ob] != new[na..nb] {
+            break;
+        }
+        p0 += 1;
+    }
+    let prefix_end_byte = old_lines.get(p0).map_or(old.len(), |r| r.0);
+    let new_prefix_end_byte = new_lines.get(p0).map_or(new.len(), |r| r.0);
+    let eq_suffix_bytes = common_suffix_len(&old[prefix_end_byte..], &new[new_prefix_end_byte..]);
+    let old_suf_start = old.len() - eq_suffix_bytes;
+    let new_suf_start = new.len() - eq_suffix_bytes;
+    let s_guess = if eq_suffix_bytes == 0 {
+        0
+    } else {
+        let idx = old_lines[p0..].partition_point(|&(a, _)| a < old_suf_start);
+        m - (p0 + idx)
+    };
+    let mut s0 = s_guess.min(min_len - p0);
+    // Verify the boundary line of `s0` in case `eq_suffix_bytes` started mid-line.
+    while s0 > 0 {
+        let (oa, _) = old_lines[m - s0];
+        let (na, _) = new_lines[n - s0];
+        if oa < old_suf_start || na < new_suf_start {
+            s0 -= 1;
+        } else {
+            break;
+        }
+    }
+    while s0 < min_len - p0 {
+        let (oa, ob) = old_lines[m - 1 - s0];
+        let (na, nb) = new_lines[n - 1 - s0];
+        if ob - oa != nb - na || old[oa..ob] != new[na..nb] {
+            break;
+        }
+        s0 += 1;
+    }
+    let middle = |p: usize, s: usize| {
+        let oa = old_lines.get(p).map_or(old.len(), |r| r.0);
+        let ob = if s == 0 { old.len() } else { old_lines[m - s].0 };
+        let na = new_lines.get(p).map_or(new.len(), |r| r.0);
+        let nb = if s == 0 { new.len() } else { new_lines[n - s].0 };
+        (&old[oa.min(ob)..ob], &new[na.min(nb)..nb])
+    };
+    let (om, nm) = middle(p0, s0);
+    if !textmerge::fits_middle(om, nm, m + n) {
+        return (p0, vec![None; n - p0 - s0], s0, true);
+    }
+    let (mut p, mut s) = (p0, s0);
+    loop {
+        let mut moved = false;
+        if p > 0 {
+            let (ea, eb) = old_lines[p - 1];
+            let edge = &old[ea..eb];
+            let elen = edge.len();
+            let in_old = p < m - s
+                && memchr::memmem::find(&old[old_lines[p].0..old_lines[m - s - 1].1], edge).is_some()
+                && old_lines[p..m - s].iter().any(|&(a, b)| b - a == elen && &old[a..b] == edge);
+            let in_new = !in_old
+                && p < n - s
+                && memchr::memmem::find(&new[new_lines[p].0..new_lines[n - s - 1].1], edge).is_some()
+                && new_lines[p..n - s].iter().any(|&(a, b)| b - a == elen && &new[a..b] == edge);
+            if in_old || in_new {
+                p -= 1;
+                moved = true;
+            }
+        }
+        if s > 0 {
+            let (ea, eb) = old_lines[m - s];
+            let edge = &old[ea..eb];
+            let elen = edge.len();
+            let in_old = p < m - s
+                && memchr::memmem::find(&old[old_lines[p].0..old_lines[m - s - 1].1], edge).is_some()
+                && old_lines[p..m - s].iter().any(|&(a, b)| b - a == elen && &old[a..b] == edge);
+            let in_new = !in_old
+                && p < n - s
+                && memchr::memmem::find(&new[new_lines[p].0..new_lines[n - s - 1].1], edge).is_some()
+                && new_lines[p..n - s].iter().any(|&(a, b)| b - a == elen && &new[a..b] == edge);
+            if in_old || in_new {
+                s -= 1;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    let (om, nm) = middle(p, s);
+    let mut mid = diff_map(om, nm, n - p - s);
+    for j in mid.iter_mut().flatten() {
+        *j += p as u32;
+    }
+    (p, mid, s, false)
+}
+
+/// [`map_lines`] when both texts' line ranges (`old_lines`, `new_lines`) are
+/// already known.
+pub fn map_lines_ranged(old: &[u8], old_lines: &[(usize, usize)], new: &[u8], new_lines: &[(usize, usize)]) -> (Vec<Option<u32>>, bool) {
+    let n = new_lines.len();
+    let m = old_lines.len();
+    let (p, mid, s, coarse) = map_lines_trimmed(old, old_lines, new, new_lines);
+    let mut map: Vec<Option<u32>> = vec![None; n];
+    for (i, slot) in map.iter_mut().enumerate().take(p) {
+        *slot = Some(i as u32);
+    }
+    for (i, v) in mid.into_iter().enumerate() {
+        map[p + i] = v;
+    }
+    for k in 0..s {
+        map[n - 1 - k] = Some((m - 1 - k) as u32);
+    }
+    (map, coarse)
 }
 
 /// Past the diff's work limit: only the lines both texts share at the
