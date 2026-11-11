@@ -980,7 +980,21 @@ impl Service {
     async fn build(&self, inputs: Inputs, on: State) -> Result<Built> {
         let (hub, project, branch) = (self.hub.clone(), self.project, self.branch.clone());
         let rt = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || build(hub, rt, project, &branch, inputs, on)).await.map_err(|e| Error::Other(e.into()))?
+        // The default branch's tip, for a landing on another branch: the
+        // landed work a change may take there (`sync::Landed`, BUG-1920).
+        let default_tip: Option<String> = sqlx::query_scalar(
+            "SELECT b.target FROM projects p JOIN branches b ON b.project_id = p.id AND b.name = p.default_branch \
+             WHERE p.id = $1 AND p.default_branch <> $2 AND b.hidden_for_embargo IS NULL",
+        )
+        .bind(project)
+        .bind(&branch)
+        .fetch_optional(&hub.db)
+        .await?;
+        let default_tip = match default_tip {
+            Some(t) => Some(ObjectId::from_hex(&t).map_err(|e| Error::Other(e.into()))?),
+            None => None,
+        };
+        tokio::task::spawn_blocking(move || build(hub, rt, project, &branch, default_tip, inputs, on)).await.map_err(|e| Error::Other(e.into()))?
     }
 
     /// Commit the batch (its objects stored already) in one transaction;
@@ -1588,7 +1602,7 @@ fn project_onto(
 /// The batch, built on `on`: the attached view keys, then each entry in
 /// order, until one that must land alone, or the batch holds
 /// [`BATCH_BYTES`].
-fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, inputs: Inputs, on: State) -> Result<Built> {
+fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, default_tip: Option<ObjectId>, inputs: Inputs, on: State) -> Result<Built> {
     let mut src = Source {
         hub: hub.clone(),
         project,
@@ -1680,7 +1694,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             user_entry,
             review_check: p.review_check.clone(),
         };
-        let outcome = match entry(&hub, &mut src, branch, &p, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
+        let outcome = match entry(&hub, &mut src, branch, default_tip, &p, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
             Ok(Some(o)) => o,
             // It changes access or rules and others come before it: it lands
             // alone, in the next batch.
@@ -1727,6 +1741,7 @@ fn entry(
     hub: &Arc<Hub>,
     src: &mut Source,
     branch: &str,
+    default_tip: Option<ObjectId>,
     p: &Prepared,
     b: &mut Built,
     memo: &mut HashMap<(String, ObjectId), ObjectId>,
@@ -1799,6 +1814,29 @@ fn entry(
                     return Ok(Some(Outcome::Rejected(format!("you may not write '{}'", c.path))));
                 }
             }
+        }
+    }
+    // The one write rule of a branch's move (`sync::branch_move_write_refusal`,
+    // BUG-1920), where the service moves it: every path a change's edits
+    // differ at needs its submitter's write access, whoever made the change
+    // and whatever its shape (a held change of someone else's seen whole, a
+    // merge and what it takes from its other parents), unless the default
+    // branch holds that version where the change joins it (landed work
+    // taken onto another branch). Asked of every entry, every time, after
+    // the answers above to someone whose access changed.
+    for (e, set) in p.row.stack.iter().zip(&sets) {
+        let mut landed = sync::Landed::new(default_tip, e.id);
+        for c in set.iter().filter(|c| !view.write(&c.path)) {
+            if landed.holds(src, &mut sync::PushRows::default(), &c.path, c.new.as_ref())? {
+                continue;
+            }
+            if !view.within_narrowing(&c.path) {
+                return Ok(Some(Outcome::Rejected(sync::NARROWED_MOVE.into())));
+            }
+            if !view.read(&c.path) {
+                return Ok(Some(Outcome::Rejected("you may not land changes outside your view".into())));
+            }
+            return Ok(Some(Outcome::Rejected(format!("you may not write '{}'", c.path))));
         }
     }
     if let Some(why) = &p.review_refusal {

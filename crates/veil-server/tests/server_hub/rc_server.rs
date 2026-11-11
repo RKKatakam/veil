@@ -56,7 +56,6 @@ fn push(hub: &TestHub, token: &str, project: &str, branch: &str, expected: Optio
 /// and `check_changes` counts `src/unfinished.rs` as "taken from another
 /// parent's side" (BUG-820's rule), whatever branch that side is on.
 #[test]
-#[ignore = "BUG-1920: a merge of someone's unlanded branch moves a branch across changes its pusher may not write"]
 fn bug_1920_a_merge_of_an_unlanded_branch_needs_write_access_to_what_it_brings() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -101,6 +100,219 @@ fn bug_1920_a_merge_of_an_unlanded_branch_needs_write_access_to_what_it_brings()
     assert_eq!(file.status, 404, "the unfinished file is on main ({answered}): {}", body(&file));
     assert_eq!(main_tip(&hub, Some(&admin_tok), &p.name), main_before, "main moved on the push of someone who may not write src/ ({answered})");
     assert_eq!(merged.status, 403, "{answered}");
+}
+
+/// A developer's unfinished `src/unfinished.rs` on a branch `wip` of its own.
+fn unfinished_work(hub: &TestHub, p: &Project) {
+    let dev_tok = p.dev.token();
+    let dev_main = main_tip(hub, Some(&dev_tok), &p.name);
+    let made = push(hub, &dev_tok, &p.name, "wip", None, dev_main);
+    assert_eq!(made.json()["results"][0]["ok"], json!(true), "{}", body(&made));
+    let c = change(
+        hub,
+        &dev_tok,
+        &p.name,
+        &json!({"base": dev_main.hex(), "description": "work in progress", "onto": {"branch": "wip", "expected": dev_main.hex()},
+                "edits": [{"path": "src/unfinished.rs", "put": {"text": "pub fn unfinished() { todo!() }\n"}}]}),
+    );
+    assert_eq!(c.status, 200, "{}", body(&c));
+    assert_eq!(c.json()["branch"]["status"], "ok", "{}", body(&c));
+}
+
+fn file_status(hub: &TestHub, token: &str, project: &str, path: &str) -> u16 {
+    hub.api().get(Some(token), &format!("/v1/projects/{project}/q/file?path={path}")).status
+}
+
+/// BUG-1920's rule for a push of every shape: every path that differs
+/// between a branch's old tip and its new one needs the mover's write
+/// access, unless the new tip holds landed work there. The shapes that
+/// bring `wip`'s `src/unfinished.rs` onto `main` for `fin` (who may not
+/// write `src/`) are each refused, and `main` is where it was.
+#[test]
+fn bug_1920_a_branch_move_is_refused_whatever_shape_brings_what_its_mover_may_not_write() {
+    use veil_core::object::{Object, Snapshot, Text};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (admin_tok, fin_tok) = (p.admin.token(), p.fin.token());
+    unfinished_work(&hub, &p);
+    let main_before = main_tip(&hub, Some(&admin_tok), &p.name);
+    let tips = hub.api().tips(Some(&fin_tok), &p.name).unwrap();
+    let (fin_main, fin_wip) = (tips.branches["main"], tips.branches["wip"]);
+    let api = hub.api();
+    let still = |shape: &str, r: &Reply| {
+        let answered = format!("{shape}: the push answered {} {}", r.status, body(r));
+        assert_eq!(file_status(&hub, &admin_tok, &p.name, "src/unfinished.rs"), 404, "the unfinished file is on main ({answered})");
+        assert_eq!(main_tip(&hub, Some(&admin_tok), &p.name), main_before, "main moved ({answered})");
+        assert_eq!(r.status, 403, "{answered}");
+        assert!(body(r).contains("you may not write 'src/unfinished.rs'"), "{answered}");
+    };
+
+    // A merge whose first parent is the unlanded work, and its second `main`.
+    let merge = Craft::new(&api, &p.fin, &p.name, "wip");
+    let (_, r) = merge.push_edited("main", Some(fin_main), |s| s.parents = vec![fin_wip, fin_main]);
+    still("a merge of [wip, main]", &r);
+
+    // A merge of `main` and a new snapshot of her own (a file she may
+    // write) that stands on the unlanded work: both uploaded in one push.
+    let mut merge = Craft::new(&api, &p.fin, &p.name, "wip");
+    merge.file(&format!("{BILL_DIR}/acme/hers.txt"), "hers\n");
+    let mut on_wip = Snapshot {
+        parents: vec![fin_wip],
+        change_id: veil_core::ChangeId::random(),
+        tree: merge.root,
+        description: Text::Plain("hers, on wip".into()),
+        author: "crafter".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    on_wip.sign(&merge.identity);
+    let on_wip = merge.put(Object::Snapshot(on_wip));
+    let (_, r) = merge.push_edited("main", Some(fin_main), |s| s.parents = vec![fin_main, on_wip]);
+    still("a merge of [main, a new snapshot on wip]", &r);
+
+    // Her own change stacked on the unlanded work, as a fast-forward.
+    let mut stacked = Craft::new(&api, &p.fin, &p.name, "wip");
+    stacked.file(&format!("{BILL_DIR}/acme/hers.txt"), "hers\n");
+    let (_, r) = stacked.push_edited("main", Some(fin_main), |_| {});
+    still("a change of her own on wip", &r);
+
+    // A new branch other than the default one lands nothing: she may name
+    // what she can read, and stack on it. Moving `main` there is refused as
+    // before, and so is merging it into `main`.
+    let made = push(&hub, &fin_tok, &p.name, "fin-on-wip", None, fin_wip);
+    assert_eq!(made.status, 200, "{}", body(&made));
+    assert_eq!(made.json()["results"][0]["ok"], json!(true), "{}", body(&made));
+    let mut stacked = Craft::new(&api, &p.fin, &p.name, "fin-on-wip");
+    stacked.file(&format!("{BILL_DIR}/acme/hers.txt"), "hers\n");
+    let (hers, r) = stacked.push_edited("fin-on-wip", Some(fin_wip), |_| {});
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", body(&r));
+    let r = push(&hub, &fin_tok, &p.name, "main", Some(fin_main), hers);
+    still("main moved to her branch on wip", &r);
+    let mut merge = Craft::new(&api, &p.fin, &p.name, "fin-on-wip");
+    merge.tip = fin_main;
+    let r = merge.push_merge("main", &[hers]);
+    still("a merge of [main, her branch on wip]", &r);
+
+}
+
+/// The pushes BUG-1920's rule must keep: landed work is no write. `fin`
+/// (who may not write `src/`) merges a `main` that a developer moved in
+/// `src/` into her own branch, lands her own change on that `main`, and
+/// moves a branch of hers forward to `main`'s tip.
+#[test]
+fn bug_1920_taking_landed_work_is_no_write() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (admin_tok, dev_tok, fin_tok) = (p.admin.token(), p.dev.token(), p.fin.token());
+    let api = hub.api();
+    let ok = |r: &Reply| {
+        assert_eq!(r.status, 200, "{}", body(r));
+        assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", body(r));
+    };
+    // Her branch, and a second one left at the old `main`.
+    let fin_old = main_tip(&hub, Some(&fin_tok), &p.name);
+    ok(&push(&hub, &fin_tok, &p.name, "fin-work", None, fin_old));
+    ok(&push(&hub, &fin_tok, &p.name, "fin-behind", None, fin_old));
+    let mut hers = Craft::new(&api, &p.fin, &p.name, "fin-work");
+    hers.file(&format!("{BILL_DIR}/acme/hers.txt"), "hers\n");
+    let (fin_work, r) = hers.push_edited("fin-work", Some(fin_old), |_| {});
+    ok(&r);
+    // Others move `main`, in a folder she may not write.
+    let dev_main = main_tip(&hub, Some(&dev_tok), &p.name);
+    let c = change(
+        &hub,
+        &dev_tok,
+        &p.name,
+        &json!({"base": dev_main.hex(), "description": "landed by dev", "onto": {"branch": "main", "expected": dev_main.hex()},
+                "edits": [{"path": "src/landed.rs", "put": {"text": "pub fn landed() {}\n"}}]}),
+    );
+    assert_eq!(c.status, 200, "{}", body(&c));
+    assert_eq!(c.json()["branch"]["status"], "ok", "{}", body(&c));
+    let fin_main = main_tip(&hub, Some(&fin_tok), &p.name);
+    assert_ne!(fin_main, fin_old);
+
+    // She merges `main` into her branch: the merge holds `main`'s tree and
+    // her file.
+    let mut merge = Craft::new(&api, &p.fin, &p.name, "main");
+    merge.file(&format!("{BILL_DIR}/acme/hers.txt"), "hers\n");
+    merge.tip = fin_work;
+    let (merged, r) = merge.push_edited("fin-work", Some(fin_work), |s| s.parents = vec![fin_work, fin_main]);
+    ok(&r);
+    // She lands it: `main` moves forward to the merge, which brings her
+    // file only.
+    ok(&push(&hub, &fin_tok, &p.name, "main", Some(fin_main), merged));
+    assert_eq!(file_status(&hub, &admin_tok, &p.name, &format!("{BILL_DIR}/acme/hers.txt")), 200);
+    assert_eq!(file_status(&hub, &admin_tok, &p.name, "src/landed.rs"), 200);
+    // Her other branch moves forward to `main`'s tip, across the
+    // developer's landed change and her own.
+    ok(&push(&hub, &fin_tok, &p.name, "fin-behind", Some(fin_old), merged));
+
+    // And unlanded work is its writer's to bring: the developer moves
+    // `main` to a branch that changes `src/`.
+    unfinished_work(&hub, &p);
+    // The developer, who may write `src/`, moves `main` to the work.
+    let dev_tok = p.dev.token();
+    let tips = hub.api().tips(Some(&dev_tok), &p.name).unwrap();
+    let r = push(&hub, &dev_tok, &p.name, "main", Some(tips.branches["main"]), tips.branches["wip"]);
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", body(&r));
+    assert_eq!(file_status(&hub, &admin_tok, &p.name, "src/unfinished.rs"), 200);
+}
+
+/// BUG-1920's rule where the landing service moves the branch: a protected
+/// `main` (its rules need no approval, so only access decides). `fin` lands
+/// the developer's held `wip`, and pushes the merges of it; nothing of
+/// `src/unfinished.rs` lands. The developer then lands it.
+#[test]
+fn bug_1920_the_landing_service_lands_only_what_its_submitter_may_write() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let (admin_tok, dev_tok, fin_tok) = (p.admin.token(), p.dev.token(), p.fin.token());
+    let rules = "[branches.main]\nprotected = true\n\n[review]\nchecks_only = [\"src/**\"]\n\
+                 normal = { approvals = 0, people_only = false }\nhigh = { approvals = 0 }\n";
+    let (l0, _) = land_new_change(&hub, &admin_tok, &p.name, ".veilrules", rules);
+    assert_eq!(l0.status, 200, "{}", body(&l0));
+    assert_eq!(l0.json()["state"], "landed", "{}", body(&l0));
+    unfinished_work(&hub, &p);
+    let main_before = main_tip(&hub, Some(&admin_tok), &p.name);
+    let tips = hub.api().tips(Some(&fin_tok), &p.name).unwrap();
+    let (fin_main, fin_wip) = (tips.branches["main"], tips.branches["wip"]);
+    let api = hub.api();
+    let still = |shape: &str, r: &Reply| {
+        let answered = format!("{shape}: answered {} {}", r.status, body(r));
+        assert_eq!(file_status(&hub, &admin_tok, &p.name, "src/unfinished.rs"), 404, "the unfinished file is on main ({answered})");
+        assert_eq!(main_tip(&hub, Some(&admin_tok), &p.name), main_before, "main moved ({answered})");
+        assert!(body(r).contains("you may not write 'src/unfinished.rs'"), "{answered}");
+    };
+
+    // The held work, landed by her.
+    let r = land(&hub, &fin_tok, &p.name, &fin_wip.hex());
+    still("landing the held wip", &r);
+    assert_eq!(r.json()["state"], "rejected", "{}", body(&r));
+    // The same as a push of the held tip, and as merges of it.
+    let r = push(&hub, &fin_tok, &p.name, "main", Some(fin_main), fin_wip);
+    still("a push of the held wip", &r);
+    let mut merge = Craft::new(&api, &p.fin, &p.name, "wip");
+    merge.tip = fin_main;
+    let r = merge.push_merge("main", &[fin_wip]);
+    still("a merge of [main, wip]", &r);
+    let merge = Craft::new(&api, &p.fin, &p.name, "wip");
+    let (_, r) = merge.push_edited("main", Some(fin_main), |s| s.parents = vec![fin_wip, fin_main]);
+    still("a merge of [wip, main]", &r);
+
+    // The developer, who may write `src/`, lands it.
+    let dev_wip = hub.api().tips(Some(&dev_tok), &p.name).unwrap().branches["wip"];
+    let r = land(&hub, &dev_tok, &p.name, &dev_wip.hex());
+    assert_eq!(r.status, 200, "{}", body(&r));
+    assert_eq!(r.json()["state"], "landed", "{}", body(&r));
+    assert_eq!(file_status(&hub, &admin_tok, &p.name, "src/unfinished.rs"), 200);
 }
 
 fn post_check(hub: &TestHub, token: &str, project: &str, snapshot: ObjectId, name: &str, state: &str) -> Reply {

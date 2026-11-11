@@ -1283,7 +1283,13 @@ pub(crate) async fn create_with(
                 None
             }
             (Some(o), Some(c), None) => match if c != parent || attempts > 1 {
-                sync::branch_move_write_refusal(hub, &who.project, &who.viewer, c, built.real, None).await?
+                // An API commit always adds to the branch: landed work it
+                // stands on is no write on a branch other than the default.
+                let landed = match plan.default_branch {
+                    true => None,
+                    false => tip(hub, project.id, &project.default_branch).await?,
+                };
+                sync::branch_move_write_refusal(hub, &who.project, &who.viewer, Some(c), built.real, landed, &mut sync::PushRows::default(), None).await?
             } else {
                 None
             } {
