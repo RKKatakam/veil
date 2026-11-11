@@ -102,6 +102,7 @@ pub struct Paths {
 }
 
 const STATE_FILE: &str = "state.json";
+const GUARD_FILE: &str = "guard.bin";
 
 impl Paths {
     pub fn new(root: &Path, ws: &str) -> Paths {
@@ -141,6 +142,28 @@ impl Paths {
     /// Durably (temp file, fsync, rename).
     fn save_state(&self, st: &State) -> Result<()> {
         self.backend().write(&VPath::new(STATE_FILE)?, &serde_json::to_vec_pretty(st)?)?;
+        Ok(())
+    }
+
+    /// The mount's secret guard, if it has shown sealed secrets.
+    pub fn load_guard(&self, repo: &Repo) -> Result<Option<Guard>> {
+        let Some(raw) = self.backend().read_opt(&VPath::new(GUARD_FILE)?)? else {
+            return Ok(None);
+        };
+        let key = repo.keys().require(veil_core::keychain::LOCAL_SCOPE)?;
+        let plain = veil_core::crypto::Envelope::from_bytes(&raw)
+            .and_then(|e| e.open(&key))
+            .map_err(|_| anyhow!("the secret guard of the mount ({}) cannot be opened with this identity's key", self.dir.join(GUARD_FILE).display()))?;
+        Ok(Some(serde_json::from_slice(&plain)?))
+    }
+
+    fn save_guard(&self, repo: &Repo, g: &Guard) -> Result<()> {
+        if g.files.is_empty() {
+            return Ok(());
+        }
+        let key = repo.keys().require(veil_core::keychain::LOCAL_SCOPE)?;
+        let env = veil_core::crypto::Envelope::seal(&key, veil_core::keychain::LOCAL_SCOPE, &serde_json::to_vec(g)?, false)?;
+        self.backend().write(&VPath::new(GUARD_FILE)?, &env.to_bytes())?;
         Ok(())
     }
 
@@ -372,9 +395,13 @@ impl Recorder {
             }
         };
         let mut guard = SandboxPaths::new(root, ws).load_guard(&repo)?.unwrap_or_default();
+        if let Some(mg) = paths.load_guard(&repo)? {
+            guard.merge(&mg);
+        }
         if let Ok(snap) = repo.snapshot(&shown_snap) {
             guard.add(&sealed_files_in_tree(repo.store(), &snap.tree, None));
         }
+        let _ = paths.save_guard(&repo, &guard);
         let upper: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(&paths.upper));
         // Large open files' content: anonymous files here, never in memory
         // (BUG-1365).
@@ -420,6 +447,7 @@ impl Recorder {
         if let Ok(snap) = repo.snapshot(snapshot) {
             self.guard.add(&sealed_files_in_tree(repo.store(), &snap.tree, None));
         }
+        let _ = self.paths.save_guard(repo, &self.guard);
         Ok((!self.guard.files.is_empty()).then(|| self.guard.secrets()))
     }
 

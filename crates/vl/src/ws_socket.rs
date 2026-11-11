@@ -205,6 +205,59 @@ fn check_revisions_here(ctx: &Ctx, ws: &str, cli: &Cli) -> Result<()> {
     }
 }
 
+/// Every description the socket accepts (`commit`, `describe`, `new`) is
+/// checked against the sandbox's secret-value guard (isolated files injected
+/// with `--with-isolated` and sealed files checked out or mounted), so no
+/// secret value enters history in plain text (BUG-1841). The refusal names
+/// the source file only, never echoing the value.
+fn check_description(ctx: &Ctx, root: &Path, ws: &str, cli: &Cli) -> Result<()> {
+    let (what, message) = match &cli.cmd {
+        Cmd::Commit { message, .. } => ("commit", message.as_str()),
+        Cmd::Describe { message, .. } => ("describe", message.as_str()),
+        Cmd::New { message, .. } => ("new", message.as_str()),
+        Cmd::Status { .. } | Cmd::Log { .. } | Cmd::Show { .. } | Cmd::Diff { .. } | Cmd::Blame(_) => return Ok(()),
+        other => bail!("`vl {}` is not available inside a sandbox", command_name(other)),
+    };
+    if message.is_empty() {
+        return Ok(());
+    }
+    let paths = veil_core::sandbox::SandboxPaths::new(root, ws);
+    let mut guard = paths.load_guard(&ctx.repo)?.unwrap_or_default();
+    if let Some(mg) = crate::mount::Paths::new(root, ws).load_guard(&ctx.repo)? {
+        guard.merge(&mg);
+    }
+    let only = match paths.load_manifest() {
+        veil_core::sandbox::Loaded::Found(m) => m.only_set()?,
+        _ => None,
+    };
+    let wc = ctx.wc()?;
+    let store = ctx.repo.store().clone();
+    store.without_fetching(|| -> Result<()> {
+        if let Ok(snap) = ctx.repo.snapshot(&wc) {
+            for id in std::iter::once(wc).chain(snap.parents.iter().copied()) {
+                if let Ok(s) = ctx.repo.snapshot(&id) {
+                    let slice = match &only {
+                        Some(set) => veil_core::vfs::restrict(&store, &s.tree, set)?,
+                        None => s.tree,
+                    };
+                    guard.add(&veil_core::sandbox::sealed_files_in_tree(&store, &slice, None));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if !guard.files.is_empty() {
+        if let Some(f) = guard.secrets().find(message.as_bytes()) {
+            bail!(
+                "`vl {what}` refused: the change description holds {} ({}); change descriptions are recorded in plain text",
+                safe(&f.excerpt),
+                f.rule,
+            );
+        }
+    }
+    Ok(())
+}
+
 // ---- inside the sandbox --------------------------------------------------------------
 
 /// The `vl` inside a sandbox: send the arguments to the socket and print
@@ -544,5 +597,6 @@ pub fn parse_command(args: Vec<OsString>) -> Result<(PathBuf, String, Cli)> {
 pub fn open(root: &Path, ws: &str, cli: &Cli) -> Result<Ctx> {
     let ctx = Ctx::open_for_workspace(root, ws)?;
     check_revisions(&ctx, ws, cli)?;
+    check_description(&ctx, root, ws, cli)?;
     Ok(ctx)
 }

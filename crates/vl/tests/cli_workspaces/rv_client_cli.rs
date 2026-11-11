@@ -158,10 +158,10 @@ fn bug_1840_sealed_secret_guard_covers_mounts_socket_commits_and_allows_in_place
 /// description that quotes an injected isolated secret must not enter
 /// history: descriptions are plain text and are pushed.
 #[test]
-#[ignore = "BUG-1841: through the workspace socket, an injected isolated secret enters history in a change description"]
 fn bug_1841_an_injected_secret_never_enters_history_through_a_description_set_inside_the_sandbox() {
     const SECRET: &str = "postgres://app:Xk29vLq8sPzQw7Lm@db/prod";
-    let t = T::new(&[("a.txt", "a\n")]);
+    const SEALED: &str = "Rk91mNv4pQz8wLx2Tr7Bc5Yd";
+    let t = T::new(&[("a.txt", "a\n"), (".env", &format!("API_KEY={SEALED}\n"))]);
     // An isolated file: on this device only, never in a snapshot.
     write(&t.proj, "deploy.key", &format!("DB_URL={SECRET}\n"));
     let st = t.ok(&["status"]);
@@ -174,19 +174,25 @@ fn bug_1841_an_injected_secret_never_enters_history_through_a_description_set_in
            vl commit -m "use $(cat deploy.key)"; echo "commit: $?"
            vl describe -m "now $(cut -d= -f2- deploy.key)"; echo "describe: $?"
            vl new -m "next $(cut -d= -f2- deploy.key)"; echo "new: $?"
+           vl commit -m "sealed $(cut -d= -f2- .env)"; echo "sealed-commit: $?"
            exit 0"#,
     );
-    assert!(o.status.success(), "the run itself works (the isolated file was injected):\n{}", text(&o));
+    let out = text(&o);
+    assert!(o.status.success(), "the run itself works (the isolated file was injected):\n{out}");
+    for tag in ["commit: 1", "describe: 1", "new: 1", "sealed-commit: 1"] {
+        assert!(out.contains(tag), "expected refusal `{tag}`:\n{out}");
+    }
+    assert!(!out.contains(SECRET), "refusal message echoed the isolated secret:\n{out}");
+    assert!(!out.contains(SEALED), "refusal message echoed the sealed secret:\n{out}");
     // The file guard works: the copy is quarantined, never recorded.
     let listed = t.ok(&["ls", "-r", "agent@"]);
     assert!(!listed.contains("copy.txt"), "the copy of the injected file is not recorded:\n{listed}");
 
-    // Nothing of the workspace's history holds the injected value.
+    // Nothing of the workspace's history holds the injected or sealed value.
     let log = t.ok(&["log", "-r", "::agent@"]);
     assert!(
-        !log.contains(SECRET),
-        "an injected isolated secret is in the workspace's history, in a description (plain text, pushed):\n{log}\nrun:\n{}",
-        text(&o)
+        !log.contains(SECRET) && !log.contains(SEALED),
+        "a secret value is in the workspace's history, in a description (plain text, pushed):\n{log}\nrun:\n{out}"
     );
 }
 
