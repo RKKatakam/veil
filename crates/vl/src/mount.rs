@@ -653,15 +653,17 @@ impl Recorder {
                 drop.push(p);
                 continue;
             }
-            let own_sealed = lookup(repo.store(), &wc_tree, &p)
-                .ok()
-                .flatten()
-                .filter(|e| sealed_leaf(repo.store(), e) != Some(false))
-                .map(|_| p.as_str());
-            let hit = self
-                .fs
-                .with_view(|ov| ov.read(&p))
-                .is_ok_and(|data| secrets.find_for(own_sealed, &data).is_some());
+            let recorded = lookup(repo.store(), &wc_tree, &p).ok().flatten();
+            let own_sealed = recorded.as_ref().filter(|e| sealed_leaf(repo.store(), e) != Some(false)).map(|_| p.as_str());
+            // The builder's rule (BUG-1931): a value the path's recorded
+            // public version holds is not a copy made in the mount.
+            let prior = recorded
+                .filter(|e| e.kind == veil_core::EntryKind::File && e.visibility.is_public())
+                .and_then(|e| repo.store().read_entry(&e).ok());
+            let hit = self.fs.with_view(|ov| ov.read(&p)).is_ok_and(|data| match &prior {
+                Some(prior) => secrets.find_new(own_sealed, &data, prior).is_some(),
+                None => secrets.find_for(own_sealed, &data).is_some(),
+            });
             if hit {
                 drop.push(p);
             }

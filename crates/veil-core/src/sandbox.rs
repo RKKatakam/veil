@@ -1199,8 +1199,9 @@ pub fn scrub(fs: &SandboxFs, since: i64, secrets: &InjectedSecrets, cache: &Stat
 /// Take the files [`scrub`] found out of the sandbox: a file `recorded`
 /// (the tree the sandbox was just recorded as) has gets its recorded
 /// version back, any other is removed. A file whose recorded version is
-/// this very content, or holds an injected value itself, is left (history
-/// has it already).
+/// this very content, or is public and holds every injected value the file
+/// does, is left (history has them already, at that path: the builder's
+/// rule, BUG-1931).
 pub fn clean_copies(
     store: &ObjectStore,
     fs: &SandboxFs,
@@ -1225,7 +1226,7 @@ pub fn clean_copies(
                     Err(e) => return Err(e),
                 };
                 if let Some((data, executable, secret)) = entry.and_then(|e| as_checked_out(store, &e)) {
-                    if fs.read(vp).is_ok_and(|have| have == data) || (!secret && secrets.find(&data).is_some()) {
+                    if fs.read(vp).is_ok_and(|have| have == data || (!secret && secrets.find_new(None, &have, &data).is_none())) {
                         return Ok(());
                     }
                     if secret {

@@ -512,7 +512,10 @@ What counts as an injected value: each `KEY=value` value that looks like a
 secret (8+ characters, mixed character classes or 20+ characters, so
 `localhost` or `3000` don't count), the whole file, and every 24+ character
 line. The command itself can of course read and use the secrets (that is
-the point); quarantine only keeps them out of history.
+the point); quarantine only keeps them out of history. A value that a
+tracked file's recorded version already holds, in plain text, is not a copy
+the command made: a README that gives the `APP_URL` your `.env` also sets
+can still be edited. Only a value that is new to a file is quarantined.
 
 **Injected files live for one run.** After the run is recorded, the
 injected files are taken out of the sandbox again (a file the sandbox had
