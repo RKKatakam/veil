@@ -391,20 +391,41 @@ pub async fn read_gc_epoch(hub: &Hub, project: i64) -> Result<i64> {
     Ok(epoch)
 }
 
+/// The advisory lock that queues a project's root-adding transactions and
+/// GC's switch in arrival order (`"veilgcgt"` ^ `project_id`). The epoch row's
+/// lock alone is what makes the switch safe, but PostgreSQL lets a new
+/// `FOR SHARE` join the row's sharers ahead of a waiting `FOR UPDATE`: under
+/// steady pushes GC's switch never got the row (64 writers at once: none in
+/// 5 s, three times; behind this lock: 1 ms). The lock manager is fair, so
+/// the switch waits only for the writers already in their transactions.
+const GATE_BASE: i64 = 0x7665_696c_6763_6774;
+
+/// One statement of a root-adding transaction, its first: wait in line with
+/// GC's switch (the advisory lock, shared: writers never wait for each
+/// other), then lock the project's GC epoch row `FOR SHARE` and read it. A
+/// switch that committed while the statement waited is seen: the row is
+/// locked and read as last committed. Binds: the project, [`gate_key`].
+pub(crate) const GUARD_SQL: &str = "SELECT e.epoch FROM (SELECT pg_advisory_xact_lock_shared($2)) g, access_epochs e \
+     WHERE e.project_id = $1 AND e.person_id = -1 FOR SHARE OF e";
+
+pub(crate) fn gate_key(project: i64) -> i64 {
+    GATE_BASE ^ project
+}
+
 /// Lock the project's GC epoch row `FOR SHARE` and verify it still matches
 /// `expected_epoch` (`BUG-1881`), serializing every root-adding transaction
-/// against GC's `FOR UPDATE` switch.
+/// against GC's `FOR UPDATE` switch. It is the transaction's first
+/// statement, so a writer waiting here holds no lock the switch needs.
 pub async fn guard_root_write(
     c: &mut PgConnection,
     project: i64,
     expected_epoch: i64,
 ) -> Result<()> {
-    let cur: Option<i64> = sqlx::query_scalar(
-        "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR SHARE",
-    )
-    .bind(project)
-    .fetch_optional(&mut *c)
-    .await?;
+    let cur: Option<i64> = sqlx::query_scalar(GUARD_SQL)
+        .bind(project)
+        .bind(gate_key(project))
+        .fetch_optional(&mut *c)
+        .await?;
     if cur != Some(expected_epoch) {
         return Err(Error::Other(anyhow::Error::new(GcEpochChanged)));
     }
@@ -415,6 +436,9 @@ pub async fn guard_root_write(
 /// transaction (`BUG-1881`), waiting for any in-flight root-adding transaction
 /// before reading `read_ref_stamp` or purging records.
 async fn lock_gc_epoch_tx(c: &mut PgConnection, project: i64) -> Result<()> {
+    // In line with the writers first ([`GATE_BASE`]): those that come after
+    // wait behind this, so the row below is free once the earlier ones end.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(gate_key(project)).execute(&mut *c).await?;
     let got: Option<i64> = sqlx::query_scalar(
         "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE",
     )

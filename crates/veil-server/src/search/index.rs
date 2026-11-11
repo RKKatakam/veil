@@ -291,12 +291,11 @@ pub(crate) async fn apply_write(
     project: i64,
     w: &PreparedWrite,
 ) -> std::result::Result<bool, sqlx::Error> {
-    let cur_gc_epoch: Option<i64> = sqlx::query_scalar(
-        "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR SHARE",
-    )
-    .bind(project)
-    .fetch_optional(&mut **tx)
-    .await?;
+    let cur_gc_epoch: Option<i64> = sqlx::query_scalar(crate::pack_gc::GUARD_SQL)
+        .bind(project)
+        .bind(crate::pack_gc::gate_key(project))
+        .fetch_optional(&mut **tx)
+        .await?;
     if cur_gc_epoch != Some(w.gc_epoch) {
         return Ok(false);
     }

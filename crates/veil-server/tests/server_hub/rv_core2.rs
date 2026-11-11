@@ -842,8 +842,8 @@ fn bug_1881_pr_writer_and_reverse_switch_order_serialize_with_gc() {
     }
     th.rt.block_on(wait_for_sql_lock(
         &h.db,
-        "SELECT epoch FROM access_epochs%FOR SHARE%",
-        "push never reached guard_root_write FOR SHARE",
+        "SELECT e.epoch FROM (SELECT pg_advisory_xact_lock_shared%FOR SHARE%",
+        "push never reached guard_root_write (in line behind GC's switch)",
     ));
     snap_lock.rollback();
     let rep = th.rt.block_on(gc_handle).unwrap().unwrap();
