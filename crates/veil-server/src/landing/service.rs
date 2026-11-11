@@ -178,6 +178,10 @@ struct BatchReviewGuard {
 }
 
 /// Metadata of a row in a built batch.
+/// How long a batch's tickets wait for its landed PRs' source branches to
+/// be deleted (BUG-1924) before they are resolved; the deletion goes on.
+const PR_CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Clone)]
 struct RowMeta {
     seq: i64,
@@ -189,6 +193,9 @@ struct RowMeta {
     epochs: (i64, i64),
     user_entry: bool,
     review_check: Option<EntryReviewCheck>,
+    /// The PR this entry lands, at its revision (`ReviewClaim::Pr`): the
+    /// batch that lands it marks it landed (BUG-1924).
+    pr: Option<(String, i32)>,
 }
 
 impl crate::limits::landing::QueuedEntry for Row {
@@ -1101,6 +1108,19 @@ impl Service {
             _ => None,
         };
         let landed = b.outcomes.iter().filter(|o| matches!(o, Outcome::Landed { .. })).count();
+        // The PRs the batch lands (BUG-1924): marked landed in its
+        // transaction, whether or not the request that queued them still
+        // waits; their source branches are cleaned after it (`prs::pr_landed`).
+        let landed_prs: Vec<(String, i32, i64)> = b
+            .rows
+            .iter()
+            .zip(&b.outcomes)
+            .filter_map(|(meta, o)| match (o, &meta.pr) {
+                (Outcome::Landed { .. }, Some((id, revision))) => Some((id.clone(), *revision, meta.person_id)),
+                _ => None,
+            })
+            .collect();
+        let tx_landed_prs = landed_prs.clone();
         let notify = hub.caches.notices.load(Ordering::SeqCst);
         let active_agents: Vec<(i64, String, (i64, i64))> = b
             .rows
@@ -1157,6 +1177,7 @@ impl Service {
                 name.clone(),
                 tx_results.clone(),
             );
+            let landed_prs = tx_landed_prs.clone();
             Box::pin(async move {
                 crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 // Fencing: only the lease's current holder moves the branch.
@@ -1319,6 +1340,13 @@ impl Service {
                 if n != seqs.len() as u64 {
                     return Err(Error::conflict(MOVED));
                 }
+                // Which of the batch's PRs this commit marked landed (one
+                // an embargo holds is its release's to mark).
+                let mut marked: Vec<bool> = Vec::with_capacity(landed_prs.len());
+                for (id, revision, _) in &landed_prs {
+                    let n = crate::prs::mark_landed(&mut *c, pid, id, *revision, now_ms).await?;
+                    marked.push(n);
+                }
                 if !snapshots.is_empty() {
                     sqlx::query(
                         "INSERT INTO snapshots (project_id, id, author) SELECT $1, s, a FROM unnest($2::TEXT[], $3::BIGINT[]) AS v(s, a) \
@@ -1406,11 +1434,11 @@ impl Service {
                         .execute(&mut *c)
                         .await?;
                 }
-                Ok(results)
+                Ok((results, marked))
             })
         })
         .await;
-        let results = match r {
+        let (results, marked_prs) = match r {
             Ok(r) => r,
             Err(Error::Api { code: "conflict", message, .. }) if message == LEASE_LOST => {
                 hub.landing.stats.lease_lost.fetch_add(1, Ordering::Relaxed);
@@ -1492,6 +1520,26 @@ impl Service {
             .filter_map(|(m, r)| Some((m.ticket.clone(), r.clone()?)))
             .collect();
         let has_revert = terminal.iter().any(|(t, _)| t.starts_with("revert-"));
+        // Each landed PR's event and its source branch's deletion: tasks of
+        // their own, so they finish whoever waits; the tickets are resolved
+        // after them as a rule (the request that waited answers with the
+        // branch gone), and never held up by them for long.
+        let cleanups: Vec<_> = landed_prs
+            .into_iter()
+            .zip(marked_prs)
+            .map(|((id, revision, person), marked)| {
+                let (hub, project) = (hub.clone(), self.project);
+                tokio::spawn(async move { crate::prs::pr_landed(&hub, project, &id, revision, person, marked).await })
+            })
+            .collect();
+        if !cleanups.is_empty() {
+            let _ = tokio::time::timeout(PR_CLEANUP_WAIT, async {
+                for h in cleanups {
+                    let _ = h.await;
+                }
+            })
+            .await;
+        }
         hub.landing.resolve(terminal);
         if has_revert {
             let _ = crate::bisect::sync_revert_outcome(hub, self.project, &self.branch).await;
@@ -1693,6 +1741,10 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             epochs: p.epochs,
             user_entry,
             review_check: p.review_check.clone(),
+            pr: match p.row.stack.first().and_then(|e| e.review.as_ref()) {
+                Some(super::ReviewClaim::Pr { id, revision, .. }) => Some((id.clone(), *revision)),
+                _ => None,
+            },
         };
         let outcome = match entry(&hub, &mut src, branch, default_tip, &p, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
             Ok(Some(o)) => o,

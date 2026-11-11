@@ -684,7 +684,6 @@ fn bug_1924_a_pr_that_lands_after_its_request_was_answered_queued_is_landed() {
 /// that "decide nothing" decide that `main@tested` never reaches this tip
 /// and that no bisect of it starts.
 #[test]
-#[ignore = "BUG-1925: results that count for nothing fill a snapshot's 64 checks, and the required check's result is refused"]
 fn bug_1925_results_that_do_not_count_never_keep_out_the_required_checks_result() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
