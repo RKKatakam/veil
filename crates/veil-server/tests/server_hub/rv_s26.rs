@@ -16,7 +16,9 @@
 //! * right after an access change, or after someone leaves a group, their
 //!   browser device gets neither the folder's ring nor its secret's bytes
 //!   (`an_access_change_hides_a_folders_ring_and_secret_at_once`,
-//!   `leaving_a_group_hides_the_folders_ring_and_secret_bytes_at_once`).
+//!   `leaving_a_group_hides_the_folders_ring_and_secret_bytes_at_once`);
+//! * agent sessions and CI runners use no route of S26, also with a
+//!   browser's headers (`agent_and_runner_sessions_use_no_route_of_s26`).
 //!
 //! The key wrapping in WASM is `veil-core`'s portable test
 //! `web_browser_device_sealing_is_authenticated_randomised_and_domain_separated`.
@@ -727,4 +729,89 @@ fn leaving_a_group_hides_the_folders_ring_and_secret_bytes_at_once() {
         let bytes = w.get_api(&secret_route);
         assert!(bytes.status == 403 || bytes.status == 404, "{which} still gave the secret's bytes: {}", bytes.status);
     }
+}
+
+/// Agent sessions and CI runners use no route of S26, also when they send
+/// what a browser sends (S26 takes an unsigned review from "the web": an
+/// `Origin` header must not make an agent's request one).
+#[test]
+fn agent_and_runner_sessions_use_no_route_of_s26() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let bob = hub.person("bob");
+    let (proj, dir) = project_with_secret(&hub, &alice, "rvagent");
+    alice.ok(&dir, &["group", "create", "devs"]);
+    alice.ok(&dir, &["group", "add", "devs", &bob.name, "--confirm", &bob.fingerprint()]);
+    alice.ok(&dir, &["access", "public/", "public", "devs"]);
+    alice.commit_main(&dir, "devs write public/");
+    alice.ok(&dir, &["push"]);
+    // A PR of Alice's that Bob may review.
+    write_files(&dir, &[("public/readme.md", "# docs, changed\n")]);
+    alice.ok(&dir, &["commit", "--no-advance", "-m", "change the docs"]);
+    alice.ok(&dir, &["tag", "set", "docs", "-r", "@-"]);
+    alice.ok(&dir, &["push"]);
+    catch_up(&hub, &proj);
+    let api = hub.api();
+    let head = api.tips(Some(&alice.token()), &proj).unwrap().branches["docs"];
+    let pr = api.post_json(Some(&alice.token()), &format!("/v1/projects/{proj}/prs"), &json!({ "head": head, "onto": "main", "title": "Docs" }));
+    assert_eq!(pr.status, 200, "{}", String::from_utf8_lossy(&pr.body));
+    let (pr_id, patch) = (pr.json()["id"].as_str().unwrap().to_string(), pr.json()["patch"].as_str().unwrap().to_string());
+
+    let sessions = |person: &Person| -> [String; 2] {
+        let agent = api.post_json(Some(&person.token()), "/v1/sessions/agent", &json!({ "project": proj, "attribution": { "agent": "bot" }, "only": [] }));
+        assert_eq!(agent.status, 200, "{}", String::from_utf8_lossy(&agent.body));
+        let runner = api.post_json(Some(&person.token()), "/v1/sessions/ci", &json!({ "project": proj }));
+        assert_eq!(runner.status, 200, "{}", String::from_utf8_lossy(&runner.body));
+        [agent.json()["token"].as_str().unwrap().to_string(), runner.json()["token"].as_str().unwrap().to_string()]
+    };
+    let origin = format!("https://{}", hub.authority());
+    // A request as a browser's script sends it, with a bearer token.
+    let as_browser = |token: &str, post: Option<&Value>, path: &str| -> Reply {
+        let bearer = format!("Bearer {token}");
+        let headers = [("authorization", bearer.as_str()), ("origin", origin.as_str()), ("sec-fetch-site", "same-origin"), ("accept", "application/json")];
+        match post {
+            Some(body) => api.post_with(path, &serde_json::to_vec(body).unwrap(), &headers),
+            None => api.get_with(path, &headers),
+        }
+    };
+    let refused = |r: Reply, what: &str| {
+        assert_eq!(r.status, 403, "{what}: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["code"], "agent_session", "{what}: {}", String::from_utf8_lossy(&r.body));
+    };
+
+    // An unsigned review "from the web": never an agent's or a runner's.
+    let review = json!({ "patch": patch, "verdict": "request-changes", "body": "no" });
+    let review_route = format!("/v1/projects/{proj}/prs/{pr_id}/reviews");
+    for (token, who) in sessions(&bob).iter().zip(["Bob's agent", "Bob's runner"]) {
+        refused(as_browser(token, Some(&review), &review_route), &format!("{who}, an unsigned review"));
+        let form = api.post_with(
+            &format!("/p/{proj}/prs/{pr_id}/reviews"),
+            format!("patch={patch}&verdict=request-changes").as_bytes(),
+            &[("authorization", &format!("Bearer {token}")), ("origin", &origin), ("sec-fetch-site", "same-origin"), ("content-type", "application/x-www-form-urlencoded")],
+        );
+        assert_eq!(form.status, 403, "{who}, the review form: {}", String::from_utf8_lossy(&form.body));
+    }
+    // The action: the same request with Bob's own session is a review.
+    let own = as_browser(&bob.token(), Some(&review), &review_route);
+    assert_eq!(own.status, 200, "{}", String::from_utf8_lossy(&own.body));
+
+    // The setting, the enrollment code, the rings, the bytes, the Worker.
+    for (token, who) in sessions(&alice).iter().zip(["the admin's agent", "the admin's runner"]) {
+        refused(as_browser(token, Some(&json!({ "enabled": true })), &format!("/v1/projects/{proj}/web-secrets")), &format!("{who}, the setting"));
+        // (An enrollment code is `vl`'s to ask for: no browser headers.)
+        refused(api.post_json(Some(token), "/v1/sessions/web-enroll", &json!({})), &format!("{who}, an enrollment code"));
+        for path in [
+            format!("/v1/projects/{proj}/web/rings"),
+            format!("/v1/projects/{proj}/web/ciphertext?rev=main&path=.env"),
+            format!("/p/{proj}/web/secrets.js"),
+            format!("/p/{proj}/web/secret-worker.js"),
+            format!("/p/{proj}/web/secret-worker.wasm"),
+        ] {
+            refused(as_browser(token, None, &path), &format!("{who}, {path}"));
+        }
+    }
+    assert_eq!(count(&hub, "SELECT count(*) FROM projects WHERE name = $1 AND web_secrets", &proj), 0);
+    // The action: the admin's own session turns the setting on.
+    let on = api.post_json(Some(&alice.token()), &format!("/v1/projects/{proj}/web-secrets"), &json!({ "enabled": true }));
+    assert_eq!(on.status, 200);
 }
