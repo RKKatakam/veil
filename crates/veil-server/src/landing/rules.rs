@@ -27,6 +27,9 @@ pub struct Rules {
     pub protected: BTreeSet<String>,
     /// Protected branches where automatic revert is disabled (`auto_revert = false`).
     pub no_auto_revert: BTreeSet<String>,
+    /// Whether `[branches] delete_merged = false` disables automatic deletion of
+    /// a PR's merged source branch when the PR lands (`BUG-1885`).
+    pub keep_merged_branches: bool,
     /// Branch → the check names that must pass before `<branch>@tested`
     /// moves to a tip (`[branches.<name>] required_checks = [...]`).
     pub required_checks: BTreeMap<String, Vec<String>>,
@@ -45,6 +48,11 @@ impl Rules {
         self.protected.contains(branch) && !self.no_auto_revert.contains(branch)
     }
 
+    /// Should landing a PR delete its merged source branch (`[branches] delete_merged`, default `true`)?
+    pub fn delete_merged(&self) -> bool {
+        !self.keep_merged_branches
+    }
+
     /// Parse `.veilrules`; the error says what is wrong (never echoing more
     /// than the key it names).
     pub fn parse(text: &str) -> Result<Rules, String> {
@@ -53,6 +61,13 @@ impl Rules {
         if let Some(branches) = doc.get("branches") {
             let branches = branches.as_table_like().ok_or_else(|| format!("{RULES_FILE}: `branches` must be a table"))?;
             for (name, rules) in branches.iter() {
+                if name == "delete_merged" && rules.as_table_like().is_none() {
+                    match rules.as_bool() {
+                        Some(b) => out.keep_merged_branches = !b,
+                        None => return Err(format!("{RULES_FILE}: `branches.delete_merged` is true or false")),
+                    }
+                    continue;
+                }
                 veil_core::commands::validate_tag_name(name).map_err(|_| format!("{RULES_FILE}: {name:?} is not a branch name"))?;
                 let rules = rules.as_table_like().ok_or_else(|| format!("{RULES_FILE}: `branches.{name}` must be a table"))?;
                 for (key, value) in rules.iter() {
@@ -170,6 +185,10 @@ mod tests {
         assert!(Rules::parse("[checks.test]\nparallel = 0\n").is_err());
         assert!(Rules::parse("[checks.test]\nunknown = 1\n").is_err());
         assert!(Rules::parse("[branches]\nmain = 1\n").is_err());
+        assert!(Rules::parse("[branches]\ndelete_merged = \"no\"\n").is_err());
+        assert!(Rules::parse("").unwrap().delete_merged());
+        assert!(!Rules::parse("[branches]\ndelete_merged = false\n[branches.main]\nprotected = true\n").unwrap().delete_merged());
+        assert!(Rules::parse("[branches]\ndelete_merged = true\n").unwrap().delete_merged());
         assert!(Rules::parse("[branches.\"a b\"]\nprotected = true\n").is_err());
         assert!(Rules::parse("[branches.main\n").is_err());
         let inline = Rules::parse("branches = { main = { protected = true } }\n").unwrap();

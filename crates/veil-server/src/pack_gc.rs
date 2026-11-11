@@ -337,6 +337,132 @@ const STAMP_TABLES: &[(&str, &str, &str)] = &[
     ("bisect_reverts", "concat_ws(chr(31), branch, lineage::text, culprit, check_name, ticket, COALESCE(revert_snapshot, ''), state)", ""),
 ];
 
+/// Error marker raised inside a root-adding transaction when the project's GC
+/// epoch (`access_epochs (project_id, -1)`) moved since the caller checked its
+/// objects (`BUG-1881`). Handled by `db::retry_requests` (and background worker
+/// loops) by rerunning the operation from its object checks under the new epoch.
+#[derive(Debug)]
+pub struct GcEpochChanged;
+
+impl std::fmt::Display for GcEpochChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("project GC epoch changed during root write")
+    }
+}
+
+impl std::error::Error for GcEpochChanged {}
+
+pub fn gc_epoch_changed(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<GcEpochChanged>().is_some()
+}
+
+pub fn is_gc_epoch_changed(e: &Error) -> bool {
+    matches!(e, Error::Other(a) if gc_epoch_changed(a))
+}
+
+/// Ensure the project's GC epoch row (`access_epochs (project, -1)`) exists,
+/// read its current value, and synchronize `hub`'s in-memory caches (`BUG-1881`).
+pub async fn read_gc_epoch(hub: &Hub, project: i64) -> Result<i64> {
+    let epoch: Option<i64> = sqlx::query_scalar(
+        "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1",
+    )
+    .bind(project)
+    .fetch_optional(&hub.db)
+    .await?;
+    let epoch = match epoch {
+        Some(e) => e,
+        None => {
+            sqlx::query(
+                "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) \
+                 VALUES ($1, -1, 0, 0) ON CONFLICT (project_id, person_id) DO NOTHING",
+            )
+            .bind(project)
+            .execute(&hub.db)
+            .await?;
+            sqlx::query_scalar(
+                "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1), 0)",
+            )
+            .bind(project)
+            .fetch_one(&hub.db)
+            .await?
+        }
+    };
+    hub.observe_gc_epoch(project, epoch);
+    Ok(epoch)
+}
+
+/// The advisory lock that queues a project's root-adding transactions and
+/// GC's switch in arrival order (`"veilgcgt"` ^ `project_id`). The epoch row's
+/// lock alone is what makes the switch safe, but PostgreSQL lets a new
+/// `FOR SHARE` join the row's sharers ahead of a waiting `FOR UPDATE`: under
+/// steady pushes GC's switch never got the row (64 writers at once: none in
+/// 5 s, three times; behind this lock: 1 ms). The lock manager is fair, so
+/// the switch waits only for the writers already in their transactions.
+const GATE_BASE: i64 = 0x7665_696c_6763_6774;
+
+/// One statement of a root-adding transaction, its first: wait in line with
+/// GC's switch (the advisory lock, shared: writers never wait for each
+/// other), then lock the project's GC epoch row `FOR SHARE` and read it. A
+/// switch that committed while the statement waited is seen: the row is
+/// locked and read as last committed. Binds: the project, [`gate_key`].
+pub(crate) const GUARD_SQL: &str = "SELECT e.epoch FROM (SELECT pg_advisory_xact_lock_shared($2)) g, access_epochs e \
+     WHERE e.project_id = $1 AND e.person_id = -1 FOR SHARE OF e";
+
+pub(crate) fn gate_key(project: i64) -> i64 {
+    GATE_BASE ^ project
+}
+
+/// Lock the project's GC epoch row `FOR SHARE` and verify it still matches
+/// `expected_epoch` (`BUG-1881`), serializing every root-adding transaction
+/// against GC's `FOR UPDATE` switch. It is the transaction's first
+/// statement, so a writer waiting here holds no lock the switch needs.
+pub async fn guard_root_write(
+    c: &mut PgConnection,
+    project: i64,
+    expected_epoch: i64,
+) -> Result<()> {
+    let cur: Option<i64> = sqlx::query_scalar(GUARD_SQL)
+        .bind(project)
+        .bind(gate_key(project))
+        .fetch_optional(&mut *c)
+        .await?;
+    if cur != Some(expected_epoch) {
+        return Err(Error::Other(anyhow::Error::new(GcEpochChanged)));
+    }
+    Ok(())
+}
+
+/// Lock the project's GC epoch row `FOR UPDATE` at the start of a GC switch
+/// transaction (`BUG-1881`), waiting for any in-flight root-adding transaction
+/// before reading `read_ref_stamp` or purging records.
+async fn lock_gc_epoch_tx(c: &mut PgConnection, project: i64) -> Result<()> {
+    // In line with the writers first ([`GATE_BASE`]): those that come after
+    // wait behind this, so the row below is free once the earlier ones end.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(gate_key(project)).execute(&mut *c).await?;
+    let got: Option<i64> = sqlx::query_scalar(
+        "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE",
+    )
+    .bind(project)
+    .fetch_optional(&mut *c)
+    .await?;
+    if got.is_none() {
+        sqlx::query(
+            "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) \
+             VALUES ($1, -1, 0, 0) ON CONFLICT (project_id, person_id) DO NOTHING",
+        )
+        .bind(project)
+        .execute(&mut *c)
+        .await?;
+        sqlx::query_scalar::<_, i64>(
+            "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE",
+        )
+        .bind(project)
+        .fetch_one(&mut *c)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Names of all tables fingerprinted by [`project_ref_stamp`].
 pub fn stamped_root_tables() -> Vec<&'static str> {
     STAMP_TABLES.iter().map(|&(t, _, _)| t).collect()
@@ -401,13 +527,7 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
     let mut report = Report::default();
     let now_ms = opts.now_ms();
 
-    let cur_gce: i64 = sqlx::query_scalar(
-        "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1), 0)",
-    )
-    .bind(project)
-    .fetch_one(&hub.db)
-    .await?;
-    hub.observe_gc_epoch(project, cur_gce);
+    read_gc_epoch(hub, project).await?;
 
     // 1. Clean up any leftover uncommitted job packs (`state = STAGED AND person_id IS NULL`)
     // from an earlier crashed merge/GC run on this project, and discard stale
@@ -480,6 +600,7 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
                     let expected = expected.clone();
                     let expired_hexes = expired_hexes.clone();
                     Box::pin(async move {
+                        lock_gc_epoch_tx(c, project).await?;
                         let cur = read_ref_stamp(c, project).await?;
                         if cur != expected {
                             return Ok(None);
@@ -773,6 +894,7 @@ async fn compact_batch(
             let dead_hexes = dead_hexes.clone();
             Box::pin(async move {
                 if let Some(expected) = &check_stamp {
+                    lock_gc_epoch_tx(c, project).await?;
                     let cur = read_ref_stamp(c, project).await?;
                     if &cur != expected {
                         return Ok(None);
@@ -1128,6 +1250,7 @@ async fn mark_and_sweep_loose(
                 let stamp = stamp.clone();
                 let expired_hexes = expired_hexes.clone();
                 Box::pin(async move {
+                    lock_gc_epoch_tx(c, project).await?;
                     let cur = read_ref_stamp(c, project).await?;
                     if cur != stamp {
                         return Ok((cur, None));
@@ -1166,6 +1289,7 @@ async fn mark_and_sweep_loose(
             let gce2 = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
                 let deleted_loose_only_hexes = deleted_loose_only_hexes.clone();
                 Box::pin(async move {
+                    lock_gc_epoch_tx(c, project).await?;
                     for chunk in deleted_loose_only_hexes.chunks(500) {
                         sqlx::query(
                             "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
@@ -1433,7 +1557,7 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("project_admins", &["project_id", "person_id"]),
     ("projections", &["project_id", "view_key", "created_at", "collapsed"]),
     ("projects", &["id", "name", "created_by", "created_at", "default_branch", "policy_text", "policy_bindings", "policy_version", "web_secrets"]),
-    ("prs", &["project_id", "id", "class_id", "policy_key", "target", "author", "title", "body", "state", "revision", "created_at", "updated_at", "embargo", "land_at_release"]),
+    ("prs", &["project_id", "id", "class_id", "policy_key", "target", "source_branch", "author", "title", "body", "state", "revision", "created_at", "updated_at", "embargo", "land_at_release"]),
     ("rings", &["project_id", "scope", "body"]),
     ("rule_history", &["project_id", "line_key", "generation"]),
     ("rule_lines", &["project_id", "line_key", "ready"]),

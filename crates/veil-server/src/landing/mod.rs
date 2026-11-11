@@ -66,6 +66,21 @@ pub struct Submitter {
     pub epochs: crate::caches::Epochs,
 }
 
+/// What satisfied (or must satisfy) the protected-branch review gate when this
+/// stack was submitted (`BUG-1880`). Stored on `stack[0]` so it survives S18
+/// content-merges (`merge_stack`), which rewrite merged blob IDs while keeping
+/// the submitted change's review identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewClaim {
+    /// Submitted via `POST /prs/{id}/land` for `id` at `revision` (`patch`).
+    Pr { id: String, revision: i32, patch: String },
+    /// Submitted via push / `POST /land` / API commit with original `patch`.
+    Patch { patch: String },
+    /// An embargo's release of its line, with original `patch`: a PR of
+    /// `embargo` may carry the approvals (BUG-1861).
+    Embargo { embargo: String, patch: String },
+}
+
 /// One change of a stack ([`stack`]): its real snapshot, and its base (the
 /// change below it that lands, or the snapshot on the branch where the
 /// stack starts). Its edits are its diff against its first parent (a merge
@@ -74,25 +89,100 @@ pub struct Submitter {
 pub struct Entry {
     pub id: ObjectId,
     pub base: ObjectId,
+    pub review: Option<ReviewClaim>,
 }
 
 impl Entry {
     pub fn plain(id: ObjectId, base: ObjectId) -> Entry {
-        Entry { id, base }
+        Entry { id, base, review: None }
     }
 }
 
-/// A stack as its queue row holds it: `[snapshot, base]` pairs.
+fn split_non_object_hex(s: &str) -> String {
+    if s.len() == 64 {
+        format!("{}:{}", &s[..32], &s[32..])
+    } else {
+        s.to_string()
+    }
+}
+
+fn join_non_object_hex(s: &str) -> String {
+    match s.split_once(':') {
+        Some((a, b)) if a.len() == 32 && b.len() == 32 => format!("{a}{b}"),
+        _ => s.to_string(),
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EncodedStackWithClaim {
+    entries: Vec<[String; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rev: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embargo: Option<String>,
+    patch: String,
+}
+
+/// A stack as its queue row holds it: `[snapshot, base]` pairs, or an object
+/// carrying [`ReviewClaim`] (`BUG-1880`; `patch` is split so `pack_gc` never
+/// scans it as a 64-hex `ObjectId`).
 pub fn encode_stack(stack: &[Entry]) -> String {
     let rows: Vec<[String; 2]> = stack.iter().map(|e| [e.id.hex(), e.base.hex()]).collect();
-    serde_json::to_string(&rows).unwrap_or_default()
+    match stack.first().and_then(|e| e.review.as_ref()) {
+        None => serde_json::to_string(&rows).unwrap_or_default(),
+        Some(ReviewClaim::Pr { id, revision, patch }) => serde_json::to_string(&EncodedStackWithClaim {
+            entries: rows,
+            pr: Some(id.clone()),
+            rev: Some(*revision),
+            embargo: None,
+            patch: split_non_object_hex(patch),
+        })
+        .unwrap_or_default(),
+        Some(ReviewClaim::Patch { patch }) => serde_json::to_string(&EncodedStackWithClaim {
+            entries: rows,
+            pr: None,
+            rev: None,
+            embargo: None,
+            patch: split_non_object_hex(patch),
+        })
+        .unwrap_or_default(),
+        Some(ReviewClaim::Embargo { embargo, patch }) => serde_json::to_string(&EncodedStackWithClaim {
+            entries: rows,
+            pr: None,
+            rev: None,
+            embargo: Some(embargo.clone()),
+            patch: split_non_object_hex(patch),
+        })
+        .unwrap_or_default(),
+    }
 }
 
 /// [`encode_stack`]'s inverse.
 pub fn decode_stack(text: &str) -> Result<Vec<Entry>> {
-    let rows: Vec<[String; 2]> = serde_json::from_str(text).map_err(|e| Error::Other(e.into()))?;
     let hex = |s: &str| ObjectId::from_hex(s).map_err(|e| Error::Other(e.into()));
-    rows.iter().map(|[s, b]| Ok(Entry::plain(hex(s)?, hex(b)?))).collect()
+    if text.trim_start().starts_with('{') {
+        let parsed: EncodedStackWithClaim = serde_json::from_str(text).map_err(|e| Error::Other(e.into()))?;
+        let mut out: Vec<Entry> = parsed
+            .entries
+            .iter()
+            .map(|[s, b]| Ok(Entry::plain(hex(s)?, hex(b)?)))
+            .collect::<Result<_>>()?;
+        let patch = join_non_object_hex(&parsed.patch);
+        let claim = match (parsed.pr, parsed.rev, parsed.embargo) {
+            (Some(id), Some(revision), _) => ReviewClaim::Pr { id, revision, patch },
+            (_, _, Some(embargo)) => ReviewClaim::Embargo { embargo, patch },
+            _ => ReviewClaim::Patch { patch },
+        };
+        if let Some(first) = out.first_mut() {
+            first.review = Some(claim);
+        }
+        Ok(out)
+    } else {
+        let rows: Vec<[String; 2]> = serde_json::from_str(text).map_err(|e| Error::Other(e.into()))?;
+        rows.iter().map(|[s, b]| Ok(Entry::plain(hex(s)?, hex(b)?))).collect()
+    }
 }
 
 /// One queue row to insert in the submit's transaction.
@@ -301,6 +391,8 @@ pub struct Services {
     waiting_by_person: Mutex<HashMap<i64, usize>>,
     /// The branches whose waiters here a poller answers (`poll`).
     pollers: Mutex<std::collections::HashSet<(i64, String)>>,
+    /// Monotonic token distinguishing merge-worker claims (`BUG-1883`).
+    next_claim: AtomicU64,
     /// Content merge workers running on this server (S18).
     pub merges: merge::Workers,
     pub stats: Stats,
@@ -318,6 +410,7 @@ impl Default for Services {
             next_waiter: AtomicU64::new(1),
             waiting_by_person: Mutex::new(HashMap::new()),
             pollers: Mutex::new(Default::default()),
+            next_claim: AtomicU64::new(1),
             merges: merge::Workers::default(),
             stats: Stats::default(),
         }
@@ -340,6 +433,10 @@ pub struct Waiter {
 }
 
 impl Services {
+    pub(crate) fn next_claim_token(&self) -> u64 {
+        self.next_claim.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Wait here for `ticket`'s outcome.
     pub fn register(&self, ticket: &str) -> Waiter {
         let (tx, rx) = oneshot::channel();
@@ -415,21 +512,33 @@ pub fn ensure(hub: &Arc<Hub>, project: i64, branch: &str) {
             hub.landing.held_elsewhere.lock().unwrap().insert(key.clone(), Instant::now());
         }
         hub.landing.running.lock().unwrap().remove(&key);
-        // An entry submitted while it was stopping is not left waiting.
-        if !held_elsewhere && service::has_ready(&hub, project, &key.1).await.unwrap_or(false) {
+        // An entry submitted while it was stopping (or held by another server
+        // that may stop before answering, `BUG-1883`) is not left waiting.
+        if service::has_ready(&hub, project, &key.1).await.unwrap_or(false) {
+            if held_elsewhere {
+                tokio::time::sleep(Duration::from_millis(LEASE_MS as u64 + 100)).await;
+            }
             ensure(&hub, project, &key.1);
         }
     });
 }
 
-/// Start the services of every branch with queued entries (a server
-/// starting after another stopped).
+/// Start the services of every branch with queued or merging entries (a server
+/// starting after another stopped). Only resets `merging` rows owned by this
+/// holder, unclaimed, or expired (`BUG-1883`), never live claims of other servers.
 pub async fn resume(hub: Arc<Hub>) {
-    let _ = sqlx::query("UPDATE landing_queue SET state = 'queued' WHERE state = 'merging'")
-        .execute(&hub.db)
-        .await;
+    let _ = sqlx::query(
+        "UPDATE landing_queue SET state = 'queued', result = NULL \
+         WHERE state = 'merging' AND (result IS NULL OR (result::jsonb->>'holder') = $1 \
+         OR (result::jsonb->>'expires_at')::BIGINT < (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT)",
+    )
+    .bind(&hub.landing.holder)
+    .execute(&hub.db)
+    .await;
     let rows: std::result::Result<Vec<(i64, String)>, _> =
-        sqlx::query_as("SELECT DISTINCT project_id, branch FROM landing_queue WHERE state = 'queued'").fetch_all(&hub.db).await;
+        sqlx::query_as("SELECT DISTINCT project_id, branch FROM landing_queue WHERE state IN ('queued', 'merging')")
+            .fetch_all(&hub.db)
+            .await;
     match rows {
         Ok(rows) => {
             for (p, b) in rows {
@@ -685,7 +794,8 @@ fn poll(hub: &Arc<Hub>, project: i64, branch: &str) {
             let now = veil_core::now_millis();
             hub.landing.stats.polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rows: std::result::Result<Vec<(String, String)>, _> = sqlx::query_as(
-                "SELECT ticket, result FROM landing_queue WHERE project_id = $1 AND branch = $2 AND done_at >= $3 AND result IS NOT NULL",
+                "SELECT ticket, result FROM landing_queue WHERE project_id = $1 AND branch = $2 AND done_at >= $3 \
+                 AND result IS NOT NULL AND state NOT IN ('queued', 'merging')",
             )
             .bind(key.0)
             .bind(&key.1)
@@ -735,6 +845,7 @@ pub async fn submit(
     }
     match (req.snapshot, req.base) {
         (Some(snapshot), None) if req.edits.is_empty() && req.change_id.is_none() && req.description.is_empty() => {
+            let onto = req.onto.clone();
             let push = PushRequest {
                 updates: vec![BranchUpdate {
                     branch: req.onto.clone(),
@@ -745,7 +856,15 @@ pub async fn submit(
                 receipts: req.receipts,
                 ..Default::default()
             };
-            let (pushed, mut landings) = crate::sync::push_with(hub, project, viewer, &who, push, true, req.wait).await?;
+            let (pushed, mut landings) = match crate::sync::push_with(hub, project, viewer, &who, push, true, req.wait).await {
+                Ok(v) => v,
+                Err(e) => {
+                    if matches!(&e, Error::Api { status, .. } if *status == axum::http::StatusCode::TOO_MANY_REQUESTS) {
+                        ensure(hub, project.id, &onto);
+                    }
+                    return Err(e);
+                }
+            };
             match landings.pop() {
                 // Projected for the pusher by `push_with`.
                 Some(l) => Ok(l),
@@ -779,6 +898,9 @@ pub async fn submit(
             let made = match r {
                 Ok(m) => m,
                 Err(e) => {
+                    if matches!(&e, Error::Api { status, .. } if *status == axum::http::StatusCode::TOO_MANY_REQUESTS) {
+                        ensure(hub, project.id, &q.branch);
+                    }
                     abandon(hub, w);
                     return Err(e);
                 }

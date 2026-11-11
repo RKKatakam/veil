@@ -586,6 +586,7 @@ async fn commit(
     built: &Built,
     restacked: &[(ObjectId, ObjectId, ObjectId)],
     person: i64,
+    gc_epoch: i64,
     mv: Option<Move>,
     land: Option<&(crate::landing::Submitter, crate::landing::Queued)>,
     base_embargo: Option<&str>,
@@ -643,6 +644,7 @@ async fn commit(
         );
         let rules_landing = rules_landing.clone();
         Box::pin(async move {
+            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             if let Some((w, q)) = &land {
                 crate::landing::insert(&mut *c, pid, w, q).await?;
             }
@@ -1039,6 +1041,7 @@ pub(crate) async fn create_with(
     if req.edits.iter().any(|e| !viewer.within_narrowing(&e.path)) {
         return Err(sync::agent_refusal(sync::NARROWED_WRITE));
     }
+    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     // Uploads are staged (S28): read into memory with what the change makes,
     // stored only once every check passed (BUG-930).
     // Held decoded under the server-wide bound while the commit runs
@@ -1220,7 +1223,7 @@ pub(crate) async fn create_with(
             }
             let default_tip = tip(hub, project.id, &project.default_branch).await?;
             let protected = sync::blocking(hub, project.id, move |src| crate::landing::protected(src, default_tip)).await?;
-            crate::prs::check_landing_review(
+            let claim = crate::prs::check_landing_review(
                 hub,
                 &who.project,
                 &who.viewer,
@@ -1230,6 +1233,9 @@ pub(crate) async fn create_with(
                 protected.contains(&q.branch),
             )
             .await?;
+            if let (Some(first), Some(claim)) = (q.stack.first_mut(), claim) {
+                first.review = Some(claim);
+            }
         }
         // The branch rules: a move of the default branch changes them only
         // for an admin, judged against its tip (BUG-1102).
@@ -1294,7 +1300,7 @@ pub(crate) async fn create_with(
             },
             _ => None,
         };
-        match commit(hub, &plan, &who, &built, &restacked, person.id, mv, land.as_ref(), base_embargo.as_deref()).await {
+        match commit(hub, &plan, &who, &built, &restacked, person.id, gc_epoch, mv, land.as_ref(), base_embargo.as_deref()).await {
             Ok(m) => break (built, m),
             // The tip moved during the request: try again on the new one,
             // with the access as it is now (BUG-1051).

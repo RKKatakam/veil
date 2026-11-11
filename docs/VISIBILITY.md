@@ -97,6 +97,8 @@ vl merge fix --into main --embargo-for security distro-partners --until 2026-12-
 
 All of that is plain text, protected by the server's permissions.
 
+**Branch names are seen by everyone who can read the project**, even when the branch's files are hidden from them: name agent branches neutrally (by task id, not by what they fix).
+
 **Not exceptions:** HTTPS (TLS) between `vl` and the server protects the network connection, and a device's own private key may be protected at rest by a passphrase or the OS keychain. Neither encrypts project data.
 
 ## Veil always works through its server

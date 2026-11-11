@@ -443,13 +443,16 @@ pub fn push(ctx: &mut Ctx, remote: &str, tags: &[String], force: bool, verify: &
         let what = if out.landed.contains(b) { "landed" } else { "pushed" };
         println!("  {} {} → {}", green(what), cyan(&safe(b)), tip.short());
     }
+    for b in &out.deleted {
+        println!("  {} {}", green("deleted"), cyan(&safe(b)));
+    }
     for w in &out.warnings {
         println!("  {} {}", dim("note:"), safe(w));
     }
     for (b, why) in &out.rejected {
         println!("  {} {}: {}", yellow("rejected"), cyan(&safe(b)), safe(why));
     }
-    if out.moved.is_empty() && out.rejected.is_empty() {
+    if out.moved.is_empty() && out.deleted.is_empty() && out.rejected.is_empty() {
         println!("Everything up to date");
     } else {
         println!("Sent {} object(s) to {remote}", out.uploaded);

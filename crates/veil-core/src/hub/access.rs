@@ -253,6 +253,15 @@ impl<'a> View<'a> {
         self.admin || self.read.iter().any(|r| *r)
     }
 
+    /// May this viewer write at least one path in the project?
+    pub fn writes_anything(&self) -> bool {
+        if self.admin {
+            return self.only.as_ref().is_none_or(|only| only.iter().any(|p| self.write(p)));
+        }
+        self.policy.rules.iter().any(|r| self.write(&r.path))
+            || self.only.as_ref().is_some_and(|only| only.iter().any(|p| self.write(p)))
+    }
+
     /// Does this viewer see `path` or anything below it?
     pub fn sees_under(&self, path: &str) -> bool {
         if self.admin || self.read(path) {

@@ -26,6 +26,7 @@
 pub mod api;
 pub mod auth;
 pub mod bisect;
+pub mod branches;
 pub mod cache;
 pub mod caches;
 pub mod changes;
