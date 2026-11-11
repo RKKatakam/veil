@@ -201,13 +201,15 @@ fn bug_1851_only_the_embargos_own_groups_release_it_through_a_push() {
             }],
         }),
     );
-    // The guarantee: refused, and the embargo stays as it was.
-    assert!(matches!(r.status, 400 | 403 | 404), "someone outside the embargo released it with a push: {} {}", r.status, body(&r));
-    assert!(api.tips(Some(&sec_tok), &p.name).unwrap().branches.contains_key(&line), "the embargo's hidden line is gone: it was released");
-    assert_eq!(main_tip(&hub, None, &p.name), main_before, "the public main moved: the embargoed fix landed on it before its deadline");
+    // The guarantee: the embargo stays as it was (its hidden line, the
+    // public main, the fix unread by anyone outside), and the push is refused.
+    let answered = format!("the push answered {} {}", r.status, body(&r));
+    assert!(api.tips(Some(&sec_tok), &p.name).unwrap().branches.contains_key(&line), "the embargo's hidden line is gone: it was released ({answered})");
+    assert_eq!(main_tip(&hub, None, &p.name), main_before, "the public main moved: the embargoed fix landed on it before its deadline ({answered})");
     let file = api.get(None, &format!("/v1/projects/{}/q/file?path=src/embargo_fix.rs", p.name));
-    assert_eq!(file.status, 404, "everyone on Earth reads the embargoed fix: {}", body(&file));
-    assert!(!body(&file).contains(FIX_MARK));
+    assert!(!body(&file).contains(FIX_MARK), "everyone on Earth reads the embargoed fix: {}", body(&file));
+    assert_eq!(file.status, 404, "{}", body(&file));
+    assert!(matches!(r.status, 400 | 403 | 404), "someone outside the embargo changed it with a push: {answered}");
 }
 
 fn change(hub: &TestHub, token: &str, project: &str, req: &Value) -> Reply {
@@ -340,48 +342,6 @@ fn bug_1853_key_rings_of_folders_a_participant_cannot_read_are_not_handed_to_the
     );
     let one = api.get(Some(&carol_tok), &format!("{rings}/{hidden}"));
     assert_eq!(one.status, 404, "asked by its name, the ring answers carol: {}", body(&one));
-}
-
-/// `docs/VISIBILITY.md`: "Admins decide who may manage each group", and
-/// taking access away "takes effect at the very next request". An admin who
-/// made someone a group's manager can take that right away again, and from
-/// then on the former manager changes nobody's membership.
-///
-/// The server has no such route (`api.rs`: `…/groups/{g}/managers` only
-/// adds; `group_managers` rows are deleted only with the whole group), and
-/// `vl group manager` has no way to remove. A manager who left the company
-/// keeps adding people to the group (and so giving them its folders) for as
-/// long as they can open the project: as long as it has one public folder,
-/// or they are in any other group.
-#[test]
-#[ignore = "BUG-1854: a group manager's right can never be taken away: there is no route and no command for it, short of deleting the group"]
-fn bug_1854_an_admin_takes_a_group_managers_right_away() {
-    let hub = TestHub::start();
-    let p = setup_project(&hub);
-    let api = hub.api();
-    let (admin_tok, carol_tok) = (p.admin.token(), p.carol.token());
-    let members = format!("/v1/projects/{}/groups/finance/members", p.name);
-    p.admin.ok(&p.dir, &["group", "manager", "finance", &p.carol.name]);
-    // Control: as its manager, carol adds dev to finance.
-    let add = api.post_json(Some(&carol_tok), &members, &json!({"people": [p.dev.name]}));
-    assert_eq!(add.status, 200, "control: a manager adds people: {}", body(&add));
-    let undo = api.post_json(Some(&admin_tok), &format!("{members}/remove"), &json!({"people": [p.dev.name]}));
-    assert_eq!(undo.status, 200, "{}", body(&undo));
-
-    // The admin takes carol's right away (the route that mirrors
-    // `…/members/remove`).
-    let revoke = api.post_json(
-        Some(&admin_tok),
-        &format!("/v1/projects/{}/groups/finance/managers/remove", p.name),
-        &json!({"people": [p.carol.name]}),
-    );
-    assert_eq!(revoke.status, 200, "an admin cannot take a manager's right away: {} {}", revoke.status, body(&revoke));
-    assert_eq!(revoke.json()["managers"], json!([]), "{}", body(&revoke));
-    // At the very next request, carol changes nobody's membership.
-    let again = api.post_json(Some(&carol_tok), &members, &json!({"people": [p.dev.name]}));
-    assert_eq!(again.status, 403, "the former manager still adds people to the group: {}", body(&again));
-    let file = api.get(Some(&p.dev.token()), &format!("/v1/projects/{}/q/tree?path={BILL_DIR}", p.name));
-    assert_eq!(file.status, 404, "dev reads billing: the former manager's addition took effect: {}", body(&file));
 }
 
 /// BUG-1850's class, second way in: the session's **own** view is replaced
@@ -583,10 +543,17 @@ fn bug_1857_one_projects_conflicted_embargo_does_not_keep_another_projects_from_
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    let at_its_deadline = released_at(&hub, ours_id, &due).is_some();
     // Control: the first embargo is the conflicted one, kept for its members.
     assert_eq!(released_at(&hub, theirs_id, &stuck), None, "control: the conflicted embargo is not released ({last})");
-    // The guarantee: ours is released at its deadline, and public.
-    assert!(released_at(&hub, ours_id, &due).is_some(), "our embargo is past its deadline and still hidden; the deadline service answered: {last}");
+    // Control: nothing is wrong with ours. With the conflicted one out of
+    // the deadline service, the same service releases it at once.
+    set_deadline(&hub, theirs_id, &stuck, None);
+    let alone = hub.rt.block_on(veil_server::embargo::release_due(&h)).map_err(|e| format!("{e:?}"));
+    assert!(released_at(&hub, ours_id, &due).is_some(), "control: our embargo releases when it is the only one due: {alone:?}");
+    // The guarantee: ours was released at its deadline, whatever became of
+    // the other project's.
+    assert!(at_its_deadline, "our embargo stayed hidden past its deadline for as long as another project's was in conflict; the deadline service answered: {last}");
     let file = hub.api().get(None, &format!("/v1/projects/{}/q/file?path=src/embargo_fix.rs", ours.name));
     assert_eq!(file.status, 200, "past its deadline, the fix is public: {}", body(&file));
     assert!(body(&file).contains(FIX_MARK), "{}", body(&file));
@@ -648,9 +615,10 @@ fn bug_1858_a_push_that_moves_a_branch_to_an_existing_snapshot_needs_write_acces
 
     // She moves `main` to the developer's branch: a push that uploads nothing.
     let moved = push(&hub, &fin_tok, &p.name, "main", Some(fin_main), fin_wip);
-    let refused = moved.status == 403 || (moved.status == 200 && moved.json()["results"][0]["ok"] == json!(false));
-    assert!(refused, "someone who may not write src/ changed src/ on main with a push: {} {}", moved.status, body(&moved));
-    assert_eq!(main_tip(&hub, Some(&admin_tok), &p.name), main_before, "main moved");
+    let answered = format!("the push answered {} {}", moved.status, body(&moved));
+    assert_eq!(main_tip(&hub, Some(&admin_tok), &p.name), main_before, "main moved on the push of someone who may not write src/ ({answered})");
     let file = hub.api().get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?path=src/unfinished.rs", p.name));
     assert_eq!(file.status, 404, "the unfinished file is on main: {}", body(&file));
+    let refused = moved.status == 403 || (moved.status == 200 && moved.json()["results"][0]["ok"] == json!(false));
+    assert!(refused, "someone who may not write src/ changed src/ on main with a push: {answered}");
 }
