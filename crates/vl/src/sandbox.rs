@@ -233,7 +233,7 @@ fn exec_mounted(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confin
     let layers_dir = paths.dir.join(crate::confine::layers_dir(core::workspace_id(&ctx.repo, name).as_deref()));
     // From here on the mount is recorded (and, if this run made it,
     // unmounted) whatever happens.
-    let server = match crate::ws_socket::Server::start(&ctx.root, name, &mount.dir, Box::new(crate::ws_socket::Mounted)) {
+    let server = match crate::ws_socket::Server::start(&ctx.root, name, &mount.dir, None, Box::new(crate::ws_socket::Mounted)) {
         Ok(s) => s,
         Err(e) => {
             if let Err(f) = mount.finish() {
@@ -551,7 +551,13 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     if let Err(e) = paths.save_cache(&mut cache) {
         warn(&format!("could not save the sandbox's stat cache: {e}"));
     }
-    let server = crate::ws_socket::Server::start(&ctx.root, name, &paths.files, Box::new(MidRun { root: ctx.root.clone(), name: name.to_string() }))?;
+    let server = crate::ws_socket::Server::start(
+        &ctx.root,
+        name,
+        &paths.files,
+        set.clone(),
+        Box::new(MidRun { root: ctx.root.clone(), name: name.to_string() }),
+    )?;
     let code = run_command(&paths.files, &paths.dir, a.command, confine, layers, Some(&server));
     drop(server);
     if let Loaded::Found(saved) = paths.load_manifest() {

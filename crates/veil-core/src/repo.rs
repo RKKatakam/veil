@@ -1547,11 +1547,24 @@ impl Repo {
     /// the merge base of the parents merged so far and that parent
     /// ([`Repo::merge_base_tree`]: a virtual base when there are several).
     pub fn parents_tree(&self, parents: &[ObjectId]) -> Result<MergeOutcome> {
+        self.parents_tree_within(parents, None)
+    }
+
+    /// [`Repo::parents_tree`], optionally restricted to `within` before any
+    /// parent trees are merged so paths outside `within` are never read or
+    /// fetched.
+    pub fn parents_tree_within(&self, parents: &[ObjectId], within: Option<&crate::vfs::SparseSet>) -> Result<MergeOutcome> {
+        let restrict = |tree: ObjectId| -> Result<ObjectId> {
+            match within {
+                Some(set) => crate::vfs::restrict(&self.store, &tree, set),
+                None => Ok(tree),
+            }
+        };
         match parents {
             [] => Ok(MergeOutcome::clean(self.store.empty_tree()?)),
-            [p] => Ok(MergeOutcome::clean(self.snapshot(p)?.tree)),
+            [p] => Ok(MergeOutcome::clean(restrict(self.snapshot(p)?.tree)?)),
             [first, rest @ ..] => {
-                let mut acc = self.snapshot(first)?.tree;
+                let mut acc = restrict(self.snapshot(first)?.tree)?;
                 let mut merged = vec![*first];
                 let mut conflicts = Vec::new();
                 let mut renames = Vec::new();
@@ -1559,8 +1572,8 @@ impl Repo {
                     // A redacted extra parent (the withheld source of an
                     // unreleased embargo) contributes nothing we can see.
                     let Some(ps) = self.snapshot_opt(p)? else { continue };
-                    let base = self.merge_base_tree(&merged, &[*p])?;
-                    let out = merge_trees(&self.store, Some(base), acc, ps.tree)?;
+                    let base = self.merge_base_tree_at(&merged, &[*p], 0, within)?;
+                    let out = merge_trees(&self.store, Some(base), acc, restrict(ps.tree)?)?;
                     acc = out.tree;
                     conflicts.extend(out.conflicts);
                     renames.extend(out.renames);
@@ -1646,24 +1659,30 @@ impl Repo {
     /// resolutions that disagree conflict again instead of one of them
     /// being taken silently (BUG-244).
     pub fn merge_base_tree(&self, a: &[ObjectId], b: &[ObjectId]) -> Result<ObjectId> {
-        self.merge_base_tree_at(a, b, 0)
+        self.merge_base_tree_at(a, b, 0, None)
     }
 
-    fn merge_base_tree_at(&self, a: &[ObjectId], b: &[ObjectId], depth: usize) -> Result<ObjectId> {
+    fn merge_base_tree_at(&self, a: &[ObjectId], b: &[ObjectId], depth: usize, within: Option<&crate::vfs::SparseSet>) -> Result<ObjectId> {
         /// Nested criss-crosses deeper than this merge against the empty
         /// tree: every disagreement is then a conflict, never a silent pick.
         const MAX_VIRTUAL_BASE_DEPTH: usize = 8;
+        let restrict = |tree: ObjectId| -> Result<ObjectId> {
+            match within {
+                Some(set) => crate::vfs::restrict(&self.store, &tree, set),
+                None => Ok(tree),
+            }
+        };
         let bases = self.merge_bases(a, b)?;
         match bases.as_slice() {
             [] => self.store.empty_tree(),
-            [one] => Ok(self.snapshot(one)?.tree),
+            [one] => restrict(self.snapshot(one)?.tree),
             _ if depth >= MAX_VIRTUAL_BASE_DEPTH => self.store.empty_tree(),
             [first, rest @ ..] => {
-                let mut acc = self.snapshot(first)?.tree;
+                let mut acc = restrict(self.snapshot(first)?.tree)?;
                 let mut merged = vec![*first];
                 for x in rest {
-                    let base = self.merge_base_tree_at(&merged, &[*x], depth + 1)?;
-                    acc = virtual_merge_base(&self.store, Some(base), acc, self.snapshot(x)?.tree)?;
+                    let base = self.merge_base_tree_at(&merged, &[*x], depth + 1, within)?;
+                    acc = virtual_merge_base(&self.store, Some(base), acc, restrict(self.snapshot(x)?.tree)?)?;
                     merged.push(*x);
                 }
                 Ok(acc)

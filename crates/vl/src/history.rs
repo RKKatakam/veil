@@ -249,6 +249,7 @@ impl LogFilterArgs {
             follow: self.follow,
             reader: Reader::Me,
             renames: RenameOptions::default(),
+            within: ctx.only.clone(),
         };
         Ok(api::LogQuery { limit, ids, filter: Some(filter), show_skipped: self.show_skipped, max_changes })
     }

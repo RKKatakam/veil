@@ -103,6 +103,9 @@ pub struct LogFilter {
     pub follow: bool,
     pub reader: Reader,
     pub renames: RenameOptions,
+    /// Restrict tree lookups, pickaxe searches and rename following to this
+    /// sparse set (for a `--only` sandbox's workspace socket).
+    pub within: Option<crate::vfs::SparseSet>,
 }
 
 impl LogFilter {
@@ -186,17 +189,27 @@ impl<'a> Searcher<'a> {
             _ => self.filter.paths.clone(),
         };
         let store = repo.store();
+        let restrict = |tree: ObjectId| -> Result<ObjectId> {
+            match &self.filter.within {
+                Some(set) => crate::vfs::restrict(store, &tree, set),
+                None => Ok(tree),
+            }
+        };
+        let s_tree = restrict(s.tree)?;
         let parent_trees: Vec<Option<ObjectId>> = s
             .parents
             .iter()
-            .map(|p| repo.exact().snapshot(p).map(|o| o.map(|ps| ps.tree)))
+            .map(|p| match repo.exact().snapshot(p)? {
+                Some(ps) => Ok(Some(restrict(ps.tree)?)),
+                None => Ok(None),
+            })
             .collect::<Result<_>>()?;
         // The path filter: changed against every parent (a merge is listed
         // only where it differs from all of them).
         if !paths.is_empty() {
             let mut touched = false;
             for p in &paths {
-                let here = lookup_entry(repo, &s.tree, p)?;
+                let here = lookup_entry(repo, &s_tree, p)?;
                 let differs = |t: &Option<ObjectId>| -> Result<bool> {
                     Ok(match t {
                         Some(t) => !same(&lookup_entry(repo, t, p)?, &here),
@@ -210,7 +223,7 @@ impl<'a> Searcher<'a> {
                 touched |= all;
             }
             if self.filter.follow {
-                self.follow(&s, &paths, &parent_trees)?;
+                self.follow(&s, &s_tree, &paths, &parent_trees)?;
             }
             if !touched {
                 return Ok(Match::No);
@@ -228,7 +241,7 @@ impl<'a> Searcher<'a> {
             _ => None,
         };
         // A folder the server refuses is not searched (BUG-1508).
-        let changes: Vec<TreeChange> = diff_trees_hiding(store, base.as_ref(), Some(&s.tree))?
+        let changes: Vec<TreeChange> = diff_trees_hiding(store, base.as_ref(), Some(&s_tree))?
             .0
             .into_iter()
             .filter(|c| paths.is_empty() || paths.iter().any(|p| c.path == *p || c.path.starts_with(p)))
@@ -237,8 +250,8 @@ impl<'a> Searcher<'a> {
         // count.
         // In a thin clone, what the pickaxe and the pairing read, each at
         // its own path (BUG-1506).
-        prefetch_changes(store, base.as_ref(), Some(&s.tree), changes.iter().filter(|c| [&c.old, &c.new].into_iter().flatten().all(|e| e.size <= MAX_SEARCHED_FILE as u64)))?;
-        let d = rename::detect(store, base.as_ref(), Some(&s.tree), &changes, self.filter.reader, &self.filter.renames)?;
+        prefetch_changes(store, base.as_ref(), Some(&s_tree), changes.iter().filter(|c| [&c.old, &c.new].into_iter().flatten().all(|e| e.size <= MAX_SEARCHED_FILE as u64)))?;
+        let d = rename::detect(store, base.as_ref(), Some(&s_tree), &changes, self.filter.reader, &self.filter.renames)?;
         self.stats.add(&d.stats);
         let changes: Vec<TreeChange> = d
             .items()
@@ -324,16 +337,16 @@ impl<'a> Searcher<'a> {
 
     /// `--follow`: hand each parent the name the file had there (renamed
     /// in this snapshot: the rename's source).
-    fn follow(&mut self, s: &Snapshot, paths: &[VPath], parent_trees: &[Option<ObjectId>]) -> Result<()> {
+    fn follow(&mut self, s: &Snapshot, s_tree: &ObjectId, paths: &[VPath], parent_trees: &[Option<ObjectId>]) -> Result<()> {
         let Some(p) = paths.first() else { return Ok(()) };
         let store = self.repo.store();
-        let here = lookup_entry(self.repo, &s.tree, p)?;
+        let here = lookup_entry(self.repo, s_tree, p)?;
         for (parent, tree) in s.parents.iter().zip(parent_trees) {
             let mut name = p.clone();
             if let (Some(_), Some(t)) = (&here, tree) {
                 if lookup_entry(self.repo, t, p)?.is_none() {
-                    let (changes, _) = diff_trees_hiding(store, Some(t), Some(&s.tree))?;
-                    let d = rename::detect(store, Some(t), Some(&s.tree), &changes, self.filter.reader, &self.filter.renames)?;
+                    let (changes, _) = diff_trees_hiding(store, Some(t), Some(s_tree))?;
+                    let d = rename::detect(store, Some(t), Some(s_tree), &changes, self.filter.reader, &self.filter.renames)?;
                     self.stats.add(&d.stats);
                     if let Some(pair) = d.pairs.iter().find(|x| x.to == *p && !x.copy) {
                         name = pair.from.clone();

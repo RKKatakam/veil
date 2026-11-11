@@ -225,6 +225,46 @@ fn check_revisions_here(ctx: &Ctx, ws: &str, cli: &Cli) -> Result<()> {
     }
 }
 
+/// Active `--only` sparse set of workspace `ws`, when a persistent sandbox run
+/// is in progress (`m.pending.is_some()`).
+fn active_only(root: &Path, ws: &str) -> Result<Option<veil_core::vfs::SparseSet>> {
+    let paths = veil_core::sandbox::SandboxPaths::new(root, ws);
+    match paths.load_manifest() {
+        veil_core::sandbox::Loaded::Found(m) if m.pending.is_some() => Ok(m.only_set()?),
+        _ => Ok(None),
+    }
+}
+
+/// In a sparse (`--only`) sandbox, every explicit path a socket command names
+/// must lie inside `--only` (plus `.veilpolicy`), the same way revisions must
+/// lie inside the workspace's own history (BUG-1844).
+fn check_paths(ctx: &Ctx, cli: &Cli) -> Result<()> {
+    let Some(set) = &ctx.only else { return Ok(()) };
+    let within = |raw: &str, what: &str| -> Result<()> {
+        let p = ctx.repo_path(raw)?;
+        if set.contains(&p) {
+            return Ok(());
+        }
+        let shown = if p.is_root() { "." } else { p.as_str() };
+        bail!(
+            "inside a sandbox with --only, `vl {what}` reads only the sandbox's paths: {} is outside --only",
+            safe(shown)
+        )
+    };
+    match &cli.cmd {
+        Cmd::Status { .. } | Cmd::Show { .. } | Cmd::Diff { .. } => Ok(()),
+        Cmd::Commit { .. } | Cmd::Describe { .. } | Cmd::New { .. } => Ok(()),
+        Cmd::Blame(a) => within(&a.path, "blame"),
+        Cmd::Log { filter, .. } => {
+            for p in &filter.paths {
+                within(p, "log")?;
+            }
+            Ok(())
+        }
+        other => bail!("`vl {}` is not available inside a sandbox", command_name(other)),
+    }
+}
+
 /// Every description the socket accepts (`commit`, `describe`, `new`) is
 /// checked against the sandbox's secret-value guard (isolated files injected
 /// with `--with-isolated` and sealed files checked out or mounted), so no
@@ -246,17 +286,13 @@ fn check_description(ctx: &Ctx, root: &Path, ws: &str, cli: &Cli) -> Result<()> 
     if let Some(mg) = crate::mount::Paths::new(root, ws).load_guard(&ctx.repo)? {
         guard.merge(&mg);
     }
-    let only = match paths.load_manifest() {
-        veil_core::sandbox::Loaded::Found(m) => m.only_set()?,
-        _ => None,
-    };
     let wc = ctx.wc()?;
     let store = ctx.repo.store().clone();
     store.without_fetching(|| -> Result<()> {
         if let Ok(snap) = ctx.repo.snapshot(&wc) {
             for id in std::iter::once(wc).chain(snap.parents.iter().copied()) {
                 if let Ok(s) = ctx.repo.snapshot(&id) {
-                    let slice = match &only {
+                    let slice = match &ctx.only {
                         Some(set) => veil_core::vfs::restrict(&store, &s.tree, set)?,
                         None => s.tree,
                     };
@@ -368,8 +404,15 @@ pub struct Server {
 
 impl Server {
     /// Serve workspace `ws` of the project at `root`, whose sandbox is the
-    /// directory `sandbox` (where an unconfined command runs).
-    pub fn start(root: &Path, ws: &str, sandbox: &Path, around: Box<dyn Around>) -> Result<Server> {
+    /// directory `sandbox` (where an unconfined command runs), restricted to
+    /// `only` when sparse.
+    pub fn start(
+        root: &Path,
+        ws: &str,
+        sandbox: &Path,
+        only: Option<veil_core::vfs::SparseSet>,
+        around: Box<dyn Around>,
+    ) -> Result<Server> {
         // A socket's path must fit `sun_path` (104 bytes on macOS, whose
         // `$TMPDIR` alone is long): the first of these where it does.
         let name_len = PREFIX.len() + 10 + 1 + 12 + "/sock".len();
@@ -400,6 +443,7 @@ impl Server {
             root: root.to_path_buf(),
             ws: ws.to_string(),
             sandbox: sandbox.to_path_buf(),
+            only,
             around,
         };
         let s = stop.clone();
@@ -472,6 +516,7 @@ struct Served {
     root: PathBuf,
     ws: String,
     sandbox: PathBuf,
+    only: Option<veil_core::vfs::SparseSet>,
     around: Box<dyn Around>,
 }
 
@@ -530,6 +575,13 @@ impl Served {
             .find_map(|base| cwd.strip_prefix(base).ok())
             .filter(|r| r.components().all(|c| matches!(c, Component::Normal(_))))
             .filter(|r| !r.components().next().is_some_and(|c| c.as_os_str().to_str().is_some_and(veil_core::object::is_reserved_name)))
+            .filter(|r| match &self.only {
+                None => true,
+                Some(set) => r
+                    .to_str()
+                    .and_then(|s| veil_core::VPath::new(s).ok())
+                    .is_some_and(|p| !set.is_outside(&p)),
+            })
             .map(Path::to_path_buf)
             .unwrap_or_default();
         let dir = Some(self.root.join(&rel)).filter(|d| d.is_dir()).unwrap_or_else(|| self.root.clone());
@@ -613,10 +665,13 @@ pub fn parse_command(args: Vec<OsString>) -> Result<(PathBuf, String, Cli)> {
     Ok((PathBuf::from(root), ws, cli))
 }
 
-/// Open the repository for `cli` through the socket: workspace `ws` only.
+/// Open the repository for `cli` through the socket: workspace `ws` only
+/// (and its `--only` paths, when sparse).
 pub fn open(root: &Path, ws: &str, cli: &Cli) -> Result<Ctx> {
-    let ctx = Ctx::open_for_workspace(root, ws)?;
+    let mut ctx = Ctx::open_for_workspace(root, ws)?;
+    ctx.only = active_only(root, ws)?;
     check_revisions(&ctx, ws, cli)?;
+    check_paths(&ctx, cli)?;
     check_description(&ctx, root, ws, cli)?;
     Ok(ctx)
 }

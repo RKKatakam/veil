@@ -718,14 +718,18 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     let repo = &ctx.repo;
     let wc = ctx.wc()?;
     let s = repo.snapshot(&wc)?;
-    let base = repo.parents_tree(&s.parents)?.tree;
-    let (changes, hidden) = veil_core::tree::diff_trees_hiding(repo.store(), Some(&base), Some(&s.tree))?;
-    let (changes, _) = detect_renames(repo, (&base, &s.tree), changes, &Renames::default())?;
+    let base = ctx.parents_tree(&s.parents)?;
+    let wc_tree = ctx.restrict_tree(s.tree)?;
+    let (changes, hidden) = veil_core::tree::diff_trees_hiding(repo.store(), Some(&base), Some(&wc_tree))?;
+    let (changes, _) = detect_renames(repo, (&base, &wc_tree), changes, &Renames::default())?;
     let report = &ctx.report;
     let embargo = EmbargoTiers::of(repo, &wc)?;
     let mut redacted = Vec::new();
     for p in &report.carried {
-        let entry = lookup(repo.store(), &s.tree, p)?;
+        if !ctx.in_only(p) {
+            continue;
+        }
+        let entry = lookup(repo.store(), &wc_tree, p)?;
         let why = entry.as_ref().and_then(|e| redaction_for_listing(repo, e));
         // Readable, yet never materialised: the filesystem refused it.
         let tier = entry.as_ref().map_or("redacted", |e| embargo.tier(repo, p, Some(e), entry_tier(repo, e)));
@@ -746,10 +750,14 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     let parents: Vec<_> = s.parents.iter().map(|p| repo.snapshot(p)).collect::<std::result::Result<_, _>>()?;
     let mut conflicts: Vec<Conflict> = Vec::new();
     for c in &s.conflicts {
-        let entry = VPath::new(c).ok().and_then(|cp| lookup(repo.store(), &s.tree, &cp).ok().flatten());
+        if !ctx.in_only_str(c) {
+            continue;
+        }
+        let entry = VPath::new(c).ok().and_then(|cp| lookup(repo.store(), &wc_tree, &cp).ok().flatten());
         let recorded_on = parents.iter().find_map(|ps| {
             let cp = VPath::new(c).ok()?;
-            let before = lookup(repo.store(), &ps.tree, &cp).ok().flatten();
+            let ps_tree = ctx.restrict_tree(ps.tree).ok()?;
+            let before = lookup(repo.store(), &ps_tree, &cp).ok().flatten();
             (ps.conflicts.contains(c) && before.is_some() && before == entry).then(|| ps.change_id.short())
         });
         let conflict = entry.as_ref().and_then(|e| conflict_info(repo, e));
@@ -758,8 +766,12 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
     for ps in &parents {
         for c in &ps.conflicts {
             let Ok(cp) = VPath::new(c) else { continue };
-            let before = lookup(repo.store(), &ps.tree, &cp)?;
-            if before.is_some() && before == lookup(repo.store(), &s.tree, &cp)? && !conflicts.iter().any(|x| x.path == *c) {
+            if !ctx.in_only(&cp) {
+                continue;
+            }
+            let ps_tree = ctx.restrict_tree(ps.tree)?;
+            let before = lookup(repo.store(), &ps_tree, &cp)?;
+            if before.is_some() && before == lookup(repo.store(), &wc_tree, &cp)? && !conflicts.iter().any(|x| x.path == *c) {
                 let conflict = before.as_ref().and_then(|e| conflict_info(repo, e));
                 conflicts.push(Conflict { path: c.clone(), recorded_on: Some(ps.change_id.short()), conflict, kept_edit: false });
             }
@@ -809,6 +821,9 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
         conflicts: {
             // Kept edits of a version left with a folder (BUG-1531).
             for k in ctx.materialised().kept_edits() {
+                if !ctx.in_only(k) {
+                    continue;
+                }
                 // Only while `@`'s parents record exactly the version
                 // written back: once they record anything else (the
                 // person's own version, committed), it is resolved
@@ -818,7 +833,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
                     let at = |t: &ObjectId| veil_core::tree::lookup(repo.store(), t, k).map(|e| e.map(|e| e.id));
                     let mut trees = Vec::new();
                     for p in &s.parents {
-                        trees.push(repo.snapshot(p)?.tree);
+                        trees.push(ctx.restrict_tree(repo.snapshot(p)?.tree)?);
                     }
                     if trees.iter().any(|t| at(t).is_ok_and(|e| e != v)) {
                         continue;
@@ -948,6 +963,7 @@ pub struct LogEntries<'a> {
     max_changes: Option<usize>,
     skipped: usize,
     stopped: bool,
+    within: Option<veil_core::vfs::SparseSet>,
 }
 
 /// What `vl log` shows: which snapshots (`-r`), how many (`-n`), and the
@@ -987,6 +1003,7 @@ pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, mut q: LogQuery) -> Result
         Some(ids) => Box::new(ids.into_iter().map(Ok)),
         None => Box::new(repo.held().visible_iter()),
     };
+    let within = q.filter.as_ref().and_then(|f| f.within.clone());
     let searcher = q.filter.filter(|f| !f.is_empty()).map(|f| Searcher::new(repo, f));
     // Without a filter `-n` is known at once; with one, only once enough
     // snapshots matched.
@@ -1033,6 +1050,7 @@ pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, mut q: LogQuery) -> Result
         max_changes: q.max_changes,
         skipped: 0,
         stopped: false,
+        within,
     })
 }
 
@@ -1116,6 +1134,18 @@ impl LogEntries<'_> {
                 ParentRef { snapshot_id: p.hex(), snapshot_short: p.short(), withheld: change_short.is_none(), change_short, id: *p }
             })
             .collect();
+        let empty = !root
+            && match &self.within {
+                Some(set) if s.parents.len() > 1 => repo
+                    .parents_tree_within(&s.parents, Some(set))
+                    .and_then(|m| veil_core::vfs::restrict(repo.store(), &s.tree, set).map(|t| m.tree == t))
+                    .unwrap_or(false),
+                _ => repo.is_empty_change(&id).unwrap_or(false),
+            };
+        let conflicts = match &self.within {
+            Some(set) => s.conflicts.iter().filter(|c| VPath::new(c).is_ok_and(|p| set.contains(&p))).cloned().collect(),
+            None => s.conflicts.clone(),
+        };
         Ok(LogEntry {
             snapshot_id: id.hex(),
             snapshot_short: id.short(),
@@ -1130,8 +1160,8 @@ impl LogEntries<'_> {
             workspaces: self.workspaces.remove(&id).unwrap_or_default(),
             tags: self.tags.remove(&id).unwrap_or_default(),
             remote_tags: self.remote_tags.remove(&id).unwrap_or_default(),
-            empty: !root && repo.is_empty_change(&id).unwrap_or(false),
-            conflicts: s.conflicts.clone(),
+            empty,
+            conflicts,
             embargo: s.embargo.as_ref().map(|e| LogEmbargo { id: e.clone(), released: repo.keys().embargo_released(e) }),
             description,
             parents,
@@ -1461,12 +1491,22 @@ pub fn diff_trees_for(ctx: &Ctx, rev: Option<&str>, from: Option<&str>, to: Opti
         (None, None) => {
             let id = ctx.rev(rev.unwrap_or("@"))?;
             let s = ctx.repo.snapshot(&id)?;
-            DiffTrees { from: ctx.repo.parents_tree(&s.parents)?.tree, to: s.tree, from_rev: id, to_rev: id }
+            DiffTrees {
+                from: ctx.parents_tree(&s.parents)?,
+                to: ctx.restrict_tree(s.tree)?,
+                from_rev: id,
+                to_rev: id,
+            }
         }
         _ => {
             let a = ctx.rev(from.unwrap_or("@"))?;
             let b = ctx.rev(to.unwrap_or("@"))?;
-            DiffTrees { from: ctx.repo.snapshot(&a)?.tree, to: ctx.repo.snapshot(&b)?.tree, from_rev: a, to_rev: b }
+            DiffTrees {
+                from: ctx.restrict_tree(ctx.repo.snapshot(&a)?.tree)?,
+                to: ctx.restrict_tree(ctx.repo.snapshot(&b)?.tree)?,
+                from_rev: a,
+                to_rev: b,
+            }
         }
     })
 }
@@ -1535,7 +1575,7 @@ pub struct AttemptInfo {
 }
 
 /// The attempts snapshot `s` lists, with what each changed.
-pub fn attempts_of(repo: &Repo, s: &Snapshot) -> Result<Vec<AttemptInfo>> {
+pub fn attempts_of(repo: &Repo, s: &Snapshot, within: Option<&veil_core::vfs::SparseSet>) -> Result<Vec<AttemptInfo>> {
     let mut out = Vec::new();
     for a in &s.attempts {
         // As a full clone answers: a thin clone fetches an attempt it lacks.
@@ -1551,8 +1591,12 @@ pub fn attempts_of(repo: &Repo, s: &Snapshot) -> Result<Vec<AttemptInfo>> {
             });
             continue;
         };
-        let base = repo.parents_tree(&at.parents)?.tree;
-        let diff = diff_body_with(repo, &DiffTrees { from: base, to: at.tree, from_rev: *a, to_rev: *a }, true, &Renames::default())?;
+        let base = repo.parents_tree_within(&at.parents, within)?.tree;
+        let to = match within {
+            Some(set) => veil_core::vfs::restrict(repo.store(), &at.tree, set)?,
+            None => at.tree,
+        };
+        let diff = diff_body_with(repo, &DiffTrees { from: base, to, from_rev: *a, to_rev: *a }, true, &Renames::default())?;
         out.push(AttemptInfo {
             snapshot_id: a.hex(),
             snapshot_short: a.short(),
@@ -1614,7 +1658,9 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
     };
     let status = (!root).then(|| repo.keys().snapshot_status(&s));
     let description = description(repo, &s);
-    let base = repo.parents_tree(&s.parents)?.tree;
+    let base = ctx.parents_tree(&s.parents)?;
+    let tree = ctx.restrict_tree(s.tree)?;
+    let conflicts = s.conflicts.iter().filter(|c| ctx.in_only_str(c)).cloned().collect();
     Ok(Show {
         schema: SHOW_SCHEMA,
         snapshot_id: id.hex(),
@@ -1628,14 +1674,14 @@ pub fn show_header(ctx: &Ctx, rev: &str, stat: bool) -> Result<Show> {
         parents: s.parents.iter().map(|p| snapshot_ref(repo, p)).collect(),
         tags: repo.view().tags.iter().filter(|(_, t)| t.target == id).map(|(n, _)| n.clone()).collect(),
         embargo,
-        conflicts: s.conflicts.clone(),
+        conflicts,
         description,
         agent: s.agent.clone(),
         abandoned: s.abandoned.clone(),
-        attempts: attempts_of(repo, &s)?,
+        attempts: attempts_of(repo, &s, ctx.only.as_ref())?,
         diff: DiffBody { stat, files: Vec::new(), renames_skipped: false, hidden: Vec::new() },
         base_tree: base,
-        tree: s.tree,
+        tree,
         timestamp_ms: s.timestamp,
         signature_status: status,
         snapshot: Some(s),
@@ -2627,7 +2673,7 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
     let repo = &ctx.repo;
     let id = ctx.rev(req.rev)?;
     let p = ctx.repo_path(req.path)?;
-    let tree = repo.snapshot(&id)?.tree;
+    let tree = ctx.restrict_tree(repo.snapshot(&id)?.tree)?;
     let reader = if req.public { Reader::Public } else { Reader::Me };
     let e = match crate::render::lookup_shown(repo, &tree, &p)? {
         Some(e) if e.kind.is_file_like() => e,
@@ -2654,6 +2700,7 @@ pub fn blame(ctx: &Ctx, req: &BlameRequest<'_>) -> Result<BlameDoc> {
         follow: req.follow,
         max_changes: req.max_changes,
         lines: req.lines,
+        within: ctx.only.clone(),
         ..BlameOptions::default()
     };
     let b = veil_core::blame::blame(repo, &id, &p, &o)?;

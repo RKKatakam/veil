@@ -207,7 +207,6 @@ fn bug_1841_an_injected_secret_never_enters_history_through_a_description_set_in
 /// `.env`. Through the workspace socket, the command must not read them
 /// either (the `vl` outside opens them, decrypted, on its behalf).
 #[test]
-#[ignore = "BUG-1844: a sparse (--only) sandbox reads the rest of the workspace, sealed secrets in plain text included, through the workspace socket"]
 fn bug_1844_a_sparse_sandbox_reads_only_its_paths_through_the_workspace_socket() {
     const SECRET: &str = "Zk29vLq8sPzQw7LmTr4Bn6Yc";
     const DOC: &str = "DOCS-ONLY-MARKER-7f3a91c2";
@@ -221,19 +220,57 @@ fn bug_1844_a_sparse_sandbox_reads_only_its_paths_through_the_workspace_socket()
         r#"test -e src/lib.rs || exit 8
            test ! -e docs && test ! -e .env || exit 9
            vl status >/dev/null || exit 7
-           vl blame src/lib.rs >/dev/null || exit 6
-           vl blame .env; vl blame docs/d.md
+           vl blame src/lib.rs || exit 6
+           vl blame .veilpolicy >/dev/null || exit 5
+           vl log src || exit 4
+           for cmd in "blame .env" "blame docs/d.md" "log .env" "log docs/d.md" "log ."; do
+               out=$(vl $cmd 2>&1) && { echo "RAN: $cmd"; exit 3; }
+               case "$out" in *'inside a sandbox with --only'*'outside --only'*) ;; *) echo "BAD REFUSAL: $cmd: $out"; exit 2;; esac
+           done
+           s_out=$(vl log -S 'K=Zk29' --pickaxe-all --json) || exit 10
+           case "$s_out" in *'"entries":[]'*) ;; *) echo "LEAK -S: $s_out"; exit 10;; esac
+           g_out=$(vl log -G 'DOCS-ONLY-MARKER' --pickaxe-all --json) || exit 11
+           case "$g_out" in *'"entries":[]'*) ;; *) echo "LEAK -G: $g_out"; exit 11;; esac
            vl diff --from root --to @
+           vl diff --from root --to @ --json
            vl show main
+           vl show main --json
            exit 0"#,
     );
     // The sandbox is sparse, the socket answers, and the command's own
     // paths are readable through it.
     assert!(o.status.success(), "{}", text(&o));
     let seen = text(&o);
+    assert!(seen.contains("pub fn f() {}"), "sandbox's own src/lib.rs should be shown:\n{seen}");
     assert!(
         !seen.contains(SECRET),
         "a sandbox given only src/ read the sealed .env, decrypted, through the workspace socket:\n{seen}"
     );
     assert!(!seen.contains(DOC), "a sandbox given only src/ read docs/d.md through the workspace socket:\n{seen}");
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        !stdout.contains("docs/d.md") && !stdout.contains("a/.env") && !stdout.contains(r#""path":".env""#),
+        "paths outside --only leaked:\n{stdout}"
+    );
+
+    // Even when a file inside `src/` was renamed from outside `--only` (or
+    // `@` already carries an edit outside `--only`), `--follow` and `status`
+    // stay inside `--only`; a later full or `--mount` run sees the whole workspace again.
+    let full = t.exec(
+        &[],
+        "mv docs/d.md src/from_doc.md && echo 'extra' > docs/other.md && vl commit -m 'move doc' && echo 'dirty-outside' >> docs/other.md",
+    );
+    assert!(full.status.success(), "{}", text(&full));
+    let o2 = t.exec(
+        &["--only", "src"],
+        "vl status && vl status --json && vl blame --follow src/from_doc.md --json && vl log --follow src/from_doc.md --json",
+    );
+    assert!(o2.status.success(), "{}", text(&o2));
+    let seen2 = text(&o2);
+    assert!(
+        !seen2.contains("docs/other.md") && !seen2.contains("docs/d.md") && !seen2.contains("dirty-outside"),
+        "status or --follow crossed --only boundary:\n{seen2}"
+    );
+    let mounted = t.exec(&["--mount"], "vl blame docs/other.md");
+    assert!(mounted.status.success() && text(&mounted).contains("dirty-outside"), "{}", text(&mounted));
 }

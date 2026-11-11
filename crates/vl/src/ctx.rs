@@ -228,6 +228,9 @@ pub struct Ctx {
     /// workspace socket ([`Ctx::open_for_workspace`]). It never records,
     /// moves or attaches the project directory.
     pub detached: bool,
+    /// Sparse `--only` paths confining a workspace-socket command: reads are
+    /// narrowed to these paths (plus `.veilpolicy`).
+    pub only: Option<veil_core::vfs::SparseSet>,
 }
 
 /// Written by `vl clone` before it fetches anything, removed once its
@@ -403,6 +406,7 @@ impl Ctx {
                 bare: true,
                 committed_from: None,
                 detached: false,
+                only: None,
             });
         }
         let checkout = load_state(&fs, &repo)?;
@@ -425,6 +429,7 @@ impl Ctx {
             bare: false,
             committed_from: None,
             detached: false,
+            only: None,
         };
         if snapshot {
             ctx.snapshot()?;
@@ -448,6 +453,29 @@ impl Ctx {
         ctx.repo.set_command_workspace(Some(ctx.ws.clone()));
         ctx.detached = true;
         Ok(ctx)
+    }
+
+    /// `tree`, restricted to [`Ctx::only`] when set.
+    pub fn restrict_tree(&self, tree: ObjectId) -> Result<ObjectId> {
+        match &self.only {
+            Some(set) => Ok(veil_core::vfs::restrict(self.repo.store(), &tree, set)?),
+            None => Ok(tree),
+        }
+    }
+
+    /// Merged tree of `parents`, restricted to [`Ctx::only`] before merging.
+    pub fn parents_tree(&self, parents: &[ObjectId]) -> Result<ObjectId> {
+        Ok(self.repo.parents_tree_within(parents, self.only.as_ref())?.tree)
+    }
+
+    /// Is `p` within [`Ctx::only`] (always `true` when `only` is unset)?
+    pub fn in_only(&self, p: &VPath) -> bool {
+        self.only.as_ref().is_none_or(|set| set.contains(p))
+    }
+
+    /// Is path string `s` within [`Ctx::only`]?
+    pub fn in_only_str(&self, s: &str) -> bool {
+        self.only.as_ref().is_none_or(|set| VPath::new(s).is_ok_and(|p| set.contains(&p)))
     }
 
     /// The project directory's stat cache (what its files hold, as far as
