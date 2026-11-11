@@ -132,7 +132,6 @@ fn bug_1860_someone_who_cannot_write_a_folder_never_reverts_a_landing_there() {
 /// refused; the same change put on an embargo line of `dev`'s own group and
 /// released by `dev` lands on `main` with no approval at all.
 #[test]
-#[ignore = "BUG-1861: an embargo's release lands on a protected branch with no approval: any group member lands unreviewed changes by embargoing and releasing them"]
 fn bug_1861_an_embargo_release_never_lands_an_unapproved_change_on_a_protected_branch() {
     let hub = TestHub::start();
     let p = setup_project(&hub);

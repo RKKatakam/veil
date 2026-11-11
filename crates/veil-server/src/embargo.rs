@@ -675,16 +675,33 @@ pub(crate) async fn record_in_tx(
     Ok(())
 }
 
-/// Background loop that periodically runs [`release_due`].
+/// How often a release that is stuck is tried again: one that failed (a
+/// conflict waits for a member to rebase; a database error passes), or one
+/// that waits for an approval (BUG-1857, BUG-1861). An approval tries it at
+/// once ([`try_release_waiting`]); this is for whatever else lets it through
+/// (a rule change, a dismissal on another server).
+const RETRY_STUCK: Duration = Duration::from_secs(5);
+
+/// Background loop that releases embargoes at their deadlines
+/// ([`release_due`]), and tries the stuck ones again every [`RETRY_STUCK`].
 pub async fn run_loop(hub: Arc<Hub>, mut stop: tokio::sync::watch::Receiver<bool>) {
     let mut check_db = true;
+    let mut retry_at = tokio::time::Instant::now() + RETRY_STUCK;
     loop {
         let next_wait = if check_db {
-            match next_due_wait_ms(&hub).await {
-                Ok(Some(ms)) => Some(Duration::from_millis(ms.clamp(100, 1_000) as u64)),
-                Ok(None) => {
+            match next_waits(&hub).await {
+                Ok((None, false)) => {
                     check_db = false;
                     None
+                }
+                Ok((fresh, stuck)) => {
+                    let fresh = fresh.map(|ms| Duration::from_millis(ms.clamp(100, 1_000) as u64));
+                    let stuck = stuck.then(|| {
+                        retry_at
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .max(Duration::from_millis(100))
+                    });
+                    fresh.into_iter().chain(stuck).min()
                 }
                 Err(_) => Some(Duration::from_secs(1)),
             }
@@ -698,7 +715,12 @@ pub async fn run_loop(hub: Arc<Hub>, mut stop: tokio::sync::watch::Receiver<bool
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                let _ = release_due(&hub).await;
+                let now = tokio::time::Instant::now();
+                let stuck = now >= retry_at;
+                if stuck {
+                    retry_at = now + RETRY_STUCK;
+                }
+                let _ = release_pending(&hub, stuck).await;
             }
             _ = hub.embargo.wake.notified() => {
                 check_db = true;
@@ -712,35 +734,31 @@ pub async fn run_loop(hub: Arc<Hub>, mut stop: tokio::sync::watch::Receiver<bool
     }
 }
 
-async fn next_due_wait_ms(hub: &Arc<Hub>) -> Result<Option<i64>> {
-    let now_ms: i64 = sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
-        .fetch_one(&hub.db)
-        .await?;
+/// Is the release recorded in `record_json` stuck (it failed, or it waits
+/// for an approval)?
+fn is_stuck(record_json: &str) -> bool {
+    serde_json::from_str::<EmbargoRecord>(record_json).ok().and_then(|r| r.state).is_some()
+}
+
+/// What the release loop waits for: the milliseconds until the next deadline
+/// of an embargo whose release is not stuck, and whether a stuck one is due.
+async fn next_waits(hub: &Arc<Hub>) -> Result<(Option<i64>, bool)> {
     let rows: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT until_ms, record_json FROM embargo_lines \
+        "SELECT until_ms - (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT, record_json FROM embargo_lines \
          WHERE released_at IS NULL AND until_ms IS NOT NULL",
     )
     .fetch_all(&hub.db)
     .await?;
-    let min_pending = rows
-        .into_iter()
-        .filter(|(_, json)| {
-            serde_json::from_str::<EmbargoRecord>(json)
-                .ok()
-                .and_then(|r| r.state)
-                .is_none()
-        })
-        .map(|(u, _)| u)
-        .min();
-    let Some(min_u) = min_pending else {
-        return Ok(None);
-    };
-    let ms = min_u - now_ms;
-    if ms <= 0 {
-        let _ = release_due(hub).await;
-        return Ok(Some(250));
+    let mut fresh: Option<i64> = None;
+    let mut stuck = false;
+    for (ms, json) in rows {
+        if !is_stuck(&json) {
+            fresh = Some(fresh.map_or(ms, |f| f.min(ms)));
+        } else if ms <= 0 {
+            stuck = true;
+        }
     }
-    Ok(Some(ms))
+    Ok((fresh, stuck))
 }
 
 pub(crate) fn failure_reason(e: &Error) -> String {
@@ -751,6 +769,9 @@ pub(crate) fn failure_reason(e: &Error) -> String {
     }
 }
 
+/// Record on an unreleased embargo why its release did not happen (`state`
+/// and `reason` of its record, which only its groups and admins read), or
+/// clear it.
 pub(crate) async fn record_embargo_status(
     hub: &Arc<Hub>,
     project_id: i64,
@@ -761,9 +782,11 @@ pub(crate) async fn record_embargo_status(
     record_embargo_status_inner(hub, project_id, embargo_id, state, reason, false).await
 }
 
-/// Hold an unapproved release onto a protected branch: keep the embargo
-/// unreleased and hidden, record `waiting_for_approval` + `reason` for its
-/// groups, and ensure `until_ms` is set so that once approved it releases.
+/// Hold an unapproved release onto a protected branch (BUG-1861): the
+/// embargo stays unreleased and hidden, its record says
+/// `waiting_for_approval` and why (to its groups and admins), and its
+/// release is due from now on (`until_ms`: asked for early, or with no
+/// deadline, it is still tried again and lands once it is approved).
 pub(crate) async fn hold_embargo_for_approval(
     hub: &Arc<Hub>,
     project_id: i64,
@@ -781,14 +804,15 @@ async fn record_embargo_status_inner(
     reason: Option<&str>,
     mark_due: bool,
 ) -> Result<()> {
-    let cur: Option<(Option<i64>, String)> = sqlx::query_as(
-        "SELECT until_ms, record_json FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL",
+    let cur: Option<(bool, String)> = sqlx::query_as(
+        "SELECT (until_ms IS NOT NULL AND until_ms <= (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT), record_json \
+         FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL",
     )
     .bind(project_id)
     .bind(embargo_id)
     .fetch_optional(&hub.db)
     .await?;
-    let Some((cur_until, old_json)) = cur else {
+    let Some((due, old_json)) = cur else {
         return Ok(());
     };
     let Ok(mut rec) = serde_json::from_str::<EmbargoRecord>(&old_json) else {
@@ -796,7 +820,7 @@ async fn record_embargo_status_inner(
     };
     let new_state = state.map(str::to_string);
     let new_reason = reason.map(str::to_string);
-    if rec.state == new_state && rec.reason == new_reason && (!mark_due || cur_until.is_some()) {
+    if rec.state == new_state && rec.reason == new_reason && (!mark_due || due) {
         return Ok(());
     }
     rec.state = new_state;
@@ -810,30 +834,21 @@ async fn record_embargo_status_inner(
         let new_json = new_json.clone();
         let eid = eid.clone();
         Box::pin(async move {
-            let n = if mark_due {
-                sqlx::query(
-                    "UPDATE embargo_lines \
-                     SET record_json = $1, \
-                         until_ms = COALESCE(until_ms, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT) \
-                     WHERE project_id = $2 AND embargo_id = $3 AND released_at IS NULL",
-                )
-                .bind(&new_json)
-                .bind(project_id)
-                .bind(&eid)
-                .execute(&mut *c)
-                .await?
-                .rows_affected()
-            } else {
-                sqlx::query(
-                    "UPDATE embargo_lines SET record_json = $1 WHERE project_id = $2 AND embargo_id = $3 AND released_at IS NULL",
-                )
-                .bind(&new_json)
-                .bind(project_id)
-                .bind(&eid)
-                .execute(&mut *c)
-                .await?
-                .rows_affected()
-            };
+            // `mark_due`: the release was asked for, so it is due now.
+            let n = sqlx::query(
+                "UPDATE embargo_lines SET record_json = $1, \
+                     until_ms = CASE WHEN $4 THEN LEAST(COALESCE(until_ms, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT), \
+                                                        (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT) \
+                                     ELSE until_ms END \
+                 WHERE project_id = $2 AND embargo_id = $3 AND released_at IS NULL",
+            )
+            .bind(&new_json)
+            .bind(project_id)
+            .bind(&eid)
+            .bind(mark_due)
+            .execute(&mut *c)
+            .await?
+            .rows_affected();
             if n > 0 && notify {
                 sqlx::query("SELECT pg_notify($1, $2)")
                     .bind(crate::caches::TIPS_CHANNEL)
@@ -847,15 +862,33 @@ async fn record_embargo_status_inner(
     .await?;
     if changed {
         hub.caches.tips_changed(project_id);
+        hub.embargo.wake();
     }
     Ok(())
 }
 
-/// Attempt to release `embargo_id` if it is already due or held in
-/// `waiting_for_approval` (called when an approval or hold dismissal lands).
+/// Release `embargo_id` for the server (no person asks): `true` when this
+/// call released it. A release that is not approved is held by
+/// [`release_one`]; any other failure is recorded on the embargo (BUG-1857),
+/// and the next one is tried all the same.
+async fn release_for_server(hub: &Arc<Hub>, project_id: i64, embargo_id: &str) -> bool {
+    match release_one(hub, project_id, embargo_id, None, None).await {
+        Ok(released) => released,
+        Err(Error::Api { code: "not_ready", .. }) => false,
+        Err(e) => {
+            let reason = failure_reason(&e);
+            let _ = record_embargo_status(hub, project_id, embargo_id, Some("failed"), Some(&reason)).await;
+            false
+        }
+    }
+}
+
+/// Try the release of `embargo_id` again, if it is due (a held release is):
+/// called when an approval of one of its PRs arrives, so that a release
+/// that waited for it lands at once (BUG-1861).
 pub(crate) async fn try_release_waiting(hub: &Arc<Hub>, project_id: i64, embargo_id: &str) {
-    let row: Option<(bool, String)> = sqlx::query_as(
-        "SELECT (until_ms IS NOT NULL AND until_ms <= (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT), record_json \
+    let due: Option<bool> = sqlx::query_scalar(
+        "SELECT (until_ms IS NOT NULL AND until_ms <= (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT) \
          FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL",
     )
     .bind(project_id)
@@ -864,40 +897,29 @@ pub(crate) async fn try_release_waiting(hub: &Arc<Hub>, project_id: i64, embargo
     .await
     .ok()
     .flatten();
-    let Some((due_now, json)) = row else {
-        return;
-    };
-    let waiting = serde_json::from_str::<EmbargoRecord>(&json)
-        .ok()
-        .is_some_and(|r| r.state.as_deref() == Some("waiting_for_approval"));
-    if !due_now && !waiting {
-        return;
-    }
-    match release_one(hub, project_id, embargo_id, None, None).await {
-        Ok(_) => {}
-        Err(Error::Api { code: "not_ready", message, .. }) => {
-            let _ = hold_embargo_for_approval(hub, project_id, embargo_id, &message).await;
-        }
-        Err(e) => {
-            let reason = failure_reason(&e);
-            let _ = record_embargo_status(hub, project_id, embargo_id, Some("failed"), Some(&reason)).await;
-        }
+    if due == Some(true) {
+        release_for_server(hub, project_id, embargo_id).await;
     }
 }
 
+/// [`try_release_waiting`] for every embargo of the project that is due: a
+/// request for changes that held their paths was dismissed.
 pub(crate) async fn try_release_waiting_in_project(hub: &Arc<Hub>, project_id: i64) {
     let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT embargo_id FROM embargo_lines WHERE project_id = $1 AND released_at IS NULL ORDER BY until_ms, embargo_id",
+        "SELECT embargo_id FROM embargo_lines WHERE project_id = $1 AND released_at IS NULL AND until_ms IS NOT NULL \
+         AND until_ms <= (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT ORDER BY until_ms, embargo_id",
     )
     .bind(project_id)
     .fetch_all(&hub.db)
     .await
     .unwrap_or_default();
     for eid in ids {
-        try_release_waiting(hub, project_id, &eid).await;
+        release_for_server(hub, project_id, &eid).await;
     }
 }
 
+/// Is `branch` protected by the rules in force (`.veilrules` at the default
+/// branch's tip)?
 pub(crate) async fn is_protected_branch(
     hub: &Arc<Hub>,
     project_id: i64,
@@ -919,13 +941,26 @@ pub(crate) async fn is_protected_branch(
     .await
 }
 
+/// Who submits a release's landing of `stack` (the landing service lands
+/// only what its submitter may write, and bounds their outstanding
+/// landings): the person releasing, if they may write every path of it;
+/// else the embargo's creator, if they still may; else an admin of the
+/// project (the first). Also the viewer the review rules answer: the person
+/// releasing, or at a deadline the creator.
 pub(crate) async fn choose_submitter(
     hub: &Arc<Hub>,
     project: &Project,
     stack: &[crate::landing::Entry],
     creator: &(i64, String, String),
     manual: Option<(&Viewer, &crate::landing::Submitter)>,
-) -> Result<(Viewer, crate::landing::Submitter, Option<crate::landing::Submitter>)> {
+) -> Result<(Viewer, crate::landing::Submitter)> {
+    let paths = crate::prs::stack_touched_paths(hub, project.id, stack, None).await?;
+    let may_submit = |v: &Viewer| project.participant(v) && (v.admin || crate::prs::review::writes_all(project, v, &paths));
+    if let Some((v, sub)) = manual {
+        if may_submit(v) {
+            return Ok((v.clone(), sub.clone()));
+        }
+    }
     let creator_person = Person {
         id: creator.0,
         name: creator.1.clone(),
@@ -942,28 +977,19 @@ pub(crate) async fn choose_submitter(
     )
     .await?;
     let release_viewer = manual.map(|(v, _)| v.clone()).unwrap_or_else(|| creator_viewer.clone());
-    let paths = crate::prs::stack_touched_paths(hub, project.id, stack, None).await?;
-    if let Some((v, sub)) = manual {
-        if project.participant(v) && (v.admin || crate::prs::review::writes_all(project, v, &paths)) {
-            return Ok((release_viewer, sub.clone(), None));
-        }
-    }
-    let caller_bounds = manual.map(|(_, s)| s.clone());
-    if project.participant(&creator_viewer)
-        && (creator_viewer.admin || crate::prs::review::writes_all(project, &creator_viewer, &paths))
-    {
+    if may_submit(&creator_viewer) {
         return Ok((
             release_viewer,
             crate::landing::Submitter {
                 person: creator_person,
                 epochs: creator_epochs,
             },
-            caller_bounds,
         ));
     }
     let (admin_id, admin_name, admin_key): (i64, String, String) = sqlx::query_as(
-        "SELECT p.id, p.name, COALESCE((SELECT d.signing_key FROM devices d WHERE d.person_id = p.id AND d.removed_at IS NULL LIMIT 1), '') \
-         FROM project_admins a JOIN people p ON p.id = a.person_id WHERE a.project_id = $1 LIMIT 1",
+        "SELECT p.id, p.name, COALESCE((SELECT d.signing_key FROM devices d WHERE d.person_id = p.id AND d.removed_at IS NULL \
+                                        ORDER BY d.signing_key LIMIT 1), '') \
+         FROM project_admins a JOIN people p ON p.id = a.person_id WHERE a.project_id = $1 ORDER BY p.id LIMIT 1",
     )
     .bind(project.id)
     .fetch_one(&hub.db)
@@ -989,10 +1015,11 @@ pub(crate) async fn choose_submitter(
             person: admin_person,
             epochs: admin_epochs,
         },
-        caller_bounds,
     ))
 }
 
+/// A release's landing ticket, whoever queued it: its submitter and its
+/// state.
 pub(crate) async fn read_embargo_ticket(
     hub: &Hub,
     project_id: i64,
@@ -1019,6 +1046,13 @@ pub(crate) async fn read_embargo_ticket(
     Ok(Some((person_id, r)))
 }
 
+/// Queue a release's landing of `judged` on `branch` under the deterministic
+/// `ticket` (once, whichever server or retry asks: the embargo's row is
+/// locked while the ticket is looked for), through `landing::insert` like
+/// every landing (its submitter's outstanding-landing bounds, S24), and wait
+/// for the landing service (S17). A ticket that failed is queued again only
+/// when a person asks (`manual_retry`); a push to the line removes it
+/// (`record_in_tx`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn queue_and_wait_embargo_landing(
     hub: &Arc<Hub>,
@@ -1028,7 +1062,6 @@ pub(crate) async fn queue_and_wait_embargo_landing(
     branch: &str,
     judged: crate::landing::Judged,
     who: &crate::landing::Submitter,
-    caller_bounds: Option<&crate::landing::Submitter>,
     manual_retry: bool,
 ) -> Result<veil_core::hub::land::LandResult> {
     let existing = read_embargo_ticket(hub, project.id, ticket).await?;
@@ -1046,77 +1079,37 @@ pub(crate) async fn queue_and_wait_embargo_landing(
         };
         let pid = project.id;
         let eid = embargo_id.to_string();
-        let t_str = ticket.to_string();
         let who2 = who.clone();
-        let csub = caller_bounds.cloned();
         crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
             let eid = eid.clone();
-            let t_str = t_str.clone();
             let q = q.clone();
             let who2 = who2.clone();
-            let csub = csub.clone();
             Box::pin(async move {
-                let _: Option<String> = sqlx::query_scalar(
-                    "SELECT embargo_id FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 FOR UPDATE",
+                let unreleased: Option<bool> = sqlx::query_scalar(
+                    "SELECT released_at IS NULL FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 FOR UPDATE",
                 )
                 .bind(pid)
                 .bind(&eid)
                 .fetch_optional(&mut *c)
                 .await?;
+                if unreleased != Some(true) {
+                    return Ok(());
+                }
                 if manual_retry {
                     sqlx::query(
                         "DELETE FROM landing_queue WHERE project_id = $1 AND ticket = $2 AND state NOT IN ('queued', 'merging', 'landed')",
                     )
                     .bind(pid)
-                    .bind(&t_str)
+                    .bind(&q.ticket)
                     .execute(&mut *c)
                     .await?;
                 }
-                let already: Option<i32> = sqlx::query_scalar(
-                    "SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2",
-                )
-                .bind(pid)
-                .bind(&t_str)
-                .fetch_optional(&mut *c)
-                .await?;
+                let already: Option<i32> = sqlx::query_scalar("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2")
+                    .bind(pid)
+                    .bind(&q.ticket)
+                    .fetch_optional(&mut *c)
+                    .await?;
                 if already.is_none() {
-                    if let Some(cs) = &csub {
-                        if cs.person.id != who2.person.id {
-                            let (max_session, max_person) = crate::limits::landing::bounds();
-                            let session = crate::limits::landing::session_of(cs);
-                            let _: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE id = $1 FOR UPDATE")
-                                .bind(cs.person.id)
-                                .fetch_optional(&mut *c)
-                                .await?;
-                            let (person_queued, session_queued): (i64, i64) = sqlx::query_as(
-                                "SELECT COUNT(*), COUNT(*) FILTER (WHERE session = $3) FROM landing_queue \
-                                 WHERE project_id = $1 AND person_id = $2 AND state IN ('queued', 'merging')",
-                            )
-                            .bind(pid)
-                            .bind(cs.person.id)
-                            .bind(session)
-                            .fetch_one(&mut *c)
-                            .await?;
-                            if !session.is_empty() && session_queued as usize >= max_session {
-                                return Err(Error::rate_limited(
-                                    format!(
-                                        "this agent session already has {max_session} landings waiting in the queue; \
-                                         wait for them to finish before submitting more"
-                                    ),
-                                    1_000,
-                                ));
-                            }
-                            if person_queued as usize >= max_person {
-                                return Err(Error::rate_limited(
-                                    format!(
-                                        "you already have {max_person} landings waiting in the queue; \
-                                         wait for them to finish before submitting more"
-                                    ),
-                                    1_000,
-                                ));
-                            }
-                        }
-                    }
                     crate::landing::insert(&mut *c, pid, &who2, &q).await?;
                 }
                 Ok(())
@@ -1126,40 +1119,57 @@ pub(crate) async fn queue_and_wait_embargo_landing(
     }
 
     let w = hub.landing.register(ticket);
-    if let Some((q_person, cur)) = read_embargo_ticket(hub, project.id, ticket).await? {
-        let outcome = if cur.state == LandState::Queued {
+    match read_embargo_ticket(hub, project.id, ticket).await {
+        Ok(Some((q_person, cur))) if cur.state == LandState::Queued => {
             crate::limits::leave_gates();
             crate::landing::ensure(hub, project.id, branch);
             let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
-            crate::landing::wait(hub, project.id, q_person, branch, w, deadline).await?
-        } else {
+            crate::landing::wait(hub, project.id, q_person, branch, w, deadline).await
+        }
+        Ok(Some((_, cur))) => {
             crate::landing::abandon(hub, w);
-            cur
-        };
-        Ok(outcome)
-    } else {
-        crate::landing::abandon(hub, w);
-        let mut r = crate::landing::queued(ticket);
-        r.state = LandState::Landed;
-        Ok(r)
+            Ok(cur)
+        }
+        // No ticket: nothing was left to land, or another server released
+        // the embargo meanwhile (the release's last step finds out which).
+        Ok(None) => {
+            crate::landing::abandon(hub, w);
+            let mut r = crate::landing::queued(ticket);
+            r.state = LandState::Landed;
+            Ok(r)
+        }
+        Err(e) => {
+            crate::landing::abandon(hub, w);
+            Err(e)
+        }
     }
 }
 
 /// Release every embargo across all projects whose `until_ms` has arrived
-/// according to PostgreSQL's `clock_timestamp()`.
+/// according to PostgreSQL's `clock_timestamp()`, each on its own: one that
+/// fails, or waits for an approval, keeps no other from its deadline
+/// (BUG-1857).
 ///
 /// Using the database clock (`clock_timestamp()`) guarantees that app-server
 /// clock skew never releases an embargo early or late, and survives restarts
 /// and multiple servers.
 pub async fn release_due(hub: &Arc<Hub>) -> Result<usize> {
-    let due: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT project_id, embargo_id FROM embargo_lines \
+    release_pending(hub, true).await
+}
+
+/// [`release_due`]; with `stuck` false, only the embargoes whose release is
+/// not stuck (the release loop tries the stuck ones every [`RETRY_STUCK`],
+/// not at every tick).
+async fn release_pending(hub: &Arc<Hub>, stuck: bool) -> Result<usize> {
+    let due: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT project_id, embargo_id, record_json FROM embargo_lines \
          WHERE released_at IS NULL AND until_ms IS NOT NULL \
          AND until_ms <= (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT \
          ORDER BY until_ms, project_id, embargo_id",
     )
     .fetch_all(&hub.db)
     .await?;
+    let due: Vec<(i64, String)> = due.into_iter().filter(|(_, _, json)| stuck || !is_stuck(json)).map(|(p, e, _)| (p, e)).collect();
 
     if due.is_empty() {
         return Ok(0);
@@ -1184,25 +1194,31 @@ pub async fn release_due(hub: &Arc<Hub>) -> Result<usize> {
 
     let mut released = 0;
     for (project_id, embargo_id) in due {
-        match release_one(hub, project_id, &embargo_id, None, None).await {
-            Ok(true) => released += 1,
-            Ok(false) => {}
-            Err(Error::Api { code: "not_ready", message, .. }) => {
-                let _ = hold_embargo_for_approval(hub, project_id, &embargo_id, &message).await;
-            }
-            Err(e) => {
-                let reason = failure_reason(&e);
-                let _ = record_embargo_status(hub, project_id, &embargo_id, Some("failed"), Some(&reason)).await;
-            }
+        if release_for_server(hub, project_id, &embargo_id).await {
+            released += 1;
         }
     }
     Ok(released)
 }
 
-/// Release one embargo `embargo_id` in `project_id`: land the commits on
-/// `embargo/<id>` onto `target_branch` (`main`) once via the landing service,
-/// mark `embargo_lines.released_at`, remove the hidden `embargo/<id>` branch,
-/// and clear `embargo_snapshots`.
+/// Release one embargo `embargo_id` in `project_id`, for the person
+/// `submitter` (an early release) or for the server (its deadline):
+///
+/// 1. **Land the line.** The changes on `embargo/<id>` land on
+///    `target_branch` through the landing service (S17), under one
+///    deterministic ticket, whatever PRs the embargo has and whatever their
+///    state (BUG-1875: the line is never dropped without landing). Onto a
+///    protected branch the landing meets S21's review rules like every
+///    landing, and the approvals of the embargo's own PR count (BUG-1861):
+///    unapproved, the release is **held** ([`hold_embargo_for_approval`]) and
+///    this answers `409 not_ready`; nothing lands and nothing turns public.
+/// 2. **Finish** (`prs::embargo::finish_release`): the embargo's PRs that
+///    are armed and ready land too, and in one transaction `released_at` is
+///    set, its PRs become ordinary, and the hidden line and the embargo's
+///    snapshot rows go (the line only at the tip that landed).
+///
+/// `Ok(true)` when this call released it; `Ok(false)` when it was released
+/// already (or by another server meanwhile).
 pub async fn release_one(
     hub: &Arc<Hub>,
     project_id: i64,
@@ -1210,16 +1226,15 @@ pub async fn release_one(
     pushed_record: Option<EmbargoRecord>,
     submitter: Option<(&Viewer, &crate::landing::Submitter)>,
 ) -> Result<bool> {
-    let row: Option<(Vec<String>, String, String, Option<i64>, String, String, bool)> = sqlx::query_as(
-        "SELECT group_names, target_branch, embargo_branch, released_at, record_json, created_by, \
-                (has_pr OR EXISTS (SELECT 1 FROM prs WHERE project_id = $1 AND embargo = $2)) \
+    let row: Option<(Vec<String>, String, String, Option<i64>, String, String)> = sqlx::query_as(
+        "SELECT group_names, target_branch, embargo_branch, released_at, record_json, created_by \
          FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
     )
     .bind(project_id)
     .bind(embargo_id)
     .fetch_optional(&hub.db)
     .await?;
-    let Some((group_names, target_branch, ebranch, released_at, record_json, created_by, has_pr)) = row else {
+    let Some((group_names, target_branch, ebranch, released_at, record_json, created_by)) = row else {
         return Ok(false);
     };
     if released_at.is_some() {
@@ -1245,7 +1260,8 @@ pub async fn release_one(
         .fetch_optional(&mut *c)
         .await?;
 
-    // Find the submitter (the device/person who created the embargo, or a project admin).
+    // The embargo's creator (the person whose device pushed it), or the
+    // project's first admin when that device is gone.
     let signer: Option<(i64, String, String)> = sqlx::query_as(
         "SELECT p.id, p.name, d.signing_key FROM devices d JOIN people p ON p.id = d.person_id \
          WHERE d.signing_key = $1 AND d.removed_at IS NULL LIMIT 1",
@@ -1253,12 +1269,12 @@ pub async fn release_one(
     .bind(&created_by)
     .fetch_optional(&mut *c)
     .await?;
-    let (person_id, person_name, device_key) = match signer {
+    let creator: (i64, String, String) = match signer {
         Some(s) => s,
         None => {
             sqlx::query_as(
-                "SELECT p.id, p.name, COALESCE((SELECT d.signing_key FROM devices d WHERE d.person_id = p.id LIMIT 1), '') \
-                 FROM project_admins a JOIN people p ON p.id = a.person_id WHERE a.project_id = $1 LIMIT 1",
+                "SELECT p.id, p.name, COALESCE((SELECT d.signing_key FROM devices d WHERE d.person_id = p.id ORDER BY d.signing_key LIMIT 1), '') \
+                 FROM project_admins a JOIN people p ON p.id = a.person_id WHERE a.project_id = $1 ORDER BY p.id LIMIT 1",
             )
             .bind(project_id)
             .fetch_one(&mut *c)
@@ -1267,33 +1283,23 @@ pub async fn release_one(
     };
     drop(c);
 
-    if has_pr {
-        return crate::prs::embargo::release_embargo_prs(
-            hub,
-            &project,
-            embargo_id,
-            &target_branch,
-            &ebranch,
-            &(person_id, person_name, device_key),
-            pushed_record,
-            &record_json,
-            submitter,
-        )
-        .await;
+    // S11: an agent session releases only what its narrowing covers.
+    if let Some((v, _)) = submitter {
+        crate::prs::embargo::agent_may_release(hub, &project, embargo_id, v).await?;
     }
 
     let admin_viewer = Viewer {
-        person: Some(person_id),
+        person: Some(creator.0),
         admin: true,
         groups: HashSet::new(),
         only: None,
         agent: false,
     };
+    let manual = submitter.is_some() || pushed_record.is_some();
 
-    // Deterministic ticket so concurrent servers / retries queue the embargo landing at most once!
-    let ticket = format!("embargo-{project_id}-{embargo_id}");
-    if let Some(etip_hex) = etip {
-        let etip_id = ObjectId::from_hex(&etip_hex).map_err(|e| Error::Other(e.into()))?;
+    // 1. Land the line.
+    if let Some(etip_hex) = &etip {
+        let etip_id = ObjectId::from_hex(etip_hex).map_err(|e| Error::Other(e.into()))?;
         let judged = match crate::landing::stack_for_embargo(
             hub,
             &project,
@@ -1322,9 +1328,7 @@ pub async fn release_one(
             crate::landing::agent_stack(hub, &project, v, &target_branch, &judged, etip_id, false, None).await?;
         }
         if !judged.stack.is_empty() {
-            let creator = (person_id, person_name.clone(), device_key.clone());
-            let (release_viewer, who, caller_bounds) =
-                choose_submitter(hub, &project, &judged.stack, &creator, submitter).await?;
+            let (release_viewer, who) = choose_submitter(hub, &project, &judged.stack, &creator, submitter).await?;
             if is_protected_branch(hub, project_id, &project.default_branch, &target_branch).await? {
                 if let Err(e) = crate::prs::check_landing_review_for_embargo(
                     hub,
@@ -1337,24 +1341,20 @@ pub async fn release_one(
                 )
                 .await
                 {
-                    if matches!(&e, Error::Api { code: "not_ready", .. }) {
-                        let _ = hold_embargo_for_approval(hub, project_id, embargo_id, &failure_reason(&e)).await;
-                    }
-                    return Err(e);
+                    let Error::Api { code: "not_ready", message, .. } = &e else {
+                        return Err(e);
+                    };
+                    let _ = hold_embargo_for_approval(hub, project_id, embargo_id, message).await;
+                    return Err(Error::new(
+                        axum::http::StatusCode::CONFLICT,
+                        "not_ready",
+                        format!("embargo {embargo_id} is not released: it waits for approval, and releases once it is approved ({message})"),
+                    ));
                 }
             }
-            let outcome = queue_and_wait_embargo_landing(
-                hub,
-                &project,
-                embargo_id,
-                &ticket,
-                &target_branch,
-                judged,
-                &who,
-                caller_bounds.as_ref(),
-                submitter.is_some() || pushed_record.is_some(),
-            )
-            .await?;
+            let ticket = format!("embargo-{project_id}-{embargo_id}");
+            let outcome =
+                queue_and_wait_embargo_landing(hub, &project, embargo_id, &ticket, &target_branch, judged, &who, manual).await?;
             if outcome.state != LandState::Landed {
                 let msg = outcome
                     .message
@@ -1365,64 +1365,20 @@ pub async fn release_one(
         }
     }
 
-    // Finalize the release in one transaction: set `released_at`, update `record_json`,
-    // delete `embargo/<id>` from `branches`, and delete its `embargo_snapshots`.
-    let now_ms: i64 = sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
-        .fetch_one(&hub.db)
-        .await?;
-    let mut rec: EmbargoRecord = serde_json::from_str(&record_json).map_err(|e| Error::Other(e.into()))?;
-    rec.released_at = Some(pushed_record.and_then(|r| r.released_at).unwrap_or(now_ms));
-    rec.state = None;
-    rec.reason = None;
-    let new_json = serde_json::to_string(&rec).unwrap_or(record_json);
-    let eid = embargo_id.to_string();
-    let ebranch2 = ebranch.clone();
-    let notify = hub.caches.notices.load(Ordering::SeqCst);
-
-    let updated = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-        let eid = eid.clone();
-        let ebranch2 = ebranch2.clone();
-        let new_json = new_json.clone();
-        Box::pin(async move {
-            let n = sqlx::query(
-                "UPDATE embargo_lines SET released_at = COALESCE(released_at, $1), record_json = $2 \
-                 WHERE project_id = $3 AND embargo_id = $4 AND released_at IS NULL",
-            )
-            .bind(now_ms)
-            .bind(&new_json)
-            .bind(project_id)
-            .bind(&eid)
-            .execute(&mut *c)
-            .await?
-            .rows_affected();
-            sqlx::query("DELETE FROM branches WHERE project_id = $1 AND name = $2")
-                .bind(project_id)
-                .bind(&ebranch2)
-                .execute(&mut *c)
-                .await?;
-            sqlx::query("DELETE FROM embargo_snapshots WHERE project_id = $1 AND embargo_id = $2")
-                .bind(project_id)
-                .bind(&eid)
-                .execute(&mut *c)
-                .await?;
-            if notify {
-                sqlx::query("SELECT pg_notify($1, $2)")
-                    .bind(crate::caches::TIPS_CHANNEL)
-                    .bind(project_id.to_string())
-                    .execute(&mut *c)
-                    .await?;
-            }
-            Ok(n > 0)
-        })
-    })
-    .await?;
-
-    hub.caches.tips_changed(project_id);
-    crate::derive::landed(hub, project_id, vec![target_branch]);
-    if updated {
-        crate::events::emit_embargo_released(hub, project_id, embargo_id).await;
-    }
-    Ok(updated)
+    // 2. Finish: the embargo's PRs, `released_at`, the hidden line.
+    crate::prs::embargo::finish_release(
+        hub,
+        &project,
+        embargo_id,
+        &target_branch,
+        &ebranch,
+        etip.as_deref(),
+        &creator,
+        pushed_record,
+        &record_json,
+        submitter,
+    )
+    .await
 }
 
 /// `POST /v1/projects/{p}/embargoes/{id}/release`: early release of an embargo
