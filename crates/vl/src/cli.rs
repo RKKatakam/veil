@@ -1025,6 +1025,9 @@ pub enum PrCmd {
         title: String,
         #[arg(long)]
         body: Option<String>,
+        /// Land an embargoed PR onto its target when the embargo releases, if its review rules are met.
+        #[arg(long)]
+        land_at_release: bool,
         #[command(flatten)]
         out: JsonOut,
     },
@@ -1123,8 +1126,16 @@ pub enum PrCmd {
     Dismiss { id: String, person: String },
     /// Close a PR (its author or an admin).
     Close { id: String },
-    /// Land a PR whose review rules are met.
-    Land { id: String },
+    /// Land a PR whose review rules are met (or arm landing at embargo release).
+    Land {
+        id: String,
+        /// Arm an embargoed PR to land when its embargo releases.
+        #[arg(long)]
+        at_release: bool,
+        /// Disarm landing at release so the PR becomes an ordinary open PR instead.
+        #[arg(long, conflicts_with = "at_release")]
+        no_at_release: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

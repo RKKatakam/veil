@@ -17,7 +17,7 @@ Subcommands:
 * [`vl pr review`](#vl-pr-review): Approve the PR's current revision, or ask for changes
 * [`vl pr dismiss`](#vl-pr-dismiss): Dismiss a reviewer's request for changes (admins): the only way it stops holding the PR but that reviewer's own approval
 * [`vl pr close`](#vl-pr-close): Close a PR (its author or an admin)
-* [`vl pr land`](#vl-pr-land): Land a PR whose review rules are met
+* [`vl pr land`](#vl-pr-land): Land a PR whose review rules are met (or arm landing at embargo release)
 
 ## `vl pr create`
 
@@ -40,6 +40,7 @@ Options:
 | `--onto <ONTO>` | The branch it is for (default: the project's default branch) |
 | `--title <TITLE>` | (required) |
 | `--body <BODY>` |  |
+| `--land-at-release` | Land an embargoed PR onto its target when the embargo releases, if its review rules are met |
 | `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
 
 ## `vl pr list`
@@ -226,7 +227,7 @@ Arguments:
 
 ## `vl pr land`
 
-Land a PR whose review rules are met
+Land a PR whose review rules are met (or arm landing at embargo release)
 
 ```text
 vl pr land [OPTIONS] <ID>
@@ -237,6 +238,13 @@ Arguments:
 | | |
 |---|---|
 | `<ID>` | (required) |
+
+Options:
+
+| | |
+|---|---|
+| `--at-release` | Arm an embargoed PR to land when its embargo releases |
+| `--no-at-release` | Disarm landing at release so the PR becomes an ordinary open PR instead |
 
 ---
 

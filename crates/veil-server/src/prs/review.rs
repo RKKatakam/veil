@@ -183,22 +183,44 @@ pub async fn put_verdict(
                 return Ok(false);
             }
             if verdict == "request-changes" {
+                let pr_embargo: String = sqlx::query_scalar("SELECT embargo FROM prs WHERE project_id = $1 AND id = $2")
+                    .bind(project)
+                    .bind(&pr)
+                    .fetch_optional(&mut *c)
+                    .await?
+                    .unwrap_or_default();
                 let paths: Vec<String> = sqlx::query_scalar("SELECT path FROM pr_paths WHERE project_id = $1 AND pr = $2")
                     .bind(project)
                     .bind(&pr)
                     .fetch_all(&mut *c)
                     .await?;
-                sqlx::query(
-                    "INSERT INTO pr_holds (project_id, person, path, pr, at) SELECT $1, $2, p, $4, $5 FROM UNNEST($3::text[]) AS p \
-                     ON CONFLICT (project_id, person, path) DO UPDATE SET pr = EXCLUDED.pr, at = EXCLUDED.at",
-                )
-                .bind(project)
-                .bind(person)
-                .bind(&paths)
-                .bind(&pr)
-                .bind(now)
-                .execute(&mut *c)
-                .await?;
+                if pr_embargo.is_empty() {
+                    sqlx::query(
+                        "INSERT INTO pr_holds (project_id, person, path, pr, at) SELECT $1, $2, p, $4, $5 FROM UNNEST($3::text[]) AS p \
+                         ON CONFLICT (project_id, person, path) DO UPDATE SET pr = EXCLUDED.pr, at = EXCLUDED.at",
+                    )
+                    .bind(project)
+                    .bind(person)
+                    .bind(&paths)
+                    .bind(&pr)
+                    .bind(now)
+                    .execute(&mut *c)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "INSERT INTO pr_embargo_holds (project_id, embargo, person, path, pr, at) \
+                         SELECT $1, $2, $3, p, $5, $6 FROM UNNEST($4::text[]) AS p \
+                         ON CONFLICT (project_id, embargo, person, path) DO UPDATE SET pr = EXCLUDED.pr, at = EXCLUDED.at",
+                    )
+                    .bind(project)
+                    .bind(&pr_embargo)
+                    .bind(person)
+                    .bind(&paths)
+                    .bind(&pr)
+                    .bind(now)
+                    .execute(&mut *c)
+                    .await?;
+                }
             }
             Ok(true)
         })
@@ -210,12 +232,32 @@ pub async fn put_verdict(
 /// (BUG-1326: whoever opened the PR), with the time of each one's latest
 /// hold there.
 pub async fn holds_on(hub: &Hub, project: i64, paths: &[String]) -> Result<Vec<(i64, String, i64)>> {
+    holds_for_pr(hub, project, "", paths).await
+}
+
+/// Holds applying to a PR in `embargo` (`""` for ordinary PRs; for embargoed
+/// PRs, includes holds in `pr_embargo_holds` for the same embargo).
+pub async fn holds_for_pr(hub: &Hub, project: i64, embargo: &str, paths: &[String]) -> Result<Vec<(i64, String, i64)>> {
+    if embargo.is_empty() {
+        return Ok(sqlx::query_as(
+            "SELECT h.person, pe.name, MAX(h.at) FROM pr_holds h JOIN people pe ON pe.id = h.person \
+             WHERE h.project_id = $1 AND h.path = ANY($2) GROUP BY h.person, pe.name ORDER BY pe.name",
+        )
+        .bind(project)
+        .bind(paths)
+        .fetch_all(&hub.db)
+        .await?);
+    }
     Ok(sqlx::query_as(
-        "SELECT h.person, pe.name, MAX(h.at) FROM pr_holds h JOIN people pe ON pe.id = h.person \
-         WHERE h.project_id = $1 AND h.path = ANY($2) GROUP BY h.person, pe.name ORDER BY pe.name",
+        "SELECT u.person, pe.name, MAX(u.at) FROM ( \
+             SELECT person, at FROM pr_holds WHERE project_id = $1 AND path = ANY($2) \
+             UNION ALL \
+             SELECT person, at FROM pr_embargo_holds WHERE project_id = $1 AND embargo = $3 AND path = ANY($2) \
+         ) u JOIN people pe ON pe.id = u.person GROUP BY u.person, pe.name ORDER BY pe.name",
     )
     .bind(project)
     .bind(paths)
+    .bind(embargo)
     .fetch_all(&hub.db)
     .await?)
 }
@@ -271,7 +313,7 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
     // (BUG-1326): released for this PR only by that reviewer's approval of
     // it (its current patch, given after the hold), for every PR by an
     // admin's dismissal.
-    let held: Vec<String> = holds_on(hub, project.id, &paths)
+    let held: Vec<String> = holds_for_pr(hub, project.id, &pr.embargo, &paths)
         .await?
         .into_iter()
         .filter(|(person, _, at)| !latest.iter().any(|v| v.person == *person && v.verdict == "approve" && v.current && v.at >= *at))
@@ -279,12 +321,19 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
         .collect();
     for v in latest {
         let reviewer = v.person != pr.author;
-        // An approval counts while its reviewer may write every path now.
+        // An approval counts while its reviewer may write every path now
+        // (and, while embargoed, is still in the embargo).
         let counted = reviewer && v.current && v.verdict == "approve" && !(need.people_only && v.agent) && {
             match access.get(&v.person) {
                 Some(w) => *w,
                 None => {
-                    let w = writes_all(project, &viewer_of(hub, project.id, v.person).await?, &paths);
+                    let rv = viewer_of(hub, project.id, v.person).await?;
+                    let in_embargo = if pr.embargo.is_empty() {
+                        true
+                    } else {
+                        crate::embargo::can_see(hub, project, &rv, &pr.embargo).await?
+                    };
+                    let w = in_embargo && writes_all(project, &rv, &paths);
                     access.insert(v.person, w);
                     w
                 }
@@ -342,13 +391,23 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
 /// finds none).
 pub async fn dismiss(hub: &Hub, project: i64, pr: &PrRow, person: i64) -> Result<u64> {
     let paths = paths_of(hub, project, &pr.id).await?;
-    let gone = sqlx::query("DELETE FROM pr_holds WHERE project_id = $1 AND person = $2 AND path = ANY($3)")
+    let mut gone = sqlx::query("DELETE FROM pr_holds WHERE project_id = $1 AND person = $2 AND path = ANY($3)")
         .bind(project)
         .bind(person)
         .bind(&paths)
         .execute(&hub.db)
         .await?
         .rows_affected();
+    if !pr.embargo.is_empty() {
+        gone += sqlx::query("DELETE FROM pr_embargo_holds WHERE project_id = $1 AND embargo = $2 AND person = $3 AND path = ANY($4)")
+            .bind(project)
+            .bind(&pr.embargo)
+            .bind(person)
+            .bind(&paths)
+            .execute(&hub.db)
+            .await?
+            .rows_affected();
+    }
     if gone > 0 {
         sqlx::query("UPDATE pr_reviews SET verdict = 'dismissed' WHERE project_id = $1 AND pr = $2 AND person = $3 AND verdict = 'request-changes'")
             .bind(project)

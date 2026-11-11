@@ -92,7 +92,9 @@ impl Subscriber {
     fn wants_type(&self, event_name: &str, state_name: &str) -> bool {
         match &self.types {
             None => true,
-            Some(list) => list.iter().any(|t| t == event_name || t == state_name),
+            Some(list) => list.iter().any(|t| {
+                t == event_name || t == state_name || (t == "pr.*" && event_name.starts_with("pr."))
+            }),
         }
     }
 }
@@ -724,6 +726,132 @@ pub async fn emit_reverted(
         }
         let data = serde_json::Value::Object(obj).to_string();
         let frame = Bytes::from(format!("event: reverted\ndata: {data}\n\n"));
+        hub.events.push_frame(&sub, frame);
+    }
+}
+
+/// Emit a PR lifecycle event (`pr.opened`, `pr.revision`, `pr.comment`,
+/// `pr.review`, `pr.closed`, `pr.landed`) only to subscribers whose fresh
+/// [`crate::prs::visible`] check succeeds (enforcing visibility classes,
+/// unreleased embargoes, and S11 agent narrowing).
+pub async fn emit_pr(hub: &Arc<Hub>, project_id: i64, pr_id: &str, event_name: &str) {
+    let state_name = event_name.strip_prefix("pr.").unwrap_or(event_name);
+    let subs: Vec<Arc<Subscriber>> = {
+        let map = hub.events.subscribers.lock().unwrap();
+        map.values()
+            .filter(|s| s.project_id == project_id && s.ticket.is_none() && s.wants_type(event_name, state_name))
+            .cloned()
+            .collect()
+    };
+    if subs.is_empty() {
+        return;
+    }
+    for sub in subs {
+        if let Some(a) = &sub.person.agent {
+            match crate::auth::load_agent_session(&hub.db, &a.session_hash, sub.person.id, project_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    hub.events.evict(&sub);
+                    continue;
+                }
+                Err(_) => continue,
+            }
+        }
+        let Ok(epochs) = crate::caches::read_epochs(&hub.db, sub.person.id, Some(project_id)).await else {
+            continue;
+        };
+        let caller = Caller {
+            person: Some(sub.person.clone()),
+            epochs,
+        };
+        let Ok(ask) = crate::query::Ask::open(hub, &sub.project_name, &caller).await else {
+            hub.events.evict(&sub);
+            continue;
+        };
+        if !ask.project.participant(&ask.viewer) {
+            hub.events.evict(&sub);
+            continue;
+        }
+        let Ok(pr) = crate::prs::visible(hub, &ask, pr_id).await else {
+            continue;
+        };
+        if sub.branch.as_deref().is_some_and(|b| b != pr.target) {
+            continue;
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert("event".into(), serde_json::Value::String(event_name.into()));
+        obj.insert("id".into(), serde_json::Value::String(pr.id));
+        obj.insert("title".into(), serde_json::Value::String(pr.title));
+        obj.insert("state".into(), serde_json::Value::String(pr.state));
+        obj.insert("target".into(), serde_json::Value::String(pr.target));
+        obj.insert("revision".into(), serde_json::json!(pr.revision));
+        if !pr.embargo.is_empty() {
+            obj.insert("embargo".into(), serde_json::Value::String(pr.embargo));
+        }
+        let data = serde_json::Value::Object(obj).to_string();
+        let frame = Bytes::from(format!("event: {event_name}\ndata: {data}\n\n"));
+        hub.events.push_frame(&sub, frame);
+    }
+}
+
+/// Emit `embargo.released` to active streams of members of that embargo's
+/// groups and project admins.
+pub async fn emit_embargo_released(hub: &Arc<Hub>, project_id: i64, embargo_id: &str) {
+    let subs: Vec<Arc<Subscriber>> = {
+        let map = hub.events.subscribers.lock().unwrap();
+        map.values()
+            .filter(|s| s.project_id == project_id && s.ticket.is_none() && s.wants_type("embargo.released", "released"))
+            .cloned()
+            .collect()
+    };
+    if subs.is_empty() {
+        return;
+    }
+    let groups: Vec<String> = sqlx::query_scalar(
+        "SELECT group_names FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
+    )
+    .bind(project_id)
+    .bind(embargo_id)
+    .fetch_optional(&hub.db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    for sub in subs {
+        if let Some(a) = &sub.person.agent {
+            match crate::auth::load_agent_session(&hub.db, &a.session_hash, sub.person.id, project_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    hub.events.evict(&sub);
+                    continue;
+                }
+                Err(_) => continue,
+            }
+        }
+        let Ok(epochs) = crate::caches::read_epochs(&hub.db, sub.person.id, Some(project_id)).await else {
+            continue;
+        };
+        let caller = Caller {
+            person: Some(sub.person.clone()),
+            epochs,
+        };
+        let Ok((project, viewer)) = crate::perm::open(hub, &sub.project_name, &caller).await else {
+            hub.events.evict(&sub);
+            continue;
+        };
+        if !project.participant(&viewer) {
+            hub.events.evict(&sub);
+            continue;
+        }
+        if !crate::embargo::can_see_groups(hub, &project, &viewer, &groups).await.unwrap_or(false) {
+            continue;
+        }
+        let data = serde_json::json!({
+            "event": "embargo.released",
+            "embargo": embargo_id,
+        })
+        .to_string();
+        let frame = Bytes::from(format!("event: embargo.released\ndata: {data}\n\n"));
         hub.events.push_frame(&sub, frame);
     }
 }

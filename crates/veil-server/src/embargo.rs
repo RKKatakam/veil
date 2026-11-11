@@ -602,15 +602,16 @@ pub async fn release_one(
     pushed_record: Option<EmbargoRecord>,
     agent_viewer: Option<&Viewer>,
 ) -> Result<bool> {
-    let row: Option<(String, String, Option<i64>, String, String)> = sqlx::query_as(
-        "SELECT target_branch, embargo_branch, released_at, record_json, created_by \
+    let row: Option<(String, String, Option<i64>, String, String, bool)> = sqlx::query_as(
+        "SELECT target_branch, embargo_branch, released_at, record_json, created_by, \
+                (has_pr OR EXISTS (SELECT 1 FROM prs WHERE project_id = $1 AND embargo = $2)) \
          FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
     )
     .bind(project_id)
     .bind(embargo_id)
     .fetch_optional(&hub.db)
     .await?;
-    let Some((target_branch, ebranch, released_at, record_json, created_by)) = row else {
+    let Some((target_branch, ebranch, released_at, record_json, created_by, has_pr)) = row else {
         return Ok(false);
     };
     if released_at.is_some() {
@@ -652,6 +653,23 @@ pub async fn release_one(
         }
     };
     drop(c);
+
+    if has_pr {
+        return crate::prs::embargo::release_embargo_prs(
+            hub,
+            &project,
+            embargo_id,
+            &target_branch,
+            &ebranch,
+            person_id,
+            &person_name,
+            &device_key,
+            pushed_record,
+            &record_json,
+            agent_viewer,
+        )
+        .await;
+    }
 
     let admin_viewer = Viewer {
         person: Some(person_id),
@@ -806,6 +824,9 @@ pub async fn release_one(
 
     hub.caches.tips_changed(project_id);
     crate::derive::landed(hub, project_id, vec![target_branch]);
+    if updated {
+        crate::events::emit_embargo_released(hub, project_id, embargo_id).await;
+    }
     Ok(updated)
 }
 

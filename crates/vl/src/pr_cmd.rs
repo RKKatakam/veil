@@ -44,9 +44,13 @@ fn pr_path(id: &str, rest: &str) -> Result<String> {
     Ok(format!("/prs/{id}{rest}"))
 }
 
-/// The snapshot id REV names here: the server takes ids of your history.
+/// The snapshot id REV names here: the server takes ids of your history (or an `embargo/<id>` line).
 fn head_of(ctx: &Ctx, rev: &str) -> Result<String> {
-    Ok(ctx.rev(rev)?.hex())
+    match ctx.rev(rev) {
+        Ok(id) => Ok(id.hex()),
+        Err(_) if rev.starts_with("embargo/") => Ok(rev.to_string()),
+        Err(e) => Err(e),
+    }
 }
 
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -71,6 +75,14 @@ fn print_pr(v: &Value, threads: Option<&Value>) {
         safe(s(v, "author")),
         safe(s(v, "target"))
     );
+    let emb = s(v, "embargo");
+    if !emb.is_empty() {
+        println!(
+            "  embargo {}{}",
+            yellow(&safe(emb)),
+            if v["land_at_release"] == true { "  (lands at release)" } else { "" }
+        );
+    }
     for r in v["reasons"].as_array().into_iter().flatten() {
         println!("  {}", dim(&safe(r.as_str().unwrap_or(""))));
     }
@@ -186,13 +198,16 @@ fn emit(v: &Value, json_out: bool, text: impl FnOnce(&Value)) -> Result<()> {
 pub fn run(ctx: &mut Ctx, cmd: &PrCmd) -> Result<()> {
     let c = client(ctx)?;
     match cmd {
-        PrCmd::Create { rev, onto, title, body, out } => {
+        PrCmd::Create { rev, onto, title, body, land_at_release, out } => {
             let mut req = json!({ "head": head_of(ctx, rev)?, "title": title });
             if let Some(o) = onto {
                 req["onto"] = json!(o);
             }
             if let Some(b) = body {
                 req["body"] = json!(b);
+            }
+            if *land_at_release {
+                req["land_at_release"] = json!(true);
             }
             let v = c.project_json("POST", "/prs", Some(&req)).map_err(hint_push)?;
             emit(&v, out.json, |v| {
@@ -324,9 +339,22 @@ pub fn run(ctx: &mut Ctx, cmd: &PrCmd) -> Result<()> {
             println!("Closed {}", bold(id));
             Ok(())
         }
-        PrCmd::Land { id } => {
-            let v = c.project_json("POST", &pr_path(id, "/land")?, None)?;
-            println!("Landed {} ({})", bold(id), safe(&v.to_string()));
+        PrCmd::Land { id, at_release, no_at_release } => {
+            let body = if *at_release {
+                Some(json!({ "at_release": true }))
+            } else if *no_at_release {
+                Some(json!({ "at_release": false }))
+            } else {
+                None
+            };
+            let v = c.project_json("POST", &pr_path(id, "/land")?, body.as_ref())?;
+            if *at_release {
+                println!("{} will land when its embargo releases", bold(id));
+            } else if *no_at_release {
+                println!("{} will become an ordinary open PR when its embargo releases", bold(id));
+            } else {
+                println!("Landed {} ({})", bold(id), safe(&v.to_string()));
+            }
             Ok(())
         }
     }

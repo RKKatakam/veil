@@ -366,15 +366,24 @@ pub async fn tested_route(
 }
 
 async fn tested_real(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch: &str) -> Result<Option<ObjectId>> {
-    let row: Option<String> = sqlx::query_scalar(
-        "SELECT t.snapshot FROM tested t JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
-         WHERE t.project_id = $1 AND t.branch = $2 AND t.lineage = b.lineage AND b.hidden_for_embargo IS NULL",
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT t.snapshot, b.hidden_for_embargo FROM tested t \
+         JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
+         WHERE t.project_id = $1 AND t.branch = $2 AND t.lineage = b.lineage",
     )
     .bind(project.id)
     .bind(branch)
     .fetch_optional(&hub.db)
     .await?;
-    let Some(real) = row.and_then(|h| ObjectId::from_hex(&h).ok()) else {
+    let Some((hex, hidden)) = row else {
+        return Ok(None);
+    };
+    if let Some(eid) = hidden {
+        if !crate::embargo::can_see(hub, project, viewer, &eid).await? {
+            return Ok(None);
+        }
+    }
+    let Ok(real) = ObjectId::from_hex(&hex) else {
         return Ok(None);
     };
     if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
@@ -384,7 +393,8 @@ async fn tested_real(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch:
 }
 
 /// `<branch>@tested` as `viewer` sees it (`None` when the branch does not
-/// exist or has no tested snapshot in its current lineage).
+/// exist, is a hidden embargo line invisible to `viewer`, or has no tested
+/// snapshot in its current lineage).
 pub async fn tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch: &str) -> Result<Option<ObjectId>> {
     let Some(real) = tested_real(hub, project, viewer, branch).await? else {
         return Ok(None);
@@ -396,15 +406,21 @@ pub async fn tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, bran
 /// All `<branch>@tested` pointers in `project` as `viewer` sees them, for
 /// [`veil_core::hub::wire::Tips::tested`].
 pub async fn all_tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<BTreeMap<String, ObjectId>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT t.branch, t.snapshot FROM tested t JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
-         WHERE t.project_id = $1 AND t.lineage = b.lineage AND b.hidden_for_embargo IS NULL ORDER BY t.branch",
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT t.branch, t.snapshot, b.hidden_for_embargo FROM tested t \
+         JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
+         WHERE t.project_id = $1 AND t.lineage = b.lineage ORDER BY t.branch",
     )
     .bind(project.id)
     .fetch_all(&hub.db)
     .await?;
     let mut out = BTreeMap::new();
-    for (branch, hex) in rows {
+    for (branch, hex, hidden) in rows {
+        if let Some(eid) = hidden {
+            if !crate::embargo::can_see(hub, project, viewer, &eid).await? {
+                continue;
+            }
+        }
         if let Ok(real) = ObjectId::from_hex(&hex) {
             if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
                 continue;
@@ -577,7 +593,7 @@ async fn resolve_rev_for_read(
             return Ok((id, out));
         }
     }
-    let Some(tip) = branch_tip(hub, project, viewer, rev).await? else {
+    let Some(tip) = visible_branch_tip(hub, project, viewer, rev).await? else {
         return Err(Error::not_found("no such revision that you can see"));
     };
     let proj_id = sync::projected(hub, project, viewer, tip).await?;
@@ -607,6 +623,29 @@ async fn branch_tip(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch: 
     Ok(Some(real))
 }
 
+async fn visible_branch_tip(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, branch: &str) -> Result<Option<ObjectId>> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT target, hidden_for_embargo FROM branches WHERE project_id = $1 AND name = $2",
+    )
+    .bind(project.id)
+    .bind(branch)
+    .fetch_optional(&hub.db)
+    .await?;
+    let Some((target, hidden)) = row else { return Ok(None) };
+    if let Some(eid) = hidden {
+        if !crate::embargo::can_see(hub, project, viewer, &eid).await? {
+            return Ok(None);
+        }
+    }
+    let Some(real) = ObjectId::from_hex(&target).ok() else {
+        return Ok(None);
+    };
+    if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+        return Ok(None);
+    }
+    Ok(Some(real))
+}
+
 /// Most first-parent steps walked above `<branch>@tested` (or the root) when
 /// evaluating `<branch>@tested`.
 const MAX_TESTED_WALK: usize = 1024;
@@ -615,11 +654,12 @@ const MAX_TESTED_WALK: usize = 1024;
 /// `tested` monotonically to the newest snapshot on the branch's
 /// first-parent chain whose required checks have all passed.
 pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
-    let branches: Vec<(String, String, i64)> =
-        sqlx::query_as("SELECT name, target, lineage FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL ORDER BY name")
-            .bind(project.id)
-            .fetch_all(&hub.db)
-            .await?;
+    let branches: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT name, target, lineage FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL ORDER BY name",
+    )
+    .bind(project.id)
+    .fetch_all(&hub.db)
+    .await?;
     if branches.is_empty() {
         return Ok(());
     }
