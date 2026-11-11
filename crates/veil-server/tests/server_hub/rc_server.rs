@@ -710,4 +710,22 @@ fn bug_1925_results_that_do_not_count_never_keep_out_the_required_checks_result(
     let tested = hub.api().get(Some(&admin), &format!("/v1/projects/{}/tested/main", p.name));
     assert_eq!(tested.status, 200, "{}", body(&tested));
     assert!(body(&tested).contains(&tip.hex()), "main@tested is the tip whose required check passed: {}", body(&tested));
+
+    // The bound still holds for each kind: a result that does not count is
+    // refused a new name on the full snapshot, and results that count stop
+    // at 64 of their own.
+    let seen = main_tip(&hub, Some(&p.dev.token()), &p.name);
+    let r = post_check(&hub, &p.dev.token(), &p.name, seen, "other/dev-0", "pass");
+    assert_eq!(r.status, 400, "{}", body(&r));
+    assert!(body(&r).contains("a snapshot keeps at most 64 distinct checks"), "{}", body(&r));
+    // (The admin's sessions share a person's 32; the second person whose
+    // results count for these names is the developer, for `ci/src` only:
+    // so the admin's own bound is what is reached here.)
+    for i in 0..31 {
+        let r = post_check(&hub, &admin, &p.name, tip, &format!("counts/{i}"), "pass");
+        assert_eq!(r.status, 200, "the admin's result {i}: {}", body(&r));
+    }
+    let r = post_check(&hub, &admin, &p.name, tip, "counts/31", "pass");
+    assert_eq!(r.status, 400, "{}", body(&r));
+    assert!(body(&r).contains("a runner may record at most 32 checks on one snapshot"), "{}", body(&r));
 }
