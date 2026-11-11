@@ -60,7 +60,7 @@ use veil_core::{
     builder::{BuildReport, InjectedSecrets, INJECTED_RULE},
     checkout::Materialised,
     object::EntryKind,
-    sandbox::{dir_name, sealed_files_in_tree, workspace_of, Guard, SandboxPaths},
+    sandbox::{dir_name, sealed_files_in_tree, sealed_leaf, workspace_of, Guard, SandboxPaths},
     tree::{diff_trees, lookup},
     vfs::{private_dir, remove_tree, walk_files, DiskBackend, NodeKind, SandboxLock, StorageBackend},
     workspace::{mount_record_op_description, SnapshotOptions},
@@ -656,7 +656,7 @@ impl Recorder {
             let own_sealed = lookup(repo.store(), &wc_tree, &p)
                 .ok()
                 .flatten()
-                .filter(|e| !e.visibility.is_public())
+                .filter(|e| sealed_leaf(repo.store(), e) != Some(false))
                 .map(|_| p.as_str());
             let hit = self
                 .fs

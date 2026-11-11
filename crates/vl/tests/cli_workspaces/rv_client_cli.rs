@@ -321,17 +321,14 @@ fn bug_1931_a_sandbox_edit_of_a_file_that_already_held_a_sealed_files_value_is_r
     assert!(lost.is_empty(), "{lost:#?}");
 }
 
-/// Re-check of BUG-1840's fix (`rc-client`): a sealed secret's value
-/// written to another file in a sandbox is never recorded, also when the
-/// secret is in conflict. The sandbox then holds every version of it in
-/// plain text, between conflict markers, for the command to resolve.
-#[test]
-#[ignore = "BUG-1932: the values of a sealed secret that is in conflict are outside the sandbox's guard"]
-fn bug_1932_the_values_of_a_conflicted_sealed_secret_copied_in_a_sandbox_are_never_recorded() {
-    const KEYS: [&str; 3] = ["Xk29vLq8sPzQw7LmTr4Bn6Yc", "Qm83nRt5wZx1cVb7yHj2kLp9", "Ty64gFd2sAq9oPi3uLk8mNb5"];
+const KEYS_1932: [&str; 3] = ["Xk29vLq8sPzQw7LmTr4Bn6Yc", "Qm83nRt5wZx1cVb7yHj2kLp9", "Ty64gFd2sAq9oPi3uLk8mNb5"];
+
+/// A project whose sealed `.env` is in conflict in the agent's workspace:
+/// two changes set the key differently, one rebased onto the other
+/// conflicts, and the workspace stands on the conflicted change (`side-b`).
+fn conflicted_env_1932() -> T {
+    const KEYS: [&str; 3] = KEYS_1932;
     let t = T::new(&[("a.txt", "a\n"), (".env", &format!("API_KEY={}\n", KEYS[0]))]);
-    // Two changes set the key differently; one rebased onto the other
-    // conflicts, and the agent's workspace stands on the conflicted change.
     std::fs::write(t.proj.join(".env"), format!("API_KEY={}\n", KEYS[1])).unwrap();
     t.ok(&["commit", "-m", "key one"]);
     t.ok(&["tag", "set", "side-a", "-r", "@-"]);
@@ -344,6 +341,17 @@ fn bug_1932_the_values_of_a_conflicted_sealed_secret_copied_in_a_sandbox_are_nev
     t.ok(&["rebase", "-s", "agent@", "-d", "side-b"]);
     let ls = t.ok(&["ls", "-r", "agent@"]);
     assert!(ls.lines().any(|l| l.contains("cloaked") && l.contains(".env") && l.contains("conflict")), "control: the sandbox's .env is a sealed secret in conflict:\n{ls}");
+    t
+}
+
+/// Re-check of BUG-1840's fix (`rc-client`): a sealed secret's value
+/// written to another file in a sandbox is never recorded, also when the
+/// secret is in conflict. The sandbox then holds every version of it in
+/// plain text, between conflict markers, for the command to resolve.
+#[test]
+fn bug_1932_the_values_of_a_conflicted_sealed_secret_copied_in_a_sandbox_are_never_recorded() {
+    const KEYS: [&str; 3] = KEYS_1932;
+    let t = conflicted_env_1932();
 
     let o = t.exec(&["-m", "agent: list the keys"], r#"set -e; grep -q '^<<<<<<<' .env; grep '^API_KEY' .env | cut -d= -f2 > vals.txt; test "$(wc -l < vals.txt)" = 3"#);
     assert!(o.status.success(), "the run itself works (the sandbox holds the conflict's versions in plain text):\n{}", text(&o));
@@ -357,4 +365,96 @@ fn bug_1932_the_values_of_a_conflicted_sealed_secret_copied_in_a_sandbox_are_nev
         text(&o)
     );
     assert!(!t.proj.join(".veil/local/sandboxes/agent/files/vals.txt").exists(), "vals.txt holds the secret's values and must be taken out of the sandbox after the run");
+}
+
+/// BUG-1932 on every route that records: a checked-out sandbox and
+/// `--mount`, at the run's end and at a `vl commit` through the workspace
+/// socket, and in a description set through the socket (BUG-1841's guard,
+/// which shared the gap). Each version of the conflicted secret is guarded:
+/// all three together, and one alone.
+#[test]
+fn bug_1932_conflicted_sealed_secret_guard_covers_mounts_socket_commits_and_descriptions() {
+    const KEYS: [&str; 3] = KEYS_1932;
+    for flags in [&[][..], &["--mount"]] {
+        let t = conflicted_env_1932();
+        let o = t.exec(
+            flags,
+            r#"set -e
+               grep -q '^<<<<<<<' .env
+               grep '^API_KEY' .env | cut -d= -f2 > vals.txt
+               test "$(wc -l < vals.txt)" = 3
+               tail -1 vals.txt > one.txt
+               echo 'clean' >> a.txt
+               vl commit -m 'mid-run commit'
+               head -1 vals.txt > later.txt
+               set +e
+               vl describe -m "key $(tail -1 vals.txt)"; echo "describe: $?"
+               vl commit -m "keys $(head -1 vals.txt)"; echo "commit: $?"
+               exit 0"#,
+        );
+        let out = text(&o);
+        assert!(o.status.success(), "{flags:?}: the run itself works:\n{out}");
+        for tag in ["describe: 1", "commit: 1"] {
+            assert!(out.contains(tag), "{flags:?}: expected the refusal `{tag}`:\n{out}");
+        }
+        for k in KEYS {
+            assert!(!out.contains(k), "{flags:?}: a refusal echoed a version of the secret:\n{out}");
+        }
+        // The clean edit was committed through the socket; no copy was,
+        // there or at the run's end.
+        let mid = t.ok(&["diff", "--from", "side-b", "--to", "agent@-"]);
+        assert!(mid.contains("+clean"), "{flags:?}: the clean edit was committed mid-run:\n{mid}");
+        for rev in ["agent@-", "agent@"] {
+            let listed = t.ok(&["ls", "-r", rev]);
+            let show = t.ok(&["diff", "--from", "side-b", "--to", rev]);
+            let recorded: Vec<&str> = KEYS.iter().copied().filter(|k| show.contains(k)).collect();
+            assert!(recorded.is_empty(), "{flags:?}: {rev} holds the secret's values in plain text: {recorded:?}\n{listed}\nrun:\n{out}");
+            for f in ["vals.txt", "one.txt", "later.txt"] {
+                assert!(!listed.lines().any(|l| l.ends_with(f)), "{flags:?}: {f} must not be recorded in {rev}:\n{listed}\nrun:\n{out}");
+            }
+            // The conflict itself is untouched, and still sealed.
+            assert!(
+                listed.lines().any(|l| l.contains("cloaked") && l.contains(".env") && l.contains("conflict")),
+                "{flags:?}: the .env of {rev} is still the sealed conflict:\n{listed}"
+            );
+        }
+        let log = t.ok(&["log", "-r", "::agent@"]);
+        for k in KEYS {
+            assert!(!log.contains(k), "{flags:?}: a version of the secret is in a description:\n{log}");
+        }
+        for f in ["vals.txt", "one.txt", "later.txt"] {
+            assert!(!t.proj.join(".veil/local/sandboxes/agent/files").join(f).exists(), "{flags:?}: {f} removed from the sandbox");
+            assert!(!t.proj.join(".veil/local/mounts/agent/upper").join(f).exists(), "{flags:?}: {f} removed from the mount overlay");
+        }
+    }
+}
+
+/// BUG-1932's guard leaves normal use alone: the command may edit the
+/// conflicted secret in place. A partial edit (markers kept) stays a sealed
+/// conflict, and its copy stays in the sandbox for the next run; a
+/// resolution is recorded as the sealed file, never plain.
+#[test]
+fn bug_1932_a_conflicted_sealed_secret_is_still_edited_and_resolved_in_place() {
+    const KEYS: [&str; 3] = KEYS_1932;
+    const NEW: &str = "Hn47bVc9xZa2lKj6hGf3dSq1";
+    for flags in [&[][..], &["--mount"]] {
+        let t = conflicted_env_1932();
+        // A partial edit: one side's key replaced, the markers kept.
+        let o = t.exec(flags, &format!(r#"set -e; grep -q '{k}' .env; sed -i 's/{k}/{NEW}/' .env; grep -q '^<<<<<<<' .env"#, k = KEYS[2]));
+        assert!(o.status.success(), "{flags:?}: the partial edit runs:\n{}", text(&o));
+        let listed = t.ok(&["ls", "-r", "agent@"]);
+        assert!(
+            listed.lines().any(|l| l.contains("cloaked") && l.contains(".env") && l.contains("conflict")),
+            "{flags:?}: a partly edited conflict is still a sealed conflict:\n{listed}\nrun:\n{}",
+            text(&o)
+        );
+        // The next run still finds the conflicted copy, with the edit, and
+        // resolves it.
+        let o = t.exec(flags, &format!(r#"set -e; grep -q '^<<<<<<<' .env; grep -q '{NEW}' .env; printf 'API_KEY={NEW}\n' > .env"#));
+        assert!(o.status.success(), "{flags:?}: the copy is still there with its edit, and the resolution runs:\n{}", text(&o));
+        let listed = t.ok(&["ls", "-r", "agent@"]);
+        let env = listed.lines().find(|l| l.contains(".env")).unwrap_or_else(|| panic!("{flags:?}: .env is recorded:\n{listed}"));
+        assert!(env.contains("cloaked") && !env.contains("conflict"), "{flags:?}: the resolution is recorded as the sealed file:\n{listed}\nrun:\n{}", text(&o));
+        assert_eq!(t.ok(&["ws", "cat", "agent", ".env"]), format!("API_KEY={NEW}\n"), "{flags:?}: the resolution's content");
+    }
 }
