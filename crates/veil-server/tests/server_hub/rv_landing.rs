@@ -131,7 +131,7 @@ fn bug_1852_1860_ci_runner_sessions_follow_their_minters_write_authority() {
     let p = setup_project(&hub);
     let (admin, dev, fin) = (p.admin.token(), p.dev.token(), p.fin.token());
 
-    let s0 = land_edit(&hub, &p, &admin, ".veilrules", RULES_CI, "protect main, require ci/src");
+    let _s0 = land_edit(&hub, &p, &admin, ".veilrules", RULES_CI, "protect main, require ci/src");
     let fin_sess = hub
         .api()
         .post_json(Some(&fin), "/v1/sessions/ci", &json!({"project": p.name, "check": "ci/src"}));

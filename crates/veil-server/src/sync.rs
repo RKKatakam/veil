@@ -1502,6 +1502,65 @@ fn differs_in_access_files(src: &Source, from: ObjectId, to: ObjectId) -> Result
     })
 }
 
+/// Check write access for every path changed between an existing branch tip
+/// `cur` and the unchecked snapshot `anchor` that a branch move brings onto
+/// it (BUG-1858). Never names a path `viewer` cannot read.
+pub(crate) async fn branch_move_write_refusal(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    cur: ObjectId,
+    anchor: ObjectId,
+    staged: Option<Arc<Staged>>,
+) -> Result<Option<String>> {
+    if (viewer.admin && viewer.only.is_none() && !viewer.agent) || cur == anchor {
+        return Ok(None);
+    }
+    let (v, text, bindings) = (viewer.clone(), project.policy_text.clone(), project.bindings.clone());
+    blocking_in(hub, project.id, HashMap::new(), staged, move |src| {
+        let p = Project {
+            id: src.project,
+            name: String::new(),
+            default_branch: String::new(),
+            policy: AccessPolicy::parse(&text),
+            policy_text: String::new(),
+            bindings,
+        };
+        let view = p.view(&v);
+        let from = src.snapshot(&cur)?.tree;
+        let to = src.snapshot(&anchor)?.tree;
+        if from == to {
+            return Ok(None);
+        }
+        let refusal = std::cell::RefCell::new(None);
+        differs_where(&|id| stored_tree(src, id), Some(from), to, &|path, x, y| {
+            let is_dir = |e: Option<&veil_core::TreeEntry>| e.is_some_and(|e| e.kind == EntryKind::Dir);
+            let is_file = |e: Option<&veil_core::TreeEntry>| e.is_some_and(|e| e.kind != EntryKind::Dir);
+            if is_file(x) || is_file(y) {
+                if !view.within_narrowing(path) {
+                    *refusal.borrow_mut() = Some(NARROWED_MOVE.to_string());
+                    return Visit::Found;
+                }
+                if !view.read(path) {
+                    *refusal.borrow_mut() = Some("you may not move this branch across changes outside your view".to_string());
+                    return Visit::Found;
+                }
+                if !view.write(path) {
+                    *refusal.borrow_mut() = Some(format!("you may not write '{path}'"));
+                    return Visit::Found;
+                }
+            }
+            if is_dir(x) || is_dir(y) {
+                Visit::Descend
+            } else {
+                Visit::Skip
+            }
+        })?;
+        Ok(refusal.into_inner())
+    })
+    .await
+}
+
 /// Why an agent session may not set a branch's tip ([`agent_tip`]).
 pub(crate) enum AgentTip {
     /// The tip would change files outside a narrowed session's paths
@@ -2747,6 +2806,26 @@ async fn push_staged(
                         ticket: None,
                     });
                     continue;
+                }
+                if !(viewer.admin && viewer.only.is_none() && !viewer.agent) {
+                    let mut x = n;
+                    let mut checked_from_cur = false;
+                    for _ in 0..=completed.len() {
+                        let Some((parents, _)) = real_parents_of.get(&x) else { break };
+                        if parents.contains(&c) {
+                            checked_from_cur = true;
+                            break;
+                        }
+                        match parents.first().copied() {
+                            Some(p) => x = p,
+                            None => break,
+                        }
+                    }
+                    if !checked_from_cur {
+                        if let Some(msg) = branch_move_write_refusal(hub, project, viewer, c, x, Some(st.clone())).await? {
+                            return Err(Error::forbidden(msg));
+                        }
+                    }
                 }
             }
         }

@@ -579,7 +579,6 @@ fn push(hub: &TestHub, token: &str, project: &str, branch: &str, expected: Optio
 /// `src/` because it is public and may not write it, puts a developer's
 /// unfinished branch on `main`.
 #[test]
-#[ignore = "BUG-1858: a push that moves a branch forward to a snapshot the server already holds is not checked for write access: someone who may not write src/ puts another branch's src/ changes on main"]
 fn bug_1858_a_push_that_moves_a_branch_to_an_existing_snapshot_needs_write_access_to_what_it_changes() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -620,4 +619,13 @@ fn bug_1858_a_push_that_moves_a_branch_to_an_existing_snapshot_needs_write_acces
     assert_eq!(file.status, 404, "the unfinished file is on main: {}", body(&file));
     let refused = moved.status == 403 || (moved.status == 200 && moved.json()["results"][0]["ok"] == json!(false));
     assert!(refused, "someone who may not write src/ changed src/ on main with a push: {answered}");
+
+    // Stacking a change in `billing/` (which `fin` MAY write) on top of `wip`
+    // and pushing `main` to that uploaded snapshot is refused too.
+    let api = hub.api();
+    let mut stacked = Craft::new(&api, &p.fin, &p.name, "wip");
+    stacked.file(&format!("{BILL_DIR}/note.txt"), "note\n");
+    let stacked_move = stacked.push_to("main", Some(fin_main));
+    assert_eq!(stacked_move.status, 403, "stacked push moved main: {}", body(&stacked_move));
+    assert_eq!(main_tip(&hub, Some(&admin_tok), &p.name), main_before);
 }

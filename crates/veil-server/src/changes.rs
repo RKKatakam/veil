@@ -1226,12 +1226,22 @@ pub(crate) async fn create_with(
                 rejected = Some("only admins may change the branch rules (.veilrules)".into());
                 None
             }
-            (Some(o), Some(c), None) => Some(Move {
-                branch: o.branch.clone(),
-                cur: c,
-                // A tip that moves away and back must not keep it trying.
-                keep_on_loss: !rebase || rebased >= MAX_REBASES || attempts > MAX_REBASES,
-            }),
+            (Some(o), Some(c), None) => match if c != parent || attempts > 1 {
+                sync::branch_move_write_refusal(hub, &who.project, &who.viewer, c, built.real, None).await?
+            } else {
+                None
+            } {
+                Some(msg) => {
+                    rejected = Some(msg);
+                    None
+                }
+                None => Some(Move {
+                    branch: o.branch.clone(),
+                    cur: c,
+                    // A tip that moves away and back must not keep it trying.
+                    keep_on_loss: !rebase || rebased >= MAX_REBASES || attempts > MAX_REBASES,
+                }),
+            },
             _ => None,
         };
         match commit(hub, &plan, &who, &built, &restacked, person.id, mv, land.as_ref()).await {
