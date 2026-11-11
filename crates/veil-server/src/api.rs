@@ -193,7 +193,7 @@ async fn device_list(hub: &HubState, name: &str, project: Option<i64>) -> Result
     let barred = "EXISTS (SELECT 1 FROM device_bars b WHERE b.device_id = d.id AND b.project_id = $2)";
     let active: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT d.public_identity FROM devices d WHERE d.person_id = $1 AND d.removed_at IS NULL AND NOT d.pending \
-         AND d.public_identity <> '' AND (NOT $3 OR NOT d.browser) AND NOT {barred} ORDER BY d.id"
+         AND NOT {barred} AND d.public_identity <> '' AND (NOT $3 OR NOT d.browser) ORDER BY d.id"
     ))
     .bind(person)
     .bind(project.unwrap_or(-1))
