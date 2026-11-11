@@ -407,7 +407,7 @@ impl ObjectStore {
     }
 
     /// Is fetching allowed on this thread (neither inside [`Self::without_fetching`]
-    /// nor after [`Self::stop_fetching`])? Unlike [`Self::may_fetch`], this is
+    /// nor after [`Self::never_fetch`])? Unlike [`Self::may_fetch`], this is
     /// `true` on full clones as well unless fetching was turned off.
     pub fn fetching_enabled(&self) -> bool {
         NO_FETCH.with(|c| c.get() == 0) && self.partial.get().is_none_or(|p| p.no_fetch.load(Ordering::SeqCst) == 0)
