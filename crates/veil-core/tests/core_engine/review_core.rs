@@ -188,3 +188,62 @@ fn bug_1835_an_operation_that_does_not_match_its_id_is_refused() {
         ),
     }
 }
+
+/// P (with `notes.txt`) and X on it; with `attempt`, X records its content
+/// as an attempt and starts again; then P is amended to drop `notes.txt`
+/// (`vl edit P`, `rm notes.txt`) and `main` is pushed to a new remote. Where
+/// the remote holds the text of `notes.txt`.
+fn amended_away_then_pushed(attempt: bool) -> Vec<String> {
+    const MARKER: &[u8] = b"review-marker-amended-away-0001";
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[("README.md", "hi\n")], "base");
+    let parent = commit_files(&mut repo, &*fs, &[("notes.txt", "review-marker-amended-away-0001\n"), ("lib.rs", "fn a() {}\n")], "P");
+    let x = commit_files(&mut repo, &*fs, &[("x.txt", "first try\n")], "X");
+    let change = repo.snapshot(&x).unwrap().change_id;
+    if attempt {
+        let dropped = repo.drop_attempt(x, "did not work").unwrap();
+        assert_eq!(repo.snapshot(&dropped.change).unwrap().attempts, vec![dropped.attempt], "X keeps its attempt");
+    }
+
+    let old = repo.snapshot(&parent).unwrap();
+    let ws = repo.ephemeral_workspace(parent).unwrap();
+    ws.remove("notes.txt").unwrap();
+    let mut tx = repo.transaction("amend P").unwrap();
+    let (tree, _) = tx.repo().build_from(&**ws.fs(), Some(old.tree)).unwrap();
+    let mut amended = (*old).clone();
+    amended.tree = tree;
+    amended.predecessors = vec![parent];
+    let amended = tx.rewrite(parent, amended).unwrap();
+    tx.commit().unwrap();
+    assert_ne!(amended, parent, "P was rewritten");
+    assert_eq!(repo.snapshot(&amended).unwrap().parents, vec![base]);
+    let x_now = repo.workspace_wc(WS).map(|wc| repo.snapshot(&wc).unwrap().parents[0]).unwrap();
+    let xs = repo.snapshot(&x_now).unwrap();
+    assert_eq!((xs.change_id, xs.parents.clone()), (change, vec![amended]), "X followed the amended P");
+    assert_eq!(xs.attempts.len(), usize::from(attempt), "X still keeps its attempt");
+    for rev in [&amended, &x_now] {
+        assert!(file_entry(&repo, rev, "notes.txt").is_none(), "notes.txt is in no visible change");
+    }
+
+    repo.set_tag("main", x_now, false).unwrap();
+    let remote: std::sync::Arc<veil_core::MemoryBackend> = std::sync::Arc::new(veil_core::MemoryBackend::new());
+    Repo::init_bare(remote.clone()).unwrap();
+    veil_core::remote::push(&mut repo, remote.clone(), false, &[], false).unwrap();
+    assert_eq!(Repo::open_remote(remote.clone()).unwrap().view().tags["main"].target, x_now, "the push moved main");
+    backend_contains(&*remote, MARKER)
+}
+
+/// Rewritten snapshots stop being reachable, so what a change's author
+/// amends away before a push never leaves the device: also when a change
+/// built on it keeps a recorded attempt (`vl attempt drop`) made on the
+/// earlier version.
+#[test]
+#[ignore = "BUG-1836: a recorded attempt keeps the old version of an amended ancestor, and a push sends it"]
+fn bug_1836_content_amended_away_under_a_recorded_attempt_is_not_pushed() {
+    assert_eq!(amended_away_then_pushed(false), Vec::<String>::new(), "control: without an attempt the amended-away text is not pushed");
+    assert_eq!(
+        amended_away_then_pushed(true),
+        Vec::<String>::new(),
+        "the remote received the text its author amended out of P before pushing"
+    );
+}
