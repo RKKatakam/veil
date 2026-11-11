@@ -274,6 +274,11 @@ pub(crate) struct RequestLocals {
     pub layers: Option<Arc<health::LayerCounts>>,
     /// Whether storage writes made here count in [`crate::store::Objects::own_writes`].
     pub own_writes: bool,
+    /// Whether the request is a browser's or web session's, and its session
+    /// (`web::session`): set by the web layer, shared by every clone, so a
+    /// task spawned with the request's locals ([`in_request`]) answers as
+    /// the request does (BUG-1926). `None` outside a request.
+    pub web: Option<Arc<Mutex<crate::web::WebCtx>>>,
 }
 
 tokio::task_local! {
@@ -291,6 +296,19 @@ pub(crate) fn with_committed<F: std::future::Future>(
     let mut ctx = current_request();
     ctx.committed = Some(committed);
     REQUEST.scope(ctx, f)
+}
+
+/// Run `f` as the web layer's request: with its web context among the
+/// request's locals.
+pub(crate) fn with_web<F: std::future::Future>(web: crate::web::WebCtx, f: F) -> impl std::future::Future<Output = F::Output> {
+    let mut ctx = current_request();
+    ctx.web = Some(Arc::new(Mutex::new(web)));
+    REQUEST.scope(ctx, f)
+}
+
+/// The web context of the request being served; `None` outside a request.
+pub(crate) fn web_ctx() -> Option<Arc<Mutex<crate::web::WebCtx>>> {
+    REQUEST.try_with(|r| r.web.clone()).ok().flatten()
 }
 
 pub(crate) fn mark_committed() {
@@ -764,6 +782,42 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-1926: whether a request is a browser's or web session's is one of
+    /// the request's locals, so a task spawned with them answers as the
+    /// request does; and with no context nothing is granted either way: it
+    /// is not known to be a web request (no web-only thing), and not known
+    /// not to be one (the web client's restrictions apply).
+    #[tokio::test]
+    async fn bug_1926_the_web_context_is_carried_with_the_requests_locals_and_closed_without_one() {
+        use crate::web::{current_csrf, current_is_web, current_may_be_web, record_session, WebCtx};
+        // No context: outside a request, or in a task spawned without it.
+        assert!(!current_is_web(), "no context is not a web request that may do web-only things");
+        assert!(current_may_be_web(), "no context is never taken for a device's request");
+        assert_eq!(current_csrf(), None);
+        // A device's request (an API route with no browser headers).
+        with_web(WebCtx::default(), async {
+            assert!(!current_is_web());
+            assert!(!current_may_be_web(), "a request known not to be a web request");
+            // Its session turns out to be a web one: every clone sees it.
+            let spawned = tokio::spawn(REQUEST.scope(current_request(), async {
+                record_session("00".repeat(32), false, true);
+                (current_is_web(), current_may_be_web())
+            }));
+            assert_eq!(spawned.await.unwrap(), (true, true), "a task spawned with the request's locals has its web context");
+            assert!(current_is_web(), "what the spawned task recorded is the request's");
+            assert!(current_csrf().is_some());
+            // A task spawned without them has no context.
+            let bare = tokio::spawn(async { (current_is_web(), current_may_be_web()) });
+            assert_eq!(bare.await.unwrap(), (false, true));
+        })
+        .await;
+        // The retry layer's own scope keeps it.
+        with_web(WebCtx { is_web: true, ..WebCtx::default() }, async {
+            with_committed(Arc::new(AtomicBool::new(false)), async { assert!(current_is_web()) }).await;
+        })
+        .await;
+    }
 
     #[test]
     fn routes_are_classed_for_shedding() {

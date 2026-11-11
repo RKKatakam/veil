@@ -1,7 +1,6 @@
 //! Browser session lifecycle (`__Host-veil_session`), per-session CSRF
 //! verification, same-origin enforcement, and request context (`docs/HUB.md` §13.39).
 
-use std::cell::RefCell;
 
 use axum::{
     body::Bytes,
@@ -29,24 +28,34 @@ pub struct WebCtx {
     pub session_hash: Option<String>,
 }
 
-tokio::task_local! {
-    static WEB_CTX: RefCell<WebCtx>;
+/// The web context of the request being served: one of the request's
+/// locals (`limits::RequestLocals`, BUG-1926), so it is carried into the
+/// tasks a request spawns with them. `None` outside a request's scope.
+fn current<T>(read: impl FnOnce(&mut WebCtx) -> T) -> Option<T> {
+    crate::limits::web_ctx().map(|c| read(&mut c.lock().unwrap()))
 }
 
+/// Is this known to be a browser's or web session's request: what a
+/// web-only thing asks (a review signed by the session, not a device). With
+/// no context, nothing is known to be one.
 pub fn current_is_web() -> bool {
-    WEB_CTX.try_with(|c| c.borrow().is_web).unwrap_or(false)
+    current(|c| c.is_web) == Some(true)
+}
+
+/// Must the web client's restrictions apply: the request is a browser's or
+/// web session's, **or nothing says it is not** (no context: BUG-1926). What
+/// every refusal to the web client asks (`Caller::not_web`), so a request
+/// whose context was lost is never taken for a device's.
+pub fn current_may_be_web() -> bool {
+    current(|c| c.is_web) != Some(false)
 }
 
 pub fn current_csrf() -> Option<String> {
-    WEB_CTX
-        .try_with(|c| c.borrow().session_hash.as_deref().map(csrf_for_session))
-        .ok()
-        .flatten()
+    current(|c| c.session_hash.as_deref().map(csrf_for_session)).flatten()
 }
 
 pub fn record_session(hash: String, from_cookie: bool, web_token: bool) {
-    let _ = WEB_CTX.try_with(|c| {
-        let mut ctx = c.borrow_mut();
+    current(|ctx| {
         if from_cookie || web_token {
             ctx.is_web = true;
         }
@@ -141,7 +150,7 @@ pub fn require_csrf(headers: &HeaderMap, session_hash: Option<&str>, form_csrf: 
 }
 
 pub fn require_current_csrf(headers: &HeaderMap, form_csrf: Option<&str>) -> Result<()> {
-    let hash = WEB_CTX.try_with(|c| c.borrow().session_hash.clone()).ok().flatten();
+    let hash = current(|c| c.session_hash.clone()).flatten();
     require_csrf(headers, hash.as_deref(), form_csrf)
 }
 
@@ -165,7 +174,7 @@ pub async fn layer(mut req: Request, next: Next) -> Response {
         session_hash: None,
     };
 
-    let mut resp = WEB_CTX.scope(RefCell::new(init), next.run(req)).await;
+    let mut resp = crate::limits::with_web(init, next.run(req)).await;
 
     if !wants_json && (resp.status().is_client_error() || resp.status().is_server_error()) {
         let already_html = resp
