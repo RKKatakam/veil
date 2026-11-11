@@ -565,6 +565,10 @@ are distinct and pins their exact bytes.
 | `POLICY_RULE_SCOPE` | `veil 2026 policy rule-scope v1` | BLAKE3 `derive_key` mode as a hash (first 80 bits) | the scope name `rule-<hex>` of an access line's secrets (not secret) |
 | `HUB_SHARE_ID` | `veil 2026 hub share-id v1` | BLAKE3 `derive_key` mode as a hash (first 128 bits) | C14: a share's id in its labels, over its project, path, sharer and recipient (not secret) |
 | `HUB_AGENT_SESSION` | `veil 2026 hub agent-session v1` | BLAKE3 `derive_key` mode as a hash (256 bits) | The hash a Veil server keeps an agent session's token under (`HUB.md` §13.27): never the plain BLAKE3 a person's session is kept under, so a server that predates agent sessions never finds one (BUG-1376) |
+| `HUB_WEB_SESSION` | `veil 2026 hub web-session v1` | BLAKE3 `derive_key` mode as a hash (256 bits) | The hash a Veil server keeps a short-lived web session's token under (`HUB.md` §13.39): kept apart from CLI sessions so a server that predates S25 never finds a `web-` session row |
+| `HUB_WEB_CSRF` | `veil 2026 hub web-csrf v1` | BLAKE3 `derive_key` mode as a hash (256 bits) | Per-session CSRF token derived from a web session's stored `session_hash` (`HUB.md` §13.39) |
+| `HUB_WEB_PRF_KEY` | `veil 2026 hub web-prf-key v1` | BLAKE3 `derive_key` → 256-bit XChaCha20-Poly1305 key | C2: symmetric wrapping key derived from a passkey's 32-byte WebAuthn PRF output (`first`) to seal a browser device's private identity keys in IndexedDB (`HUB.md` §13.40) |
+| `HUB_WEB_ENROLL` | `veil 2026 hub web-enroll v1` | BLAKE3 `derive_key` mode as a hash (256 bits) | Single-use short-lived `vl web` passkey enrollment token hash (`HUB.md` §13.40): kept apart from session hashes |
 | `WRAP_LABEL_PREFIX` | `wrap:` | AEAD associated data | C3, C3L |
 | `PREV_KEY_LABEL_PREFIX` | `prev-key:` | AEAD associated data | C2 |
 | `EMBARGO_WRAP_LABEL_PREFIX` | `embargo-wrap:` | AEAD associated data | C2, C7 (retired in format 8: reserved, never reused) |
@@ -572,6 +576,7 @@ are distinct and pins their exact bytes.
 | `LOCAL_LABEL` | `local` | AEAD associated data | C2, C8 |
 | `VAULT_LABEL_PREFIX` | `vault:` | AEAD associated data | C2, C12 |
 | `SHARE_LABEL_PREFIX` | `share:` | AEAD associated data (and, after `wrap:`, HPKE aad; no scope name has a `:`) | C2, C3, C14 |
+| `WEB_DEVICE_IDENTITY_LABEL_PREFIX` | `web-device:` | AEAD associated data (`web-device:<credential-id>`) | C2: binds a browser device's PRF-sealed `Identity` envelope in IndexedDB to its WebAuthn credential ID (`HUB.md` §13.40) |
 | `GENERATION_SEPARATOR` | `#` | label syntax `<scope>#<key-id>` | C1, C2 |
 
 Signature contexts never contain NUL and are followed by `0x00`, so
