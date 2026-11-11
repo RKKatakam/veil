@@ -913,7 +913,9 @@ quay.io; the tests use the MinIO server binary packaged as
   | create or delete groups, choose managers | admins |
   | add or remove a group's people | admins and that group's managers; **a manager never adds themselves** |
   | upload objects, push, read key rings | participants: admins, group members, people named on a rule |
-  | force a branch move, delete a branch | admins |
+  | force a branch move | admins |
+  | delete a branch | admins. Anyone who may write a path, when the branch's work is all on the default branch (its tip is the default branch's tip or below it, or the landing service landed it there): `vl tag delete NAME`, then `vl push` (BUG-1885). Never this way: the default branch, a protected branch, an embargo's line, a forced push. An agent session: only a merged branch, and only one it may move (§13.27: its tip's change stays inside a narrowed session's paths and changes no file that decides access) |
+  | delete a pull request's source branch when it lands | the server, if the branch still points at the head that landed (never the default branch, the target, a protected branch or an embargo's line); `[branches] delete_merged = false` in `.veilrules` turns it off |
 
 * **Every check is on the server, on every request**; removing someone
   takes effect on their next request, on every server: servers cache
@@ -1713,7 +1715,9 @@ one entry can hold: **10,000 branches per project** and **1,000 branch
 updates per push** (`sync::MAX_BRANCHES`, `MAX_PUSH_UPDATES`), and **1,000
 groups per project** (`perm::MAX_GROUPS`); each is checked against the
 records when the request begins, so concurrent requests may each add up to
-the bound.
+the bound. A deleted branch stops counting at once (in the push that
+deletes it too); its search heads and derived rows are left to the purges
+and GC that exist (BUG-1885).
 
 **Branch tips.** A pull may see a tip up to **100 ms** old, as
 `phase-2-thin-clients.md` §5.1 allows; rows read before a push's notice are

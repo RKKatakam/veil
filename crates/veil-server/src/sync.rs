@@ -2590,7 +2590,9 @@ async fn push_staged(
     // The review rules a landing on the default branch brings (S21,
     // `prs::state`): recorded in this push's transaction.
     let mut rules_landing: Option<crate::prs::state::Landing> = None;
-    let mut merged_delete_lineage: Option<i64> = None;
+    // The default branch, for the deletions of merged branches (BUG-1885):
+    // read once a push, its lineage checked again where the branch goes.
+    let mut default_anc: Option<(ObjectId, i64, crate::landing::Ancestry)> = None;
     // New branches, against the branches when the push began (concurrent
     // pushes may each add up to the bound; deletions in the push free slots at once).
     let created: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_some() && !current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
@@ -2719,44 +2721,47 @@ async fn push_staged(
             continue;
         }
         if new_real.is_none() {
-            let writes = project.view(viewer).writes_anything();
-            let mut merged_deletable = false;
-            if !req.force
-                && !is_embargo_branch
-                && !u.branch.starts_with(veil_core::embargo::EMBARGO_BRANCH_PREFIX)
-                && u.branch != project.default_branch
-                && !protected.contains(&u.branch)
-                && writes
-            {
-                if let (Some(c), Some((dtip, dlin))) = (
-                    cur,
-                    crate::branches::lineage_of(hub, project.id, &project.default_branch).await?,
-                ) {
-                    if crate::branches::contained_in_branch(
-                        hub,
-                        project.id,
-                        Some(st.clone()),
-                        c,
-                        &project.default_branch,
-                        dtip,
-                        dlin,
-                    )
-                    .await?
-                    {
-                        merged_deletable = true;
-                        merged_delete_lineage = Some(dlin);
+            // A branch whose tip is contained in the default branch holds
+            // nothing of its own: whoever may write here deletes it
+            // (BUG-1885). Any other deletion stays an admin's, and is never
+            // an agent session's. Never this way: a forced push, the default
+            // branch, a protected one, an embargo's line.
+            let mut merged = false;
+            if let Some(c) = cur {
+                if !req.force
+                    && !(viewer.admin && !viewer.agent)
+                    && !is_embargo_branch
+                    && !crate::branches::kept(&u.branch, &project.default_branch, &protected)
+                    && project.view(viewer).writes_anything()
+                {
+                    if default_anc.is_none() {
+                        if let Some((tip, lineage)) = crate::branches::tip_of(hub, project.id, &project.default_branch).await? {
+                            let anc = crate::landing::Ancestry::new_staged(hub.clone(), project.id, &project.default_branch, tip, lineage, Some(st.clone()));
+                            default_anc = Some((tip, lineage, anc));
+                        }
+                    }
+                    if let Some((tip, _, anc)) = default_anc.as_mut() {
+                        merged = crate::branches::contained(hub, project.id, anc, *tip, c).await?;
                     }
                 }
             }
-            if !merged_deletable {
-                if viewer.agent && (viewer.admin || writes) {
+            if !merged {
+                if !viewer.admin {
+                    return Err(Error::forbidden(if is_embargo_branch || crate::branches::kept(&u.branch, &project.default_branch, &protected) {
+                        "only admins may delete a branch".to_string()
+                    } else {
+                        format!(
+                            "only admins may delete a branch, unless its work is all on '{}' and you may write here: '{}' was not deleted",
+                            project.default_branch, u.branch
+                        )
+                    }));
+                }
+                if viewer.agent {
                     return Err(agent_refusal("an agent session never deletes a branch"));
                 }
-                if !viewer.admin {
-                    return Err(Error::forbidden("only admins may delete a branch"));
-                }
             } else if let Some(c) = cur {
-                match crate::branches::agent_delete_check(hub, project, viewer, c, Some(st.clone())).await? {
+                // S11: an agent session deletes only a branch it may move.
+                match crate::branches::agent_may_delete(hub, project, viewer, c, Some(st.clone())).await? {
                     Some(AgentTip::Narrowed) => {
                         results.push(BranchResult {
                             branch: u.branch.clone(),
@@ -2768,8 +2773,7 @@ async fn push_staged(
                         continue;
                     }
                     Some(AgentTip::Access) => return Err(agent_refusal(AGENT_ACCESS_MOVE)),
-                    Some(AgentTip::DefaultBranch) => return Err(agent_refusal(AGENT_DEFAULT_BRANCH)),
-                    None => {}
+                    Some(AgentTip::DefaultBranch) | None => {}
                 }
             }
         }
@@ -2971,7 +2975,10 @@ async fn push_staged(
         listed.iter().map(|p| p.objects as i64).collect(),
     );
     let default_branch = project.default_branch.clone();
-    let admin_unrestricted_delete = viewer.admin && !viewer.agent;
+    // A merged branch goes only while the default branch it was judged
+    // against is in the same lineage (not rewound since: BUG-1885).
+    let admin_delete = viewer.admin && !viewer.agent;
+    let merged_lineage = default_anc.as_ref().map_or(-1, |(_, lineage, _)| *lineage);
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
     progress.lock().unwrap().transaction = commits;
@@ -3034,9 +3041,9 @@ async fn push_staged(
                         .bind(pid)
                         .bind(&branch)
                         .bind(c0.hex())
-                        .bind(admin_unrestricted_delete)
+                        .bind(admin_delete)
                         .bind(&default_branch)
-                        .bind(merged_delete_lineage.unwrap_or(-1))
+                        .bind(merged_lineage)
                         .execute(&mut *c)
                         .await?
                         .rows_affected(),

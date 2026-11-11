@@ -593,7 +593,7 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
     query::resolve(hub, ask, &onto, deadline).await?;
     let onto_tip = tip(hub, ask.project.id, &onto).await?.ok_or_else(|| Error::not_found("no such revision that you can see"))?;
     let (_, head) = query::resolve_real(hub, ask, &q.head, deadline).await?;
-    let source_branch = crate::branches::pr_source_branch(hub, ask.project.id, &q.head, &onto, head).await?;
+    let source_branch = crate::branches::source_of_pr(hub, ask.project.id, &q.head, &onto, head).await?;
     let r = compute(hub, ask, head, onto_tip).await?;
     readable_by(ask, &r.touched)?;
     if ask.viewer.only.is_some() && r.touched.iter().any(|p| !ask.viewer.within_narrowing(p)) {
@@ -872,7 +872,7 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let deadline = Instant::now() + DEADLINE;
     let (_, head) = query::resolve_real(hub, ask, &q.head, deadline).await?;
-    let source_branch = crate::branches::pr_source_branch(hub, ask.project.id, &q.head, &pr.target, head).await?;
+    let source_branch = crate::branches::source_of_pr(hub, ask.project.id, &q.head, &pr.target, head).await?;
     // The target as the caller sees it (never a withheld one), then its tip.
     query::resolve(hub, ask, &pr.target, deadline).await.map_err(|_| Error::conflict(format!("the target {} no longer exists", pr.target)))?;
     let onto = tip(hub, ask.project.id, &pr.target).await?.ok_or_else(|| Error::conflict(format!("the target {} no longer exists", pr.target)))?;
@@ -1811,7 +1811,7 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
             .bind(pr.revision)
             .execute(&hub.db)
             .await?;
-        let _ = crate::branches::delete_merged_pr_branch(hub, ask.project.id, &pr.id, me).await;
+        let _ = crate::branches::delete_landed_pr_branch(hub, &ask.project, &pr.id, pr.revision, me).await;
         return show(hub, ask, id).await;
     }
     if let Some(first) = judged.stack.first_mut() {
@@ -1865,7 +1865,7 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
                 .bind(pr.revision)
                 .execute(&hub.db)
                 .await?;
-            let _ = crate::branches::delete_merged_pr_branch(hub, ask.project.id, &pr.id, me).await;
+            let _ = crate::branches::delete_landed_pr_branch(hub, &ask.project, &pr.id, pr.revision, me).await;
             let mut v = show(hub, ask, id).await?;
             v["landing"] = serde_json::to_value(&r).unwrap_or_default();
             Ok(v)

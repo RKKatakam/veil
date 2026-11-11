@@ -185,7 +185,6 @@ struct RowMeta {
     epochs: (i64, i64),
     user_entry: bool,
     review_check: Option<EntryReviewCheck>,
-    pr_claim: Option<(String, i32)>,
 }
 
 impl crate::limits::landing::QueuedEntry for Row {
@@ -1404,20 +1403,6 @@ impl Service {
         }
         for (meta, res) in b.rows.iter().zip(results.iter()) {
             if let Some(r) = res {
-                if r.state == LandState::Landed {
-                    if let Some((pr_id, pr_rev)) = &meta.pr_claim {
-                        let _ = sqlx::query(
-                            "UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open' AND revision = $4",
-                        )
-                        .bind(veil_core::now_millis())
-                        .bind(self.project)
-                        .bind(pr_id)
-                        .bind(*pr_rev)
-                        .execute(&hub.db)
-                        .await;
-                        let _ = crate::branches::delete_merged_pr_branch(hub, self.project, pr_id, meta.person_id).await;
-                    }
-                }
                 let (ev, st_str) = match r.state {
                     LandState::Landed => ("land.landed", "landed"),
                     LandState::Conflict => ("land.conflict", "conflict"),
@@ -1635,10 +1620,6 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         let mark = (b.objects.len(), b.bytes, b.snapshots.len(), b.memos.len(), b.landings.len(), b.flushes);
         let last_cid = p.row.stack.last().and_then(|e| src.snapshot(&e.id).ok().map(|s| s.change_id));
         let user_entry = !p.row.ticket.starts_with("revert-") && !p.row.ticket.starts_with("embargo-");
-        let pr_claim = p.row.stack.first().and_then(|e| match &e.review {
-            Some(super::ReviewClaim::Pr { id, revision, .. }) => Some((id.clone(), *revision)),
-            _ => None,
-        });
         let row = RowMeta {
             seq: p.row.seq,
             ticket: p.row.ticket.clone(),
@@ -1649,7 +1630,6 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             epochs: p.epochs,
             user_entry,
             review_check: p.review_check.clone(),
-            pr_claim,
         };
         let outcome = match entry(&hub, &mut src, branch, &p, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
             Ok(Some(o)) => o,

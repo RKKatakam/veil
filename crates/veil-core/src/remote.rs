@@ -1027,8 +1027,9 @@ pub(crate) fn record_tag_deletion(backend: &dyn StorageBackend, name: &str, targ
     save_deleted_tags(backend, &map)
 }
 
-/// Drop the pending deletion record for `name` once a remote push has
-/// deleted it (see [`deleted_tags`]). Called under the repository lock.
+/// Drop the record of `name`'s deletion ([`deleted_tags`]) once a push
+/// settled it: the server deleted its tag, or refused to (the next pull
+/// then brings the tag back). Called under the repository lock.
 pub fn clear_tag_deletion(backend: &dyn StorageBackend, name: &str) -> Result<()> {
     let mut map = deleted_tags(backend)?;
     if map.remove(name).is_some() {

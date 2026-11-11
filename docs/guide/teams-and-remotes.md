@@ -67,6 +67,17 @@ your working copy**: `vl rebase -d main` after pulling.
   If somebody moves the branch on the server to work you haven't seen, the
   pull brings it back and says so: new work is never hidden by an old
   deletion.
+* **`vl tag delete NAME`, then `vl push`, deletes the server's branch too**
+  (`deleted experiment`), while it is still where you deleted it. Anyone who
+  may write to the project deletes a branch whose work is all on the default
+  branch; any other branch, only an admin. A deletion the server refuses is
+  shown (`rejected experiment: only admins may delete a branch, unless its
+  work is all on 'main' and you may write here`), the rest of the push goes
+  through, and the next pull brings the tag back. Landing a pull request
+  deletes the branch it came from ([The Veil server](the-server.md)).
+* **Everyone who can read the project sees its branch names**, even when the
+  branch's files are hidden from them. Name agent branches neutrally: by task
+  id, not by what they fix.
 * **A pull removes `REMOTE/TAG` for branches the server no longer has**
   (`pruned origin/experiment`). Your own tag of that name is kept, with a
   warning: delete it too, or your next `vl push` publishes it again.
