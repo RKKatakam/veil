@@ -3206,11 +3206,15 @@ async fn push_staged(
         .filter(|b| veil_core::embargo::embargo_id_of_branch(b).is_none())
         .collect();
     if !public_moved.is_empty() {
+        let default_moved = public_moved.iter().any(|b| b == &project.default_branch);
         crate::derive::landed(hub, project.id, public_moved);
+        if default_moved {
+            hub.embargo.wake();
+        }
     }
     // Early embargo releases pushed via `vl embargo release <id>` + `vl push`.
     for (eid, rec) in embargo_releases {
-        crate::embargo::release_one(hub, project.id, &eid, Some(rec), Some(viewer)).await?;
+        crate::embargo::release_one(hub, project.id, &eid, Some(rec), Some((viewer, who))).await?;
     }
     // The tips as the pusher sees them now (their own snapshots, where the
     // server's projection gives them back).

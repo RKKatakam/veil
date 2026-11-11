@@ -38,11 +38,10 @@ use super::{
     state, PrRow, DEADLINE,
 };
 use crate::{
-    auth::{Caller, Person},
     db::{transaction, Isolation},
     derive::changes,
     error::{Error, Result},
-    perm::{self, Project, Viewer},
+    perm::{Project, Viewer},
     query::{
         self,
         graph::{blocking, ensure, G},
@@ -543,12 +542,10 @@ pub async fn release_embargo_prs(
     embargo_id: &str,
     target_branch: &str,
     ebranch: &str,
-    person_id: i64,
-    person_name: &str,
-    device_key: &str,
+    creator: &(i64, String, String),
     pushed_record: Option<EmbargoRecord>,
     record_json: &str,
-    agent_viewer: Option<&Viewer>,
+    submitter: Option<(&Viewer, &crate::landing::Submitter)>,
 ) -> Result<bool> {
     type CandRow = (String, String, i64, String, String, String, String, i32, i64, i64, bool);
     let prs: Vec<CandRow> = sqlx::query_as(
@@ -562,7 +559,7 @@ pub async fn release_embargo_prs(
     .await?;
 
     // Enforce S11 agent narrowing & access-file rules if an agent session asked for early release.
-    if let Some(v) = agent_viewer {
+    if let Some((v, _)) = submitter {
         for (pr_id, ..) in &prs {
             let paths = review::paths_of(hub, project.id, pr_id).await?;
             if v.only.is_some() && paths.iter().any(|p| !v.within_narrowing(p)) {
@@ -575,16 +572,71 @@ pub async fn release_embargo_prs(
     }
 
     let admin_viewer = Viewer {
-        person: Some(person_id),
+        person: Some(creator.0),
         admin: true,
         groups: HashSet::new(),
         only: None,
         agent: false,
     };
 
+    // Never turn an embargo on a protected target public while its changes lack S21 approval.
+    let target_protected =
+        crate::embargo::is_protected_branch(hub, project.id, &project.default_branch, target_branch).await?;
+    if target_protected {
+        let etip: Option<String> =
+            sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
+                .bind(project.id)
+                .bind(ebranch)
+                .fetch_optional(&hub.db)
+                .await?;
+        if let Some(etip_hex) = etip {
+            let etip_id = ObjectId::from_hex(&etip_hex).map_err(|e| Error::Other(e.into()))?;
+            if let Ok(judged) = crate::landing::stack_for_embargo(
+                hub,
+                project,
+                &admin_viewer,
+                target_branch,
+                etip_id,
+                &HashMap::new(),
+                None,
+                Some(embargo_id),
+            )
+            .await?
+            {
+                if judged.branch && !judged.stack.is_empty() {
+                    let (release_viewer, _, _) =
+                        crate::embargo::choose_submitter(hub, project, &judged.stack, creator, submitter).await?;
+                    if let Err(e) = super::check_landing_review_for_embargo(
+                        hub,
+                        project,
+                        &release_viewer,
+                        target_branch,
+                        &judged.stack,
+                        None,
+                        Some(embargo_id),
+                    )
+                    .await
+                    {
+                        if matches!(&e, Error::Api { code: "not_ready", .. }) {
+                            let _ = crate::embargo::hold_embargo_for_approval(
+                                hub,
+                                project.id,
+                                embargo_id,
+                                &crate::embargo::failure_reason(&e),
+                            )
+                            .await;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     let rules = state::rules_in_force(hub, project, &project.default_branch).await?;
     let mut landed_prs: HashSet<String> = HashSet::new();
     let mut touched_branches: BTreeSet<String> = BTreeSet::new();
+    let manual_retry = submitter.is_some() || pushed_record.is_some();
 
     for (id, pr_target, author, author_name, title, body, state_str, revision, created_at, updated_at, land_at_release) in &prs {
         if state_str != "open" || !*land_at_release {
@@ -620,10 +672,15 @@ pub async fn release_embargo_prs(
         let Some(current) = revs.iter().find(|r| r.n == pr_row.revision) else {
             continue;
         };
+        let land_branch = if pr_target == ebranch {
+            target_branch.to_string()
+        } else {
+            pr_target.clone()
+        };
         let gate = review::gate(
             hub,
             project,
-            &admin_viewer,
+            submitter.map(|(v, _)| v).unwrap_or(&admin_viewer),
             &pr_row,
             &current.patch,
             Risk::parse(&current.risk),
@@ -631,122 +688,63 @@ pub async fn release_embargo_prs(
         )
         .await?;
         if !gate.ready {
-            // S21's review rules are not met: do not land onto the branch;
-            // the PR will release as an ordinary open PR instead.
-            continue;
+            let reason = format!("not ready to land: {}", gate.reasons.join("; "));
+            let _ = crate::embargo::hold_embargo_for_approval(hub, project.id, embargo_id, &reason).await;
+            return Err(Error::new(StatusCode::CONFLICT, "not_ready", reason));
         }
 
-        let land_branch = if pr_target == ebranch {
-            target_branch.to_string()
-        } else {
-            pr_target.clone()
-        };
-        let ticket = format!("embargo-pr-{}-{id}", project.id);
-        let existing_outcome = crate::landing::read(hub, project.id, person_id, &ticket).await?;
-        let need_queue = existing_outcome.is_none();
-        if need_queue || agent_viewer.is_some_and(|v| v.agent) {
-            let judged = match crate::landing::stack_for_embargo(
-                hub,
-                project,
-                &admin_viewer,
-                &land_branch,
-                current.head,
-                &HashMap::new(),
-                None,
-                Some(embargo_id),
-            )
-            .await?
-            {
-                Ok(j) if j.branch => j,
-                Ok(_) => continue,
-                Err(why) => {
-                    if pushed_record.is_some() || agent_viewer.is_some() {
-                        return Err(Error::conflict(why));
-                    }
-                    continue;
+        let judged = match crate::landing::stack_for_embargo(
+            hub,
+            project,
+            &admin_viewer,
+            &land_branch,
+            current.head,
+            &HashMap::new(),
+            None,
+            Some(embargo_id),
+        )
+        .await?
+        {
+            Ok(j) if j.branch => j,
+            Ok(_) => continue,
+            Err(why) => {
+                if manual_retry {
+                    return Err(Error::conflict(why));
                 }
-            };
-            if let Some(v) = agent_viewer {
-                crate::landing::agent_stack(hub, project, v, &land_branch, &judged, current.head, false, None).await?;
-            }
-            if need_queue && judged.stack.is_empty() {
-                landed_prs.insert(id.clone());
                 continue;
             }
-            if need_queue && !judged.stack.is_empty() {
-                let (_, _, epochs) = perm::open_at(
-                    hub,
-                    &project.name,
-                    &Caller {
-                        person: Some(Person {
-                            id: person_id,
-                            name: person_name.to_string(),
-                            device_key: device_key.to_string(),
-                            agent: None,
-                        }),
-                        epochs: crate::caches::Epochs::default(),
-                    },
-                )
-                .await?;
-                let who = crate::landing::Submitter {
-                    person: Person {
-                        id: person_id,
-                        name: person_name.to_string(),
-                        device_key: device_key.to_string(),
-                        agent: None,
-                    },
-                    epochs,
-                };
-                let q = crate::landing::Queued {
-                    ticket: ticket.clone(),
-                    branch: land_branch.clone(),
-                    stack: judged.stack,
-                    lineage: judged.lineage,
-                    skipped: Arc::new(std::sync::Mutex::new(judged.skipped)),
-                };
-                sqlx::query(
-                    "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, \
-                     project_epoch, state, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued', \
-                     (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT) ON CONFLICT (ticket) DO NOTHING",
-                )
-                .bind(project.id)
-                .bind(&q.branch)
-                .bind(&q.ticket)
-                .bind(who.person.id)
-                .bind(&who.person.name)
-                .bind(&who.person.device_key)
-                .bind(crate::landing::encode_stack(&q.stack))
-                .bind(q.lineage)
-                .bind(who.epochs.person)
-                .bind(who.epochs.project.map_or(0, |(_, e)| e))
-                .execute(&hub.db)
-                .await?;
-            }
+        };
+        if let Some((v, _)) = submitter {
+            crate::landing::agent_stack(hub, project, v, &land_branch, &judged, current.head, false, None).await?;
         }
-
-        let w = hub.landing.register(&ticket);
-        if let Some((_, cur)) = crate::landing::read(hub, project.id, person_id, &ticket).await? {
-            let outcome = if cur.state == LandState::Queued {
-                crate::limits::leave_gates();
-                crate::landing::ensure(hub, project.id, &land_branch);
-                let deadline = tokio::time::Instant::now() + crate::landing::WAIT;
-                crate::landing::wait(hub, project.id, person_id, &land_branch, w, deadline).await?
-            } else {
-                crate::landing::abandon(hub, w);
-                cur
-            };
-            if outcome.state == LandState::Landed {
-                landed_prs.insert(id.clone());
-                touched_branches.insert(land_branch);
-            } else if pushed_record.is_some() || agent_viewer.is_some() {
-                return Err(Error::conflict(
-                    outcome
-                        .message
-                        .unwrap_or_else(|| "embargo PR landing did not complete".into()),
-                ));
-            }
-        } else {
-            crate::landing::abandon(hub, w);
+        if judged.stack.is_empty() {
+            landed_prs.insert(id.clone());
+            continue;
+        }
+        let (_, who, caller_bounds) =
+            crate::embargo::choose_submitter(hub, project, &judged.stack, creator, submitter).await?;
+        let ticket = format!("embargo-pr-{}-{id}", project.id);
+        let outcome = crate::embargo::queue_and_wait_embargo_landing(
+            hub,
+            project,
+            embargo_id,
+            &ticket,
+            &land_branch,
+            judged,
+            &who,
+            caller_bounds.as_ref(),
+            manual_retry,
+        )
+        .await?;
+        if outcome.state == LandState::Landed {
+            landed_prs.insert(id.clone());
+            touched_branches.insert(land_branch);
+        } else if manual_retry {
+            return Err(Error::conflict(
+                outcome
+                    .message
+                    .unwrap_or_else(|| "embargo PR landing did not complete".into()),
+            ));
         }
     }
 
