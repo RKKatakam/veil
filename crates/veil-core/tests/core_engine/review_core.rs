@@ -247,3 +247,61 @@ fn bug_1836_content_amended_away_under_a_recorded_attempt_is_not_pushed() {
         "the remote received the text its author amended out of P before pushing"
     );
 }
+
+/// What a clone of `repo`'s tagged history holds that only the removed
+/// encryption wrote, by the one rule of `vl upgrade` and of the server's
+/// push check (`policy::sealed_secret`).
+fn named_by_the_only_secrets_rule(repo: &mut Repo) -> Vec<String> {
+    let remote: std::sync::Arc<veil_core::MemoryBackend> = std::sync::Arc::new(veil_core::MemoryBackend::new());
+    Repo::init_bare(remote.clone()).unwrap();
+    veil_core::remote::push(repo, remote.clone(), false, &[], false).unwrap();
+    veil_core::upgrade::removed_content(&(remote as std::sync::Arc<dyn StorageBackend>)).unwrap()
+}
+
+/// Only secret files are encrypted, and `vl` writes nothing its own rule
+/// for that refuses: a secret made and renamed within one change (the
+/// working copy recorded in between, as any command does).
+#[test]
+#[ignore = "BUG-1833: a secret made and renamed within one change is committed sealed at an ordinary path, which the only-secrets rule refuses"]
+fn bug_1833_a_secret_made_and_renamed_within_one_change_is_what_the_rule_accepts() {
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[(".veilpolicy", ".env cloak team\n"), ("README.md", "hi\n")], "base");
+    fs.write(&p(".env"), b"REGION=review-marker-made-and-renamed-0001\n").unwrap();
+    let recorded = snap(&mut repo, &*fs);
+    assert_eq!(file_entry(&repo, &recorded, ".env").unwrap().visibility, Visibility::Cloaked { scope: "team".into() });
+    let data = fs.read(&p(".env")).unwrap();
+    fs.remove_file(&p(".env")).unwrap();
+    fs.write(&p("settings.txt"), &data).unwrap();
+    snap(&mut repo, &*fs);
+    let (c, _) = repo.commit_working_copy(WS, "settings").unwrap();
+    assert_eq!(repo.snapshot(&c).unwrap().parents, vec![base]);
+    assert!(file_entry(&repo, &c, "settings.txt").is_some(), "the renamed file is recorded");
+    repo.set_tag("main", c, false).unwrap();
+
+    assert_eq!(named_by_the_only_secrets_rule(&mut repo), Vec::<String>::new(), "vl recorded what its own rule calls encrypted non-secret content");
+}
+
+/// The same when the rename is its own change, folded into the change
+/// that added the secret (`vl squash`).
+#[test]
+#[ignore = "BUG-1833: a secret made and renamed within one change is committed sealed at an ordinary path, which the only-secrets rule refuses"]
+fn bug_1833_a_rename_squashed_into_the_change_that_added_the_secret_is_what_the_rule_accepts() {
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[(".veilpolicy", ".env cloak team\n"), ("README.md", "hi\n")], "base");
+    commit_files(&mut repo, &*fs, &[(".env", "REGION=review-marker-made-and-renamed-0002\n")], "add the secret");
+    let data = fs.read(&p(".env")).unwrap();
+    fs.remove_file(&p(".env")).unwrap();
+    fs.write(&p("settings.txt"), &data).unwrap();
+    snap(&mut repo, &*fs);
+    let (rename, _) = repo.commit_working_copy(WS, "rename it").unwrap();
+    // Control: the rename alone is what the rule accepts (BUG-940, BUG-1055).
+    repo.set_tag("main", rename, false).unwrap();
+    assert_eq!(named_by_the_only_secrets_rule(&mut repo), Vec::<String>::new(), "control: a renamed secret is accepted");
+
+    let squashed = repo.squash(rename).unwrap();
+    assert_eq!(repo.snapshot(&squashed).unwrap().parents, vec![base], "the two changes are one, on the base");
+    assert!(file_entry(&repo, &squashed, "settings.txt").is_some(), "the renamed file is recorded");
+    repo.set_tag("main", squashed, true).unwrap();
+
+    assert_eq!(named_by_the_only_secrets_rule(&mut repo), Vec::<String>::new(), "vl recorded what its own rule calls encrypted non-secret content");
+}
