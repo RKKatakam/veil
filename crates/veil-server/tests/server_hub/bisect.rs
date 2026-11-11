@@ -49,12 +49,13 @@ fn get_bisect(hub: &TestHub, token: Option<&str>, project: &str, branch: &str) -
 /// and counted when the lease comes free, and the status route counts
 /// nothing while the lease is held (`docs/HUB.md` §13.36, "When a result
 /// counts"): after racing reports, the phase is reached a moment after the
-/// last answer.
+/// last answer (and until the first of them is counted there is no bisect
+/// yet: `404`).
 fn bisect_in_phase(hub: &TestHub, token: &str, project: &str, branch: &str, phase: &str) -> Value {
     let began = std::time::Instant::now();
     loop {
         let r = get_bisect(hub, Some(token), project, branch);
-        assert_eq!(r.status, 200, "{}", body(&r));
+        assert!(r.status == 200 || r.status == 404, "{} {}", r.status, body(&r));
         let st = r.json();
         if st["phase"] == phase || began.elapsed() > Duration::from_secs(30) {
             return st;

@@ -5359,8 +5359,9 @@ migration `0026_bisect_and_revert.sql` (`landing_queue.priority`,
     for the lease's 5 s and 1.5 s more) counts it. **So after concurrent
     reports the bisect advances a moment after the last answer, not with
     it**: a client that reads `GET …/bisect/{branch}` straight after its
-    `POST` may see the phase from before its result, and asks again (a
-    runner follows `check.requested` events instead).
+    `POST` may see the phase from before its result (or `404`, no bisect
+    yet, when the first failure itself found the lease held), and asks again
+    (a runner follows `check.requested` events instead).
   * No stored result is left out: every step recounts from `checks`
     (`run_count`), not from the report that started it, so a result is
     counted by the first step that begins after it was stored, whoever's it
