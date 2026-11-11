@@ -61,6 +61,12 @@ fn read_cmds() -> Vec<Vec<&'static str>> {
         vec!["tag", "list"],
         vec!["log", "--json", "src/lib.rs"],
         vec!["evolog", "-r", "main"],
+        // A file moved in from the billing folder: for finance a rename to
+        // follow, for the others a file added there.
+        vec!["log", "--json", "src/moved.txt"],
+        vec!["log", "--json", "--follow", "src/moved.txt"],
+        vec!["blame", "--follow", "src/moved.txt", "-r", "main", "--json"],
+        vec!["diff", "--json", "-r", "main--"],
     ]
 }
 
@@ -97,6 +103,11 @@ fn rvgaps_thin_clone_of_a_partial_viewer_answers_as_their_full_clone() {
         who.ok(who.home.path(), &["clone", &hub.url(&p.name), thin.to_str().unwrap()]);
         for d in differences(who, &full, &thin, &read_cmds()) {
             all.push(format!("{name}: {d}"));
+        }
+        // Each is an answer, not a refusal both clones share.
+        for args in read_cmds() {
+            let (ok, text) = answer(who, &full, &args);
+            assert!(ok, "{name}: `vl {}` in the full clone: {text}", args.join(" "));
         }
     }
     assert!(all.is_empty(), "{}", all.join("\n\n"));

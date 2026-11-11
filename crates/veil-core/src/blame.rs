@@ -1421,7 +1421,7 @@ mod tests {
         };
         const LINES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
         let (mut one, mut several) = (0, 0);
-        for case in 0..60_000 {
+        for case in 0..60_000u32 {
             let k = 2 + rnd() % 5;
             let old: Vec<&str> = (0..1 + rnd() % 14).map(|_| LINES[rnd() % k]).collect();
             let mut new = old.clone();
@@ -1430,10 +1430,10 @@ mod tests {
                 new[at] = LINES[rnd() % (k + 2)];
             }
             let (mut old, mut new) = (old.join("\n") + "\n", new.join("\n") + "\n");
-            if case % 5 == 0 {
+            if case.is_multiple_of(5) {
                 old.pop();
             }
-            if case % 3 == 0 {
+            if case.is_multiple_of(3) {
                 new.pop();
             }
             match ranged_maps_agree(&old, &new) {
@@ -1471,12 +1471,12 @@ mod tests {
         own(&format!("{parent}last"));
         own(parent.trim_end());
         let mut reused = 0;
-        for case in 0..3_000 {
+        for case in 0..3_000u32 {
             let k = 2 + rnd() % 30;
             let line = |r: usize| format!("{}\n", "line of some length ".repeat(1 + r % k % 4) + &(r % k).to_string());
             let mut lines: Vec<String> = (0..64 + rnd() % 200).map(|_| line(rnd())).collect();
             let mut parent = lines.concat();
-            if case % 3 == 0 {
+            if case.is_multiple_of(3) {
                 parent.pop();
             }
             for _ in 0..rnd() % 4 {
