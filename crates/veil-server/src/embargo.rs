@@ -685,7 +685,7 @@ pub(crate) async fn record_in_tx(
 const RETRY_STUCK: Duration = Duration::from_secs(30);
 
 /// Background loop that releases embargoes at their deadlines
-/// ([`release_due`]), and tries the stuck ones again every [`RETRY_STUCK`].
+/// ([`release_due`]), and tries the stuck ones again every `RETRY_STUCK`.
 pub async fn run_loop(hub: Arc<Hub>, mut stop: tokio::sync::watch::Receiver<bool>) {
     let mut check_db = true;
     let mut retry_at = tokio::time::Instant::now() + RETRY_STUCK;
@@ -872,14 +872,26 @@ async fn record_embargo_status_inner(
 /// Release `embargo_id` for the server (no person asks): `true` when this
 /// call released it. A release that is not approved is held by
 /// [`release_one`]; any other failure is recorded on the embargo (BUG-1857),
-/// and the next one is tried all the same.
+/// and the next one is tried all the same. A passing failure (the database,
+/// not the release's own answer) never replaces what the embargo's groups
+/// were told already (that it waits for an approval, or its conflict).
 async fn release_for_server(hub: &Arc<Hub>, project_id: i64, embargo_id: &str) -> bool {
     match release_one(hub, project_id, embargo_id, None, None).await {
         Ok(released) => released,
         Err(Error::Api { code: "not_ready", .. }) => false,
         Err(e) => {
-            let reason = failure_reason(&e);
-            let _ = record_embargo_status(hub, project_id, embargo_id, Some("failed"), Some(&reason)).await;
+            let told: Option<String> =
+                sqlx::query_scalar("SELECT record_json FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2")
+                    .bind(project_id)
+                    .bind(embargo_id)
+                    .fetch_optional(&hub.db)
+                    .await
+                    .ok()
+                    .flatten();
+            if matches!(e, Error::Api { .. }) || told.is_some_and(|json| !is_stuck(&json)) {
+                let reason = failure_reason(&e);
+                let _ = record_embargo_status(hub, project_id, embargo_id, Some("failed"), Some(&reason)).await;
+            }
             false
         }
     }
@@ -1215,7 +1227,7 @@ async fn release_pending(hub: &Arc<Hub>, stuck: bool) -> Result<usize> {
 ///    state (BUG-1875: the line is never dropped without landing). Onto a
 ///    protected branch the landing meets S21's review rules like every
 ///    landing, and the approvals of the embargo's own PR count (BUG-1861):
-///    unapproved, the release is **held** ([`hold_embargo_for_approval`]) and
+///    unapproved, the release is **held** (`hold_embargo_for_approval`) and
 ///    this answers `409 not_ready`; nothing lands and nothing turns public.
 /// 2. **Finish** (`prs::embargo::finish_release`): the embargo's PRs that
 ///    are armed and ready land too, and in one transaction `released_at` is
