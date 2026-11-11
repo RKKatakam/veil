@@ -288,7 +288,7 @@ today; **they must be the same code** on client and server.
 | # | Check | Today |
 |---|---|---|
 | 1 | The person may push to this project and branch (branch rules, §7.4) | (new) |
-| 2 | **Write access by path:** every file the push adds, changes or removes is in a folder the pusher has access to | (new) |
+| 2 | **Write access by path:** every file the push adds, changes or removes is in a folder the pusher has access to. The same for what a branch's move brings, whatever brings it (a snapshot the server already holds, a merge, a stack on someone's work; by push, by an API commit, by the landing service): every path that differs between the branch's old tip and its new one needs the mover's write access, unless the new tip holds landed work there (the default branch's version where the two last join, on another branch that only moves forward: BUG-1858, BUG-1920) | (new) |
 | 3 | **Policy changes:** a push that changes `.veilpolicy` access rules comes from an admin (§5.2) | (new) |
 | 4 | Pack integrity: checksums, every object re-hashed against its id | `pack.rs` |
 | 5 | Canonical decoding; safe names (`..`, `/`, NUL, `.veil`); tree depth | `Object::decode`, `remote.rs` |
@@ -5452,7 +5452,10 @@ migration `0026_bisect_and_revert.sql` (`landing_queue.priority`,
     `prs::check_landing_review`) as if high risk (`people_only = true`,
     refusal `reverted twice: needs a person's approval`), regardless of the
     branch's rules, and the count is never reset. First-time culprits still
-    revert immediately as before.
+    revert immediately as before. The count is also by what was reverted
+    (`culprit_patch`: `prs::edits_id`, the change's edits whatever change id
+    carries them), so the same edit made again as a new change needs a
+    person too (BUG-1921).
 * **Visibility (`docs/VISIBILITY.md`) and routes (`GET /v1/projects/{p}/bisect/{branch}`).**
   * `events::emit_check_requested`, `events::emit_reverted`, and
     `bisect::status_route` project every snapshot (`good`, `bad`, `candidates`,

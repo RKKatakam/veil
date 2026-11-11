@@ -708,7 +708,7 @@ pub async fn finish_release(
         }
         // BUG-1884: a change the server reverted twice needs a person's
         // approval here too, as on every other route that lands a PR.
-        let cids: Vec<String> = current.changes.iter().map(|c| c.change.clone()).collect();
+        let cids = super::revert_identities(hub, project.id, &current.changes).await?;
         let rev_twice = crate::bisect::any_reverted_twice(hub, project.id, &cids).await?;
         let gate = review::gate(
             hub,

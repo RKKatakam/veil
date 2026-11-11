@@ -582,7 +582,12 @@ fn without(c: &mut Craft<'_>, name: &str) {
 
 /// Sign a snapshot of `c`'s root on `parents`, upload it with what `c`
 /// made, and submit it to land on main (`POST …/land` of a snapshot).
-fn land_crafted(mut c: Craft<'_>, parents: Vec<ObjectId>, wait: bool) -> Reply {
+fn land_crafted(c: Craft<'_>, parents: Vec<ObjectId>, wait: bool) -> Reply {
+    land_crafted_onto(c, parents, "main", wait)
+}
+
+/// [`land_crafted`] onto the branch `onto`.
+fn land_crafted_onto(mut c: Craft<'_>, parents: Vec<ObjectId>, onto: &str, wait: bool) -> Reply {
     let mut s = Snapshot {
         parents,
         change_id: veil_core::ChangeId::random(),
@@ -607,7 +612,7 @@ fn land_crafted(mut c: Craft<'_>, parents: Vec<ObjectId>, wait: bool) -> Reply {
     c.api.post_json(
         Some(&c.token),
         &format!("/v1/projects/{}/land", c.project),
-        &json!({"onto": "main", "snapshot": id.hex(), "receipts": map, "wait": wait}),
+        &json!({"onto": onto, "snapshot": id.hex(), "receipts": map, "wait": wait}),
     )
 }
 
@@ -720,26 +725,50 @@ fn bug_1104_a_submitter_who_lost_access_is_told_nothing_of_what_changed_since() 
     assert_eq!(c["state"], "rejected", "the answer tells someone without access that a hidden file changed: {c}");
 }
 
+/// BUG-1105: a merge checked again when it lands (its submitter's access
+/// epoch changed) is checked against every parent, so what it takes from
+/// another parent's side is not counted as its submitter's own write.
+///
+/// Since BUG-1920 what a merge may take without write access is **landed
+/// work**: the default branch's, merged into another branch. So the merge
+/// here is of `main` into a branch `release`; the same merge of someone's
+/// unlanded branch onto `main` is refused (the second half, and
+/// `rc_server::bug_1920_…`).
 #[test]
 fn bug_1105_a_merge_checked_again_at_landing_keeps_its_other_parents() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
-    // The dev adds a file to src/ on a branch of their own.
-    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
-    c.file("src/feature.rs", "feature\n");
-    let r = c.push_to("feature", None);
-    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
-    // fin reads src/ (it is public) but may not write it; a merge taking
-    // the dev's change from the other parent is allowed (`check_changes`).
     let ftok = p.fin.token();
-    let feature = api.tips(Some(&ftok), &p.name).unwrap().branches["feature"];
+    // A branch `release` at main's tip; then the dev lands a file in src/
+    // on main.
+    let old = tip_for(&hub, &ftok, &p.name);
+    let made = api.post_json(
+        Some(&ftok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "release", "expected": null, "new": old.hex()}]}),
+    );
+    assert_eq!(made.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&made.body));
+    let dtok = p.dev.token();
+    let r = land(&api, &dtok, &p.name, tip_for(&hub, &dtok, &p.name), json!([put("src/landed.rs", "landed\n")]), true);
+    assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+    // fin reads src/ (it is public) but may not write it; a merge of main
+    // into `release`, taking the dev's landed change from the other
+    // parent, is allowed (`check_changes`, and the branch move's rule).
+    let main = tip_for(&hub, &ftok, &p.name);
     let mut m = Craft::new(&api, &p.fin, &p.name, "main");
-    m.root = m.tree_of(feature);
-    let tip = m.tip;
-    hold(&hub, pid);
-    let r = land_crafted(m, vec![tip, feature], false);
+    m.tip = old;
+    let h = hub.hub();
+    hub.rt
+        .block_on(
+            sqlx::query("INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, 'release', 'test', 1, $2)")
+                .bind(pid)
+                .bind(veil_core::now_millis() + 600_000)
+                .execute(&h.db),
+        )
+        .unwrap();
+    let r = land_crafted_onto(m, vec![old, main], "release", false);
     let v = r.json();
     assert_eq!(v["state"], "queued", "accepted at submit: {v}");
     // fin's access epoch changes (a new group: nothing they may read or
@@ -749,6 +778,21 @@ fn bug_1105_a_merge_checked_again_at_landing_keeps_its_other_parents() {
     release(&hub, pid);
     let r = outcome(&api, &ftok, &p.name, v["ticket"].as_str().unwrap());
     assert_eq!(r["state"], "landed", "{r}");
+
+    // The same merge of unlanded work onto main is no longer fin's to land
+    // (BUG-1920): the dev's branch `feature` changes src/.
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/feature.rs", "feature\n");
+    let r = c.push_to("feature", None);
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let feature = api.tips(Some(&ftok), &p.name).unwrap().branches["feature"];
+    let mut m = Craft::new(&api, &p.fin, &p.name, "main");
+    m.root = m.tree_of(feature);
+    let tip = m.tip;
+    let r = land_crafted(m, vec![tip, feature], true);
+    let v = r.json();
+    assert_eq!(v["state"], "rejected", "{v}");
+    assert_eq!(v["message"], "you may not write 'src/feature.rs'", "{v}");
 }
 
 #[test]

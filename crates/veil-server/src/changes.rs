@@ -568,6 +568,10 @@ async fn restack(hub: &Arc<Hub>, who: &Arc<Who>, chain: Vec<ObjectId>, onto: Obj
 struct Move {
     branch: String,
     cur: ObjectId,
+    /// The change's parent: `cur`, the caller's changes restacked on it, or
+    /// a stack of the caller's own held changes made on `cur` itself, which
+    /// the move brings onto the branch with the change (BUG-1922).
+    below: ObjectId,
     keep_on_loss: bool,
 }
 
@@ -608,23 +612,44 @@ async fn commit(
         (Some(file), Some(m)) => Some(crate::prs::state::Landing { old: Some(m.cur), new: built.real, file: file.clone(), fast_forward: true }),
         _ => None,
     };
+    // The held snapshots the move reaches first: the change's parent, when
+    // it is neither the tip nor one of the changes restacked here.
+    let below: Vec<ObjectId> = mv.iter().filter(|m| m.below != m.cur && !restacked.iter().any(|(n, _, _)| *n == m.below)).map(|m| m.below).collect();
+    let moved_from = mv.as_ref().map(|m| m.cur);
     let mv = mv.map(|m| (m.branch, m.cur.hex(), m.keep_on_loss));
     let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let committed: Vec<ObjectId> = restacked.iter().map(|(n, _, _)| *n).chain(std::iter::once(built.real)).collect();
     // What a move puts on the branch, by change id and author
     // (`landed_changes`, BUG-1522, BUG-1527): the caller's restacked changes
-    // and this one.
+    // and this one, and the held changes below it that the move brings
+    // (BUG-1922: a stack made on the tip itself), read as a push's
+    // fast-forward reads them (`landing::reached`). Where they cannot all
+    // be read, the move turns the branch's `changes_recorded` off, in the
+    // lineage they were read under.
+    let (mut recorded, mut read_under): (bool, Option<i64>) = (true, None);
     let on_branch: (Vec<String>, Vec<i64>, Vec<String>) = match &mv {
         None => (Vec::new(), Vec::new(), Vec::new()),
-        Some(_) => {
+        Some((branch, _, _)) => {
             let ids = committed.clone();
             let mut cs: Vec<String> = sync::blocking(hub, pid, move |src| {
                 ids.iter().take(ids.len() - 1).map(|n| Ok(src.snapshot(n)?.change_id.to_string())).collect::<Result<Vec<_>>>()
             })
             .await?;
             cs.push(cid.clone());
-            let aus = vec![person; cs.len()];
-            (cs, aus, committed.iter().map(ObjectId::hex).collect())
+            let mut aus = vec![person; cs.len()];
+            let mut ls: Vec<String> = committed.iter().map(ObjectId::hex).collect();
+            if !below.is_empty() {
+                match crate::landing::reached(hub, pid, branch, below, moved_from).await? {
+                    Some((lineage, (c2, a2, l2))) => {
+                        cs.extend(c2);
+                        aus.extend(a2);
+                        ls.extend(l2);
+                        read_under = Some(lineage);
+                    }
+                    None => recorded = false,
+                }
+            }
+            (cs, aus, ls)
         }
     };
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
@@ -652,11 +677,16 @@ async fn commit(
             let mut moved = None;
             if let Some((branch, cur, keep)) = &mv {
                 let lineage: Option<i64> =
-                    sqlx::query_scalar("UPDATE branches SET target = $1 WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage")
+                    sqlx::query_scalar(
+                        "UPDATE branches SET target = $1, changes_recorded = changes_recorded AND $5 AND ($6::BIGINT IS NULL OR lineage = $6) \
+                         WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage",
+                    )
                         .bind(&real)
                         .bind(pid)
                         .bind(branch)
                         .bind(cur)
+                        .bind(recorded)
+                        .bind(read_under)
                         .fetch_optional(&mut *c)
                         .await?;
                 let rows = u64::from(lineage.is_some());
@@ -1283,7 +1313,13 @@ pub(crate) async fn create_with(
                 None
             }
             (Some(o), Some(c), None) => match if c != parent || attempts > 1 {
-                sync::branch_move_write_refusal(hub, &who.project, &who.viewer, c, built.real, None).await?
+                // An API commit always adds to the branch: landed work it
+                // stands on is no write on a branch other than the default.
+                let landed = match plan.default_branch {
+                    true => None,
+                    false => tip(hub, project.id, &project.default_branch).await?,
+                };
+                sync::branch_move_write_refusal(hub, &who.project, &who.viewer, Some(c), built.real, landed, &mut sync::PushRows::default(), None).await?
             } else {
                 None
             } {
@@ -1294,6 +1330,7 @@ pub(crate) async fn create_with(
                 None => Some(Move {
                     branch: o.branch.clone(),
                     cur: c,
+                    below: parent,
                     // A tip that moves away and back must not keep it trying.
                     keep_on_loss: !rebase || rebased >= MAX_REBASES || attempts > MAX_REBASES,
                 }),

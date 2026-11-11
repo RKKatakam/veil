@@ -288,7 +288,7 @@ pub async fn gate(hub: &Arc<Hub>, ask: &Ask, pr: &PrRow) -> Result<(Vec<RevRow>,
     let rules = rules(hub, ask).await?;
     let revs = rated(hub, ask.project.id, &pr.id, &rules).await?;
     let current = revs.iter().find(|r| r.n == pr.revision).ok_or_else(|| Error::Other(anyhow::anyhow!("the PR's revision is missing")))?;
-    let cids: Vec<String> = current.changes.iter().map(|c| c.change.clone()).collect();
+    let cids = revert_identities(hub, ask.project.id, &current.changes).await?;
     let rev_twice = crate::bisect::any_reverted_twice(hub, ask.project.id, &cids).await?;
     let gate = review::gate(hub, &ask.project, &ask.viewer, pr, &current.patch, Risk::parse(&current.risk), &rules, rev_twice).await?;
     Ok((revs, gate))
@@ -334,6 +334,45 @@ pub async fn landed(hub: &Arc<Hub>, project: i64, branches: &[String]) -> Result
     match default {
         Some(d) if branches.contains(&d) => rules_of_project(hub, project, &d).await.map(|_| ()),
         _ => Ok(()),
+    }
+}
+
+/// Mark `pr` landed at `revision`, where it is open at that revision and no
+/// embargo holds it (an embargo's release marks its own PRs): in the
+/// transaction that lands it (the landing batch's, BUG-1924) or that finds
+/// its changes on the target already. Whether it was marked here.
+pub(crate) async fn mark_landed(c: &mut sqlx::PgConnection, project: i64, pr: &str, revision: i32, now: i64) -> Result<bool> {
+    let n = sqlx::query(
+        "UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open' AND revision = $4 AND embargo = ''",
+    )
+    .bind(now)
+    .bind(project)
+    .bind(pr)
+    .bind(revision)
+    .execute(&mut *c)
+    .await?
+    .rows_affected();
+    Ok(n > 0)
+}
+
+/// The landing service's hook for a landed entry of a PR (BUG-1924), after
+/// the batch that marked it committed, whether or not the request that
+/// queued it still waits: the event (when that batch `marked` it), and its
+/// source branch deleted (BUG-1885). Best effort: a branch it leaves is
+/// deleted by anyone who may write.
+pub(crate) async fn pr_landed(hub: &Arc<Hub>, project: i64, pr: &str, revision: i32, actor: i64, marked: bool) {
+    if marked {
+        crate::events::emit_pr(hub, project, pr, "pr.landed").await;
+    }
+    let r: Result<()> = async {
+        let name: Option<String> = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project).fetch_optional(&hub.db).await?;
+        let Some(name) = name else { return Ok(()) };
+        let Some(p) = crate::perm::load_project(&mut *hub.db.acquire().await?, &name).await? else { return Ok(()) };
+        crate::branches::delete_landed_pr_branch(hub, &p, pr, revision, actor).await
+    }
+    .await;
+    if let Err(e) = r {
+        eprintln!("veil-server: deleting the source branch of landed PR {pr} of project {project}: {e:?}");
     }
 }
 
@@ -1604,9 +1643,52 @@ pub struct StackReviewDiff {
     pub touched: BTreeSet<String>,
     pub files: Vec<rules::FileChange>,
     pub patch: String,
-    /// The change ids of the stack's entries (the rule for a change the
-    /// server reverted twice: BUG-1884).
+    /// What "reverted twice" counts the stack's entries by (BUG-1884,
+    /// BUG-1921): each one's change id, and what its edits are whatever
+    /// change id carries them ([`edits_id`]).
     pub changes: Vec<String>,
+}
+
+/// What a change's edits are, whatever change id it is given (BUG-1921):
+/// a hash of the leaves its tree differs at from its base's (each path,
+/// with the entry before and after), in a domain of its own. The same edit
+/// made again as a new change has the same one; a rebased version whose
+/// files differ has another, and is known by its change id. `None` for a
+/// change with no edits.
+fn edits_id_of(leaves: &[veil_core::hub::project::Change]) -> Option<String> {
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut h = blake3::Hasher::new_derive_key("veil 2026 hub change edits v1");
+    h.update(&(leaves.len() as u64).to_le_bytes());
+    for c in leaves {
+        h.update(&(c.path.len() as u64).to_le_bytes());
+        h.update(c.path.as_bytes());
+        revision::entry_bytes(&mut h, c.old.as_ref());
+        revision::entry_bytes(&mut h, c.new.as_ref());
+    }
+    Some(format!("edits:{}", h.finalize().to_hex()))
+}
+
+/// [`edits_id_of`] the edits of `snapshot` against `parent`.
+pub fn edits_id(src: &crate::sync::Source, snapshot: ObjectId, parent: ObjectId) -> Result<Option<String>> {
+    let (leaves, _) = crate::derive::changes::diff(src, src.snapshot(&parent)?.tree, src.snapshot(&snapshot)?.tree)?;
+    Ok(edits_id_of(&leaves))
+}
+
+/// What "reverted twice" counts the changes of a PR's revision by: their
+/// change ids and their edits ([`edits_id`]).
+pub(crate) async fn revert_identities(hub: &Arc<Hub>, project: i64, changes: &[StackChange]) -> Result<Vec<String>> {
+    let stack = changes.to_vec();
+    crate::sync::blocking(hub, project, move |src| {
+        let mut ids = Vec::with_capacity(stack.len() * 2);
+        for c in &stack {
+            ids.push(c.change.clone());
+            ids.extend(edits_id(src, c.snapshot_id(), c.parent_id())?);
+        }
+        Ok(ids)
+    })
+    .await
 }
 
 /// Compute [`StackReviewDiff`] for `stack` from `src`.
@@ -1625,6 +1707,7 @@ pub fn stack_review_diff(src: &crate::sync::Source, stack: &[crate::landing::Ent
         };
         let ptree = src.snapshot(&parent)?.tree;
         let (leaves, dirs) = crate::derive::changes::diff(src, ptree, s.tree)?;
+        changes.extend(edits_id_of(&leaves));
         if !leaves.is_empty() {
             patch.update(&s.change_id.0);
             patch.update(&(leaves.len() as u64).to_le_bytes());
@@ -2127,20 +2210,10 @@ pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: 
     r.warnings.extend(crate::landing::skipped_warnings(hub, ask.project.id, &q.branch, &skipped).await?);
     use veil_core::hub::land::LandState;
     match r.state {
-        LandState::Landed => {
-            let now = veil_core::now_millis();
-            let n = sqlx::query("UPDATE prs SET state = 'landed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open' AND revision = $4")
-                .bind(now)
-                .bind(ask.project.id)
-                .bind(&pr.id)
-                .bind(pr.revision)
-                .execute(&hub.db)
-                .await?
-                .rows_affected();
-            if n > 0 {
-                crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.landed").await;
-            }
-            let _ = crate::branches::delete_landed_pr_branch(hub, &ask.project, &pr.id, pr.revision, me).await;
+        // The batch that landed it marked the PR and cleans its source
+        // branch (`mark_landed`, `pr_landed`: BUG-1924); the request only
+        // reports, as it does for a landing that outlasts its wait.
+        LandState::Landed | LandState::Queued => {
             let mut v = show(hub, ask, id).await?;
             v["landing"] = serde_json::to_value(&r).unwrap_or_default();
             Ok(v)
@@ -2163,11 +2236,6 @@ pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: 
             } else {
                 Err(Error::bad_request(msg))
             }
-        }
-        LandState::Queued => {
-            let mut v = show(hub, ask, id).await?;
-            v["landing"] = serde_json::to_value(&r).unwrap_or_default();
-            Ok(v)
         }
     }
 }

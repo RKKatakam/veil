@@ -140,7 +140,7 @@ pub async fn for_tips(
     // A narrowed agent session gets no grant: a grant reaches everything
     // below its root, wider than the narrowing. It reads through `fetch`
     // and the query API, which narrow (`docs/HUB.md` §13.27).
-    if viewer.only.is_some() || caller.is_web() {
+    if viewer.only.is_some() || caller.may_be_web() {
         return Ok(BTreeMap::new());
     }
     let person = caller.person.as_ref().map(|p| p.id);
@@ -433,7 +433,7 @@ pub async fn get_object(
     headers: HeaderMap,
     asker: Option<axum::Extension<crate::limits::answers::For>>,
 ) -> Result<Response> {
-    if crate::web::current_is_web() || crate::auth::has_browser_or_web_headers(&headers) {
+    if crate::web::current_may_be_web() || crate::auth::has_browser_or_web_headers(&headers) {
         return Err(Error::new(
             StatusCode::FORBIDDEN,
             crate::auth::WEB_SESSION,
@@ -487,7 +487,7 @@ pub async fn get_object(
 /// reaches, as object frames; the others are left out, alike whether they
 /// exist or not.
 pub async fn batch(State(hub): State<HubState>, Path(target): Path<String>, body: Bytes) -> Result<Response> {
-    if crate::web::current_is_web() {
+    if crate::web::current_may_be_web() {
         return Err(Error::new(
             StatusCode::FORBIDDEN,
             crate::auth::WEB_SESSION,
