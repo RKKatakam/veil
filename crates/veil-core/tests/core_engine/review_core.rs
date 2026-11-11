@@ -2,7 +2,7 @@
 //! 2026-11-10): each test shows one guarantee failing, and is ignored under
 //! its `docs/BUGS.md` row until the bug is fixed.
 
-use veil_core::{ObjectId, Repo};
+use veil_core::{policy::Policy, policy::Tier, ObjectId, Repo, StorageBackend};
 
 use crate::adversarial_support::*;
 
@@ -56,4 +56,41 @@ fn bug_1830_a_committed_change_stays_visible_when_the_working_copy_line_moves_of
     assert_eq!(repo.snapshot(&wc).unwrap().parents, vec![moved], "the working copy followed B");
 
     assert!(repo.held().visible().unwrap().contains(&a), "change A (a.txt) left the view");
+}
+
+/// Invalid rules fail safe: a protective rule that can match no path is
+/// never accepted in silence.
+#[test]
+#[ignore = "BUG-1831: a protective `.veilpolicy` rule spelled `./dir/`, or behind a byte order mark, protects nothing and warns of nothing"]
+fn bug_1831_a_protective_rule_that_can_match_nothing_fails_safe() {
+    for (what, text) in [
+        ("a byte order mark before the first rule", "\u{feff}private/ isolate\n"),
+        ("a leading `./`", "./private/ isolate\n"),
+        ("a leading `./` on a file", "./private/notes.txt isolate\n"),
+    ] {
+        let policy = Policy::parse(text);
+        let class = policy.classify(&p("private/notes.txt"), false);
+        assert!(
+            class.tier == Tier::Isolated || !policy.warnings.is_empty(),
+            "{what}: `private/notes.txt` is {:?} and the policy has no warning",
+            class.tier
+        );
+    }
+}
+
+/// The same end to end: what the member's rule keeps on the device is not
+/// recorded.
+#[test]
+#[ignore = "BUG-1831: a protective `.veilpolicy` rule spelled `./dir/`, or behind a byte order mark, protects nothing and warns of nothing"]
+fn bug_1831_a_file_under_a_dot_slash_rule_is_not_recorded() {
+    let (mut repo, fs, _) = new_repo("alice");
+    fs.write(&p(".veilpolicy"), b"./private/ isolate\n").unwrap();
+    fs.write(&p("private/notes.txt"), b"kept on this device only\n").unwrap();
+    fs.write(&p("README.md"), b"hello\n").unwrap();
+    let out = repo.snapshot_workspace(WS, &*fs).unwrap();
+    assert!(file_entry(&repo, &out.snapshot, "README.md").is_some(), "the snapshot recorded the working copy");
+    assert!(
+        file_entry(&repo, &out.snapshot, "private/notes.txt").is_none() || !out.report.policy_warnings.is_empty(),
+        "private/notes.txt was recorded as plain text, with no warning"
+    );
 }
