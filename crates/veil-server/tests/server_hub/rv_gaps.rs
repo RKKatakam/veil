@@ -359,11 +359,18 @@ fn settled(api: &Api, token: Option<&str>, path: &str) -> Reply {
     let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         let r = api.get(token, path);
-        if r.status != 503 || std::time::Instant::now() >= end {
+        if !(r.status == 503 || behind(&r)) || std::time::Instant::now() >= end {
             return r;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// Is `r` a search or grep answer from an index still catching up with
+/// the branch tip (`behind`, `docs/HUB.md` §13.23)? It is the answer of an
+/// older snapshot, and says so: not what two views are compared by.
+fn behind(r: &Reply) -> bool {
+    r.status == 200 && serde_json::from_slice::<serde_json::Value>(&r.body).is_ok_and(|v| v["behind"] == true)
 }
 
 /// Without what differs between two askers of one view: the policy's
@@ -417,6 +424,7 @@ fn query_answers(api: &Api, project: &str, token: Option<&str>, who: &str) -> Ve
     for p in paths {
         let r = settled(api, token, &format!("{base}/{p}"));
         assert_eq!(r.status, 200, "{who}: {p}: {}", String::from_utf8_lossy(&r.body));
+        assert!(!behind(&r), "{who}: {p}: the index never caught up with the tip: {}", String::from_utf8_lossy(&r.body));
         let text = match serde_json::from_slice::<serde_json::Value>(&r.body) {
             Ok(mut v) => {
                 stripped(&mut v);
