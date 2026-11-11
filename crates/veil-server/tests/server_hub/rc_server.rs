@@ -426,7 +426,6 @@ fn bug_1921_an_edit_reverted_twice_needs_a_person_whatever_change_id_it_is_given
 /// The control is the same revision of a change that reached `main` as the
 /// move's own change: refused, "already landed on 'main' with other edits".
 #[test]
-#[ignore = "BUG-1922: a change brought onto a branch below an API commit's own is landed again"]
 fn bug_1922_a_change_below_an_api_commit_that_moved_the_branch_is_not_landed_again() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
