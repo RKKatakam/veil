@@ -3925,7 +3925,10 @@ Every request passes through `limits::admit` before any route, in this order:
    `retry_after_ms` (and `Retry-After`): the time until the caller's own
    next token, the same for every project, hidden or not, naming nothing.
    `vl` waits it out (and a `503 busy`'s), at most 8 times and 2 minutes in
-   all (BUG-1331). Idle buckets (full ones) are forgotten; a shard keeps at
+   all (BUG-1331); a `503 warming` (the caller's history is being
+   prepared, on any route that reads it: a pull's `/history` page, a
+   query), which carries no time, under the same bound: half a second,
+   doubling to 8 s (BUG-1913). Idle buckets (full ones) are forgotten; a shard keeps at
    most 16,384 keys. **Every signed-in request also pays its person's
    umbrella** (ten times a device's rate, over all of the person's devices
    and agent sessions), under a session or under a read grant, whose
