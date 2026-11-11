@@ -1003,6 +1003,11 @@ fn g6_phase2_routes_enforce_batch_chain_upload_and_inline_bounds() {
 /// `unreferenced_objects`, pass 2 rewrites packs / deletes loose objects past
 /// `retention_window_ms`, and pass 3 sweeps `DISCARDED` packs from storage.
 fn run_full_gc(hub: &TestHub, pid: i64) -> pack_gc::Report {
+    // The search index names its segments in `search_shards`, which GC's
+    // reference stamp reads (BUG-1923): GC gives way to an index still
+    // writing what the test's pushes started, so that is finished first.
+    hub.rt.block_on(veil_server::derive::catch_up_project(&hub.hub(), pid)).unwrap();
+    hub.rt.block_on(veil_server::search::index::catch_up_project(&hub.hub(), pid)).unwrap();
     for off in [0i64, 120_000, 120_001] {
         let rep = hub
             .rt
