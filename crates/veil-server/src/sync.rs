@@ -2670,11 +2670,17 @@ async fn push_staged(
             }
         }
         let is_embargo_branch = veil_core::embargo::embargo_id_of_branch(&u.branch).is_some();
+        let rev_twice_branch = !is_embargo_branch
+            && !req.force
+            && !land_all
+            && !protected.contains(&u.branch)
+            && cur.is_some()
+            && crate::bisect::branch_has_reverted_twice(hub, project.id, &u.branch).await?;
         // Landed by the landing service instead of moved here: the new
         // changes on top of whatever base they have (they need not be on
         // the tip), as one stack. Hidden embargo lines (`embargo/<id>`) move
         // directly by CAS and land on their target branch at release.
-        if !is_embargo_branch && !req.force && (land_all || protected.contains(&u.branch)) && (cur.is_some() || land_all) {
+        if !is_embargo_branch && !req.force && (land_all || protected.contains(&u.branch) || rev_twice_branch) && (cur.is_some() || land_all) {
             let Some(new_real) = new_real else {
                 return Err(Error::forbidden(format!("'{}' is protected: only an admin's forced push deletes it", u.branch)));
             };
@@ -2735,16 +2741,24 @@ async fn push_staged(
                 results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
                 continue;
             }
-            if protected.contains(&u.branch) {
-                match crate::prs::check_landing_review(hub, project, viewer, &u.branch, &judged.stack, Some(st.clone())).await {
-                    Ok(_) => {}
-                    Err(e) if land_all => return Err(e),
-                    Err(Error::Api { message, .. }) => {
-                        results.push(refuse(&message));
-                        continue;
-                    }
-                    Err(e) => return Err(e),
+            match crate::prs::check_landing_review(
+                hub,
+                project,
+                viewer,
+                &u.branch,
+                &judged.stack,
+                Some(st.clone()),
+                protected.contains(&u.branch),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) if land_all => return Err(e),
+                Err(Error::Api { message, .. }) => {
+                    results.push(refuse(&message));
+                    continue;
                 }
+                Err(e) => return Err(e),
             }
             queued.push(crate::landing::Queued {
                 ticket: crate::landing::ticket(),

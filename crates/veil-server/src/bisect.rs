@@ -127,10 +127,51 @@ pub struct BisectStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub culprit_change_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub original: Option<ObjectId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_change_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub revert: Option<ObjectId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revert_ticket: Option<String>,
     pub updated_at: i64,
+}
+
+/// Whether any `change_id` in `change_ids` has been automatically reverted at
+/// least twice in `project_id` (BUG-1884). Counted by `change_id` across
+/// rebases and lineages, and never reset.
+pub async fn any_reverted_twice(hub: &Hub, project_id: i64, change_ids: &[String]) -> Result<bool> {
+    if change_ids.is_empty() {
+        return Ok(false);
+    }
+    sync_queued_reverts(hub, project_id, None).await?;
+    let hit: Option<String> = sqlx::query_scalar(
+        "SELECT culprit_change_id FROM bisect_reverts \
+         WHERE project_id = $1 AND culprit_change_id <> '' AND culprit_change_id = ANY($2) AND state = 'reverted' \
+         GROUP BY culprit_change_id HAVING COUNT(*) >= 2 LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(change_ids)
+    .fetch_optional(&hub.db)
+    .await?;
+    Ok(hit.is_some())
+}
+
+/// Whether `branch` itself has any `change_id` reverted twice by the server,
+/// so even a direct fast-forward onto an unprotected branch still checks
+/// `change_id`s reverted twice there while leaving topic branches free.
+pub async fn branch_has_reverted_twice(hub: &Hub, project_id: i64, branch: &str) -> Result<bool> {
+    sync_queued_reverts(hub, project_id, Some(branch)).await?;
+    let hit: Option<String> = sqlx::query_scalar(
+        "SELECT culprit_change_id FROM bisect_reverts \
+         WHERE project_id = $1 AND branch = $2 AND culprit_change_id <> '' AND state = 'reverted' \
+         GROUP BY culprit_change_id HAVING COUNT(*) >= 2 LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(branch)
+    .fetch_optional(&hub.db)
+    .await?;
+    Ok(hit.is_some())
 }
 
 /// Acquire a short database lease for `(project_id, branch)` in `bisect_leases`.
@@ -1254,6 +1295,139 @@ async fn choose_confirm_parent(
     .await
 }
 
+/// Ensure any `bisect_reverts` rows on `project_id` (optionally filtered to
+/// `branch`) whose `landing_queue` ticket already finished are updated before
+/// checking `revert_snapshot` or revert counts.
+async fn sync_queued_reverts(hub: &Hub, project_id: i64, branch: Option<&str>) -> Result<()> {
+    let pending: Vec<(String, i64, String, String)> = match branch {
+        Some(br) => {
+            sqlx::query_as(
+                "SELECT branch, lineage, culprit, ticket FROM bisect_reverts \
+                 WHERE project_id = $1 AND branch = $2 AND state = 'queued'",
+            )
+            .bind(project_id)
+            .bind(br)
+            .fetch_all(&hub.db)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT branch, lineage, culprit, ticket FROM bisect_reverts \
+                 WHERE project_id = $1 AND state = 'queued'",
+            )
+            .bind(project_id)
+            .fetch_all(&hub.db)
+            .await?
+        }
+    };
+    for (br, lin, culprit_hex, ticket) in pending {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT state, result FROM landing_queue WHERE project_id = $1 AND ticket = $2",
+        )
+        .bind(project_id)
+        .bind(&ticket)
+        .fetch_optional(&hub.db)
+        .await?;
+        let Some((st, Some(res_json))) = row else { continue };
+        if st == "queued" || st == "merging" {
+            continue;
+        }
+        let Ok(outcome) = serde_json::from_str::<veil_core::hub::land::LandResult>(&res_json) else {
+            continue;
+        };
+        if outcome.state == LandState::Landed {
+            let landed_hex = outcome.landed.first().map(ObjectId::hex);
+            sqlx::query(
+                "UPDATE bisect_reverts SET state = 'reverted', revert_snapshot = $5 \
+                 WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND culprit = $4 AND state = 'queued'",
+            )
+            .bind(project_id)
+            .bind(&br)
+            .bind(lin)
+            .bind(&culprit_hex)
+            .bind(&landed_hex)
+            .execute(&hub.db)
+            .await?;
+            clear_reverted_landing_marks(hub, project_id, &br, lin, &culprit_hex).await?;
+        } else if matches!(outcome.state, LandState::Conflict | LandState::Rejected) {
+            sqlx::query(
+                "UPDATE bisect_reverts SET state = 'conflict' \
+                 WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND culprit = $4 AND state = 'queued'",
+            )
+            .bind(project_id)
+            .bind(&br)
+            .bind(lin)
+            .bind(&culprit_hex)
+            .execute(&hub.db)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove deduplication rows for a reverted snapshot (`landed_changes`, and
+/// `landings` where `submitted <> landed`) so re-landing or rewriting the
+/// reverted `change_id` is judged afresh rather than skipped or rejected as
+/// already landed.
+async fn clear_reverted_landing_marks(
+    hub: &Hub,
+    project_id: i64,
+    branch: &str,
+    lineage: i64,
+    culprit_hex: &str,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM landed_changes WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND landed = $4",
+    )
+    .bind(project_id)
+    .bind(branch)
+    .bind(lineage)
+    .bind(culprit_hex)
+    .execute(&hub.db)
+    .await?;
+    sqlx::query(
+        "DELETE FROM landings WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND landed = $4 AND submitted <> landed",
+    )
+    .bind(project_id)
+    .bind(branch)
+    .bind(lineage)
+    .bind(culprit_hex)
+    .execute(&hub.db)
+    .await?;
+    Ok(())
+}
+
+/// If `culprit` is a revert the server made itself on `(project_id, branch)`,
+/// return the `(original_snapshot, original_change_id)` that revert undid.
+async fn server_revert_origin(
+    hub: &Arc<Hub>,
+    project_id: i64,
+    branch: &str,
+    culprit: ObjectId,
+) -> Result<Option<(ObjectId, String)>> {
+    sync_queued_reverts(hub, project_id, Some(branch)).await?;
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT culprit, culprit_change_id FROM bisect_reverts \
+         WHERE project_id = $1 AND branch = $2 AND revert_snapshot = $3 LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(branch)
+    .bind(culprit.hex())
+    .fetch_optional(&hub.db)
+    .await?;
+    let Some((orig_hex, mut orig_cid)) = row else {
+        return Ok(None);
+    };
+    let orig = ObjectId::from_hex(&orig_hex).map_err(|e| Error::Other(e.into()))?;
+    if orig_cid.is_empty() {
+        orig_cid = sync::blocking(hub, project_id, move |src| {
+            Ok(src.snapshot(&orig)?.change_id.to_string())
+        })
+        .await?;
+    }
+    Ok(Some((orig, orig_cid)))
+}
+
 /// Build and land the priority revert for confirmed `culprit` through S17
 /// (`landing_queue` with `priority = 1`), idempotently across servers and
 /// restarts.
@@ -1269,6 +1443,34 @@ async fn revert_confirmed_culprit(
     if crate::embargo::is_withheld_for_query(hub, project.id, &culprit).await? {
         b.phase = "unconfirmed".to_string();
         save_bisect(hub, b, holder, epoch).await?;
+        return Ok(());
+    }
+
+    // BUG-1884: the server never reverts a revert it made itself. Stop the
+    // bisect as `needs a person` without reverting, and notify participants
+    // who see the culprit or original change through the event stream.
+    if let Some((original, original_cid)) = server_revert_origin(hub, project.id, &b.branch, culprit).await? {
+        let culprit_cid = sync::blocking(hub, project.id, move |src| {
+            Ok(src.snapshot(&culprit)?.change_id.to_string())
+        })
+        .await?;
+        b.phase = "needs a person".to_string();
+        b.probes.clear();
+        if save_bisect(hub, b, holder, epoch).await? {
+            crate::events::emit_needs_person(
+                hub,
+                project.id,
+                &b.branch,
+                culprit,
+                &culprit_cid,
+                original,
+                &original_cid,
+                &b.check_name,
+                &b.session_paths,
+                b.admin_only,
+            )
+            .await;
+        }
         return Ok(());
     }
 
@@ -1384,10 +1586,12 @@ async fn revert_confirmed_culprit(
     let p_epoch = epochs.person;
     let j_epoch = epochs.project.map_or(0, |(_, e)| e);
 
+    let culprit_cid2 = culprit_cid.clone();
     crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-        let (branch_name, culprit_hex, check_name, rev_hex, ticket2, admin_name, admin_device_key, stack_json) = (
+        let (branch_name, culprit_hex, culprit_cid2, check_name, rev_hex, ticket2, admin_name, admin_device_key, stack_json) = (
             branch_name.clone(),
             culprit_hex.clone(),
+            culprit_cid2.clone(),
             check_name.clone(),
             rev_hex.clone(),
             ticket2.clone(),
@@ -1406,14 +1610,15 @@ async fn revert_confirmed_culprit(
             .await?;
 
             let inserted = sqlx::query(
-                "INSERT INTO bisect_reverts (project_id, branch, lineage, culprit, check_name, ticket, state, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, 'queued', (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT) \
+                "INSERT INTO bisect_reverts (project_id, branch, lineage, culprit, culprit_change_id, check_name, ticket, state, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT) \
                  ON CONFLICT (project_id, branch, lineage, culprit) DO NOTHING",
             )
             .bind(pid)
             .bind(&branch_name)
             .bind(lineage)
             .bind(&culprit_hex)
+            .bind(&culprit_cid2)
             .bind(&check_name)
             .bind(&ticket2)
             .execute(&mut *c)
@@ -1493,18 +1698,23 @@ async fn apply_revert_outcome(
             b.revert_snapshot = landed_snap;
             save_bisect(hub, b, holder, epoch).await?;
             let landed_hex = landed_snap.map(|x| x.hex());
+            let culprit_hex = culprit.hex();
             let notified = sqlx::query(
-                "UPDATE bisect_reverts SET state = 'reverted', revert_snapshot = $5 \
+                "UPDATE bisect_reverts \
+                 SET state = 'reverted', revert_snapshot = $5, \
+                     culprit_change_id = CASE WHEN culprit_change_id = '' THEN $6 ELSE culprit_change_id END \
                  WHERE project_id = $1 AND branch = $2 AND lineage = $3 AND culprit = $4 AND state <> 'reverted'",
             )
             .bind(project_id)
             .bind(&b.branch)
             .bind(b.lineage)
-            .bind(culprit.hex())
+            .bind(&culprit_hex)
             .bind(&landed_hex)
+            .bind(culprit_cid)
             .execute(&hub.db)
             .await?
             .rows_affected();
+            clear_reverted_landing_marks(hub, project_id, &b.branch, b.lineage, &culprit_hex).await?;
             if notified == 1 {
                 if let Some(rev_real) = landed_snap {
                     crate::events::emit_reverted(
@@ -1632,6 +1842,8 @@ pub async fn status_route(
 
     let mut vis_culprit = None;
     let mut vis_culprit_cid = None;
+    let mut vis_original = None;
+    let mut vis_original_cid = None;
     if let Some(c) = b.culprit {
         if let Some(pc) = visible_projection(&hub, &project, &viewer, c).await? {
             vis_culprit = Some(pc);
@@ -1641,6 +1853,14 @@ pub async fn status_route(
             .await?;
             vis_culprit_cid = Some(cid);
         }
+        if b.phase == "needs a person" {
+            if let Some((orig, ocid)) = server_revert_origin(&hub, project.id, &b.branch, c).await? {
+                if let Some(po) = visible_projection(&hub, &project, &viewer, orig).await? {
+                    vis_original = Some(po);
+                    vis_original_cid = Some(ocid);
+                }
+            }
+        }
     }
 
     let mut vis_revert = None;
@@ -1648,13 +1868,13 @@ pub async fn status_route(
         vis_revert = visible_projection(&hub, &project, &viewer, r).await?;
     }
 
-    // If the viewer cannot see the check AND neither a culprit nor a revert is visible
-    // to them (or a culprit was identified in hidden paths that are invisible to them),
-    // the bisect does not exist in their view (`404`).
-    if !sees_check && vis_culprit.is_none() && vis_revert.is_none() {
+    // If the viewer cannot see the check AND neither a culprit nor a revert (nor
+    // the original change undid by a culprit revert) is visible to them, the
+    // bisect does not exist in their view (`404`).
+    if !sees_check && vis_culprit.is_none() && vis_revert.is_none() && vis_original.is_none() {
         return Err(Error::not_found(format!("no bisect on branch '{branch}'")));
     }
-    if b.culprit.is_some() && vis_culprit.is_none() && vis_revert.is_none() {
+    if b.culprit.is_some() && vis_culprit.is_none() && vis_revert.is_none() && vis_original.is_none() {
         return Err(Error::not_found(format!("no bisect on branch '{branch}'")));
     }
 
@@ -1679,6 +1899,8 @@ pub async fn status_route(
         probes: vis_probes,
         culprit: vis_culprit,
         culprit_change_id: vis_culprit_cid,
+        original: vis_original,
+        original_change_id: vis_original_cid,
         revert: vis_revert,
         revert_ticket: (viewer.admin || vis_revert.is_some()).then_some(b.revert_ticket).flatten(),
         updated_at: b.updated_at,

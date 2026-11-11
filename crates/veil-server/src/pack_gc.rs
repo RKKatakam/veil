@@ -1387,7 +1387,7 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("access_epochs", &["project_id", "person_id", "epoch", "changed_at"]),
     ("audit_log", &["id", "project_id", "at", "actor", "action", "details"]),
     ("bisect_leases", &["project_id", "branch", "holder", "epoch", "expires_at"]),
-    ("bisect_reverts", &["project_id", "branch", "lineage", "check_name", "ticket", "state", "created_at"]),
+    ("bisect_reverts", &["project_id", "branch", "lineage", "check_name", "ticket", "state", "created_at", "culprit_change_id"]),
     ("bisects", &["project_id", "branch", "lineage", "check_name", "lo", "hi", "phase", "culprit_fails", "parent_passes", "confirm_requested_at", "session_paths", "admin_only", "revert_ticket", "created_at", "updated_at"]),
     ("blame_ends", &["project_id", "view_key", "path_key", "follow", "held", "kept_bytes", "path_keys", "created_at"]),
     ("blame_jobs", &["project_id", "view_key", "path_key", "follow", "holder", "expires_at"]),

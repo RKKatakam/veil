@@ -728,6 +728,143 @@ pub async fn emit_reverted(
     }
 }
 
+/// Visible projection of `real` for `viewer` (non-withheld, touches at least
+/// one path readable within `viewer`'s narrowing, and did not collapse into
+/// its first parent's projection).
+async fn visible_event_snapshot(
+    hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    viewer: &crate::perm::Viewer,
+    real: ObjectId,
+) -> Option<ObjectId> {
+    if real == crate::sync::root_snapshot_id() {
+        return None;
+    }
+    if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await.unwrap_or(true) {
+        return None;
+    }
+    let p_snap = crate::sync::projected(hub, project, viewer, real).await.ok()?;
+    if !viewer.admin || project.view(viewer).is_narrowed() {
+        let (policy_text, bindings, v) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
+        let (parent, touches_visible) = crate::sync::blocking(hub, project.id, move |src| {
+            let s = src.snapshot(&real)?;
+            let Some(p0) = s.parents.first().copied() else {
+                return Ok((None, false));
+            };
+            let ps = src.snapshot(&p0)?;
+            let p = crate::perm::Project {
+                id: src.project,
+                name: String::new(),
+                default_branch: String::new(),
+                policy: veil_core::hub::access::AccessPolicy::parse(&policy_text),
+                policy_text,
+                bindings,
+            };
+            let view = p.view(&v);
+            let step = crate::landing::edits::edit_set(src, s.tree, ps.tree)?;
+            let vis = step.iter().any(|c| view.read(&c.path) && view.within_narrowing(&c.path));
+            Ok((Some(p0), vis))
+        })
+        .await
+        .unwrap_or((None, false));
+        if !touches_visible {
+            return None;
+        }
+        if let Some(p0) = parent {
+            if crate::sync::projected(hub, project, viewer, p0).await.ok() == Some(p_snap) {
+                return None;
+            }
+        }
+    }
+    Some(p_snap)
+}
+
+/// Emit `bisect.needs_person` (`state: "needs a person"`) when bisect names a
+/// server-made revert (`culprit_real`) of `original_real` as the culprit and
+/// stops without reverting (BUG-1884), filtered per viewer (`docs/VISIBILITY.md`).
+#[allow(clippy::too_many_arguments)]
+pub async fn emit_needs_person(
+    hub: &Arc<Hub>,
+    project_id: i64,
+    branch: &str,
+    culprit_real: ObjectId,
+    culprit_change_id: &str,
+    original_real: ObjectId,
+    original_change_id: &str,
+    check_name: &str,
+    session_paths: &[String],
+    admin_only: bool,
+) {
+    let subs: Vec<Arc<Subscriber>> = {
+        let map = hub.events.subscribers.lock().unwrap();
+        map.values()
+            .filter(|s| {
+                s.project_id == project_id
+                    && s.ticket.is_none()
+                    && s.branch.as_deref().is_none_or(|b| b == branch)
+                    && (s.wants_type("bisect.needs_person", "needs a person")
+                        || s.wants_type("needs_person", "bisect"))
+            })
+            .cloned()
+            .collect()
+    };
+    if subs.is_empty() {
+        return;
+    }
+    for sub in subs {
+        if let Some(a) = &sub.person.agent {
+            match crate::auth::load_agent_session(&hub.db, &a.session_hash, sub.person.id, project_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    hub.events.evict(&sub);
+                    continue;
+                }
+                Err(_) => continue,
+            }
+        }
+        let Ok(epochs) = crate::caches::read_epochs(&hub.db, sub.person.id, Some(project_id)).await else {
+            continue;
+        };
+        let caller = Caller {
+            person: Some(sub.person.clone()),
+            epochs,
+        };
+        let Ok((project, viewer)) = crate::perm::open(hub, &sub.project_name, &caller).await else {
+            hub.events.evict(&sub);
+            continue;
+        };
+        if !project.participant(&viewer) {
+            hub.events.evict(&sub);
+            continue;
+        }
+        let p_culprit = visible_event_snapshot(hub, &project, &viewer, culprit_real).await;
+        let p_original = visible_event_snapshot(hub, &project, &viewer, original_real).await;
+        if p_culprit.is_none() && p_original.is_none() {
+            continue;
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert("event".into(), serde_json::Value::String("bisect.needs_person".into()));
+        obj.insert("state".into(), serde_json::Value::String("needs a person".into()));
+        obj.insert("phase".into(), serde_json::Value::String("needs a person".into()));
+        obj.insert("branch".into(), serde_json::Value::String(branch.into()));
+        if let Some(pc) = p_culprit {
+            obj.insert("culprit".into(), serde_json::Value::String(pc.hex()));
+            obj.insert("change_id".into(), serde_json::Value::String(culprit_change_id.into()));
+            obj.insert("culprit_change_id".into(), serde_json::Value::String(culprit_change_id.into()));
+        }
+        if let Some(po) = p_original {
+            obj.insert("original".into(), serde_json::Value::String(po.hex()));
+            obj.insert("original_change_id".into(), serde_json::Value::String(original_change_id.into()));
+        }
+        if crate::ci::can_see_check(&project, &viewer, session_paths, admin_only) {
+            obj.insert("check".into(), serde_json::Value::String(check_name.into()));
+        }
+        let data = serde_json::Value::Object(obj).to_string();
+        let frame = Bytes::from(format!("event: bisect.needs_person\ndata: {data}\n\n"));
+        hub.events.push_frame(&sub, frame);
+    }
+}
+
 type WaitFut = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 struct StreamBody {

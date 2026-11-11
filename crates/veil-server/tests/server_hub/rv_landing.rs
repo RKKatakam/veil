@@ -465,3 +465,454 @@ fn bug_1863_what_a_push_committed_in_its_own_task_is_never_run_again() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(runs.load(Ordering::SeqCst), 2, "uncommitted retryable failure in spawned task must still retry");
 }
+
+fn collect_sse_events(resp: ureq::http::Response<ureq::Body>, want: usize, timeout: Duration) -> Vec<(String, Value)> {
+    use std::io::{BufRead, BufReader};
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(resp.into_body().into_reader());
+        let mut cur_event = String::new();
+        let mut cur_data = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                    if trimmed.is_empty() {
+                        if !cur_event.is_empty() || !cur_data.is_empty() {
+                            let val = serde_json::from_str(&cur_data).unwrap_or(Value::String(cur_data.clone()));
+                            if tx.send((cur_event.clone(), val)).is_err() {
+                                break;
+                            }
+                            cur_event.clear();
+                            cur_data.clear();
+                        }
+                    } else if let Some(ev) = trimmed.strip_prefix("event:") {
+                        cur_event = ev.trim().to_string();
+                    } else if let Some(d) = trimmed.strip_prefix("data:") {
+                        if !cur_data.is_empty() {
+                            cur_data.push('\n');
+                        }
+                        cur_data.push_str(d.trim());
+                    }
+                }
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let mut out = Vec::new();
+    while out.len() < want {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(rem) {
+            Ok(item) => out.push(item),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// BUG-1884 guarantee 1: the server never reverts a revert it made itself.
+/// When a later landing builds on a change that bisect reverts, and a second
+/// bisect names the server's own revert as the culprit, bisect stops as
+/// `needs a person` without reverting, and the authors of both the culprit and
+/// the original change are notified through the project's event stream.
+#[test]
+fn bug_1884_server_never_reverts_a_revert_it_made_itself() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let admin = p.admin.token();
+    let dev1 = p.dev.token();
+
+    // Add `p.sec` to `devs` so the original change and the dependent change
+    // have distinct authors, and verify both receive `bisect.needs_person`.
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let dev2 = p.sec.token();
+
+    let rules = "[branches.main]\nprotected = true\nrequired_checks = [\"ci/lint\", \"ci/build\"]\n\n\
+                 [checks.\"ci/lint\"]\npaths = [\"src/\"]\n\n\
+                 [checks.\"ci/build\"]\npaths = [\"src/\"]\n\n\
+                 [review]\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n";
+    let s0 = land_edit(&hub, &p, &admin, ".veilrules", rules, "rules");
+    assert_eq!(post_check(&hub, &admin, &p.name, s0, "ci/lint", "pass").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, s0, "ci/build", "pass").status, 200);
+
+    // `p.dev` lands `c1` adding `src/helper.rs`, and `bob` lands `c2` calling it.
+    let c1_reply = change(&hub, &dev1, &p.name, "src/helper.rs", "pub fn helper() -> i32 { 7 }\n", "add helper");
+    assert_eq!(c1_reply.status, 200, "{}", body(&c1_reply));
+    let c1_sub = c1_reply.json()["snapshot"].as_str().unwrap().to_string();
+    let c1_cid = c1_reply.json()["change_id"].as_str().unwrap().to_string();
+    let l1 = land(&hub, &dev1, &p.name, &c1_sub);
+    assert_eq!(l1.status, 200, "{}", body(&l1));
+    assert_eq!(l1.json()["state"], "landed");
+    let c1 = tip(&hub, &admin, &p.name);
+
+    let c2 = land_edit(&hub, &p, &dev2, "src/caller.rs", "pub fn run() -> i32 { crate::helper::helper() }\n", "use helper");
+
+    // `ci/lint` fails on `c2` and `c1` (twice on `c1`), so S20 reverts `c1` as `r1`.
+    assert_eq!(post_check(&hub, &admin, &p.name, c2, "ci/lint", "fail").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, c1, "ci/lint", "fail").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, c1, "ci/lint", "fail").status, 200);
+
+    let mut st1 = bisect_status(&hub, &admin, &p.name).json();
+    for _ in 0..50 {
+        if st1["phase"] == "reverted" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        st1 = bisect_status(&hub, &admin, &p.name).json();
+    }
+    assert_eq!(st1["phase"], "reverted", "{st1}");
+    let r1 = ObjectId::from_hex(st1["revert"].as_str().unwrap()).unwrap();
+    assert_eq!(tip(&hub, &admin, &p.name), r1);
+
+    // Subscribe both authors (`p.dev` and `bob`) and `p.admin` to `/events`.
+    let dev1_sse = hub.api().get_unread(&format!("/v1/projects/{}/events", p.name), &[("authorization", &format!("Bearer {dev1}"))]);
+    let dev2_sse = hub.api().get_unread(&format!("/v1/projects/{}/events", p.name), &[("authorization", &format!("Bearer {dev2}"))]);
+    assert_eq!(dev1_sse.status().as_u16(), 200);
+    assert_eq!(dev2_sse.status().as_u16(), 200);
+
+    // `ci/build` passes on `c1` and `c2`, but fails on `r1` (because `c2` needs `c1`!).
+    // A second `fail` on `r1` confirms `r1` (the server's own revert!) as the culprit.
+    assert_eq!(post_check(&hub, &admin, &p.name, c1, "ci/build", "pass").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, c2, "ci/build", "pass").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, r1, "ci/build", "fail").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, r1, "ci/build", "fail").status, 200);
+
+    let st2 = bisect_status(&hub, &admin, &p.name).json();
+    assert_eq!(st2["phase"], "needs a person", "server-made revert named as culprit must stop as 'needs a person': {st2}");
+    assert_eq!(st2["culprit"], r1.hex(), "{st2}");
+    assert_eq!(st2["original"], c1.hex(), "{st2}");
+    assert_eq!(st2["original_change_id"], c1_cid, "{st2}");
+    assert!(st2["revert"].is_null(), "must not revert a server-made revert: {st2}");
+    assert_eq!(tip(&hub, &admin, &p.name), r1, "branch tip must remain at r1 without a revert-of-revert");
+
+    let ev1 = collect_sse_events(dev1_sse, 1, Duration::from_secs(2));
+    let ev2 = collect_sse_events(dev2_sse, 1, Duration::from_secs(2));
+    assert!(
+        ev1.iter().any(|(ev, d)| ev == "bisect.needs_person" && d["state"] == "needs a person" && d["original_change_id"] == c1_cid),
+        "author of original change must receive bisect.needs_person event: {ev1:?}"
+    );
+    assert!(
+        ev2.iter().any(|(ev, d)| ev == "bisect.needs_person" && d["state"] == "needs a person" && d["original_change_id"] == c1_cid),
+        "author of subsequent change must receive bisect.needs_person event: {ev2:?}"
+    );
+}
+
+/// BUG-1884 guarantee 2: after a `change_id` has been reverted twice by the
+/// server, landing that `change_id` again (even rewritten/rebased and under
+/// permissive branch rules) requires one person's approval via S21 as if high
+/// risk; an agent's approval never counts, the refusal names
+/// `reverted twice: needs a person's approval`, and the count is never reset.
+#[test]
+fn bug_1884_change_reverted_twice_needs_a_persons_approval() {
+    use veil_core::{crypto::domains::SIG_CONTEXT_HUB_PR_REVIEW, hub::pr::review_message};
+
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let admin = p.admin.token();
+    let dev = p.dev.token();
+
+    // Even when `.veilrules` marks `src/**` as `checks_only` and sets 0 approvals
+    // for both normal and high risk (with `people_only = false` on normal),
+    // a twice-reverted `change_id` must still require 1 person's approval!
+    let rules = "[branches.main]\nprotected = true\nrequired_checks = [\"ci/src\"]\n\n\
+                 [checks.\"ci/src\"]\npaths = [\"src/\"]\n\n\
+                 [review]\nchecks_only = [\"src/**\"]\n\
+                 normal = { approvals = 0, people_only = false }\n\
+                 high = { approvals = 0 }\n";
+    let s0 = land_edit(&hub, &p, &admin, ".veilrules", rules, "permissive rules");
+    assert_eq!(post_check(&hub, &admin, &p.name, s0, "ci/src", "pass").status, 200);
+
+    // Mint agent sessions for `p.dev` and `p.admin`.
+    let dev_sess = hub
+        .api()
+        .post_json(
+            Some(&dev),
+            "/v1/sessions/agent",
+            &json!({"project": p.name, "attribution": {"agent": "test/coder"}}),
+        )
+        .json();
+    let dev_agent = dev_sess["token"].as_str().unwrap().to_string();
+    let admin_sess = hub
+        .api()
+        .post_json(
+            Some(&admin),
+            "/v1/sessions/agent",
+            &json!({"project": p.name, "attribution": {"agent": "test/reviewer"}}),
+        )
+        .json();
+    let admin_agent = admin_sess["token"].as_str().unwrap().to_string();
+
+    // 1st landing of `cid` by `dev_agent`, followed by 1st automatic revert.
+    let c1_res = change(&hub, &dev_agent, &p.name, "src/flaky.rs", "pub const V: i32 = 1;\n", "feature v1");
+    assert_eq!(c1_res.status, 200, "{}", body(&c1_res));
+    let cid = c1_res.json()["change_id"].as_str().unwrap().to_string();
+    let sub1 = c1_res.json()["snapshot"].as_str().unwrap().to_string();
+    let l1 = land(&hub, &dev_agent, &p.name, &sub1);
+    assert_eq!(l1.status, 200, "{}", body(&l1));
+    assert_eq!(l1.json()["state"], "landed");
+    let s1 = tip(&hub, &admin, &p.name);
+
+    assert_eq!(post_check(&hub, &admin, &p.name, s1, "ci/src", "fail").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, s1, "ci/src", "fail").status, 200);
+    let mut st = bisect_status(&hub, &admin, &p.name).json();
+    for _ in 0..50 {
+        if st["phase"] == "reverted" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        st = bisect_status(&hub, &admin, &p.name).json();
+    }
+    assert_eq!(st["phase"], "reverted", "{st}");
+    let r1 = tip(&hub, &admin, &p.name);
+    assert_eq!(post_check(&hub, &admin, &p.name, r1, "ci/src", "pass").status, 200);
+
+    // After 1 revert, rewriting `cid` still lands directly without person approval.
+    let base2 = tip(&hub, &dev_agent, &p.name);
+    let c2_res = hub.api().post_json(
+        Some(&dev_agent),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": base2.hex(),
+            "change_id": cid,
+            "description": "feature v2",
+            "edits": [{"path": "src/flaky.rs", "put": {"text": "pub const V: i32 = 2;\n"}}]
+        }),
+    );
+    assert_eq!(c2_res.status, 200, "{}", body(&c2_res));
+    let sub2 = c2_res.json()["snapshot"].as_str().unwrap().to_string();
+    let l2 = land(&hub, &dev_agent, &p.name, &sub2);
+    assert_eq!(l2.status, 200, "after 1 revert, re-landing cid must still be allowed: {}", body(&l2));
+    assert_eq!(l2.json()["state"], "landed");
+    let s2 = tip(&hub, &admin, &p.name);
+
+    // 2nd automatic revert of `cid`.
+    assert_eq!(post_check(&hub, &admin, &p.name, s2, "ci/src", "fail").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, s2, "ci/src", "fail").status, 200);
+    st = bisect_status(&hub, &admin, &p.name).json();
+    for _ in 0..50 {
+        if st["phase"] == "reverted" && st["culprit"] == s2.hex() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        st = bisect_status(&hub, &admin, &p.name).json();
+    }
+    assert_eq!(st["phase"], "reverted", "{st}");
+    let r2 = tip(&hub, &admin, &p.name);
+
+    // 3rd attempt: direct re-land of `sub2` AND rebased/rewritten `cid` (`sub3`) must both be refused!
+    let l2_again = land(&hub, &dev_agent, &p.name, &sub2);
+    assert_eq!(l2_again.status, 409, "{}", body(&l2_again));
+    assert!(
+        body(&l2_again).contains("reverted twice: needs a person's approval"),
+        "expected reverted-twice refusal reason, got: {}",
+        body(&l2_again)
+    );
+
+    let base3 = tip(&hub, &dev_agent, &p.name);
+    let c3_topic = hub.api().post_json(
+        Some(&dev_agent),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": base3.hex(),
+            "change_id": cid,
+            "description": "feature v3 rebased and rewritten",
+            "edits": [{"path": "src/flaky.rs", "put": {"text": "pub const V: i32 = 3;\n"}}]
+        }),
+    );
+    assert_eq!(c3_topic.status, 200, "{}", body(&c3_topic));
+    let sub3 = c3_topic.json()["snapshot"].as_str().unwrap().to_string();
+
+    let c3_land = land(&hub, &dev_agent, &p.name, &sub3);
+    assert_eq!(c3_land.status, 409, "{}", body(&c3_land));
+    assert!(
+        body(&c3_land).contains("reverted twice: needs a person's approval"),
+        "rewritten change_id must still require person approval: {}",
+        body(&c3_land)
+    );
+
+    // Push `sub3` onto a topic branch `wip/fix` and open a PR onto `main`.
+    let push_wip = hub.api().post_json(
+        Some(&dev_agent),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "wip/fix", "expected": null, "new": sub3}]}),
+    );
+    assert_eq!(push_wip.status, 200, "{}", body(&push_wip));
+    assert_eq!(push_wip.json()["results"][0]["ok"], json!(true), "{}", body(&push_wip));
+    let wip_admin = hub.api().tips(Some(&admin), &p.name).unwrap().branches["wip/fix"];
+    assert_eq!(post_check(&hub, &admin, &p.name, wip_admin, "ci/src", "pass").status, 200);
+
+    let pr_resp = hub.api().post_json(
+        Some(&dev_agent),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"head": sub3, "onto": "main", "title": "Fix feature v3"}),
+    );
+    assert_eq!(pr_resp.status, 200, "{}", body(&pr_resp));
+    let pr_json = pr_resp.json();
+    let pr_id = pr_json["id"].as_str().unwrap().to_string();
+    let patch3 = pr_json["patch"].as_str().unwrap().to_string();
+    assert_eq!(pr_json["review"]["risk"], "high", "{pr_json}");
+    assert_eq!(pr_json["review"]["ready"], false, "{pr_json}");
+    assert!(
+        pr_json["review"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r.as_str() == Some("reverted twice: needs a person's approval")),
+        "PR review gate must name reverted-twice reason: {pr_json}"
+    );
+
+    // Agent approval is refused over HTTP, and even a stored `agent = true`
+    // verdict never counts toward landing a twice-reverted change_id.
+    let admin_sig = p
+        .admin
+        .identity()
+        .sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch3, "approve"));
+    let agent_rev = hub.api().post_json(
+        Some(&admin_agent),
+        &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+        &json!({"patch": patch3, "verdict": "approve", "signature": admin_sig}),
+    );
+    assert_eq!(agent_rev.status, 403, "agent session must not approve PR: {}", body(&agent_rev));
+
+    let pid: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.hub().db))
+        .unwrap();
+    let admin_person_id: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.admin.name).fetch_one(&hub.hub().db))
+        .unwrap();
+    let stored = hub
+        .rt
+        .block_on(veil_server::prs::review::put_verdict(
+            &hub.hub(),
+            pid,
+            &pr_id,
+            1,
+            admin_person_id,
+            "approve",
+            &patch3,
+            true,
+            "agent-dev",
+            &admin_sig,
+            "lgtm from agent",
+            true,
+        ))
+        .unwrap();
+    assert!(stored);
+    let pr_land_agent = hub
+        .api()
+        .post_json(Some(&dev_agent), &format!("/v1/projects/{}/prs/{pr_id}/land", p.name), &json!({}));
+    assert_eq!(pr_land_agent.status, 409, "agent verdict must never count: {}", body(&pr_land_agent));
+    assert!(body(&pr_land_agent).contains("reverted twice: needs a person's approval"));
+
+    // Now a human person (`p.admin`) approves the exact patch -> landing succeeds!
+    let person_rev = hub.api().post_json(
+        Some(&admin),
+        &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+        &json!({"patch": patch3, "verdict": "approve", "signature": admin_sig}),
+    );
+    assert_eq!(person_rev.status, 200, "{}", body(&person_rev));
+    assert_eq!(person_rev.json()["review"]["ready"], true, "{}", body(&person_rev));
+
+    // Approval of `patch3` only lets that exact patch land: another rewrite of
+    // `cid` (`V = 99`) is still refused without its own person approval.
+    let c3_other = hub.api().post_json(
+        Some(&dev_agent),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": base3.hex(),
+            "change_id": cid,
+            "description": "feature v3 different patch",
+            "edits": [{"path": "src/flaky.rs", "put": {"text": "pub const V: i32 = 99;\n"}}]
+        }),
+    );
+    assert_eq!(c3_other.status, 200, "{}", body(&c3_other));
+    let sub3_other = c3_other.json()["snapshot"].as_str().unwrap().to_string();
+    let other_land = land(&hub, &dev_agent, &p.name, &sub3_other);
+    assert_eq!(other_land.status, 409, "person approval applies only to exact patch: {}", body(&other_land));
+    assert!(body(&other_land).contains("reverted twice: needs a person's approval"));
+
+    let pr_land_ok = hub
+        .api()
+        .post_json(Some(&dev_agent), &format!("/v1/projects/{}/prs/{pr_id}/land", p.name), &json!({}));
+    assert_eq!(pr_land_ok.status, 200, "person approval of exact patch must let cid land: {}", body(&pr_land_ok));
+    assert_eq!(file_on_main(&hub, &admin, &p.name, "src/flaky.rs").body, b"pub const V: i32 = 3;\n");
+
+    // The revert count was not reset to 0 by `pr_land_ok`: after just ONE more
+    // revert of `cid`, re-landing `cid` still needs a person's approval (if the
+    // count had been reset to 0, one revert would leave count == 1 and allow it).
+    assert_eq!(post_check(&hub, &admin, &p.name, r2, "ci/src", "pass").status, 200);
+    let s3 = tip(&hub, &admin, &p.name);
+    assert_eq!(post_check(&hub, &admin, &p.name, s3, "ci/src", "fail").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, s3, "ci/src", "fail").status, 200);
+    st = bisect_status(&hub, &admin, &p.name).json();
+    for _ in 0..50 {
+        if st["phase"] == "reverted" && st["culprit"] == s3.hex() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        st = bisect_status(&hub, &admin, &p.name).json();
+    }
+    assert_eq!(st["phase"], "reverted", "{st}");
+    assert_eq!(st["culprit"], s3.hex(), "{st}");
+
+    let base4 = tip(&hub, &dev_agent, &p.name);
+    let c4_res = hub.api().post_json(
+        Some(&dev_agent),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": base4.hex(),
+            "change_id": cid,
+            "description": "feature v4 unapproved rewrite",
+            "edits": [{"path": "src/flaky.rs", "put": {"text": "pub const V: i32 = 4;\n"}}]
+        }),
+    );
+    assert_eq!(c4_res.status, 200, "{}", body(&c4_res));
+    let sub4 = c4_res.json()["snapshot"].as_str().unwrap().to_string();
+    let c4_land = land(&hub, &dev_agent, &p.name, &sub4);
+    assert_eq!(c4_land.status, 409, "revert count must not reset after landing: {}", body(&c4_land));
+    assert!(body(&c4_land).contains("reverted twice: needs a person's approval"));
+}
+
+/// BUG-1884 guarantee 3: bisect still reverts a first-time confirmed culprit
+/// at once, as before, so normal operation is unchanged.
+#[test]
+fn bug_1884_first_time_culprit_still_reverts_at_once() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let admin = p.admin.token();
+    let dev = p.dev.token();
+
+    let rules = "[branches.main]\nprotected = true\nrequired_checks = [\"ci/src\"]\n\n\
+                 [checks.\"ci/src\"]\npaths = [\"src/\"]\n\n\
+                 [review]\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n";
+    let s0 = land_edit(&hub, &p, &admin, ".veilrules", rules, "rules");
+    assert_eq!(post_check(&hub, &admin, &p.name, s0, "ci/src", "pass").status, 200);
+
+    let c1 = land_edit(&hub, &p, &dev, "src/good.rs", "pub const OK: bool = true;\n", "good");
+    let c2 = land_edit(&hub, &p, &dev, "src/bad.rs", "compile_error!(\"oops\");\n", "first-time culprit");
+
+    assert_eq!(post_check(&hub, &admin, &p.name, c1, "ci/src", "pass").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, c2, "ci/src", "fail").status, 200);
+    assert_eq!(post_check(&hub, &admin, &p.name, c2, "ci/src", "fail").status, 200);
+
+    let mut st = bisect_status(&hub, &admin, &p.name).json();
+    for _ in 0..50 {
+        if st["phase"] == "reverted" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        st = bisect_status(&hub, &admin, &p.name).json();
+    }
+    assert_eq!(st["phase"], "reverted", "{st}");
+    assert_eq!(st["culprit"], c2.hex(), "{st}");
+    assert_eq!(file_on_main(&hub, &admin, &p.name, "src/good.rs").status, 200);
+    assert_eq!(file_on_main(&hub, &admin, &p.name, "src/bad.rs").status, 404);
+}
+

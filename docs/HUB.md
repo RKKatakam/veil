@@ -5322,6 +5322,22 @@ migration `0026_bisect_and_revert.sql` (`landing_queue.priority`,
     `ours = tip.tree`, `theirs = P.tree`), surgically reversing only `C`'s edits
     while preserving later changes' edits. If a later change modified the same
     lines as `C`, S18 reports a conflict and bisect records `phase = "conflict"`.
+* **No automatic revert loops (`BUG-1884`, migration `0029_bisect_revert_change_id.sql`).**
+  * The server never reverts a revert it made itself (`bisect::server_revert_origin`
+    matches `bisect_reverts.revert_snapshot`). When bisect confirms a server-made
+    revert as the culprit (for instance, after a later landing built on the
+    reverted change), bisect stops at `phase = "needs a person"` without queueing
+    a revert and emits `bisect.needs_person` (`events::emit_needs_person`,
+    visibility-filtered per viewer) naming both the culprit revert and the
+    original change.
+  * `bisect_reverts` also records `culprit_change_id`. Once a `change_id` has
+    been reverted twice by the server (`bisect::any_reverted_twice`), landing
+    that `change_id` again—even rebased or rewritten—requires at least one
+    person's approval of the exact patch through S21 (`prs::review::gate`,
+    `prs::check_landing_review`) as if high risk (`people_only = true`,
+    refusal `reverted twice: needs a person's approval`), regardless of the
+    branch's rules, and the count is never reset. First-time culprits still
+    revert immediately as before.
 * **Visibility (`docs/VISIBILITY.md`) and routes (`GET /v1/projects/{p}/bisect/{branch}`).**
   * `events::emit_check_requested`, `events::emit_reverted`, and
     `bisect::status_route` project every snapshot (`good`, `bad`, `candidates`,
