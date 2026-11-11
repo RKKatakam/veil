@@ -918,7 +918,7 @@ const FRONTIER_LIMIT: usize = 64;
 
 /// Whether a change of a stack landed already ([`Ancestry::landed`]).
 #[derive(Clone, Copy, PartialEq)]
-enum Landed {
+pub(crate) enum Landed {
     No,
     /// With the same edits: skipped.
     Same,
@@ -1400,7 +1400,7 @@ impl Ancestry {
     /// same change, or rebased on a tip that holds it: skip it); `Other`:
     /// it brings further edits (refused: they are a new change's). A row
     /// with another author is ignored (`No`).
-    async fn landed(&mut self, x: ObjectId, held: bool, fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>) -> Result<Landed> {
+    pub(crate) async fn landed(&mut self, x: ObjectId, held: bool, fresh: &HashMap<ObjectId, (Vec<ObjectId>, i64)>) -> Result<Landed> {
         let n: Option<i32> = if !held {
             None
         } else {

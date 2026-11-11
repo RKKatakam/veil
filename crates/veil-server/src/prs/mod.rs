@@ -593,6 +593,7 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
     query::resolve(hub, ask, &onto, deadline).await?;
     let onto_tip = tip(hub, ask.project.id, &onto).await?.ok_or_else(|| Error::not_found("no such revision that you can see"))?;
     let (_, head) = query::resolve_real(hub, ask, &q.head, deadline).await?;
+    let source_branch = crate::branches::pr_source_branch(hub, ask.project.id, &q.head, &onto, head).await?;
     let r = compute(hub, ask, head, onto_tip).await?;
     readable_by(ask, &r.touched)?;
     if ask.viewer.only.is_some() && r.touched.iter().any(|p| !ask.viewer.within_narrowing(p)) {
@@ -608,15 +609,24 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
     for _ in 0..5 {
         let id = random_id();
         let now = veil_core::now_millis();
-        let (r, key, lines, title, body, onto, id2) = (r.clone(), key.clone(), lines.clone(), title.clone(), body.clone(), onto.clone(), id.clone());
+        let (r, key, lines, title, body, onto, src_b, id2) = (
+            r.clone(),
+            key.clone(),
+            lines.clone(),
+            title.clone(),
+            body.clone(),
+            onto.clone(),
+            source_branch.clone(),
+            id.clone(),
+        );
         let fresh = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
-            let (r, key, lines, title, body, onto, id) = (r.clone(), key.clone(), lines.clone(), title.clone(), body.clone(), onto.clone(), id2.clone());
+            let (r, key, lines, title, body, onto, src_b, id) = (r.clone(), key.clone(), lines.clone(), title.clone(), body.clone(), onto.clone(), src_b.clone(), id2.clone());
             Box::pin(async move {
                 crate::pack_gc::guard_root_write(&mut *c, project, gc_epoch).await?;
                 let class = class::put_class(&mut *c, project, &key, &lines).await?;
                 let inserted = sqlx::query(
-                    "INSERT INTO prs (project_id, id, class_id, policy_key, target, author, title, body, state, revision, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', 1, $9, $9) ON CONFLICT (project_id, id) DO NOTHING",
+                    "INSERT INTO prs (project_id, id, class_id, policy_key, target, source_branch, author, title, body, state, revision, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $10, $6, $7, $8, 'open', 1, $9, $9) ON CONFLICT (project_id, id) DO NOTHING",
                 )
                 .bind(project)
                 .bind(&id)
@@ -627,6 +637,7 @@ pub async fn create(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr) -> 
                 .bind(&title)
                 .bind(&body)
                 .bind(now)
+                .bind(&src_b)
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
@@ -861,6 +872,7 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let deadline = Instant::now() + DEADLINE;
     let (_, head) = query::resolve_real(hub, ask, &q.head, deadline).await?;
+    let source_branch = crate::branches::pr_source_branch(hub, ask.project.id, &q.head, &pr.target, head).await?;
     // The target as the caller sees it (never a withheld one), then its tip.
     query::resolve(hub, ask, &pr.target, deadline).await.map_err(|_| Error::conflict(format!("the target {} no longer exists", pr.target)))?;
     let onto = tip(hub, ask.project.id, &pr.target).await?.ok_or_else(|| Error::conflict(format!("the target {} no longer exists", pr.target)))?;
@@ -911,13 +923,13 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     let (project, prid, r, old_rev) = (ask.project.id, pr.id.clone(), Arc::new(r), pr.revision);
     let now = veil_core::now_millis();
     let ok = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
-        let (key, lines, prid, r, moved) = (key.clone(), lines.clone(), prid.clone(), r.clone(), moved.clone());
+        let (key, lines, prid, r, moved, src_b) = (key.clone(), lines.clone(), prid.clone(), r.clone(), moved.clone(), source_branch.clone());
         Box::pin(async move {
             crate::pack_gc::guard_root_write(&mut *c, project, gc_epoch).await?;
             let class = class::put_class(&mut *c, project, &key, &lines).await?;
             // The compare-and-swap: two new revisions at once, one wins.
             let moved_on = sqlx::query(
-                "UPDATE prs SET revision = $1, class_id = $2, policy_key = $3, updated_at = $4 \
+                "UPDATE prs SET revision = $1, class_id = $2, policy_key = $3, updated_at = $4, source_branch = COALESCE($8, source_branch) \
                  WHERE project_id = $5 AND id = $6 AND revision = $7 AND state = 'open'",
             )
             .bind(n)
@@ -927,6 +939,7 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
             .bind(project)
             .bind(&prid)
             .bind(old_rev)
+            .bind(&src_b)
             .execute(&mut *c)
             .await?
             .rows_affected();
@@ -1798,6 +1811,7 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
             .bind(pr.revision)
             .execute(&hub.db)
             .await?;
+        let _ = crate::branches::delete_merged_pr_branch(hub, ask.project.id, &pr.id, me).await;
         return show(hub, ask, id).await;
     }
     if let Some(first) = judged.stack.first_mut() {
@@ -1851,6 +1865,7 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
                 .bind(pr.revision)
                 .execute(&hub.db)
                 .await?;
+            let _ = crate::branches::delete_merged_pr_branch(hub, ask.project.id, &pr.id, me).await;
             let mut v = show(hub, ask, id).await?;
             v["landing"] = serde_json::to_value(&r).unwrap_or_default();
             Ok(v)

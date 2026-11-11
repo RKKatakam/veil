@@ -1129,3 +1129,633 @@ fn bug_1883_peer_resume_preserves_live_merge_claims() {
     assert_eq!(done["state"], "landed", "{done}");
     assert_eq!(done["merges"], 1, "no duplicate merge counted when peer runs resume: {done}");
 }
+
+// ---------------------------------------------------------------------------
+// BUG-1885: merged branches can be deleted by writers and on PR landing
+// ---------------------------------------------------------------------------
+
+/// BUG-1885 Guarantee 1: anyone with write access to the project may delete a
+/// branch whose tip is already contained in the default branch (`vl tag delete`
+/// + `vl push`, and HTTP `/push`); unmerged branches, protected branches, the
+/// default branch, `embargo/…` lines, and callers without write access stay
+/// refused.
+#[test]
+fn bug_1885_writers_may_delete_merged_branches_only() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    // Protect `rel-prot-1` (pointing at `main`) via `.veilrules` on `main`.
+    write_files(&p.dir, &[(".veilrules", "[branches.rel-prot-1]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect rel-prot-1");
+    p.admin.ok(&p.dir, &["push"]);
+
+    let dev_dir = p.dev.dir("clone");
+    p.dev.clone_trusting(&hub.url(&p.name), &dev_dir, &p.fp);
+
+    // 1. `dev` creates `task-anc-1` with a change, merges it into `main`, and
+    //    also creates `task-eq-1` right at `main`, plus `task-unmerged-1`
+    //    holding work NOT on `main`.
+    write_files(&dev_dir, &[("src/anc1.rs", "pub fn anc1() -> u32 { 1 }\n")]);
+    p.dev.ok(&dev_dir, &["commit", "--no-advance", "-m", "anc1"]);
+    p.dev.ok(&dev_dir, &["tag", "set", "task-anc-1", "-r", "@-"]);
+    p.dev.ok(&dev_dir, &["push", "-t", "task-anc-1"]);
+
+    // Advance `main` past `task-anc-1` (merge/fast-forward + one more commit so
+    // `task-anc-1` is a strict ancestor of `main`).
+    p.dev.ok(&dev_dir, &["tag", "set", "main", "-r", "task-anc-1"]);
+    p.dev.ok(&dev_dir, &["new", "main"]);
+    write_files(&dev_dir, &[("src/after_anc.rs", "pub fn after() {}\n")]);
+    p.dev.commit_main(&dev_dir, "advance main past task-anc-1");
+    p.dev.ok(&dev_dir, &["tag", "set", "task-eq-1", "-r", "main"]);
+    p.dev.ok(&dev_dir, &["tag", "set", "rel-prot-1", "-r", "main"]);
+    p.dev.ok(&dev_dir, &["push"]);
+
+    // Create `task-unmerged-1` with work not on `main`.
+    p.dev.ok(&dev_dir, &["new", "main"]);
+    write_files(&dev_dir, &[("src/unmerged1.rs", "pub fn unmerged() {}\n")]);
+    p.dev.ok(&dev_dir, &["commit", "--no-advance", "-m", "unmerged work"]);
+    p.dev.ok(&dev_dir, &["tag", "set", "task-unmerged-1", "-r", "@-"]);
+    p.dev.ok(&dev_dir, &["push", "-t", "task-unmerged-1"]);
+
+    // Create an embargo line pointing at `main` (contained in `main`, yet `embargo/…`).
+    let main_real: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(project_id(&hub, &p.name)).fetch_one(&hub.hub().db))
+        .unwrap();
+    hub.rt
+        .block_on(
+            sqlx::query("INSERT INTO branches (project_id, name, target) VALUES ($1, 'embargo/e1a2b3c4d5e6f708', $2)")
+                .bind(project_id(&hub, &p.name))
+                .bind(&main_real)
+                .execute(&hub.hub().db),
+        )
+        .unwrap();
+    hub.hub().caches.tips_changed(project_id(&hub, &p.name));
+
+    // Client route: `vl tag delete task-anc-1` followed by `vl push` deletes the merged ancestor branch.
+    p.dev.ok(&dev_dir, &["tag", "delete", "task-anc-1"]);
+    let pushed = p.dev.ok(&dev_dir, &["push"]);
+    assert!(pushed.contains("deleted") && pushed.contains("task-anc-1"), "expected deletion in push output: {pushed}");
+    let branches = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    assert!(!branches.contains_key("task-anc-1"), "merged ancestor branch should be deleted: {branches:?}");
+
+    // Equal-tip branch (`task-eq-1 == main`): `dev` deletes via `vl tag delete` + `vl push`.
+    p.dev.ok(&dev_dir, &["tag", "delete", "task-eq-1"]);
+    let pushed_eq = p.dev.ok(&dev_dir, &["push"]);
+    assert!(pushed_eq.contains("deleted") && pushed_eq.contains("task-eq-1"), "{pushed_eq}");
+    assert!(!api.tips(Some(&admin_tok), &p.name).unwrap().branches.contains_key("task-eq-1"));
+
+    // Unmerged branch (`task-unmerged-1`): `vl tag delete` + `vl push` is refused with today's clear admin-only refusal!
+    let unmerged_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["task-unmerged-1"];
+    p.dev.ok(&dev_dir, &["tag", "delete", "task-unmerged-1"]);
+    let refused = p.dev.fails(&dev_dir, &["push"]);
+    assert!(refused.contains("only admins may delete a branch"), "clear refusal expected: {refused}");
+    assert_eq!(api.tips(Some(&admin_tok), &p.name).unwrap().branches.get("task-unmerged-1"), Some(&unmerged_tip));
+    // Restore local tag so subsequent pushes in `dev_dir` are clean; admin CAN delete it.
+    p.dev.ok(&dev_dir, &["tag", "set", "task-unmerged-1", "-r", &unmerged_tip.hex()]);
+
+    // Someone WITHOUT write access (in an unassigned group `observers` that has no `.veilpolicy` write rule) is refused even on a merged branch.
+    let reader = Person::new(&hub, "reader1");
+    p.admin.ok(&p.dir, &["group", "create", "observers"]);
+    p.admin.ok(&p.dir, &["group", "add", "observers", "reader1", "--confirm", &reader.fingerprint()]);
+    let r = Craft::new(&api, &p.dev, &p.name, "main");
+    let main_dev_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let _ = r;
+    let mk_merged = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-merged-2", "expected": null, "new": main_dev_tip.hex()}]}),
+    );
+    assert_eq!(mk_merged.status, 200, "{}", String::from_utf8_lossy(&mk_merged.body));
+    let reader_tip = api.tips(Some(&reader.token()), &p.name).unwrap().branches["task-merged-2"];
+    let r_reader = api.post_json(
+        Some(&reader.token()),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-merged-2", "expected": reader_tip.hex(), "new": null}]}),
+    );
+    assert_eq!(r_reader.status, 403, "{}", String::from_utf8_lossy(&r_reader.body));
+    assert_eq!(r_reader.json()["message"], "only admins may delete a branch");
+    assert!(api.tips(Some(&admin_tok), &p.name).unwrap().branches.contains_key("task-merged-2"));
+
+    // Protected branch (`rel-prot-1` == `main`), default branch (`main`), and `embargo/…` line are never deleted this way.
+    let prot_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["rel-prot-1"];
+    let r_prot = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "rel-prot-1", "expected": prot_tip.hex(), "new": null}]}),
+    );
+    assert_eq!(r_prot.status, 403, "{}", String::from_utf8_lossy(&r_prot.body));
+    assert!(r_prot.json()["message"].as_str().unwrap_or("").contains("protected"));
+
+    let r_main = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "main", "expected": main_dev_tip.hex(), "new": null}]}),
+    );
+    assert_eq!(r_main.status, 403, "{}", String::from_utf8_lossy(&r_main.body));
+    assert_eq!(r_main.json()["message"], "only admins may delete a branch");
+
+    let emb_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches.get("embargo/e1a2b3c4d5e6f708").copied();
+    let r_emb = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "embargo/e1a2b3c4d5e6f708", "expected": emb_tip.map(|t| t.hex()), "new": null}]}),
+    );
+    assert_eq!(r_emb.status, 403, "{}", String::from_utf8_lossy(&r_emb.body));
+    assert_eq!(r_emb.json()["message"], "only admins may delete a branch");
+
+    let branches_end = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    assert!(branches_end.contains_key("rel-prot-1"));
+    assert!(branches_end.contains_key("main"));
+    assert!(branches_end.contains_key("embargo/e1a2b3c4d5e6f708"));
+}
+
+/// BUG-1885 Guarantee 2: landing a PR deletes its source branch if its tip is
+/// now contained in the PR's target (including rebased landings onto a moved
+/// protected branch and PRs onto non-default branches), leaves the source
+/// branch alone if new unmerged work moved it ahead or if it is protected, and
+/// honours `[branches] delete_merged = false` in `.veilrules`.
+#[test]
+fn bug_1885_pr_landing_deletes_merged_source_branch_unless_disabled() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    write_files(
+        &p.dir,
+        &[(
+            ".veilrules",
+            "[branches.main]\nprotected = true\n[review]\nlow = { approvals = 0 }\nnormal = { approvals = 1 }\n",
+        )],
+    );
+    p.admin.commit_main(&p.dir, "protect main");
+    p.admin.ok(&p.dir, &["push"]);
+
+    let dev_dir = p.dev.dir("clone");
+    p.dev.clone_trusting(&hub.url(&p.name), &dev_dir, &p.fp);
+
+    // 1. CLI `vl pr create` + `vl pr land` when `main` moved meanwhile (landing service rebases!).
+    write_files(&dev_dir, &[("src/pr_del1.rs", "pub fn f1() -> u32 { 1 }\n")]);
+    p.dev.ok(&dev_dir, &["commit", "--no-advance", "-m", "pr del 1"]);
+    p.dev.ok(&dev_dir, &["tag", "set", "task-pr-1", "-r", "@-"]);
+    p.dev.ok(&dev_dir, &["push", "-t", "task-pr-1"]);
+    let pr1_out = p.dev.ok(&dev_dir, &["pr", "create", "task-pr-1", "--title", "PR 1", "--json"]);
+    let pr1: Value = serde_json::from_str(pr1_out.lines().next().unwrap()).unwrap();
+    let pr1_id = pr1["id"].as_str().unwrap();
+
+    // Advance `main` with a low-risk docs change so `task-pr-1` must rebase on land.
+    let base_main = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let r_doc = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "base": base_main.hex(), "edits": [put("docs/note.md", "hello\n")], "wait": true}),
+    );
+    assert_eq!(r_doc.status, 200, "{}", String::from_utf8_lossy(&r_doc.body));
+    assert_eq!(r_doc.json()["state"], "landed");
+
+    p.admin.ok(&p.dir, &["pr", "review", pr1_id, "--approve"]);
+    p.dev.ok(&dev_dir, &["pr", "land", pr1_id]);
+    let tips_after_pr1 = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    assert!(!tips_after_pr1.contains_key("task-pr-1"), "PR source branch must be deleted on land: {tips_after_pr1:?}");
+    assert_eq!(
+        api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?path=src/pr_del1.rs", p.name)).status,
+        200,
+        "landed file is on main"
+    );
+
+    // 2. Sub-branch PR onto a non-default feature branch (`onto: "feat-umb-1"`).
+    let main_now = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_eq!(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "feat-umb-1", "expected": null, "new": main_now.hex()}]}),
+        )
+        .status,
+        200
+    );
+    let sub_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": main_now.hex(), "edits": [put("src/sub_umb.rs", "pub fn sub() {}\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "task-sub-1", "expected": null, "new": sub_snap.hex()}]}),
+        )
+        .status,
+        200
+    );
+    let pr_sub = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "task-sub-1", "onto": "feat-umb-1", "title": "sub into feature"}),
+        )
+        .json();
+    let pr_sub_id = pr_sub["id"].as_str().unwrap();
+    let sub_patch = pr_sub["patch"].as_str().unwrap();
+    let sig_sub = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, pr_sub_id, sub_patch, "approve"));
+    assert_eq!(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_sub_id}/reviews", p.name),
+            &json!({"patch": sub_patch, "verdict": "approve", "signature": sig_sub}),
+        )
+        .status,
+        200
+    );
+    let r_land_sub = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_sub_id}/land", p.name), &json!({}));
+    assert_eq!(r_land_sub.status, 200, "{}", String::from_utf8_lossy(&r_land_sub.body));
+    let tips_after_sub = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    assert!(!tips_after_sub.contains_key("task-sub-1"), "sub-branch deleted when landed into feature target: {tips_after_sub:?}");
+    assert!(tips_after_sub.contains_key("feat-umb-1"));
+
+    // 3. Source branch moved ahead to unmerged work while PR was open -> NOT deleted!
+    let main_now2 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let ahead1: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": main_now2.hex(), "edits": [put("src/ahead1.rs", "pub fn a1() {}\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "task-ahead-1", "expected": null, "new": ahead1.hex()}]}),
+        )
+        .status,
+        200
+    );
+    let pr_ahead = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "task-ahead-1", "title": "ahead"}),
+        )
+        .json();
+    let pr_ahead_id = pr_ahead["id"].as_str().unwrap();
+    let ahead_patch = pr_ahead["patch"].as_str().unwrap();
+    // Push a second unmerged commit onto `task-ahead-1` without updating the PR.
+    let ahead2: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": ahead1.hex(), "edits": [put("src/ahead2.rs", "pub fn a2() {}\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "task-ahead-1", "expected": ahead1.hex(), "new": ahead2.hex()}]}),
+        )
+        .status,
+        200
+    );
+    let sig_ahead = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, pr_ahead_id, ahead_patch, "approve"));
+    assert_eq!(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_ahead_id}/reviews", p.name),
+            &json!({"patch": ahead_patch, "verdict": "approve", "signature": sig_ahead}),
+        )
+        .status,
+        200
+    );
+    let r_land_ahead = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_ahead_id}/land", p.name), &json!({}));
+    assert_eq!(r_land_ahead.status, 200, "{}", String::from_utf8_lossy(&r_land_ahead.body));
+    assert_eq!(
+        api.tips(Some(&dev_tok), &p.name).unwrap().branches.get("task-ahead-1"),
+        Some(&ahead2),
+        "branch with unmerged work past the PR head must be kept"
+    );
+
+    // 4. `.veilrules` `[branches] delete_merged = false` turns off auto-deletion on PR land.
+    let main_admin = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let rules_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({
+                "base": main_admin.hex(),
+                "edits": [put(".veilrules", "[branches]\ndelete_merged = false\n\n[branches.main]\nprotected = true\n\n[review]\nnormal = { approvals = 1 }\nhigh = { approvals = 1, people_only = true }\n")],
+            }),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "main", "expected": main_admin.hex(), "new": rules_snap.hex()}], "force": true}),
+        )
+        .status,
+        200
+    );
+
+    let main_now3 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let keep_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": main_now3.hex(), "edits": [put("src/keep_me.rs", "pub fn keep() {}\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "task-keep-1", "expected": null, "new": keep_snap.hex()}]}),
+        )
+        .status,
+        200
+    );
+    let pr_keep = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "task-keep-1", "title": "keep branch"}),
+        )
+        .json();
+    let pr_keep_id = pr_keep["id"].as_str().unwrap();
+    let keep_patch = pr_keep["patch"].as_str().unwrap();
+    let sig_keep = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, pr_keep_id, keep_patch, "approve"));
+    assert_eq!(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_keep_id}/reviews", p.name),
+            &json!({"patch": keep_patch, "verdict": "approve", "signature": sig_keep}),
+        )
+        .status,
+        200
+    );
+    let r_land_keep = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_keep_id}/land", p.name), &json!({}));
+    assert_eq!(r_land_keep.status, 200, "{}", String::from_utf8_lossy(&r_land_keep.body));
+    assert_eq!(
+        api.tips(Some(&dev_tok), &p.name).unwrap().branches.get("task-keep-1"),
+        Some(&keep_snap),
+        "[branches] delete_merged = false must preserve the merged source branch"
+    );
+}
+
+/// BUG-1885 Guarantee 3: a narrowed agent session may delete only a merged
+/// branch it may move (S11's `agent_tip` rule); unmerged branches and merged
+/// branches touching paths outside its narrowing are refused.
+#[test]
+fn bug_1885_narrowed_agent_deletes_only_merged_branches_it_may_move() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+
+    let narrow_api = api
+        .post_json(
+            Some(&dev_tok),
+            "/v1/sessions/agent",
+            &json!({"project": p.name, "attribution": {"agent": "claude-code", "task": "BUG-1885-A"}, "only": ["src/api"]}),
+        )
+        .json()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let wide_agent = api
+        .post_json(
+            Some(&dev_tok),
+            "/v1/sessions/agent",
+            &json!({"project": p.name, "attribution": {"agent": "claude-code", "task": "BUG-1885-W"}, "only": []}),
+        )
+        .json()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+
+    // 1. `narrow_api` creates `task-api-1` (inside `src/api`) and `task-wip-1` (unmerged, inside `src/api`).
+    let api_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&narrow_api),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base.hex(), "edits": [put("src/api/h.rs", "pub fn h() {}\n")], "onto": {"branch": "task-api-1", "expected": null}}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    let wip_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&narrow_api),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base.hex(), "edits": [put("src/api/wip.rs", "pub fn wip() {}\n")], "onto": {"branch": "task-wip-1", "expected": null}}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+
+    // 2. `dev` creates `task-other-1` touching `src/other_mod.rs` (outside `src/api`).
+    let other_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": api_snap.hex(), "edits": [put("src/other_mod.rs", "pub fn other() {}\n")], "onto": {"branch": "task-other-1", "expected": null}}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+
+    // Advance `main` to `other_snap`, which contains BOTH `task-api-1` and `task-other-1`!
+    let r_ff = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "main", "expected": base.hex(), "new": other_snap.hex()}]}),
+    );
+    assert_eq!(r_ff.status, 200, "{}", String::from_utf8_lossy(&r_ff.body));
+    assert_eq!(r_ff.json()["results"][0]["ok"], true);
+
+    // Unmerged branch (`task-wip-1`): even inside `src/api`, an agent session never deletes an unmerged branch.
+    let r_wip = api.post_json(
+        Some(&narrow_api),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-wip-1", "expected": wip_snap.hex(), "new": null}]}),
+    );
+    assert_eq!(r_wip.status, 403, "{}", String::from_utf8_lossy(&r_wip.body));
+    assert_eq!(r_wip.json()["code"], "agent_session");
+    assert_eq!(r_wip.json()["message"], "an agent session never deletes a branch");
+
+    // Merged branch outside narrowing (`task-other-1`): refused with S11's narrowing refusal, naming no path!
+    let r_other = api.post_json(
+        Some(&narrow_api),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-other-1", "expected": other_snap.hex(), "new": null}]}),
+    );
+    assert_eq!(r_other.status, 200, "{}", String::from_utf8_lossy(&r_other.body));
+    let res0 = &r_other.json()["results"][0];
+    assert_eq!(res0["ok"], false, "{res0}");
+    assert_eq!(res0["message"], "this agent session is narrowed: this would change files outside its paths");
+    assert!(!String::from_utf8_lossy(&r_other.body).contains("other_mod"));
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches.get("task-other-1"), Some(&other_snap));
+
+    // Merged branch inside narrowing (`task-api-1`): `narrow_api` deletes it even though `main` moved on in `src/other_mod.rs`!
+    let r_api = api.post_json(
+        Some(&narrow_api),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-api-1", "expected": api_snap.hex(), "new": null}]}),
+    );
+    assert_eq!(r_api.status, 200, "{}", String::from_utf8_lossy(&r_api.body));
+    assert_eq!(r_api.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r_api.body));
+    assert!(!api.tips(Some(&dev_tok), &p.name).unwrap().branches.contains_key("task-api-1"));
+
+    // Unnarrowed agent session (`wide_agent`) deletes merged `task-other-1`.
+    let r_wide = api.post_json(
+        Some(&wide_agent),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-other-1", "expected": other_snap.hex(), "new": null}]}),
+    );
+    assert_eq!(r_wide.status, 200, "{}", String::from_utf8_lossy(&r_wide.body));
+    assert_eq!(r_wide.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r_wide.body));
+    let end_branches = api.tips(Some(&dev_tok), &p.name).unwrap().branches;
+    assert!(!end_branches.contains_key("task-other-1"));
+    assert_eq!(end_branches.get("task-wip-1"), Some(&wip_snap));
+}
+
+/// BUG-1885 Guarantee 4: deleted branches stop counting toward
+/// `sync::MAX_BRANCHES` (10,000) at once (both in the same push and in
+/// subsequent pushes), while search heads, derived rows and referenced objects
+/// stay intact for existing purge/GC.
+#[test]
+fn bug_1885_deleted_branches_stop_counting_toward_max_branches_at_once() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+    let pid = project_id(&hub, &p.name);
+
+    // Create a merged branch `task-cap-1` via push so search/derived rows exist for it.
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let cap_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base.hex(), "edits": [put("src/cap_keep.rs", "pub fn cap_keep_token_9911() {}\n")], "onto": {"branch": "task-cap-1", "expected": null}}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    let r_ff = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "main", "expected": base.hex(), "new": cap_snap.hex()}]}),
+    );
+    assert_eq!(r_ff.status, 200);
+    assert_eq!(r_ff.json()["results"][0]["ok"], true);
+
+    let h = hub.hub();
+    hub.rt.block_on(veil_server::derive::catch_up_project(&h, pid)).unwrap();
+    hub.rt.block_on(veil_server::search::index::catch_up_project(&h, pid)).unwrap();
+
+    let search_head_before: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM search_heads WHERE project_id = $1 AND branch = 'task-cap-1'").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    assert_eq!(search_head_before, 1, "task-cap-1 indexed in search_heads before deletion");
+
+    // Fill `branches` to `MAX_BRANCHES` (currently `main` + `task-cap-1` = 2; insert 9,998 more).
+    let main_real: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    let need = (veil_server::sync::MAX_BRANCHES - 2) as i64;
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO branches (project_id, name, target) \
+                 SELECT $1, 'bulk-' || g::text, $2 FROM generate_series(1, $3) AS g",
+            )
+            .bind(pid)
+            .bind(&main_real)
+            .bind(need)
+            .execute(&h.db),
+        )
+        .unwrap();
+    h.caches.tips_changed(pid);
+
+    // At `MAX_BRANCHES`: creating one more branch is refused.
+    let r_over = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-over-1", "expected": null, "new": cap_snap.hex()}]}),
+    );
+    assert_eq!(r_over.status, 400, "{}", String::from_utf8_lossy(&r_over.body));
+    assert!(r_over.json()["message"].as_str().unwrap_or("").contains("10000 branches"));
+
+    // Deleting `task-cap-1` and creating `task-rep-1` in ONE push succeeds at once!
+    let r_swap = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [
+                {"branch": "task-cap-1", "expected": cap_snap.hex(), "new": null},
+                {"branch": "task-rep-1", "expected": null, "new": cap_snap.hex()}
+            ]
+        }),
+    );
+    assert_eq!(r_swap.status, 200, "{}", String::from_utf8_lossy(&r_swap.body));
+    assert_eq!(r_swap.json()["results"][0]["ok"], true);
+    assert_eq!(r_swap.json()["results"][1]["ok"], true);
+
+    // Deleting `task-rep-1` in one push, then creating `task-rep-2` in the very next push, succeeds at once!
+    let r_del = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-rep-1", "expected": cap_snap.hex(), "new": null}]}),
+    );
+    assert_eq!(r_del.status, 200, "{}", String::from_utf8_lossy(&r_del.body));
+    assert_eq!(r_del.json()["results"][0]["ok"], true);
+
+    let r_create = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "task-rep-2", "expected": null, "new": cap_snap.hex()}]}),
+    );
+    assert_eq!(r_create.status, 200, "{}", String::from_utf8_lossy(&r_create.body));
+    assert_eq!(r_create.json()["results"][0]["ok"], true);
+
+    // Search heads, derived rows, and objects referenced by `main` stay intact.
+    let search_head_after: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT COUNT(*) FROM search_heads WHERE project_id = $1 AND branch = 'task-cap-1'").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    assert_eq!(search_head_after, 1, "search_heads left for existing purge/GC");
+    let file_r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?path=src/cap_keep.rs", p.name));
+    assert_eq!(file_r.status, 200, "referenced object remains intact");
+}

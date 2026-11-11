@@ -2590,10 +2590,12 @@ async fn push_staged(
     // The review rules a landing on the default branch brings (S21,
     // `prs::state`): recorded in this push's transaction.
     let mut rules_landing: Option<crate::prs::state::Landing> = None;
+    let mut merged_delete_lineage: Option<i64> = None;
     // New branches, against the branches when the push began (concurrent
-    // pushes may each add up to the bound).
+    // pushes may each add up to the bound; deletions in the push free slots at once).
     let created: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_some() && !current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
-    if !created.is_empty() && current.len() + created.len() > MAX_BRANCHES {
+    let deleting: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_none() && current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
+    if !created.is_empty() && current.len().saturating_sub(deleting.len()) + created.len() > MAX_BRANCHES {
         return Err(Error::bad_request(format!("a project has at most {MAX_BRANCHES} branches")));
     }
     for u in &req.updates {
@@ -2716,11 +2718,60 @@ async fn push_staged(
             });
             continue;
         }
-        if new_real.is_none() && !viewer.admin {
-            return Err(Error::forbidden("only admins may delete a branch"));
-        }
-        if new_real.is_none() && viewer.agent {
-            return Err(agent_refusal("an agent session never deletes a branch"));
+        if new_real.is_none() {
+            let writes = project.view(viewer).writes_anything();
+            let mut merged_deletable = false;
+            if !req.force
+                && !is_embargo_branch
+                && !u.branch.starts_with(veil_core::embargo::EMBARGO_BRANCH_PREFIX)
+                && u.branch != project.default_branch
+                && !protected.contains(&u.branch)
+                && writes
+            {
+                if let (Some(c), Some((dtip, dlin))) = (
+                    cur,
+                    crate::branches::lineage_of(hub, project.id, &project.default_branch).await?,
+                ) {
+                    if crate::branches::contained_in_branch(
+                        hub,
+                        project.id,
+                        Some(st.clone()),
+                        c,
+                        &project.default_branch,
+                        dtip,
+                        dlin,
+                    )
+                    .await?
+                    {
+                        merged_deletable = true;
+                        merged_delete_lineage = Some(dlin);
+                    }
+                }
+            }
+            if !merged_deletable {
+                if viewer.agent && (viewer.admin || writes) {
+                    return Err(agent_refusal("an agent session never deletes a branch"));
+                }
+                if !viewer.admin {
+                    return Err(Error::forbidden("only admins may delete a branch"));
+                }
+            } else if let Some(c) = cur {
+                match crate::branches::agent_delete_check(hub, project, viewer, c, Some(st.clone())).await? {
+                    Some(AgentTip::Narrowed) => {
+                        results.push(BranchResult {
+                            branch: u.branch.clone(),
+                            ok: false,
+                            message: Some(NARROWED_MOVE.into()),
+                            tip: cur_seen,
+                            ticket: None,
+                        });
+                        continue;
+                    }
+                    Some(AgentTip::Access) => return Err(agent_refusal(AGENT_ACCESS_MOVE)),
+                    Some(AgentTip::DefaultBranch) => return Err(agent_refusal(AGENT_DEFAULT_BRANCH)),
+                    None => {}
+                }
+            }
         }
         // The one rule of every tip an agent session sets (`agent_tip`):
         // first, for a narrowed one, anything outside its paths; then the
@@ -2795,6 +2846,11 @@ async fn push_staged(
             }
         }
         plans.push((u.branch.clone(), cur, new_real, accept, policy_text_update));
+    }
+    let planned_creates: HashSet<&str> = plans.iter().filter(|(_, cur, new, ..)| cur.is_none() && new.is_some()).map(|(b, ..)| b.as_str()).collect();
+    let planned_deletes: HashSet<&str> = plans.iter().filter(|(_, cur, new, ..)| cur.is_some() && new.is_none()).map(|(b, ..)| b.as_str()).collect();
+    if !planned_creates.is_empty() && current.len().saturating_sub(planned_deletes.len()) + planned_creates.len() > MAX_BRANCHES {
+        return Err(Error::bad_request(format!("a project has at most {MAX_BRANCHES} branches")));
     }
     // The pusher's projections of what this push moves branches to, worked
     // out now and written in its transaction (an admin's are the snapshots).
@@ -2915,6 +2971,7 @@ async fn push_staged(
         listed.iter().map(|p| p.objects as i64).collect(),
     );
     let default_branch = project.default_branch.clone();
+    let admin_unrestricted_delete = viewer.admin && !viewer.agent;
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
     progress.lock().unwrap().transaction = commits;
@@ -2970,10 +3027,16 @@ async fn push_staged(
                             lineages.push((branch.clone(), lineage));
                             1
                         }),
-                    (Some(c0), None) => sqlx::query("DELETE FROM branches WHERE project_id = $1 AND name = $2 AND target = $3")
+                    (Some(c0), None) => sqlx::query(
+                        "DELETE FROM branches WHERE project_id = $1 AND name = $2 AND target = $3 \
+                         AND ($4 OR EXISTS (SELECT 1 FROM branches WHERE project_id = $1 AND name = $5 AND lineage = $6))",
+                    )
                         .bind(pid)
                         .bind(&branch)
                         .bind(c0.hex())
+                        .bind(admin_unrestricted_delete)
+                        .bind(&default_branch)
+                        .bind(merged_delete_lineage.unwrap_or(-1))
                         .execute(&mut *c)
                         .await?
                         .rows_affected(),

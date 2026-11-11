@@ -1531,7 +1531,7 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("project_admins", &["project_id", "person_id"]),
     ("projections", &["project_id", "view_key", "created_at", "collapsed"]),
     ("projects", &["id", "name", "created_by", "created_at", "default_branch", "policy_text", "policy_bindings", "policy_version"]),
-    ("prs", &["project_id", "id", "class_id", "policy_key", "target", "author", "title", "body", "state", "revision", "created_at", "updated_at"]),
+    ("prs", &["project_id", "id", "class_id", "policy_key", "target", "source_branch", "author", "title", "body", "state", "revision", "created_at", "updated_at"]),
     ("rings", &["project_id", "scope", "body"]),
     ("rule_history", &["project_id", "line_key", "generation"]),
     ("rule_lines", &["project_id", "line_key", "ready"]),

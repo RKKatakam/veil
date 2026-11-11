@@ -1498,6 +1498,8 @@ impl Uploads<'_> {
 pub struct PushOutcome {
     pub warnings: Vec<String>,
     pub moved: Vec<(String, ObjectId)>,
+    /// Branches deleted on the server by this push.
+    pub deleted: Vec<String>,
     /// Of `moved`: protected branches, where the server's landing service
     /// landed the pushed changes (`docs/HUB.md` §13.19).
     pub landed: Vec<String>,
@@ -1524,6 +1526,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
     let mut attempt = 0;
     loop {
         attempt += 1;
+        let deleted = veil_core::remote::deleted_tags(&**repo.backend())?;
         let view = repo.view().clone();
         let prefix = format!("{remote}/");
         let mut updates = Vec::new();
@@ -1541,8 +1544,24 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 new: Some(tag.target),
             });
         }
+        for name in deleted.keys() {
+            if view.tags.contains_key(name) {
+                continue;
+            }
+            if !only_tags.is_empty() && !only_tags.contains(name) {
+                continue;
+            }
+            if let Some(&expected) = view.remote_tags.get(&format!("{prefix}{name}")) {
+                updates.push(BranchUpdate {
+                    branch: name.clone(),
+                    expected: Some(expected),
+                    new: None,
+                });
+            }
+        }
         for t in only_tags {
-            if !view.tags.contains_key(t) {
+            let deleted_remote = deleted.contains_key(t) && view.remote_tags.contains_key(&format!("{prefix}{t}"));
+            if !view.tags.contains_key(t) && !deleted_remote {
                 bail!("no tag '{t}' here");
             }
         }
@@ -1551,13 +1570,14 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         // to the server's hidden `embargo/<id>` line with its signed record when
         // its groups exist on the server.
         let targets: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
-        let blocks = veil_core::remote::embargo_blocks(repo, &targets)?;
+        let mut blocks = veil_core::remote::embargo_blocks(repo, &targets)?.into_iter();
         let mut server_groups: Option<HashSet<String>> = None;
         let mut withheld = Vec::new();
         let mut kept = Vec::new();
         let mut embargoes: BTreeMap<String, veil_core::keychain::EmbargoRecord> = BTreeMap::new();
         let mut embargo_targets: BTreeMap<String, (String, ObjectId)> = BTreeMap::new();
-        for (u, why) in updates.into_iter().zip(blocks) {
+        for u in updates {
+            let why = if u.new.is_some() { blocks.next().unwrap_or(None) } else { None };
             match why {
                 Some(why) => {
                     let carried = u.new.and_then(|t| repo.carried_embargo(&t).ok().flatten());
@@ -1621,6 +1641,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             return Ok(PushOutcome {
                 warnings: release_warnings,
                 moved: vec![],
+                deleted: vec![],
                 landed: vec![],
                 rejected: withheld,
                 uploaded: 0,
@@ -1651,6 +1672,7 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
         let mut out = PushOutcome {
             warnings: withdrawn.iter().cloned().chain(result.warnings.iter().cloned()).collect(),
             moved: vec![],
+            deleted: vec![],
             landed: vec![],
             rejected: withheld,
             uploaded,
@@ -1701,6 +1723,8 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
                 }
                 (true, None) => {
                     tx.view.remote_tags.remove(&format!("{prefix}{}", r.branch));
+                    veil_core::remote::clear_tag_deletion(&**tx.repo().backend(), &r.branch)?;
+                    out.deleted.push(r.branch);
                 }
                 (false, _) => out.rejected.push((r.branch, r.message.unwrap_or_default())),
             }

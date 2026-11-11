@@ -1027,6 +1027,16 @@ pub(crate) fn record_tag_deletion(backend: &dyn StorageBackend, name: &str, targ
     save_deleted_tags(backend, &map)
 }
 
+/// Drop the pending deletion record for `name` once a remote push has
+/// deleted it (see [`deleted_tags`]). Called under the repository lock.
+pub fn clear_tag_deletion(backend: &dyn StorageBackend, name: &str) -> Result<()> {
+    let mut map = deleted_tags(backend)?;
+    if map.remove(name).is_some() {
+        save_deleted_tags(backend, &map)?;
+    }
+    Ok(())
+}
+
 /// What a pull does about a remote tag `name` (at `remote_target`) that
 /// has no local tag: `true` to leave it deleted here (see
 /// [`deleted_tags`]). Drops the record when the remote moved past it.

@@ -44,8 +44,15 @@ fn pr_path(id: &str, rest: &str) -> Result<String> {
     Ok(format!("/prs/{id}{rest}"))
 }
 
-/// The snapshot id REV names here: the server takes ids of your history.
+/// The branch name (when `rev` is a tag pushed to `origin` at the same tip)
+/// or snapshot id `rev` names here.
 fn head_of(ctx: &Ctx, rev: &str) -> Result<String> {
+    let view = ctx.repo.view();
+    if let Some(tag) = view.tags.get(rev) {
+        if view.remote_tags.get(&format!("origin/{rev}")) == Some(&tag.target) {
+            return Ok(rev.to_string());
+        }
+    }
     Ok(ctx.rev(rev)?.hex())
 }
 
