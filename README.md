@@ -11,6 +11,16 @@ what, and does the merging.
 
 Veil is not Git, and doesn't interoperate with it. It's written in Rust.
 
+**Where it came from.** Veil is the brainchild of two things. One is Theo's
+(t3.gg) argument that Git is holding agents back, made in his video "Git is
+holding us back": commits and branches were designed for people taking
+turns, not for agents working all at once. The other is
+[Scion](docs/design/scion-for-developers.md), the source control system
+Anthropic described building for its own agents: a server at the centre,
+thin clients, and landing done by the server. Veil takes that design and
+tries to make it something any team can run, from one laptop up. It isn't
+affiliated with or endorsed by either.
+
 ## Why it's built for agents
 
 | What goes wrong with Git | What Veil does |
@@ -57,12 +67,22 @@ and S3-compatible storage beside it ([landings](docs/design/scale/LOAD.md),
 
 ## Where it stands
 
-Veil is pre-release. Every milestone of the server plan is built, and the
-whole suite is green: about 800 server tests, each run on PostgreSQL and on
-YugabyteDB, and about 2,300 client and engine tests. A review of the whole
-code base this week found about 75 bugs; every one is in
-[docs/BUGS.md](docs/BUGS.md) with the test that reproduces it, and all but a
-handful are fixed.
+Veil is pre-release, and close to done:
+
+| Part | State |
+|---|---|
+| Client engine, workspaces, sandboxes | Built |
+| Thin clones, caches, storage on S3 with PostgreSQL or YugabyteDB | Built |
+| History, blame and search answered by the server | Built, speed gate passed |
+| Landing at agent scale, CI, pull requests, embargoes, web client | Built |
+| Review of the whole code base (eight passes this week) | Done: about 75 bugs found, all but a handful fixed |
+| Benchmarks on the final code | Next |
+| A run across several machines | Next |
+
+The whole suite is green: about 800 server tests, each run on PostgreSQL and
+on YugabyteDB, and about 2,300 client and engine tests. Every bug found is
+in [docs/BUGS.md](docs/BUGS.md) with the test that reproduces it, the open
+ones included.
 
 Not proven yet: scale across several machines (the numbers above are from
 one), and the sandbox on macOS, where commands run unconfined for now. By
@@ -102,40 +122,9 @@ Start with [what Veil is](docs/OVERVIEW.md) and
 Veil supports **Linux and macOS**, on x86_64 and aarch64 (Apple
 silicon). Windows is not supported.
 
-### From a release
-
-Every release has a `vl` binary for each platform (static musl binaries on
-Linux, so they run on any distribution), with its SHA-256 checksum, shell
-completions and man pages. The installer script picks the right one, checks
-its checksum and puts `vl` in `~/.cargo/bin`, adding that to your `PATH`:
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/veil-vcs/veil/releases/latest/download/vl-installer.sh | sh
-vl --version
-```
-
-`VL_INSTALL_DIR=<dir>` installs into `<dir>/bin` instead;
-`VL_NO_MODIFY_PATH=1` leaves your shell profile alone. To install by hand, download
-`vl-<target>.tar.xz` and its `.sha256` from the release page
-(`<target>` is `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
-`x86_64-apple-darwin` or `aarch64-apple-darwin`):
-
-```sh
-shasum -a 256 -c vl-aarch64-apple-darwin.tar.xz.sha256    # or sha256sum -c
-tar -xJf vl-aarch64-apple-darwin.tar.xz
-install -m 755 vl-aarch64-apple-darwin/vl ~/.local/bin/
-```
-
-The installer only installs the binary. For completions and man pages, see
-[below](#shell-completions-and-man-pages).
-
-### Homebrew (macOS and Linux)
-
-```sh
-brew install veil-vcs/tap/vl
-```
-
-The formula installs the binary, bash/zsh/fish completions and man pages.
+There is no release yet, so build `vl` from source, as below. The first
+release will ship a binary for each platform with an installer script and a
+Homebrew formula ([docs/RELEASING.md](docs/RELEASING.md)).
 
 ### With Cargo
 
@@ -550,3 +539,8 @@ WebAssembly ([docs/guide/embedding.md](docs/guide/embedding.md)).
 ## Credits
 
 Thanks to okpom, who helped with the idea for Veil.
+
+The idea owes a great deal to Theo (t3.gg), whose case that Git is holding
+agents back is what Veil sets out to answer, and to Anthropic's public
+description of Scion, whose design Veil follows. Neither is affiliated with
+Veil or has endorsed it.
