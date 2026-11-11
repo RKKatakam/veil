@@ -287,6 +287,86 @@ fn bug_1880_an_approval_withdrawn_while_the_entry_is_queued_still_lands() {
     );
 }
 
+/// BUG-1880's fix checks the review again in the batch's transaction, but
+/// reads it without a lock (`READ COMMITTED`): a reviewer who takes the
+/// approval back after that read and before the batch commits is answered
+/// `ready: false`, and the change still lands. The window is the batch's
+/// transaction (milliseconds; longer when it waits for a row, as here).
+#[test]
+#[ignore = "BUG-1886: an approval withdrawn while the landing batch commits still lands"]
+fn bug_1886_an_approval_withdrawn_while_the_batch_commits_still_lands() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
+
+    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect main with review rules");
+    p.admin.ok(&p.dir, &["push"]);
+
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": base.hex(), "edits": [put("src/feature-1880.rs", "pub fn feat() {}\n")]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let feat: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "feat", "expected": null, "new": feat.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true);
+    let pr = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "feat", "title": "add feat"})).json();
+    let (pr_id, patch) = (pr["id"].as_str().unwrap().to_string(), pr["patch"].as_str().unwrap().to_string());
+    let review = |verdict: &str| {
+        let sig = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, verdict));
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+            &json!({"patch": patch, "verdict": verdict, "signature": sig}),
+        )
+    };
+    let r = review("approve");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true);
+
+    // The batch that lands it checks the review in its transaction, and is
+    // then held at the branch's row (as by a push to the branch).
+    let h = th.hub();
+    let mut held = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt
+        .block_on(sqlx::query("SELECT 1 FROM branches WHERE project_id = $1 AND name = 'main' FOR UPDATE").bind(pid).fetch_one(&mut *held))
+        .unwrap();
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": feat.hex(), "wait": false}),
+    );
+    assert_eq!(r.status, 200, "the approved change is queued: {}", String::from_utf8_lossy(&r.body));
+    let queued = r.json();
+    assert_eq!(queued["state"], "queued", "{queued}");
+    let ticket = queued["ticket"].as_str().unwrap().to_string();
+    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE branches SET target%", "the batch never reached its branch move"));
+
+    // Its reviewer takes the approval back, and is told the PR is not ready.
+    let r = review("request-changes");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], false, "the PR is no longer ready to land");
+
+    th.rt.block_on(held.rollback()).unwrap();
+    let done = outcome(&api, &dev_tok, &p.name, &ticket);
+    assert_ne!(done["state"], "queued", "the entry was answered: {done}");
+    assert_eq!(
+        api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"],
+        base,
+        "a change whose only approval was withdrawn (its reviewer told so) landed on protected main: {done}"
+    );
+    assert_eq!(done["state"], "rejected", "{done}");
+}
+
 /// BUG-1880 variants: (1) `.veilrules` tightened by an entry ahead in the
 /// queue, (2) a `pr_holds` hold placed on a path while queued, and (3) a new
 /// revision pushed to a PR while `prs::land` is queued.
@@ -1159,11 +1239,11 @@ fn api_change(api: &Api, token: &str, project: &str, body: &Value) -> ObjectId {
     snap
 }
 
-/// BUG-1885 Guarantee 1: anyone with write access to the project may delete a
-/// branch whose tip is already contained in the default branch (`vl tag delete`
-/// + `vl push`, and HTTP `/push`); unmerged branches, protected branches, the
-/// default branch, `embargo/…` lines, and callers without write access stay
-/// refused.
+/// BUG-1885, guarantees 1 and 5: anyone with write access to the project may
+/// delete a branch whose tip is already contained in the default branch (by
+/// `vl tag delete` then `vl push`, and by HTTP `/push`); unmerged branches,
+/// protected branches, the default branch, `embargo/…` lines, and callers
+/// without write access stay refused, in clear words.
 #[test]
 fn bug_1885_writers_may_delete_merged_branches_only() {
     /// What a deletion that only an admin may make is answered.
