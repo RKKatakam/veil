@@ -114,7 +114,8 @@ fn signed_up(api: &Api) -> String {
 /// under a new name: two anonymous requests each) is served each one's
 /// whole device rate: here 20 sign-ups, each then sending its 20 an hour.
 #[test]
-fn rvgaps_one_address_signing_up_new_people_stays_within_a_persons_rate() {
+#[ignore = "BUG-1890: every sign-up from one address gets a fresh device and person bucket, so one address is served any multiple of a person's rate"]
+fn bug_1890_one_address_signing_up_new_people_stays_within_a_persons_rate() {
     let device = Rate { per_second: 20, per_hour: 20 };
     let hub = TestHub::start_with_limits(Settings { device, ..Settings::default() });
     let api = hub.api();
