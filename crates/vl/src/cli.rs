@@ -1155,6 +1155,8 @@ pub enum PrCmd {
         /// Disarm landing at release so the PR becomes an ordinary open PR instead.
         #[arg(long, conflicts_with = "at_release")]
         no_at_release: bool,
+        #[command(flatten)]
+        out: JsonOut,
     },
 }
 

@@ -4649,26 +4649,35 @@ mod s21_c4 {
         });
     }
 
-    /// BUG-1730: `vl pr land` does not accept `--json` and in text mode prints
+    /// BUG-1730: `vl pr land` did not accept `--json` and in text mode printed
     /// the raw `veil.pr/1` JSON object inside parentheses (`Landed <id> ({...})`).
+    /// Fixed: `--json` prints the PR, and the text is one line.
     #[test]
-    #[ignore = "BUG-1730: vl pr land prints raw JSON in text mode and lacks --json"]
     fn bug_1730_vl_pr_land_prints_raw_json_and_lacks_json_flag() {
         let th = TestHub::start();
         let p = setup_project(&th);
         let dev_dir = p.dev.dir("clone");
         p.dev.clone_trusting(&th.url(&p.name), &dev_dir, &p.fp);
-        write_files(&dev_dir, &[("src/f.rs", "fn f() {}\n")]);
-        p.dev.ok(&dev_dir, &["commit", "--no-advance", "-m", "f"]);
-        p.dev.ok(&dev_dir, &["tag", "set", "f-b1", "-r", "@-"]);
-        p.dev.ok(&dev_dir, &["push"]);
-        let out = p.dev.ok(&dev_dir, &["pr", "create", "f-b1", "--title", "F", "--json"]);
-        let v: Value = serde_json::from_str(&out).unwrap();
-        let id = v["id"].as_str().unwrap();
-        p.admin.ok(&p.dir, &["pr", "review", id, "--approve"]);
-        let json_out = p.admin.ok(&p.dir, &["pr", "land", id, "--json"]);
+        let mut ids = Vec::new();
+        for b in ["f-b1", "f-b2"] {
+            write_files(&dev_dir, &[(&format!("src/{b}.rs"), "fn f() {}\n")]);
+            p.dev.ok(&dev_dir, &["commit", "--no-advance", "-m", b]);
+            p.dev.ok(&dev_dir, &["tag", "set", b, "-r", "@-"]);
+            p.dev.ok(&dev_dir, &["push"]);
+            let out = p.dev.ok(&dev_dir, &["pr", "create", b, "--title", "F", "--json"]);
+            let v: Value = serde_json::from_str(&out).unwrap();
+            ids.push(v["id"].as_str().unwrap().to_string());
+            p.dev.ok(&dev_dir, &["new", "main"]);
+        }
+        p.admin.ok(&p.dir, &["pr", "review", &ids[0], "--approve"]);
+        let json_out = p.admin.ok(&p.dir, &["pr", "land", &ids[0], "--json"]);
         let landed: Value = serde_json::from_str(&json_out).expect("vl pr land --json should emit valid JSON");
         assert_eq!(landed["state"], "landed");
+        assert_eq!(landed["id"], ids[0].as_str());
+        // In text: one line, no JSON.
+        p.admin.ok(&p.dir, &["pr", "review", &ids[1], "--approve"]);
+        let text = p.admin.ok(&p.dir, &["pr", "land", &ids[1]]);
+        assert!(text.contains(&format!("Landed {} onto main", ids[1])) && !text.contains('{'), "{text}");
     }
 
     /// S19 + S21 Guarantee 1: every PR write route (open, update/new revision,

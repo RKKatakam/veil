@@ -245,6 +245,7 @@ Options:
 |---|---|
 | `--at-release` | Arm an embargoed PR to land when its embargo releases |
 | `--no-at-release` | Disarm landing at release so the PR becomes an ordinary open PR instead |
+| `--json` | Print one JSON document instead of text (its schema is named in its `schema` field; see docs/reference/json.md). Errors then also print a `veil.error/1` document |
 
 ---
 

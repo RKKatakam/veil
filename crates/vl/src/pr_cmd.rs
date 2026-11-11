@@ -347,7 +347,7 @@ pub fn run(ctx: &mut Ctx, cmd: &PrCmd) -> Result<()> {
             println!("Closed {}", bold(id));
             Ok(())
         }
-        PrCmd::Land { id, at_release, no_at_release } => {
+        PrCmd::Land { id, at_release, no_at_release, out } => {
             let body = if *at_release {
                 Some(json!({ "at_release": true }))
             } else if *no_at_release {
@@ -356,14 +356,17 @@ pub fn run(ctx: &mut Ctx, cmd: &PrCmd) -> Result<()> {
                 None
             };
             let v = c.project_json("POST", &pr_path(id, "/land")?, body.as_ref())?;
-            if *at_release {
-                println!("{} will land when its embargo releases", bold(id));
-            } else if *no_at_release {
-                println!("{} will become an ordinary open PR when its embargo releases", bold(id));
-            } else {
-                println!("Landed {} ({})", bold(id), safe(&v.to_string()));
-            }
-            Ok(())
+            // The PR as it is now: JSON with `--json`, one line otherwise
+            // (BUG-1730: the text was the whole JSON document).
+            emit(&v, out.json, |v| {
+                if *at_release {
+                    println!("{} will land when its embargo releases", bold(id));
+                } else if *no_at_release {
+                    println!("{} will become an ordinary open PR when its embargo releases", bold(id));
+                } else {
+                    println!("Landed {} onto {}", bold(id), safe(s(v, "target")));
+                }
+            })
         }
     }
 }
