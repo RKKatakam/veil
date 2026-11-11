@@ -51,3 +51,4 @@ mod web;
 mod rv_new;
 mod web_secrets;
 mod rv_s26;
+mod browser;

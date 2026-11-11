@@ -681,6 +681,85 @@ fn bug_1905_a_passkey_signs_in_again_after_signing_out() {
     assert_eq!(count(&hub, "SELECT count(*) FROM audit_log WHERE action = $1", "remove browser device"), 0);
 }
 
+/// The Workers' scripts call only functions the Workers' WASM exports. (Found
+/// by the first run in a real browser: `secret-worker.js` called
+/// `veil_worker_clear_out`, which no WASM had, so "Show secret" never showed
+/// one. `scripts/web-secret-worker.mjs` runs the WASM with a script of its
+/// own, not the server's.)
+#[test]
+fn the_worker_scripts_call_only_functions_the_wasm_exports() {
+    let called = |script: &str| -> Vec<String> {
+        script
+            .split("ex.veil_")
+            .skip(1)
+            .map(|rest| format!("veil_{}", rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>()))
+            .collect()
+    };
+    for (script, wasm, least) in [
+        (include_str!("../../src/web/assets.rs"), include_str!("../../../veil-core/examples/web_wasm.rs"), 5),
+        (include_str!("../../src/web/secrets.rs"), include_str!("../../../veil-core/examples/web_secret_worker.rs"), 6),
+    ] {
+        let names = called(script);
+        assert!(names.len() >= least, "the Worker script's calls were not found: {names:?}");
+        for name in names {
+            assert!(wasm.contains(&format!("extern \"C\" fn {name}(")), "a Worker script calls `{name}`, which its WASM does not export");
+        }
+    }
+}
+
+/// The pages' own forms work: the CSRF token a page carries (its `_csrf`
+/// fields and `veil-csrf` meta) is the session's, on every kind of page, so
+/// a browser that submits the page's "Sign out" form is signed out. (The
+/// other tests take the token from the sign-in's JSON answer, which a
+/// browser's forms never see.)
+#[test]
+fn the_token_in_a_pages_forms_is_the_sessions() {
+    let hub = TestHub::start();
+    let alice = hub.person("alice");
+    let (proj, _dir) = project_with_secret(&hub, &alice, "rvforms");
+    let mut web = BrowserClient::new(&hub);
+    let mut pk = VirtualPasskey::new_without_prf(98);
+    pk.enroll(&mut web, &alice.name, &mint_enroll_code(&hub, &alice));
+    let session = web.csrf.clone().expect("the session's token");
+    let field = |page: &WebReply, what: &str| -> String {
+        assert_eq!(page.status, 200, "{what}: {}", page.text());
+        let text = page.text();
+        let at = text.find("name=\"_csrf\" value=\"").unwrap_or_else(|| panic!("{what}: no form with a token: {text}"));
+        text[at + "name=\"_csrf\" value=\"".len()..].split('"').next().unwrap().to_string()
+    };
+    for path in ["/".to_string(), "/about".to_string(), "/devices".to_string(), format!("/p/{proj}"), format!("/p/{proj}/tree"), format!("/p/{proj}/file/public/readme.md"), format!("/p/{proj}/admin")] {
+        assert_eq!(field(&web.get(&path), &path), session, "the token in the forms of {path} is not the session's");
+    }
+    let page = web.get(&format!("/p/{proj}/file/public/readme.md"));
+    let token = field(&page, "the file page");
+    let form = format!("_csrf={token}");
+    let submit = |headers: &[(&str, &str)]| {
+        let mut all = vec![("content-type", "application/x-www-form-urlencoded")];
+        all.extend_from_slice(headers);
+        web.send("POST", "/web/logout", &all, Some(form.as_bytes()))
+    };
+    // BUG-1907: the pages are served with `Referrer-Policy: no-referrer`,
+    // so a browser sends `Origin: null` with a form it submits. From another
+    // site (the browser says which), or with nothing that says where from,
+    // that is refused; and the session goes on.
+    assert_eq!(page.header("referrer-policy"), Some("no-referrer"));
+    for (headers, what) in [
+        (&[("origin", "null"), ("sec-fetch-site", "cross-site")][..], "another site's form"),
+        (&[("origin", "null"), ("sec-fetch-site", "same-site")][..], "a sibling site's form"),
+        (&[("origin", "null")][..], "`Origin: null` and no Sec-Fetch-Site"),
+        (&[("origin", "https://evil.example"), ("sec-fetch-site", "same-origin")][..], "another origin beside a same-origin claim"),
+        (&[][..], "neither header"),
+    ] {
+        let r = submit(headers);
+        assert_eq!(r.status, 403, "{what}: {}", r.text());
+        assert_eq!(web.get("/devices").status, 200, "{what} ended the session");
+    }
+    // The page's own "Sign out" form, as a browser submits it.
+    let out = submit(&[("origin", "null"), ("sec-fetch-site", "same-origin"), ("sec-fetch-mode", "navigate"), ("sec-fetch-dest", "document")]);
+    assert_eq!(out.status, 303, "the page's own Sign out form: {}", out.text());
+    assert_eq!(web.get("/devices").status, 401, "the session goes on after Sign out");
+}
+
 /// "Your devices" in the web client lists every passkey of the person with
 /// their `vl` devices, and removes a browser: another one ("Remove"), or the
 /// one the session is in ("Remove this browser"), which is a separate action

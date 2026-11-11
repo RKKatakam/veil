@@ -56,10 +56,16 @@ function putStr(s) {
   return putBytes(enc.encode(s));
 }
 
+// As the server's Worker script reads an answer: copy it out, then have the
+// WASM zero and empty it (the answer of an opened secret is its plaintext).
 function readOut() {
   const ptr = ex.veil_worker_out_ptr();
   const len = ex.veil_worker_out_len();
-  return dec.decode(new Uint8Array(memory.buffer, ptr, len));
+  const text = dec.decode(new Uint8Array(memory.buffer, ptr, len));
+  ex.veil_worker_clear_out();
+  assert.equal(ex.veil_worker_out_len(), 0, 'the answer was not cleared');
+  assert.ok(new Uint8Array(memory.buffer, ptr, len).every((b) => b === 0), 'the answer was not zeroed');
+  return text;
 }
 
 function freeAll(allocs) {

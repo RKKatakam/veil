@@ -190,6 +190,15 @@ pub extern "C" fn veil_worker_out_len() -> usize {
     OUT.lock().unwrap().len()
 }
 
+/// Zero and empty the answer: the Worker script calls it as soon as it has
+/// read the answer (the secret's plaintext), so no copy stays in WASM memory.
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_worker_clear_out() {
+    use zeroize::Zeroize as _;
+    let mut out = OUT.lock().unwrap();
+    out.zeroize();
+}
+
 unsafe fn slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     if len == 0 {
         &[]

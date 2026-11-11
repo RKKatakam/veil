@@ -162,7 +162,9 @@ impl BrowserClient {
         }
         let encoded = pairs.join("&").into_bytes();
         self.sent_bodies.lock().unwrap().push((path.to_string(), encoded.clone()));
-        self.send("POST", path, &[("content-type", "application/x-www-form-urlencoded"), ("origin", &self.origin), ("sec-fetch-site", "same-origin")], Some(&encoded))
+        // As a browser submits a form of these pages: under their
+        // `Referrer-Policy: no-referrer` its `Origin` is `null` (BUG-1907).
+        self.send("POST", path, &[("content-type", "application/x-www-form-urlencoded"), ("origin", "null"), ("sec-fetch-site", "same-origin")], Some(&encoded))
     }
 }
 
