@@ -162,7 +162,6 @@ fn embargoed_fix(hub: &TestHub, p: &Project) -> String {
 /// it: here someone who was in `security` when the fix was pushed, and was
 /// then removed from it.
 #[test]
-#[ignore = "BUG-1851: anyone in any group who knows an embargo's id releases it with a push of a record that names their own group"]
 fn bug_1851_only_the_embargos_own_groups_release_it_through_a_push() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -204,12 +203,114 @@ fn bug_1851_only_the_embargos_own_groups_release_it_through_a_push() {
     // The guarantee: the embargo stays as it was (its hidden line, the
     // public main, the fix unread by anyone outside), and the push is refused.
     let answered = format!("the push answered {} {}", r.status, body(&r));
+    assert_eq!(r.status, 404, "someone outside the embargo received a non-404 answer: {answered}");
     assert!(api.tips(Some(&sec_tok), &p.name).unwrap().branches.contains_key(&line), "the embargo's hidden line is gone: it was released ({answered})");
     assert_eq!(main_tip(&hub, None, &p.name), main_before, "the public main moved: the embargoed fix landed on it before its deadline ({answered})");
     let file = api.get(None, &format!("/v1/projects/{}/q/file?path=src/embargo_fix.rs", p.name));
     assert!(!body(&file).contains(FIX_MARK), "everyone on Earth reads the embargoed fix: {}", body(&file));
     assert_eq!(file.status, 404, "{}", body(&file));
-    assert!(matches!(r.status, 400 | 403 | 404), "someone outside the embargo changed it with a push: {answered}");
+}
+
+#[test]
+fn bug_1851_push_cannot_rewrite_deadline_or_scope_of_stored_embargo() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let eid = embargoed_fix(&hub, &p);
+    let api = hub.api();
+    let (fin_tok, sec_tok) = (p.fin.token(), p.sec.token());
+    let stored = api
+        .tips(Some(&sec_tok), &p.name)
+        .unwrap()
+        .embargoes
+        .into_iter()
+        .find(|e| e.id == eid)
+        .expect("security member sees the stored embargo record");
+    let main_before = main_tip(&hub, None, &p.name);
+
+    // 1. Outsider pushes a past `until` with no `released_at` naming their own group (`finance`).
+    let r_out = api.post_json(
+        Some(&fin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [],
+            "embargoes": [{
+                "format": veil_core::keychain::EMBARGO_FORMAT,
+                "id": eid,
+                "scope": "finance",
+                "until": 1_000,
+                "released_at": null,
+                "created": stored.created,
+            }],
+        }),
+    );
+    assert_eq!(r_out.status, 404, "outsider deadline rewrite must return 404: {}", body(&r_out));
+
+    // 2. Fake embargo id returns the identical 404 status and format (no existence oracle).
+    let r_fake = api.post_json(
+        Some(&fin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [],
+            "embargoes": [{
+                "format": veil_core::keychain::EMBARGO_FORMAT,
+                "id": "0123456789",
+                "scope": "finance",
+                "until": 1_000,
+                "released_at": null,
+                "created": stored.created,
+            }],
+        }),
+    );
+    assert_eq!(r_fake.status, 404, "unknown standalone embargo id must return 404: {}", body(&r_fake));
+
+    // 3. Member of `security` tries to rewrite `until` to the past or change `scope`.
+    let r_deadline = api.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [],
+            "embargoes": [{
+                "format": veil_core::keychain::EMBARGO_FORMAT,
+                "id": eid,
+                "scope": stored.scope,
+                "until": 1_000,
+                "released_at": null,
+                "created": stored.created,
+            }],
+        }),
+    );
+    assert_eq!(r_deadline.status, 400, "member deadline rewrite must be refused: {}", body(&r_deadline));
+
+    let r_scope = api.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [],
+            "embargoes": [{
+                "format": veil_core::keychain::EMBARGO_FORMAT,
+                "id": eid,
+                "scope": "security,finance",
+                "until": stored.until,
+                "released_at": null,
+                "created": stored.created,
+            }],
+        }),
+    );
+    assert_eq!(r_scope.status, 400, "member scope rewrite must be refused: {}", body(&r_scope));
+
+    // Running `release_due` must not release the embargo: its stored deadline was untouched.
+    let released = hub.rt.block_on(veil_server::embargo::release_due(&hub.hub())).unwrap();
+    assert_eq!(released, 0, "stored deadline must remain untouched");
+    assert_eq!(main_tip(&hub, None, &p.name), main_before);
+    let after = api
+        .tips(Some(&sec_tok), &p.name)
+        .unwrap()
+        .embargoes
+        .into_iter()
+        .find(|e| e.id == eid)
+        .expect("embargo still active");
+    assert_eq!(after.until, stored.until);
+    assert_eq!(after.scope, stored.scope);
 }
 
 fn change(hub: &TestHub, token: &str, project: &str, req: &Value) -> Reply {

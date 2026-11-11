@@ -246,7 +246,21 @@ pub(crate) async fn prepare_push(
     let mut releases: Vec<(String, EmbargoRecord)> = Vec::new();
     let mut upserts: Vec<LineUpsert> = Vec::new();
 
-    // 1. Validate every EmbargoRecord in `req.embargoes`.
+    let mut pushed_eids: HashSet<String> = HashSet::new();
+    for id in order {
+        if let Some(eid) = &parents_of[id].embargo {
+            pushed_eids.insert(eid.clone());
+        }
+    }
+    for u in &req.updates {
+        if let Some(eid) = embargo_id_of_branch(&u.branch) {
+            pushed_eids.insert(eid.to_string());
+        }
+    }
+
+    // 1. Validate every EmbargoRecord in `req.embargoes` against the stored
+    //    embargo line when one exists (never trusting the pushed record's groups
+    //    or deadline over the stored row).
     for rec in &req.embargoes {
         if rec.format != veil_core::keychain::EMBARGO_FORMAT {
             return Err(Error::bad_request(format!("unsupported embargo record format {}", rec.format)));
@@ -254,24 +268,53 @@ pub(crate) async fn prepare_push(
         if rec.id.len() != 10 || !rec.id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
             return Err(Error::bad_request("an embargo id is 10 lowercase hex characters"));
         }
-        let groups = rec.groups();
-        if groups.is_empty() {
-            return Err(Error::bad_request("an embargo must name at least one group"));
-        }
-        let found: Vec<String> = sqlx::query_scalar("SELECT name FROM groups WHERE project_id = $1 AND name = ANY($2)")
-            .bind(project.id)
-            .bind(&groups)
-            .fetch_all(&hub.db)
-            .await?;
-        for g in &groups {
-            if !found.contains(g) {
-                return Err(Error::bad_request(format!("no group named '{g}' in this project")));
+        let existing: Option<(Vec<String>, String)> = sqlx::query_as(
+            "SELECT group_names, record_json FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
+        )
+        .bind(project.id)
+        .bind(&rec.id)
+        .fetch_optional(&hub.db)
+        .await?;
+
+        if let Some((stored_groups, stored_json)) = existing {
+            if !can_see_groups(hub, project, viewer, &stored_groups).await? {
+                return Err(Error::not_found(format!("no embargo '{}'", rec.id)));
             }
-        }
-        if !can_see_groups(hub, project, viewer, &groups).await? {
-            return Err(Error::forbidden(
-                "you must be an admin or a member of the embargo's group to push or release it",
-            ));
+            let stored_rec: EmbargoRecord =
+                serde_json::from_str(&stored_json).map_err(|e| Error::Other(e.into()))?;
+            if rec.groups() != stored_groups
+                || rec.scope != stored_rec.scope
+                || rec.until != stored_rec.until
+                || rec.created != stored_rec.created
+            {
+                return Err(Error::bad_request(format!(
+                    "embargo {} record conflicts with the stored embargo (scope, deadline, or creation time differs)",
+                    rec.id
+                )));
+            }
+        } else {
+            if !pushed_eids.contains(&rec.id) {
+                return Err(Error::not_found(format!("no embargo '{}'", rec.id)));
+            }
+            let groups = rec.groups();
+            if groups.is_empty() {
+                return Err(Error::bad_request("an embargo must name at least one group"));
+            }
+            let found: Vec<String> = sqlx::query_scalar("SELECT name FROM groups WHERE project_id = $1 AND name = ANY($2)")
+                .bind(project.id)
+                .bind(&groups)
+                .fetch_all(&hub.db)
+                .await?;
+            for g in &groups {
+                if !found.contains(g) {
+                    return Err(Error::bad_request(format!("no group named '{g}' in this project")));
+                }
+            }
+            if !can_see_groups(hub, project, viewer, &groups).await? {
+                return Err(Error::forbidden(
+                    "you must be an admin or a member of the embargo's group to push or release it",
+                ));
+            }
         }
         records_by_id.insert(rec.id.clone(), rec.clone());
         if rec.released_at.is_some() {
@@ -309,34 +352,27 @@ pub(crate) async fn prepare_push(
             if eid.len() != 10 || !eid.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
                 return Err(Error::bad_request("invalid embargo id on snapshot"));
             }
-            // Must have a matching record in `req.embargoes` or already in `embargo_lines`.
-            let rec = match records_by_id.get(eid).cloned() {
-                Some(r) => r,
-                None => {
-                    let existing: Option<String> = sqlx::query_scalar(
-                        "SELECT record_json FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
-                    )
-                    .bind(project.id)
-                    .bind(eid)
-                    .fetch_optional(&hub.db)
-                    .await?;
-                    match existing.and_then(|j| serde_json::from_str::<EmbargoRecord>(&j).ok()) {
-                        Some(r) => r,
-                        None => {
-                            return Err(Error::bad_request(format!(
-                                "snapshot {} carries embargo {}, which was not included in the push",
-                                id.short(),
-                                eid
-                            )))
-                        }
-                    }
+            // Must have a matching record validated in step 1 or already in `embargo_lines`
+            // whose stored groups include the pusher.
+            if !records_by_id.contains_key(eid) {
+                let existing_groups: Option<Vec<String>> = sqlx::query_scalar(
+                    "SELECT group_names FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
+                )
+                .bind(project.id)
+                .bind(eid)
+                .fetch_optional(&hub.db)
+                .await?;
+                let authorized = match existing_groups {
+                    Some(gs) => can_see_groups(hub, project, viewer, &gs).await?,
+                    None => false,
+                };
+                if !authorized {
+                    return Err(Error::bad_request(format!(
+                        "snapshot {} carries embargo {}, which was not included in the push",
+                        id.short(),
+                        eid
+                    )));
                 }
-            };
-            let groups = rec.groups();
-            if !can_see_groups(hub, project, viewer, &groups).await? {
-                return Err(Error::forbidden(
-                    "you must be an admin or a member of the embargo's group to push to it",
-                ));
             }
             snap_embargo.insert(*id, eid.clone());
         } else {
@@ -370,14 +406,11 @@ pub(crate) async fn prepare_push(
         .await?;
 
         let (groups, target_branch, rec) = match (existing_row, records_by_id.get(&eid)) {
-            (Some((groups, target, released_at, json)), rec_opt) => {
+            (Some((groups, target, released_at, json)), _) => {
                 if !can_see_groups(hub, project, viewer, &groups).await? {
                     return Err(Error::not_found(format!("no branch '{}'", u.branch)));
                 }
-                let rec = match rec_opt {
-                    Some(r) => r.clone(),
-                    None => serde_json::from_str::<EmbargoRecord>(&json).map_err(|e| Error::Other(e.into()))?,
-                };
+                let rec = serde_json::from_str::<EmbargoRecord>(&json).map_err(|e| Error::Other(e.into()))?;
                 let _ = released_at;
                 (groups, target, rec)
             }
@@ -388,7 +421,9 @@ pub(crate) async fn prepare_push(
                 } else {
                     u.branch.clone()
                 };
-                (groups, target, rec.clone())
+                let mut initial = rec.clone();
+                initial.released_at = None;
+                (groups, target, initial)
             }
             (None, None) => {
                 return Err(Error::not_found(format!("no branch '{}'", u.branch)));
@@ -410,33 +445,8 @@ pub(crate) async fn prepare_push(
                 target_branch,
                 embargo_branch: ebranch,
                 until_ms: rec.until,
-                released_at: rec.released_at,
+                released_at: None,
                 record_json: serde_json::to_string(&rec).unwrap_or_default(),
-                created_by: pusher_key.to_string(),
-                created_at: rec.created,
-            });
-        }
-    }
-
-    // Also include any standalone EmbargoRecord in `req.embargoes` that updated an existing line's record.
-    for (eid, rec) in &records_by_id {
-        if !upserts.iter().any(|x| x.embargo_id == *eid) {
-            let existing: Option<(Vec<String>, String)> = sqlx::query_as(
-                "SELECT group_names, target_branch FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
-            )
-            .bind(project.id)
-            .bind(eid)
-            .fetch_optional(&hub.db)
-            .await?;
-            let (groups, target_branch) = existing.unwrap_or_else(|| (rec.groups(), project.default_branch.clone()));
-            upserts.push(LineUpsert {
-                embargo_id: eid.clone(),
-                group_names: groups,
-                target_branch,
-                embargo_branch: embargo_branch(eid),
-                until_ms: rec.until,
-                released_at: rec.released_at,
-                record_json: serde_json::to_string(rec).unwrap_or_default(),
                 created_by: pusher_key.to_string(),
                 created_at: rec.created,
             });
@@ -458,9 +468,7 @@ pub(crate) async fn record_in_tx(
         sqlx::query(
             "INSERT INTO embargo_lines (project_id, embargo_id, group_names, target_branch, embargo_branch, until_ms, released_at, record_json, created_by, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-             ON CONFLICT (project_id, embargo_id) DO UPDATE SET \
-             until_ms = COALESCE(EXCLUDED.until_ms, embargo_lines.until_ms), \
-             record_json = EXCLUDED.record_json",
+             ON CONFLICT (project_id, embargo_id) DO NOTHING",
         )
         .bind(project_id)
         .bind(&u.embargo_id)
@@ -602,8 +610,8 @@ pub async fn release_one(
     pushed_record: Option<EmbargoRecord>,
     agent_viewer: Option<&Viewer>,
 ) -> Result<bool> {
-    let row: Option<(String, String, Option<i64>, String, String, bool)> = sqlx::query_as(
-        "SELECT target_branch, embargo_branch, released_at, record_json, created_by, \
+    let row: Option<(Vec<String>, String, String, Option<i64>, String, String, bool)> = sqlx::query_as(
+        "SELECT group_names, target_branch, embargo_branch, released_at, record_json, created_by, \
                 (has_pr OR EXISTS (SELECT 1 FROM prs WHERE project_id = $1 AND embargo = $2)) \
          FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2",
     )
@@ -611,7 +619,7 @@ pub async fn release_one(
     .bind(embargo_id)
     .fetch_optional(&hub.db)
     .await?;
-    let Some((target_branch, ebranch, released_at, record_json, created_by, has_pr)) = row else {
+    let Some((group_names, target_branch, ebranch, released_at, record_json, created_by, has_pr)) = row else {
         return Ok(false);
     };
     if released_at.is_some() {
@@ -626,6 +634,11 @@ pub async fn release_one(
     let Some(project) = perm::load_project(&mut c, &pname).await? else {
         return Ok(false);
     };
+    if let Some(v) = agent_viewer {
+        if !can_see_groups(hub, &project, v, &group_names).await? {
+            return Err(Error::not_found(format!("no embargo '{embargo_id}'")));
+        }
+    }
     let etip: Option<String> = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
         .bind(project_id)
         .bind(&ebranch)
@@ -772,13 +785,8 @@ pub async fn release_one(
     let now_ms: i64 = sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
         .fetch_one(&hub.db)
         .await?;
-    let mut rec: EmbargoRecord = match pushed_record {
-        Some(r) => r,
-        None => serde_json::from_str(&record_json).map_err(|e| Error::Other(e.into()))?,
-    };
-    if rec.released_at.is_none() {
-        rec.released_at = Some(now_ms);
-    }
+    let mut rec: EmbargoRecord = serde_json::from_str(&record_json).map_err(|e| Error::Other(e.into()))?;
+    rec.released_at = Some(pushed_record.and_then(|r| r.released_at).unwrap_or(now_ms));
     let new_json = serde_json::to_string(&rec).unwrap_or(record_json);
     let eid = embargo_id.to_string();
     let ebranch2 = ebranch.clone();

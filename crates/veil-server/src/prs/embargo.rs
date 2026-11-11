@@ -467,6 +467,9 @@ pub async fn land_embargoed(
     pr: &PrRow,
     at_release: Option<bool>,
 ) -> Result<Value> {
+    if !crate::embargo::can_see(hub, &ask.project, &ask.viewer, &pr.embargo).await? {
+        return Err(super::not_a_pr());
+    }
     let paths = review::paths_of(hub, ask.project.id, &pr.id).await?;
     if pr.author != me && !review::writes_all(&ask.project, &ask.viewer, &paths) {
         return Err(Error::forbidden(
@@ -739,13 +742,8 @@ pub async fn release_embargo_prs(
     let now_ms: i64 = sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT")
         .fetch_one(&hub.db)
         .await?;
-    let mut rec: EmbargoRecord = match pushed_record {
-        Some(r) => r,
-        None => serde_json::from_str(record_json).map_err(|e| Error::Other(e.into()))?,
-    };
-    if rec.released_at.is_none() {
-        rec.released_at = Some(now_ms);
-    }
+    let mut rec: EmbargoRecord = serde_json::from_str(record_json).map_err(|e| Error::Other(e.into()))?;
+    rec.released_at = Some(pushed_record.and_then(|r| r.released_at).unwrap_or(now_ms));
     let new_json = serde_json::to_string(&rec).unwrap_or_else(|_| record_json.to_string());
     let pid = project.id;
     let policy = project.policy.clone();
