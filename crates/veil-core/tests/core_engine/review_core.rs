@@ -156,3 +156,35 @@ fn bug_1834_a_sealed_backup_of_a_secret_does_not_block_the_upgrade() {
     let repo = Repo::open(fs.clone(), Some(alice), "alice").unwrap();
     assert_eq!(repo.store().read_entry(&file_entry(&repo, &c, ".envrc.orig").unwrap()).unwrap(), b"export REGION=review-marker-backup-old\n");
 }
+
+/// Corrupt data is refused, never returned: an operation is named by the
+/// BLAKE3 of its bytes, like an object, and a file that no longer matches
+/// its name is not read as the repository's state.
+#[test]
+#[ignore = "BUG-1835: an operation file whose bytes do not match its id is read and used; only `vl fsck` notices"]
+fn bug_1835_an_operation_that_does_not_match_its_id_is_refused() {
+    let (mut repo, fs, alice) = new_repo("alice");
+    let a = commit_files(&mut repo, &*fs, &[("a.txt", "a\n")], "A");
+    let b = commit_files(&mut repo, &*fs, &[("b.txt", "b\n")], "B");
+    repo.set_tag("v1", a, false).unwrap();
+    assert_eq!(repo.view().tags["v1"].target, a);
+    let op = repo.op_id();
+    drop(repo);
+    // Damage on disk: the newest operation now says `v1` is at B.
+    let path = p(&format!(".veil/ops/{}", op.hex()));
+    let raw = String::from_utf8(fs.read(&path).unwrap()).unwrap();
+    let was = format!("\"v1\":{{\"target\":\"{}\"", a.hex());
+    assert!(raw.contains(&was), "the operation records the tag");
+    let damaged = raw.replace(&was, &format!("\"v1\":{{\"target\":\"{}\"", b.hex()));
+    assert_ne!(ObjectId::hash(damaged.as_bytes()), op, "the file no longer matches its id");
+    fs.write(&path, damaged.as_bytes()).unwrap();
+
+    match Repo::open(fs.clone(), Some(alice), "alice") {
+        Err(e) => assert!(matches!(e, veil_core::VeilError::Corrupt(..)), "refused, but not as corrupt: {e}"),
+        Ok(repo) => panic!(
+            "the damaged operation was read as the repository's state: tag v1 is at {} (it was set to {})",
+            repo.view().tags["v1"].target.short(),
+            a.short()
+        ),
+    }
+}
