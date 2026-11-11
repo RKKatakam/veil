@@ -94,6 +94,23 @@ pub enum Cmd {
         #[arg(long, value_name = "FILE")]
         ca: Option<PathBuf>,
     },
+    /// Enroll a browser passkey on a Veil server.
+    ///
+    /// Prints a short-lived, single-use link to open in the browser. The
+    /// browser creates a passkey and its own separate device keys inside a
+    /// Web Worker; confirm the fingerprint the browser shows with
+    /// `vl identity confirm FINGERPRINT` so secret keys may be shared with it.
+    Web {
+        /// The server (`veil://host[:port]`), when signed in to several.
+        #[arg(long, value_name = "URL")]
+        server: Option<String>,
+        /// Optional label for this browser device (for example `work-laptop`).
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// Print the enrollment code and URL as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Groups of people on the Veil server (the origin remote's project).
     #[command(subcommand)]
     Group(GroupCmd),

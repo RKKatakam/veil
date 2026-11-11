@@ -37,6 +37,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/sessions/agent", post(auth::agent_session))
         .route("/v1/sessions/ci", post(crate::ci::ci_session))
         .route("/v1/sessions/web", post(auth::web_session))
+        .route("/v1/sessions/web-enroll", post(auth::web_enroll_session))
         .route("/v1/people/{name}/devices", get(devices))
         .route("/v1/people/{name}/pending/{fingerprint}", get(pending_device))
         .route("/v1/devices/vouch", post(vouch))
@@ -99,13 +100,20 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/q/grep", get(crate::search::grep_route))
         // Health metrics, for the project's admins (S24).
         .route("/v1/projects/{p}/health", get(crate::limits::health::route))
-        // The web client, first version, with no secrets (S25, docs/HUB.md §13.39).
+        // Secrets in the browser API (S26, docs/HUB.md §13.40).
+        .route("/v1/projects/{p}/web-secrets", post(crate::web::secrets::set_web_secrets_api_route))
+        .route("/v1/projects/{p}/web/rings", get(crate::web::secrets::web_rings_route))
+        .route("/v1/projects/{p}/web/ciphertext", get(crate::web::secrets::web_ciphertext_route))
+        // The web client (S25, docs/HUB.md §13.39; S26 passkeys & browser secrets, §13.40).
         .route("/", get(crate::web::home_route))
         .route("/about", get(crate::web::about_route))
         .route("/login", get(crate::web::login_page_route))
         .route("/static/{asset}", get(crate::web::static_route))
         .route("/web/session", post(crate::web::adopt_session_route))
-        .route("/web/login", post(crate::web::device_login_route))
+        .route("/web/passkey/register/begin", post(crate::web::passkey::register_begin_route))
+        .route("/web/passkey/register/finish", post(crate::web::passkey::register_finish_route))
+        .route("/web/passkey/login/begin", post(crate::web::passkey::login_begin_route))
+        .route("/web/passkey/login/finish", post(crate::web::passkey::login_finish_route))
         .route("/web/logout", post(crate::web::logout_route))
         .route("/p/{p}", get(crate::web::project_overview_route))
         .route("/p/{p}/tree", get(crate::web::tree_root_route))
@@ -120,13 +128,18 @@ pub fn router(hub: HubState) -> Router {
         .route("/p/{p}/prs/{id}", get(crate::web::pr_show_route))
         .route("/p/{p}/prs/{id}/threads", post(crate::web::pr_new_thread_route))
         .route("/p/{p}/prs/{id}/threads/{t}", post(crate::web::pr_thread_update_route))
+        .route("/p/{p}/prs/{id}/reviews", post(crate::web::pr_review_route))
         .route("/p/{p}/prs/{id}/close", post(crate::web::pr_close_route))
         .route("/p/{p}/prs/{id}/land", post(crate::web::pr_land_route))
         .route("/p/{p}/prs/{id}/dismiss", post(crate::web::pr_dismiss_route))
         .route("/p/{p}/admin", get(crate::web::admin_route))
+        .route("/p/{p}/admin/web-secrets", post(crate::web::secrets::admin_web_secrets_form_route))
         .route("/p/{p}/admin/groups", post(crate::web::admin_create_group_route))
         .route("/p/{p}/admin/groups/{g}/delete", post(crate::web::admin_delete_group_route))
         .route("/p/{p}/admin/groups/{g}/members", post(crate::web::admin_members_route))
+        .route("/p/{p}/web/secrets.js", get(crate::web::secrets::project_secrets_js_route))
+        .route("/p/{p}/web/secret-worker.js", get(crate::web::secrets::project_secret_worker_js_route))
+        .route("/p/{p}/web/secret-worker.wasm", get(crate::web::secrets::project_secret_worker_wasm_route))
         .layer(DefaultBodyLimit::max(crate::db::body_limit("")))
         .layer(axum::middleware::from_fn(crate::db::retry_requests))
         .layer(axum::middleware::from_fn(crate::web::layer))
@@ -136,42 +149,73 @@ pub fn router(hub: HubState) -> Router {
         .with_state(hub)
 }
 
-async fn devices(State(hub): State<HubState>, caller: Caller, Path(name): Path<String>) -> Result<Json<Devices>> {
+#[derive(Deserialize, Default)]
+struct DevicesParams {
+    project: Option<String>,
+}
+
+async fn devices(
+    State(hub): State<HubState>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Query(params): Query<DevicesParams>,
+) -> Result<Json<Devices>> {
     caller.signed_in()?;
-    device_list(&hub, &name, None).await
+    let pid = match &params.project {
+        Some(p) if !p.is_empty() => {
+            let (project, viewer) = perm::open(&hub, p, &caller).await?;
+            if !project.participant(&viewer) {
+                return Err(Error::not_found("no such project that you can see"));
+            }
+            Some(project.id)
+        }
+        _ => None,
+    };
+    device_list(&hub, &name, pid).await
 }
 
 /// A person's devices with the vouches the server stores. The server's
 /// list is not what wraps a key: admins' `vl` check the vouches
 /// (`docs/HUB.md` §13.11). In `project`, a device an admin removed from it
 /// is listed as removed (BUG-843), so its devices revoke it from its rings.
+/// Browser devices without PRF have no device keys (`public_identity = ''`)
+/// and are never listed; in projects with `web_secrets = FALSE`, browser
+/// devices are omitted from `identities` and listed in `removed`.
 async fn device_list(hub: &HubState, name: &str, project: Option<i64>) -> Result<Json<Devices>> {
     let person: Option<i64> = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(name).fetch_optional(&hub.db).await?;
     let Some(person) = person else {
         return Err(Error::not_found(format!("no person named '{name}'")));
     };
+    let hide_browser = match project {
+        Some(pid) => !crate::web::secrets::is_project_web_secrets_enabled(&hub.db, pid).await?,
+        None => false,
+    };
     let barred = "EXISTS (SELECT 1 FROM device_bars b WHERE b.device_id = d.id AND b.project_id = $2)";
     let active: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT d.public_identity FROM devices d WHERE d.person_id = $1 AND d.removed_at IS NULL AND NOT d.pending \
-         AND NOT {barred} ORDER BY d.id"
+         AND NOT {barred} AND d.public_identity <> '' AND (NOT $3 OR NOT d.browser) ORDER BY d.id"
     ))
     .bind(person)
     .bind(project.unwrap_or(-1))
+    .bind(hide_browser)
     .fetch_all(&hub.db)
     .await?;
     // Only the newest few pending devices: anyone can make pending devices
     // under a name, so their number must not cost the person anything.
     let mut pending: Vec<String> = sqlx::query_scalar(
-        "SELECT public_identity FROM devices WHERE person_id = $1 AND removed_at IS NULL AND pending ORDER BY id DESC LIMIT $2",
+        "SELECT public_identity FROM devices WHERE person_id = $1 AND removed_at IS NULL AND pending \
+         AND public_identity <> '' AND (NOT $3 OR NOT browser) ORDER BY id DESC LIMIT $2",
     )
     .bind(person)
     .bind(crate::auth::LISTED_PENDING)
+    .bind(hide_browser)
     .fetch_all(&hub.db)
     .await?;
     pending.reverse();
     let vouches: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT d.public_identity, v.voucher_key, v.signature FROM device_vouches v JOIN devices d ON d.id = v.device_id \
-         JOIN people p ON p.id = d.person_id WHERE p.name = $1 AND d.removed_at IS NULL AND NOT d.pending ORDER BY d.id, v.voucher_key",
+         JOIN people p ON p.id = d.person_id WHERE p.name = $1 AND d.removed_at IS NULL AND NOT d.pending \
+         AND d.public_identity <> '' ORDER BY d.id, v.voucher_key",
     )
     .bind(name)
     .fetch_all(&hub.db)
@@ -179,17 +223,18 @@ async fn device_list(hub: &HubState, name: &str, project: Option<i64>) -> Result
     let joins: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT i.invite_key, d.public_identity, i.signature FROM invites i JOIN devices d ON d.id = i.device_id \
          JOIN people p ON p.id = d.person_id WHERE p.name = $1 AND d.removed_at IS NULL AND i.signature IS NOT NULL \
-         ORDER BY i.used_at",
+         AND d.public_identity <> '' ORDER BY i.used_at",
     )
     .bind(name)
     .fetch_all(&hub.db)
     .await?;
     let removed: Vec<String> = sqlx::query_scalar(&format!(
-        "SELECT d.public_identity FROM devices d WHERE d.person_id = $1 AND NOT d.pending \
-         AND (d.removed_at IS NOT NULL OR {barred}) ORDER BY d.id"
+        "SELECT d.public_identity FROM devices d WHERE d.person_id = $1 AND NOT d.pending AND d.public_identity <> '' \
+         AND (d.removed_at IS NOT NULL OR {barred} OR ($3 AND d.browser)) ORDER BY d.id"
     ))
     .bind(person)
     .bind(project.unwrap_or(-1))
+    .bind(hide_browser)
     .fetch_all(&hub.db)
     .await?;
     Ok(Json(Devices {
@@ -293,6 +338,10 @@ async fn queue_key_requests_everywhere(db: &sqlx::PgPool, person: i64) -> Result
     Ok(())
 }
 
+pub(crate) async fn queue_key_requests_for_person(db: &sqlx::PgPool, person: i64) -> Result<()> {
+    queue_key_requests_everywhere(db, person).await
+}
+
 /// How long a key request stays listed.
 const KEY_REQUEST_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
 /// Longest an invite may be valid.
@@ -382,12 +431,19 @@ async fn remove_device(State(hub): State<HubState>, caller: Caller, Json(req): J
             if person == me.id {
                 sqlx::query("UPDATE devices SET removed_at = $1 WHERE id = $2").bind(veil_core::now_millis()).bind(id).execute(&mut *c).await?;
                 sqlx::query("DELETE FROM sessions WHERE device_id = $1").bind(id).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM webauthn_credentials WHERE device_id = $1").bind(id).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM browser_device_rings WHERE device_id = $1").bind(id).execute(&mut *c).await?;
             } else {
                 let project = admin_of.expect("allowed only as an admin of the project");
                 sqlx::query("INSERT INTO device_bars (project_id, device_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
                     .bind(project)
                     .bind(id)
                     .bind(veil_core::now_millis())
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("DELETE FROM browser_device_rings WHERE project_id = $1 AND device_id = $2")
+                    .bind(project)
+                    .bind(id)
                     .execute(&mut *c)
                     .await?;
                 queue_key_request(c, person, project).await?;
@@ -1152,7 +1208,8 @@ async fn post_ring(
             }
         }
     }
-    merge_ring(&hub, &project, ring).await
+    let web_secrets = crate::web::secrets::validate_ring_browser_members(&hub.db, project.id, &ring).await?;
+    merge_ring(&hub, &project, ring, web_secrets).await
 }
 
 /// Merge `ring` into the stored ring: read, merge in memory with the
@@ -1160,7 +1217,7 @@ async fn post_ring(
 /// one-row compare-and-swap on the old body, again if someone else wrote
 /// first. No serialisable transaction: YugabyteDB reports range conflicts
 /// between unrelated projects' rings as deadlocks.
-async fn merge_ring(hub: &HubState, project: &Project, ring: KeyRing) -> Result<Json<serde_json::Value>> {
+async fn merge_ring(hub: &HubState, project: &Project, ring: KeyRing, web_secrets: bool) -> Result<Json<serde_json::Value>> {
     let pid = project.id;
     // The project's `team` ring, which every other ring must name (the
     // engine's `Keychain::bound`, BUG-845). Its genesis never changes.
@@ -1198,6 +1255,11 @@ async fn merge_ring(hub: &HubState, project: &Project, ring: KeyRing) -> Result<
             }
         };
         let Some(body) = merged else {
+            if web_secrets {
+                if let Some(cur) = &current {
+                    crate::web::secrets::sync_browser_rings_for_scope(&hub.db, pid, &ring.scope, cur).await?;
+                }
+            }
             return Ok(Json(current.and_then(|b| serde_json::from_str(&b).ok()).unwrap_or(serde_json::Value::Null)));
         };
         let rows = match &current {
@@ -1218,6 +1280,9 @@ async fn merge_ring(hub: &HubState, project: &Project, ring: KeyRing) -> Result<
                 .rows_affected(),
         };
         if rows == 1 {
+            if web_secrets {
+                crate::web::secrets::sync_browser_rings_for_scope(&hub.db, pid, &ring.scope, &body).await?;
+            }
             return Ok(Json(serde_json::from_str(&body).unwrap_or(serde_json::Value::Null)));
         }
     }

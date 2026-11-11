@@ -28,6 +28,7 @@ Global options (accepted by every command):
 | [`vl init`](init.md) | Create a repository in PATH (default: current directory) |
 | [`vl clone`](clone.md) | Copy a repository (and every tag you can see) into a new directory |
 | [`vl login`](login.md) | Sign in to a Veil server with this device's identity key |
+| [`vl web`](web.md) | Enroll a browser passkey on a Veil server |
 | [`vl group`](group.md) | Groups of people on the Veil server (the origin remote's project) |
 | [`vl change`](change.md) | Commit through the Veil server's API, without a checkout (scripts, CI, agents) |
 | [`vl invite`](invite.md) | Invite a person to a group (admins): prints a one-time link to send them (Slack, email) |

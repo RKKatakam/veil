@@ -1243,7 +1243,7 @@ pub fn remove_device(fingerprint: &str, server: Option<&str>) -> Result<()> {
         let _ = merge_server_rings(c.repo.keys(), &client.url, client.rings().unwrap_or_default());
     }
     // The device: one of mine the server lists, or a ring member's.
-    let mine = client.devices(&me)?;
+    let mine = client.devices_everywhere(&me)?;
     let listed = mine.identities.iter().chain(&mine.pending).find(|d| hub::fingerprint(d).as_deref() == Some(fp.as_str())).cloned();
     let in_rings: Option<(String, String)> = ctx.as_ref().and_then(|c| {
         local_states(c).into_iter().flat_map(|st| st.members.into_iter()).find_map(|(id, m)| {

@@ -750,9 +750,31 @@ impl Client {
     }
 
     /// A person's devices and vouches, as the server lists them: never
-    /// enough on its own to wrap a key (`docs/HUB.md` §13.11).
+    /// enough on its own to wrap a key (`docs/HUB.md` §13.11). When scoped
+    /// to a project, browser devices are omitted unless the project has
+    /// enabled browser secrets.
     pub fn devices(&self, person: &str) -> Result<Devices> {
+        let path = if self.url.project.is_empty() {
+            format!("/v1/people/{person}/devices")
+        } else {
+            format!("/v1/people/{person}/devices?project={}", self.url.project)
+        };
+        self.json("GET", &path, None::<&()>)
+    }
+
+    /// A person's devices across the whole server (regardless of project
+    /// browser-secret settings), for `vl identity remove` and `vl identity list`.
+    pub fn devices_everywhere(&self, person: &str) -> Result<Devices> {
         self.json("GET", &format!("/v1/people/{person}/devices"), None::<&()>)
+    }
+
+    /// Mint a short-lived single-use browser passkey enrollment code (`vl web`).
+    pub fn web_enroll(&self, label: Option<&str>) -> Result<veil_core::hub::web::WebEnrollResponse> {
+        let req = veil_core::hub::web::WebEnrollRequest {
+            label: label.map(str::to_string),
+            seconds: None,
+        };
+        self.json("POST", "/v1/sessions/web-enroll", Some(&req))
     }
 
     /// Vouch, with this device's key, that `device` (a full public

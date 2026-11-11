@@ -1,15 +1,15 @@
-//! Web client WASM module (`docs/HUB.md` §13.39): diffing, snapshot
-//! signature verification, sealed-entry classification, and device-signed
-//! login / PR review in browser memory, with **no secret decryption path**.
+//! Web client WASM module (`docs/HUB.md` §13.39, §13.40): diffing, snapshot
+//! signature verification, sealed-entry classification, and passkey-PRF sealing
+//! of a freshly generated browser device identity inside a Worker — with **no
+//! secret decryption or key ring unwrap path**.
 
 use std::sync::Mutex;
 
 use veil_core::{
     clock,
     hub::web::{
-        classify_file_meta, diff_text_bounded, inspect_object_no_secrets, sign_web_login, sign_web_pr_review, WebFileState, WebObjectSummary,
+        classify_file_meta, diff_text_bounded, inspect_object_no_secrets, seal_new_browser_device, WebFileState, WebObjectSummary,
     },
-    Identity,
 };
 
 static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
@@ -45,7 +45,6 @@ fn install_clock() {
 
 /// Self-check when invoked natively (`cargo run --example web_wasm ...`).
 pub fn self_check() -> Result<String, String> {
-    let alice = Identity::generate("alice");
     let diff = diff_text_bounded("fn a() -> u32 { 1 }\n", "fn a() -> u32 { 2 }\n", 65_536);
     if diff.binary || diff.too_large || diff.hunks.len() != 1 {
         return Err("unexpected diff output".into());
@@ -63,13 +62,9 @@ pub fn self_check() -> Result<String, String> {
     if inspected != WebObjectSummary::Sealed {
         return Err("sealed raw object was not classified as Sealed".into());
     }
-    let login = sign_web_login(&alice.to_json(), "localhost:4443", &"22".repeat(32), Some("alice")).map_err(|e| e.to_string())?;
-    if login.key != alice.verifying_hex() {
-        return Err("login key mismatch".into());
-    }
-    let sig = sign_web_pr_review(&alice.to_json(), "acme", "pr-abcdef12", "patch-1", "approve").map_err(|e| e.to_string())?;
-    if sig.len() != 128 {
-        return Err("review signature length mismatch".into());
+    let bundle = seal_new_browser_device("alice", "cred-self-check", &[0x42; 32]).map_err(|e| e.to_string())?;
+    if !bundle.public_identity.starts_with("veil1") || bundle.fingerprint.len() != 24 {
+        return Err("invalid sealed browser device bundle".into());
     }
     Ok("web_wasm: self-check ok (no secret decryption paths)\n".into())
 }
@@ -158,68 +153,27 @@ pub unsafe extern "C" fn veil_web_inspect_object(ptr: *const u8, len: usize) -> 
     write_out(inspect_object_no_secrets(raw))
 }
 
-/// Generate a fresh in-memory browser identity JSON (for tests / ephemeral signing).
-///
-/// # Safety
-/// `name_ptr` must be valid for `name_len` bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_web_generate_identity(name_ptr: *const u8, name_len: usize) -> i32 {
-    install_clock();
-    let res = (|| {
-        let name = unsafe { utf8(name_ptr, name_len) }?;
-        Ok(Identity::generate(name).to_json())
-    })();
-    write_out(res)
-}
-
-/// Sign a single-use login challenge (`hub-login`) in WASM memory.
+/// Generate a fresh browser device identity inside WASM memory and seal its
+/// private keys under a 32-byte WebAuthn PRF output (`HUB_WEB_PRF_KEY`),
+/// returning only public keys, fingerprint, and ciphertext for IndexedDB.
 ///
 /// # Safety
 /// Input pointers must be valid for their given lengths.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_web_sign_login(
-    id_ptr: *const u8,
-    id_len: usize,
-    hub_ptr: *const u8,
-    hub_len: usize,
-    chal_ptr: *const u8,
-    chal_len: usize,
+pub unsafe extern "C" fn veil_web_seal_new_device(
+    person_ptr: *const u8,
+    person_len: usize,
+    cred_ptr: *const u8,
+    cred_len: usize,
+    prf_ptr: *const u8,
+    prf_len: usize,
 ) -> i32 {
     install_clock();
     let res = (|| {
-        let id = unsafe { utf8(id_ptr, id_len) }?;
-        let hub = unsafe { utf8(hub_ptr, hub_len) }?;
-        let chal = unsafe { utf8(chal_ptr, chal_len) }?;
-        sign_web_login(id, hub, chal, None)
-    })();
-    write_out(res)
-}
-
-/// Sign a PR review verdict (`hub-pr-review`) in WASM memory.
-///
-/// # Safety
-/// Input pointers must be valid for their given lengths.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn veil_web_sign_review(
-    id_ptr: *const u8,
-    id_len: usize,
-    proj_ptr: *const u8,
-    proj_len: usize,
-    pr_ptr: *const u8,
-    pr_len: usize,
-    patch_ptr: *const u8,
-    patch_len: usize,
-    verdict_ptr: *const u8,
-    verdict_len: usize,
-) -> i32 {
-    install_clock();
-    let res = (|| {
-        let id = unsafe { utf8(id_ptr, id_len) }?;
-        let proj = unsafe { utf8(proj_ptr, proj_len) }?;
-        let pr = unsafe { utf8(pr_ptr, pr_len) }?;
-        let patch = unsafe { utf8(patch_ptr, patch_len) }?;
-        let verdict = unsafe { utf8(verdict_ptr, verdict_len) }?;
-        sign_web_pr_review(id, proj, pr, patch, verdict)
+        let person = unsafe { utf8(person_ptr, person_len) }?;
+        let cred = unsafe { utf8(cred_ptr, cred_len) }?;
+        let prf = unsafe { slice(prf_ptr, prf_len) };
+        seal_new_browser_device(person, cred, prf)
     })();
     write_out(res)
 }

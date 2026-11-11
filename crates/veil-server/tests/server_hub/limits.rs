@@ -487,7 +487,7 @@ fn bug_1331_vl_waits_out_a_rate_limit() {
 /// Raw TLS connections from a chosen local address (clients on several
 /// addresses of one machine: 127.0.0.2, …, or two IPv6 addresses of one
 /// /64), and raw HTTP/1.1 and HTTP/2 over them.
-mod raw {
+pub(crate) mod raw {
     use std::{
         io::Read,
         net::{IpAddr, SocketAddr, TcpStream},

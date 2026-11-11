@@ -7,6 +7,8 @@
 
 pub mod assets;
 pub mod html;
+pub mod passkey;
+pub mod secrets;
 pub mod session;
 
 use std::fmt::Write as _;
@@ -23,7 +25,7 @@ use veil_core::hub::wire::GroupChange;
 
 pub use assets::static_route;
 pub use session::{
-    adopt_session_route, check_same_origin, current_csrf, current_is_web, device_login_route, layer, login_page_route, logout_route,
+    adopt_session_route, check_same_origin, current_csrf, current_is_web, layer, login_page_route, logout_route,
     record_session, require_csrf,
 };
 
@@ -31,7 +33,7 @@ use crate::{
     auth::Caller,
     error::{Error, Result},
     perm,
-    prs::{self, CreatePr, DismissRequest, ListParams, NewThread, PrDiffParams, ThreadUpdate},
+    prs::{self, CreatePr, DismissRequest, ListParams, NewThread, PrDiffParams, ReviewRequest, ThreadUpdate},
     query::{self, Ask, BlameParams, FileParams, HistoryParams, LogParams, ShowParams, TreeParams},
     search::{self, GrepParams, SearchParams},
     sync,
@@ -503,10 +505,52 @@ pub async fn file_route(
     body.push_str("</span></div><div class=\"card-body\">");
 
     if is_sealed {
-        // Drop raw object bytes immediately; never inspect or render them.
+        // Drop raw object bytes immediately; never inspect or render them on the server.
         drop(bytes);
-        body.push_str("<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — open with vl.</strong></p>");
-        body.push_str("<p class=\"muted\">In S25, secret files are decrypted only on trusted devices via <code>vl cat</code> or a local workspace. Their bytes never reach the browser.</p>");
+        let web_secrets_on = secrets::is_project_web_secrets_enabled(&hub.db, ask.project.id).await?;
+        if !web_secrets_on {
+            body.push_str("<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — open with vl.</strong></p>");
+            body.push_str("<p class=\"muted\">Browser secret decryption is turned off for this project. Open secret files locally with <code>vl cat</code> or in a local workspace.</p>");
+        } else {
+            let dev_status = secrets::caller_browser_device_status(&hub.db, ask.project.id, &caller).await?;
+            match dev_status {
+                Some(st) if st.barred => {
+                    body.push_str("<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — open with vl.</strong></p>");
+                    body.push_str("<p class=\"muted\">This browser device has been removed from this project.</p>");
+                }
+                Some(st) if st.browser && !st.prf_supported => {
+                    body.push_str("<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — open with vl.</strong></p>");
+                    body.push_str("<p class=\"muted\">This browser can't open secrets (WebAuthn PRF extension is unavailable). Everything else in the web client works.</p>");
+                }
+                Some(st) if st.browser && !st.confirmed => {
+                    let fp = st.fingerprint.as_deref().unwrap_or("<FINGERPRINT>");
+                    let _ = writeln!(
+                        body,
+                        "<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — confirm this browser device first.</strong></p><p class=\"muted\">Confirm fingerprint <code>{}</code> on an existing device (<code>vl identity confirm {}</code>) and share keys (<code>vl share-keys</code>) before opening secrets here.</p>",
+                        esc(fp),
+                        esc(fp)
+                    );
+                }
+                Some(st) if st.confirmed => {
+                    let rev_attr = q.rev.as_deref().unwrap_or(&ask.project.default_branch);
+                    let _ = writeln!(
+                        body,
+                        "<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file</strong></p><p class=\"muted\">{}</p><div class=\"form-row\"><button id=\"veil-show-secret\" type=\"button\" data-project=\"{}\" data-path=\"{}\" data-rev=\"{}\">Show secret</button><button id=\"veil-hide-secret\" type=\"button\" hidden>Hide</button><span id=\"veil-secret-status\" class=\"muted\"></span></div><pre id=\"veil-secret-plaintext\" hidden></pre><script src=\"/p/{up}/web/secrets.js\" defer></script>",
+                        esc(secrets::HONEST_LIMIT_NOTICE),
+                        esc(pname),
+                        esc(&clean),
+                        esc(rev_attr)
+                    );
+                }
+                _ => {
+                    let _ = writeln!(
+                        body,
+                        "<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — open with vl or an enrolled passkey browser device.</strong></p><p class=\"muted\">{}</p>",
+                        esc(secrets::HONEST_LIMIT_NOTICE)
+                    );
+                }
+            }
+        }
     } else if bytes.contains(&0) {
         let len = bytes.len();
         drop(bytes);
@@ -1369,15 +1413,15 @@ pub async fn pr_show_route(
                 url_part(pr_id),
                 esc(tok)
             );
-        }
-        if caller.person.as_ref().is_some_and(|u| u.agent.is_none()) && pr_state == "open" {
-            let _ = writeln!(
-                body,
-                "<hr><h4>Device-signed review (WASM in-memory)</h4><form id=\"veil-wasm-review-form\" data-project=\"{}\" data-pr=\"{}\" data-patch=\"{}\"><div class=\"form-row\"><select id=\"veil-review-verdict\"><option value=\"approve\">Approve</option><option value=\"request-changes\">Request changes</option></select><input id=\"veil-review-body\" type=\"text\" placeholder=\"Review note (optional)\"></div><textarea id=\"veil-review-identity\" placeholder=\"Paste device identity JSON to sign review in WASM memory (never sent to server)\"></textarea><div class=\"form-row\"><button type=\"submit\">Sign &amp; submit review</button><span id=\"veil-review-status\" class=\"muted\"></span></div></form>",
-                esc(pname),
-                esc(pr_id),
-                esc(pr_patch)
-            );
+            if caller.person.as_ref().is_some_and(|u| u.agent.is_none()) && pr_state == "open" {
+                let _ = writeln!(
+                    body,
+                    "<hr><h4>Submit review</h4><form method=\"post\" action=\"/p/{up}/prs/{}/reviews\"><input type=\"hidden\" name=\"_csrf\" value=\"{}\"><input type=\"hidden\" name=\"patch\" value=\"{}\"><div class=\"form-row\"><select name=\"verdict\"><option value=\"approve\">Approve</option><option value=\"request-changes\">Request changes</option></select><input name=\"body\" type=\"text\" placeholder=\"Review note (optional)\"><button type=\"submit\">Submit review</button></div></form>",
+                    url_part(pr_id),
+                    esc(tok),
+                    esc(pr_patch)
+                );
+            }
         }
     }
     body.push_str("</div></div>");
@@ -1502,6 +1546,38 @@ pub async fn pr_dismiss_route(
     Ok(redirect_see_other(&format!("/p/{}/prs/{}", url_part(&ask.project.name), url_part(&id))))
 }
 
+/// `POST /p/{p}/prs/{id}/reviews`: Record a PR review for the signed-in web person (`person_only`, CSRF-protected).
+pub async fn pr_review_route(
+    State(hub): State<HubState>,
+    caller: Caller,
+    headers: HeaderMap,
+    Path((p, id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Response> {
+    caller.person_only()?;
+    let mut form = parse_form(&body);
+    require_current_csrf(&headers, form.get("_csrf").map(String::as_str))?;
+    let ask = Ask::open(&hub, &p, &caller).await?;
+    let note = form
+        .remove("body")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    prs::add_review(
+        &hub,
+        &ask,
+        &caller,
+        &id,
+        ReviewRequest {
+            patch: form.remove("patch").unwrap_or_default(),
+            verdict: form.remove("verdict").unwrap_or_default(),
+            body: note,
+            signature: None,
+        },
+    )
+    .await?;
+    Ok(redirect_see_other(&format!("/p/{}/prs/{}", url_part(&ask.project.name), url_part(&id))))
+}
+
 /// `GET /p/{p}/admin`: Groups & access administration (`person_only`).
 /// Shows only the groups the signed-in person is allowed to see (`api::list_groups`).
 pub async fn admin_route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Response> {
@@ -1511,11 +1587,36 @@ pub async fn admin_route(State(hub): State<HubState>, caller: Caller, Path(p): P
         return Err(Error::not_found("no such project that you can see"));
     }
     let csrf = current_csrf();
+    let web_secrets_on = secrets::is_project_web_secrets_enabled(&hub.db, project.id).await?;
     let groups = crate::api::list_groups(State(hub.clone()), caller.clone(), Path(p)).await?.0;
     let pname = &project.name;
     let up = url_part(pname);
 
     let mut body = String::new();
+    let _ = writeln!(
+        body,
+        "<div class=\"card\"><div class=\"card-header\"><span>Secrets in the browser</span><span class=\"badge\">{}</span></div><div class=\"card-body\"><p class=\"muted\">{}</p>",
+        if web_secrets_on { "On" } else { "Off (default)" },
+        esc(secrets::HONEST_LIMIT_NOTICE)
+    );
+    if viewer.admin {
+        if let Some(tok) = &csrf {
+            if web_secrets_on {
+                let _ = writeln!(
+                    body,
+                    "<form method=\"post\" action=\"/p/{up}/admin/web-secrets\"><input type=\"hidden\" name=\"_csrf\" value=\"{}\"><input type=\"hidden\" name=\"enabled\" value=\"false\"><button type=\"submit\">Turn off browser secrets</button></form>",
+                    esc(tok)
+                );
+            } else {
+                let _ = writeln!(
+                    body,
+                    "<form method=\"post\" action=\"/p/{up}/admin/web-secrets\"><input type=\"hidden\" name=\"_csrf\" value=\"{}\"><input type=\"hidden\" name=\"enabled\" value=\"true\"><div class=\"form-row\"><label><input type=\"checkbox\" name=\"acknowledge_limit\" value=\"1\" required> I understand the browser secret security limit</label><button type=\"submit\">Turn on browser secrets</button></div></form>",
+                    esc(tok)
+                );
+            }
+        }
+    }
+    body.push_str("</div></div>");
     body.push_str("<div class=\"card\"><div class=\"card-header\">Groups</div><div class=\"card-body\">");
     if groups.is_empty() {
         body.push_str("<p class=\"muted\">No groups visible to you.</p>");
