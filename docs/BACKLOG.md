@@ -90,6 +90,7 @@ Veil is server-centric ([OVERVIEW.md](OVERVIEW.md)). The order is:
   deletes it; pulled tags are not attributed to the remote that sent them.
 - **Retired identities stay on disk** (`$VEIL_HOME/retired/`, 0600) until
   the user deletes them, so vaults can be re-keyed.
+- **The team vault's forbidden-variable list (`team_vault::EXECUTION_VARIABLES`) misses variables that run code** (`MAKEFILES`, `GNUMAKEFLAGS`, `PYTEST_ADDOPTS`, `TAR_OPTIONS`, `VIMINIT`, `OPENSSL_CONF`, `COMPOSE_FILE`), and it matters once the team vault syncs through the server.
 
 ## Build
 
