@@ -483,6 +483,69 @@ fn expected(repo: &Repo, u: &selection::Unit, pick: Option<&Pick>, path: &VPath)
     }
 }
 
+/// The sealed files of `tree` that the one rule for "only secret files are
+/// encrypted" does not take on parents with trees `parents`
+/// (`policy::sealed_secret`, as the server's push check asks it: the path
+/// is no secret's, no parent holds a sealed file there, and the snapshot
+/// moves no secret of that scope away from its path).
+fn not_a_secrets(repo: &Repo, tree: &ObjectId, parents: &[ObjectId]) -> Vec<VPath> {
+    let changes = veil_core::tree::diff_trees(repo.store(), parents.first(), Some(tree)).unwrap();
+    let mut out = vec![];
+    for c in &changes {
+        let Some(e) = &c.new else { continue };
+        let Visibility::Cloaked { scope } = &e.visibility else { continue };
+        let explained = veil_core::policy::sealed_secret::<std::convert::Infallible>(
+            c.path.as_str(),
+            scope,
+            false,
+            |_| Ok(parents.iter().any(|t| file_entry_in(repo, t, &c.path).is_some_and(|e| !e.visibility.is_public()))),
+            |scope| {
+                Ok(changes.iter().any(|o| o.new.is_none() && o.old.as_ref().is_some_and(|e| matches!(&e.visibility, Visibility::Cloaked { scope: s } if s == scope))))
+            },
+        )
+        .unwrap();
+        if !explained {
+            out.push(c.path.clone());
+        }
+    }
+    out
+}
+
+fn parent_trees(repo: &Repo, id: &ObjectId) -> Vec<ObjectId> {
+    repo.snapshot(id).unwrap().parents.iter().map(|p| tree_of(repo, p)).collect()
+}
+
+/// Every file of `tree`: its content, executable bit and sealing; a file
+/// of `plain` as the ordinary file it is recorded as.
+fn listing(repo: &Repo, tree: &ObjectId, plain: &[VPath]) -> Vec<(VPath, EntryKind, Vec<u8>, bool, Visibility)> {
+    walk_files(repo.store(), tree)
+        .unwrap()
+        .into_iter()
+        .map(|(q, e)| {
+            let v = if plain.contains(&q) { Visibility::Public } else { e.visibility.clone() };
+            (q, e.kind, repo.store().read_blob(&e.id).unwrap(), e.executable, v)
+        })
+        .collect()
+}
+
+/// Snapshot `id`, which a split or a squash wrote for the half `want`, is
+/// that half as it is recorded on `id`'s parents: the same tree, except
+/// that a sealed file the parents do not explain ([`not_a_secrets`]: a
+/// secret's new name taken apart from its deletion) is the same file,
+/// plain (BUG-1833, BUG-1911). And `id` holds nothing the rule refuses.
+fn check_recorded(repo: &Repo, id: &ObjectId, want: &ObjectId) -> Result<(), TestCaseError> {
+    let parents = parent_trees(repo, id);
+    let got = tree_of(repo, id);
+    let plain = not_a_secrets(repo, want, &parents);
+    if plain.is_empty() {
+        prop_assert_eq!(got, *want);
+    } else {
+        prop_assert_eq!(listing(repo, &got, &[]), listing(repo, want, &plain));
+    }
+    prop_assert_eq!(not_a_secrets(repo, &got, &parents), Vec::<VPath>::new(), "written sealed, and not a secret's by the push check's rule");
+    Ok(())
+}
+
 fn check(files: Vec<FileCase>, seed: Vec<u64>) -> Result<(), TestCaseError> {
     let (mut repo, fs, _) = new_repo("alice");
     fs.write(&p(".veilpolicy"), b"secret/ cloak team\n").unwrap();
@@ -544,16 +607,20 @@ fn check(files: Vec<FileCase>, seed: Vec<u64>) -> Result<(), TestCaseError> {
         prop_assert!(repo.split(&parts, &sel, None).is_err());
         return Ok(());
     }
-    // Split, then squash the halves back together: the original tree.
+    // Split: the halves, each as it is recorded on its parents.
     let r = repo.split(&parts, &sel, Some("first")).unwrap();
-    prop_assert_eq!(tree_of(&repo, &r.first), h.chosen);
-    prop_assert_eq!(tree_of(&repo, &r.second), t);
+    check_recorded(&repo, &r.first, &h.chosen)?;
+    check_recorded(&repo, &r.second, &t)?;
     repo.undo().unwrap();
     prop_assert_eq!(repo.view(), &view0, "one undo restores the original exactly");
+    // Split, then squash the halves back together: the second half's tree
+    // (the original tree, as the split recorded it), on the base.
     let op0 = repo.op_id();
     let r = repo.split(&parts, &sel, None).unwrap();
+    let second = tree_of(&repo, &r.second);
     let back = repo.squash(r.second).unwrap();
-    prop_assert_eq!(tree_of(&repo, &back), t, "the halves squashed together are the original");
+    prop_assert_eq!(tree_of(&repo, &back), second, "the halves squashed together are the original");
+    check_recorded(&repo, &back, &second)?;
     prop_assert_eq!(repo.snapshot(&back).unwrap().parents.clone(), vec![base]);
     repo.restore_operation(op0).unwrap();
     prop_assert_eq!(repo.view(), &view0);
@@ -561,8 +628,8 @@ fn check(files: Vec<FileCase>, seed: Vec<u64>) -> Result<(), TestCaseError> {
     // The same choice squashed into the parent: the parent gets the
     // chosen half, the change keeps its tree.
     let r = repo.squash_into(c, None, Some((&parts, &sel))).unwrap();
-    prop_assert_eq!(tree_of(&repo, &r.destination), h.chosen);
-    prop_assert_eq!(tree_of(&repo, &r.source.unwrap()), t);
+    check_recorded(&repo, &r.destination, &h.chosen)?;
+    check_recorded(&repo, &r.source.unwrap(), &t)?;
     repo.undo().unwrap();
     prop_assert_eq!(repo.view(), &view0);
     Ok(())
@@ -579,6 +646,173 @@ proptest! {
     fn halves_are_the_choice_and_the_rest(files in prop::collection::vec(file_case(), 6), seed in prop::collection::vec(any::<u64>(), 8)) {
         check(files, seed)?;
     }
+}
+
+// ---- BUG-1911: a secret's rename, taken apart ----------------------------------
+
+const SETTINGS: &str = "REGION=eu-west\n";
+
+/// `base` commits the secret `secret/.env.s`; the working copy renames it
+/// to `a.txt` (recorded sealed: protection follows a secret across a
+/// rename) and adds `c.txt`.
+fn renamed_secret(content: &str) -> (Repo, std::sync::Arc<veil_core::MemoryBackend>, ObjectId) {
+    let (mut repo, fs, _) = new_repo("alice");
+    let base = commit_files(&mut repo, &*fs, &[(".veilpolicy", "secret/ cloak team\n"), ("secret/.env.s", content), ("keep.txt", "k\n")], "base");
+    fs.remove_file(&p("secret/.env.s")).unwrap();
+    fs.write(&p("a.txt"), content.as_bytes()).unwrap();
+    fs.write(&p("c.txt"), b"c\n").unwrap();
+    snap(&mut repo, &*fs);
+    assert_eq!(file_entry(&repo, &wc(&repo), "a.txt").unwrap().visibility, team(), "control: the renamed secret is recorded sealed");
+    assert_eq!(not_a_secrets(&repo, &tree_of(&repo, &wc(&repo)), &[tree_of(&repo, &base)]), Vec::<VPath>::new(), "control: and is a secret's, by the rule");
+    (repo, fs, base)
+}
+
+fn whole(path: &str) -> Selection {
+    [(p(path), Pick { whole: true, ..Pick::default() })].into_iter().collect()
+}
+
+/// BUG-1911, the case the property test's random search found, shrunk: a
+/// change renames a secret, and only the **deletion** of the old name is
+/// squashed into the parent (or split off). The destination is exactly the
+/// chosen half. The source's new name then stands on a parent that holds
+/// no secret: it is the same file, recorded as the ordinary file its path
+/// makes it (plain), which is what the server's push check takes; nothing
+/// else of either change differs, and one undo restores both. (Before:
+/// `squash` did this while the property demanded the source's old tree,
+/// and `split` kept the file sealed, which the push check refuses for good:
+/// BUG-1833 through BUG-1837's `keep_sealing`.)
+#[test]
+fn bug_1911_a_renamed_secrets_deletion_taken_alone_leaves_the_new_name_an_ordinary_file() {
+    for split in [false, true] {
+        let (mut repo, _fs, base) = renamed_secret(SETTINGS);
+        let c = wc(&repo);
+        let t = tree_of(&repo, &c);
+        let change_id = repo.snapshot(&c).unwrap().change_id;
+        let parts = parts_of(&repo, &c);
+        let sel = whole("secret/.env.s");
+        let h = selection::halves(repo.store(), &parts.base, &parts.tree, &parts.units, &sel).unwrap();
+        let view0 = repo.view().clone();
+        let (first, second) = if split {
+            let r = repo.split(&parts, &sel, None).unwrap();
+            assert_eq!(repo.snapshot(&r.first).unwrap().parents, vec![base]);
+            (r.first, r.second)
+        } else {
+            let r = repo.squash_into(c, None, Some((&parts, &sel))).unwrap();
+            assert!(!r.emptied);
+            assert_eq!(repo.snapshot(&r.destination).unwrap().parents, repo.snapshot(&base).unwrap().parents, "the parent, rewritten");
+            (r.destination, r.source.expect("the source keeps the rest"))
+        };
+        // The first half: the base without the secret, and nothing else.
+        assert_eq!(tree_of(&repo, &first), h.chosen, "split {split}");
+        assert_eq!(
+            listing(&repo, &h.chosen, &[]),
+            listing(&repo, &tree_of(&repo, &base), &[]).into_iter().filter(|f| f.0 != p("secret/.env.s")).collect::<Vec<_>>(),
+            "split {split}"
+        );
+        // The rest: the change's own tree, `a.txt` an ordinary file.
+        let s2 = repo.snapshot(&second).unwrap();
+        assert_eq!(s2.parents, vec![first]);
+        assert_eq!(s2.change_id, change_id, "the rest stays the change");
+        assert_eq!(listing(&repo, &s2.tree, &[]), listing(&repo, &t, &[p("a.txt")]), "split {split}");
+        assert_eq!(file_entry(&repo, &second, "a.txt").unwrap().visibility, Visibility::Public);
+        assert_eq!(read_at(&repo, &second, "a.txt"), SETTINGS.as_bytes());
+        assert_eq!(wc(&repo), second, "the working copy follows the change");
+        // Nothing either wrote is refused by the push check's rule.
+        for id in [first, second] {
+            assert_eq!(not_a_secrets(&repo, &tree_of(&repo, &id), &parent_trees(&repo, &id)), Vec::<VPath>::new(), "split {split}");
+        }
+        repo.undo().unwrap();
+        assert_eq!(repo.view(), &view0, "one undo restores both changes (split {split})");
+    }
+}
+
+/// The other way round: only the **new name** is chosen. The first half
+/// then adds the file beside the secret, a copy, which is an ordinary file
+/// (plain, as `vl commit` records a copy); the rest deletes the secret and
+/// keeps the change's tree exactly. (Before: both commands wrote the copy
+/// sealed, which the push check refuses.)
+#[test]
+fn bug_1911_a_renamed_secrets_new_name_taken_alone_is_a_copy_recorded_plain() {
+    for split in [false, true] {
+        let (mut repo, _fs, _base) = renamed_secret(SETTINGS);
+        let c = wc(&repo);
+        let t = tree_of(&repo, &c);
+        let parts = parts_of(&repo, &c);
+        let sel = whole("a.txt");
+        let h = selection::halves(repo.store(), &parts.base, &parts.tree, &parts.units, &sel).unwrap();
+        let view0 = repo.view().clone();
+        let (first, second) = if split {
+            let r = repo.split(&parts, &sel, None).unwrap();
+            (r.first, r.second)
+        } else {
+            let r = repo.squash_into(c, None, Some((&parts, &sel))).unwrap();
+            (r.destination, r.source.expect("the source keeps the rest"))
+        };
+        assert_eq!(listing(&repo, &tree_of(&repo, &first), &[]), listing(&repo, &h.chosen, &[p("a.txt")]), "split {split}");
+        assert_eq!(file_entry(&repo, &first, "a.txt").unwrap().visibility, Visibility::Public);
+        assert_eq!(file_entry(&repo, &first, "secret/.env.s").unwrap().visibility, team(), "the secret itself stays sealed");
+        assert_eq!(tree_of(&repo, &second), t, "the rest keeps the change's tree (split {split})");
+        for id in [first, second] {
+            assert_eq!(not_a_secrets(&repo, &tree_of(&repo, &id), &parent_trees(&repo, &id)), Vec::<VPath>::new(), "split {split}");
+        }
+        repo.undo().unwrap();
+        assert_eq!(repo.view(), &view0, "one undo restores both changes (split {split})");
+    }
+}
+
+/// A file recorded plain this way is scanned as any new ordinary file: a
+/// split or a squash that would leave a secret-looking file plain is
+/// refused, and changes nothing. (Recording the rename itself with such
+/// content holds the file back, so the token arrives by an edit.)
+#[test]
+fn bug_1911_taking_a_renamed_secret_apart_is_refused_when_it_looks_like_a_secret() {
+    for split in [false, true] {
+        let (mut repo, fs, _base) = renamed_secret(SETTINGS);
+        // An edit of the renamed file stays sealed, whatever it holds.
+        fs.write(&p("a.txt"), b"GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\n").unwrap();
+        snap(&mut repo, &*fs);
+        let c = wc(&repo);
+        assert_eq!(file_entry(&repo, &c, "a.txt").unwrap().visibility, team(), "control: the edited file is still sealed");
+        let parts = parts_of(&repo, &c);
+        let sel = whole("secret/.env.s");
+        let (view0, op0) = (repo.view().clone(), repo.op_id());
+        let err = if split { repo.split(&parts, &sel, None).map(|_| ()).unwrap_err() } else { repo.squash_into(c, None, Some((&parts, &sel))).map(|_| ()).unwrap_err() };
+        assert!(matches!(&err, veil_core::VeilError::Policy(m) if m.contains("'a.txt' looks like it holds a secret")), "split {split}: {err:?}");
+        assert_eq!((repo.view(), repo.op_id()), (&view0, op0), "a refusal changes nothing (split {split})");
+    }
+}
+
+/// What is built on the change follows it: a later change that still
+/// carries the renamed file is rebased onto the rest and holds the same
+/// ordinary file, so the whole stack is what the push check takes.
+#[test]
+fn bug_1911_what_is_built_on_a_split_rename_follows_it() {
+    let (mut repo, fs, _base) = renamed_secret(SETTINGS);
+    let (c, _) = repo.commit_working_copy(WS, "rename the settings").unwrap();
+    commit_files(&mut repo, &*fs, &[("c.txt", "C\n")], "more");
+    let view0 = repo.view().clone();
+    let parts = parts_of(&repo, &c);
+    let r = repo.split(&parts, &whole("secret/.env.s"), None).unwrap();
+    // The working copy, the later change, the rest, the first half.
+    let mut stack = vec![wc(&repo)];
+    while *stack.last().unwrap() != r.first {
+        let parents = repo.snapshot(stack.last().unwrap()).unwrap().parents.clone();
+        assert_eq!(parents.len(), 1);
+        stack.push(parents[0]);
+    }
+    assert_eq!(stack.len(), 4, "{stack:?}");
+    assert_eq!(stack[2], r.second);
+    assert_eq!(repo.description(&repo.snapshot(&stack[1]).unwrap()), "more");
+    for id in &stack {
+        assert_eq!(not_a_secrets(&repo, &tree_of(&repo, id), &parent_trees(&repo, id)), Vec::<VPath>::new(), "{}", id.short());
+    }
+    for id in &stack[..3] {
+        assert_eq!(file_entry(&repo, id, "a.txt").unwrap().visibility, Visibility::Public, "{}", id.short());
+        assert_eq!(read_at(&repo, id, "a.txt"), SETTINGS.as_bytes());
+    }
+    assert_eq!(read_at(&repo, &stack[1], "c.txt"), b"C\n");
+    repo.undo().unwrap();
+    assert_eq!(repo.view(), &view0);
 }
 
 /// Pure: applying a random set of blocks, then the complement on top of

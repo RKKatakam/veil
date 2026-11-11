@@ -332,6 +332,47 @@ fn bug_1833_a_secret_made_and_renamed_within_one_change_is_accepted() {
     assert!(out.status.success(), "the push of what vl itself recorded was refused: {text}");
 }
 
+/// BUG-1911 (BUG-1833's class through `vl split` and a partial `vl squash`):
+/// a change renames a secret, which `vl` keeps sealed at its new name, and
+/// one of its two halves (the deletion of the old name, or the new name)
+/// is split off or squashed into the change before. The half that then
+/// holds the new name without the deletion (on a parent with no secret, or
+/// as a copy beside it) is recorded as the ordinary file its path makes it,
+/// and the server takes the push. (`vl split` kept it sealed, and so did
+/// `vl squash` for the copy: "'settings-staging.txt' is not a secret file:
+/// only secret files are encrypted", for that push and every later one.)
+#[test]
+fn bug_1911_a_renamed_secret_taken_apart_by_split_or_squash_is_accepted() {
+    let hub = TestHub::start();
+    let secret = format!("{BILL_DIR}/.env.staging");
+    let mut refused = Vec::new();
+    for cmd in ["split", "squash"] {
+        for chosen in [secret.as_str(), "settings-staging.txt"] {
+            let p = setup_project(&hub);
+            write_files(&p.dir, &[(&secret, "REGION=review-marker-taken-apart-0001\n")]);
+            p.admin.commit_main(&p.dir, "the staging secret");
+            p.admin.ok(&p.dir, &["push"]);
+            // A change of this clone's own for the squash to go into.
+            write_files(&p.dir, &[("staging-notes.txt", "notes\n")]);
+            p.admin.commit_main(&p.dir, "notes");
+            std::fs::rename(p.dir.join(&secret), p.dir.join("settings-staging.txt")).unwrap();
+            p.admin.commit_main(&p.dir, "rename the staging settings");
+            p.admin.ok(&p.dir, &[cmd, "-r", "main", chosen]);
+            // The rest stays the change `main` names, and holds the renamed file.
+            let repo = veil_core::Repo::open(std::sync::Arc::new(veil_core::DiskBackend::new(&p.dir)), None, "test").unwrap();
+            let tree = repo.snapshot(&repo.view().tags["main"].target).unwrap().tree;
+            assert!(veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new("settings-staging.txt").unwrap()).unwrap().is_some(), "{cmd} {chosen}: the new name is recorded");
+            assert!(veil_core::tree::lookup(repo.store(), &tree, &veil_core::VPath::new(&secret).unwrap()).unwrap().is_none(), "{cmd} {chosen}: the old name is gone");
+            drop(repo);
+            let out = p.admin.run(&p.dir, &["push"]);
+            if !out.status.success() {
+                refused.push(format!("vl {cmd} {chosen}: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+            }
+        }
+    }
+    assert!(refused.is_empty(), "the push of what vl itself recorded was refused: {refused:#?}");
+}
+
 /// A stack over a hidden change (BUG-1054's fix makes the caller's own
 /// changes again on the real tip) fails with 400 "missing object" when a
 /// change of the stack holds a folder its maker sees whole: `restack`

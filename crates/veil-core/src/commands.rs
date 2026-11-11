@@ -484,7 +484,9 @@ impl Repo {
     /// child, holds the rest and stays the original change: the same
     /// change id, description, cloak, and the same tree, so its descendants,
     /// tags and working copies follow it with nothing to rebase. Nothing's
-    /// audience changes (see [`selection`]).
+    /// audience changes (see [`selection`]); a renamed secret taken apart
+    /// from the deletion of its old name is recorded as the ordinary file
+    /// it then is (`Transaction::reconcile_sealing`, BUG-1911).
     ///
     /// Refused when either change would be empty (nothing chosen, or
     /// everything), for an embargoed merge, and when the change moved since
@@ -492,7 +494,6 @@ impl Repo {
     pub fn split(&mut self, parts: &ChangeParts, sel: &Selection, message: Option<&str>) -> Result<SplitResult> {
         let id = parts.id;
         let mut tx = self.transaction("split")?;
-        tx.keep_sealing();
         let s = tx.repo().snapshot(&id)?;
         check_current(tx.repo(), &[id], parts, &s)?;
         if s.embargo.is_some() {
@@ -553,7 +554,10 @@ impl Repo {
     ///   chosen part is merged into the destination.
     ///
     /// Descendants are rebased. One transaction: `vl undo` restores
-    /// everything.
+    /// everything. Each snapshot written is its half exactly, but for a
+    /// renamed secret the selection took apart from the deletion of its old
+    /// name: an ordinary file there (`Transaction::reconcile_sealing`,
+    /// BUG-1911).
     pub fn squash_into(&mut self, id: ObjectId, into: Option<ObjectId>, part: Option<(&ChangeParts, &Selection)>) -> Result<SquashResult> {
         let mut tx = self.transaction("squash")?;
         let s = tx.repo().snapshot(&id)?;

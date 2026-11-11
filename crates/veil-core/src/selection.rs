@@ -11,7 +11,10 @@
 //! the rest.
 //!
 //! **Audiences** (ARCHITECTURE §4 rule 5). Choosing never changes who can
-//! read anything:
+//! read anything (one case is decided when a half is written, not here: a
+//! renamed secret, sealed at an ordinary path, whose half no longer holds
+//! the deletion of its old name is recorded as the ordinary file it then
+//! is, `Transaction::reconcile_sealing`, BUG-1911):
 //!
 //! * a whole unit's halves are its entries exactly as recorded (same
 //!   object, same sealing): no content is read or sealed;
