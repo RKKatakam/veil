@@ -742,6 +742,26 @@ mod tests {
         drop(held);
     }
 
+    /// BUG-1891: the share is per /64, and nothing groups the /64s of one
+    /// delegated prefix. A home line's /56 (RFC 6177; hosts and tunnel
+    /// brokers hand out /48s) is 256 of them: with `--max-connections 16`,
+    /// two connections from each of eight /64s of one /56 are every
+    /// connection of the server.
+    #[test]
+    #[ignore = "BUG-1891: the /64s of one delegated IPv6 prefix (a /56 or /48) each get a whole share: one subscriber opens every connection"]
+    fn bug_1891_one_delegated_ipv6_prefix_opens_every_connection() {
+        let c = Connections::new(16);
+        let held: Vec<Option<Slot>> = (0..8u16)
+            .flat_map(|n| {
+                let ip: IpAddr = format!("2001:db8:0:{n:x}::1").parse().unwrap();
+                [c.open(ip), c.open(ip)]
+            })
+            .collect();
+        assert!(held[0].is_some() && held[1].is_some(), "the first /64 opens its share");
+        let open = held.iter().flatten().count();
+        assert!(open < 16, "eight /64s of one /56 opened all {open} of the server's 16 connections");
+    }
+
     /// A refusal names nothing but the wait, in the body and the header.
     #[tokio::test]
     async fn refusals_say_when_to_come_back_and_nothing_else() {

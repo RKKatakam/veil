@@ -1456,3 +1456,140 @@ fn a_power_loss_tears_history_index_layers_and_they_are_rebuilt() {
     assert!(reopened.is_ancestor(&line[0], &tip).unwrap());
 }
 
+
+// ---- rv-gaps: operations the sweeps above do not reach ----------------------------------
+
+/// [`world`] after `prep` ran in Alice's repository.
+fn world_after(prep: fn(&mut Repo, &Arc<MemoryBackend>)) -> World {
+    let mut w = world();
+    let fs = Arc::new(w.local.fork());
+    {
+        let mut repo = Repo::open(fs.clone(), Some(w.id.clone()), "alice").unwrap();
+        prep(&mut repo, &fs);
+    }
+    w.local = fs.fork();
+    w
+}
+
+fn committed(repo: &mut Repo, fs: &Arc<MemoryBackend>) {
+    repo.snapshot_workspace(WS, &**fs).unwrap();
+    repo.commit_working_copy(WS, "a commit to take back").unwrap();
+}
+
+#[test]
+fn rvgaps_crash_during_undo() {
+    sweep_in(world_after(committed), "undo", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.undo()?;
+        Ok(())
+    }, true);
+}
+
+#[test]
+fn rvgaps_crash_during_undo_keeping_edits() {
+    sweep_in(world_after(committed), "undo keeping edits", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.undo_keeping_edits(WS)?;
+        Ok(())
+    }, true);
+}
+
+#[test]
+fn rvgaps_crash_during_redo() {
+    fn prep(repo: &mut Repo, fs: &Arc<MemoryBackend>) {
+        committed(repo, fs);
+        repo.undo_keeping_edits(WS).unwrap();
+    }
+    sweep_in(world_after(prep), "redo", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        // Done already (the crash came after it): nothing left to redo.
+        match repo.redo_keeping_edits(WS) {
+            Err(e) if e.to_string().contains("nothing to redo") => Ok(()),
+            r => r.map(|_| ()),
+        }
+    }, true);
+}
+
+#[test]
+fn rvgaps_crash_during_op_restore() {
+    sweep_in(world_after(committed), "op restore", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        let head = repo.op_id();
+        let older = repo.ops().get(&head)?.parents[0];
+        let older = repo.ops().get(&older)?.parents[0];
+        repo.restore_operation_keeping_edits(WS, older)?;
+        Ok(())
+    }, true);
+}
+
+#[test]
+fn rvgaps_crash_during_workspace_create_and_remove() {
+    sweep("create workspace", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        if !repo.view().workspaces.contains_key("second") {
+            repo.create_workspace("second", vec![env.v3])?;
+        }
+        Ok(())
+    });
+    fn prep(repo: &mut Repo, _: &Arc<MemoryBackend>) {
+        let v3 = repo.view().tags["side"].target;
+        repo.create_workspace("second", vec![v3]).unwrap();
+    }
+    sweep_in(world_after(prep), "remove workspace", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        if repo.view().workspaces.contains_key("second") {
+            repo.remove_workspace("second")?;
+        }
+        Ok(())
+    }, true);
+}
+
+#[test]
+fn rvgaps_crash_during_rewrites() {
+    sweep("describe", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.describe(env.side, "said again")?;
+        Ok(())
+    });
+    sweep("abandon", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.abandon(env.side)?;
+        Ok(())
+    });
+    sweep("squash", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.squash(env.v3)?;
+        Ok(())
+    });
+    sweep("duplicate", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.duplicate(&[env.side], &[env.v3], &veil_core::duplicate::DuplicateOptions { message: None, record_origin: true })?;
+        Ok(())
+    });
+    sweep("cherry-pick", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.cherry_pick(WS, &[env.side], &veil_core::duplicate::DuplicateOptions { message: None, record_origin: false })?;
+        Ok(())
+    });
+    sweep("edit", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.edit(WS, env.side)?;
+        Ok(())
+    });
+    sweep("new", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        repo.new_change(WS, vec![env.side], "a new change")?;
+        Ok(())
+    });
+}
+
+#[test]
+fn rvgaps_crash_during_tag_delete() {
+    sweep("tag delete", Target::Local, |env| {
+        let mut repo = env.open(&env.local)?;
+        if repo.view().tags.contains_key("side") {
+            repo.delete_tag("side")?;
+        }
+        Ok(())
+    });
+}
