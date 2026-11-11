@@ -1694,9 +1694,9 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/p/{p}/admin/groups", "person"),
         ("/p/{p}/admin/groups/{g}/delete", "person"),
         ("/p/{p}/admin/groups/{g}/members", "person"),
-        ("/p/{p}/web/secrets.js", "none"),
-        ("/p/{p}/web/secret-worker.js", "none"),
-        ("/p/{p}/web/secret-worker.wasm", "none"),
+        ("/p/{p}/web/secrets.js", "person"),
+        ("/p/{p}/web/secret-worker.js", "person"),
+        ("/p/{p}/web/secret-worker.wasm", "person"),
     ];
     let routes: Vec<&str> = API.split(".route(\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
     assert!(routes.len() >= 40, "the router was not read: {routes:?}");
@@ -1728,11 +1728,20 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         &rest[..end]
     };
     const SHARES: &str = include_str!("../../src/shares.rs");
+    const SECRETS: &str = include_str!("../../src/web/secrets.rs");
+    const WEB: &str = include_str!("../../src/web/mod.rs");
     for (src, f, call) in [
         (API, "access", "viewer.narrowed_to(&path)?"),
         (API, "get_rings", "viewer.narrowed_scopes(&project)"),
         (API, "get_ring", "viewer.narrowed_scopes(&project)"),
         (SHARES, "list", "viewer.within_narrowing(&path)"),
+        (SECRETS, "set_web_secrets_api_route", "caller.person_only()?"),
+        (SECRETS, "admin_web_secrets_form_route", "caller.person_only()?"),
+        (SECRETS, "web_rings_route", "caller.person_only()?"),
+        (SECRETS, "web_ciphertext_route", "caller.person_only()?"),
+        (SECRETS, "web_ciphertext_route", "query::file(&hub, &ask,"),
+        (SECRETS, "guard_project_worker_asset", "caller.person_only()?"),
+        (WEB, "pr_review_route", "caller.person_only()?"),
     ] {
         assert!(handler(src, f).contains(call), "route handler {f} is not narrowed ({call})");
     }

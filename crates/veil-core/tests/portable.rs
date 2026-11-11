@@ -1289,6 +1289,16 @@ fn web_browser_device_prf_sealing_and_worker_secret_decryption() {
         cred_id,
         &prf,
         &browser.sealed_identity_hex,
+        &rev_rings_json,
+        Some(&proj_fp),
+        Some(&bill_oid_g1),
+        &bill_raw_g1,
+    )
+    .is_err());
+    assert!(open_secret_in_worker(
+        cred_id,
+        &prf,
+        &browser.sealed_identity_hex,
         "{}",
         Some(&proj_fp),
         Some(&bill_oid_g1),

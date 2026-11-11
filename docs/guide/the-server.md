@@ -595,7 +595,7 @@ enrollment link:
 
 ```
 vl web
-vl web --remote origin
+vl web --server veil://hub.example.com
 ```
 
 Open the link in your browser and create a passkey. Later visits sign in with
@@ -616,12 +616,12 @@ vl share-keys
 
 Opening secrets in the browser is **off by default** on every project. A
 project admin can turn it on from the project's `/p/<project>/admin` page after
-acknowledging its security limit: **because the server serves the web client's
-code on every load, a server that was broken into could serve modified web code
-that reads secrets opened in a browser.** With the setting off, no browser gets
-wrapped keys and no page loads the secret-decryption Worker. When it is on,
-clicking **Show secret** decrypts the file inside the Worker on demand without
-caching the plaintext or sending it anywhere.
+acknowledging its security limit: **unlike `vl` on your machine, a server that
+was broken into could serve web code that reads secrets opened in a browser.**
+With the setting off, no browser gets wrapped keys and no page loads the
+secret-decryption Worker. When it is on, clicking **Show secret** shows the
+same warning on first use and decrypts the file inside the Worker on demand
+without caching the plaintext or sending it anywhere.
 
 Signing out of the browser or removing its device revokes its wrapped keys and
 rotates secret keys for new secrets on the next `vl share-keys`:

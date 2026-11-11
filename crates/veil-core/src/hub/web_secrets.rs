@@ -158,6 +158,9 @@ fn derive_ring_keys(
 
     let mut keys: BTreeMap<String, Zeroizing<Key>> = BTreeMap::new();
     let my_id = me.public_hex();
+    if !state.members.contains_key(&my_id) {
+        return Ok((state.genesis_key_id().to_string(), keys));
+    }
     let scope = ring.scope.as_str();
 
     if ring.is_legacy() {

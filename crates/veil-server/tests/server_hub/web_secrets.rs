@@ -547,6 +547,7 @@ fn guarantee_1_no_route_ever_returns_a_plain_secret() {
         format!("/p/{proj}/file/billing/.env.stripe"),
         format!("/p/{proj}/file/infra/.env.prod"),
         format!("/p/{proj}/blame/.env"),
+        format!("/p/{proj}/history/.env"),
         format!("/p/{proj}/log"),
         format!("/p/{proj}/commit/main"),
         format!("/p/{proj}/search?mode=grep&q=CANARY_S26"),
@@ -573,15 +574,22 @@ fn guarantee_1_no_route_ever_returns_a_plain_secret() {
     for api_route in [
         format!("/v1/projects/{proj}/q/tree?rev=main"),
         format!("/v1/projects/{proj}/q/log?rev=main"),
+        format!("/v1/projects/{proj}/q/show?rev=main"),
+        format!("/v1/projects/{proj}/q/history?rev=main&path=.env"),
         format!("/v1/projects/{proj}/q/diff?to=rot&from=main"),
         format!("/v1/projects/{proj}/q/search?mode=grep&q=CANARY_S26"),
+        format!("/v1/projects/{proj}/q/grep?rev=main&pattern=CANARY_S26"),
         format!("/v1/projects/{proj}/prs/{pr_id}"),
+        format!("/v1/projects/{proj}/prs/{pr_id}/diff"),
         format!("/v1/projects/{proj}/web/rings"),
     ] {
         let r = web.get_api(&api_route);
         assert_eq!(r.status, 200, "{api_route}: {}", r.text());
         assert_no_canary_bytes(&r.body, &all_canaries, &api_route);
     }
+    let q_blame = web.get_api(&format!("/v1/projects/{proj}/q/blame?rev=main&path=.env"));
+    assert!(q_blame.status == 400 || q_blame.status == 403, "blame on sealed file must fail: {}", q_blame.status);
+    assert_no_canary_bytes(&q_blame.body, &all_canaries, "/q/blame .env");
 
     // `/web/ciphertext` returns ONLY encrypted `Object::Sealed` bytes (never plain secrets, and refuses plain files!).
     let plain_try = web.get_api(&format!("/v1/projects/{proj}/web/ciphertext?rev=main&path=public/readme.md"));
@@ -870,6 +878,8 @@ fn guarantee_3_project_setting_off_gives_no_wrapped_key_and_no_decrypt_path() {
         admin_html.contains("broken into") && admin_html.contains("web code"),
         "admin settings page must state the honest limit: {admin_html}"
     );
+    let no_ack = web.post_form(&format!("/p/{proj}/admin/web-secrets"), &[("enabled", "true")], true);
+    assert_eq!(no_ack.status, 400, "enabling without acknowledging limit must fail: {}", no_ack.text());
     let turn_on = web.post_form(
         &format!("/p/{proj}/admin/web-secrets"),
         &[("enabled", "true"), ("acknowledge_limit", "1")],
@@ -882,6 +892,11 @@ fn guarantee_3_project_setting_off_gives_no_wrapped_key_and_no_decrypt_path() {
     assert!(
         file_on_html.contains("broken into") && file_on_html.contains("veil-show-secret"),
         "enabled sealed file page must show button and honest-limit notice: {file_on_html}"
+    );
+    let secrets_js = web.get(&format!("/p/{proj}/web/secrets.js")).text();
+    assert!(
+        secrets_js.contains("broken into") && secrets_js.contains("web code") && secrets_js.contains("window.confirm"),
+        "secrets.js must confirm the honest limit on the first Show secret: {secrets_js}"
     );
     assert_eq!(web.get_api(&format!("/v1/projects/{proj}/web/rings")).status, 200);
 
@@ -1099,6 +1114,35 @@ fn guarantee_4_browser_device_sees_only_readable_folder_rings_and_removal_delete
         removed_list.contains(&bundle2.public_identity.as_str()),
         "signed-out browser device must be marked removed so vl rotates keys"
     );
+
+    // 4. Project-admin bar (`POST /v1/devices/remove` with `project`) deletes that project's
+    //    `browser_device_rings`, hides `veil-show-secret`, and refuses `/web/rings` (`403`).
+    let code3 = mint_enroll_code(&hub, &bob);
+    let mut bob_web3 = BrowserClient::new(&hub);
+    let mut bob_pk3 = VirtualPasskey::new_with_prf(26);
+    let reg3 = bob_pk3.enroll(&mut bob_web3, &bob.name, &code3);
+    let fp3 = reg3["fingerprint"].as_str().unwrap().to_string();
+    bob.ok(&bob_dir, &["pull"]);
+    bob.ok(&bob_dir, &["identity", "confirm", &fp3]);
+    alice.ok(&dir, &["share-keys"]);
+    assert_eq!(bob_web3.get_api(&format!("/v1/projects/{proj}/web/rings")).status, 200);
+
+    let bundle3 = bob_pk3.bundle.as_ref().unwrap().clone();
+    let bar_res = hub.api().post_json(
+        Some(&alice.token()),
+        "/v1/devices/remove",
+        &json!({ "device": bundle3.public_identity, "project": proj }),
+    );
+    assert_eq!(bar_res.status, 200, "{}", String::from_utf8_lossy(&bar_res.body));
+    assert_eq!(bob_web3.get_api(&format!("/v1/projects/{proj}/web/rings")).status, 403);
+    assert_eq!(
+        bob_web3
+            .get_api(&format!("/v1/projects/{proj}/web/ciphertext?rev=main&path=billing/.env.stripe"))
+            .status,
+        403
+    );
+    let barred_page = bob_web3.get(&format!("/p/{proj}/file/billing/.env.stripe")).text();
+    assert!(!barred_page.contains("veil-show-secret"), "barred browser device must not render Show secret: {barred_page}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,6 +1420,20 @@ fn guarantee_6_web_approvals_count_only_under_s21_rules() {
         &json!({ "patch": patch_mixed, "verdict": "approve" }),
     );
     assert!(agt_try.status == 401 || agt_try.status == 403, "agent must not submit web review without device sig");
+    let ci = api
+        .post_json(
+            Some(&carol.token()),
+            "/v1/sessions/ci",
+            &json!({ "project": proj }),
+        )
+        .json();
+    let ci_tok = ci["token"].as_str().unwrap();
+    let ci_try = api.post_json(
+        Some(ci_tok),
+        &format!("/v1/projects/{proj}/prs/{pr_id}/reviews"),
+        &json!({ "patch": patch_mixed, "verdict": "approve" }),
+    );
+    assert!(ci_try.status == 401 || ci_try.status == 403, "CI runner session must never approve PRs");
 
     // Rule 4: Stale patch hash is refused (`409`).
     let stale = carol_web.post_json(

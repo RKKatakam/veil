@@ -512,8 +512,12 @@ pub async fn file_route(
             body.push_str("<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — open with vl.</strong></p>");
             body.push_str("<p class=\"muted\">Browser secret decryption is turned off for this project. Open secret files locally with <code>vl cat</code> or in a local workspace.</p>");
         } else {
-            let dev_status = secrets::caller_browser_device_status(&hub.db, &caller).await?;
+            let dev_status = secrets::caller_browser_device_status(&hub.db, ask.project.id, &caller).await?;
             match dev_status {
+                Some(st) if st.barred => {
+                    body.push_str("<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — open with vl.</strong></p>");
+                    body.push_str("<p class=\"muted\">This browser device has been removed from this project.</p>");
+                }
                 Some(st) if st.browser && !st.prf_supported => {
                     body.push_str("<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — open with vl.</strong></p>");
                     body.push_str("<p class=\"muted\">This browser can't open secrets (WebAuthn PRF extension is unavailable). Everything else in the web client works.</p>");
@@ -522,7 +526,7 @@ pub async fn file_route(
                     let fp = st.fingerprint.as_deref().unwrap_or("<FINGERPRINT>");
                     let _ = writeln!(
                         body,
-                        "<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — confirm this browser device first.</strong></p><p class=\"muted\">Confirm fingerprint <code>{}</code> on an existing device (<code>vl identity confirm {}</code>) and share keys (<code>vl keys</code>) before opening secrets here.</p>",
+                        "<p><span class=\"badge badge-sealed\">sealed</span> <strong>Sealed secret file — confirm this browser device first.</strong></p><p class=\"muted\">Confirm fingerprint <code>{}</code> on an existing device (<code>vl identity confirm {}</code>) and share keys (<code>vl share-keys</code>) before opening secrets here.</p>",
                         esc(fp),
                         esc(fp)
                     );

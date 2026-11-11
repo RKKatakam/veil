@@ -352,27 +352,35 @@ pub async fn admin_web_secrets_form_route(
 pub struct BrowserDeviceStatus {
     pub browser: bool,
     pub prf_supported: bool,
+    pub barred: bool,
     pub confirmed: bool,
     pub fingerprint: Option<String>,
 }
 
-pub async fn caller_browser_device_status(db: &sqlx::PgPool, caller: &Caller) -> Result<Option<BrowserDeviceStatus>> {
+pub async fn caller_browser_device_status(
+    db: &sqlx::PgPool,
+    project_id: i64,
+    caller: &Caller,
+) -> Result<Option<BrowserDeviceStatus>> {
     let Some(me) = &caller.person else {
         return Ok(None);
     };
-    type Row = (bool, bool, bool, Option<String>, bool);
+    type Row = (bool, bool, bool, Option<String>, bool, bool);
     let row: Option<Row> = sqlx::query_as(
         "SELECT d.browser, d.prf_supported, d.pending, d.fingerprint, \
-         EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id) \
+         EXISTS (SELECT 1 FROM device_vouches v WHERE v.device_id = d.id), \
+         EXISTS (SELECT 1 FROM device_bars b WHERE b.project_id = $2 AND b.device_id = d.id) \
          FROM devices d WHERE d.signing_key = $1 AND d.removed_at IS NULL",
     )
     .bind(&me.device_key)
+    .bind(project_id)
     .fetch_optional(db)
     .await?;
-    Ok(row.map(|(browser, prf_supported, pending, fingerprint, has_vouch)| BrowserDeviceStatus {
+    Ok(row.map(|(browser, prf_supported, pending, fingerprint, has_vouch, barred)| BrowserDeviceStatus {
         browser,
         prf_supported,
-        confirmed: browser && prf_supported && !pending && has_vouch,
+        barred,
+        confirmed: browser && prf_supported && !pending && has_vouch && !barred,
         fingerprint,
     }))
 }
@@ -424,6 +432,7 @@ pub async fn web_rings_route(
     caller: Caller,
     Path(p): Path<String>,
 ) -> Result<Json<Value>> {
+    caller.person_only()?;
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
     if !is_project_web_secrets_enabled(&hub.db, project.id).await? {
         return Err(web_secrets_disabled_err());
@@ -490,6 +499,7 @@ pub async fn web_ciphertext_route(
     Path(p): Path<String>,
     Query(q): Query<FileParams>,
 ) -> Result<Response> {
+    caller.person_only()?;
     let ask = Ask::open(&hub, &p, &caller).await?;
     if !is_project_web_secrets_enabled(&hub.db, ask.project.id).await? {
         return Err(web_secrets_disabled_err());
@@ -534,6 +544,7 @@ pub async fn web_ciphertext_route(
 }
 
 async fn guard_project_worker_asset(hub: &HubState, caller: &Caller, p: &str) -> Result<String> {
+    caller.person_only()?;
     let (project, _viewer) = perm::open(hub, p, caller).await?;
     if !is_project_web_secrets_enabled(&hub.db, project.id).await? {
         return Err(web_secrets_disabled_err());
@@ -680,6 +691,9 @@ const SECRETS_PAGE_JS: &str = r#"'use strict';
     if (statusEl) statusEl.textContent = '';
   }
 
+  var limitAcked = false;
+  var HONEST_LIMIT = "Honest limit: unlike vl on your machine, a server that was broken into could serve web code that reads secrets opened in a browser.";
+
   if (hideBtn) {
     hideBtn.addEventListener('click', clearSecret);
   }
@@ -689,6 +703,12 @@ const SECRETS_PAGE_JS: &str = r#"'use strict';
     if (!window.PublicKeyCredential || !navigator.credentials) {
       if (statusEl) statusEl.textContent = "This browser can't open secrets (WebAuthn PRF unavailable).";
       return;
+    }
+    if (!limitAcked) {
+      if (typeof window.confirm === 'function' && !window.confirm(HONEST_LIMIT + '\n\nDecrypt and show this secret in the browser?')) {
+        return;
+      }
+      limitAcked = true;
     }
     if (statusEl) statusEl.textContent = 'Touch your passkey to unlock your browser device key…';
     loadStoredDevice().then(function (rec) {
