@@ -321,7 +321,9 @@ fn guarantee_1_merging_never_loses_or_changes_an_object_across_servers_and_crash
 
     // Wait until reader threads are actively reading, then finish the merge and
     // sweep all discarded packs with `pack_grace_ms: 0`.
-    while reads_done.load(Relaxed) < 16 {
+    // (A reader that failed ends these waits: its panic is reported below,
+    // where the readers are joined, instead of a test that never ends.)
+    while reads_done.load(Relaxed) < 16 && !reader_threads.iter().any(|t| t.is_finished()) {
         std::thread::sleep(Duration::from_millis(5));
     }
     let finish_opts = Options {
@@ -336,7 +338,7 @@ fn guarantee_1_merging_never_loses_or_changes_an_object_across_servers_and_crash
 
     // Let readers keep reading after old packs have been deleted from storage!
     let mark = reads_done.load(Relaxed);
-    while reads_done.load(Relaxed) < mark + 32 {
+    while reads_done.load(Relaxed) < mark + 32 && !reader_threads.iter().any(|t| t.is_finished()) {
         std::thread::sleep(Duration::from_millis(5));
     }
     stop.store(true, Relaxed);
@@ -1709,5 +1711,169 @@ fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_
             hub.rt.block_on(fresh.exists(pid, &id)).unwrap(),
             "{label} ({id}) must be retained by pack_gc"
         );
+    }
+}
+
+/// A store that pauses one read of a pack (an entry's bytes, or whether the
+/// pack is there) until the test lets it go on: the moment between a lookup
+/// in a pack's index and the read of that pack (BUG-1898).
+struct PausedStore {
+    inner: Arc<dyn veil_server::store::BlobStore>,
+    /// Reads of a pack left before the one that pauses (negative: none).
+    left: std::sync::atomic::AtomicI64,
+    reached: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    go: tokio::sync::Notify,
+}
+
+impl PausedStore {
+    async fn pack_read(&self, key: &str) {
+        if key.contains("/pack/") && self.left.fetch_sub(1, Relaxed) == 0 {
+            self.reached.lock().unwrap().send(()).unwrap();
+            self.go.notified().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl veil_server::store::BlobStore for PausedStore {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, data: Bytes) -> anyhow::Result<()> {
+        self.inner.put(key, data).await
+    }
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        self.pack_read(key).await;
+        self.inner.exists(key).await
+    }
+    async fn len(&self, key: &str) -> anyhow::Result<Option<u64>> {
+        self.inner.len(key).await
+    }
+    async fn get_range(&self, key: &str, start: u64, end: u64) -> anyhow::Result<Option<(Bytes, u64)>> {
+        // An index is read from the pack's first byte; an entry never is.
+        if start > 0 {
+            self.pack_read(key).await;
+        }
+        self.inner.get_range(key, start, end).await
+    }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+}
+
+/// BUG-1898: a read listed the project's packs, found its object in one, and
+/// by the time it read that pack a merge had switched to a new pack and
+/// swept the old one (`pack_grace_ms: 0`; or a read that outlasts the grace
+/// period). It forgot the pack, missed the loose object, and then took the
+/// listing it had itself read moments before for a current one (it began
+/// after the read did): "missing", for an object the merged pack holds.
+/// Here every read path is stopped at exactly that moment (after its index
+/// lookup, before its read of the pack) while the packs are merged and the
+/// old ones deleted, on a server that has never listed the project: each
+/// must answer the object, from the merged pack.
+#[test]
+fn bug_1898_every_read_that_finds_its_pack_merged_and_swept_reads_the_listing_again() {
+    use veil_server::store::Objects;
+    type Read = fn(&Objects, &tokio::runtime::Handle, i64, &ObjectId, &Bytes, &Bytes);
+    fn range(o: &Objects, rt: &tokio::runtime::Handle, p: i64, id: &ObjectId, raw: &Bytes, _: &Bytes) {
+        let (part, len) = rt.block_on(o.get_range(p, id, 3, 19)).expect("get_range must not fail").expect("get_range must never see a missing object");
+        assert_eq!(len, raw.len() as u64);
+        assert_eq!(&part[..], &raw[3..=19]);
+    }
+    // (name, reads of a pack before the one that is stopped, the read)
+    let reads: [(&str, i64, Read); 8] = [
+        ("get", 0, |o, rt, p, id, raw, _| {
+            assert_eq!(&rt.block_on(o.get(p, id)).expect("get must not fail").expect("get must never see a missing object"), raw)
+        }),
+        ("get_many", 0, |o, rt, p, id, raw, _| {
+            let got = rt.block_on(o.get_many(p, &[*id])).expect("get_many must not fail");
+            assert_eq!(got[0].as_ref().expect("get_many must never see a missing object"), raw)
+        }),
+        ("get_encoded", 0, |o, rt, p, id, _, enc| {
+            assert_eq!(&rt.block_on(o.get_encoded(p, id)).expect("get_encoded must not fail").expect("get_encoded must never see a missing object"), enc)
+        }),
+        ("get_blocking", 0, |o, rt, p, id, raw, _| {
+            assert_eq!(&o.get_blocking(rt, p, id).expect("get_blocking must not fail").expect("get_blocking must never see a missing object"), raw)
+        }),
+        ("get_ephemeral_blocking", 0, |o, rt, p, id, raw, _| {
+            assert_eq!(&o.get_ephemeral_blocking(rt, p, id).expect("get_ephemeral_blocking must not fail").expect("get_ephemeral_blocking must never see a missing object"), raw)
+        }),
+        // Stopped at the read of the entry's first bytes, then at the read
+        // of the range itself.
+        ("get_range (its head)", 0, range),
+        ("get_range (its bytes)", 1, range),
+        ("exists", 0, |o, rt, p, id, _, _| assert!(rt.block_on(o.exists(p, id)).expect("exists must not fail"), "exists must never see a missing object")),
+    ];
+
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let listed = || -> Vec<String> {
+        hub.rt
+            .block_on(
+                sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = $2 ORDER BY created_at, name")
+                    .bind(pid)
+                    .bind(LISTED)
+                    .fetch_all(&h.db),
+            )
+            .unwrap()
+    };
+    let opts = Options { min_packs_to_merge: 2, run_gc: false, pack_grace_ms: 0, ..Options::default() };
+
+    for (i, (name, before_pause, read)) in reads.into_iter().enumerate() {
+        // A push: one more small listed pack beside what the last merge left.
+        write_files(&p.dir, &[(&format!("src/b1898_{i}.txt"), &format!("bug-1898 {i} {}\n", unique("q")))]);
+        p.admin.commit_main(&p.dir, &format!("bug 1898, push {i}"));
+        p.admin.ok(&p.dir, &["push"]);
+        let old = listed();
+        assert!(old.len() >= 2, "{name}: {} listed packs to merge", old.len());
+
+        // An object of the newest pack that is stored as it is (so a ranged
+        // read reads the pack for those bytes), with what it must read as.
+        let newest = pack::key(pid, old.last().unwrap());
+        let index = hub.rt.block_on(pack::read_index(&**h.objects.blob_store(), &newest, h.objects.index_bound())).unwrap().expect("the pushed pack is stored");
+        let (id, raw, enc) = index
+            .index
+            .iter()
+            .find_map(|(id, _)| {
+                let enc = hub.rt.block_on(h.objects.get_encoded(pid, id)).unwrap()?;
+                let raw = hub.rt.block_on(h.objects.get(pid, id)).unwrap()?;
+                (!veil_core::hub::encoding::is_compressed(&enc) && raw.len() > 20).then_some((*id, raw, enc))
+            })
+            .unwrap_or_else(|| panic!("{name}: the pushed pack holds an object stored as it is"));
+        drop(index);
+
+        // A server that has never listed this project reads it, and stops
+        // between its lookup in the old pack's index and its read of it.
+        let (reached, at_the_read) = std::sync::mpsc::channel();
+        let store = Arc::new(PausedStore {
+            inner: h.objects.blob_store().clone(),
+            left: std::sync::atomic::AtomicI64::new(before_pause),
+            reached: std::sync::Mutex::new(reached),
+            go: tokio::sync::Notify::new(),
+        });
+        let objects = Objects::with_db(store.clone(), 1 << 10, Some(h.db.clone()));
+        let rt = hub.rt.handle().clone();
+        let reader = std::thread::spawn(move || read(&objects, &rt, pid, &id, &raw, &enc));
+        at_the_read
+            .recv_timeout(Duration::from_secs(120))
+            .unwrap_or_else(|_| panic!("{name}: the read never reached the pack (did it fail? {})", reader.is_finished()));
+
+        // Meanwhile the packs are merged, and the old ones deleted at once.
+        let r = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).unwrap();
+        assert_eq!(r.packs_merged, old.len(), "{name}: every listed pack was merged");
+        assert_eq!(r.discarded_packs_swept, old.len(), "{name}: every replaced pack was swept");
+        assert!(!hub.rt.block_on(h.objects.blob_store().exists(&newest)).unwrap(), "{name}: the pack the reader found is gone from the store");
+        assert_eq!(listed().len(), 1, "{name}: one merged pack is listed");
+
+        store.go.notify_one();
+        if let Err(e) = reader.join() {
+            let why = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+            panic!("{name}, racing a merge and its sweep: {why}");
+        }
     }
 }

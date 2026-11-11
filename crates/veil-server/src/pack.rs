@@ -633,6 +633,13 @@ const PACK_WEIGHT: usize = 128;
 /// any size always reads; then the entries of projects used least
 /// recently, never the one in use.
 pub const LOOKUP_BUDGET: usize = 128 << 20;
+/// How many times one lookup reads a project's listing while packs it names
+/// are found gone from the store ([`Packs::locate`], BUG-1898). A pack is
+/// deleted only after the switch that replaced it and its grace period, so
+/// the second listing names the replacement; a third is for a second merge
+/// within one lookup. A listed pack that is lost from the store for good
+/// ends the lookup here, answered as before.
+const LISTINGS: usize = 3;
 
 /// One listed pack of a project: its index while loaded, and when it was
 /// last searched.
@@ -658,8 +665,9 @@ impl Map {
 }
 
 struct ProjectPacks {
-    /// Serialises listings; when the last one began.
-    listing: tokio::sync::Mutex<Option<Instant>>,
+    /// Serialises listings; when the last one began, and [`Packs::gone`]
+    /// then.
+    listing: tokio::sync::Mutex<Option<(Instant, u64)>>,
     map: RwLock<Map>,
     used: AtomicU64,
 }
@@ -693,6 +701,11 @@ pub struct Packs {
     /// [`LOOKUP_BUDGET`] (smaller in tests).
     budget: usize,
     tick: AtomicU64,
+    /// How many times a pack was forgotten ([`Packs::forget`]): one a merge
+    /// or a collection replaced, which a read on this server may have found
+    /// gone from the store. A listing read before then may be from before
+    /// the switch that replaced it, whenever it began (BUG-1898).
+    gone: AtomicU64,
     /// [`INDEXES_HELD`]: every index held outside the lookup maps.
     bound: Bound,
     /// Indexes and lengths of packs staged recently, by name (a push on the
@@ -734,6 +747,7 @@ impl Packs {
             projects: Mutex::new(HashMap::new()),
             budget: LOOKUP_BUDGET,
             tick: AtomicU64::new(0),
+            gone: AtomicU64::new(0),
             // One holder takes at most what the staged-index cache leaves,
             // so a share for any index can always come free.
             bound: Bound { most: INDEXES_HELD - STAGED_INDEXES, ..Bound::new(INDEXES_HELD) },
@@ -804,15 +818,36 @@ impl Packs {
     /// past its budget, read again from storage. One project entry serves
     /// the whole lookup, so an eviction of the project's entry meanwhile
     /// (another project's lookup) never empties it (BUG-1495's class).
+    ///
+    /// **`again` never answers from a listing older than a pack found gone**
+    /// (BUG-1898): packs are merged and collected (S29), so what this
+    /// server's map names may be from before a switch, and the pack it
+    /// names swept. The caller that found one gone forgot it
+    /// ([`Packs::forget`]); `again` then reads the listing anew before it
+    /// searches (the map may name another replaced pack that holds the
+    /// object), and once more if a pack was found gone meanwhile (by this
+    /// lookup's own index reads, or another's), at most [`LISTINGS`] times:
+    /// a switch commits before its replaced packs are deleted, so a listing
+    /// read after one was found gone names what replaced it.
     pub async fn locate(&self, store: &Arc<dyn BlobStore>, project: i64, id: &ObjectId, again: bool, since: Instant, reads: &AtomicU64) -> Result<Option<(Arc<str>, Slot)>> {
         let p = self.project(project);
-        match self.find_in(&p, id) {
-            Found::At(n, s) => return Ok(Some((n, s))),
-            Found::Absent | Found::Paged if !again => return Ok(None),
-            _ => {}
+        if !again {
+            match self.find_in(&p, id) {
+                Found::At(n, s) => return Ok(Some((n, s))),
+                Found::Absent | Found::Paged => return Ok(None),
+                Found::Unloaded => {}
+            }
         }
-        self.refresh_in(&p, store, project, since, reads).await?;
-        self.find_paged_in(&p, store, project, id, reads).await
+        let mut found = None;
+        for _ in 0..LISTINGS {
+            let gone = self.gone.load(Ordering::SeqCst);
+            self.refresh_in(&p, store, project, since, reads).await?;
+            found = self.find_paged_in(&p, store, project, id, reads).await?;
+            if found.is_some() || self.gone.load(Ordering::SeqCst) == gone {
+                break;
+            }
+        }
+        Ok(found)
     }
 
     /// [`Packs::find`] in every listed pack of `project` this server knows:
@@ -905,6 +940,9 @@ impl Packs {
         if names.is_empty() {
             return;
         }
+        // Before anything else: a listing that began before this is no
+        // longer taken for a current one (BUG-1898).
+        self.gone.fetch_add(1, Ordering::SeqCst);
         for n in names {
             self.staged.insert(name_key(project, n), None, 64);
         }
@@ -977,17 +1015,23 @@ impl Packs {
 
     /// Read `project`'s listing again, and the indexes of the packs this
     /// server does not know, unless a listing began after `since` (it
-    /// holds every pack listed before then).
+    /// holds every pack listed before then) **and no pack was forgotten
+    /// since it began** (BUG-1898: one found gone from the store was
+    /// replaced by a switch that listing may not have seen, so a lookup
+    /// that began before the listing, found its pack gone after it, and
+    /// took the listing for a current one answered "missing" for an object
+    /// the merged pack holds).
     pub async fn refresh(&self, store: &Arc<dyn BlobStore>, project: i64, since: Instant, reads: &AtomicU64) -> Result<()> {
         self.refresh_in(&self.project(project), store, project, since, reads).await
     }
 
     async fn refresh_in(&self, p: &Arc<ProjectPacks>, store: &Arc<dyn BlobStore>, project: i64, since: Instant, reads: &AtomicU64) -> Result<()> {
         let mut last = p.listing.lock().await;
-        if last.is_some_and(|t| t >= since) {
+        let gone = self.gone.load(Ordering::SeqCst);
+        if last.is_some_and(|(t, g)| t >= since && g == gone) {
             return Ok(());
         }
-        let began = Instant::now();
+        let began = (Instant::now(), gone);
         let Some(db) = &self.db else {
             p.map.write().unwrap().loaded = true;
             *last = Some(began);

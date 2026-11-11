@@ -799,9 +799,11 @@ fn bug_1107_a_batch_of_one_line_changes_in_a_big_folder_stays_within_memory() {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["landing::big_folder_batch_in_a_child", "--exact", "--include-ignored", "--nocapture", "--test-threads", "1"])
         .env("VEIL_S17_CHILD", "1")
-        // As the server's allocator (jemalloc, two arenas: BUG-864); this
-        // test binary has glibc's, with an arena per thread.
-        .env("MALLOC_ARENA_MAX", "2")
+        // One allocator arena (this test binary has glibc's allocator, with
+        // an arena per thread; the server has jemalloc). Not two, as it
+        // was: see `bug_1272_…` below (this one read 119 to 188 MiB over
+        // four runs of the same code).
+        .env("MALLOC_ARENA_MAX", "1")
         .output()
         .unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1146,7 +1148,15 @@ fn bug_1272_a_stack_of_changes_in_a_big_folder_stays_within_the_batch_bound() {
         // before it measures (S17 cycle 3 review: glibc kept it, the
         // service's growth fitted in it unseen, and the child said 0 MiB).
         .env("VEIL_S17_TRIM", "1")
-        .env("MALLOC_ARENA_MAX", "2")
+        // One allocator arena, so that the peak is what the service holds.
+        // glibc reuses freed memory only within the arena it came from, so
+        // with two arenas the number followed which arena each thread of
+        // the landing drew from, not the code: 63 to 343 MiB over 9 runs
+        // alone of one build (3 of them past the bound; `integration`: 194
+        // to 221 alone, 161 to 235 beside the other landing tests). With one:
+        // 93 to 116 (`integration`: 106 to 182), and 464 to 466 with
+        // `BATCH_BYTES` taken away, so it still sees what BUG-1272 was.
+        .env("MALLOC_ARENA_MAX", "1")
         .output()
         .unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));

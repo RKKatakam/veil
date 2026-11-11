@@ -5350,6 +5350,30 @@ migration `0026_bisect_and_revert.sql` (`landing_queue.priority`,
     (for `P`).
   * If `C` passes on its confirmation re-run or `P` fails, bisect transitions to
     `phase = "flaky"` and never reverts anything.
+* **When a result counts (`step_branch`, `spawn_step_after_lease`, `reconcile_branch`; BUG-1862, BUG-1899).**
+  * `POST …/checks` stores the result and answers `200` whether or not the
+    bisect has counted it yet. One step at a time runs per branch, under
+    `bisect_leases`. A report that finds the lease free steps the bisect
+    within its own request. A report that finds it held (a concurrent report
+    of the same or another result, another server, a revert being landed) is
+    answered at once, and a step that follows the lease (asked every 50 ms,
+    for the lease's 5 s and 1.5 s more) counts it. **So after concurrent
+    reports the bisect advances a moment after the last answer, not with
+    it**: a client that reads `GET …/bisect/{branch}` straight after its
+    `POST` may see the phase from before its result (or `404`, no bisect
+    yet, when the first failure itself found the lease held), and asks again
+    (a runner follows `check.requested` events instead).
+  * No stored result is left out: every step recounts from `checks`
+    (`run_count`), not from the report that started it, so a result is
+    counted by the first step that begins after it was stored, whoever's it
+    is; the status route and a server's start run such a step themselves
+    (when the lease is free; the status route counts nothing while it is
+    held, and answers what is stored). Each of the three (a report's own
+    step, the step that follows the lease, the status route's and the
+    start's) runs again, up to 8 times, when garbage collection switched the
+    project's packs between its reads and its write (§13.37's guard on
+    writes of roots: BUG-1899, the step that follows the lease ran once and
+    gave the result up).
 * **Priority-lane server revert via S17 and S18 (`revert_confirmed_culprit`).**
   * When `C` is confirmed (`culprit_fails >= 2` and `parent_passes >= 1`), the
     server constructs a revert snapshot signed by `hub.identity` with
@@ -5416,7 +5440,7 @@ Design: [`docs/design/server/storage-and-cost.md` §8](design/server/storage-and
   1. **Per-project advisory lock and shedding:** one server at a time runs `pack_gc` on a project (`pg_try_advisory_lock(LOCK_BASE ^ project_id)` on `derive.db`), acquiring a background worker permit (`derive::Workers::permit`) and yielding to landings and pushes via `limits.derive_turn()` (`limits::DERIVE_PAUSE`).
   2. **Bounded index and object reads:** source pack indexes are read one at a time under `pack::INDEXES_HELD` (`Objects::index_bound`), deduplicating objects across the batch and filtering out any expired-unreferenced objects. Live entries are copied in contiguous range spans (`COPY_SPAN = 2 MiB`) under `store::ReadAhead` (`store::DECODED_IN_FLIGHT`), verifying every entry header (`pack::entry`), and written as new `STAGED` job packs (`person_id IS NULL`, capped at `MAX_MERGED_BYTES = 32 MiB` and `pack::MAX_OBJECTS = 262,144`) via `Objects::put_job_pack` (which inserts the `STAGED` row before writing the storage object).
   3. **Atomic switch transaction:** in one `READ COMMITTED` transaction (`db::transaction`), the job locks the replaced packs (`SELECT ... FOR UPDATE`), verifies they are still `LISTED` (and, when GC drops unreferenced objects, verifies the project's ref/push stamp `RefStamp` is unchanged), updates the new pack(s) to `LISTED` (`state = 1`), and marks the replaced packs `DISCARDED` (`state = 2`, `discarded_at = now_ms`).
-  4. **Cross-server lookup coherence:** the server that ran the switch calls `Objects::listed_here` and `Objects::forget_packs` (`Packs::forget`). Other servers prune unlisted packs on `Packs::refresh_in`, and if a ranged read (`Objects::try_pack_range`, `Objects::stored`, `Objects::get_blocking`, `Packs::find_paged_in`) encounters a pack that was already merged and swept after its grace window, it forgets that pack and refreshes the project's listing seamlessly without surfacing an error.
+  4. **Cross-server lookup coherence:** the server that ran the switch calls `Objects::listed_here` and `Objects::forget_packs` (`Packs::forget`). Other servers prune unlisted packs on `Packs::refresh_in`, and if a ranged read (`Objects::try_pack_range`, `Objects::stored`, `Objects::get_blocking`, `Packs::find_paged_in`) encounters a pack that was already merged and swept after its grace window, it forgets that pack and refreshes the project's listing seamlessly without surfacing an error. **Every read asks a listing read after it found a pack gone before it answers "missing" (BUG-1898):** `Packs::forget` counts, a listing is taken for a current one only if no pack was forgotten since it began (it used to be enough that it began after the read did: a read that listed, found its object in an old pack, and met that pack swept answered "missing" from its own listing of a moment before), `Packs::locate` lists before it searches again and once more if a pack was found gone meanwhile (at most 3 listings a lookup), and `Objects::get`, `get_many`, `get_encoded`, `get_blocking`, `get_ephemeral_blocking`, `get_range`, `read_cost` and `exists` all read through it (`Objects::pack_range_again`: a pack found by the new listing and swept in turn is looked up again, 3 times, not failed on). A switch commits before any pack it replaced is deleted, so that listing names the pack that holds the object. With the default grace period (60 s) only a read that outlasts it could meet this; with `pack_grace_ms = 0` any read could (`bug_1898_every_read_that_finds_its_pack_merged_and_swept_reads_the_listing_again`, each read stopped between its index lookup and its read of the pack).
   5. **Grace-period sweep:** once `now_ms - discarded_at >= pack_grace_ms`, `sweep_discarded` deletes the storage object (`store.delete`) and then deletes the `DISCARDED` row from `packs`. Uncommitted job packs from an interrupted run (`state = 0 AND person_id IS NULL`) and abandoned client uploads older than `staged_grace_ms` are discarded and swept by `sweep_staged`.
 * **A switch that drops objects excludes the transactions that add roots (BUG-1881).** Each such switch (`run_with_lock`, `compact_batch` when it drops objects, `mark_and_sweep_loose`) locks the project's GC epoch row (`access_epochs (project, -1)`) `FOR UPDATE` before it reads the reference stamp, and raises the epoch as it commits. Every transaction that adds a root (a push, an API commit, a PR or its revision, a landing's queue entry and batch, a merge worker, a check and the tested pointer, an embargo's release (its queue entries, its last step, the tags of its PRs' projected snapshots), a bisect and the record of a revert that landed, the search index) read the epoch before it checked its objects (`pack_gc::read_gc_epoch`), and its first statement locks the row `FOR SHARE` and compares (`guard_root_write`): after a switch it starts over (`GcEpochChanged`), and a switch that follows it sees its rows in the stamp and gives up. Writers never wait for each other, and add no commit. Both sides first take a transaction-level advisory lock (`GATE_BASE ^ project`: writers shared, the switch exclusive), which is granted in arrival order: PostgreSQL lets new `FOR SHARE` lockers join a row ahead of a waiting `FOR UPDATE`, so under steady pushes the switch alone never got the row. While a switch's transaction runs (the stamp's read, the purge), the project's root writers wait for it.
 * **Garbage collection reachability closure.** `mark_and_sweep_loose` walks the object graph starting from all server roots of the project:
