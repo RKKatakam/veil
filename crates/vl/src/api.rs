@@ -1201,6 +1201,8 @@ fn thin_query_log<'a>(
         max_changes: None,
         skipped: 0,
         stopped: false,
+        // Never reached from a sparse sandbox (`log_entries_with`).
+        within: None,
     };
     let mut local_searcher = path_filter.as_ref().map(|(p, follow)| {
         Searcher::new(
@@ -1563,7 +1565,11 @@ pub fn log_entries_with<'a>(repo: &'a Repo, ws: &str, mut q: LogQuery) -> Result
     let root = repo.root_id();
     let signers = repo.keys().known_signers();
 
-    if repo.is_partial() {
+    // A sparse sandbox (`--only`, BUG-1844) is shown its own paths only: its
+    // log comes from what this clone holds, restricted below, never from the
+    // server's answer for the whole project.
+    let sparse = q.filter.as_ref().is_some_and(|f| f.within.is_some());
+    if repo.is_partial() && !sparse {
         if let Some(path_filter) = thin_log_route(&q) {
             let promisor = repo
                 .store()
