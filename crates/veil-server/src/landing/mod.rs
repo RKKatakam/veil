@@ -66,6 +66,18 @@ pub struct Submitter {
     pub epochs: crate::caches::Epochs,
 }
 
+/// What satisfied (or must satisfy) the protected-branch review gate when this
+/// stack was submitted (`BUG-1880`). Stored on `stack[0]` so it survives S18
+/// content-merges (`merge_stack`), which rewrite merged blob IDs while keeping
+/// the submitted change's review identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewClaim {
+    /// Submitted via `POST /prs/{id}/land` for `id` at `revision` (`patch`).
+    Pr { id: String, revision: i32, patch: String },
+    /// Submitted via push / `POST /land` / API commit with original `patch`.
+    Patch { patch: String },
+}
+
 /// One change of a stack ([`stack`]): its real snapshot, and its base (the
 /// change below it that lands, or the snapshot on the branch where the
 /// stack starts). Its edits are its diff against its first parent (a merge
@@ -74,25 +86,87 @@ pub struct Submitter {
 pub struct Entry {
     pub id: ObjectId,
     pub base: ObjectId,
+    pub review: Option<ReviewClaim>,
 }
 
 impl Entry {
     pub fn plain(id: ObjectId, base: ObjectId) -> Entry {
-        Entry { id, base }
+        Entry { id, base, review: None }
     }
 }
 
-/// A stack as its queue row holds it: `[snapshot, base]` pairs.
+fn split_non_object_hex(s: &str) -> String {
+    if s.len() == 64 {
+        format!("{}:{}", &s[..32], &s[32..])
+    } else {
+        s.to_string()
+    }
+}
+
+fn join_non_object_hex(s: &str) -> String {
+    match s.split_once(':') {
+        Some((a, b)) if a.len() == 32 && b.len() == 32 => format!("{a}{b}"),
+        _ => s.to_string(),
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EncodedStackWithClaim {
+    entries: Vec<[String; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rev: Option<i32>,
+    patch: String,
+}
+
+/// A stack as its queue row holds it: `[snapshot, base]` pairs, or an object
+/// carrying [`ReviewClaim`] (`BUG-1880`; `patch` is split so `pack_gc` never
+/// scans it as a 64-hex `ObjectId`).
 pub fn encode_stack(stack: &[Entry]) -> String {
     let rows: Vec<[String; 2]> = stack.iter().map(|e| [e.id.hex(), e.base.hex()]).collect();
-    serde_json::to_string(&rows).unwrap_or_default()
+    match stack.first().and_then(|e| e.review.as_ref()) {
+        None => serde_json::to_string(&rows).unwrap_or_default(),
+        Some(ReviewClaim::Pr { id, revision, patch }) => serde_json::to_string(&EncodedStackWithClaim {
+            entries: rows,
+            pr: Some(id.clone()),
+            rev: Some(*revision),
+            patch: split_non_object_hex(patch),
+        })
+        .unwrap_or_default(),
+        Some(ReviewClaim::Patch { patch }) => serde_json::to_string(&EncodedStackWithClaim {
+            entries: rows,
+            pr: None,
+            rev: None,
+            patch: split_non_object_hex(patch),
+        })
+        .unwrap_or_default(),
+    }
 }
 
 /// [`encode_stack`]'s inverse.
 pub fn decode_stack(text: &str) -> Result<Vec<Entry>> {
-    let rows: Vec<[String; 2]> = serde_json::from_str(text).map_err(|e| Error::Other(e.into()))?;
     let hex = |s: &str| ObjectId::from_hex(s).map_err(|e| Error::Other(e.into()));
-    rows.iter().map(|[s, b]| Ok(Entry::plain(hex(s)?, hex(b)?))).collect()
+    if text.trim_start().starts_with('{') {
+        let parsed: EncodedStackWithClaim = serde_json::from_str(text).map_err(|e| Error::Other(e.into()))?;
+        let mut out: Vec<Entry> = parsed
+            .entries
+            .iter()
+            .map(|[s, b]| Ok(Entry::plain(hex(s)?, hex(b)?)))
+            .collect::<Result<_>>()?;
+        let patch = join_non_object_hex(&parsed.patch);
+        let claim = match (parsed.pr, parsed.rev) {
+            (Some(id), Some(revision)) => ReviewClaim::Pr { id, revision, patch },
+            _ => ReviewClaim::Patch { patch },
+        };
+        if let Some(first) = out.first_mut() {
+            first.review = Some(claim);
+        }
+        Ok(out)
+    } else {
+        let rows: Vec<[String; 2]> = serde_json::from_str(text).map_err(|e| Error::Other(e.into()))?;
+        rows.iter().map(|[s, b]| Ok(Entry::plain(hex(s)?, hex(b)?))).collect()
+    }
 }
 
 /// One queue row to insert in the submit's transaction.

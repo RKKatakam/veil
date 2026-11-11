@@ -76,7 +76,6 @@ fn outcome(api: &Api, token: &str, project: &str, ticket: &str) -> Value {
 /// another server's lease; in use, behind a long queue, a slow batch or a
 /// merge worker) still sees it land.
 #[test]
-#[ignore = "BUG-1880: a queued entry lands on a protected branch after its approval was withdrawn"]
 fn bug_1880_an_approval_withdrawn_while_the_entry_is_queued_still_lands() {
     let th = TestHub::start();
     let p = setup_project(&th);
@@ -142,6 +141,300 @@ fn bug_1880_an_approval_withdrawn_while_the_entry_is_queued_still_lands() {
         "a change whose only approval was withdrawn landed on protected main: {done}"
     );
     assert_eq!(done["state"], "rejected", "{done}");
+    assert!(
+        done["message"].as_str().unwrap_or_default().starts_with("not ready to land:"),
+        "expected submit review refusal, got: {done}"
+    );
+}
+
+/// BUG-1880 variants: (1) `.veilrules` tightened by an entry ahead in the
+/// queue, (2) a `pr_holds` hold placed on a path while queued, and (3) a new
+/// revision pushed to a PR while `prs::land` is queued.
+#[test]
+fn bug_1880_tightened_rules_hold_and_new_revision_while_queued_are_refused() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
+
+    // Initially `src/docs/**` is `checks_only` (0 approvals needed).
+    write_files(
+        &p.dir,
+        &[(
+            ".veilrules",
+            "[branches.main]\nprotected = true\n\n[review]\nchecks_only = [\"src/docs/**\"]\n",
+        )],
+    );
+    p.admin.commit_main(&p.dir, "protect main with checks_only src/docs");
+    p.admin.ok(&p.dir, &["push"]);
+
+    // --- Variant 2: a hold (`pr_holds`) placed on `src/docs/held.md` while queued ---
+    let base1 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let held_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base1.hex(), "edits": [put("src/docs/held.md", "v1\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    let other_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base1.hex(), "edits": [put("src/docs/held.md", "other pr\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "other-held", "expected": null, "new": other_snap.hex()}], "force": false}),
+    );
+    let other_pr = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "other-held", "title": "other doc"}),
+        )
+        .json();
+    let (other_pr_id, other_patch) = (
+        other_pr["id"].as_str().unwrap().to_string(),
+        other_pr["patch"].as_str().unwrap().to_string(),
+    );
+
+    hold_lease(&th, pid, "main");
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": held_snap.hex(), "wait": false}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let held_ticket = r.json()["ticket"].as_str().unwrap().to_string();
+
+    // Admin requests changes on `other_pr`, placing a `pr_holds` hold on `src/docs/held.md`.
+    let sig = p.admin.identity().sign(
+        SIG_CONTEXT_HUB_PR_REVIEW,
+        &review_message(&p.name, &other_pr_id, &other_patch, "request-changes"),
+    );
+    let r = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/prs/{other_pr_id}/reviews", p.name),
+        &json!({"patch": other_patch, "verdict": "request-changes", "signature": sig}),
+    );
+    assert_eq!(r.status, 200);
+
+    release_lease(&th, pid, "main");
+    let done_held = outcome(&api, &dev_tok, &p.name, &held_ticket);
+    assert_eq!(done_held["state"], "rejected", "{done_held}");
+    assert!(
+        done_held["message"].as_str().unwrap_or_default().contains("asked for changes"),
+        "{done_held}"
+    );
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"], base1);
+
+    // --- Variant 1: `.veilrules` tightened by an entry ahead in the queue ---
+    // Admin prepares a `.veilrules` update removing `checks_only`, approved by a second admin.
+    let admin_base1 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let tighten_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": admin_base1.hex(), "edits": [put(".veilrules", "[branches.main]\nprotected = true\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "tighten-rules", "expected": null, "new": tighten_snap.hex()}], "force": false}),
+    );
+    let rules_pr = api
+        .post_json(
+            Some(&admin_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "tighten-rules", "title": "tighten rules"}),
+        )
+        .json();
+    let (rules_pr_id, rules_patch) = (
+        rules_pr["id"].as_str().unwrap().to_string(),
+        rules_pr["patch"].as_str().unwrap().to_string(),
+    );
+    let admin2 = th.person("admin2_1880");
+    let admin2_tok = admin2.token();
+    th.rt.block_on(async {
+        sqlx::query("INSERT INTO project_admins (project_id, person_id) SELECT $1, id FROM people WHERE name = $2")
+            .bind(pid)
+            .bind(&admin2.name)
+            .execute(&th.hub().db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, 0, 1, 0) \
+             ON CONFLICT (project_id, person_id) DO UPDATE SET epoch = access_epochs.epoch + 1",
+        )
+        .bind(pid)
+        .execute(&th.hub().db)
+        .await
+        .unwrap();
+    });
+    let sig_rules = admin2.identity().sign(
+        SIG_CONTEXT_HUB_PR_REVIEW,
+        &review_message(&p.name, &rules_pr_id, &rules_patch, "approve"),
+    );
+    let r = api.post_json(
+        Some(&admin2_tok),
+        &format!("/v1/projects/{}/prs/{rules_pr_id}/reviews", p.name),
+        &json!({"patch": rules_patch, "verdict": "approve", "signature": sig_rules}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true);
+
+    let doc_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base1.hex(), "edits": [put("src/docs/unapproved.md", "needs approval under new rules\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+
+    hold_lease(&th, pid, "main");
+    // Queue the rule-tightening entry first, then Dev's unapproved `docs/` entry behind it.
+    let r1 = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": tighten_snap.hex(), "wait": false}),
+    );
+    assert_eq!(r1.status, 200, "{}", String::from_utf8_lossy(&r1.body));
+    let t_rules = r1.json()["ticket"].as_str().unwrap().to_string();
+
+    let r2 = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "snapshot": doc_snap.hex(), "wait": false}),
+    );
+    assert_eq!(r2.status, 200, "{}", String::from_utf8_lossy(&r2.body));
+    let t_doc = r2.json()["ticket"].as_str().unwrap().to_string();
+
+    release_lease(&th, pid, "main");
+    let done_rules = outcome(&api, &admin_tok, &p.name, &t_rules);
+    assert_eq!(done_rules["state"], "landed", "{done_rules}");
+    let done_doc = outcome(&api, &dev_tok, &p.name, &t_doc);
+    assert_eq!(done_doc["state"], "rejected", "entry behind tightened .veilrules must be refused: {done_doc}");
+    assert!(
+        done_doc["message"].as_str().unwrap_or_default().starts_with("not ready to land:"),
+        "{done_doc}"
+    );
+
+    // --- Variant 3: a new revision pushed to a PR while `POST /prs/{id}/land` is queued ---
+    let base2 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let rev1_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base2.hex(), "edits": [put("src/rev1880.rs", "pub fn v() -> i32 { 1 }\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    let rev2_snap: ObjectId = serde_json::from_value(
+        api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base2.hex(), "edits": [put("src/rev1880.rs", "pub fn v() -> i32 { 2 }\n")]}),
+        )
+        .json()["snapshot"]
+            .clone(),
+    )
+    .unwrap();
+    api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "pr-rev-race", "expected": null, "new": rev1_snap.hex()}], "force": false}),
+    );
+    let pr3 = api
+        .post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/prs", p.name),
+            &json!({"head": "pr-rev-race", "title": "rev race"}),
+        )
+        .json();
+    let (pr3_id, pr3_patch) = (
+        pr3["id"].as_str().unwrap().to_string(),
+        pr3["patch"].as_str().unwrap().to_string(),
+    );
+    let sig3 = p.admin.identity().sign(
+        SIG_CONTEXT_HUB_PR_REVIEW,
+        &review_message(&p.name, &pr3_id, &pr3_patch, "approve"),
+    );
+    let r = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/prs/{pr3_id}/reviews", p.name),
+        &json!({"patch": pr3_patch, "verdict": "approve", "signature": sig3}),
+    );
+    assert_eq!(r.status, 200);
+
+    hold_lease(&th, pid, "main");
+    let api_land = th.api();
+    let (tok_land, pname, pr3_land) = (dev_tok.clone(), p.name.clone(), pr3_id.clone());
+    let land_handle = std::thread::spawn(move || {
+        api_land.post_json(
+            Some(&tok_land),
+            &format!("/v1/projects/{pname}/prs/{pr3_land}/land"),
+            &json!({}),
+        )
+    });
+    // Wait until `prs::land` has inserted the queued row into `landing_queue`.
+    let wait_until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let cnt: i64 = th
+            .rt
+            .block_on(
+                sqlx::query_scalar("SELECT COUNT(*) FROM landing_queue WHERE project_id = $1 AND state = 'queued'")
+                    .bind(pid)
+                    .fetch_one(&th.hub().db),
+            )
+            .unwrap();
+        if cnt >= 1 {
+            break;
+        }
+        assert!(Instant::now() < wait_until, "prs::land did not queue in time");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Push revision 2 to the PR while revision 1's landing is queued.
+    let push_r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "pr-rev-race-2", "expected": null, "new": rev2_snap.hex()}], "force": false}),
+    );
+    assert_eq!(push_r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&push_r.body));
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/prs/{pr3_id}/revisions", p.name),
+        &json!({"head": "pr-rev-race-2"}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["revision"], 2);
+
+    release_lease(&th, pid, "main");
+    let land_resp = land_handle.join().unwrap();
+    assert_eq!(land_resp.status, 409, "stale PR revision must be refused: {}", String::from_utf8_lossy(&land_resp.body));
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"], base2);
+    let pr_after = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr3_id}", p.name)).json();
+    assert_eq!(pr_after["state"], "open", "PR must remain open at revision 2: {pr_after}");
+    assert_eq!(pr_after["revision"], 2);
 }
 
 /// GC never deletes an object a concurrent push is about to reference. The

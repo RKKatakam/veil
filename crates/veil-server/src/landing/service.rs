@@ -155,6 +155,24 @@ struct Row {
     agent_session: Option<String>,
 }
 
+/// Per-entry protected-branch review check state (`BUG-1880`).
+#[derive(Clone)]
+struct EntryReviewCheck {
+    project: Arc<Project>,
+    viewer: Viewer,
+    diff: crate::prs::StackReviewDiff,
+    claim: Option<super::ReviewClaim>,
+}
+
+/// Batch-level review rules state verified inside `Service::commit`'s single
+/// transaction (`BUG-1880`).
+#[derive(Clone)]
+struct BatchReviewGuard {
+    ctx: crate::prs::BranchReviewContext,
+    project_epoch: i64,
+    protected: bool,
+}
+
 /// Metadata of a row in a built batch.
 #[derive(Clone)]
 struct RowMeta {
@@ -165,6 +183,8 @@ struct RowMeta {
     change_id: Option<veil_core::ChangeId>,
     agent_session: Option<String>,
     epochs: (i64, i64),
+    user_entry: bool,
+    review_check: Option<EntryReviewCheck>,
 }
 
 impl crate::limits::landing::QueuedEntry for Row {
@@ -234,6 +254,8 @@ struct Prepared {
     /// and the push's checks run again.
     recheck: bool,
     epochs: (i64, i64),
+    review_refusal: Option<String>,
+    review_check: Option<EntryReviewCheck>,
 }
 
 /// A batch's inputs, read before it is built.
@@ -248,6 +270,7 @@ struct Inputs {
     /// Stack changes that landed already, in the branch's lineage
     /// (`landings`).
     landed: HashMap<ObjectId, Record>,
+    review_guard: Option<BatchReviewGuard>,
 }
 
 /// Where a stack change landed already (its edits are on the branch).
@@ -294,6 +317,7 @@ struct Built {
     accept: Option<String>,
     /// The default branch's `.veilrules` at the new tip (S21).
     rules_file: Option<crate::prs::state::RulesFile>,
+    review_guard: Option<BatchReviewGuard>,
 }
 
 impl Built {
@@ -730,8 +754,81 @@ impl Service {
             let w = who[&k].clone();
             let cur_epochs = (person_epoch(row.person.id), project_epoch);
             let recheck = row.epochs != cur_epochs;
-            entries.push(Prepared { row, who: w, recheck, epochs: cur_epochs });
+            entries.push(Prepared {
+                row,
+                who: w,
+                recheck,
+                epochs: cur_epochs,
+                review_refusal: None,
+                review_check: None,
+            });
         }
+        let is_user_entry = |ticket: &str| !ticket.starts_with("revert-") && !ticket.starts_with("embargo-");
+        let review_guard = if let Some(first_proj) = entries
+            .iter()
+            .find(|e| is_user_entry(&e.row.ticket))
+            .and_then(|e| e.who.as_ref().ok().map(|a| a.project.clone()))
+        {
+            let ctx = crate::prs::branch_review_context(hub, &first_proj, &self.branch, on.tip, on.made.clone()).await?;
+            let is_protected = ctx.protected.contains(&self.branch);
+            if is_protected {
+                let pending_stacks: Vec<(usize, Vec<Entry>)> = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| is_user_entry(&e.row.ticket) && e.who.is_ok() && !e.row.stack.is_empty())
+                    .map(|(i, e)| (i, e.row.stack.clone()))
+                    .collect();
+                let diffs: Vec<(usize, crate::prs::StackReviewDiff)> = if pending_stacks.is_empty() {
+                    Vec::new()
+                } else {
+                    sync::blocking(hub, self.project, move |src| {
+                        pending_stacks
+                            .into_iter()
+                            .map(|(i, st)| Ok((i, crate::prs::stack_review_diff(src, &st)?)))
+                            .collect()
+                    })
+                    .await?
+                };
+                if !diffs.is_empty() {
+                    let mut c = hub.db.acquire().await?;
+                    for (idx, diff) in diffs {
+                        let e = &mut entries[idx];
+                        let Ok(a) = &e.who else { continue };
+                        let claim = e.row.stack.first().and_then(|x| x.review.clone());
+                        match crate::prs::verify_landing_review(
+                            &mut c,
+                            &a.project,
+                            &a.viewer,
+                            &self.branch,
+                            &diff,
+                            &ctx.rules,
+                            claim.as_ref(),
+                        )
+                        .await?
+                        {
+                            Ok(_) => {
+                                e.review_check = Some(EntryReviewCheck {
+                                    project: a.project.clone(),
+                                    viewer: a.viewer.clone(),
+                                    diff,
+                                    claim,
+                                });
+                            }
+                            Err(why) => {
+                                e.review_refusal = Some(why);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(BatchReviewGuard {
+                ctx,
+                project_epoch,
+                protected: is_protected,
+            })
+        } else {
+            None
+        };
         // View keys known and not kept: attached from their newest memo on
         // the recent line, or handed to the background fill.
         let recent: Vec<ObjectId> = on.recent.iter().copied().collect();
@@ -819,7 +916,7 @@ impl Service {
             .await?;
             rows.into_iter().filter_map(|(s, l)| Some((ObjectId::from_hex(&s).ok()?, Record { landed: ObjectId::from_hex(&l).ok()?, change: None }))).collect()
         };
-        Ok(Inputs { entries, attach, memo, origins, landed })
+        Ok(Inputs { entries, attach, memo, origins, landed, review_guard })
     }
 
     /// Build the batch on `on` (on a blocking thread: trees, hashes,
@@ -916,9 +1013,25 @@ impl Service {
                 _ => None,
             })
             .collect();
+        let has_active_user_entries = b
+            .rows
+            .iter()
+            .zip(&b.outcomes)
+            .any(|(meta, o)| meta.user_entry && matches!(o, Outcome::Landed { .. } | Outcome::Merging(_)));
+        let active_review_checks: Vec<EntryReviewCheck> = b
+            .rows
+            .iter()
+            .zip(&b.outcomes)
+            .filter_map(|(meta, o)| match (o, &meta.review_check) {
+                (Outcome::Landed { .. } | Outcome::Merging(_), Some(rc)) => Some(rc.clone()),
+                _ => None,
+            })
+            .collect();
+        let review_guard = b.review_guard.clone();
+        let old_tip_id = b.old_tip;
         let tx_results = results.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-            let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing) = (
+            let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing, active_review_checks, review_guard) = (
                 ls.clone(),
                 ll.clone(),
                 mc.clone(),
@@ -928,6 +1041,8 @@ impl Service {
                 snapshot_authors.clone(),
                 active_agents.clone(),
                 rules_landing.clone(),
+                active_review_checks.clone(),
+                review_guard.clone(),
             );
             let (branch, holder, old, new, seqs, snapshots, mk, mr, mp, accept, name, mut results) = (
                 branch.clone(),
@@ -1006,6 +1121,43 @@ impl Service {
                 };
                 if n != 1 {
                     return Err(Error::conflict(MOVED));
+                }
+                // Re-verify protected-branch review rules and PR gates inside
+                // the batch's commit transaction before recording new rules or
+                // updating queue rows (`BUG-1880`).
+                if has_active_user_entries {
+                    if let Some(guard) = &review_guard {
+                        let cur_proj_epoch: i64 = sqlx::query_scalar(
+                            "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = 0), 0)",
+                        )
+                        .bind(pid)
+                        .fetch_one(&mut *c)
+                        .await?;
+                        if cur_proj_epoch != guard.project_epoch {
+                            return Err(Error::conflict(MOVED));
+                        }
+                        if !crate::prs::rules_unchanged_in_tx(&mut *c, pid, &branch, old_tip_id, &guard.ctx).await? {
+                            return Err(Error::conflict(MOVED));
+                        }
+                        if guard.protected {
+                            for rc in &active_review_checks {
+                                if crate::prs::verify_landing_review(
+                                    &mut *c,
+                                    &rc.project,
+                                    &rc.viewer,
+                                    &branch,
+                                    &rc.diff,
+                                    &guard.ctx.rules,
+                                    rc.claim.as_ref(),
+                                )
+                                .await?
+                                .is_err()
+                                {
+                                    return Err(Error::conflict(MOVED));
+                                }
+                            }
+                        }
+                    }
                 }
                 if let Some(l) = &rules_landing {
                     crate::prs::state::record_landing(&mut *c, pid, l).await?;
@@ -1341,7 +1493,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         pending: (*on.made).clone(),
         staged: None,
     };
-    let Inputs { entries, attach, mut memo, origins, landed } = inputs;
+    let Inputs { entries, attach, mut memo, origins, landed, review_guard } = inputs;
     let mut b = Built {
         rows: Vec::new(),
         outcomes: Vec::new(),
@@ -1357,6 +1509,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         alone: false,
         accept: None,
         rules_file: None,
+        review_guard,
     };
     // Attached keys: projected from their memo over what came after it.
     for (k, who, at, m) in attach {
@@ -1410,6 +1563,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         }
         let mark = (b.objects.len(), b.bytes, b.snapshots.len(), b.memos.len(), b.landings.len(), b.flushes);
         let last_cid = p.row.stack.last().and_then(|e| src.snapshot(&e.id).ok().map(|s| s.change_id));
+        let user_entry = !p.row.ticket.starts_with("revert-") && !p.row.ticket.starts_with("embargo-");
         let row = RowMeta {
             seq: p.row.seq,
             ticket: p.row.ticket.clone(),
@@ -1418,6 +1572,8 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
             change_id: last_cid,
             agent_session: p.row.agent_session.clone(),
             epochs: p.epochs,
+            user_entry,
+            review_check: p.review_check.clone(),
         };
         let outcome = match entry(&hub, &mut src, branch, &p, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
             Ok(Some(o)) => o,
@@ -1501,12 +1657,6 @@ fn entry(
     // lands as a merge, on the tip it was made on (except an embargoed
     // merge landing at release, whose edits land on the current tip).
     let as_merge = |s: &Snapshot, base: ObjectId| s.embargo.is_none() && s.parents.len() > 1 && !s.parents[1..].contains(&base);
-    if sets.iter().flatten().any(|c| c.path == POLICY_FILE || c.path == RULES_FILE) {
-        if !b.rows.is_empty() {
-            return Ok(None);
-        }
-        b.alone = true;
-    }
     // Access changed since the submit (or after a re-queued merge): it
     // decides first, whatever happened on the tip since, so the answer to
     // someone who may no longer see or write a path never says whether it
@@ -1544,6 +1694,15 @@ fn entry(
                 }
             }
         }
+    }
+    if let Some(why) = &p.review_refusal {
+        return Ok(Some(Outcome::Rejected(why.clone())));
+    }
+    if sets.iter().flatten().any(|c| c.path == POLICY_FILE || c.path == RULES_FILE) {
+        if !b.rows.is_empty() {
+            return Ok(None);
+        }
+        b.alone = true;
     }
     // The stack, change by change, on the tip: each as a new snapshot, never
     // the submitted one, so nothing hidden below it shows in the answer

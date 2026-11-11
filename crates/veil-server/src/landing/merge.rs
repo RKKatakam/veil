@@ -1043,6 +1043,15 @@ fn merge_stack(
         chain_tree = tree;
     }
 
+    if let Some(first) = new_stack.first_mut() {
+        first.review = match job.stack.first().and_then(|e| e.review.clone()) {
+            Some(c) => Some(c),
+            None => crate::prs::stack_review_diff(&src, &job.stack)
+                .ok()
+                .map(|d| super::ReviewClaim::Patch { patch: d.patch }),
+        };
+    }
+
     Ok(WorkerOutcome::Requeued {
         stack: new_stack,
         objects,

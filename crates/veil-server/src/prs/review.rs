@@ -45,13 +45,18 @@ pub struct Verdict {
 
 /// The access of `person` in `project` now, from the database.
 pub async fn viewer_of(hub: &Hub, project: i64, person: i64) -> Result<Viewer> {
+    let mut c = hub.db.acquire().await?;
+    viewer_of_conn(&mut c, project, person).await
+}
+
+pub async fn viewer_of_conn(c: &mut sqlx::PgConnection, project: i64, person: i64) -> Result<Viewer> {
     let (admin, groups): (bool, Vec<i64>) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM project_admins WHERE project_id = $1 AND person_id = $2), \
          ARRAY(SELECT g.id FROM groups g JOIN group_members m ON m.group_id = g.id WHERE g.project_id = $1 AND m.person_id = $2)",
     )
     .bind(project)
     .bind(person)
-    .fetch_one(&hub.db)
+    .fetch_one(&mut *c)
     .await?;
     Ok(Viewer {
         person: Some(person),
@@ -69,10 +74,15 @@ pub fn writes_all(project: &Project, viewer: &Viewer, paths: &[String]) -> bool 
 
 /// The PR's touched paths.
 pub async fn paths_of(hub: &Hub, project: i64, pr: &str) -> Result<Vec<String>> {
+    let mut c = hub.db.acquire().await?;
+    paths_of_conn(&mut c, project, pr).await
+}
+
+pub async fn paths_of_conn(c: &mut sqlx::PgConnection, project: i64, pr: &str) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar("SELECT path FROM pr_paths WHERE project_id = $1 AND pr = $2 ORDER BY path")
         .bind(project)
         .bind(pr)
-        .fetch_all(&hub.db)
+        .fetch_all(&mut *c)
         .await?)
 }
 
@@ -86,6 +96,11 @@ pub const REVIEW_BYTES: usize = 256 << 10;
 /// revision with patch `patch`; the texts of the latest
 /// [`REVIEWS_SHOWN`] within [`REVIEW_BYTES`] are read after.
 pub async fn verdicts(hub: &Hub, project: i64, pr: &str, patch: &str) -> Result<Vec<Verdict>> {
+    let mut c = hub.db.acquire().await?;
+    verdicts_conn(&mut c, project, pr, patch, true).await
+}
+
+pub async fn verdicts_conn(c: &mut sqlx::PgConnection, project: i64, pr: &str, patch: &str, with_bodies: bool) -> Result<Vec<Verdict>> {
     type Row = (i64, String, i32, String, bool, i64, String, i64);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT DISTINCT ON (r.person) r.person, pe.name, r.revision, r.verdict, r.agent, r.at, r.patch, octet_length(r.body)::BIGINT \
@@ -94,13 +109,16 @@ pub async fn verdicts(hub: &Hub, project: i64, pr: &str, patch: &str) -> Result<
     )
     .bind(project)
     .bind(pr)
-    .fetch_all(&hub.db)
+    .fetch_all(&mut *c)
     .await?;
     let mut out: Vec<Verdict> = rows
         .into_iter()
         .map(|(person, name, revision, verdict, agent, at, p, size)| Verdict { person, name, revision, verdict, agent, body: None, size, at, current: p == patch })
         .collect();
     out.sort_by_key(|a| std::cmp::Reverse((a.at, a.person)));
+    if !with_bodies {
+        return Ok(out);
+    }
     let mut bytes = 0usize;
     let mut want: Vec<(i64, i32)> = Vec::new();
     for v in out.iter().take(REVIEWS_SHOWN) {
@@ -120,7 +138,7 @@ pub async fn verdicts(hub: &Hub, project: i64, pr: &str, patch: &str) -> Result<
         .bind(pr)
         .bind(&people)
         .bind(&revs)
-        .fetch_all(&hub.db)
+        .fetch_all(&mut *c)
         .await?;
         let bodies: HashMap<(i64, i32), String> = bodies.into_iter().map(|(p, r, b)| ((p, r), b)).collect();
         for v in out.iter_mut() {
@@ -210,13 +228,18 @@ pub async fn put_verdict(
 /// (BUG-1326: whoever opened the PR), with the time of each one's latest
 /// hold there.
 pub async fn holds_on(hub: &Hub, project: i64, paths: &[String]) -> Result<Vec<(i64, String, i64)>> {
+    let mut c = hub.db.acquire().await?;
+    holds_on_conn(&mut c, project, paths).await
+}
+
+pub async fn holds_on_conn(c: &mut sqlx::PgConnection, project: i64, paths: &[String]) -> Result<Vec<(i64, String, i64)>> {
     Ok(sqlx::query_as(
         "SELECT h.person, pe.name, MAX(h.at) FROM pr_holds h JOIN people pe ON pe.id = h.person \
          WHERE h.project_id = $1 AND h.path = ANY($2) GROUP BY h.person, pe.name ORDER BY pe.name",
     )
     .bind(project)
     .bind(paths)
-    .fetch_all(&hub.db)
+    .fetch_all(&mut *c)
     .await?)
 }
 
@@ -261,17 +284,32 @@ impl Gate {
 /// `risk` (rated under `rules`, the rules in force: BUG-1424), as
 /// `viewer` is shown it. Every route asks through [`super::gate`].
 pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, patch: &str, risk: Risk, rules: &Review) -> Result<Gate> {
+    let mut c = hub.db.acquire().await?;
+    gate_conn(&mut c, project, viewer, pr, patch, risk, rules, true).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn gate_conn(
+    c: &mut sqlx::PgConnection,
+    project: &Project,
+    viewer: &Viewer,
+    pr: &PrRow,
+    patch: &str,
+    risk: Risk,
+    rules: &Review,
+    with_bodies: bool,
+) -> Result<Gate> {
     let need = rules.need(risk);
-    let paths = paths_of(hub, project.id, &pr.id).await?;
+    let paths = paths_of_conn(&mut *c, project.id, &pr.id).await?;
     let mut reviews = Vec::new();
     let mut approvals = 0u32;
     let mut access: HashMap<i64, bool> = HashMap::new();
-    let latest = verdicts(hub, project.id, &pr.id, patch).await?;
+    let latest = verdicts_conn(&mut *c, project.id, &pr.id, patch, with_bodies).await?;
     // Requests for changes at any of these paths, whoever opened this PR
     // (BUG-1326): released for this PR only by that reviewer's approval of
     // it (its current patch, given after the hold), for every PR by an
     // admin's dismissal.
-    let held: Vec<String> = holds_on(hub, project.id, &paths)
+    let held: Vec<String> = holds_on_conn(&mut *c, project.id, &paths)
         .await?
         .into_iter()
         .filter(|(person, _, at)| !latest.iter().any(|v| v.person == *person && v.verdict == "approve" && v.current && v.at >= *at))
@@ -284,7 +322,7 @@ pub async fn gate(hub: &Hub, project: &Project, viewer: &Viewer, pr: &PrRow, pat
             match access.get(&v.person) {
                 Some(w) => *w,
                 None => {
-                    let w = writes_all(project, &viewer_of(hub, project.id, v.person).await?, &paths);
+                    let w = writes_all(project, &viewer_of_conn(&mut *c, project.id, v.person).await?, &paths);
                     access.insert(v.person, w);
                     w
                 }

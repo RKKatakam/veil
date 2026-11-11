@@ -2677,9 +2677,14 @@ async fn push_staged(
                 results.push(refuse("a change with unresolved conflicts never lands: resolve them first"));
                 continue;
             }
+            let mut stack = judged.stack;
             if protected.contains(&u.branch) {
-                match crate::prs::check_landing_review(hub, project, viewer, &u.branch, &judged.stack, Some(st.clone())).await {
-                    Ok(_) => {}
+                match crate::prs::check_landing_review(hub, project, viewer, &u.branch, &stack, Some(st.clone())).await {
+                    Ok(claim) => {
+                        if let (Some(first), Some(c)) = (stack.first_mut(), claim) {
+                            first.review = Some(c);
+                        }
+                    }
                     Err(e) if land_all => return Err(e),
                     Err(Error::Api { message, .. }) => {
                         results.push(refuse(&message));
@@ -2691,7 +2696,7 @@ async fn push_staged(
             queued.push(crate::landing::Queued {
                 ticket: crate::landing::ticket(),
                 branch: u.branch.clone(),
-                stack: judged.stack,
+                stack,
                 lineage: judged.lineage,
                 skipped: Arc::new(std::sync::Mutex::new(judged.skipped)),
             });

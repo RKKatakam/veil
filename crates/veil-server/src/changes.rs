@@ -1191,7 +1191,10 @@ pub(crate) async fn create_with(
             let default_tip = tip(hub, project.id, &project.default_branch).await?;
             let protected = sync::blocking(hub, project.id, move |src| crate::landing::protected(src, default_tip)).await?;
             if protected.contains(&q.branch) {
-                crate::prs::check_landing_review(hub, &who.project, &who.viewer, &q.branch, &q.stack, None).await?;
+                let claim = crate::prs::check_landing_review(hub, &who.project, &who.viewer, &q.branch, &q.stack, None).await?;
+                if let (Some(first), Some(claim)) = (q.stack.first_mut(), claim) {
+                    first.review = Some(claim);
+                }
             }
         }
         // The branch rules: a move of the default branch changes them only
