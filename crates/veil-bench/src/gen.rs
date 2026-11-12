@@ -351,6 +351,13 @@ pub fn generate(p: &Profile, seed: u64, root: &Path, home: &Path, pack_every: us
     for (d, s) in &layout.cloak_rules {
         policy.push_str(&format!("{d}/ {s}\n"));
     }
+    // The generator wrote this policy, as a member who commits an edit of
+    // `.veilpolicy`: it is the policy accepted on this device. Left as `vl
+    // init` accepted its own text, the checked-out repository had a policy
+    // change waiting for `vl policy accept` for ever, which no command
+    // reported and under which the file watcher is not used (BUG-1944: the
+    // 1 GB profile scanned 35,000 files at every command).
+    veil_core::policy::save_accepted(&DiskBackend::new(root), policy.as_bytes())?;
     let chunk = 2000usize;
     let chunks = import.len().div_ceil(chunk).max(1);
     for (c, part) in import.chunks(chunk).enumerate() {

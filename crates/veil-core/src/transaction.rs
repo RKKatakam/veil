@@ -739,7 +739,9 @@ impl<'r> Transaction<'r> {
         let tips: HashSet<ObjectId> = self.start_view.heads.iter().copied().collect();
         let mut under = HashSet::new();
         for h in &tips {
-            if let Some(s) = self.repo.held().snapshot(h)? {
+            // One that cannot be read (it is no head any more) names no
+            // parents: the walk reads past them as before.
+            if let Ok(Some(s)) = self.repo.held().snapshot(h) {
                 under.extend(s.parents.iter().copied());
             }
         }
