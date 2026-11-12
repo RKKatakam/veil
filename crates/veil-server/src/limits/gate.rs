@@ -31,6 +31,14 @@ pub enum Class {
 /// How long a pull waits before it goes ahead of newer landings.
 pub const AGE: Duration = Duration::from_secs(1);
 
+/// Once the landing that has waited longest for a place has waited this
+/// long, a new one is told to come back (`503 busy`, `retry_after_ms`) at
+/// once: the gate takes landings in slower than they come (BUG-1955: past
+/// the server's capacity a submit waited up to [`Class::wait`] here, 9 s
+/// on average with 1,500 a second offered, told nothing). Those waiting
+/// keep their places.
+pub const WRITE_BACKLOG: Duration = Duration::from_secs(2);
+
 impl Class {
     /// The longest a request of the class waits for a place.
     pub fn wait(self) -> Duration {
@@ -77,6 +85,8 @@ pub struct Place {
 enum Enter {
     In,
     Wait(u64, oneshot::Receiver<()>),
+    /// A landing behind [`WRITE_BACKLOG`] of waiting ones.
+    Full,
 }
 
 impl Gate {
@@ -89,6 +99,9 @@ impl Gate {
         if s.running < self.cap && s.waiting() == 0 {
             s.running += 1;
             return Enter::In;
+        }
+        if class == Class::Write && s.queues[Class::Write as usize].front().is_some_and(|(_, _, at)| at.elapsed() >= WRITE_BACKLOG) {
+            return Enter::Full;
         }
         let (tx, rx) = oneshot::channel();
         let t = s.next;
@@ -129,6 +142,7 @@ impl Gate {
         let got = match self.enter(class) {
             Enter::In => true,
             Enter::Wait(t, rx) => Ticket { gate: self.clone(), class, id: t, rx: Some(rx), map: None }.wait(deadline).await,
+            Enter::Full => false,
         };
         got.then(|| Place { gate: self.clone(), map: None })
     }
@@ -246,6 +260,7 @@ impl Map {
         let got = match entered {
             Enter::In => true,
             Enter::Wait(t, rx) => Ticket { gate: gate.clone(), class, id: t, rx: Some(rx), map: Some((self.clone(), key.clone())) }.wait(deadline).await,
+            Enter::Full => false,
         };
         if !got {
             // Nobody may be left in it: forget it then.
@@ -422,6 +437,47 @@ mod tests {
         let order = order.lock().unwrap().clone();
         let landing_at = order.iter().position(|(_, c)| *c == Class::Write).unwrap();
         assert!(landing_at <= 2, "the landing ran {landing_at}th, after {} aged pulls: {order:?}", landing_at);
+    }
+
+    /// BUG-1955: behind landings that have waited [`WRITE_BACKLOG`] a new
+    /// landing is answered at once, not after its whole wait; those
+    /// waiting keep their places and get in; pulls still wait; and once
+    /// the backlog is gone landings wait again.
+    #[tokio::test(start_paused = true)]
+    async fn a_landing_behind_a_long_backlog_is_told_at_once() {
+        let g = Gate::new(1);
+        let held = g.place(Class::Write, soon(10)).await.unwrap();
+        let first = {
+            let g = g.clone();
+            tokio::spawn(async move { g.place(Class::Write, soon(60_000)).await.is_some() })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Behind a backlog younger than the bound: it waits (and gets in).
+        let second = {
+            let g = g.clone();
+            tokio::spawn(async move { g.place(Class::Write, soon(60_000)).await.is_some() })
+        };
+        let pull = {
+            let g = g.clone();
+            tokio::spawn(async move { g.place(Class::Read, soon(60_000)).await.is_some() })
+        };
+        tokio::time::sleep(WRITE_BACKLOG).await;
+        let asked = Instant::now();
+        assert!(g.place(Class::Write, soon(60_000)).await.is_none(), "a landing behind the backlog got a place");
+        assert_eq!(asked.elapsed(), Duration::ZERO, "it was not answered at once");
+        assert_eq!(g.load(), (1, 3), "the waiting ones keep their places");
+        drop(held);
+        assert!(first.await.unwrap() && second.await.unwrap() && pull.await.unwrap(), "those waiting got in");
+        assert_eq!(g.load(), (0, 0));
+        // No backlog: a landing waits for its place again.
+        let held = g.place(Class::Write, soon(10)).await.unwrap();
+        let later = {
+            let g = g.clone();
+            tokio::spawn(async move { g.place(Class::Write, soon(60_000)).await.is_some() })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(held);
+        assert!(later.await.unwrap());
     }
 
     /// A pull that has waited [`AGE`] goes before a newer landing: a steady

@@ -88,6 +88,15 @@ fn free_slot(taken: &[i32], max: usize) -> Option<i32> {
 pub async fn admit_queue(c: &mut PgConnection, project: i64, who: &Submitter, q: &Queued) -> Result<()> {
     let (max_session, max_person) = bounds();
     let session = session_of(who);
+    // First a slot at random, unread: free unless the person has many
+    // waiting, and then the index says so. Only a submit that lost reads
+    // the person's waiting rows for a free one (BUG-1955: every submit read
+    // them all, up to the person's bound of them, when one person's agents
+    // had a long queue).
+    let random = |max: usize| (u64::from_le_bytes(veil_core::crypto::random_bytes::<8>()) % max.clamp(1, i32::MAX as usize) as u64) as i32;
+    if insert_at(c, project, who, q, session, random(max_person), (!session.is_empty()).then(|| random(max_session))).await? {
+        return Ok(());
+    }
     for _ in 0..ADMIT_TRIES {
         let (person_queued, session_queued, person_slots, session_slots): (i64, i64, Vec<i32>, Vec<i32>) = sqlx::query_as(
             "SELECT COUNT(*), COUNT(*) FILTER (WHERE session = $3), \
@@ -125,37 +134,41 @@ pub async fn admit_queue(c: &mut PgConnection, project: i64, who: &Submitter, q:
                 RETRY_AFTER_MS,
             ));
         };
-        // `ON CONFLICT DO NOTHING`: a submit of the same person in flight
-        // holds the slot. This one waits only if that one has not committed
-        // yet, and then reads the slots again.
-        let inserted = sqlx::query(
-            "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, \
-             project_epoch, agent_session, person_slot, session_slot, state, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'queued', \
-             (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT) ON CONFLICT DO NOTHING",
-        )
-        .bind(project)
-        .bind(&q.branch)
-        .bind(&q.ticket)
-        .bind(who.person.id)
-        .bind(&who.person.name)
-        .bind(&who.person.device_key)
-        .bind(session)
-        .bind(encode_stack(&q.stack))
-        .bind(q.lineage)
-        .bind(who.epochs.person)
-        .bind(who.epochs.project.map_or(0, |(_, e)| e))
-        .bind(who.person.agent.as_ref().map(|a| a.session_hash.as_str()))
-        .bind(person_slot)
-        .bind(session_slot)
-        .execute(&mut *c)
-        .await?
-        .rows_affected();
-        if inserted == 1 {
+        if insert_at(c, project, who, q, session, person_slot, session_slot).await? {
             return Ok(());
         }
     }
     Err(Error::busy())
+}
+
+/// Queue `q` holding these slots; `false` if one of them is taken.
+/// `ON CONFLICT DO NOTHING`: a submit of the same person in flight holds the
+/// slot. This one waits only if that one has not committed yet.
+async fn insert_at(c: &mut PgConnection, project: i64, who: &Submitter, q: &Queued, session: &str, person_slot: i32, session_slot: Option<i32>) -> Result<bool> {
+    let inserted = sqlx::query(
+        "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, \
+         project_epoch, agent_session, person_slot, session_slot, state, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'queued', \
+         (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT) ON CONFLICT DO NOTHING",
+    )
+    .bind(project)
+    .bind(&q.branch)
+    .bind(&q.ticket)
+    .bind(who.person.id)
+    .bind(&who.person.name)
+    .bind(&who.person.device_key)
+    .bind(session)
+    .bind(encode_stack(&q.stack))
+    .bind(q.lineage)
+    .bind(who.epochs.person)
+    .bind(who.epochs.project.map_or(0, |(_, e)| e))
+    .bind(who.person.agent.as_ref().map(|a| a.session_hash.as_str()))
+    .bind(person_slot)
+    .bind(session_slot)
+    .execute(&mut *c)
+    .await?
+    .rows_affected();
+    Ok(inserted == 1)
 }
 
 /// A queued row's identity for fair-share scheduling.

@@ -31,6 +31,10 @@ pub trait BlobStore: Send + Sync {
     /// Store `data` at `key`. Keys name immutable content: writing the
     /// same key twice writes the same bytes.
     async fn put(&self, key: &str, data: Bytes) -> Result<()>;
+    /// How many writes one caller keeps in flight at once (`sync::put_all`).
+    fn writes_at_once(&self) -> usize {
+        crate::sync::PUTS_AT_ONCE
+    }
     async fn exists(&self, key: &str) -> Result<bool>;
     /// The length of the object at `key` without reading it where the
     /// store can (a file's size, an S3 `HEAD`); `None` if there is none.
@@ -106,6 +110,14 @@ impl BlobStore for FsStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// A write here waits twice for the file system's journal (the file,
+    /// then its folder), and writes in flight together share its commits:
+    /// what a landing batch stores (some 500 objects) took eight rounds of
+    /// 64, 37 to 48 ms a batch, the largest part of a batch (BUG-1955).
+    fn writes_at_once(&self) -> usize {
+        256
     }
 
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {

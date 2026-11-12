@@ -217,6 +217,12 @@ enum Cmd {
         /// `landing`: the agents belong to this many people, in turn.
         #[arg(long, default_value_t = 1)]
         people: usize,
+        /// `landing`, open loop: the offered rate over the measured window,
+        /// as `RATE:SECONDS,…` (e.g. `1500:120,500:60`: past capacity, then
+        /// below it). The window lasts as long as the steps; `--rates` is
+        /// the warm-up's rate.
+        #[arg(long, value_delimiter = ',')]
+        steps: Vec<String>,
     },
     /// Generate a repository (and keep it).
     Gen(GenArgs),
@@ -371,6 +377,7 @@ fn main() -> Result<()> {
             mix,
             merge_every,
             people,
+            steps,
         } => {
             let mode = match mode.as_str() {
                 "pull" => load::Mode::Pull,
@@ -390,6 +397,13 @@ fn main() -> Result<()> {
                 })
                 .collect::<Result<_>>()?;
             let rates = rates.iter().map(|r| r.parse::<load::Rate>().map_err(|e| anyhow!(e))).collect::<Result<_>>()?;
+            let steps: Vec<(f64, f64)> = steps
+                .iter()
+                .map(|s| {
+                    let step = s.split_once(':').and_then(|(r, t)| Some((r.parse::<f64>().ok()?, t.parse::<f64>().ok()?)));
+                    step.filter(|(r, t)| *r > 0.0 && *t > 0.0).ok_or_else(|| anyhow!("--steps {s}: RATE:SECONDS, both above 0"))
+                })
+                .collect::<Result<_>>()?;
             let v = load::run_all(&load::Args {
                 url,
                 ca,
@@ -414,6 +428,7 @@ fn main() -> Result<()> {
                 mix,
                 merge_every,
                 people,
+                steps,
             })?;
             std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
             let md = load::markdown(&v)?;

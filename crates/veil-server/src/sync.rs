@@ -4007,8 +4007,9 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
 pub async fn put_all(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<Item = (ObjectId, Bytes)>) -> Result<()> {
     let mut set = tokio::task::JoinSet::new();
     let mut it = objects.into_iter();
+    let at_once = hub.objects.blob_store().writes_at_once().max(1);
     loop {
-        while set.len() < PUTS_AT_ONCE {
+        while set.len() < at_once {
             let Some((id, b)) = it.next() else { break };
             let h = hub.clone();
             set.spawn(async move { h.objects.put(project, &id, b).await });
@@ -4026,5 +4027,6 @@ pub async fn put_all(hub: &Arc<Hub>, project: i64, objects: impl IntoIterator<It
 pub use crate::store::DECODED_IN_FLIGHT as DECODING_IN_FLIGHT;
 use crate::store::DECODED as DECODING;
 
-/// Most object writes one request has in flight ([`put_all`]).
+/// Most object writes one request has in flight ([`put_all`]), unless the
+/// store says otherwise (`BlobStore::writes_at_once`: a local directory).
 pub const PUTS_AT_ONCE: usize = 64;

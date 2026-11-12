@@ -361,9 +361,12 @@ impl Waits {
 
     /// The line that tells the person what a `warming` answer makes the
     /// request wait for: at the first one, then every ten seconds (with
-    /// the server's own words, which say how far it is).
+    /// the server's own words, which say how far it is). The same for a
+    /// landing told to come back (`503 queue_full`: `vl land` waits and
+    /// submits again).
     fn notice(&mut self, status: u16, body: &[u8], now: std::time::Instant) -> Option<String> {
-        if !is_warming(status, body) || self.told.is_some_and(|t| now.duration_since(t) < Duration::from_secs(10)) {
+        let queue_full = status == 503 && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v["code"] == "queue_full");
+        if !(is_warming(status, body) || queue_full) || self.told.is_some_and(|t| now.duration_since(t) < Duration::from_secs(10)) {
             return None;
         }
         self.told = Some(now);
@@ -2313,6 +2316,23 @@ mod tests {
         assert_eq!(w.notice(503, &warming(2_000), t0 + Duration::from_secs(9)), None);
         assert!(w.notice(503, &warming(259_000), t0 + Duration::from_secs(10)).is_some_and(|l| l.ends_with("(9000 snapshots ready)")));
         assert_eq!(w.notice(429, &limited(0), t0 + Duration::from_secs(60)), None);
+    }
+
+    /// A landing told to come back (`503 queue_full`, BUG-1955) is waited
+    /// out as its answer asks, and the person is told so.
+    #[test]
+    fn bug_1955_a_full_landing_queue_is_waited_out_with_a_note() {
+        let t0 = std::time::Instant::now();
+        let full = br#"{"code":"queue_full","message":"the landing queue of 'main' is full (landings are arriving faster than they land); try again in a few seconds","retry_after_ms":1200}"#;
+        let mut w = Waits::new(t0);
+        assert_eq!(w.next(503, full, 7, t0), Some(Duration::from_millis(1_207)));
+        assert_eq!(
+            w.notice(503, full, t0).as_deref(),
+            Some("waiting for the server: the landing queue of 'main' is full (landings are arriving faster than they land)")
+        );
+        // Not at every answer, and not for ever.
+        assert_eq!(w.notice(503, full, t0 + Duration::from_secs(2)), None);
+        assert_eq!((0..20).filter(|_| w.next(503, full, 0, t0).is_some()).count(), RETRIES as usize - 1);
     }
 
     #[test]

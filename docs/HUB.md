@@ -5250,7 +5250,8 @@ vl embargo release ID
 Design: `docs/design/server/phase-4-agent-scale.md` §4.4, §4.11, the S24 row
 of §8, threat rows 20 and 21; §13.19 (S17) and §13.25 (S24, part A) here.
 Code: `crates/veil-server/src/limits/landing.rs` (outstanding-landing bounds
-and two-level fair batch ordering), `crates/veil-server/src/limits/mod.rs` and
+and two-level fair batch ordering), `crates/veil-server/src/limits/pressure.rs`
+(early back-pressure, item 6), `crates/veil-server/src/limits/mod.rs` and
 `bucket.rs` (per-agent-session and per-person rate buckets),
 `crates/veil-server/src/limits/health.rs` and `crates/vl/src/stats_cmd.rs`
 (landing counters in the admin-only health metrics), minimal wiring in
@@ -5351,6 +5352,91 @@ transaction per landing instead of 23.
    for 40 landings (**2.02** per landing: 1 push commit + 1 background derive
    commit).
 
+6. **A submit past what the service lands in time is told to come back**
+   (`limits/pressure.rs`, BUG-1955). Until this, nothing answered a
+   submitter past the service's capacity: the request waited out the
+   server's 30 s, answered `queued`, the agent submitted again, and the
+   service went on landing changes nobody waited for. Now `POST …/land`
+   (both shapes) asks `limits::pressure::admit` before anything is done for
+   the submit: **how many landings would land before this one**, in the
+   service's own order (item 2: of the submitter's own, each session's up to
+   one more than this session has; of each other person's, up to one more
+   than that; `Waiting::ahead`). At `MAX_BRANCH_WAITING` (2,048: 32
+   batches) or more, or more than the service serves in `MAX_QUEUE_WAIT`
+   (10 s) at the rate it is serving now, the answer is **`503 queue_full`**
+   with `retry_after_ms` (the time the service needs for what is over the
+   bound, 1 to 5 s) and `Retry-After`; nothing is queued, stored or
+   recorded. Because the count follows the fair order, it is each
+   submitter's fair share of the queue: behind one person's 1,000 waiting
+   landings another person's first landing has one before it, and is
+   queued. One person alone meets only their own bound (item 1: 1,000 is
+   below 2,048), with its `429` as before. What waits is read from the
+   database at most every 100 ms a branch and server (one statement:
+   `landing_queue`'s waiting rows by person and session, and the service's
+   count of entries served); between two reads a server adds what it
+   admitted itself, so servers sharing a database may together admit a few
+   more than the bound: the exact bounds are item 1's. The rate is
+   `landing_leases.served` (migration 37), which the batch's transaction
+   adds its entries to in the statement that renews the lease; a service
+   that serves nothing (a lease held elsewhere) gives no rate, and then the
+   count alone decides. `vl land` waits as the answer asks and submits
+   again (as for every `retry_after_ms`), with a note (`waiting for the
+   server: the landing queue of 'main' is full …`). Not asked: landing a PR,
+   an embargo's release and the server's own reverts (bounded by item 1).
+7. **A merge and a conflict report read the branch's changes at the
+   change's own paths** (`landing/edits.rs` `touching`, BUG-1955). Whether a
+   change that overlaps the tip can be merged, the merge itself, and the
+   conflict report each asked for the branch's whole edit set since the
+   change's base (`edit_set(tip, base)`) and kept the edits at the change's
+   paths. On a busy branch that is every folder anyone landed in since: with
+   10,000 agents each in a folder of its own, a base ten seconds old was
+   10,000 folders, read for each such entry, in the batch's own thread.
+   `touching` gives the same edits in the same order (a property test
+   against the filtered edit set) from the folders on the way to the path
+   and under it. The conflict report's "landed since" list asks each of the
+   256 steps first whether it touched the edits, and reads the step's edit
+   set only then.
+8. **A batch's entries are read on several threads** (`landing/service.rs`
+   `read_ahead`, BUG-1955). What an entry's build reads that no other entry
+   changes (its stack's snapshots, each change's edit set and base tree:
+   objects, by id) is read for all entries of the batch on up to 8 threads;
+   then the entries are built on the tip one after another, as before. An
+   entry whose read failed is read again in its turn, and answered what it
+   always was. The batch is the one built on one thread, byte for byte.
+9. **Fewer round trips a batch and a submit** (BUG-1955): the authors a
+   batch's commit records are read in one statement (one a landing before,
+   in turn); a submit takes one of its person's slots at random without
+   reading which are free, and reads them only when that one is taken
+   (BUG-1940's fix read all of the person's waiting rows for every submit).
+10. **A batch's objects are stored while its transaction runs**
+   (`landing/service.rs` `Storing`, BUG-1955). They were stored first and
+   the transaction began after: two steps of 27 and 37 ms one after the
+   other, the longest part of a batch (the next batch's build waited for
+   both). Now the transaction runs its statements while the objects are
+   written and waits for them just before it commits: the branch still
+   names nothing that is not stored (a batch whose objects cannot be
+   stored rolls back and is built again; a transaction run again finds the
+   store's outcome). Measured: 57 to 45 ms a batch with the gate's mix.
+   The transaction waits for them at most half a lease (1 s): past that
+   it rolls back, the batch waits for its objects holding nothing, and
+   its transaction runs again, so a slow or hung object store never holds
+   the lease's row, which the branch's other servers need to take the
+   lease over once it expires (BUG-1982).
+11. **A landing behind a backlog in its project's gate is told at once**
+   (`limits/gate.rs` `WRITE_BACKLOG`, BUG-1955). Past what a project's
+   submits get through its bulkhead (48 places with 64 database
+   connections, a submit holding one for 35 to 45 ms on the benchmark's
+   machine: about 1,100 a second), the requests waited in the gate, up
+   to a write's 20 s, and item 6's answer was never reached (the landing
+   queue itself stayed short): with 1,500 a second offered, 9 s on
+   average, told nothing. Now, once the landing that has waited longest
+   for a place has waited 2 s, a new landing is answered `503 busy` with
+   `retry_after_ms` (0.5 to 1.5 s) at once, before any work; those
+   waiting keep their places and their order, pulls and search are
+   treated as before, and when the backlog is under 2 s landings wait for
+   a place again. One person's flood holds another person's landing back
+   no longer than the gate's order did: both come in as places free.
+
 **Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
 `concurrency.rs`, unit tests in `limits/landing.rs`):
 
@@ -5365,6 +5451,11 @@ transaction per landing instead of 23.
 | 7 | S14: file history and blame memos written in the consolidated transaction equal what they were before | `derive::landing` writes `projections`, `view_file_history`, and `view_graph` in one transaction; `q/blame` and `q/history` match the independent projected-files model and the projection-equivalence copy. | `blame::consolidated_landing_pass_file_history_and_blame_memos_match_projected_files`, `blame::blame_and_history_match_the_projected_files`, `query::query_projection_equivalence` |
 | 8 | S18 and S19: a re-queued merge counts once against the outstanding-landing bounds; a CI runner session never queues a landing; fair-share batching keeps S18's merge-worker ordering correct (BUG-1667) | `limits::landing::admit_queue` counts `state IN ('queued', 'merging')` and stores `agent_session`; CI runner sessions are refused `403 agent_session`; fair-share batches interleave fast-path landings and content merges cleanly. | `limits::s18_and_s19_requeued_merge_counts_once_runner_never_queues_and_fair_batch_keeps_merge_ordering` |
 | 9 | YugabyteDB: the single background transaction stays within YugabyteDB's limits on a large 500-file landing | `derive::landing` caps inline search/memo preparation on large batches (`writes.history.len() > 64`), commits derived rows in `ROWS_PER_STATEMENT` chunks with retry on retryable conflict (`STATEMENT_DEADLINE`), and finishes memoization and search indexing in the background. | `limits::a_500_file_landing_and_its_background_derive_pass_stay_bounded_and_succeed` |
+| 10 | Past what the service lands in time a submit is told to come back at once (`503 queue_full`, `retry_after_ms` 1 to 5 s) with nothing done for it, and another person's landing is still queued (BUG-1955) | Six held landings of one person fill a bound of 6: the seventh is refused in under 5 s with no queue row, snapshot or change ref; another person's is queued; once the six land, the seventh goes in | `landing_hold::bug_1955_a_full_queue_tells_the_submitter_to_come_back_and_holds_nobody_else_up` |
+| 11 | `vl land` waits out a full queue as the answer asks, with a note, and lands | the note `waiting for the server: the landing queue of 'main' is full …`, then landed | `landing_hold::bug_1955_vl_land_waits_for_a_full_queue_and_says_so`; `vl` unit test `bug_1955_a_full_landing_queue_is_waited_out_with_a_note` |
+| 12 | A batch read on several threads is the batch built on one, byte for byte (BUG-1955) | Three seeded batches of 90 submits by two people (new files, overlapping edits of one shared file, two changes adding one path): the same objects, snapshots, landings, memos, tip and answers, with at least one merge and one conflict each; the service then lands what the one-thread build said | `landing_hold::bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one` |
+| 13 | A batch commits only once its objects are stored (BUG-1955) | With the store's folders unwritable, three held landings stay queued and the branch keeps its tip for 3 s; once writable, all three land and their files read back at the new tip | `landing_hold::bug_1955_a_batch_lands_only_once_its_objects_are_stored` |
+| 14 | Behind 2 s of landings waiting in a gate, a new landing is answered at once; those waiting keep their places and get in; pulls still wait; with no backlog landings wait again (BUG-1955) | a gate of one place held, two landings and a pull waiting: after 2 s a third landing is refused without waiting, the gate's load is (1 running, 3 waiting), and all three get in once the place is free | `limits::gate::tests::a_landing_behind_a_long_backlog_is_told_at_once` |
 
 ### 13.36 S20: automatic bisect and revert (built)
 

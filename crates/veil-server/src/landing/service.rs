@@ -141,6 +141,7 @@ pub(super) async fn has_ready(hub: &Hub, project: i64, branch: &str) -> Result<b
 }
 
 /// A queue row.
+#[derive(Clone)]
 struct Row {
     seq: i64,
     ticket: String,
@@ -241,6 +242,7 @@ struct Known {
 }
 
 /// An entry ready to build.
+#[derive(Clone)]
 struct Prepared {
     row: Row,
     who: Result<As, String>,
@@ -253,6 +255,7 @@ struct Prepared {
 }
 
 /// A batch's inputs, read before it is built.
+#[derive(Clone)]
 struct Inputs {
     entries: Vec<Prepared>,
     /// View keys to attach: `(key, who, position on the recent line, memo there)`.
@@ -345,6 +348,42 @@ impl Built {
         self.flushes += 1;
         Ok(())
     }
+}
+
+/// A batch's objects being stored (`sync::put_all`): its transaction runs
+/// meanwhile and waits for them only before it commits (BUG-1955: the
+/// store and then the transaction, one after the other, were the service's
+/// longest step). Waited once; a transaction run again finds the outcome.
+enum Storing {
+    Running(tokio::task::JoinHandle<Result<()>>),
+    Stored,
+    Failed(String),
+}
+
+impl Storing {
+    async fn wait(this: &tokio::sync::Mutex<Storing>) -> Result<()> {
+        let mut s = this.lock().await;
+        if let Storing::Running(task) = &mut *s {
+            *s = match task.await {
+                Ok(Ok(())) => Storing::Stored,
+                Ok(Err(e)) => Storing::Failed(format!("{e:?}")),
+                Err(e) => Storing::Failed(e.to_string()),
+            };
+        }
+        match &*s {
+            Storing::Failed(e) => Err(Error::Other(anyhow::anyhow!("storing the batch's objects: {e}"))),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// `f` as [`crate::db::transaction`] takes it, so that it can be passed by
+/// reference and run again.
+fn tx_fn<T, F>(f: F) -> F
+where
+    F: for<'t> FnMut(&'t mut sqlx::PgConnection) -> crate::db::TxFuture<'t, T>,
+{
+    f
 }
 
 /// How a batch's commit ended.
@@ -463,7 +502,7 @@ impl Service {
             let inputs = self.prepare(rows, &on, state.tip, &mut known).await?;
             self.hub.landing.stats.prepare_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             let t = Instant::now();
-            let built = self.build(inputs, on).await?;
+            let built = self.build(inputs, on, build_threads()).await?;
             self.hub.landing.stats.build_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             // Its objects are stored while the batch before it commits (they
             // are content-addressed: stored for a batch that is then
@@ -494,10 +533,7 @@ impl Service {
             let seqs = built.rows.iter().map(|r| r.seq).collect();
             let (alone, after) = (built.alone, built.after.clone());
             let s = Arc::new(self.clone_handle());
-            let task = tokio::spawn(async move {
-                store.await.map_err(|e| Error::Other(e.into()))??;
-                s.commit(built, gc_epoch).await
-            });
+            let task = tokio::spawn(async move { s.commit(built, gc_epoch, Arc::new(tokio::sync::Mutex::new(Storing::Running(store)))).await });
             inflight = Some(InFlight { task, seqs, alone, after });
         }
     }
@@ -817,11 +853,12 @@ impl Service {
                 let diffs: Vec<(usize, crate::prs::StackReviewDiff)> = if pending_stacks.is_empty() {
                     Vec::new()
                 } else {
+                    // Each stack's diff on its own, on several threads (a
+                    // third of a millisecond each, one after another: 22 ms
+                    // of a protected branch's batch, BUG-1955); the first
+                    // that fails is the batch's error, as before.
                     sync::blocking(hub, self.project, move |src| {
-                        pending_stacks
-                            .into_iter()
-                            .map(|(i, st)| Ok((i, crate::prs::stack_review_diff(src, &st)?)))
-                            .collect()
+                        on_threads(&pending_stacks, build_threads(), |(i, st)| Ok((*i, crate::prs::stack_review_diff(src, st)?))).into_iter().collect()
                     })
                     .await?
                 };
@@ -976,8 +1013,8 @@ impl Service {
     }
 
     /// Build the batch on `on` (on a blocking thread: trees, hashes,
-    /// signatures).
-    async fn build(&self, inputs: Inputs, on: State) -> Result<Built> {
+    /// signatures), its entries read ahead on `threads` threads.
+    async fn build(&self, inputs: Inputs, on: State, threads: usize) -> Result<Built> {
         let (hub, project, branch) = (self.hub.clone(), self.project, self.branch.clone());
         let rt = tokio::runtime::Handle::current();
         // The default branch's tip, for a landing on another branch: the
@@ -994,12 +1031,12 @@ impl Service {
             Some(t) => Some(ObjectId::from_hex(&t).map_err(|e| Error::Other(e.into()))?),
             None => None,
         };
-        tokio::task::spawn_blocking(move || build(hub, rt, project, &branch, default_tip, inputs, on)).await.map_err(|e| Error::Other(e.into()))?
+        tokio::task::spawn_blocking(move || build(hub, rt, project, &branch, default_tip, inputs, on, threads)).await.map_err(|e| Error::Other(e.into()))?
     }
 
     /// Commit the batch (its objects stored already) in one transaction;
     /// then tell the waiters here, spawn merge workers, and emit events.
-    async fn commit(&self, mut b: Built, gc_epoch: i64) -> Result<Committed> {
+    async fn commit(&self, mut b: Built, gc_epoch: i64, stored: Arc<tokio::sync::Mutex<Storing>>) -> Result<Committed> {
         let t = Instant::now();
         let hub = &self.hub;
         for o in &mut b.outcomes {
@@ -1056,12 +1093,28 @@ impl Service {
         // Each change landed, by its id and author, for the branch's lineage:
         // "already landed" asks it whatever its submitted snapshot (BUG-1522,
         // BUG-1527).
-        let empty_fresh = HashMap::new();
+        // The authors the server recorded, of all of them in one statement
+        // (they were asked one landing after another, a round trip each:
+        // BUG-1955); one it did not record is found as before.
+        let recorded: HashMap<ObjectId, (Vec<ObjectId>, i64)> = {
+            let hex: Vec<String> = b.landings.iter().filter(|(_, r)| r.change.is_some()).map(|(sid, _)| sid.hex()).collect();
+            let rows: Vec<(String, i64)> = match hex.is_empty() {
+                true => Vec::new(),
+                false => {
+                    sqlx::query_as("SELECT id, author FROM snapshots WHERE project_id = $1 AND id = ANY($2) AND author <> 0")
+                        .bind(self.project)
+                        .bind(&hex)
+                        .fetch_all(&hub.db)
+                        .await?
+                }
+            };
+            rows.into_iter().filter_map(|(id, a)| Some((ObjectId::from_hex(&id).ok()?, (Vec::new(), a)))).collect()
+        };
         let mut snap_authors: HashMap<ObjectId, i64> = HashMap::new();
         let (mut cc, mut ca, mut cl) = (Vec::new(), Vec::new(), Vec::new());
         for (sid, r) in &b.landings {
             if let Some(c) = &r.change {
-                if let Some(a) = super::snapshot_author(hub, self.project, *sid, &empty_fresh).await? {
+                if let Some(a) = super::snapshot_author(hub, self.project, *sid, &recorded).await? {
                     snap_authors.insert(r.landed, a);
                     cc.push(c.clone());
                     ca.push(a);
@@ -1142,7 +1195,8 @@ impl Service {
         let old_tip_id = b.old_tip;
         let tx_results = results.clone();
         let tx_hub = hub.clone();
-        let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+        let stored_outside = stored.clone();
+        let mut run = tx_fn(move |c| {
             let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing, active_review_checks, review_guard, claim_tokens) = (
                 ls.clone(),
                 ll.clone(),
@@ -1173,17 +1227,22 @@ impl Service {
             );
             let landed_prs = tx_landed_prs.clone();
             let tx_hub = tx_hub.clone();
+            let stored = stored.clone();
             Box::pin(async move {
                 crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 // Fencing: only the lease's current holder moves the branch.
+                // (And the entries it has served: what a submit reads the
+                // service's rate from, `limits::pressure`.)
                 let held = sqlx::query(&format!(
-                    "UPDATE landing_leases SET expires_at = {DB_NOW} + $5 WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4"
+                    "UPDATE landing_leases SET expires_at = {DB_NOW} + $5, served = served + $6 \
+                     WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4"
                 ))
                 .bind(pid)
                 .bind(&branch)
                 .bind(&holder)
                 .bind(epoch)
                 .bind(LEASE_MS)
+                .bind(seqs.len() as i64)
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
@@ -1438,10 +1497,24 @@ impl Service {
                         .execute(&mut *c)
                         .await?;
                 }
+                // What the batch made is stored before the branch names it:
+                // waited for here a little only, so that a slow store never
+                // holds the lease's row (and the branch's other servers)
+                // for long; past that, outside the transaction, which then
+                // runs again (BUG-1982).
+                if tokio::time::timeout(STORE_IN_TRANSACTION, Storing::wait(&stored)).await.is_err() {
+                    return Err(Error::conflict(STORE_SLOW));
+                }
+                Storing::wait(&stored).await?;
                 Ok((results, marked))
             })
-        })
-        .await;
+        });
+        let r = loop {
+            match crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, &mut run).await {
+                Err(Error::Api { code: "conflict", message, .. }) if message == STORE_SLOW => Storing::wait(&stored_outside).await?,
+                r => break r,
+            }
+        };
         let (results, marked_prs) = match r {
             Ok(r) => r,
             Err(Error::Api { code: "conflict", message, .. }) if message == LEASE_LOST => {
@@ -1491,6 +1564,7 @@ impl Service {
         );
         for outcome in &b.outcomes {
             if let Outcome::Merging(job) = outcome {
+                st.merging.fetch_add(1, Ordering::Relaxed);
                 super::merge::spawn(hub, job.clone());
             }
         }
@@ -1591,6 +1665,13 @@ async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> 
 
 const LEASE_LOST: &str = "the landing lease was lost";
 const MOVED: &str = "the branch moved under the landing service";
+/// A batch's objects were not stored within [`STORE_IN_TRANSACTION`] of its
+/// transaction's last statement: it is rolled back, waits for them without
+/// holding anything, and runs again (BUG-1982).
+const STORE_SLOW: &str = "the batch's objects are still being stored";
+/// How long a batch's transaction waits for its objects before it lets go
+/// of the lease's row: half the lease.
+const STORE_IN_TRANSACTION: Duration = Duration::from_millis(LEASE_MS as u64 / 2);
 /// An entry whose stack was judged under another lineage of the branch.
 const RESET: &str = "the branch was reset since this change was submitted (a forced push, or deleted and made again): submit it again";
 const MEMO_RACE: &str = "a projection memo was stored meanwhile with another value";
@@ -1654,7 +1735,76 @@ fn project_onto(
 /// The batch, built on `on`: the attached view keys, then each entry in
 /// order, until one that must land alone, or the batch holds
 /// [`BATCH_BYTES`].
-fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, default_tip: Option<ObjectId>, inputs: Inputs, on: State) -> Result<Built> {
+/// What the build of an entry reads that no other entry of its batch
+/// changes: its stack's snapshots, and each change's edit set and base
+/// tree. They are objects read by their ids, so they are the same read
+/// before the batch is built or in the entry's turn: the entries of a
+/// batch are read on several threads ([`read_ahead`]), and then built on
+/// the tip, one after another, as before.
+struct Read {
+    snaps: Vec<Arc<Snapshot>>,
+    sets: Vec<Vec<Change>>,
+    base_trees: Vec<ObjectId>,
+}
+
+fn read_entry(src: &Source, stack: &[Entry]) -> veil_core::Result<Read> {
+    let snaps: Vec<Arc<Snapshot>> = stack.iter().map(|e| src.snapshot(&e.id)).collect::<veil_core::Result<_>>()?;
+    // Each change's edits: its own, against its first parent (a merge
+    // based on another parent: against that one, BUG-1271). Every change of
+    // a stack is one its submitter sees whole (`landing::stack`).
+    let mut sets: Vec<Vec<Change>> = Vec::new();
+    let mut base_trees: Vec<ObjectId> = Vec::new();
+    for (e, s) in stack.iter().zip(&snaps) {
+        let against = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) { e.base } else { s.parents[0] };
+        let old = src.snapshot(&against)?.tree;
+        sets.push(edits::edit_set(src, s.tree, old)?);
+        base_trees.push(old);
+    }
+    Ok(Read { snaps, sets, base_trees })
+}
+
+/// The threads a batch's entries are read on: the machine's, at most 8
+/// (the build itself, on the tip, is one thread's).
+fn build_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
+}
+
+/// `f` of each of `items`, in their order, on up to `threads` threads (at
+/// least 8 items a thread; with one thread, or few items, here).
+fn on_threads<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let per = items.len().div_ceil(threads.max(1)).max(8);
+    if threads < 2 || items.len() <= per {
+        return items.iter().map(f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = items.chunks(per).map(|part| s.spawn(move || part.iter().map(f).collect::<Vec<R>>())).collect();
+        parts.into_iter().flat_map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
+    })
+}
+
+/// [`read_entry`] of each entry, on `threads` threads (BUG-1955: a batch
+/// was built on one core of the machine's). `None` for an entry whose read
+/// failed, and for all with one thread: [`entry`] reads it in its turn, and
+/// answers what it always did.
+fn read_ahead(src: &Source, entries: &[Prepared], threads: usize) -> Vec<Option<Read>> {
+    match threads {
+        0 | 1 => entries.iter().map(|_| None).collect(),
+        _ => on_threads(entries, threads, |p| read_entry(src, &p.row.stack).ok()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build(
+    hub: Arc<Hub>,
+    rt: tokio::runtime::Handle,
+    project: i64,
+    branch: &str,
+    default_tip: Option<ObjectId>,
+    inputs: Inputs,
+    on: State,
+    threads: usize,
+) -> Result<Built> {
     let mut src = Source {
         hub: hub.clone(),
         project,
@@ -1721,7 +1871,8 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         b.after.keys.insert(k, Kept { who, at: p });
         hub.landing.stats.attached.fetch_add(1, Ordering::Relaxed);
     }
-    for p in entries {
+    let read = read_ahead(&src, &entries, threads);
+    for (p, read) in entries.into_iter().zip(read) {
         if b.alone {
             break;
         }
@@ -1733,7 +1884,10 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
         }
         let mark = (b.objects.len(), b.bytes, b.snapshots.len(), b.memos.len(), b.landings.len(), b.flushes);
         let merged = b.merged.len();
-        let last_cid = p.row.stack.last().and_then(|e| src.snapshot(&e.id).ok().map(|s| s.change_id));
+        let last_cid = match &read {
+            Some(r) => r.snaps.last().map(|s| s.change_id),
+            None => p.row.stack.last().and_then(|e| src.snapshot(&e.id).ok().map(|s| s.change_id)),
+        };
         let user_entry = !p.row.ticket.starts_with("revert-");
         let row = RowMeta {
             seq: p.row.seq,
@@ -1750,7 +1904,7 @@ fn build(hub: Arc<Hub>, rt: tokio::runtime::Handle, project: i64, branch: &str, 
                 _ => None,
             },
         };
-        let outcome = match entry(&hub, &mut src, branch, default_tip, &p, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
+        let outcome = match entry(&hub, &mut src, branch, default_tip, &p, read, &mut b, &mut memo, &origins, &landed, on.made_bytes) {
             Ok(Some(o)) => o,
             // It changes access or rules and others come before it: it lands
             // alone, in the next batch.
@@ -1799,6 +1953,7 @@ fn entry(
     branch: &str,
     default_tip: Option<ObjectId>,
     p: &Prepared,
+    read: Option<Read>,
     b: &mut Built,
     memo: &mut HashMap<(String, ObjectId), ObjectId>,
     origins: &HashMap<ObjectId, ObjectId>,
@@ -1818,18 +1973,12 @@ fn entry(
     if p.row.lineage != b.after.lineage {
         return Ok(Some(Outcome::Rejected(RESET.into())));
     }
-    let snaps: Vec<Arc<Snapshot>> = p.row.stack.iter().map(|e| src.snapshot(&e.id)).collect::<veil_core::Result<_>>()?;
-    // Each change's edits: its own, against its first parent (a merge
-    // based on another parent: against that one, BUG-1271). Every change of
-    // a stack is one its submitter sees whole (`landing::stack`).
-    let mut sets: Vec<Vec<Change>> = Vec::new();
-    let mut base_trees: Vec<ObjectId> = Vec::new();
-    for (e, s) in p.row.stack.iter().zip(&snaps) {
-        let against = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) { e.base } else { s.parents[0] };
-        let old = src.snapshot(&against)?.tree;
-        sets.push(edits::edit_set(src, s.tree, old)?);
-        base_trees.push(old);
-    }
+    // The stack's snapshots, and each change's edits and base tree: read
+    // ahead with the batch's other entries, or now.
+    let Read { snaps, sets, base_trees } = match read {
+        Some(r) => r,
+        None => read_entry(src, &p.row.stack)?,
+    };
     // A merge whose base is its first parent (as the submitter saw it):
     // lands as a merge, on the tip it was made on (except an embargoed
     // merge landing at release, whose edits land on the current tip).
@@ -2160,6 +2309,49 @@ fn entry(
     }
     b.after.tip = Some(chain);
     Ok(Some(Outcome::Landed { reals }))
+}
+
+/// For tests (`landing_hold`): the batch `branch`'s service would build
+/// now, built with its entries read on one thread and on `threads`, each
+/// build told line by line: every object made (by id; its id is its bytes'), the
+/// snapshots, memos and landing records, the tip, and each entry's outcome
+/// as its submitter is answered. Nothing is stored, queued or committed.
+#[doc(hidden)]
+pub async fn build_both_ways(hub: &Arc<Hub>, project: i64, branch: &str, threads: usize) -> Result<[Vec<String>; 2]> {
+    let name: String = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project).fetch_one(&hub.db).await?;
+    let s = Service { hub: hub.clone(), project, name, branch: branch.to_string(), epoch: 0, won: Default::default() };
+    let state = s.load().await?;
+    let rows = s.ready(&HashSet::new()).await?;
+    let inputs = s.prepare(rows, &state, state.tip, &mut Known::default()).await?;
+    let mut told = Vec::new();
+    for threads in [1, threads] {
+        let b = s.build(inputs.clone(), State { made_bytes: 0, ..state.clone() }, threads).await?;
+        let mut lines = vec![format!("tip {:?} -> {:?}, alone {}, accept {:?}", b.old_tip, b.after.tip, b.alone, b.accept)];
+        // (By id: the trees an entry makes are held in a map, in no order.)
+        let mut objects: Vec<String> = b.objects.iter().map(|(id, raw)| format!("object {} is {} ({} bytes)", id.hex(), ObjectId::hash(raw).hex(), raw.len())).collect();
+        objects.sort();
+        lines.extend(objects);
+        lines.extend(b.snapshots.iter().map(|x| format!("snapshot {}", x.hex())));
+        lines.extend(b.merged.iter().map(|x| format!("merged {}", x.hex())));
+        lines.extend(b.landings.iter().map(|(x, r)| format!("landing {} as {} ({:?})", x.hex(), r.landed.hex(), r.change)));
+        lines.extend(b.memos.iter().map(|(k, x, px, collapsed)| format!("memo {k} {} {} {collapsed}", x.hex(), px.hex())));
+        lines.extend(b.after.recent.iter().map(|x| format!("recent {}", x.hex())));
+        lines.extend(b.after.keys.iter().map(|(k, kept)| format!("key {k} at {}", kept.at.hex())));
+        for (row, o) in b.rows.iter().zip(&b.outcomes) {
+            lines.push(match o {
+                Outcome::Landed { reals } => format!("{} landed as {:?}", row.ticket, reals.iter().map(ObjectId::hex).collect::<Vec<_>>()),
+                Outcome::Merging(job) => {
+                    format!("{} merging on {} {:?}", row.ticket, job.tip.hex(), job.stack.iter().map(|e| (e.id.hex(), e.base.hex())).collect::<Vec<_>>())
+                }
+                Outcome::Conflict(report) => {
+                    format!("{} conflict {}", row.ticket, serde_json::to_string(&report.clone().into_result(&row.ticket, branch)).map_err(|e| Error::Other(e.into()))?)
+                }
+                Outcome::Rejected(why) => format!("{} rejected: {why}", row.ticket),
+            });
+        }
+        told.push(lines);
+    }
+    Ok([told.remove(0), told.remove(0)])
 }
 
 /// [`recheck`] exposed for `landing::merge`.
