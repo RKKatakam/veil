@@ -40,7 +40,7 @@ git checkout COMMIT        # the `commit=` line of the run.txt beside the number
 bash deploy/do/test/test.sh   # the kit's own tests; a fake doctl, nothing leaves the machine; ends "all green"
 ```
 
-## 3. The free rehearsal (about 30 to 45 minutes, no cost)
+## 3. The free rehearsal (about 10 minutes after the image build, no cost)
 
 The paid topology on one machine, small: three YugabyteDB nodes, MinIO in
 place of DigitalOcean Spaces, two Veil servers on the one database and
