@@ -120,3 +120,80 @@ fn bug_1955_vl_land_waits_for_a_full_queue_and_says_so() {
         assert_eq!(v["state"], "landed", "{v}");
     }
 }
+
+/// BUG-1955: a batch whose entries are read on several threads is the batch
+/// built on one, byte for byte: the same objects, the same snapshots,
+/// projections and landing records in the same order, the same tip, and
+/// the same answer for every entry. Seeded batches of two people's changes:
+/// new files, edits of one shared file (the second of two overlaps: handed
+/// to a merge), and two changes adding one path (the second conflicts).
+/// And what the service then lands is what the build on one thread said.
+#[test]
+fn bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let (dev, admin) = (p.dev.token(), p.admin.token());
+    let shared: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let made = land_edit(&api, &admin, &p.name, api.tips(Some(&admin), &p.name).unwrap().branches["main"], "src/par/shared.txt", &shared, true);
+    assert_eq!(made.status, 200, "{}", String::from_utf8_lossy(&made.body));
+    assert_eq!(made.json()["state"], "landed", "{}", made.json());
+
+    for seed in 1..=3u64 {
+        let mut state = seed.wrapping_mul(0x9e3779b97f4a7c15);
+        let mut next = |n: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % n
+        };
+        hold_branch(&hub, pid, "main");
+        let bases = [api.tips(Some(&dev), &p.name).unwrap().branches["main"], api.tips(Some(&admin), &p.name).unwrap().branches["main"]];
+        // 90 submits: more than one batch, so the batch is the service's fair choice.
+        let mut tickets: Vec<(usize, String)> = Vec::new();
+        for i in 0..90 {
+            let who = next(2) as usize;
+            let (path, text) = match next(100) {
+                0..=14 => {
+                    let at = next(40);
+                    ("src/par/shared.txt".to_string(), shared.replace(&format!("line {at}\n"), &format!("line {at} of {seed}/{i}\n")))
+                }
+                15..=29 => (format!("src/par/s{seed}/same-{}.txt", next(3)), format!("{seed}/{i}\n")),
+                _ => (format!("src/par/s{seed}/f{i:02}.rs"), format!("{seed}/{i}\n")),
+            };
+            let r = land_edit(&api, [&dev, &admin][who], &p.name, bases[who], &path, &text, false);
+            assert_eq!(r.status, 200, "seed {seed}, submit {i}: {}", String::from_utf8_lossy(&r.body));
+            tickets.push((who, r.json()["ticket"].as_str().unwrap().to_string()));
+        }
+        let [one, several] = hub.rt.block_on(veil_server::landing::build_both_ways(&hub.hub(), pid, "main", 8)).expect("the batch builds both ways");
+        let count = |what: &str| one.iter().filter(|l| l.contains(what)).count();
+        assert!(count("object ") > 100 && count(" landed as ") >= 20, "seed {seed}: {} objects, {} landed", count("object "), count(" landed as "));
+        assert!(count(" merging on ") >= 1 && count(" conflict ") >= 1, "seed {seed}: {} merging, {} conflicts", count(" merging on "), count(" conflict "));
+        assert!(count("memo ") >= 20, "seed {seed}: {} projections", count("memo "));
+        for (a, b) in one.iter().zip(&several) {
+            assert_eq!(a, b, "seed {seed}");
+        }
+        assert_eq!(one.len(), several.len(), "seed {seed}");
+
+        // The service lands them (on this machine's threads): every ticket
+        // ends, and an admin's landing the one-thread build said lands is
+        // answered with the snapshots it said.
+        release_branch(&hub, pid, "main");
+        for (who, t) in &tickets {
+            let token = [&dev, &admin][*who];
+            let mut v = wait_ticket(&api, token, &p.name, t);
+            // (A merged change that was queued again is waited for again.)
+            for _ in 0..200 {
+                if v["state"] != "queued" && v["state"] != "merging" {
+                    break;
+                }
+                v = wait_ticket(&api, token, &p.name, t);
+            }
+            assert!(v["state"] == "landed" || v["state"] == "conflict", "seed {seed}: {v}");
+            if let (1, Some(line)) = (*who, one.iter().find(|l| l.starts_with(&format!("{t} landed as ")))) {
+                assert_eq!(v["state"], "landed", "seed {seed}: {v}");
+                let landed: Vec<String> = v["landed"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+                assert_eq!(*line, format!("{t} landed as {landed:?}"), "seed {seed}");
+            }
+        }
+    }
+}

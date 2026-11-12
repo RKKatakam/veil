@@ -840,6 +840,9 @@ fn poll(hub: &Arc<Hub>, project: i64, branch: &str) {
     });
 }
 
+#[doc(hidden)]
+pub use service::build_both_ways;
+
 /// Unregister a waiter whose submit failed.
 pub fn abandon(hub: &Hub, w: Waiter) {
     hub.landing.forget(&w.ticket, w.id);
