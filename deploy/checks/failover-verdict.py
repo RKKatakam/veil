@@ -101,10 +101,14 @@ def main():
     first = num(chk, "first_landing_after_stop_ms")
     gap = num(chk, "longest_gap_after_stop_ms")
     normal = num(chk, "longest_gap_before_stop_ms")
+    after_n = num(chk, "landings_after_stop")
+    # Failing over means landing again: with no landing after the stop
+    # there is no pause to measure, and the lease moving proves nothing.
+    row("landings before / after the stop", f"{chk.get('landings_before_stop', '–')} / {chk.get('landings_after_stop', '–')}",
+        after_n is not None and after_n > 0, "another server must land after the stop")
     row("first landing after the stop", "–" if first is None else f"{first} ms", None, "from the stop command on the database's clock")
-    row("longest pause in landings after the stop", "–" if gap is None else f"{gap} ms", None if gap is None else gap <= PAUSE_TARGET_MS,
+    row("longest pause in landings after the stop", "–" if gap is None else f"{gap} ms", gap is not None and gap <= PAUSE_TARGET_MS,
         f"target at most {PAUSE_TARGET_MS} ms (phase 4 §7); the longest in the 30 s before: {normal} ms")
-    row("landings before / after the stop", f"{chk.get('landings_before_stop', '–')} / {chk.get('landings_after_stop', '–')}", None, "")
     print("| Check | Value | | What it shows |")
     print("|---|---|---|---|")
     print("\n".join(rows))

@@ -18,7 +18,12 @@
 #      nodes): create.sh makes every droplet, configure.sh shares the first
 #      server's keys through files and writes the balancer's configuration,
 #      bench.sh runs every gate of deploy/gates.sh where it belongs, and no
-#      secret appears in any of it.
+#      secret appears in any of it;
+#   6. configure.sh and bench.sh --approve on that topology, with fake ssh, scp
+#      and docker: every droplet is reached (ssh inside a `while read` loop
+#      must not eat the list), the first server's keys travel as private
+#      files, and no secret is on an ssh or scp command line, in the output
+#      or in the results.
 # Everything runs under a temporary state directory inside the worktree's .scratch/.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); DO=$(cd "$HERE/.." && pwd); ROOT=$(cd "$DO/../.." && pwd)
@@ -27,6 +32,7 @@ trap '[ "${KEEP_TEST_DIR:-0}" = 1 ] || { [[ -n "${T:-}" && -n "${ROOT:-}" && "$T
 export FAKE_DOCTL_LOG=$T/doctl.log; : > "$FAKE_DOCTL_LOG"
 export FAKE_AWS_LOG=$T/aws.log; : > "$FAKE_AWS_LOG"
 export FAKE_CURL_LOG=$T/curl.log; : > "$FAKE_CURL_LOG"
+export FAKE_SSH_LOG=$T/ssh.log; : > "$FAKE_SSH_LOG"
 cp "$HERE/fake-doctl" "$T/doctl"; chmod +x "$T/doctl"
 cat > "$T/aws" <<'AWS'
 #!/usr/bin/env bash
@@ -38,8 +44,10 @@ cat > "$T/curl" <<'CURL'
 #!/usr/bin/env bash
 set -euo pipefail
 echo "curl $*" >> "${FAKE_CURL_LOG:?}"
-stdin_cfg=$(cat || true)
-[[ "$stdin_cfg" == *"user ="* ]] || { echo "fake-curl: missing user on stdin" >&2; exit 1; }
+if [[ " $* " == *" -K - "* ]]; then
+    stdin_cfg=$(cat || true)
+    [[ "$stdin_cfg" == *"user ="* ]] || { echo "fake-curl: missing user on stdin" >&2; exit 1; }
+fi
 if [[ "$*" == *"-X GET"* ]]; then
     if [ "${FAKE_SPACES_STATE:-exists}" = exists ]; then
         printf '<ListAllMyBucketsResult><Buckets><Bucket><Name>%s</Name></Bucket></Buckets></ListAllMyBucketsResult>' "${FAKE_BUCKET_NAME:-veil-kit-test-objects-123}"
@@ -54,6 +62,31 @@ else
 fi
 CURL
 chmod +x "$T/curl"
+# ssh as the real one: without -n it reads all of stdin (and forwards it).
+cat > "$T/ssh" <<'SSH'
+#!/usr/bin/env bash
+echo "ssh $*" >> "${FAKE_SSH_LOG:?}"
+[[ " $* " == *" -n "* ]] || cat > /dev/null
+case "$*" in
+    *"cat /var/lib/veil/hub-"*) echo "fake-server-key-material" ;;
+    *"cat /var/lib/veil/stats.json"*) echo '{"landing_batches": 0}' ;;
+esac
+exit 0
+SSH
+cat > "$T/scp" <<'SCP'
+#!/usr/bin/env bash
+echo "scp $*" >> "${FAKE_SSH_LOG:?}"
+SCP
+cat > "$T/docker" <<'DOCKER'
+#!/usr/bin/env bash
+case "$1" in
+    save) echo "fake image $2" ;;
+    image) echo "sha256:fake revision=fake" ;;
+esac
+exit 0
+DOCKER
+printf '#!/usr/bin/env bash\ncat\n' > "$T/zstd"
+chmod +x "$T/ssh" "$T/scp" "$T/docker" "$T/zstd"
 export PATH=$T:$PATH
 export VEIL_DO_ENV=$T/env
 cat > "$VEIL_DO_ENV" <<ENV
@@ -83,7 +116,7 @@ out=$("$T/do/create.sh" 2>&1); check "create.sh dry run prints the plan" '[[ "$o
 for g in pull land branches api landing scaling objects openscion scale; do "$T/do/bench.sh" "$g" >/dev/null 2>&1; done
 VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3 "$T/do/bench.sh" failover >/dev/null 2>&1; VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3 "$T/do/configure.sh" >/dev/null 2>&1
 "$T/do/logs.sh" >/dev/null 2>&1
-check "no doctl, aws or curl call without --approve" '[ ! -s "$FAKE_DOCTL_LOG" ] && [ ! -s "$FAKE_AWS_LOG" ] && [ ! -s "$FAKE_CURL_LOG" ]'
+check "no doctl, aws, curl, ssh or scp call without --approve" '[ ! -s "$FAKE_DOCTL_LOG" ] && [ ! -s "$FAKE_AWS_LOG" ] && [ ! -s "$FAKE_CURL_LOG" ] && [ ! -s "$FAKE_SSH_LOG" ]'
 check "dry runs touch nothing on disk (no state dir, no results dir)" '[ ! -e "$T/state" ] && [ ! -e "$T/results" ]'
 check "flag typos are refused across every script" '
     ! "$T/do/create.sh" --aprove >/dev/null 2>&1 &&
@@ -222,5 +255,20 @@ all_out="$out_est $out_c $out_cfg $all_bench $(cat "$FAKE_DOCTL_LOG")"
 check "no secret appears anywhere in the full topology's runs" '[[ "$all_out" != *"dop_v1_fake_secret_token"* && "$all_out" != *"secret-spaces-key"* && "$all_out" != *"secret-spaces-val"* && "$all_out" != *"secret-db-pass"* ]]'
 topo=$(env $FULL bash -c '. "$1/do/lib.sh" 2>/dev/null; topology' _ "$T")
 check "the topology recorded beside results is the settings, without a secret" '[[ "$topo" == *"HUBS=3"* && "$topo" == *"YB_NODES=3"* && "$topo" == *"HAPROXY_IMAGE=haproxy:3.0-alpine@sha256:"* && "$topo" != *"secret"* && "$topo" != *"dop_v1"* ]]'
+
+echo "== 6. configure.sh and bench.sh --approve on the full topology (fake ssh, scp and docker)"
+: > "$FAKE_SSH_LOG"
+check "the dry runs above reached no droplet" '[ ! -s "$FAKE_SSH_LOG" ]'
+out_ac=$(env $FULL "$T/do/configure.sh" --approve dokit-test 2>&1 </dev/null); rc=$?
+check "configure.sh --approve succeeds" '[ $rc = 0 ] && [[ "$out_ac" == *"== configured."* ]]'
+check "it waits for cloud-init on all 9 droplets and gives each the certificate (ssh in a loop eats no droplet)" '[ "$(grep -c "cloud-init status --wait" "$FAKE_SSH_LOG")" = 9 ] && [ "$(grep -c "/etc/veil/tls/ca.pem$" "$FAKE_SSH_LOG")" = 9 ] && [ "$(grep -c "chmod 755 /etc/veil/tls" "$FAKE_SSH_LOG")" = 9 ]'
+check "every server and driver gets its hub.env as a file, and servers 2 and 3 the first one's keys" '[ "$(grep -c "/etc/veil/hub.env$" "$FAKE_SSH_LOG")" = 5 ] && [ "$(grep -c "203.0.113.2:/etc/veil/hubkeys/hub-" "$FAKE_SSH_LOG")" = 4 ] && [ "$(grep -c "203.0.113.3:/etc/veil/hubkeys/hub-" "$FAKE_SSH_LOG")" = 4 ]'
+S5=$T/state/veil-kit-full
+check "the fetched keys and env files stay private on this machine (in the run's 0700 state directory)" '[ "$(stat -c %a "$S5")" = 700 ] && [ "$(stat -c %a "$S5/hubkeys")" = 700 ] && [ "$(stat -c %a "$S5/hubkeys/hub-grant-key")" = 600 ] && [ "$(stat -c %a "$S5/hub3.env")" = 600 ]'
+out_ab=$(env $FULL "$T/do/bench.sh" --approve pull 2>&1 </dev/null); rc=$?
+res=$(ls -d "$T"/results/veil-kit-full/*-pull 2>/dev/null | head -1)
+check "bench.sh --approve pull succeeds and records run.txt, topology.env, images.txt and commands.txt" '[ $rc = 0 ] && [ -n "$res" ] && [ -s "$res/run.txt" ] && [ -s "$res/topology.env" ] && [ -s "$res/images.txt" ] && [ -s "$res/commands.txt" ] && grep -q "^commit=" "$res/run.txt" && grep -q "revision=" "$res/images.txt"'
+leaks=$(cat "$FAKE_SSH_LOG" "$FAKE_DOCTL_LOG" "$FAKE_CURL_LOG"; echo "$out_ac $out_ab"; cat "$res"/* 2>/dev/null)
+check "no secret on an ssh or scp command line, in the output or in the results" '[[ "$leaks" != *"dop_v1_fake_secret_token"* && "$leaks" != *"secret-spaces-key"* && "$leaks" != *"secret-spaces-val"* && "$leaks" != *"secret-db-pass"* && "$leaks" != *"fake-server-key-material"* ]]'
 
 [ $fail = 0 ] && echo "deploy/do/test: all green" || { echo "deploy/do/test: FAILED"; exit 1; }

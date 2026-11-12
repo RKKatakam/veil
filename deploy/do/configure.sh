@@ -36,7 +36,7 @@ CERT_NAMES=()
 while read -r role name size; do
     case $role in hub|lb|cache) CERT_NAMES+=("$(addr "$name")" "$(paddr "$name")" "$name") ;; esac
 done < <(droplets)
-[ $APPROVED = 1 ] && "$DO_ROOT/deploy/tls/mkcert.sh" "$STATE/tls" "${CERT_NAMES[@]}" || echo "would run mkcert for ${CERT_NAMES[*]}" >&2
+if [ $APPROVED = 1 ]; then "$DO_ROOT/deploy/tls/mkcert.sh" "$STATE/tls" "${CERT_NAMES[@]}"; else echo "would run mkcert for ${CERT_NAMES[*]}" >&2; fi
 while read -r role name size; do
     ip=$(ip_of "$name"); ip=${ip:-${name}_IP}
     for f in ca.pem server.pem server-key.pem; do copy_to "$STATE/tls/$f" "$ip" "/etc/veil/tls/$f"; done

@@ -93,9 +93,9 @@ hub_stats() { # server number
 db_sql() { # SQL on stdin -> rows, | between columns
     if [ $APPROVED = 0 ]; then cat >/dev/null; fi
     if [ "$YB_NODES" -gt 0 ]; then
-        remote "$(addr "$NAME-yb1")" "docker exec -i yb bin/ysqlsh -h $(paddr "$NAME-yb1") -U yugabyte -d yugabyte -X -q -tA -F'|' -v ON_ERROR_STOP=1"
+        remote_stdin "$(addr "$NAME-yb1")" "docker exec -i yb bin/ysqlsh -h $(paddr "$NAME-yb1") -U yugabyte -d yugabyte -X -q -tA -F'|' -v ON_ERROR_STOP=1"
     else
-        remote "$(addr "$NAME-db")" "docker exec -i pg psql -U veil -d veil -X -q -tA -F'|' -v ON_ERROR_STOP=1"
+        remote_stdin "$(addr "$NAME-db")" "docker exec -i pg psql -U veil -d veil -X -q -tA -F'|' -v ON_ERROR_STOP=1"
     fi
 }
 
@@ -105,16 +105,17 @@ DRIVER_IPS=(); for i in $(seq "$DRIVERS"); do DRIVER_IPS+=("$(addr "$NAME-driver
 { gate_meta "$COMMIT" "$TAG"; echo "args=$*"; } | record run.txt
 topology | record topology.env
 {
-    echo "# built here (deploy/docker/build.sh), shipped by configure.sh: the ids are the images' config digests"
+    echo "# built here (deploy/docker/build.sh), shipped by configure.sh: the ids are the images' config digests,"
+    echo "# revision= the commit each was built from (run.txt's commit= is this checkout's now)"
     for img in veil-server veil-bench; do
-        echo "local $img:$TAG $(docker image inspect -f '{{.Id}}' "$img:$TAG" 2>/dev/null || echo missing)"
+        echo "local $img:$TAG $(docker image inspect -f '{{.Id}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}' "$img:$TAG" 2>/dev/null || echo missing)"
     done
     echo "# pinned third-party images (deploy/versions.env)"
     echo "PG_IMAGE=$PG_IMAGE"; echo "YB_IMAGE=$YB_IMAGE"; echo "HAPROXY_IMAGE=$HAPROXY_IMAGE"
 } | record images.txt
 for h in "${HUB_IPS[@]}" "${DRIVER_IPS[@]}"; do
     if [ $APPROVED = 1 ]; then
-        remote "$h" "for i in veil-server:$TAG veil-bench:$TAG; do docker image inspect -f \"$h \$i {{.Id}}\" \$i 2>/dev/null; done; docker ps --format '$h running {{.Names}} {{.Image}}'" >> "$OUT/images.txt" 2>/dev/null || true
+        remote "$h" "for i in veil-server:$TAG veil-bench:$TAG; do docker image inspect -f \"$h \$i {{.Id}} revision={{index .Config.Labels \\\"org.opencontainers.image.revision\\\"}}\" \$i 2>/dev/null; done; docker ps --format '$h running {{.Names}} {{.Image}}'" >> "$OUT/images.txt" 2>/dev/null || true
     else remote "$h" "docker image inspect veil-server:$TAG veil-bench:$TAG; docker ps"; fi
 done
 

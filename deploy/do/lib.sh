@@ -79,10 +79,19 @@ run_do() { # doctl arguments...
     if [ $APPROVED = 1 ]; then doctl "$@"; else echo "would run: doctl $*" >&2; fi
 }
 # Secrets never appear on a command line: they go through files or stdin.
+# `remote` never reads stdin (ssh -n): inside `while read …; done < <(droplets)`
+# ssh would forward the rest of the list to the droplet, and the loop would
+# stop after its first droplet. `remote_stdin` is for a command fed on stdin.
 remote() { # host, command...   (ssh as root with this run's key)
-    local host=$1; shift
+    _ssh -n "$@"
+}
+remote_stdin() { # host, command...   (stdin goes to the command)
+    _ssh "" "$@"
+}
+_ssh() { # -n or "", host, command...
+    local n=$1 host=$2; shift 2
     if [ $APPROVED = 1 ]; then
-        ssh -i "$STATE/id_ed25519" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" \
+        ssh ${n:+"$n"} -i "$STATE/id_ed25519" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" \
             -o ConnectTimeout=15 -o BatchMode=yes "root@$host" "$@"
     else echo "would run on $host: $*" >&2; fi
 }

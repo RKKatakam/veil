@@ -56,7 +56,9 @@ printf 'a whole month forgotten:     $%.2f  <- why destroy.sh and its check matt
 topo_hourly() { # servers, YugabyteDB nodes, cache: the droplets' USD/hour
     local HUBS=$1 YB_NODES=$2 WITH_CACHE=$3 t=0 role name size p
     while read -r role name size; do
-        p=${live[$size]:-$(price_of "$size")}; t=$(echo "$t + ${p:-0}" | bc -l)
+        p=${live[$size]:-$(price_of "$size")}
+        [ -n "$p" ] || { echo unknown; return; }   # never priced as free
+        t=$(echo "$t + $p" | bc -l)
     done < <(droplets)
     echo "$t"
 }
@@ -68,6 +70,7 @@ for t in "1 0 0 one server, PostgreSQL (the default)" "1 3 0 one server, Yugabyt
          "3 0 0 three servers + balancer, PostgreSQL" "3 3 1 the full run + the cache"; do
     read -r h y c label <<<"$t"
     r=$(topo_hourly "$h" "$y" "$c")
+    [ "$r" != unknown ] || { printf '   %-58s %9s   (no built-in price for one of its sizes)\n' "$label" unknown; continue; }
     printf '   %-58s %9.3f %9.2f %11.2f %13.2f\n' "$label" "$r" "$(echo "$r * $HOURS + $SPACES_MONTHLY" | bc -l)" \
         "$(echo "$r * 24 + $SPACES_MONTHLY" | bc -l)" "$(echo "$r * 672 + $SPACES_MONTHLY" | bc -l)"
 done

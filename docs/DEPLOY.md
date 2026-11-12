@@ -290,9 +290,10 @@ LB_PORT=28443 deploy/compose/rehearsal.sh NAME         # a free host port on a s
 ```
 
 Results: `deploy/compose/results/<stamp>/<gate>/`, and each container's
-log in `deploy/compose/results/<stamp>/`. On the shared development
-machine run it as a heavy job (`bash ~/.cache/veil-orch/heavy.sh NAME 12
-…`) and never touch the `veil-shared-*` containers. **The rehearsal's
+log in `deploy/compose/results/<stamp>/`. On a machine others use, run
+it alone (it needs 11.5 GB), give it its own `NAME` and `LB_PORT`, and
+leave other Compose projects alone: its teardown removes only its own
+project's containers, network and volumes. **The rehearsal's
 numbers are for the flow only**: one machine plays nine. The rehearsal of
 2026-11-12 is in §9.
 
@@ -426,7 +427,15 @@ tip of `main` is in the derived graph, then runs `deploy/checks/failover.sql`
   snapshots plus the landed changes, exactly;
 - **the pause**: the longest gap between landings (their `done_at`) after
   the stop, against the target of 2 s and the longest gap in the 30 s
-  before.
+  before. At least one landing must follow the stop: with none there is
+  no pause to measure, and a lease that moved proves nothing, so the
+  verdict fails.
+
+Tickets answered `conflict` or `rejected` are counted, not judged: the
+tool submits such a change again as a new ticket, so a server that
+wrongly refused changes after the failover would show only in those
+counts (each agent writes a file of its own, so a plain run expects no
+conflicts).
 
 The database is the authority here because the benchmark tool does not
 log which change each of its landings was: it counts them. Its count over
