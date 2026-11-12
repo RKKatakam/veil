@@ -217,9 +217,10 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
         // A large viewer graph, a batch per statement.
         let batch = 100_000i64;
         let mut lo = 0i64;
+        let mut insert_tries = 0;
         while lo < rows {
             let hi = (lo + batch).min(rows);
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id) \
                  SELECT 1 + i % 4, 'k' || (i % 12), md5(i::text) || md5((i + 1)::text), i, i, '[]', 0, '[]', '', '' \
                  FROM generate_series($1::BIGINT, $2::BIGINT - 1) i",
@@ -227,9 +228,19 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
             .bind(lo)
             .bind(hi)
             .execute(&db)
-            .await
-            .unwrap();
-            lo = hi;
+            .await;
+            match inserted {
+                Ok(_) => lo = hi,
+                // YugabyteDB: another database's DDL can invalidate this
+                // statement's catalog snapshot (40001); the batch did not
+                // apply, so it is run again (BUG-1984).
+                Err(e) => {
+                    let retryable = e.as_database_error().and_then(|d| d.code()).is_some_and(|c| c == "40001" || c == "40P01");
+                    insert_tries += 1;
+                    assert!(retryable && insert_tries < 50, "view_graph rows {lo}..{hi}: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
         }
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM view_graph").fetch_one(&db).await.unwrap();
         assert_eq!(n, rows);

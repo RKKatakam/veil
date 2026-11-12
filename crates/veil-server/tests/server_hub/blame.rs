@@ -2508,7 +2508,11 @@ mod s14rd2_review {
                     break 'fill;
                 }
                 let before = jobs_started(&h.hub);
-                for _ in 0..50 {
+                // Until this job starts, bounded in time rather than in
+                // tries: under a loaded YugabyteDB 50 tries can pass before
+                // the lease is seen (BUG-1984).
+                let until = std::time::Instant::now() + Duration::from_secs(60);
+                while std::time::Instant::now() < until {
                     let r = once(&th, &h, &o, BlameParams { rev: Some(s.clone()), path: path.into(), follow: Some(follow), n: Some(10), ..Default::default() }, limits(5, BlameLimits::default()));
                     assert!(matches!(r, Err("warming" | "deadline")), "answered under another server's lease: {r:?}");
                     if jobs_started(&h.hub) > before {
