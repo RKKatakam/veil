@@ -617,3 +617,107 @@ fn a_failed_clone_leaves_no_directory_that_looks_usable() {
     admin.ok(admin.home.path(), &["clone", &hub.url(&name), was_there.to_str().unwrap()]);
     assert_eq!(std::fs::read_to_string(was_there.join("src/lib.rs")).unwrap(), "fn lib() {}\n");
 }
+
+/// Every version of `path` at `rev` (snapshot ids, newest first), or `None`
+/// when the first page answers `warming` or `deadline` within `first`
+/// (the file history is not written up to `rev` yet). A page after an
+/// answered first one never waits for the file history: its cursor names
+/// versions already written.
+fn whole_history(th: &TestHub, h: &Hist, a: &veil_server::query::Ask, rev: &str, path: &str, first: Limits) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let q = HistoryParams { rev: Some(rev.into()), path: Some(path.into()), follow: Some(false), n: Some(200), after: after.clone() };
+        let limits = if after.is_none() { first } else { Limits::default() };
+        match th.rt.block_on(query::history(&h.hub, a, q, limits)) {
+            Ok(v) => {
+                out.extend(v["entries"].as_array().unwrap().iter().map(|e| e["snapshot_id"].as_str().unwrap().to_string()));
+                after = v["next"].as_str().map(str::to_string);
+                if after.is_none() {
+                    return Some(out);
+                }
+            }
+            Err(Error::Api { code: "warming" | "deadline", .. }) if after.is_none() => return None,
+            Err(Error::Api { code: "deadline", .. }) => continue,
+            Err(e) => panic!("history of {path} at {rev}, after {after:?}: {e:?}"),
+        }
+    }
+}
+
+/// BUG-1954: the file history of a long push is written in batches, and a
+/// reader is never answered from part of it. With the file history written
+/// up to one tip and rows only above it, the history of a path at the tip
+/// answers `warming` and at the written tip answers whole; while the fill
+/// of the rest runs (batches of 500 rows committed one by one), every
+/// answer, at the tip or at any revision between, is `warming` or the
+/// whole history at that revision; once it is done, the whole history.
+#[test]
+fn bug_1954_a_file_history_filled_in_part_answers_whole_or_warming() {
+    let th = TestHub::start();
+    let carol = 772_001;
+    let (policy_text, bindings) = policy(carol);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let n = 600usize;
+    let mut files = Files::new();
+    let tip1 = line(&th, &mut h, root_snapshot_id(), 0, n, &mut files);
+    h.set_branch(&th, "main", tip1);
+    let hub = h.hub.clone();
+    let project = h.project(&th);
+    let adm_viewer = admin();
+    let adm = ask(&th, &h, &adm_viewer);
+    // Newest first, as the history answers: `pub/a.txt` changes in every
+    // snapshot, `fin/b.txt` in every other one.
+    let expect = |h: &Hist, upto: usize, path: &str| -> Vec<String> {
+        h.order[..upto].iter().enumerate().rev().filter(|(i, _)| path == "pub/a.txt" || i % 2 == 0).map(|(_, s)| s.hex()).collect()
+    };
+    th.rt.block_on(query::graph::ensure_files(&hub, &project, &adm_viewer, &[tip1], None)).expect("the file history of the first push");
+    assert_eq!(whole_history(&th, &h, &adm, &tip1.hex(), "pub/a.txt", Limits::default()), Some(expect(&h, n, "pub/a.txt")));
+    assert_eq!(whole_history(&th, &h, &adm, &tip1.hex(), "fin/b.txt", Limits::default()), Some(expect(&h, n, "fin/b.txt")));
+
+    // A push of as many again on top: rows only (another server holds the
+    // lease of the file history).
+    let tip2 = line(&th, &mut h, tip1, n, n, &mut files);
+    h.set_branch(&th, "main", tip2);
+    assert_eq!(h.order.len(), 2 * n);
+    hold_file_history(&th, &h, &adm_viewer);
+    th.rt.block_on(query::graph::extend_rows(&hub, &project, &adm_viewer, &[tip2])).expect("the rows of the second push");
+    let quick = Limits { deadline: Duration::from_millis(40), ..Limits::default() };
+    for path in ["pub/a.txt", "fin/b.txt"] {
+        assert_eq!(whole_history(&th, &h, &adm, &tip2.hex(), path, quick), None, "{path} at the tip: warming, not half a history");
+        assert_eq!(whole_history(&th, &h, &adm, &h.order[n + n / 2].hex(), path, quick), None, "{path} between the tips: warming");
+        assert_eq!(whole_history(&th, &h, &adm, &tip1.hex(), path, quick), Some(expect(&h, n, path)), "{path} at the written tip: whole");
+    }
+
+    // The fill of the rest runs; readers ask all the while.
+    release(&th, &h);
+    let done = Arc::new(AtomicBool::new(false));
+    let fill = {
+        let (hub, project, viewer, done) = (hub.clone(), project.clone(), adm_viewer.clone(), done.clone());
+        th.rt.spawn(async move {
+            let r = query::graph::ensure_files(&hub, &project, &viewer, &[tip2], None).await;
+            done.store(true, Ordering::SeqCst);
+            r
+        })
+    };
+    let (mut whole, mut warming, mut asks) = (0usize, 0usize, 0usize);
+    let mut rng = Rng::new(1954);
+    while !done.load(Ordering::SeqCst) {
+        let at = if asks % 2 == 0 { 2 * n } else { n + 1 + rng.below(n - 1) };
+        let path = if asks % 3 == 0 { "fin/b.txt" } else { "pub/a.txt" };
+        asks += 1;
+        match whole_history(&th, &h, &adm, &h.order[at - 1].hex(), path, quick) {
+            Some(v) => {
+                assert_eq!(v, expect(&h, at, path), "{path} at snapshot {at} of {}: the whole history or nothing", 2 * n);
+                whole += 1;
+            }
+            None => warming += 1,
+        }
+    }
+    th.rt.block_on(fill).unwrap().expect("the file history of the second push");
+    println!("BUG-1954: during the fill, {asks} asks: {whole} whole histories, {warming} warming");
+    assert!(warming > 0, "the tip waited for its file history at least once");
+    for path in ["pub/a.txt", "fin/b.txt"] {
+        assert_eq!(whole_history(&th, &h, &adm, &tip2.hex(), path, quick), Some(expect(&h, 2 * n, path)), "{path} at the tip, once written");
+    }
+    assert_eq!(rows_with_files(&th, &h, &adm_viewer), 2 * n as i64, "every row of the admins' graph is marked");
+}

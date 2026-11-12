@@ -205,27 +205,33 @@ fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
     let db = hub.hub().db.clone();
     let run = run_id();
     let branch = format!("speed-{run}");
-    // YugabyteDB may ask a transaction that read after other transactions'
-    // writes to start again ("Restart read required"); the server's own
-    // picks are single statements, which the database then runs again by
-    // itself. Here the whole transaction is run again.
+    // YugabyteDB may ask a snapshot transaction that read after other
+    // transactions' writes to start again ("Restart read required"); the
+    // server's own picks are single statements, which the database then runs
+    // again by itself. This transaction of 41,000 rows met that on every one
+    // of eight tries beside other tests (BUG-1957), so it is serializable
+    // (YugabyteDB reads such a transaction at the latest time, under locks:
+    // it has no read restarts; PostgreSQL answers it the same), and a try
+    // that loses a race anyway is run again after a jittered wait, up to a
+    // deadline. Every statement's error goes to that retry, the inserts'
+    // too; what is checked is checked on every try.
     hub.rt.block_on(async {
-      let mut attempts = 0;
+      let mut attempts = 0u32;
+      let deadline = Instant::now() + Duration::from_secs(300);
       loop {
         attempts += 1;
         let done: veil_server::error::Result<()> = async {
         // Everything in one transaction that is rolled back: no landing
         // service sees these rows.
-        let mut tx = db.begin().await.unwrap();
+        let mut tx = db.begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE").await?;
         let people: Vec<i64> = sqlx::query_scalar("INSERT INTO people (name, created_at) SELECT $1 || g, 0 FROM generate_series(1, 301) g RETURNING id")
             .bind(format!("speed-{run}-"))
             .fetch_all(&mut *tx)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(people.len(), 301);
         let (flooder, people) = (people[300], &people[..300]);
         // (person, session, created_at, priority)
-        async fn insert(tx: &mut sqlx::PgConnection, project: i64, branch: &str, run: &str, rows: &[(i64, String, i64, i32)]) -> Vec<i64> {
+        async fn insert(tx: &mut sqlx::PgConnection, project: i64, branch: &str, run: &str, rows: &[(i64, String, i64, i32)]) -> veil_server::error::Result<Vec<i64>> {
             let seqs: Vec<i64> = sqlx::query_scalar(
                 "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, project_epoch, \
                  state, created_at, priority) \
@@ -240,10 +246,9 @@ fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
             .bind(rows.iter().map(|r| r.2).collect::<Vec<_>>())
             .bind(rows.iter().map(|r| r.3).collect::<Vec<_>>())
             .fetch_all(&mut *tx)
-            .await
-            .unwrap();
+            .await?;
             assert_eq!(seqs.len(), rows.len());
-            seqs
+            Ok(seqs)
         }
         // 20,000 landings of 300 people in turn; every other person's are
         // from three agent sessions, the others' from their own.
@@ -256,7 +261,7 @@ fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
                 })
                 .collect()
         };
-        insert(&mut tx, pid, &branch, &run, &many(0, 20_000)).await;
+        insert(&mut tx, pid, &branch, &run, &many(0, 20_000)).await?;
         let none = HashSet::new();
         let before = rows_fetched(&mut tx).await;
         let picked = pick_batch(&mut tx, pid, &branch, &none, 64).await?;
@@ -271,9 +276,9 @@ fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
         // after another) and three of the server's reverts. Some of the
         // first rows are being committed (left out).
         let flood: Vec<(i64, String, i64, i32)> = (0..1_000).map(|i| (flooder, format!("flood-{}", i / 100), i, 0)).collect();
-        let flood_seqs = insert(&mut tx, pid, &branch, &run, &flood).await;
+        let flood_seqs = insert(&mut tx, pid, &branch, &run, &flood).await?;
         let reverts: Vec<(i64, String, i64, i32)> = (0..3).map(|i| (people[7], String::new(), 5_000_000 + i, 1)).collect();
-        let revert_seqs = insert(&mut tx, pid, &branch, &run, &reverts).await;
+        let revert_seqs = insert(&mut tx, pid, &branch, &run, &reverts).await?;
         let mut flood_order = flood_seqs.clone();
         flood_order.sort();
         let exclude: HashSet<i64> = flood_order[..5].iter().copied().chain([*revert_seqs.iter().min().unwrap()]).collect();
@@ -299,20 +304,25 @@ fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
         assert!(fetched <= 3_000, "the database fetched {fetched} rows of the queue to choose 64 of 21,000 behind a flood");
 
         // Twice the queue: the same batch from the same reading.
-        insert(&mut tx, pid, &branch, &run, &many(20_000, 20_000)).await;
+        insert(&mut tx, pid, &branch, &run, &many(20_000, 20_000)).await?;
         let before = rows_fetched(&mut tx).await;
         let twice = pick_batch(&mut tx, pid, &branch, &exclude, 64).await?;
         let fetched_twice = rows_fetched(&mut tx).await - before;
         assert_eq!(twice.rows.iter().map(|r| r.seq).collect::<Vec<_>>(), picked_seqs);
         assert_eq!((twice.statements, twice.read), (behind_flood.statements, behind_flood.read));
         assert!(fetched_twice <= 3_000, "the database fetched {fetched_twice} rows of the queue to choose 64 of 41,000");
-        tx.rollback().await.unwrap();
+        tx.rollback().await?;
         Ok(())
         }
         .await;
         match done {
             Ok(()) => break,
-            Err(e) if e.is_retryable() && attempts < 8 => continue,
+            Err(e) if e.is_retryable() && Instant::now() < deadline => {
+                println!("BUG-1957: try {attempts} lost a race, run again: {e:?}");
+                let cap = 50u64 << attempts.min(5);
+                let jitter = u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % cap;
+                tokio::time::sleep(Duration::from_millis(cap / 2 + jitter)).await;
+            }
             Err(e) => panic!("choosing a batch failed (attempt {attempts}): {e:?}"),
         }
       }
