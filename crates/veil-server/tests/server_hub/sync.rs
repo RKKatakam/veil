@@ -91,7 +91,8 @@ fn a_one_directory_clone_killed_during_its_checkout_is_finished() {
 /// again in a few seconds", as
 /// `a_one_directory_clone_killed_during_its_checkout_is_finished` did under
 /// a full suite's load on YugabyteDB. Here the admins' graph is cold and
-/// another server's lease holds its fill for 8 s.
+/// its fills are held for 8 s (the file history's by another server's
+/// lease, the rows' by every slot being taken: BUG-1943).
 #[test]
 fn bug_1913_a_pull_waits_out_a_warming_server() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -119,14 +120,18 @@ fn bug_1913_a_pull_waits_out_a_warming_server() {
         std::thread::sleep(Duration::from_millis(20));
     }
     rt.block_on(async {
-        sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, 'admin', 'other-server', $2)")
-            .bind(pid)
-            .bind(veil_core::now_millis() + 600_000)
-            .execute(&db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, 'admin', 'other-server', $2) \
+             ON CONFLICT (project_id, view_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at",
+        )
+        .bind(pid)
+        .bind(veil_core::now_millis() + 600_000)
+        .execute(&db)
+        .await
+        .unwrap();
         sqlx::query("DELETE FROM view_graph WHERE project_id = $1").bind(pid).execute(&db).await.unwrap();
     });
+    let busy = rt.block_on(hub.hub().query.hold_row_fills());
     hub.hub().query.rows.clear();
     // The page the pull will ask for is answered `warming` now.
     let (auth, format) = (format!("Bearer {token}"), veil_core::repo::REPO_FORMAT.to_string());
@@ -144,6 +149,7 @@ fn bug_1913_a_pull_waits_out_a_warming_server() {
             std::thread::sleep(Duration::from_secs(8));
             released.store(true, Ordering::SeqCst);
             rt.block_on(sqlx::query("DELETE FROM view_fills WHERE project_id = $1 AND holder = 'other-server'").bind(pid).execute(&db)).unwrap();
+            drop(busy);
         });
         p.admin.run(&p.dir, &["pull"])
     });

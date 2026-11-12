@@ -465,8 +465,8 @@ fn fresh_rows_keep_embargo_lines_hidden_revisions_and_a_narrowing() {
     }
 }
 
-/// A query that gives up waiting for a fill says how far the fill is (the
-/// viewer's own snapshots projected and written so far), so a client that
+/// A query that gives up waiting for a fill says how far the fill is (its
+/// steps over the viewer's own history so far), so a client that
 /// asks again sees the server getting on (`vl` waits on while the number
 /// grows): the numbers never go back, and they grow.
 #[test]
@@ -487,7 +487,7 @@ fn warming_says_how_far_the_fill_is() {
             Err(Error::Api { code: "warming", message, .. }) => {
                 let n = message
                     .strip_prefix("this history is being prepared for you (")
-                    .and_then(|m| m.strip_suffix(" snapshots so far); try again in a few seconds"))
+                    .and_then(|m| m.strip_suffix(" steps so far); try again in a few seconds"))
                     .and_then(|n| n.parse::<u64>().ok())
                     .unwrap_or_else(|| panic!("a `warming` answer without the fill's progress: {message}"));
                 seen.push(n);
@@ -501,4 +501,100 @@ fn warming_says_how_far_the_fill_is() {
     assert!(seen.windows(2).all(|w| w[0] <= w[1]), "the progress went back: {seen:?}");
     assert!(seen.last() > seen.first(), "the progress never grew: {seen:?}");
     assert!(th.rt.block_on(query::log(&h.hub, &a, LogParams::default(), Limits::default())).is_ok());
+}
+
+/// BUG-1943 through `vl`: a project pushed a moment ago (forty changes in
+/// one push) is filled by the push itself, with nobody asking: its admins'
+/// rows are there within seconds. The default clone (a thin one, which
+/// asks the query API for the tip's generation) works at once and holds
+/// the files; the first `vl pull` after another push, in a full clone
+/// (which asks for the history of the tip it had: a page start), works at
+/// once too; neither ever met `warming`.
+#[test]
+fn bug_1943_a_project_pushed_with_vl_is_cloned_and_pulled_at_once() {
+    let hub = TestHub::start();
+    let admin = hub.person("admin");
+    let name = unique("warm");
+    let dir = admin.dir("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    admin.ok(&dir, &["init"]);
+    admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+    for i in 0..40 {
+        write_files(&dir, &[("src/lib.rs", &format!("fn lib() {{ {i} }}\n")), (&format!("docs/page-{}.md", i % 7), &format!("# page, edit {i}\n"))]);
+        admin.commit_main(&dir, &format!("commit {i}"));
+    }
+    admin.ok(&dir, &["push"]);
+    // Filled by the push: the tip's row, without one query.
+    let h = hub.hub();
+    let (project, tip): (i64, String) = hub.rt.block_on(again(|| {
+        sqlx::query_as("SELECT p.id, b.target FROM projects p JOIN branches b ON b.project_id = p.id AND b.name = 'main' WHERE p.name = $1")
+            .bind(&name)
+            .fetch_one(&h.db)
+    }));
+    let t = Instant::now();
+    loop {
+        let rows: i64 = hub.rt.block_on(again(|| {
+            sqlx::query_scalar("SELECT count(*) FROM view_graph WHERE project_id = $1 AND view_key = 'admin' AND snapshot = $2")
+                .bind(project)
+                .bind(&tip)
+                .fetch_one(&h.db)
+        }));
+        if rows == 1 {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(60), "the push of 40 changes did not fill its admins' graph");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!("BUG-1943: the push's rows were there {:?} after it", t.elapsed());
+    let t = Instant::now();
+    let thin = admin.dir("thin");
+    let out = admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
+    let took = t.elapsed();
+    assert!(out.contains("thin") && !out.contains("warming") && !out.contains("being prepared"), "{out}");
+    assert_eq!(std::fs::read_to_string(thin.join("src/lib.rs")).unwrap(), "fn lib() { 39 }\n");
+    assert!(took < Duration::from_secs(30), "the default clone of 40 changes took {took:?}");
+    let log = admin.ok(&thin, &["log", "-n", "3"]);
+    assert!(log.contains("commit 39") && !log.contains("being prepared"), "{log}");
+    // A full clone, then one more change pushed: its first pull.
+    let full = admin.dir("full");
+    admin.ok(admin.home.path(), &["clone", "--full", &hub.url(&name), full.to_str().unwrap()]);
+    write_files(&dir, &[("src/lib.rs", "fn lib() { 40 }\n")]);
+    admin.commit_main(&dir, "commit 40");
+    admin.ok(&dir, &["push"]);
+    let t = Instant::now();
+    let out = admin.ok(&full, &["pull"]);
+    let took = t.elapsed();
+    assert!(!out.contains("warming") && !out.contains("being prepared"), "{out}");
+    assert!(took < Duration::from_secs(30), "the first pull took {took:?}");
+    assert!(admin.ok(&full, &["log", "-n", "2"]).contains("commit 40"));
+}
+
+/// A clone that fails after it fetched (here: a folder to keep that the
+/// project does not have; BUG-1943's failed at the same step, when the
+/// server kept answering `warming`) leaves no directory behind that looks
+/// like a clone: the one it made is removed, one that was there is empty.
+#[test]
+fn a_failed_clone_leaves_no_directory_that_looks_usable() {
+    let hub = TestHub::start();
+    let admin = hub.person("admin");
+    let name = unique("warm");
+    let dir = admin.dir("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    admin.ok(&dir, &["init"]);
+    admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+    write_files(&dir, &[("src/lib.rs", "fn lib() {}\n")]);
+    admin.commit_main(&dir, "first");
+    admin.ok(&dir, &["push"]);
+    let made = admin.dir("made");
+    let out = admin.fails(admin.home.path(), &["clone", "--only", "no-such-folder", &hub.url(&name), made.to_str().unwrap()]);
+    assert!(out.contains("no directory 'no-such-folder' that you can see in this project"), "{out}");
+    assert!(!made.exists(), "a failed clone left {}", made.display());
+    let was_there = admin.dir("was-there");
+    std::fs::create_dir_all(&was_there).unwrap();
+    let out = admin.fails(admin.home.path(), &["clone", "--only", "no-such-folder", &hub.url(&name), was_there.to_str().unwrap()]);
+    assert!(out.contains("no directory 'no-such-folder'"), "{out}");
+    assert_eq!(std::fs::read_dir(&was_there).unwrap().count(), 0, "a failed clone left files in {}", was_there.display());
+    // And the same place takes a clone that works.
+    admin.ok(admin.home.path(), &["clone", &hub.url(&name), was_there.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(was_there.join("src/lib.rs")).unwrap(), "fn lib() {}\n");
 }

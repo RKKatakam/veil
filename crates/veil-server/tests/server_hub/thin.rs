@@ -2157,7 +2157,9 @@ fn s16_unreachable_or_warming_server_is_reported_clearly() {
     admin.ok(admin.home.path(), &["clone", &hub.url(&name), thin.to_str().unwrap()]);
 
     // 1. Server answers `503 warming` when the viewer graph is cleared and
-    // synchronous derivation is held back by an active lease in `view_fills`.
+    // its fills are held back: the file history's by an active lease in
+    // `view_fills`, the rows' by every slot being taken (BUG-1943: the rows
+    // are filled apart, under no lease).
     let pid: i64 = hub.rt.block_on(async {
         sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
             .bind(&name)
@@ -2167,13 +2169,17 @@ fn s16_unreachable_or_warming_server_is_reported_clearly() {
     });
     hub.rt.block_on(async {
         sqlx::query("DELETE FROM view_graph WHERE project_id = $1").bind(pid).execute(&hub.hub().db).await.unwrap();
-        sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, 'admin', 'other-server', $2)")
-            .bind(pid)
-            .bind(veil_core::now_millis() + 600_000)
-            .execute(&hub.hub().db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, 'admin', 'other-server', $2) \
+             ON CONFLICT (project_id, view_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at",
+        )
+        .bind(pid)
+        .bind(veil_core::now_millis() + 600_000)
+        .execute(&hub.hub().db)
+        .await
+        .unwrap();
     });
+    let _busy = hub.rt.block_on(hub.hub().query.hold_row_fills());
     hub.hub().query.rows.clear();
 
     let warming_cmds: &[&[&str]] = &[

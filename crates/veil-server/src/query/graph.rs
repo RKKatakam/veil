@@ -671,10 +671,10 @@ pub async fn read_ahead(hub: &Arc<Hub>, project: i64, snapshots: Vec<ObjectId>) 
     }
 }
 
-/// How far a fill is: the projections it memoised and the rows it wrote
-/// (a number of the viewer's own snapshots, nothing else). A query that
-/// gives up waiting for the fill answers it ([`warming`]): a client waits
-/// on while it grows.
+/// How far a fill is: the projections it memoised, the snapshots it read
+/// on its way down and the rows it wrote (steps over the viewer's own
+/// history, nothing else). A query that gives up waiting for the fill
+/// answers it ([`warming`]): a client waits on while it grows.
 pub type Progress = Arc<std::sync::atomic::AtomicU64>;
 
 tokio::task_local! {
@@ -815,6 +815,9 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
     fn reading(&self, x: &ObjectId) -> Result<Arc<Snapshot>> {
         if !self.files {
             self.g.cx.hub().query.fill_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(p) = &self.progress {
+            p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.g.snapshot(x)
     }
@@ -1252,6 +1255,14 @@ impl State {
     pub fn file_fills_started(&self, project: i64) -> u64 {
         self.started.lock().unwrap().get(&project).map_or(0, |s| s.1)
     }
+
+    /// Take every slot of the rows' fills until the permit is dropped: no
+    /// such fill walks here meanwhile, as on a server whose fills are all
+    /// busy (the tests make a server answer `warming` this way: the rows'
+    /// fills take no lease another server could be shown to hold).
+    pub async fn hold_row_fills(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.row_slots.clone().acquire_many_owned(MAX_FILLS as u32).await.expect("the semaphore is never closed")
+    }
 }
 
 /// A query whose viewer's graph is being filled: the fill goes on in the
@@ -1265,14 +1276,14 @@ pub fn warming() -> Error {
 }
 
 /// [`warming`], from a query that waited for a fill that has come as far
-/// as `progress` (a count of the viewer's own snapshots: [`Progress`]).
+/// as `progress` (steps over the viewer's own history: [`Progress`]).
 /// The number is in the message, so a client that asks again sees whether
 /// the server is getting on (`vl` waits on while it changes, BUG-1943).
 fn warming_at(progress: u64) -> Error {
     Error::new(
         StatusCode::SERVICE_UNAVAILABLE,
         "warming",
-        format!("this history is being prepared for you ({progress} snapshots so far); try again in a few seconds"),
+        format!("this history is being prepared for you ({progress} steps so far); try again in a few seconds"),
     )
 }
 

@@ -42,11 +42,12 @@ pub(crate) fn ask(th: &TestHub, h: &Hist, viewer: &Viewer) -> Ask {
     }
 }
 
-/// Fill `viewer`'s graph of `h` up to its branches (as a landing does), so
-/// that no query of the test meets a first fill.
+/// Fill `viewer`'s graph of `h` up to its branches (as a landing does: its
+/// rows and their file history), so that no query of the test meets a
+/// first fill. (`warm.rs` has the queries of rows without file history.)
 pub(crate) fn warm_up(th: &TestHub, h: &Hist, viewer: &Viewer) {
     let tips: Vec<ObjectId> = h.branches.values().copied().collect();
-    th.rt.block_on(query::graph::ensure(&h.hub, &h.project(th), viewer, &tips, None)).unwrap();
+    th.rt.block_on(query::graph::ensure_files(&h.hub, &h.project(th), viewer, &tips, None)).unwrap();
 }
 
 pub(crate) fn admin() -> Viewer {
@@ -2167,7 +2168,9 @@ fn s3rd2_resolve_answers_alike_whatever_hidden_history_it_meets() {
             .await
             .unwrap();
         assert_eq!(n, 0, "no fill projected the first version for the viewer");
-        // Another fill of the viewer's graph is running, in both projects.
+        // Another fill of the viewer's graph is running, in both projects
+        // (and, below, every fill of rows on this server is busy: a
+        // resolve that waited for a fill would answer `warming`).
         for (pid, key) in [(a.id, vka.clone()), (b.id, vk.clone())] {
             sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, $2, 'another-server', $3)")
                 .bind(pid)
@@ -2178,6 +2181,7 @@ fn s3rd2_resolve_answers_alike_whatever_hidden_history_it_meets() {
                 .unwrap();
         }
     });
+    let _busy = th.rt.block_on(hub.query.hold_row_fills());
     let prefix = veil_core::ChangeId(change).display()[..4].to_string();
     let once = |h: &Hist, x: &Ask| th.rt.block_on(async { norm(query::resolve_prefix(&h.hub, x, &prefix, &[], Limits::default()).await) });
     let without = once(&a, &xa);
