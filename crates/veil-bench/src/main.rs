@@ -203,6 +203,17 @@ enum Cmd {
         /// Results JSON (a Markdown table is written beside it).
         #[arg(long)]
         out: PathBuf,
+        /// `main` is a protected branch whose `[review]` rules ask for 0
+        /// approvals (the review checks of the landing path run).
+        #[arg(long)]
+        protected: bool,
+        /// `landing`: 3 % of the changes overlap another's and merge, 2 %
+        /// conflict (else every change is a new file of the agent's own).
+        #[arg(long)]
+        mix: bool,
+        /// `branches`: land the agent's branch on `main` after every N pushes.
+        #[arg(long, default_value_t = 0)]
+        merge_every: u64,
     },
     /// Generate a repository (and keep it).
     Gen(GenArgs),
@@ -353,6 +364,9 @@ fn main() -> Result<()> {
             via,
             dir,
             out,
+            protected,
+            mix,
+            merge_every,
         } => {
             let mode = match mode.as_str() {
                 "pull" => load::Mode::Pull,
@@ -392,6 +406,9 @@ fn main() -> Result<()> {
                 flood,
                 db_container,
                 vias,
+                protected,
+                mix,
+                merge_every,
             })?;
             std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
             let md = load::markdown(&v)?;

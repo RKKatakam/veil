@@ -183,7 +183,25 @@ pub struct Args {
     /// `objects`: read through a regional cache (`true`) or the server, one
     /// set of curves each.
     pub vias: Vec<bool>,
+    /// `main` is a protected branch (`.veilrules`), with every `[review]`
+    /// rule at 0 approvals: the landing path's review checks run, and no
+    /// PR is needed.
+    pub protected: bool,
+    /// `landing`: 3 % of the changes edit one line of a shared file that
+    /// others edit meanwhile (read at the tip, landed on it), and 2 %
+    /// write a hot file on the agent's last landing (a conflict whenever
+    /// someone wrote it since); the rest touch nothing shared.
+    pub mix: bool,
+    /// `branches`: after every this many pushes, the agent lands its branch
+    /// on `main` through the landing service (0: never).
+    pub merge_every: u64,
 }
+
+/// `--mix`: the shared files (`w/shared/sN`) and each one's slots (a line
+/// an agent owns, then three that nobody changes), and the hot files.
+const MIX_SHARED: usize = 4;
+const MIX_SLOTS: usize = 2_560;
+const MIX_HOT: usize = 16;
 
 // ---- the HTTP client ------------------------------------------------------------------------
 
@@ -302,6 +320,8 @@ struct Counters {
     ops: AtomicU64,
     collisions: AtomicU64,
     busy: AtomicU64,
+    /// Branches landed on `main` (`--merge-every`).
+    merges: AtomicU64,
     errors: AtomicU64,
     requests: AtomicU64,
     /// Landings that were up to date (pull mode: nothing to fetch).
@@ -345,6 +365,8 @@ struct Agent<'a> {
     c: &'a Counters,
     /// `objects` through a regional cache: its API.
     objects: Option<Api>,
+    mix: bool,
+    merge_every: u64,
 }
 
 impl Agent<'_> {
@@ -570,6 +592,18 @@ impl Agent<'_> {
                             self.pull()?;
                         }
                     }
+                    // `--merge-every`: the branch lands on `main` (what of it
+                    // has not landed yet), through the landing service.
+                    if self.merge_every > 0 && self.branch != "main" && self.files % self.merge_every == 0 {
+                        self.c.requests.fetch_add(1, Ordering::Relaxed);
+                        let r = self.api.post_json(Some(self.token), &self.path("/land"), &json!({"onto": "main", "snapshot": snap.hex()}))?;
+                        ok(&r, "land the branch")?;
+                        let v: serde_json::Value = serde_json::from_slice(&r.body)?;
+                        if v["state"].as_str() != Some("landed") {
+                            bail!("the branch did not land on main: {v}");
+                        }
+                        self.c.count(&self.c.merges, 1);
+                    }
                     return Ok(collisions);
                 }
                 409 => {
@@ -705,15 +739,23 @@ impl Agent<'_> {
         let mut collisions = 0;
         let mut attempt = 0u32;
         self.files += 1;
-        let path = format!("{}/f{:06}", self.dir.join("/"), self.files);
+        let mut path = format!("{}/f{:06}", self.dir.join("/"), self.files);
+        let mut text = format!("agent file {} of {}\n", self.files, self.dir.join("/"));
+        // `--mix`: 3 in 100 of an agent's changes are an overlap, 2 a conflict.
+        let me: usize = self.dir.last().and_then(|d| d[1..].parse().ok()).unwrap_or(0);
+        let kind = if self.mix { (self.files as usize + me) % 100 } else { 100 };
+        if (3..5).contains(&kind) {
+            path = format!("w/hot/c{:02}", (self.files as usize / 100 + me) % MIX_HOT);
+        }
         loop {
             attempt += 1;
             if Instant::now() > deadline {
                 bail!("no landing within the deadline after {collisions} collisions");
             }
             let base = match self.clone.tip {
-                Some((t, _)) => t,
-                None => {
+                // An overlap is always made on the tip, read just before.
+                Some((t, _)) if kind >= 3 => t,
+                _ => {
                     self.c.requests.fetch_add(1, Ordering::Relaxed);
                     let r = self.api.get(self.token, &self.path("/tips"))?;
                     ok(&r, "tips")?;
@@ -721,9 +763,21 @@ impl Agent<'_> {
                     *tips.branches.get("main").ok_or_else(|| anyhow!("no main"))?
                 }
             };
+            if kind < 3 {
+                // The shared file as the tip has it, with this agent's line changed.
+                path = format!("w/shared/s{}", me % MIX_SHARED);
+                self.c.requests.fetch_add(1, Ordering::Relaxed);
+                let r = self.api.get(self.token, &self.path(&format!("/q/file?rev={}&path={path}", base.hex())))?;
+                ok(&r, "read the shared file")?;
+                let mine = format!("slot {:05} ", (me / MIX_SHARED) % MIX_SLOTS);
+                text = String::from_utf8(r.body)?
+                    .split_inclusive('\n')
+                    .map(|l| if l.starts_with(&mine) { format!("{mine}{} {}\n", me, self.files) } else { l.to_string() })
+                    .collect();
+            }
             self.c.requests.fetch_add(1, Ordering::Relaxed);
             let req = json!({"onto": "main", "base": base.hex(), "description": format!("land {}", self.files),
-                "edits": [{"path": path, "put": {"text": format!("agent file {} of {}\n", self.files, self.dir.join("/"))}}]});
+                "edits": [{"path": path, "put": {"text": text}}]});
             let r = self.api.post_json(Some(self.token), &self.path("/land"), &req)?;
             if r.status == 503 {
                 self.c.count(&self.c.busy, 1);
@@ -955,7 +1009,7 @@ fn unique(prefix: &str) -> String {
 /// Create a project as `admin`: group `agents` (with `agent`), the policy
 /// `w/  agents`, and a first snapshot, with `seed` files of 4 KiB in
 /// `w/seed/`.
-fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, seed: usize) -> Result<String> {
+fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, seed: usize, protected: bool, mix: bool) -> Result<String> {
     let name = unique("load-");
     ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}"), &json!({}))?, "create project")?;
     ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}/groups/agents"), &json!({}))?, "create group")?;
@@ -993,8 +1047,26 @@ fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, s
         let st = put(Object::Tree(st));
         w.insert(TreeEntry::dir("seed", st));
     }
+    if mix {
+        let body: String = (0..MIX_SLOTS).map(|j| format!("slot {j:05} 0\n-\n-\n-\n")).collect();
+        let mut st = Tree::default();
+        for i in 0..MIX_SHARED {
+            let b = format!("shared file {i}\n-\n{body}").into_bytes();
+            let size = b.len() as u64;
+            let id = put(Object::Blob(b));
+            st.insert(file(&format!("s{i}"), id, size));
+        }
+        let st = put(Object::Tree(st));
+        w.insert(TreeEntry::dir("shared", st));
+    }
     let w = put(Object::Tree(w));
     let mut root = Tree::default();
+    if protected {
+        let rules = b"[branches.main]\nprotected = true\n\n[review]\nlow = { approvals = 0 }\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n".to_vec();
+        let size = rules.len() as u64;
+        let id = put(Object::Blob(rules));
+        root.insert(file(".veilrules", id, size));
+    }
     root.insert(file(".veilpolicy", policy, pl));
     root.insert(TreeEntry::dir("w", w));
     let root = put(Object::Tree(root));
@@ -1067,7 +1139,7 @@ type Schedule = Arc<Mutex<mpsc::Receiver<Instant>>>;
 fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, cache: Option<&crate::server::CacheProc>) -> Result<serde_json::Value> {
     let setup = Api::new(cx.base, cx.ca)?;
     let seed = if a.mode == Mode::Objects { SEED_FILES } else { 0 };
-    let names: Vec<String> = (0..projects).map(|_| create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, seed)).collect::<Result<_>>()?;
+    let names: Vec<String> = (0..projects).map(|_| create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, seed, a.protected, a.mix)).collect::<Result<_>>()?;
     let cache_ca = cache.map(|c| std::fs::read_to_string(&c.cert)).transpose()?;
     let c = Counters::default();
     let bg = Counters::default();
@@ -1076,7 +1148,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
     let landers = if matches!(a.mode, Mode::Pull | Mode::Objects) && a.background > 0.0 { projects } else { 0 };
     // The flooded project beside the measured ones (S24).
     let flood = if a.mode == Mode::Pull { a.flood } else { 0 };
-    let flooded = if flood > 0 { Some(create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, seed)?) } else { None };
+    let flooded = if flood > 0 { Some(create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, seed, false, false)?) } else { None };
     let fl = Counters::default();
     let ready = Barrier::new(clients + landers + flood + 1);
     // Open loop: scheduled landings, one queue per project.
@@ -1107,6 +1179,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                         clone: Held::default(),
                         files: 0,
                         c,
+                        mix: a.mix,
+                        merge_every: a.merge_every,
                         objects: match (cache, cache_ca) {
                             (Some(k), Some(ca)) => match Api::new(&k.https(), Some(ca)) {
                                 Ok(api) => Some(api),
@@ -1195,6 +1269,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                         files: 0,
                         c: bg,
                         objects: None,
+                        mix: false,
+                        merge_every: 0,
                     },
                     Err(e) => {
                         bg.error(&e);
@@ -1236,6 +1312,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                         files: 0,
                         c: fl,
                         objects: None,
+                        mix: false,
+                        merge_every: 0,
                     },
                     Err(e) => {
                         fl.error(&e);
@@ -1374,6 +1452,9 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "background_landings": bg.ops.load(Ordering::Relaxed),
             "background_errors": bg.errors.load(Ordering::Relaxed),
         });
+        result["protected"] = json!(a.protected);
+        result["mix"] = json!(a.mix);
+        result["branch_merges"] = json!(c.merges.load(Ordering::Relaxed));
         // The landing service's own counters (the server this tool started).
         let ratio = |a: Option<f64>, b: Option<f64>, k: f64| a.zip(b).map(|(a, b)| if b > 0.0 { a / b / k } else { f64::NAN });
         result["landing_batches"] = json!(stat("landing_batches"));

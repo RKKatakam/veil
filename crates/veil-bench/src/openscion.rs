@@ -116,6 +116,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
     let tag = server.pid();
     run(vl(&a.dir).args(["login", &hub, "--name", &format!("bench{tag}"), "--ca"]).arg(&server.cert))?;
     let (mut cases, mut bytes) = (Vec::new(), Vec::new());
+    let mut kept: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
     for &files in &a.sizes {
         let name = format!("os{files}-{tag}");
         let src = a.dir.join(format!("src-{files}"));
@@ -182,6 +183,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
                 bail!("vl clone --only wrote {files_out} files, not 100");
             }
         }
+        kept.push((files, proj.clone(), gorigin.clone()));
         eprintln!("{files} files, server bytes: {push_io}");
         push_io["files"] = json!(files);
         bytes.push(push_io);
@@ -198,7 +200,44 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
             }));
         }
     }
-    Ok(json!({ "profile": "openscion", "objects": if a.server.s3_endpoint.is_some() { "s3" } else { "directory" }, "cases": cases, "bytes": bytes }))
+    // The G2 gate's extra cases (no OpenScion targets), after everything
+    // above so that those numbers are measured as before: `status` and
+    // `log -n 20` beside Git, with the Veil daemon as the cases above left
+    // it (it starts on demand, and its file watcher, S7, spares `vl` the
+    // scan); then `vl daemon stop`, and status and the same commit by a scan.
+    let daemon = vl(&a.dir).args(["daemon", "status"]).output()?;
+    let daemon = String::from_utf8_lossy(&daemon.stdout).lines().next().unwrap_or("").to_string();
+    eprintln!("the Veil daemon during the cases above: {daemon}");
+    let mut extra = |files: usize, case: &str, v: Vec<f64>, g: Vec<f64>| {
+        let (v, g) = (median(v), median(g));
+        cases.push(json!({ "files": files, "case": case, "veil_ms": v, "git_ms": g, "target_ms": null, "meets_target": null, "beats_git": v <= g, "runs": a.runs }));
+    };
+    for (files, proj, gorigin) in &kept {
+        let (mut vs, mut gs, mut vlog, mut glog) = (vec![], vec![], vec![], vec![]);
+        for _ in 0..a.runs {
+            vs.push(time(vl(proj).args(["status"]))?);
+            gs.push(time(git(gorigin).args(["status"]))?);
+            vlog.push(time(vl(proj).args(["log", "-n", "20"]))?);
+            glog.push(time(git(gorigin).args(["log", "-n", "20"]))?);
+        }
+        extra(*files, "status, clean (daemon as above)", vs, gs);
+        extra(*files, "log -n 20", vlog, glog);
+    }
+    run(vl(&a.dir).args(["daemon", "stop"]))?;
+    for (files, proj, gorigin) in &kept {
+        let (mut vs, mut gs, mut vc, mut gc) = (vec![], vec![], vec![], vec![]);
+        for r in 0..a.runs {
+            vs.push(time(vl(proj).args(["status"]))?);
+            gs.push(time(git(gorigin).args(["status"]))?);
+            std::fs::write(proj.join("d001/f001.txt"), format!("scan {r}\n"))?;
+            vc.push(time(vl(proj).args(["commit", "-m", &format!("scan {r}")]))?);
+            std::fs::write(gorigin.join("d001/f001.txt"), format!("scan {r}\n"))?;
+            gc.push(time(git(gorigin).args(["commit", "-qam", &format!("scan {r}")]))?);
+        }
+        extra(*files, "status, clean (daemon stopped: a scan)", vs, gs);
+        extra(*files, "commit one changed file (daemon stopped: a scan)", vc, gc);
+    }
+    Ok(json!({ "profile": "openscion", "objects": if a.server.s3_endpoint.is_some() { "s3" } else { "directory" }, "daemon": daemon, "cases": cases, "bytes": bytes }))
 }
 
 /// The workloads measured as OpenScion measures its own numbers
@@ -341,7 +380,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             c["veil_ms"].as_f64().unwrap_or(f64::NAN),
             c["git_ms"].as_f64().unwrap_or(f64::NAN),
             c["target_ms"],
-            if c["meets_target"] == json!(true) { "yes" } else { "no" },
+            if c["meets_target"] == json!(true) { "yes" } else if c["meets_target"].is_null() { "—" } else { "no" },
             if c["beats_git"] == json!(true) { "yes" } else { "no" },
         ));
     }
