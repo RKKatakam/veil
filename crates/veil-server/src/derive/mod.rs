@@ -1220,6 +1220,18 @@ fn cache_derive_rows(hub: &Hub, project: i64, w: &Writes) {
 /// queued here and run in the background (`query::graph::prefill`). Only
 /// the branches named (a landing's) are touched (BUG-870).
 pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> Result<()> {
+    fill_tips(hub, project_id, branches, false).await
+}
+
+/// [`memo_tips`], each view key's rows first (`query::graph::prefill_rows`):
+/// what a push of many snapshots runs at once, beside the derived data and
+/// not after it (BUG-1943). The rows cost a read of each new snapshot; the
+/// file history, queued behind them, a diff of each.
+pub async fn rows_of_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> Result<()> {
+    fill_tips(hub, project_id, branches, true).await
+}
+
+async fn fill_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String], rows_first: bool) -> Result<()> {
     let Some((project, viewers)) = viewers_of(hub, project_id).await? else { return Ok(()) };
     let branches: Vec<String> =
         sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = ANY($2) AND hidden_for_embargo IS NULL")
@@ -1237,9 +1249,14 @@ pub async fn memo_tips(hub: &Arc<Hub>, project_id: i64, branches: &[String]) -> 
         }
         // Queue the fill that memoises the projections and extends the
         // viewer's graph (`query::graph::prefill`: the one fill of this
-        // view key, which a query that needs it joins). Never waited for
-        // here: the deriver holds nothing while fills run (BUG-911).
-        if let Err(e) = crate::query::graph::prefill(hub, &project, &v, &tips).await {
+        // view key's file history, with the rows it finds missing; or,
+        // rows first, the two fills one after the other). Never waited
+        // for here: the deriver holds nothing while fills run (BUG-911).
+        let queued = match rows_first {
+            true => crate::query::graph::prefill_rows(hub, &project, &v, &tips).await,
+            false => crate::query::graph::prefill(hub, &project, &v, &tips).await,
+        };
+        if let Err(e) = queued {
             if failed.is_ok() {
                 failed = Err(e);
             }

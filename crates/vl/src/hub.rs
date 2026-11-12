@@ -302,10 +302,82 @@ pub struct Client {
 }
 
 /// How often, how long each time and how long in all [`Client::send`]
-/// waits out a server's `retry_after_ms` (BUG-1331) or `warming` (BUG-1913).
+/// waits out a server's `retry_after_ms` (BUG-1331) or `warming` (BUG-1913):
+/// for `warming`, counted anew each time the server's answer shows that it
+/// got on ([`Waits`], BUG-1943).
 const RETRIES: u32 = 8;
 const RETRY_WAIT: Duration = Duration::from_secs(30);
 const RETRY_FOR: Duration = Duration::from_secs(120);
+
+/// One request's waits for a server that says to come back
+/// ([`retry_after`]).
+///
+/// A `503 warming` answer says how far the server is with the caller's
+/// history (in its message: how many of the caller's snapshots are ready,
+/// and a token that changes while the server works on them; `veil-server`'s
+/// `query::graph`). While the answer changes from one to the next, the
+/// server is getting on, and
+/// the request is sent again for as long as it takes (BUG-1943: a clone
+/// gave up after [`RETRIES`] answers, a minute, while the server was half
+/// way through a long history). Answers that stay the same, and every
+/// other answer that asks to wait, are bounded by [`RETRIES`] and
+/// [`RETRY_FOR`] as before.
+struct Waits {
+    /// Waits since the request was first sent, or since the server last
+    /// got on.
+    tries: u32,
+    since: std::time::Instant,
+    /// The last `warming` answer.
+    warming: Option<Vec<u8>>,
+    /// When the person was last told what the request is waiting for.
+    told: Option<std::time::Instant>,
+}
+
+impl Waits {
+    fn new(now: std::time::Instant) -> Waits {
+        Waits { tries: 0, since: now, warming: None, told: None }
+    }
+
+    /// How long to wait before the request is sent again, after the answer
+    /// `status` and `body` at `now` (`jitter`: a few milliseconds more, so
+    /// that many clients do not come back at once). `None`: the answer is
+    /// the request's.
+    fn next(&mut self, status: u16, body: &[u8], jitter: u64, now: std::time::Instant) -> Option<Duration> {
+        if is_warming(status, body) {
+            if self.warming.as_deref().is_some_and(|last| last != body) {
+                self.tries = 0;
+                self.since = now;
+            }
+            self.warming = Some(body.to_vec());
+        }
+        let ms = retry_after(status, body, self.tries)?;
+        let wait = Duration::from_millis(ms.saturating_add(jitter)).min(RETRY_WAIT);
+        if self.tries >= RETRIES || now.duration_since(self.since) + wait > RETRY_FOR {
+            return None;
+        }
+        self.tries += 1;
+        Some(wait)
+    }
+
+    /// The line that tells the person what a `warming` answer makes the
+    /// request wait for: at the first one, then every ten seconds (with
+    /// the server's own words, which say how far it is).
+    fn notice(&mut self, status: u16, body: &[u8], now: std::time::Instant) -> Option<String> {
+        if !is_warming(status, body) || self.told.is_some_and(|t| now.duration_since(t) < Duration::from_secs(10)) {
+            return None;
+        }
+        self.told = Some(now);
+        let said = serde_json::from_slice::<serde_json::Value>(body).ok().and_then(|v| v["message"].as_str().map(str::to_string)).unwrap_or_default();
+        // Without "try again" (that is this wait) and the token (which
+        // only says that the server is at work).
+        let said = said.strip_suffix("; try again in a few seconds").unwrap_or(&said);
+        let said = match said.rfind(", step ") {
+            Some(at) if said.ends_with(')') => format!("{})", &said[..at]),
+            _ => said.to_string(),
+        };
+        Some(format!("waiting for the server: {}", crate::render::safe(&said)))
+    }
+}
 
 /// Is this answer `503 warming`: the server is preparing the caller's
 /// history, and the same request succeeds a little later? [`Client::send`]
@@ -444,19 +516,19 @@ impl Client {
     /// the caller's history, it answers `503 warming` (BUG-1913), on any
     /// route that reads history (a pull's `/history` among them). At most
     /// [`RETRIES`] waits of at most [`RETRY_WAIT`] each, within
-    /// [`RETRY_FOR`] in all; then the server's last answer.
+    /// [`RETRY_FOR`] in all; then the server's last answer. A `warming`
+    /// server that gets on is waited for as long as it does, and the
+    /// person is told what for, on standard error ([`Waits`], BUG-1943).
     fn send(&self, method: &str, path: &str, body: Option<(&str, Vec<u8>)>, auth: bool) -> Result<(u16, Vec<u8>)> {
-        let start = std::time::Instant::now();
-        let mut tries = 0;
+        let mut waits = Waits::new(std::time::Instant::now());
         loop {
             let (status, out) = self.send_once(method, path, body.as_ref().map(|(ct, b)| (*ct, &b[..])), auth)?;
-            let Some(ms) = retry_after(status, &out, tries) else { return Ok((status, out)) };
             let jitter = u64::from(veil_core::crypto::random_bytes::<1>()[0]);
-            let wait = Duration::from_millis(ms.saturating_add(jitter)).min(RETRY_WAIT);
-            if tries >= RETRIES || start.elapsed() + wait > RETRY_FOR {
-                return Ok((status, out));
+            let now = std::time::Instant::now();
+            let Some(wait) = waits.next(status, &out, jitter, now) else { return Ok((status, out)) };
+            if let Some(line) = waits.notice(status, &out, now) {
+                eprintln!("  {} {line}", crate::render::yellow("note:"));
             }
-            tries += 1;
             std::thread::sleep(wait);
         }
     }
@@ -2189,6 +2261,60 @@ mod tests {
     /// `retry_after_ms` (BUG-1331), on every request ([`Client::send`] asks
     /// [`retry_after`]): half a second, doubling to 8 s, or what the server
     /// says. Any other answer is the request's.
+    #[test]
+    fn bug_1943_a_warming_server_that_gets_on_is_waited_for() {
+        // As the server says it: the caller's snapshots ready so far, and a
+        // token that changes while it works (here: also while none is ready).
+        let warming = |n: u64| {
+            format!(
+                r#"{{"code":"warming","message":"this history is being prepared for you ({} snapshots ready, step {:04x}); try again in a few seconds"}}"#,
+                n.saturating_sub(250_000),
+                n % 65_521
+            )
+            .into_bytes()
+        };
+        let t0 = std::time::Instant::now();
+        // A server that gets on: every answer is waited out, however many
+        // there are and however long it takes (an hour here), each wait
+        // short again.
+        let mut w = Waits::new(t0);
+        let mut now = t0;
+        for i in 0..1_000u64 {
+            let wait = w.next(503, &warming(i * 500), 0, now).unwrap_or_else(|| panic!("gave up at answer {i} of a server getting on"));
+            assert!(wait <= Duration::from_secs(1), "answer {i}: {wait:?}");
+            now += Duration::from_millis(3_600);
+        }
+        // It stalls (the same answer): waited out as before, [`RETRIES`]
+        // times with longer and longer waits, then the answer is the
+        // request's.
+        let stalled = warming(600_000);
+        let waits: Vec<Option<Duration>> = (0..=RETRIES).map(|_| w.next(503, &stalled, 0, now)).collect();
+        assert_eq!(waits.iter().flatten().map(|d| d.as_millis()).collect::<Vec<_>>(), [500, 1000, 2000, 4000, 8000, 8000, 8000, 8000]);
+        assert_eq!(waits.last(), Some(&None), "a stalled server is given up on");
+        // A server that never says how far it is, from the first answer.
+        let mut w = Waits::new(t0);
+        let same = warming(0);
+        assert_eq!((0..20).filter(|_| w.next(503, &same, 0, t0).is_some()).count(), RETRIES as usize);
+        // Every other answer that asks to wait keeps its bounds, whatever
+        // its text: a rate limit is not progress.
+        let mut w = Waits::new(t0);
+        let limited = |n: u64| format!(r#"{{"code":"rate_limited","message":"limit {n}","retry_after_ms":1000}}"#).into_bytes();
+        assert_eq!((0..20u64).filter(|n| w.next(429, &limited(*n), 0, t0).is_some()).count(), RETRIES as usize);
+        let mut w = Waits::new(t0);
+        assert!(w.next(429, &limited(0), 0, t0 + RETRY_FOR).is_none(), "past the time for one request");
+        assert!(Waits::new(t0).next(200, b"{}", 0, t0).is_none() && Waits::new(t0).next(404, &warming(1), 0, t0).is_none());
+        // The person is told what the wait is for: at once, then every ten
+        // seconds, in the server's words.
+        let mut w = Waits::new(t0);
+        assert_eq!(
+            w.notice(503, &warming(1_500), t0).as_deref(),
+            Some("waiting for the server: this history is being prepared for you (0 snapshots ready)")
+        );
+        assert_eq!(w.notice(503, &warming(2_000), t0 + Duration::from_secs(9)), None);
+        assert!(w.notice(503, &warming(259_000), t0 + Duration::from_secs(10)).is_some_and(|l| l.ends_with("(9000 snapshots ready)")));
+        assert_eq!(w.notice(429, &limited(0), t0 + Duration::from_secs(60)), None);
+    }
+
     #[test]
     fn bug_1913_warming_is_waited_out_as_retry_after_is() {
         let warming = br#"{"code":"warming","message":"this history is being prepared for you; try again in a few seconds"}"#;

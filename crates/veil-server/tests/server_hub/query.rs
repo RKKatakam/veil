@@ -42,11 +42,12 @@ pub(crate) fn ask(th: &TestHub, h: &Hist, viewer: &Viewer) -> Ask {
     }
 }
 
-/// Fill `viewer`'s graph of `h` up to its branches (as a landing does), so
-/// that no query of the test meets a first fill.
+/// Fill `viewer`'s graph of `h` up to its branches (as a landing does: its
+/// rows and their file history), so that no query of the test meets a
+/// first fill. (`warm.rs` has the queries of rows without file history.)
 pub(crate) fn warm_up(th: &TestHub, h: &Hist, viewer: &Viewer) {
     let tips: Vec<ObjectId> = h.branches.values().copied().collect();
-    th.rt.block_on(query::graph::ensure(&h.hub, &h.project(th), viewer, &tips, None)).unwrap();
+    th.rt.block_on(query::graph::ensure_files(&h.hub, &h.project(th), viewer, &tips, None)).unwrap();
 }
 
 pub(crate) fn admin() -> Viewer {
@@ -71,7 +72,7 @@ pub(crate) fn norm(r: veil_server::error::Result<Value>) -> String {
 
 /// One query of the harness.
 #[derive(Clone, Debug)]
-enum Q {
+pub(crate) enum Q {
     Log(LogParams, Limits),
     Show(ShowParams),
     Tree(TreeParams),
@@ -114,7 +115,7 @@ where
 }
 
 /// Run `q` as `a`; a log is followed through every page (at most 60).
-fn run(th: &TestHub, h: &Hist, a: &Ask, q: &Q) -> Vec<String> {
+pub(crate) fn run(th: &TestHub, h: &Hist, a: &Ask, q: &Q) -> Vec<String> {
     let hub = h.hub.clone();
     th.rt.block_on(async {
         match q {
@@ -180,13 +181,13 @@ fn run(th: &TestHub, h: &Hist, a: &Ask, q: &Q) -> Vec<String> {
 }
 
 /// Every path any snapshot of `h` held.
-fn all_paths(h: &Hist) -> BTreeSet<String> {
+pub(crate) fn all_paths(h: &Hist) -> BTreeSet<String> {
     h.files.values().flat_map(|f| f.keys().map(|k| k.trim_end_matches('/').to_string())).collect()
 }
 
 /// The harness's queries for one viewer: revisions by branch and by the
 /// viewer's own ids, paths readable, hidden and missing.
-fn queries(rng: &mut Rng, revs: &[String], paths: &[String]) -> Vec<Q> {
+pub(crate) fn queries(rng: &mut Rng, revs: &[String], paths: &[String]) -> Vec<Q> {
     let pick = |rng: &mut Rng, v: &[String]| v[rng.below(v.len())].clone();
     let small = Limits {
         work: 12,
@@ -2167,7 +2168,9 @@ fn s3rd2_resolve_answers_alike_whatever_hidden_history_it_meets() {
             .await
             .unwrap();
         assert_eq!(n, 0, "no fill projected the first version for the viewer");
-        // Another fill of the viewer's graph is running, in both projects.
+        // Another fill of the viewer's graph is running, in both projects
+        // (and, below, every fill of rows on this server is busy: a
+        // resolve that waited for a fill would answer `warming`).
         for (pid, key) in [(a.id, vka.clone()), (b.id, vk.clone())] {
             sqlx::query("INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, $2, 'another-server', $3)")
                 .bind(pid)
@@ -2178,6 +2181,7 @@ fn s3rd2_resolve_answers_alike_whatever_hidden_history_it_meets() {
                 .unwrap();
         }
     });
+    let _busy = th.rt.block_on(hub.query.hold_row_fills());
     let prefix = veil_core::ChangeId(change).display()[..4].to_string();
     let once = |h: &Hist, x: &Ask| th.rt.block_on(async { norm(query::resolve_prefix(&h.hub, x, &prefix, &[], Limits::default()).await) });
     let without = once(&a, &xa);
