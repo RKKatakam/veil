@@ -123,6 +123,50 @@ fn mutual_exclusion_under_contention() {
     }
 }
 
+/// Threads that keep asking for the lock take turns: one that releases and
+/// asks again queues behind those already waiting, so no waiter sees more
+/// than one acquisition by each other thread while it waits (BUG-1986: a
+/// releaser took the lock straight back, about 110 times in a row, and one
+/// waiter gave up after its 20 s wait on a loaded machine). Counted in
+/// acquisitions, not time, so load cannot make it flaky; the bound has
+/// slack for a thread descheduled between counting and asking.
+#[test]
+fn contenders_take_turns_and_none_starves() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const THREADS: u64 = 8;
+    for (fs, _tmp) in backends() {
+        let done = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let fs = fs.clone();
+                let done = done.clone();
+                thread::spawn(move || {
+                    let mut spans = Vec::new();
+                    for _ in 0..15 {
+                        let before = done.load(Ordering::SeqCst);
+                        let l = RepoLock::acquire_with(fs.clone(), &quick(20_000));
+                        let l = l.expect("acquired within the wait");
+                        spans.push(done.load(Ordering::SeqCst) - before);
+                        thread::yield_now();
+                        done.fetch_add(1, Ordering::SeqCst);
+                        drop(l);
+                    }
+                    spans
+                })
+            })
+            .collect();
+        let spans: Vec<Vec<u64>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(done.load(Ordering::SeqCst), THREADS * 15, "every acquisition succeeded on {}", fs.kind());
+        let worst = spans.iter().flatten().max().copied().unwrap();
+        assert!(
+            worst <= 3 * (THREADS - 1),
+            "on {}, a waiter saw {worst} acquisitions by others while it waited (at most {} with turns); per thread: {spans:?}",
+            fs.kind(),
+            THREADS - 1
+        );
+    }
+}
+
 #[test]
 fn long_transaction_keeps_its_lock() {
     // The old scheme stole any lock older than a fixed age. Now the holder

@@ -31,6 +31,15 @@
 //!   process's pid but an unregistered token was leaked (its owner dropped
 //!   without being able to remove the file, e.g. after a simulated crash),
 //!   so it is reclaimed immediately, without waiting for the lease.
+//! * **Turns within a process.** Threads of one process waiting for the
+//!   lock through one backend handle take turns in arrival order: only the
+//!   one that has waited longest may create the lock file when it finds it
+//!   free, and a release in this process wakes it at once. A thread that
+//!   releases and asks again queues behind the others instead of taking the
+//!   lock straight back, which starved a waiter past its wait (BUG-1986).
+//!   Every waiter still reads and judges the holder as before (takeovers,
+//!   reasons, fencing waits); the turn only orders who creates a free lock.
+//!   Exclusion is still decided by `create_new` alone.
 //! * **Reentrancy.** [`RepoLock::acquire_reentrant`] returns a nested handle
 //!   when the calling thread already holds the lock, so metadata writers can
 //!   run both on their own and inside a transaction. Plain
@@ -737,17 +746,19 @@ impl RepoLock {
             start: my_start(),
             ..Extras::default()
         };
+        let turn = Turn::take(&backend);
         let mut first = true;
         loop {
             // Every way round the loop (including `continue`) passes the
             // deadline and the back-off: a lock path that keeps defeating
             // `create_new` without reading back as a lock must never spin
-            // (BUG-119).
+            // (BUG-119). A release in this process, or our turn coming,
+            // ends the back-off early (finitely often).
             if !first {
                 if clock.now().saturating_sub(start) >= wait {
                     return Err(VeilError::Locked(reason));
                 }
-                clock.sleep(backoff);
+                clock.pause(backoff, &|d| turn.wait(d));
                 backoff = (backoff * 2).min(Duration::from_millis(50));
             }
             first = false;
@@ -757,7 +768,9 @@ impl RepoLock {
             let token = Registered::new(info.token.clone());
             // The lease runs from before the write that may grant it.
             let attempt = clock.now();
-            if backend.create_new(&path, &encode(&info, &extra))? {
+            // Only the longest waiter of this process creates a free lock
+            // (BUG-1986); the others still judge the holder below.
+            if turn.mine() && backend.create_new(&path, &encode(&info, &extra))? {
                 return Ok(Self::held(backend, path, info, extra, token, opts, ctx, attempt));
             }
             let Some(raw) = backend.read_opt(&path)? else {
@@ -975,6 +988,7 @@ impl Drop for RepoLock {
             }
         }
         unregister(&self.token);
+        Turn::released();
     }
 }
 
@@ -1358,6 +1372,89 @@ impl Drop for Registered {
     }
 }
 
+// ---- turns among this process's waiters (BUG-1986) ----------------------------
+
+/// Tickets of the threads now in [`RepoLock::acquire_in`], per backend handle
+/// (its address: one handle shared by threads is one repository; separate
+/// handles race as separate processes do). The smallest ticket's thread is
+/// the one that may create a free lock file.
+struct Turns {
+    next: u64,
+    /// Bumped by every release in this process and every turn that ends,
+    /// so a wake-up that lands before its waiter blocks is not lost.
+    changes: u64,
+    waiting: BTreeMap<usize, std::collections::BTreeSet<u64>>,
+}
+
+static TURNS: Mutex<Turns> = Mutex::new(Turns { next: 0, changes: 0, waiting: BTreeMap::new() });
+/// Signalled when a lock is released in this process or a turn ends.
+static TURN_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn turns() -> std::sync::MutexGuard<'static, Turns> {
+    TURNS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One thread's place among this process's waiters for one lock, given up
+/// when the acquisition ends (also by an error or a panic).
+struct Turn {
+    key: usize,
+    ticket: u64,
+    /// `Turns::changes` at our last attempt.
+    seen: std::cell::Cell<u64>,
+}
+
+impl Turn {
+    fn take(backend: &Arc<dyn StorageBackend>) -> Turn {
+        let key = Arc::as_ptr(backend) as *const () as usize;
+        let mut t = turns();
+        let ticket = t.next;
+        t.next += 1;
+        t.waiting.entry(key).or_default().insert(ticket);
+        let seen = std::cell::Cell::new(t.changes);
+        Turn { key, ticket, seen }
+    }
+
+    /// Whether no thread of this process has waited longer for this lock.
+    fn mine(&self) -> bool {
+        let t = turns();
+        self.seen.set(t.changes);
+        t.waiting.get(&self.key).and_then(|w| w.first()) == Some(&self.ticket)
+    }
+
+    /// Block for up to `d` (real time), or until a lock is released in
+    /// this process or a turn ends (at once if that happened since our
+    /// last attempt).
+    fn wait(&self, d: Duration) {
+        let t = turns();
+        if t.changes == self.seen.get() {
+            let _ = TURN_CHANGED.wait_timeout(t, d);
+        }
+    }
+
+    fn released() {
+        Self::changed(turns());
+    }
+
+    fn changed(mut t: std::sync::MutexGuard<'static, Turns>) {
+        t.changes = t.changes.wrapping_add(1);
+        drop(t);
+        TURN_CHANGED.notify_all();
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        let mut t = turns();
+        if let Some(w) = t.waiting.get_mut(&self.key) {
+            w.remove(&self.ticket);
+            if w.is_empty() {
+                t.waiting.remove(&self.key);
+            }
+        }
+        Self::changed(t);
+    }
+}
+
 // ---- owners of private directories ---------------------------------------------
 
 static LIVE_OWNERS: Mutex<BTreeMap<String, ()>> = Mutex::new(BTreeMap::new());
@@ -1567,6 +1664,14 @@ mod clock {
         /// Monotonic time since an arbitrary origin.
         fn now(&self) -> Duration;
         fn sleep(&self, d: Duration);
+        /// Back off for `d` between two attempts at the lock. `wake` blocks
+        /// for up to a real-time duration, returning early when the lock is
+        /// released in this process; a clock in real time uses it, a
+        /// simulated one sleeps.
+        fn pause(&self, d: Duration, wake: &dyn Fn(Duration)) {
+            let _ = wake;
+            self.sleep(d);
+        }
         /// How long (real time) the heartbeat waits between checks of
         /// [`LockClock::now`].
         fn poll_interval(&self, every: Duration) -> Duration {
@@ -1592,6 +1697,12 @@ mod clock {
             std::thread::sleep(d);
             #[cfg(not(feature = "os"))]
             let _ = d;
+        }
+        fn pause(&self, d: Duration, wake: &dyn Fn(Duration)) {
+            #[cfg(feature = "os")]
+            wake(d);
+            #[cfg(not(feature = "os"))]
+            let _ = (d, wake);
         }
     }
 
