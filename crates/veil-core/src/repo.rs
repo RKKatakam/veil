@@ -2088,9 +2088,14 @@ impl Repo {
         self.graph.persists()
     }
 
+    /// [`GraphIndex::voids`].
+    pub(crate) fn graph_voids(&self) -> u64 {
+        self.graph.voids()
+    }
+
     /// [`GraphIndex::missing_below`].
-    pub(crate) fn graph_missing_below(&self, heads: &[ObjectId]) -> Result<Option<Vec<ObjectId>>> {
-        self.graph.missing_below(self, heads)
+    pub(crate) fn graph_missing_below(&self, heads: &[ObjectId], voids: u64) -> Result<Option<Vec<ObjectId>>> {
+        self.graph.missing_below(self, heads, voids)
     }
 
     /// Drop the history index, to be computed again: after a thin clone is

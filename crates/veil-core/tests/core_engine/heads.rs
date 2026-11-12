@@ -736,3 +736,106 @@ fn no_head_descends_from_another_after_a_rewrite_whatever_came_before() {
     assert!(merges_seen > 20, "the walk merged concurrent operations {merges_seen} times");
     assert!(reverts > 50, "the walk undid or redid {reverts} commands");
 }
+
+/// A memory backend that runs `hook` once, at the first barrier after it
+/// is set: what another process does while a commit is durable-syncing.
+#[derive(Default)]
+struct AtBarrier {
+    inner: MemoryBackend,
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl std::fmt::Debug for AtBarrier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AtBarrier")
+    }
+}
+
+impl StorageBackend for AtBarrier {
+    fn kind(&self) -> &'static str {
+        "memory"
+    }
+    fn read(&self, path: &VPath) -> veil_core::Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> veil_core::Result<()> {
+        self.inner.write(path, data)
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> veil_core::Result<bool> {
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> veil_core::Result<Vec<veil_core::vfs::DirEntry>> {
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> veil_core::Result<Option<veil_core::vfs::Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, executable: bool) -> veil_core::Result<()> {
+        self.inner.set_executable(path, executable)
+    }
+    fn sync_barrier(&self) -> veil_core::Result<()> {
+        let hook = self.hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        self.inner.sync_barrier()
+    }
+}
+
+/// Review of `clifast2b` (BUG-2010): the withheld snapshot between two
+/// heads arrives from another process (a pull) while a rewrite is at its
+/// barrier, after the rewrite settled its heads without it. The history
+/// index takes the arrival as a missing parent that arrived and is dropped
+/// (`persist_index`); the settled-heads record must still not say that
+/// the rewrite's heads are apart, or every later rewrite keeps the old
+/// head under the upper one.
+#[test]
+fn bug_2010_history_that_arrives_while_a_rewrite_commits_is_not_taken_as_absent_from_its_heads() {
+    let backend = Arc::new(AtBarrier::default());
+    let mut repo = Repo::init(backend.clone(), None, "t").unwrap();
+    let root = repo.root_id();
+    let old = change_on(&mut repo, root, "old.txt");
+    let mut other = root;
+    for i in 0..6 {
+        other = change_on(&mut repo, other, &format!("line{i}.txt"));
+    }
+    let between = foreign(&repo, vec![old], 1);
+    let elsewhere = Repo::init(Arc::new(MemoryBackend::new()), None, "t").unwrap();
+    let between_id = elsewhere.store().put_snapshot(&between).unwrap();
+    let mut tx = repo.transaction("a pull: the upper snapshot, its parent withheld").unwrap();
+    let upper = tx.repo().store().put_snapshot(&foreign(tx.repo(), vec![between_id], 2)).unwrap();
+    tx.add_head(upper).unwrap();
+    tx.commit().unwrap();
+    other = repo.describe(other, "described while the parent is withheld").unwrap();
+    assert_eq!(heads(&repo), HashSet::from([old, other, upper]), "nothing held joins the heads yet");
+
+    // The next rewrite settles its heads without `between`; at its
+    // barrier, another process stores it (no reference moves).
+    let weak = Arc::downgrade(&backend);
+    let arrived = between.clone();
+    *backend.hook.lock().unwrap() = Some(Box::new(move || {
+        let backend: Arc<dyn StorageBackend> = weak.upgrade().unwrap();
+        let pull = Repo::open(backend, None, "t").unwrap();
+        assert_eq!(pull.store().put_snapshot(&arrived).unwrap(), between_id);
+        pull.store().sync_barrier().unwrap();
+    }));
+    other = repo.describe(other, "described while it arrives").unwrap();
+    assert!(backend.hook.lock().unwrap().is_none(), "the other process ran during the rewrite");
+    assert!(repo.store().has(&between_id), "the withheld snapshot arrived");
+    assert!(repo.held().ancestors(&upper).unwrap().contains(&old), "the old head is under the upper one now");
+    assert_eq!(heads(&repo), HashSet::from([old, other, upper]), "settled before it arrived: the full walk did not see it either");
+
+    // The rewrite after it must read the range.
+    let other = repo.describe(other, "described after it arrived").unwrap();
+    assert_eq!(heads(&repo), HashSet::from([other, upper]), "the old head is under the upper one, and still a head");
+    assert_eq!(redundant_heads(&repo), Vec::<ObjectId>::new());
+}

@@ -118,8 +118,10 @@ pub struct Transaction<'r> {
     /// directory it records (BUG-492).
     carried_sealed: HashSet<VPath>,
     /// [`Transaction::drop_ancestor_heads`] ran: the heads it leaves are
-    /// apart (none descends from another), for the snapshots held now.
-    settles: bool,
+    /// apart (none descends from another), for the snapshots held when it
+    /// ran; with the history index's drop count read before its walk
+    /// ([`crate::settled::record`]).
+    settles: Option<u64>,
 }
 
 /// Names of the operation's bytes and of its (empty) head file in a
@@ -189,7 +191,7 @@ impl<'r> Transaction<'r> {
             kept_dir: None,
             keep_attribution: false,
             carried_sealed: HashSet::new(),
-            settles: false,
+            settles: None,
         })
     }
 
@@ -694,7 +696,7 @@ impl<'r> Transaction<'r> {
     /// Drop any head in `self.view.heads` that another head already descends
     /// from, keeping `heads` the maximal tips of the visible DAG.
     fn drop_ancestor_heads(&mut self) -> Result<()> {
-        self.settles = true;
+        self.settles = Some(self.repo.graph_voids());
         if self.view.heads.len() <= 1 {
             return Ok(());
         }
@@ -2075,8 +2077,8 @@ impl<'r> Transaction<'r> {
         self.repo.persist_index();
         // Best effort too: without the record the next rewrite reads the
         // range between its heads (a merge moves heads after the step).
-        if self.settles && self.merge.is_none() {
-            crate::settled::record(self.repo, &id);
+        if let (Some(voids), None) = (self.settles, &self.merge) {
+            crate::settled::record(self.repo, &id, voids);
         }
         let warnings = self.take_merge_warnings();
         self.repo.warnings.extend(warnings);

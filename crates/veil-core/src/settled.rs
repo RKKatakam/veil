@@ -64,15 +64,17 @@ fn decode(data: &[u8]) -> Option<(ObjectId, Vec<ObjectId>)> {
 }
 
 /// After the commit of operation `op`, whose transaction ended with
-/// `Transaction::drop_ancestor_heads` (its heads are `repo`'s view's now):
-/// record them as apart. Best effort; nothing in a thin clone, nor when
-/// the index cannot say what could join them.
-pub(crate) fn record(repo: &Repo, op: &ObjectId) {
+/// `Transaction::drop_ancestor_heads` (its heads are `repo`'s view's now),
+/// which read `voids` ([`crate::graph_index::GraphIndex::voids`]) before
+/// its walk: record them as apart. Best effort; nothing in a thin clone,
+/// nor when the index cannot say what could join them (dropped since the
+/// walk: a missing parent arrived meanwhile, BUG-2010).
+pub(crate) fn record(repo: &Repo, op: &ObjectId, voids: u64) {
     if repo.store.is_partial() || !repo.graph_persists() {
         return;
     }
     let heads: Vec<ObjectId> = repo.view.heads.iter().copied().collect();
-    let Ok(Some(missing)) = repo.graph_missing_below(&heads) else { return };
+    let Ok(Some(missing)) = repo.graph_missing_below(&heads, voids) else { return };
     let _ = repo.backend.write_unsynced(&path(), &encode(op, &missing));
 }
 

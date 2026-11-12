@@ -246,6 +246,9 @@ struct State {
     /// no generation from its server (it could not be reached): lower
     /// bounds. Never persisted, and invisible to `Exact` walks (BUG-1291).
     partial: HashSet<ObjectId>,
+    /// How many times this process dropped the index: what was known
+    /// missing before is forgotten then (`GraphIndex::missing_below`).
+    voids: u64,
 }
 
 impl State {
@@ -268,6 +271,7 @@ impl State {
         *self = State {
             loaded: true,
             epoch,
+            voids: self.voids,
             ..State::default()
         };
     }
@@ -452,6 +456,7 @@ impl GraphIndex {
             false => 0,
         };
         st.reset(epoch);
+        st.voids += 1;
     }
 
     /// Re-check, after the store may have gained snapshots (a commit, a
@@ -613,18 +618,30 @@ impl GraphIndex {
         self.void(&mut st);
     }
 
+    /// How many times this process dropped the index so far: pass it to
+    /// [`GraphIndex::missing_below`] before a walk whose missing parents
+    /// it is to list.
+    pub fn voids(&self) -> u64 {
+        self.lock().voids
+    }
+
     /// Every parent this index took as missing, after computing the entries
     /// of `heads` and all below them, when none of them is in the store:
     /// what could later join two of `heads` (a snapshot's parents never
     /// change, so a head's held history grows only when one of these
     /// arrives; `crate::settled`). `None` when one has arrived (the index
-    /// is then dropped), when a head is not held, when an entry is a thin
-    /// clone's lower bound, or when there are more than [`MAX_MISSING`].
-    pub fn missing_below(&self, repo: &Repo, heads: &[ObjectId]) -> Result<Option<Vec<ObjectId>>> {
+    /// is then dropped), when the index was dropped since `voids` was read
+    /// (what the walk then took as missing is no longer listed: BUG-2010),
+    /// when a head is not held, when an entry is a thin clone's lower
+    /// bound, or when there are more than [`MAX_MISSING`].
+    pub fn missing_below(&self, repo: &Repo, heads: &[ObjectId], voids: u64) -> Result<Option<Vec<ObjectId>>> {
         let mut st = self.lock();
         self.ensure_loaded(repo, &mut st);
         if any_arrived(repo, &st.missing) {
             self.void(&mut st);
+            return Ok(None);
+        }
+        if st.voids != voids {
             return Ok(None);
         }
         let mut w = Walker { repo, st: &mut st, exact: false };
