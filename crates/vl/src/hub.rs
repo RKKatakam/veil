@@ -313,8 +313,10 @@ const RETRY_FOR: Duration = Duration::from_secs(120);
 /// ([`retry_after`]).
 ///
 /// A `503 warming` answer says how far the server is with the caller's
-/// history (a count in its message, `veil-server`'s `query::graph`). While
-/// that changes from one answer to the next, the server is getting on, and
+/// history (in its message: how many of the caller's snapshots are ready,
+/// and a token that changes while the server works on them; `veil-server`'s
+/// `query::graph`). While the answer changes from one to the next, the
+/// server is getting on, and
 /// the request is sent again for as long as it takes (BUG-1943: a clone
 /// gave up after [`RETRIES`] answers, a minute, while the server was half
 /// way through a long history). Answers that stay the same, and every
@@ -366,8 +368,14 @@ impl Waits {
         }
         self.told = Some(now);
         let said = serde_json::from_slice::<serde_json::Value>(body).ok().and_then(|v| v["message"].as_str().map(str::to_string)).unwrap_or_default();
+        // Without "try again" (that is this wait) and the token (which
+        // only says that the server is at work).
         let said = said.strip_suffix("; try again in a few seconds").unwrap_or(&said);
-        Some(format!("waiting for the server: {}", crate::render::safe(said)))
+        let said = match said.rfind(", step ") {
+            Some(at) if said.ends_with(')') => format!("{})", &said[..at]),
+            _ => said.to_string(),
+        };
+        Some(format!("waiting for the server: {}", crate::render::safe(&said)))
     }
 }
 
@@ -2255,7 +2263,16 @@ mod tests {
     /// says. Any other answer is the request's.
     #[test]
     fn bug_1943_a_warming_server_that_gets_on_is_waited_for() {
-        let warming = |n: u64| format!(r#"{{"code":"warming","message":"this history is being prepared for you ({n} steps so far); try again in a few seconds"}}"#).into_bytes();
+        // As the server says it: the caller's snapshots ready so far, and a
+        // token that changes while it works (here: also while none is ready).
+        let warming = |n: u64| {
+            format!(
+                r#"{{"code":"warming","message":"this history is being prepared for you ({} snapshots ready, step {:04x}); try again in a few seconds"}}"#,
+                n.saturating_sub(250_000),
+                n % 65_521
+            )
+            .into_bytes()
+        };
         let t0 = std::time::Instant::now();
         // A server that gets on: every answer is waited out, however many
         // there are and however long it takes (an hour here), each wait
@@ -2291,10 +2308,10 @@ mod tests {
         let mut w = Waits::new(t0);
         assert_eq!(
             w.notice(503, &warming(1_500), t0).as_deref(),
-            Some("waiting for the server: this history is being prepared for you (1500 steps so far)")
+            Some("waiting for the server: this history is being prepared for you (0 snapshots ready)")
         );
         assert_eq!(w.notice(503, &warming(2_000), t0 + Duration::from_secs(9)), None);
-        assert!(w.notice(503, &warming(9_000), t0 + Duration::from_secs(10)).is_some_and(|l| l.contains("(9000 steps so far)")));
+        assert!(w.notice(503, &warming(259_000), t0 + Duration::from_secs(10)).is_some_and(|l| l.ends_with("(9000 snapshots ready)")));
         assert_eq!(w.notice(429, &limited(0), t0 + Duration::from_secs(60)), None);
     }
 

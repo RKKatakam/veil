@@ -671,11 +671,61 @@ pub async fn read_ahead(hub: &Arc<Hub>, project: i64, snapshots: Vec<ObjectId>) 
     }
 }
 
-/// How far a fill is: the projections it memoised, the snapshots it read
-/// on its way down and the rows it wrote (steps over the viewer's own
-/// history, nothing else). A query that gives up waiting for the fill
-/// answers it ([`warming`]): a client waits on while it grows.
-pub type Progress = Arc<std::sync::atomic::AtomicU64>;
+/// How far a fill is, for the queries that give up waiting for it (their
+/// `warming` answer says it, and a client waits on while it changes):
+///
+/// * `rows`: the rows it wrote, which are the viewer's own snapshots and
+///   nothing else;
+/// * `steps`: everything it did (the projections it memoised, the
+///   snapshots it read on its way down, the rows it wrote). **Never
+///   answered**: for a viewer who is not an admin it counts real
+///   snapshots, hidden ones among them. An answer carries only
+///   [`FillProgress::token`], which says that it changed.
+#[derive(Debug)]
+pub struct FillProgress {
+    rows: std::sync::atomic::AtomicU64,
+    steps: std::sync::atomic::AtomicU64,
+    /// Never leaves the server: what makes the token say nothing of `steps`.
+    salt: [u8; 16],
+}
+
+pub type Progress = Arc<FillProgress>;
+
+impl Default for FillProgress {
+    fn default() -> Self {
+        FillProgress {
+            rows: Default::default(),
+            steps: Default::default(),
+            salt: veil_core::crypto::random_bytes::<16>(),
+        }
+    }
+}
+
+impl FillProgress {
+    fn step(&self) {
+        self.steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn wrote(&self, rows: u64) {
+        self.rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+        self.steps.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The viewer's own snapshots this fill has written rows for.
+    pub fn rows(&self) -> u64 {
+        self.rows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Four hex digits that change when the fill has done anything since
+    /// they were last read (a keyed hash of `steps` under this fill's own
+    /// random key: how much it did cannot be read from them).
+    pub fn token(&self) -> String {
+        let steps = self.steps.load(std::sync::atomic::Ordering::Relaxed);
+        let mut key = [0u8; 32];
+        key[..16].copy_from_slice(&self.salt);
+        hex::encode(&blake3::keyed_hash(&key, &steps.to_le_bytes()).as_bytes()[..2])
+    }
+}
 
 tokio::task_local! {
     /// The fill this task projects for (`sync::projected` counts each
@@ -686,7 +736,7 @@ tokio::task_local! {
 
 /// One projection memoised by the fill this task runs, if it runs one.
 pub(crate) fn projected_one() {
-    let _ = FILLING.try_with(|p| p.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let _ = FILLING.try_with(|p| p.step());
 }
 
 /// [`extend`] (`files`) or [`extend_rows`]; the walk runs in one of
@@ -817,7 +867,7 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             self.g.cx.hub().query.fill_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(p) = &self.progress {
-            p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            p.step();
         }
         self.g.snapshot(x)
     }
@@ -1011,7 +1061,7 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             hub.query.rows.insert(cache_key(project, gce, vk, i), r.clone(), 320);
         }
         if let Some(p) = &self.progress {
-            p.fetch_add(graph.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            p.wrote(graph.len() as u64);
         }
         Ok(())
     }
@@ -1275,15 +1325,20 @@ pub fn warming() -> Error {
     )
 }
 
-/// [`warming`], from a query that waited for a fill that has come as far
-/// as `progress` (steps over the viewer's own history: [`Progress`]).
-/// The number is in the message, so a client that asks again sees whether
-/// the server is getting on (`vl` waits on while it changes, BUG-1943).
-fn warming_at(progress: u64) -> Error {
+/// [`warming`], from a query that waited for a fill: with how many of the
+/// viewer's own snapshots the fill has written, and its token
+/// ([`FillProgress`]: nothing of what the viewer cannot see, not even how
+/// much of it there is). A client that asks again sees whether the server
+/// is getting on: `vl` waits on while the answer changes (BUG-1943).
+fn warming_at(progress: &FillProgress) -> Error {
     Error::new(
         StatusCode::SERVICE_UNAVAILABLE,
         "warming",
-        format!("this history is being prepared for you ({progress} steps so far); try again in a few seconds"),
+        format!(
+            "this history is being prepared for you ({} snapshots ready, step {}); try again in a few seconds",
+            progress.rows(),
+            progress.token()
+        ),
     )
 }
 
@@ -1348,7 +1403,7 @@ async fn filled(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[Obje
         let outcome = match deadline {
             Some(d) => tokio::time::timeout_at(d.into(), done)
                 .await
-                .map_err(|_| warming_at(progress.load(std::sync::atomic::Ordering::Relaxed)))?,
+                .map_err(|_| warming_at(&progress))?,
             None => done.await,
         };
         if let Some(Err((full, e))) = outcome {

@@ -465,42 +465,61 @@ fn fresh_rows_keep_embargo_lines_hidden_revisions_and_a_narrowing() {
     }
 }
 
-/// A query that gives up waiting for a fill says how far the fill is (its
-/// steps over the viewer's own history so far), so a client that
-/// asks again sees the server getting on (`vl` waits on while the number
-/// grows): the numbers never go back, and they grow.
+/// A query that gives up waiting for a fill says how far the fill is, so
+/// a client that asks again sees the server getting on (`vl` waits on
+/// while the answer changes): how many of the viewer's **own** snapshots
+/// are ready, and a token that changes while the fill works. Nothing else:
+/// here anyone on Earth sees 3 snapshots of a history of 400 (the rest
+/// change `fin/` only), their first fill projects all 400, and no answer
+/// counts more than 3 or carries any other number.
 #[test]
-fn warming_says_how_far_the_fill_is() {
+fn warming_says_how_far_the_fill_is_in_the_viewers_own_snapshots() {
     let th = TestHub::start();
     let (policy_text, bindings) = policy(770_005);
     let mut h = Hist::new(&th, &policy_text, &bindings);
     let mut files = Files::new();
-    let tip = line(&th, &mut h, root_snapshot_id(), 0, 400, &mut files);
+    let mut tip = root_snapshot_id();
+    for i in 0..400usize {
+        files.insert("fin/b.txt".into(), format!("ledger {i}\n").into_bytes());
+        if i % 150 == 0 {
+            files.insert("pub/a.txt".into(), format!("version {i}\n").into_bytes());
+        }
+        let mut change = [0u8; 16];
+        change[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        change[15] = 0xb5;
+        tip = h.commit(&th, &[tip], files.clone(), change, 1_700_000_000_000 + i as i64 * 1000, None);
+    }
     h.set_branch(&th, "main", tip);
     let a = ask(&th, &h, &Viewer::default());
     let quick = Limits { deadline: Duration::from_millis(20), ..Limits::default() };
-    let mut seen: Vec<u64> = Vec::new();
+    let mut seen: Vec<(u64, String)> = Vec::new();
     let t = Instant::now();
     loop {
         match th.rt.block_on(query::log(&h.hub, &a, LogParams::default(), quick)) {
             Ok(_) | Err(Error::Api { code: "deadline", .. }) => break,
             Err(Error::Api { code: "warming", message, .. }) => {
-                let n = message
+                let said = message
                     .strip_prefix("this history is being prepared for you (")
-                    .and_then(|m| m.strip_suffix(" steps so far); try again in a few seconds"))
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .unwrap_or_else(|| panic!("a `warming` answer without the fill's progress: {message}"));
-                seen.push(n);
+                    .and_then(|m| m.strip_suffix("); try again in a few seconds"))
+                    .and_then(|m| m.split_once(" snapshots ready, step "))
+                    .and_then(|(rows, token)| Some((rows.parse::<u64>().ok()?, token.to_string())));
+                let (rows, token) = said.unwrap_or_else(|| panic!("a `warming` answer of another form: {message}"));
+                assert!(token.len() == 4 && token.bytes().all(|b| b.is_ascii_hexdigit()), "{message}");
+                assert!(rows <= 3, "more snapshots than the viewer has: {message}");
+                seen.push((rows, token));
             }
             Err(e) => panic!("{e:?}"),
         }
         assert!(t.elapsed() < Duration::from_secs(300), "the fill never finished");
     }
-    println!("warming: {} answers, from {:?} to {:?}", seen.len(), seen.first(), seen.last());
-    assert!(seen.len() >= 2, "a first fill of 400 projected snapshots was not waited for twice: {seen:?}");
-    assert!(seen.windows(2).all(|w| w[0] <= w[1]), "the progress went back: {seen:?}");
-    assert!(seen.last() > seen.first(), "the progress never grew: {seen:?}");
-    assert!(th.rt.block_on(query::log(&h.hub, &a, LogParams::default(), Limits::default())).is_ok());
+    let tokens: BTreeSet<&str> = seen.iter().map(|(_, t)| t.as_str()).collect();
+    println!("warming: {} answers, {} tokens, rows from {:?} to {:?}", seen.len(), tokens.len(), seen.first().map(|s| s.0), seen.last().map(|s| s.0));
+    assert!(seen.len() >= 2, "a first fill that projects 400 snapshots was not waited for twice: {seen:?}");
+    assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "the count went back: {seen:?}");
+    assert!(tokens.len() >= 2, "the answers never changed while the fill worked: {seen:?}");
+    let log = th.rt.block_on(query::log(&h.hub, &a, LogParams::default(), Limits::default())).unwrap();
+    let mine = log["entries"].as_array().unwrap().iter().filter(|e| e["root"] == false).count();
+    assert_eq!(mine, 3, "the viewer's own snapshots: {log}");
 }
 
 /// BUG-1943 through `vl`: a project pushed a moment ago (forty changes in
