@@ -148,14 +148,20 @@ fn bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one() {
         };
         hold_branch(&hub, pid, "main");
         let bases = [api.tips(Some(&dev), &p.name).unwrap().branches["main"], api.tips(Some(&admin), &p.name).unwrap().branches["main"]];
+        // The shared file as this seed's base has it (the seed before landed
+        // edits of it): each overlap edits one line of that.
+        let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path=src/par/shared.txt", p.name, bases[0].hex()));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let shared = String::from_utf8(r.body).unwrap();
         // 90 submits: more than one batch, so the batch is the service's fair choice.
         let mut tickets: Vec<(usize, String)> = Vec::new();
         for i in 0..90 {
             let who = next(2) as usize;
             let (path, text) = match next(100) {
                 0..=14 => {
-                    let at = next(40);
-                    ("src/par/shared.txt".to_string(), shared.replace(&format!("line {at}\n"), &format!("line {at} of {seed}/{i}\n")))
+                    let at = next(40) as usize;
+                    let text: String = shared.lines().enumerate().map(|(n, l)| if n == at { format!("line {at} of {seed}/{i}\n") } else { format!("{l}\n") }).collect();
+                    ("src/par/shared.txt".to_string(), text)
                 }
                 15..=29 => (format!("src/par/s{seed}/same-{}.txt", next(3)), format!("{seed}/{i}\n")),
                 _ => (format!("src/par/s{seed}/f{i:02}.rs"), format!("{seed}/{i}\n")),
@@ -482,6 +488,8 @@ fn bug_1982_a_hung_object_store_never_holds_the_branchs_lease_row() {
     let r = land_edit(&api, &dev, &p.name, base, "src/hung/f.rs", "hung\n", false);
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    let landed_here = || hub.hub().landing.stats.landed.load(Ordering::SeqCst);
+    let landed_before = landed_here();
     stall.store(true, Ordering::SeqCst);
     release_branch(&hub, pid, "main");
     // The batch is built and its objects' writes hang.
@@ -499,12 +507,11 @@ fn bug_1982_a_hung_object_store_never_holds_the_branchs_lease_row() {
     });
     let holder = locked.expect("the lease's row was held while the batch's objects were being stored");
     assert_ne!(holder, "test", "the service never took the lease");
-    let state: String = hub
-        .rt
-        .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(&db))
-        .unwrap();
-    assert_eq!(state, "queued", "a batch whose objects were not stored changed its ticket");
-    assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], base, "a batch whose objects were not stored moved the branch");
+    // This server landed nothing whose objects it had not stored. (Another
+    // test's server on the same database may take the expired lease over
+    // and land the change, as BUG-1982's fix means it to: `landing::resume`
+    // serves every queued branch.)
+    assert_eq!(landed_here(), landed_before, "a batch whose objects were not stored landed");
 
     stall.store(false, Ordering::SeqCst);
     let v = wait_ticket(&api, &dev, &p.name, &ticket);
