@@ -1865,3 +1865,69 @@ fn bug_1885_deleted_branches_stop_counting_toward_max_branches_at_once() {
     let file_r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?path=src/cap_keep.rs", p.name));
     assert_eq!(file_r.status, 200, "referenced object remains intact");
 }
+
+/// BUG-2061 (BUG-1886's class, left by its fix): `dev`'s protection comes
+/// from the default branch's `.veilrules`, which the batch landing on `dev`
+/// reads without a lock (`prs::rules_unchanged_in_tx` reads `main`'s tip
+/// before it takes the review gate). `dev` is protected and `src/docs/**`
+/// needs no approval; a change of `src/docs/` is queued on `dev`, and its
+/// batch is held after its review check, at its entry's row. The admin then
+/// pushes `.veilrules` to `main` without `checks_only` (one approval needed)
+/// and is answered. The change must not land unapproved after that answer:
+/// either the push waits for the batch, or the batch refuses the change.
+#[test]
+#[ignore = "BUG-2061: a rules change on the default branch does not wait for a batch on another protected branch"]
+fn bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let dev_tok = p.dev.token();
+    write_files(&p.dir, &[(".veilrules", "[branches.dev]\nprotected = true\n\n[review]\nchecks_only = [\"src/docs/**\"]\n")]);
+    p.admin.commit_main(&p.dir, "protect dev; src/docs needs checks only");
+    p.admin.ok(&p.dir, &["push"]);
+    let main = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "dev", "expected": null, "new": main.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+
+    hold_lease(&th, pid, "dev");
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "dev", "base": main.hex(), "edits": [put("src/docs/x.md", "x\n")], "description": "doc", "wait": false}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "queued", "{}", r.json());
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    let h = th.hub();
+    let mut held = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt
+        .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
+        .unwrap();
+    release_lease(&th, pid, "dev");
+    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entry's row"));
+
+    let answered = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let pushing = scope.spawn(|| {
+            write_files(&p.dir, &[(".veilrules", "[branches.dev]\nprotected = true\n")]);
+            p.admin.commit_main(&p.dir, "src/docs needs an approval");
+            p.admin.ok(&p.dir, &["push"]);
+            answered.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_secs(3));
+        let answered_while_held = answered.load(Ordering::SeqCst);
+        th.rt.block_on(held.rollback()).unwrap();
+        pushing.join().unwrap();
+        let done = outcome(&api, &dev_tok, &p.name, &ticket);
+        if answered_while_held {
+            assert_eq!(done["state"], "rejected", "landed unapproved after the tighter rules were answered: {done}");
+        } else {
+            assert_eq!(done["state"], "landed", "{done}");
+        }
+    });
+}
