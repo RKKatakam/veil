@@ -92,6 +92,12 @@ start_services() {
   for i in $(seq 120); do D exec "$PG" pg_isready -h 127.0.0.1 -U veil >/dev/null 2>&1 && break; sleep 1; done
   for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done
   for i in $(seq 180); do ysql "select 1" >/dev/null 2>&1 && break; sleep 2; done
+  # yugabyted (2025.2) sets enforce_tablet_replica_limits=true on the master after
+  # the flags above, and a runtime flag is lost when the container restarts: with
+  # the limit on, a 3 GiB tserver may hold 438 tablets, three or four of the test
+  # databases, and every later CREATE TABLE fails (2026-11-12, after a reboot).
+  # Set it at each start; it is idempotent.
+  D exec "$YB" sh -c 'H=$(hostname -i); bin/yb-ts-cli --server_address=$H:7100 set_flag --force enforce_tablet_replica_limits false && bin/yb-ts-cli --server_address=$H:7100 set_flag --force tablet_replicas_per_gib_limit 100000' >/dev/null 2>&1 || echo "warning: could not lift YugabyteDB's tablet limit" >&2
 }
 
 # Databases left by runs that were killed before their cleanup ran: each
