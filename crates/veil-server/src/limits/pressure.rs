@@ -202,7 +202,7 @@ pub async fn admit(hub: &Hub, project: i64, branch: &str, who: &crate::landing::
         Some(wait) => {
             hub.landing.stats.queue_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(Some(Refused {
-                message: format!("landings are arriving on '{branch}' faster than they land, and yours would wait too long: submit it again in a moment"),
+                message: format!("the landing queue of '{branch}' is full (landings are arriving faster than they land); try again in a few seconds"),
                 wait,
             }))
         }
