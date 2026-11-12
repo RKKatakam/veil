@@ -159,6 +159,30 @@ fn no_route_of_this_week_gives_anyone_a_folder_they_cannot_see() {
     assert!(has_marker(&dev, PUBLIC_MARK), "the dev reads src/");
 }
 
+/// `docs/VISIBILITY.md` (as built, S4): removing access takes effect at
+/// the very next request, also for what this week's speed work keeps warm:
+/// the viewer's graph rows and file history, kept blames, history cursors,
+/// search shards and PR classes. Finance reads billing through every route
+/// (which fills them), is removed from the group, and gets nothing of it.
+#[test]
+fn removing_someone_from_a_group_stops_every_warm_answer_at_once() {
+    let hub = TestHub::start();
+    let (p, prs) = hunt_project(&hub);
+    let api = hub.api();
+    let real = real_paths(&p.dir);
+    let snaps = real_snapshots(&p.dir);
+    let fin = p.fin.token();
+    let before = crawl(&api, Some(&fin), &p.name, &real, &snaps, &prs);
+    assert!(has_marker(&before, BILL_MARK), "finance reads billing before");
+    assert!(has_marker(&before, PR_MARK), "finance sees the billing PR before");
+    assert!(has_marker(&before, CHECK_MARK), "finance sees its check before");
+    // (`ok` asserts the command succeeded.)
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.fin.name]);
+    let after = crawl(&api, Some(&fin), &p.name, &real, &snaps, &prs);
+    assert_no_marker(&after, &[BILL_DIR, BILL_MARK, ENV_MARK, DESC_MARK, PR_MARK, CHECK_MARK], "finance, once removed");
+    assert!(has_marker(&after, PUBLIC_MARK), "finance still reads src/");
+}
+
 #[test]
 fn an_admins_session_narrowed_to_src_gets_nothing_outside_it_on_this_weeks_routes() {
     let hub = TestHub::start();
