@@ -439,10 +439,10 @@ fn bug_1960_history_that_arrives_in_the_rewriting_transaction_drops_the_head_it_
 /// another.
 #[test]
 fn bug_1960_an_operation_without_its_settled_record_is_no_proof_the_heads_are_apart() {
+    let record = veil_core::VPath::new(".veil/index/settled-heads").unwrap();
     for how in ["removed", "torn", "another operation's"] {
         let (mut repo, [old, other, upper], between) = settled_beside_withheld_history();
         let backend = repo.backend().clone();
-        let record = veil_core::VPath::new(&format!(".veil/index/settled/{}", repo.op_id().hex())).unwrap();
         let written = backend.read_opt(&record).unwrap().expect("the rewrite recorded its heads");
         match how {
             "removed" => backend.remove_file(&record).unwrap(),
@@ -559,6 +559,7 @@ fn no_head_descends_from_another_after_a_rewrite_whatever_came_before() {
         let elsewhere = Repo::init(Arc::new(MemoryBackend::new()), None, "t").unwrap();
         let mut withheld: Vec<veil_core::Snapshot> = Vec::new();
         for step in 0..60 {
+            let op_before = repo.op_id();
             let wc = repo.workspace_wc("default").unwrap();
             let mut free: Vec<ObjectId> = repo.held().visible().unwrap().into_iter().filter(|id| *id != root && *id != wc).collect();
             // Not one standing on a withheld snapshot (a rewrite of it reads its parent).
@@ -718,7 +719,9 @@ fn no_head_descends_from_another_after_a_rewrite_whatever_came_before() {
             }
             let op = repo.ops().get(&repo.op_id()).unwrap();
             merges_seen += usize::from(op.parents.len() > 1);
-            if op.parents.len() == 1 && !op.rewritten.is_empty() {
+            // After an operation (a release with none leaves the heads as
+            // the operation before left them, until the next rewrite).
+            if repo.op_id() != op_before && op.parents.len() == 1 && !op.rewritten.is_empty() {
                 rewrites_checked += 1;
                 assert_eq!(
                     redundant_heads(&repo),
