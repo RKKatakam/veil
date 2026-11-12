@@ -199,10 +199,11 @@ pub fn clone(url: &HubUrl, dest: Option<&Path>, only: Option<&str>, thin: Option
     if dest.exists() && std::fs::read_dir(&dest)?.next().is_some() {
         bail!("destination {} is not empty", dest.display());
     }
-    // A clone of one directory is thin too, as every clone is by default
-    // (BUG-1945): the tip's trees on the way to the directory and its
-    // files; older history and versions are fetched when read. `--full`
-    // keeps the S1 form (every snapshot, every version of the directory).
+    // A clone of one directory keeps its S1 form (every snapshot, that
+    // directory's files): S3 does not combine it with a thin clone. (A thin
+    // one would show the folders it never wrote as deleted: its hidden
+    // paths are files, and a thin clone can read every folder's tree.)
+    let thin = if only.is_some() { None } else { thin };
     let created = !dest.exists();
     std::fs::create_dir_all(&dest)?;
     let dest = dest.canonicalize()?;

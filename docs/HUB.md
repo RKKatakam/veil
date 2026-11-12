@@ -3064,9 +3064,9 @@ at the server, with **no full graph**. Code: `veil-core/src/promisor.rs`
   of the phase-2 design); `--full` keeps S1's clone. A thin clone fetches
   the branch tips (one `history` page holding just them) and the trees and
   files of the branch it checks out, into `.veil/cache/`. `--only DIR`
-  clones kept their S1 form (not thin) until client speed round 5
-  (2026-11-12, BUG-1945): they are thin too, with only that directory's
-  files of the tip fetched; `--only DIR --full` keeps the S1 form.
+  clones keep their S1 form (not thin). Since client speed round 5
+  (2026-11-12, BUG-1945) a thin clone's first fetch reads every tree of
+  the tip in one request (`subtree`, revision 7) where the server has it.
 * **Repository format 9** (`docs/FORMAT.md`): format 8 plus the
   `partial: {remote, cache_limit}` marker. S3's release wrote thin clones
   at it (every other repository at 8). Since S11, format 10 has everything

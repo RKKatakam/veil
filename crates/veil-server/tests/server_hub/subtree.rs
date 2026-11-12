@@ -2,8 +2,8 @@
 //! trees of a folder, every level, in one answer. Access is `fetch`'s at
 //! every level: a folder the caller may not see is refused as a fetch of it
 //! is, an answer names nothing the caller may not see, and a narrowed agent
-//! session gets its paths only (`docs/HUB.md` §13.27). And `vl clone
-//! --only` is thin: the folder's files of the tip, no older version.
+//! session gets its paths only (`docs/HUB.md` §13.27). A thin clone's
+//! first fetch uses it (covered by the `thin::` clones).
 
 use serde_json::{json, Value};
 use veil_core::{
@@ -185,25 +185,4 @@ fn a_narrowed_agent_session_gets_only_its_paths_from_the_subtree_route() {
     g.sort();
     w.sort();
     assert_eq!(g, w, "the folders on the way and src/deep/a's trees, nothing of src/deep/e or src/side");
-}
-
-/// `vl clone --only` is thin (BUG-1945): the folder's files of the tip are
-/// checked out, an older version of them is not fetched (read on demand),
-/// and nothing outside the folder is.
-#[test]
-fn a_one_folder_clone_is_thin_and_fetches_no_older_version() {
-    let hub = TestHub::start();
-    let p = setup_project(&hub);
-    let d = p.fin.dir("only");
-    let out = p.fin.ok(p.fin.home.path(), &["clone", &hub.url(&p.name), d.to_str().unwrap(), "--only", BILL_DIR]);
-    assert!(out.contains("Cloned") && out.contains("thin"), "{out}");
-    assert_eq!(std::fs::read_to_string(d.join(BILL_DIR).join("acme/invoice.txt")).unwrap(), format!("{BILL_MARK}\nsecond"));
-    let objects = everything_in(&d);
-    assert!(!has_marker(&objects, PUBLIC_MARK), "an object outside --only was fetched");
-    // The first version (`BILL_MARK` alone): no object holds exactly it.
-    let first = BILL_MARK.to_string();
-    assert!(!objects.iter().any(|(n, b)| n.contains("object") && b.ends_with(first.as_bytes()) && !b.ends_with(b"second")), "an older version was fetched");
-    // Read on demand: the history shows both versions.
-    let log = p.fin.ok(&d, &["log", "-n", "10"]);
-    assert!(log.contains("initial import"), "{log}");
 }
