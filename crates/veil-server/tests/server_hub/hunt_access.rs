@@ -112,10 +112,16 @@ fn hunt_project(hub: &TestHub) -> (Project, Vec<String>) {
         Some(&admin),
         &format!("/v1/projects/{}/changes", p.name),
         &json!({"base": base.hex(), "description": "billing follow-up",
-                "edits": [{"path": format!("{BILL_DIR}/acme/next.txt"), "put": {"text": BILL_MARK}}],
-                "onto": {"branch": "hunt-bill", "expected": null}}),
+                "edits": [{"path": format!("{BILL_DIR}/acme/next.txt"), "put": {"text": BILL_MARK}}]}),
     );
-    assert_eq!(r.status, 200, "the admin commits a billing change on a branch: {}", body(&r));
+    assert_eq!(r.status, 200, "the admin commits a billing change: {}", body(&r));
+    let snap: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    let r = api.post_json(
+        Some(&admin),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "hunt-bill", "expected": null, "new": snap.hex()}], "force": false}),
+    );
+    assert_eq!((r.status, r.json()["results"][0]["ok"].clone()), (200, json!(true)), "the admin makes a branch of it: {}", body(&r));
     let r = api.post_json(Some(&admin), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "hunt-bill", "title": PR_MARK, "body": PR_MARK}));
     assert_eq!(r.status, 200, "the admin opens a PR of it: {}", body(&r));
     let pr = r.json()["id"].as_str().unwrap().to_string();
