@@ -283,8 +283,21 @@ struct TlsDatabase {
     _dir: tempfile::TempDir,
 }
 
+/// The certificate a [`TlsDatabase`] presents: for `localhost`, signed by
+/// its CA; the same but expired; or signed by its own key.
+#[derive(Clone, Copy, PartialEq)]
+enum Leaf {
+    Signed,
+    Expired,
+    SelfSigned,
+}
+
 impl TlsDatabase {
     fn start(rt: &tokio::runtime::Runtime, url: &str) -> TlsDatabase {
+        Self::presenting(rt, url, Leaf::Signed)
+    }
+
+    fn presenting(rt: &tokio::runtime::Runtime, url: &str, leaf: Leaf) -> TlsDatabase {
         use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let authority = |name: &str| {
@@ -297,7 +310,14 @@ impl TlsDatabase {
         };
         let (ca_params, ca_key, ca_pem) = authority("Veil test CA");
         let key = KeyPair::generate().unwrap();
-        let cert = CertificateParams::new(vec!["localhost".to_string()]).unwrap().signed_by(&key, &Issuer::from_params(&ca_params, &ca_key)).unwrap();
+        let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        if leaf == Leaf::Expired {
+            (params.not_before, params.not_after) = (rcgen::date_time_ymd(2020, 1, 1), rcgen::date_time_ymd(2021, 1, 1));
+        }
+        let cert = match leaf {
+            Leaf::SelfSigned => params.self_signed(&key).unwrap(),
+            _ => params.signed_by(&key, &Issuer::from_params(&ca_params, &ca_key)).unwrap(),
+        };
         let dir = tempfile::Builder::new().prefix("veil-tls-db").tempdir().unwrap();
         let (ca, another_ca) = (dir.path().join("ca.pem"), dir.path().join("another-ca.pem"));
         std::fs::write(&ca, ca_pem).unwrap();
@@ -506,5 +526,24 @@ fn bug_1909_verify_ca_does_not_check_the_certificates_name() {
     let refused = select_one(&rt, &tls.url("127.0.0.1", &format!("sslmode=verify-full&sslrootcert={ca}"))).unwrap_err();
     assert!(refused.contains("invalid peer certificate: certificate not valid for name \"127.0.0.1\""), "{refused}");
     assert_eq!(tls.seen(), (1, 0), "no refused certificate carried a connection");
+    drop_database(&rt, &name);
+}
+
+/// BUG-1909's patch forgives only the name: under `verify-ca`, a database
+/// whose certificate is expired, or signed by its own key rather than the CA
+/// given, is refused, reached by its certificate's name or by an address.
+#[test]
+fn bug_1909_verify_ca_still_refuses_an_expired_or_self_signed_certificate() {
+    let rt = runtime();
+    let (url, name) = fresh_database(&rt);
+    for (leaf, why) in [(Leaf::Expired, "invalid peer certificate: certificate expired"), (Leaf::SelfSigned, "invalid peer certificate: UnknownIssuer")] {
+        let tls = TlsDatabase::presenting(&rt, &url, leaf);
+        let ca = tls.ca.display().to_string();
+        for host in ["localhost", "127.0.0.1"] {
+            let refused = select_one(&rt, &tls.url(host, &format!("sslmode=verify-ca&sslrootcert={ca}"))).unwrap_err();
+            assert!(refused.contains(why), "{host}: {refused}");
+        }
+        assert_eq!(tls.seen(), (0, 0), "no refused certificate carried a connection");
+    }
     drop_database(&rt, &name);
 }
