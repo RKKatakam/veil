@@ -12,7 +12,13 @@
 #      or plans reaching the $100 budget;
 #   4. partial create records state, blocks a second create/configure, and
 #      destroy.sh --approve removes everything by tag and all 4 Spaces buckets,
-#      while --check fails if anything (or doctl itself) fails.
+#      while --check fails if anything (or doctl itself) fails, a load
+#      balancer or a reserved IP included;
+#   5. the full topology (three servers behind the balancer, three YugabyteDB
+#      nodes): create.sh makes every droplet, configure.sh shares the first
+#      server's keys through files and writes the balancer's configuration,
+#      bench.sh runs every gate of deploy/gates.sh where it belongs, and no
+#      secret appears in any of it.
 # Everything runs under a temporary state directory inside the worktree's .scratch/.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); DO=$(cd "$HERE/.." && pwd); ROOT=$(cd "$DO/../.." && pwd)
@@ -74,7 +80,9 @@ chmod 600 "$VEIL_DO_ENV"
 out=$("$T/do/create.sh" 2>&1); check "create.sh dry run prints the plan" '[[ "$out" == *"would run: doctl compute droplet create veil-kit-test-hub"* ]]'
 "$T/do/estimate.sh" >/dev/null 2>&1; "$T/do/estimate.sh" --live >/dev/null 2>&1
 "$T/do/destroy.sh" >/dev/null 2>&1; "$T/do/configure.sh" >/dev/null 2>&1
-"$T/do/bench.sh" pull >/dev/null 2>&1; "$T/do/logs.sh" >/dev/null 2>&1
+for g in pull land branches api landing scaling objects openscion scale; do "$T/do/bench.sh" "$g" >/dev/null 2>&1; done
+VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3 "$T/do/bench.sh" failover >/dev/null 2>&1; VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3 "$T/do/configure.sh" >/dev/null 2>&1
+"$T/do/logs.sh" >/dev/null 2>&1
 check "no doctl, aws or curl call without --approve" '[ ! -s "$FAKE_DOCTL_LOG" ] && [ ! -s "$FAKE_AWS_LOG" ] && [ ! -s "$FAKE_CURL_LOG" ]'
 check "dry runs touch nothing on disk (no state dir, no results dir)" '[ ! -e "$T/state" ] && [ ! -e "$T/results" ]'
 check "flag typos are refused across every script" '
@@ -118,7 +126,7 @@ out=$("$T/do/create.sh" --approve 2>&1 || true); check "a second create.sh refus
 out_cfg=$(VEIL_DO_WITH_CACHE=1 "$T/do/configure.sh" 2>&1)
 check "configure.sh dry run names the server command with Spaces and the private DB address" '[[ "$out_cfg" == *"--s3-endpoint https://nyc3.digitaloceanspaces.com --s3-bucket $BUCKET"* && "$out_cfg" == *"10.10.0.2:5432:5432"* ]]'
 out_pull=$("$T/do/bench.sh" pull 2>&1)
-check "bench.sh pull runs on a driver against the hub's private address" '[[ "$out_pull" == *"would run on 203.0.113.3"* || "$out_pull" == *"would run on 203.0.113.4"* ]] && [[ "$out_pull" == *"--url https://10.10.0.1:8443 --ca /tls/ca.pem"* ]]'
+check "bench.sh pull runs on a driver against the hub's private address" '[[ "$out_pull" == *"would run on 203.0.113.3: mkdir -p /srv/bench"* ]] && [[ "$out_pull" == *"--url https://10.10.0.1:8443 --ca /tls/ca.pem"* ]]'
 out_os=$("$T/do/bench.sh" openscion 2>&1)
 check "bench.sh openscion runs on the hub with its own server" '[[ "$out_os" == *"would run on 203.0.113.1"* && "$out_os" == *"--server /usr/local/bin/veil-server"* ]]'
 all_out="$out $out_cfg $out_pull $out_os $(cat "$FAKE_DOCTL_LOG")"
@@ -176,5 +184,43 @@ check "partial create saved BUCKET, KEY_ID, FW_ID and the 2 created droplets" '
 '
 FAKE_DOCTL_STATE=destroyed FAKE_SPACES_STATE=gone "$T/do/destroy.sh" --approve >/dev/null 2>&1
 check "destroy after partial create cleans up and removes state.env" '[ ! -f "$T/state/veil-kit-test/state.env" ]'
+
+out=$(FAKE_DOCTL_STATE=destroyed FAKE_SPACES_STATE=gone FAKE_LBS="veil-kit-test-lb" "$T/do/destroy.sh" --check --approve 2>&1 || true)
+check "the check fails when a load balancer named after the run remains" '[[ "$out" == *"load balancers named veil-kit-test*: 1"* && "$out" == *"SOMETHING IS LEFT"* ]]'
+
+echo "== 5. the full topology: three servers behind the balancer, three YugabyteDB nodes"
+: > "$FAKE_DOCTL_LOG"
+FULL="VEIL_DO_NAME=veil-kit-full VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3"
+export FAKE_NAME=veil-kit-full FAKE_DOCTL_STATE=created
+export FAKE_DROPLETS="veil-kit-full-hub veil-kit-full-hub2 veil-kit-full-hub3 veil-kit-full-lb veil-kit-full-yb1 veil-kit-full-yb2 veil-kit-full-yb3 veil-kit-full-driver1 veil-kit-full-driver2"
+out_est=$(env $FULL "$T/do/estimate.sh" 2>/dev/null)
+check "estimate prices the full topology, a forgotten day and month, and every topology" '[[ "$out_est" == *"veil-kit-full-hub3 (hub)"* && "$out_est" == *"veil-kit-full-lb (lb)"*"c-4"* && "$out_est" == *"hourly rate (droplets):      \$2.875"* && "$out_est" == *"planned 8 hours + Spaces:    \$28.00"* && "$out_est" == *"24 hours left running:       \$74.00"* && "$out_est" == *"a whole month forgotten:     \$1937.00"* && "$out_est" == *"three servers + balancer, YugabyteDB x3 (the full run)"*"2.875"*"28.00"*"74.00"*"1937.00"* && "$out_est" == *"one server, PostgreSQL (the default)"*"1.250"*"15.00"*"35.00"*"845.00"* ]]'
+out_c=$(env $FULL "$T/do/create.sh" --approve 2>&1); rc=$?
+check "create.sh makes 9 droplets: 3 servers, the balancer, 3 YugabyteDB nodes, 2 drivers" '[ $rc = 0 ] && [ "$(grep -c "compute droplet create" "$FAKE_DOCTL_LOG")" = 9 ] && grep -q "create veil-kit-full-hub3 --region nyc3 --size c-16" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-full-lb --region nyc3 --size c-4" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-full-yb3 --region nyc3 --size c-8" "$FAKE_DOCTL_LOG" && ! grep -q "create veil-kit-full-db " "$FAKE_DOCTL_LOG"'
+out_cfg=$(env $FULL "$T/do/configure.sh" 2>&1)
+check "configure.sh starts three YugabyteDB nodes joined to the first, and lifts the tablet limit on each" '[ "$(grep -c "bin/yugabyted start" <<<"$out_cfg")" = 3 ] && [ "$(grep -c -- "--join=10.10.0.5" <<<"$out_cfg")" = 2 ] && [ "$(grep -c "set_flag --force enforce_tablet_replica_limits false" <<<"$out_cfg")" = 3 ]'
+check "configure.sh runs the migrations once, then three servers, each on its own YugabyteDB node" '[ "$(grep -c "veil-server:[^ ]* migrate" <<<"$out_cfg")" = 1 ] && [ "$(grep -c "docker run -d --name veil-server" <<<"$out_cfg")" = 3 ] && [[ "$out_cfg" == *"the database URL of server 3) to 203.0.113.3"* ]]'
+check "configure.sh copies the first server's keys through private files, never a command line" '[[ "$out_cfg" == *"would fetch the first server'"'"'s identity and keys"* && "$out_cfg" == *"would copy $T/state/veil-kit-full/hubkeys/hub-grant-key to 203.0.113.3:/etc/veil/hubkeys/hub-grant-key"* ]]'
+check "configure.sh writes the balancer's configuration for the three servers' private addresses and starts HAProxy" '[[ "$out_cfg" == *"haproxy-cfg.sh 10.10.0.1:8443 10.10.0.2:8443 10.10.0.3:8443"* && "$out_cfg" == *"would run on 203.0.113.4: chmod 644 /etc/veil/haproxy.cfg; docker rm -f veil-lb"*"haproxy:3.0-alpine@sha256:"* && "$out_cfg" == *"would curl https://203.0.113.4:8443/v1/epochs"* ]]'
+check "the certificate names every server and the balancer" '[[ "$out_cfg" == *"would run mkcert for 203.0.113.1 10.10.0.1 veil-kit-full-hub 203.0.113.2 10.10.0.2 veil-kit-full-hub2 203.0.113.3 10.10.0.3 veil-kit-full-hub3 203.0.113.4 10.10.0.4 veil-kit-full-lb"* ]]'
+all_bench=""
+for g in $(. "$ROOT/deploy/gates.sh" >/dev/null 2>&1; echo "$GATES_ALL"); do
+    o=$(env $FULL "$T/do/bench.sh" "$g" 2>&1); r=$?
+    [ $r = 0 ] || echo "   (bench.sh $g dry run exited $r)"
+    all_bench="$all_bench $o"
+    printf -v "bench_$g" '%s' "$o"
+done
+check "every gate's dry run succeeds and records run.txt, topology.env, images.txt" '[ "$(grep -c "would record run.txt" <<<"$all_bench")" = 10 ] && [ "$(grep -c "would record topology.env" <<<"$all_bench")" = 10 ]'
+check "the drivers' gates run on a driver against the balancer's private address" '[[ "$bench_landing" == *"would run on 203.0.113.8: mkdir -p /srv/bench"*"--url https://10.10.0.4:8443"*"--mode landing --projects 1 --clients 10000 --people 100 --rates 1000"* ]] && [ "$(grep -c "\[landing-" <<<"$bench_landing")" = 6 ] && [[ "$bench_landing" == *"landing-mix-600s"*"--protected --mix"* ]]'
+check "branches runs the cost curve and the headline (300, 1,000 and 3,000 agents merging every 5th push)" '[[ "$bench_branches" == *"[branches on"* && "$bench_branches" == *"--clients 300,1000,3000 --rates max --merge-every 5"* ]]'
+check "scaling stops servers 2 and 3, then 3, then starts all, and drives from both drivers" '[[ "$bench_scaling" == *"scaling: 1 of 3 servers running"*"would run on 203.0.113.2: docker stop"*"would run on 203.0.113.3: docker stop"*"scaling: 2 of 3"*"scaling: 3 of 3"* ]] && [[ "$bench_scaling" == *"[scaling-3servers-landing@2 on 203.0.113.9]"*"--out /work/results/"*"scaling-3servers-landing@2.json"* ]]'
+check "failover stops the lease holder, then reads the checks from YugabyteDB through stdin" '[[ "$bench_failover" == *"failover: server 1 holds the lease"*"would run on 203.0.113.1: docker stop -t 30 veil-server"* && "$bench_failover" == *"would run on 203.0.113.5: docker exec -i yb bin/ysqlsh -h 10.10.0.5"* && "$bench_failover" == *"would record failover-check.txt"* ]]'
+check "objects, openscion and scale run on the first server with a server of their own" '[[ "$bench_objects" == *"[objects on 203.0.113.1]"*"--server /usr/local/bin/veil-server"* && "$bench_openscion" == *"[openscion on 203.0.113.1]"* && "$bench_scale" == *"[scale on 203.0.113.1]"*"--profile 1g"* ]]'
+check "failover refuses with one server, and an unknown gate is refused" '! VEIL_DO_NAME=veil-kit-full "$T/do/bench.sh" failover >/dev/null 2>&1 && ! env $FULL "$T/do/bench.sh" nosuchgate >/dev/null 2>&1'
+check "the bench dry runs called nothing" '[ "$(grep -vc "compute droplet create\|ssh-key import\|firewall create\|tag create\|droplet get\|droplet list" "$FAKE_DOCTL_LOG")" = 0 ]'
+all_out="$out_est $out_c $out_cfg $all_bench $(cat "$FAKE_DOCTL_LOG")"
+check "no secret appears anywhere in the full topology's runs" '[[ "$all_out" != *"dop_v1_fake_secret_token"* && "$all_out" != *"secret-spaces-key"* && "$all_out" != *"secret-spaces-val"* && "$all_out" != *"secret-db-pass"* ]]'
+topo=$(env $FULL bash -c '. "$1/do/lib.sh" 2>/dev/null; topology' _ "$T")
+check "the topology recorded beside results is the settings, without a secret" '[[ "$topo" == *"HUBS=3"* && "$topo" == *"YB_NODES=3"* && "$topo" == *"HAPROXY_IMAGE=haproxy:3.0-alpine@sha256:"* && "$topo" != *"secret"* && "$topo" != *"dop_v1"* ]]'
 
 [ $fail = 0 ] && echo "deploy/do/test: all green" || { echo "deploy/do/test: FAILED"; exit 1; }

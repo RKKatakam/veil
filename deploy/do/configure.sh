@@ -61,25 +61,29 @@ echo "== 4. database"
 if [ "$YB_NODES" -gt 0 ]; then
     YB1=$(addr "$NAME-yb1")
     # YugabyteDB, one yugabyted per node, the first the seed (docs/HUB.md
-    # §13.1: the Apache-2.0 core image). Three nodes replicate every tablet
-    # three times. One tablet per table and node: Veil's tables are many
-    # and small.
+    # §13.1: the Apache-2.0 core image). With three nodes yugabyted keeps
+    # three copies of every tablet. One tablet per table on each node
+    # (`ysql_num_shards_per_tserver=1`): a hash-sharded table has three,
+    # one led by each node; Veil's tables are many and mostly small
+    # (docs/DEPLOY.md §2, "YugabyteDB").
     FIRST=$(paddr "$NAME-yb1")
     for i in $(seq "$YB_NODES"); do
         n=$NAME-yb$i; ip=$(addr "$n"); priv=$(paddr "$n")
         join=""; [ "$i" -gt 1 ] && join="--join=$FIRST"
-        remote "$ip" "docker rm -f yb >/dev/null 2>&1; docker run -d --name yb --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v yb-data:/root/var $YB_IMAGE bin/yugabyted start --background=false --advertise_address=$priv $join --tserver_flags=ysql_num_shards_per_tserver=1"
+        remote "$ip" "docker rm -f yb >/dev/null 2>&1; docker run -d --name yb --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v yb-data:/root/var $YB_IMAGE bin/yugabyted start --background=false --advertise_address=$priv $join --tserver_flags=ysql_num_shards_per_tserver=1 --master_flags=enforce_tablet_replica_limits=false"
         remote "$ip" 'for i in $(seq 120); do docker exec yb bin/ysqlsh -h '"$priv"' -tAc "select 1" >/dev/null 2>&1 && break; sleep 2; done; echo "   yb'"$i"' answers"'
     done
     remote "$YB1" 'for i in $(seq 60); do n=$(docker exec yb bin/ysqlsh -h '"$FIRST"' -tAc "select count(*) from yb_servers()" 2>/dev/null); [ "$n" = '"$YB_NODES"' ] && break; sleep 2; done; echo "   YugabyteDB nodes in the cluster: $n (expected '"$YB_NODES"')"; [ "$n" = '"$YB_NODES"' ]'
     # yugabyted turns enforce_tablet_replica_limits on at every start,
-    # whatever --master_flags says. A migrated Veil database is about 500
-    # tablets; a 16 GB node's default limit is above that, a smaller node's
-    # is not (docs/DEPLOY.md, "YugabyteDB"). Lifted on every master, as the
-    # rehearsal and scripts/verify-server.sh do; a restarted node needs it again.
+    # whatever --master_flags says, and the limit counts every replica a
+    # node holds: with three tablets per table, a migrated Veil database is
+    # about three times its table count on every node (docs/DEPLOY.md §2).
+    # Lifted on every master, as the rehearsal and scripts/verify-server.sh
+    # do; a node that restarts needs it again (configure.sh --approve again,
+    # or this one command on it), before any table is created.
     for i in $(seq "$YB_NODES"); do
         n=$NAME-yb$i
-        remote "$(addr "$n")" "docker exec yb bin/yb-ts-cli --server_address=$(paddr "$n"):7100 set_flag --force enforce_tablet_replica_limits false"
+        remote "$(addr "$n")" "docker exec yb bin/yb-ts-cli --server_address=$(paddr "$n"):7100 set_flag --force enforce_tablet_replica_limits false && docker exec yb bin/yb-ts-cli --server_address=$(paddr "$n"):7100 set_flag --force tablet_replicas_per_gib_limit 100000"
     done
 else
     DBIP=$(ip_of "$NAME-db"); DBIP=${DBIP:-DB_IP}; DBPRIV=$(priv_of "$NAME-db"); DBPRIV=${DBPRIV:-DB_PRIVATE_IP}

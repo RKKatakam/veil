@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # The cost of the planned test, line by line (docs/DEPLOY.md, "Topology and
 # cost"), from the topology in deploy/do/.env. Prints the hourly rate and
-# the total for VEIL_DO_HOURS, plus a 24-hour worst case (what it costs if
-# teardown is forgotten for a day). Never talks to DigitalOcean unless
-# `--live --approve`, which replaces the built-in prices with the API's.
+# the total for VEIL_DO_HOURS, what a teardown forgotten for a day and for
+# a month would cost, and the same four numbers for every topology the kit
+# offers (one to three servers, PostgreSQL or YugabyteDB). Never talks to
+# DigitalOcean unless `--live --approve`, which replaces the built-in
+# prices with the API's.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 LIVE=0
@@ -50,6 +52,25 @@ printf 'hourly rate (droplets):      $%.3f\n' "$total"
 printf 'planned %s hours + Spaces:    $%.2f\n' "$HOURS" "$planned"
 printf '24 hours left running:       $%.2f\n' "$day"
 printf 'a whole month forgotten:     $%.2f  <- why destroy.sh and its check matter\n' "$(echo "$total * 672 + $SPACES_MONTHLY" | bc -l)"
+# Every topology, with this .env's sizes and drivers.
+topo_hourly() { # servers, YugabyteDB nodes, cache: the droplets' USD/hour
+    local HUBS=$1 YB_NODES=$2 WITH_CACHE=$3 t=0 role name size p
+    while read -r role name size; do
+        p=${live[$size]:-$(price_of "$size")}; t=$(echo "$t + ${p:-0}" | bc -l)
+    done < <(droplets)
+    echo "$t"
+}
+echo
+echo "every topology (sizes and $DRIVERS driver(s) as above; + Spaces \$$SPACES_MONTHLY):"
+printf '   %-58s %9s %9s %11s %13s\n' "topology" "USD/hour" "${HOURS} h" "a day left" "a month left"
+for t in "1 0 0 one server, PostgreSQL (the default)" "1 3 0 one server, YugabyteDB x3" \
+         "2 3 0 two servers + balancer, YugabyteDB x3" "3 3 0 three servers + balancer, YugabyteDB x3 (the full run)" \
+         "3 0 0 three servers + balancer, PostgreSQL" "3 3 1 the full run + the cache"; do
+    read -r h y c label <<<"$t"
+    r=$(topo_hourly "$h" "$y" "$c")
+    printf '   %-58s %9.3f %9.2f %11.2f %13.2f\n' "$label" "$r" "$(echo "$r * $HOURS + $SPACES_MONTHLY" | bc -l)" \
+        "$(echo "$r * 24 + $SPACES_MONTHLY" | bc -l)" "$(echo "$r * 672 + $SPACES_MONTHLY" | bc -l)"
+done
 if [ $LIVE = 0 ] || [ $APPROVED = 0 ]; then echo "(built-in list prices; confirm with: $0 --live --approve, or doctl compute size list)"; fi
 if [ "$(echo "$planned >= $BUDGET_MAX" | bc -l)" = 1 ]; then
     echo "estimate: planned cost (\$$(printf '%.2f' "$planned")) reaches or exceeds the \$$BUDGET_MAX budget" >&2
