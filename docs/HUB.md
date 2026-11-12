@@ -5417,6 +5417,20 @@ transaction per landing instead of 23.
    names nothing that is not stored (a batch whose objects cannot be
    stored rolls back and is built again; a transaction run again finds the
    store's outcome). Measured: 57 to 45 ms a batch with the gate's mix.
+11. **A landing behind a backlog in its project's gate is told at once**
+   (`limits/gate.rs` `WRITE_BACKLOG`, BUG-1955). Past what a project's
+   submits get through its bulkhead (48 places with 64 database
+   connections, a submit holding one for 35 to 45 ms on the benchmark's
+   machine: about 1,100 a second), the requests waited in the gate, up
+   to a write's 20 s, and item 6's answer was never reached (the landing
+   queue itself stayed short): with 1,500 a second offered, 9 s on
+   average, told nothing. Now, once the landing that has waited longest
+   for a place has waited 2 s, a new landing is answered `503 busy` with
+   `retry_after_ms` (0.5 to 1.5 s) at once, before any work; those
+   waiting keep their places and their order, pulls and search are
+   treated as before, and when the backlog is under 2 s landings wait for
+   a place again. One person's flood holds another person's landing back
+   no longer than the gate's order did: both come in as places free.
 
 **Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
 `concurrency.rs`, unit tests in `limits/landing.rs`):
@@ -5436,6 +5450,7 @@ transaction per landing instead of 23.
 | 11 | `vl land` waits out a full queue as the answer asks, with a note, and lands | the note `waiting for the server: the landing queue of 'main' is full …`, then landed | `landing_hold::bug_1955_vl_land_waits_for_a_full_queue_and_says_so`; `vl` unit test `bug_1955_a_full_landing_queue_is_waited_out_with_a_note` |
 | 12 | A batch read on several threads is the batch built on one, byte for byte (BUG-1955) | Three seeded batches of 90 submits by two people (new files, overlapping edits of one shared file, two changes adding one path): the same objects, snapshots, landings, memos, tip and answers, with at least one merge and one conflict each; the service then lands what the one-thread build said | `landing_hold::bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one` |
 | 13 | A batch commits only once its objects are stored (BUG-1955) | With the store's folders unwritable, three held landings stay queued and the branch keeps its tip for 3 s; once writable, all three land and their files read back at the new tip | `landing_hold::bug_1955_a_batch_lands_only_once_its_objects_are_stored` |
+| 14 | Behind 2 s of landings waiting in a gate, a new landing is answered at once; those waiting keep their places and get in; pulls still wait; with no backlog landings wait again (BUG-1955) | a gate of one place held, two landings and a pull waiting: after 2 s a third landing is refused without waiting, the gate's load is (1 running, 3 waiting), and all three get in once the place is free | `limits::gate::tests::a_landing_behind_a_long_backlog_is_told_at_once` |
 
 ### 13.36 S20: automatic bisect and revert (built)
 
