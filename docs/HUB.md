@@ -4820,6 +4820,25 @@ and `crates/veil-core/src/hub/land.rs`.
 
 #### The design as built
 
+* **Since BUG-1956 (2026-11-12) the batch merges, not a worker.** A change
+  whose paths changed on the tip since its base is merged by content in the
+  landing batch, onto the tip as everything before it in the queue's order
+  left it (`merge::merge_onto`, with the eligibility and per-path rules
+  below), and lands, or is answered `conflict` when that merge is not clean:
+  the answers are a serial landing's, in order, exactly once. There is no
+  re-queue, no `land.requeued` event, no `MAX_MERGES` cap and no worker
+  pool; a landed answer's `merges` counts one more when the batch merged it.
+  A batch's merges read at most 4 MiB (`MERGE_BYTES`; an entry that needs
+  more comes first in the next batch, where it is merged whatever its size),
+  and the lease is renewed while a batch builds. The access checks a worker
+  made are the batch's own (`entry`, and the push's checks again on the new
+  parent, `service::recheck`, for every merged change). Rows left `merging`
+  by a server before the fix are queued again when their claim expires
+  (`landing::resume`, `reclaim_expired_merges`). Until then, a batch landed
+  one change per file changed since the entries' bases and sent the others
+  to workers, which queued them again at the back: more than about four
+  clean overlaps of one file at once were answered `conflict`. The rest of
+  this list is the design before the fix.
 * **Merge workers (`landing/merge.rs`):** when a queued change cannot take
   S17's fast path (`edits::fast_path`), `merge::can_merge` checks whether the
   entry has `merges < MAX_MERGES` (`3`) and its overlapping paths can all be
