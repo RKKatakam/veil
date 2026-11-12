@@ -164,7 +164,7 @@ rehearsal: `deploy/compose/results/<stamp>/<gate>/`):
 | `<label>.md` | the same as a table; `<label>.log` the tool's output (`GATE MISSED:` lines name each missed target) |
 | `hub<N>-stats.json`, `hub<N>-docker-stats.log` | each server's request-path counters at the end (the landing service's batches, landings and timings among them: the tool fills its own `landing_*` fields only for a server it starts), and its CPU and memory every 5 s |
 | `scaling.md` | the scaling table: each curve's throughput with 1, 2 and 3 servers (summed over the drivers), and its ratio to one server's |
-| `failover-verdict.md`, `failover-check.txt`, `failover-run.txt`, `failover-after.txt`, `failover.json` | the failover verdict, the database's checks behind it, what the gate did and when |
+| `failover-verdict.md`, `failover-check.txt`, `failover-line.txt`, `failover-run.txt`, `failover-after.txt`, `failover.json`, `failover.landings.jsonl` | the failover verdict; the database's checks behind it and `main`'s first-parent line (`n\|snapshot\|change\|tickets`, tip first); what the gate did and when; the tool's numbers and its per-change log (one JSON line per `landed` answer: `ticket`, `change`, `landed`, `project`, `at_ms`; one per failed submit: `failed`, and `ticket` when the server gave one) |
 
 A gate's command exits non-zero when a run failed or missed one of the
 tool's targets; the results are kept either way.
@@ -202,7 +202,8 @@ and the file it comes from. Empty: not run yet.
 | landings across 100 projects/s with 1, 2, 3 servers | `scaling` | `scaling.md` (`scaling-<N>servers-landing@<driver>.json`) | |
 | failover: another server took the lease | `failover` | `failover-verdict.md`, row "lease holder before / after" | |
 | failover: longest pause in landings | `failover` | `failover-verdict.md` (`failover-check.txt`: `longest_gap_after_stop_ms`) | |
-| failover: changes lost / landed twice | `failover` | `failover-verdict.md` (`failover-check.txt`: `unfinished`, `recorded_not_on_main`, `change_twice_on_main`, `main_without_ticket`) | |
+| failover: changes lost / landed twice, from the database | `failover` | `failover-verdict.md` (`failover-check.txt`: `unfinished`, `recorded_not_on_main`, `change_twice_on_main`, `main_without_ticket`) | |
+| failover: every change an agent was told landed on `main` once; landings no agent was told about, against the failed submits | `failover` | `failover-verdict.md`, rows "told landed, …" and "landed, no agent told" (`failover.landings.jsonl` against `failover-line.txt`) | |
 | pulls/s, 10 / 100 / 1,000 agents; statements per warm pull | `pull` | `pull.json`: `ops_per_s`, `db_per_op` | |
 | landings/s into `main`, 1 and 50 agents, 1 / 10 / 100 projects | `land` | `land.json` | |
 | API commits/s, the same points | `api` | `api.json` | |
