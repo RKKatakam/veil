@@ -685,6 +685,76 @@ fn bug_2060_an_edit_the_tip_already_holds_merges_cleanly() {
     assert_eq!(file("src/same/own.txt"), (200, "its own edit\n".to_string()));
 }
 
+/// BUG-2070 (BUG-2060's class, left by its fix): an edit the tip already
+/// holds is no edit of the merged change whatever the file: a binary file,
+/// a file over the 1 MiB merge cap, a `-merge` file, a file whose base was
+/// a folder, and the delete of a file the tip replaced with a folder. The
+/// tip makes each of those edits; a change on the old base makes the same
+/// ones and one of its own: a three-way merge of it is clean, so it lands,
+/// and the tip keeps every file as the first change left it.
+#[test]
+fn bug_2070_an_edit_the_tip_already_holds_merges_cleanly_whatever_the_file() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let land = |base: veil_core::ObjectId, edits: serde_json::Value| {
+        let r = api.post_json(
+            Some(&dev),
+            &format!("/v1/projects/{}/land", p.name),
+            &serde_json::json!({"onto": "main", "base": base.hex(), "edits": edits, "description": "bug 2070", "wait": true}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        r.json()
+    };
+    let tip = || api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let big: String = (0..20_000).map(|i| format!("big line {i:06} of a file over the merge cap\n")).collect();
+    let made = land(
+        tip(),
+        serde_json::json!([
+            {"path": "src/held/.veilattributes", "put": {"text": "*.lock -merge\n"}},
+            {"path": "src/held/bin.dat", "put": {"text": "\u{0}BIN 0\n"}},
+            {"path": "src/held/big.txt", "put": {"text": big}},
+            {"path": "src/held/dep.lock", "put": {"text": "dep 1\ndep 2\n"}},
+            {"path": "src/held/node", "put": {"text": "a file\n"}},
+            {"path": "src/held/tree/inner.txt", "put": {"text": "in a folder\n"}},
+        ]),
+    );
+    assert_eq!(made["state"], "landed", "{made}");
+    let base = tip();
+    let edits = serde_json::json!([
+        {"path": "src/held/bin.dat", "put": {"text": "\u{0}BIN 1\n"}},
+        {"path": "src/held/big.txt", "put": {"text": big.replacen("big line 000007 ", "big line 000007 edited ", 1)}},
+        {"path": "src/held/dep.lock", "put": {"text": "dep 1\ndep 3\n"}},
+        {"path": "src/held/node", "delete": true},
+        {"path": "src/held/node/inner.txt", "put": {"text": "now a folder\n"}},
+        {"path": "src/held/tree/inner.txt", "delete": true},
+        {"path": "src/held/tree", "put": {"text": "now a file\n"}},
+    ]);
+    let first = land(base, edits.clone());
+    assert_eq!(first["state"], "landed", "{first}");
+    let after_first = tip();
+    let mut again = edits.as_array().unwrap().clone();
+    again.push(serde_json::json!({"path": "src/held/own.txt", "put": {"text": "its own edit\n"}}));
+    let second = land(base, serde_json::Value::Array(again));
+    assert_eq!(second["state"], "landed", "a clean three-way merge lands: {second}");
+    assert_eq!(second["merges"], 1, "{second}");
+    let file = |rev: veil_core::ObjectId, path: &str| {
+        let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path={path}", p.name, rev.hex()));
+        (r.status, r.body)
+    };
+    let now = tip();
+    for path in ["src/held/bin.dat", "src/held/big.txt", "src/held/dep.lock", "src/held/node/inner.txt", "src/held/tree"] {
+        let (got, want) = (file(now, path), file(after_first, path));
+        assert_eq!(want.0, 200, "{path}");
+        assert!(got == want, "{path} changed by the second change");
+    }
+    assert_eq!(file(now, "src/held/own.txt"), (200, b"its own edit\n".to_vec()));
+    // Every edit held by the tip: the change lands, empty.
+    let third = land(base, edits);
+    assert_eq!(third["state"], "landed", "a clean three-way merge lands: {third}");
+}
+
 /// One change of [`bug_1956_every_kind_of_edit_lands_as_landing_them_one_by_one`]:
 /// who submits it, on which base, and its edits.
 #[derive(Clone)]

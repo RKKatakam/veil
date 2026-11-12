@@ -5458,6 +5458,36 @@ transaction per landing instead of 23.
    treated as before, and when the backlog is under 2 s landings wait for
    a place again. One person's flood holds another person's landing back
    no longer than the gate's order did: both come in as places free.
+12. **The review gate and the landing's lock order** (`prs::close_review_gate`,
+   `prs::share_review_gate`, BUG-1886, BUG-2061). Every landing meets the
+   review rules and holds in force when it commits. The gate is a
+   per-project transaction-scoped advisory lock: every batch with a
+   person's entry takes it **shared** right after its branch row's
+   compare-and-swap, before it reads again anything the review rules come
+   from (the default branch's tip and `pr_review_rules`, the reverts,
+   `prs`, `pr_reviews`, `pr_holds`); everything that changes those takes
+   it **exclusively**: a verdict and the holds it places, and a PR's new
+   revision (first, after the GC guard); a landing of the default branch
+   whose rules record changes (`prs::state::record_landing` answers
+   whether it does: the push takes the gate once it holds every branch row
+   it moves, a commit through the API after its branch row, the default
+   branch's own batch instead of taking it shared); an embargo's release
+   moving its holds into `pr_holds` and retargeting its PRs
+   (`finish_release`, after the line's row); and a revert recorded as
+   landed (`bisect::record_revert_landed`). Such a write commits before a
+   batch reads (the batch refuses what no longer meets the rules and is
+   built again) or waits for the batch's commit. Every transaction takes
+   its locks in this order: the GC guard (`pack_gc::guard_root_write`),
+   the landing lease's row, branch rows, the review gate, then the rows it
+   writes (queue rows, PRs, snapshots); nothing that holds the gate waits
+   for a lease or a branch row, so no cycle is possible. (`Storing` is
+   waited for last, holding these, for at most half a lease, and the store
+   takes none of them; item 11's places are in memory, taken before any
+   transaction.) Batches do not wait for one another; a writer waits at
+   most for the batches already committing. PostgreSQL queues a lock
+   request behind a waiting one it conflicts with, so batches that come
+   after a waiting exclusive request wait behind it: a rules push on a busy
+   project is not starved.
 
 **Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
 `concurrency.rs`, unit tests in `limits/landing.rs`):
@@ -5478,6 +5508,7 @@ transaction per landing instead of 23.
 | 12 | A batch read on several threads is the batch built on one, byte for byte (BUG-1955) | Three seeded batches of 90 submits by two people (new files, overlapping edits of one shared file, two changes adding one path): the same objects, snapshots, landings, memos, tip and answers, with at least one merge and one conflict each; the service then lands what the one-thread build said | `landing_hold::bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one` |
 | 13 | A batch commits only once its objects are stored (BUG-1955) | With the store's folders unwritable, three held landings stay queued and the branch keeps its tip for 3 s; once writable, all three land and their files read back at the new tip | `landing_hold::bug_1955_a_batch_lands_only_once_its_objects_are_stored` |
 | 14 | Behind 2 s of landings waiting in a gate, a new landing is answered at once; those waiting keep their places and get in; pulls still wait; with no backlog landings wait again (BUG-1955) | a gate of one place held, two landings and a pull waiting: after 2 s a third landing is refused without waiting, the gate's load is (1 running, 3 waiting), and all three get in once the place is free | `limits::gate::tests::a_landing_behind_a_long_backlog_is_told_at_once` |
+| 15 | Every landing meets the review rules and holds in force when it commits: a tighter `.veilrules` on the default branch, or an embargo's release moving a hold into `pr_holds`, answered while a batch on another protected branch commits, is never overtaken by it (BUG-2061) | the batch held after its review check, at its entry's row: the rules push and the release wait for it (the change lands, under the rules it was read under), then are answered; the next such change is refused `not_ready` | `rv_core2::bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits`, `rv_core2::bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them` |
 
 ### 13.36 S20: automatic bisect and revert (built)
 
