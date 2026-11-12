@@ -3160,16 +3160,19 @@ pub(crate) struct Ahead {
     stop: std::sync::atomic::AtomicBool,
 }
 
+/// A folder's tree in the parent snapshot, and its id.
+type ParentDir = (Arc<Tree>, ObjectId);
+
 struct AheadTask {
     path: VPath,
-    sub: Option<(Arc<Tree>, ObjectId)>,
+    sub: Option<ParentDir>,
     /// The walk's depth (its stack's length) while it builds `path`'s entries.
     depth: usize,
 }
 
 #[cfg_attr(not(feature = "os"), allow(dead_code))]
 enum TaskState {
-    Queued(Option<CacheRun>),
+    Queued(Option<Box<CacheRun>>),
     Running,
     Done(Box<AheadResult>),
     Taken,
@@ -3234,7 +3237,7 @@ impl Ahead {
             opts.materialised.is_some_and(|m| m.hidden(path) || m.lost(path))
                 || opts.policy.classify(path, true).tier == Tier::Ignored
         };
-        let mut level: Vec<(VPath, Option<(Arc<Tree>, ObjectId)>)> = vec![(VPath::root(), Some((parent.clone(), ObjectId([0; 32]))))];
+        let mut level: Vec<(VPath, Option<ParentDir>)> = vec![(VPath::root(), Some((parent.clone(), ObjectId([0; 32]))))];
         for depth in 1..=AHEAD_MAX_DEPTH {
             let mut next = Vec::new();
             for (dir, sub) in &level {
@@ -3263,7 +3266,7 @@ impl Ahead {
                     Some(r) => r.split_below(depth, &by_path, level.len()).into_iter().map(Some).collect(),
                     None => (0..level.len()).map(|_| None).collect(),
                 };
-                let state = runs.iter_mut().map(|r| TaskState::Queued(r.take())).collect();
+                let state = runs.iter_mut().map(|r| TaskState::Queued(r.take().map(Box::new))).collect();
                 let tasks = level.into_iter().map(|(path, sub)| AheadTask { path, sub, depth }).collect();
                 return Some(Ahead {
                     tasks,
@@ -3294,7 +3297,7 @@ impl Ahead {
                 })
             };
             let Some((i, run)) = claimed else { return };
-            self.build(env, i, run);
+            self.build(env, i, run.map(|r| *r));
         }
     }
 
@@ -3353,7 +3356,7 @@ impl Ahead {
                 TaskState::Queued(run) => {
                     st[i] = TaskState::Running;
                     drop(st);
-                    self.build(env, i, run);
+                    self.build(env, i, run.map(|r| *r));
                     st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 }
                 TaskState::Running => {
