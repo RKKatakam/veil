@@ -1,72 +1,53 @@
-//! Content merge workers, re-queue and conflict reports for the landing
-//! service (milestone S18; `docs/HUB.md` §13.30;
+//! Content merges and conflict reports for the landing service
+//! (milestone S18; `docs/HUB.md` §13.30;
 //! `docs/design/server/phase-4-agent-scale.md` §4.3, §5).
 //!
-//! When a queued change's edited paths changed on the branch's tip since its
-//! base ([`super::edits::fast_path`] is `Some`), the landing service checks
-//! whether the change can be merged by content:
+//! When a change's edited paths changed on the branch since its base
+//! ([`super::edits::fast_path`] is `Some`), the landing batch merges it by
+//! content onto the running tip, in the queue's order ([`merge_onto`]):
 //!
-//! * Up to [`MAX_MERGES`] (3) clean content merges are attempted per queued
-//!   submission. A change that still overlaps after [`MAX_MERGES`] merges is
-//!   answered `conflict`.
-//! * A merge worker runs on a bounded pool ([`MAX_WORKERS`]) and tries a
-//!   three-way content merge (`veil_core::textmerge::merge` or
-//!   `veil_core::attributes::union_merge` per `.veilattributes`) on each
-//!   overlapping path when both sides are plain-text `Public` files that the
-//!   submitter may read and write.
-//! * **Guarantee 1:** Before a merged snapshot can re-queue or land, the
-//!   worker verifies that the submitter sees every edit of the original and
-//!   merged change whole (`Class::Whole`) under both the project's current
-//!   access epochs and the tip's `.veilpolicy`, and runs the push checks
-//!   (`sync::complete`) on the new parent.
-//! * **Guarantee 2:** When a merge cannot be done cleanly, the worker builds
-//!   a conflict report (`onto`, `base`, `paths`, `conflicts`, `landed_since`)
-//!   that names nothing hidden from the submitter; any conflict involving a
-//!   path the submitter cannot read is reported solely as
-//!   [`HIDDEN_CONFLICT`] (`"conflicts with changes you can't see"`), never by
-//!   path.
-//! * **Guarantee 3:** Clean merges atomically transition their queue row
-//!   `merging -> queued` with `merges = merges + 1` and record the original
-//!   submitted snapshot in `predecessors`, so a re-queued change lands at
-//!   most once.
-
-use std::{
-    collections::HashMap,
-    sync::{atomic::Ordering, Arc},
-};
+//! * A change that merges cleanly onto what landed before it lands; one
+//!   that does not is answered `conflict`, never one that merges cleanly
+//!   (BUG-1956: until then a merge was made by a worker off the batch and
+//!   the change queued again at the back, at most three times, and more
+//!   than about four clean overlaps of one file at once were answered
+//!   `conflict`).
+//! * A path is merged (`veil_core::textmerge::merge`, or
+//!   `veil_core::attributes::union_merge` per `.veilattributes`) only when
+//!   both sides are plain-text `Public` files within
+//!   [`MAX_MERGE_FILE_BYTES`] that the submitter may read and write, and
+//!   what changed it on the branch is visible to them whole.
+//! * **Guarantee 1:** A merged change lands only after the push's checks
+//!   (`sync::complete`) on its new parent, as its submitter is now, as
+//!   every landing that needs them (`service::recheck`).
+//! * **Guarantee 2:** When a merge cannot be done cleanly, the conflict
+//!   report (`onto`, `base`, `paths`, `conflicts`, `landed_since`) names
+//!   nothing hidden from the submitter; any conflict involving a path the
+//!   submitter cannot read is reported solely as [`HIDDEN_CONFLICT`]
+//!   (`"conflicts with changes you can't see"`), never by path.
+//! * Rows a server before BUG-1956's fix left `merging` are queued again
+//!   when their claim expires (`landing::resume`, BUG-1883).
 
 use bytes::Bytes;
-use tokio::sync::Semaphore;
 use veil_core::{
     attributes::{AttrSource, Attrs, MergeAttr, ATTRIBUTES_FILE, MAX_FILE},
     hub::{
-        access::{AccessPolicy, View},
+        access::View,
         land::{ConflictPath, LandResult, LandState},
         project::Change,
     },
-    object::{EntryKind, Object, Snapshot, TreeEntry, Visibility},
+    object::{EntryKind, Object, TreeEntry, Visibility},
     policy::POLICY_FILE,
     secrets::looks_binary,
     vpath::VPath,
     ChangeId, ObjectId,
 };
 
-use super::{edits, rules::RULES_FILE, Entry};
+use super::{edits, rules::RULES_FILE};
 use crate::{
-    auth::{Caller, Person},
-    caches::Epochs,
-    error::{Error, Result},
-    perm::{Project, Viewer},
+    error::Result,
     sync::{self, Source},
-    Hub,
 };
-
-/// Most times one submission is content-merged and re-queued before an
-/// overlap is answered `conflict`.
-pub const MAX_MERGES: u32 = 3;
-
-/// Most merge workers running at once on one server.
-pub const MAX_WORKERS: usize = 8;
 
 /// Largest plain-text file (in bytes) that the server content-merges; above
 /// this, an overlapping edit is answered `conflict` so the client merges it.
@@ -74,19 +55,6 @@ pub const MAX_MERGE_FILE_BYTES: u64 = 1 << 20;
 
 /// The sole message when a conflict involves a path the receiver cannot read.
 pub const HIDDEN_CONFLICT: &str = "conflicts with changes you can't see";
-
-/// Bounded pool of merge workers on this server.
-pub struct Workers {
-    sem: Arc<Semaphore>,
-}
-
-impl Default for Workers {
-    fn default() -> Self {
-        Workers {
-            sem: Arc::new(Semaphore::new(MAX_WORKERS)),
-        }
-    }
-}
 
 /// Details of a conflict on a branch tip (real snapshot IDs, projected for
 /// the viewer by `landing::seen`).
@@ -132,23 +100,6 @@ impl ConflictReport {
             warnings: Vec::new(),
         }
     }
-}
-
-/// A queue row claimed for content merging by a merge worker.
-#[derive(Clone)]
-pub struct Job {
-    pub project: i64,
-    pub project_name: String,
-    pub branch: String,
-    pub seq: i64,
-    pub ticket: String,
-    pub person: Person,
-    pub agent_session: Option<String>,
-    pub stack: Vec<Entry>,
-    pub lineage: i64,
-    pub merges: u32,
-    pub tip: ObjectId,
-    pub claim_token: u64,
 }
 
 /// Read `.veilattributes` from a real tree `tree` in `src`, restricted to
@@ -336,72 +287,6 @@ fn collect_landed_since(
     Ok(out)
 }
 
-/// Quick check during batch build: can this overlapping entry possibly be
-/// content-merged by a merge worker?
-///
-/// Returns `Ok(true)` if a merge worker should be spawned for it, or
-/// `Ok(false)` if it is definitely a conflict (e.g. `merges >= MAX_MERGES`,
-/// a merge commit, touches policy/rules, has a hidden conflict, or an
-/// overlapping path is not a plain-text `Public` file within
-/// [`MAX_MERGE_FILE_BYTES`] on both sides).
-#[allow(clippy::too_many_arguments)]
-pub fn can_merge(
-    src: &Source,
-    view: &View<'_>,
-    merges: u32,
-    snaps: &[Arc<Snapshot>],
-    sets: &[Vec<Change>],
-    base_trees: &[ObjectId],
-    chain_tree: ObjectId,
-) -> Result<bool> {
-    if merges >= MAX_MERGES {
-        return Ok(false);
-    }
-    for ((s, set), parent_tree) in snaps.iter().zip(sets).zip(base_trees) {
-        if s.parents.len() > 1 {
-            return Ok(false);
-        }
-        if set.iter().any(|c| {
-            veil_core::hub::agent::decides_access(&c.path)
-                || c.path == POLICY_FILE
-                || c.path == RULES_FILE
-                || !view.read(&c.path)
-                || !view.write(&c.path)
-        }) {
-            return Ok(false);
-        }
-        if edits::fast_path(src, *parent_tree, chain_tree, set)?.is_none() {
-            continue;
-        }
-        let attrs = Attrs::with_source(
-            Box::new(ServerAttrSource {
-                src,
-                tree: chain_tree,
-                view,
-            }),
-            None,
-        );
-        for c in set {
-            if edits::fast_path(src, *parent_tree, chain_tree, std::slice::from_ref(c))?.is_none() {
-                continue;
-            }
-            if edits::touching(src, chain_tree, *parent_tree, &c.path)?
-                .iter()
-                .any(|m| !view.read(&m.path) || !view.within_narrowing(&m.path))
-            {
-                return Ok(false);
-            }
-            let Some(te) = &c.new else { return Ok(false) };
-            let Some(oe) = sync::entry_at(src, &chain_tree, &c.path)? else { return Ok(false) };
-            let be = sync::entry_at(src, parent_tree, &c.path)?;
-            if !can_merge_entries(&attrs, &c.path, be.as_ref(), &oe, te) {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
-}
-
 fn can_merge_entries(
     attrs: &Attrs<'_>,
     path: &str,
@@ -439,682 +324,65 @@ fn can_merge_entries(
     be.is_some()
 }
 
-/// Spawn a merge worker for `job`.
-pub fn spawn(hub: &Arc<Hub>, job: Job) {
-    let hub = hub.clone();
-    tokio::spawn(async move {
-        struct RenewStop(tokio::task::AbortHandle);
-        impl Drop for RenewStop {
-            fn drop(&mut self) {
-                self.0.abort();
-            }
-        }
-        let renew_task = {
-            let hub = hub.clone();
-            let holder = hub.landing.holder.clone();
-            let (pid, branch, seq, token) = (job.project, job.branch.clone(), job.seq, job.claim_token as i64);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let res = sqlx::query(
-                        "UPDATE landing_queue \
-                         SET result = jsonb_build_object('holder', $4::TEXT, 'token', $5::BIGINT, 'expires_at', (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $6::BIGINT)::TEXT \
-                         WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging' \
-                         AND result IS NOT NULL AND (result::jsonb->>'holder') = $4 AND (result::jsonb->>'token')::BIGINT = $5",
-                    )
-                    .bind(pid)
-                    .bind(&branch)
-                    .bind(seq)
-                    .bind(&holder)
-                    .bind(token)
-                    .bind(super::LEASE_MS)
-                    .execute(&hub.db)
-                    .await;
-                    if let Ok(r) = res {
-                        if r.rows_affected() == 0 {
-                            break;
-                        }
-                    }
-                }
-            })
-        };
-        let renew_guard = RenewStop(renew_task.abort_handle());
-        let _permit = hub.landing.merges.sem.clone().acquire_owned().await.ok();
-        loop {
-            match run_worker(&hub, job.clone()).await {
-                Ok(()) => break,
-                Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-                Err(e) => {
-                    eprintln!("veil-server: merge worker failed: {e:?}");
-                    drop(renew_guard);
-                    let _ = sqlx::query(
-                        "UPDATE landing_queue SET state = 'queued', result = NULL \
-                         WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging' \
-                         AND result IS NOT NULL AND (result::jsonb->>'holder') = $4 AND (result::jsonb->>'token')::BIGINT = $5",
-                    )
-                    .bind(job.project)
-                    .bind(&job.branch)
-                    .bind(job.seq)
-                    .bind(&hub.landing.holder)
-                    .bind(job.claim_token as i64)
-                    .execute(&hub.db)
-                    .await;
-                    super::ensure(&hub, job.project, &job.branch);
-                    break;
-                }
-            }
-        }
-    });
+/// A change merged onto a tip by [`merge_onto`].
+pub(super) struct Merged {
+    /// Its edits onto the tip: the merged ones where the tip changed.
+    pub set: Vec<Change>,
+    /// The merged files' blobs.
+    pub blobs: Vec<(ObjectId, Bytes)>,
+    /// The bytes of the three versions of the files merged.
+    pub read: usize,
 }
 
-enum WorkerOutcome {
-    Requeued {
-        stack: Vec<Entry>,
-        objects: Vec<(ObjectId, Bytes)>,
-        snapshots: Vec<ObjectId>,
-        origins: Vec<(ObjectId, ObjectId)>,
-        onto: ObjectId,
-        change_id: Option<ChangeId>,
-    },
-    Conflict(ConflictReport),
-    Rejected(String, Option<ChangeId>),
-}
-
-async fn run_worker(hub: &Arc<Hub>, mut job: Job) -> Result<()> {
-    // 1. Re-open the project, viewer and submitting agent session as the
-    //    submitter is *now* (current access epochs), so revoked access or an
-    //    expired/revoked agent session is caught before any merge lands.
-    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, job.project).await?;
-    let session_gone = if let Some(sh) = &job.agent_session {
-        match crate::auth::load_agent_session(&hub.db, sh, job.person.id, job.project).await? {
-            Some(grant) => {
-                job.person.agent = Some(grant);
-                false
-            }
-            None => true,
-        }
-    } else {
-        false
-    };
-    let epochs_rows: Vec<(i64, i64, i64)> = sqlx::query_as(
-        "SELECT project_id, person_id, epoch FROM access_epochs WHERE (project_id = 0 AND person_id = $1) OR (project_id = $2 AND person_id = 0)",
-    )
-    .bind(job.person.id)
-    .bind(job.project)
-    .fetch_all(&hub.db)
-    .await?;
-    let person_epoch = epochs_rows.iter().find(|e| e.0 == 0 && e.1 == job.person.id).map_or(0, |e| e.2);
-    let project_epoch = epochs_rows.iter().find(|e| e.0 == job.project && e.1 == 0).map_or(0, |e| e.2);
-    let caller = Caller {
-        person: Some(job.person.clone()),
-        epochs: Epochs {
-            person: person_epoch,
-            project: Some((job.project, project_epoch)),
-            gc: Some((job.project, gc_epoch)),
-        },
-    };
-    let who = if session_gone {
-        Err("this agent session has expired or been revoked: sign in again".to_string())
-    } else {
-        match crate::perm::open(hub, &job.project_name, &caller).await {
-            Ok((p, v)) if p.participant(&v) => Ok((Arc::new(p), v)),
-            Ok(_) | Err(Error::Api { code: "not_found", .. }) => Err("you are no longer in this project".to_string()),
-            Err(Error::Api { message, code: "forbidden", .. }) => Err(message),
-            Err(e) => return Err(e),
-        }
-    };
-
-    // Read the current tip and lineage of the branch from the database.
-    let branch_row: Option<(String, i64)> =
-        sqlx::query_as("SELECT target, lineage FROM branches WHERE project_id = $1 AND name = $2")
-            .bind(job.project)
-            .bind(&job.branch)
-            .fetch_optional(&hub.db)
-            .await?;
-
-    let outcome = match (who, branch_row) {
-        (Err(why), _) => WorkerOutcome::Rejected(why, None),
-        (_, None) => WorkerOutcome::Rejected(format!("there is no branch '{}'", job.branch), None),
-        (Ok((project, viewer)), Some((tip_hex, lineage))) => {
-            if lineage != job.lineage {
-                WorkerOutcome::Rejected(
-                    "the branch was reset since this change was submitted (a forced push, or deleted and made again): submit it again".into(),
-                    None,
-                )
-            } else {
-                let tip = ObjectId::from_hex(&tip_hex).map_err(|e| Error::Other(e.into()))?;
-                let h = hub.clone();
-                let j = job.clone();
-                let rt = tokio::runtime::Handle::current();
-                tokio::task::spawn_blocking(move || merge_stack(h, rt, project, viewer, j, tip))
-                    .await
-                    .map_err(|e| Error::Other(e.into()))??
-            }
-        }
-    };
-
-    match outcome {
-        WorkerOutcome::Requeued {
-            stack,
-            objects,
-            snapshots,
-            origins,
-            onto,
-            change_id,
-        } => {
-            sync::put_all(hub, job.project, objects).await?;
-            let empty_fresh = HashMap::new();
-            let mut snap_authors = Vec::with_capacity(origins.len());
-            for (_, o) in &origins {
-                let a = super::snapshot_author(hub, job.project, *o, &empty_fresh).await?.unwrap_or(job.person.id);
-                snap_authors.push(a);
-            }
-            let snap_hex: Vec<String> = snapshots.iter().map(ObjectId::hex).collect();
-            let orig_real: Vec<String> = origins.iter().map(|(r, _)| r.hex()).collect();
-            let orig_src: Vec<String> = origins.iter().map(|(_, o)| o.hex()).collect();
-            let encoded = super::encode_stack(&stack);
-            let pid = job.project;
-            let person_id = job.person.id;
-            let agent_session = job.agent_session.clone();
-            let branch = job.branch.clone();
-            let seq = job.seq;
-            let holder = hub.landing.holder.clone();
-            let claim_token = job.claim_token as i64;
-            let max_merges = i64::from(MAX_MERGES);
-            let requeue_out: std::result::Result<Option<i64>, String> =
-                crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-                    let (snap_hex, snap_authors, orig_real, orig_src, encoded, branch, agent_session, holder) = (
-                        snap_hex.clone(),
-                        snap_authors.clone(),
-                        orig_real.clone(),
-                        orig_src.clone(),
-                        encoded.clone(),
-                        branch.clone(),
-                        agent_session.clone(),
-                        holder.clone(),
-                    );
-                    Box::pin(async move {
-                        crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
-                        if let Some(sh) = &agent_session {
-                            if crate::auth::load_agent_session(&mut *c, sh, person_id, pid).await?.is_none() {
-                                return Ok(Err("this agent session has expired or been revoked: sign in again".to_string()));
-                            }
-                        }
-                        if !snap_hex.is_empty() {
-                            sqlx::query(
-                                "INSERT INTO snapshots (project_id, id, author) SELECT $1, s, a FROM unnest($2::TEXT[], $3::BIGINT[]) AS v(s, a) \
-                                 ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0",
-                            )
-                            .bind(pid)
-                            .bind(&snap_hex)
-                            .bind(&snap_authors)
-                            .execute(&mut *c)
-                            .await?;
-                        }
-                        if !orig_real.is_empty() {
-                            sqlx::query(
-                                "INSERT INTO origins (project_id, real_id, origin_id) \
-                                 SELECT $1, r, o FROM unnest($2::TEXT[], $3::TEXT[]) AS v(r, o) ON CONFLICT DO NOTHING",
-                            )
-                            .bind(pid)
-                            .bind(&orig_real)
-                            .bind(&orig_src)
-                            .execute(&mut *c)
-                            .await?;
-                        }
-                        let m: Option<i64> = sqlx::query_scalar(
-                            "UPDATE landing_queue SET state = 'queued', result = NULL, stack = $4, merges = merges + 1, \
-                             created_at = (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT \
-                             WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging' AND merges < $5 \
-                             AND result IS NOT NULL AND (result::jsonb->>'holder') = $6 AND (result::jsonb->>'token')::BIGINT = $7 \
-                             RETURNING merges",
-                        )
-                        .bind(pid)
-                        .bind(&branch)
-                        .bind(seq)
-                        .bind(&encoded)
-                        .bind(max_merges)
-                        .bind(&holder)
-                        .bind(claim_token)
-                        .fetch_optional(&mut *c)
-                        .await?;
-                        Ok(Ok(m))
-                    })
-                })
-                .await?;
-
-            for s in &snapshots {
-                hub.caches.put_committed(job.project, s);
-            }
-            match requeue_out {
-                Ok(Some(m)) => {
-                    let mut r = super::queued(&job.ticket);
-                    r.change_id = change_id;
-                    r.onto = Some(onto);
-                    r.merges = m as u32;
-                    crate::events::emit_ticket(
-                        hub,
-                        job.project,
-                        &job.branch,
-                        job.person.id,
-                        "land.requeued",
-                        "requeued",
-                        r,
-                    )
-                    .await;
-                    super::ensure(hub, job.project, &job.branch);
-                }
-                Ok(None) => {}
-                Err(why) => {
-                    let mut res = super::queued(&job.ticket);
-                    res.state = LandState::Rejected;
-                    res.change_id = change_id;
-                    res.message = Some(why);
-                    res.merges = job.merges;
-                    finish_terminal(hub, &job, gc_epoch, "rejected", "land.rejected", res).await?;
-                }
-            }
-        }
-        WorkerOutcome::Conflict(report) => {
-            let res = report.into_result(&job.ticket, &job.branch);
-            finish_terminal(hub, &job, gc_epoch, "conflict", "land.conflict", res).await?;
-        }
-        WorkerOutcome::Rejected(why, cid) => {
-            let mut res = super::queued(&job.ticket);
-            res.state = LandState::Rejected;
-            res.change_id = cid;
-            res.message = Some(why);
-            res.merges = job.merges;
-            finish_terminal(hub, &job, gc_epoch, "rejected", "land.rejected", res).await?;
-        }
+/// Merge the edits `set` of a change, made on `parent_tree`, onto the tree
+/// `chain_tree` that changed some of their paths since: `None` when it
+/// cannot be merged cleanly (a conflict), which is when it is a merge
+/// snapshot (`parents` of more than one), changes what decides access or
+/// review, holds a path `view` may not read or write, overlaps a change
+/// of the tip's at a path `view` does not see whole, or a path's three
+/// versions do not merge cleanly ([`merge_entry_bytes`]).
+pub(super) fn merge_onto(
+    src: &Source,
+    view: &View<'_>,
+    parents: usize,
+    set: &[Change],
+    parent_tree: ObjectId,
+    chain_tree: ObjectId,
+) -> Result<Option<Merged>> {
+    if parents > 1 {
+        return Ok(None);
     }
-    Ok(())
-}
-
-async fn finish_terminal(
-    hub: &Arc<Hub>,
-    job: &Job,
-    gc_epoch: i64,
-    state_str: &str,
-    event_name: &str,
-    res: LandResult,
-) -> Result<()> {
-    let text = serde_json::to_string(&res).unwrap_or_default();
-    let pid = job.project;
-    let branch = job.branch.clone();
-    let seq = job.seq;
-    let holder = hub.landing.holder.clone();
-    let claim_token = job.claim_token as i64;
-    let state_owned = state_str.to_string();
-    let n = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
-        let (branch, state_owned, text, holder) = (branch.clone(), state_owned.clone(), text.clone(), holder.clone());
-        Box::pin(async move {
-            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
-            Ok(sqlx::query(
-                "UPDATE landing_queue SET state = $4, result = $5, done_at = $6 \
-                 WHERE project_id = $1 AND branch = $2 AND seq = $3 AND state = 'merging' \
-                 AND result IS NOT NULL AND (result::jsonb->>'holder') = $7 AND (result::jsonb->>'token')::BIGINT = $8",
-            )
-            .bind(pid)
-            .bind(&branch)
-            .bind(seq)
-            .bind(&state_owned)
-            .bind(&text)
-            .bind(veil_core::now_millis())
-            .bind(&holder)
-            .bind(claim_token)
-            .execute(&mut *c)
-            .await?
-            .rows_affected())
-        })
-    })
-    .await?;
-    if n == 1 {
-        match res.state {
-            LandState::Conflict => {
-                hub.landing.stats.conflicts.fetch_add(1, Ordering::Relaxed);
-                hub.limits.health.record(
-                    job.project,
-                    &crate::limits::health::Counts {
-                        landing_conflicts: 1,
-                        ..Default::default()
-                    },
-                );
-            }
-            LandState::Rejected => {
-                hub.landing.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                hub.limits.health.record(
-                    job.project,
-                    &crate::limits::health::Counts {
-                        landing_rejected: 1,
-                        ..Default::default()
-                    },
-                );
-            }
-            _ => {}
-        }
-        crate::events::emit_ticket(
-            hub,
-            job.project,
-            &job.branch,
-            job.person.id,
-            event_name,
-            state_str,
-            res.clone(),
-        )
-        .await;
-        let is_revert = job.ticket.starts_with("revert-");
-        hub.landing.resolve([(job.ticket.clone(), res)]);
-        if is_revert {
-            let _ = crate::bisect::sync_revert_outcome(hub, job.project, &job.branch).await;
-        }
+    if set.iter().any(|c| {
+        veil_core::hub::agent::decides_access(&c.path)
+            || c.path == POLICY_FILE
+            || c.path == RULES_FILE
+            || !view.read(&c.path)
+            || !view.write(&c.path)
+    }) {
+        return Ok(None);
     }
-    Ok(())
-}
-
-/// Perform the three-way content merge of `job.stack` onto `tip`, verifying
-/// whole-change visibility (Guarantee 1) and `sync::complete` on the new
-/// parents.
-fn merge_stack(
-    hub: Arc<Hub>,
-    rt: tokio::runtime::Handle,
-    project: Arc<Project>,
-    viewer: Viewer,
-    job: Job,
-    tip: ObjectId,
-) -> Result<WorkerOutcome> {
-    let mut src = Source {
-        hub: hub.clone(),
-        project: job.project,
-        rt,
-        pending: HashMap::new(),
-        staged: None,
-    };
-    let view = project.view(&viewer);
-    let tip_tree = src.snapshot(&tip)?.tree;
-    let tip_policy = AccessPolicy::parse(&sync::policy_text(&src, &tip_tree)?);
-    let tip_project = Project {
-        id: project.id,
-        name: project.name.clone(),
-        default_branch: project.default_branch.clone(),
-        policy: tip_policy,
-        policy_text: String::new(),
-        bindings: project.bindings.clone(),
-    };
-    let tip_view = tip_project.view(&viewer);
-
-    let snaps: Vec<Arc<Snapshot>> = job.stack.iter().map(|e| src.snapshot(&e.id)).collect::<veil_core::Result<_>>()?;
-    let last_cid = snaps.last().map(|s| s.change_id);
-
-    if job.merges >= MAX_MERGES {
-        let e = &job.stack[0];
-        let s = &snaps[0];
-        let against = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) { e.base } else { s.parents[0] };
-        let parent_tree = src.snapshot(&against)?.tree;
-        let set = edits::edit_set(&src, s.tree, parent_tree)?;
-        let report = build_conflict(&src, &view, against, parent_tree, tip, tip_tree, &set, job.merges, last_cid)?;
-        return Ok(WorkerOutcome::Conflict(report));
-    }
-
-    let mut chain = tip;
-    let mut chain_tree = tip_tree;
-    let mut new_stack = Vec::with_capacity(job.stack.len());
-    let mut objects: Vec<(ObjectId, Bytes)> = Vec::new();
-    let mut held_bytes: usize = 0;
-    let mut snapshots: Vec<ObjectId> = Vec::new();
-    let mut origins: Vec<(ObjectId, ObjectId)> = Vec::new();
-
-    for (e, s) in job.stack.iter().zip(&snaps) {
-        let sid = e.id;
-        let against = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) { e.base } else { s.parents[0] };
-        let parent_tree = src.snapshot(&against)?.tree;
-        let set = edits::edit_set(&src, s.tree, parent_tree)?;
-
-        if viewer.agent {
-            let default = job.branch == project.default_branch;
-            for v in [&view, &tip_view] {
-                match sync::agent_tip(&src, v, default, Some(against), sid)? {
-                    Some(sync::AgentTip::Narrowed) => return Ok(WorkerOutcome::Rejected(sync::NARROWED_MOVE.into(), last_cid)),
-                    Some(sync::AgentTip::Access) => return Ok(WorkerOutcome::Rejected(sync::AGENT_ACCESS_MOVE.into(), last_cid)),
-                    Some(sync::AgentTip::DefaultBranch) => return Ok(WorkerOutcome::Rejected(sync::AGENT_DEFAULT_BRANCH.into(), last_cid)),
-                    None => {}
-                }
-            }
+    let attrs = Attrs::with_source(Box::new(ServerAttrSource { src, tree: chain_tree, view }), None);
+    let mut out = Merged { set: Vec::with_capacity(set.len()), blobs: Vec::new(), read: 0 };
+    for c in set {
+        if edits::fast_path(src, parent_tree, chain_tree, std::slice::from_ref(c))?.is_none() {
+            out.set.push(c.clone());
+            continue;
         }
-
-        // Guarantee 1: A merge never lands anything its submitter couldn't
-        // see whole. Every edit of the change must be readable and writable
-        // by the submitter under both current permissions and the tip's
-        // policy; a hidden edit is refused without naming its path.
-        if (!viewer.admin || view.is_narrowed() || tip_view.is_narrowed())
-            && set.iter().any(|c| {
-                !view.read(&c.path)
-                    || !tip_view.read(&c.path)
-                    || !view.within_narrowing(&c.path)
-                    || !tip_view.within_narrowing(&c.path)
-            })
-        {
-            let msg = if view.is_narrowed() || tip_view.is_narrowed() {
-                sync::NARROWED_MOVE.into()
-            } else {
-                "your access changed since this change was submitted, and it holds edits you cannot see: make it again".into()
-            };
-            return Ok(WorkerOutcome::Rejected(msg, last_cid));
-        }
-        if let Some(c) = set
+        if edits::touching(src, chain_tree, parent_tree, &c.path)?
             .iter()
-            .find(|c| (!viewer.admin || viewer.agent) && (!view.write(&c.path) || !tip_view.write(&c.path)))
+            .any(|m| !view.read(&m.path) || !view.within_narrowing(&m.path))
         {
-            let msg = if viewer.agent && veil_core::hub::agent::decides_access(&c.path) {
-                format!("an agent session never changes '{}', which decides access or review", c.path)
-            } else if !view.within_narrowing(&c.path) || !tip_view.within_narrowing(&c.path) {
-                sync::NARROWED_MOVE.to_string()
-            } else {
-                format!("you may not write '{}'", c.path)
-            };
-            return Ok(WorkerOutcome::Rejected(msg, last_cid));
+            return Ok(None);
         }
-        if s.parents.len() > 1 {
-            return Ok(WorkerOutcome::Rejected(
-                "a merge lands only on the tip it was made on: merge the branch's new tip and land again".into(),
-                last_cid,
-            ));
-        }
-
-        let mut merged_set = Vec::with_capacity(set.len());
-        if edits::fast_path(&src, parent_tree, chain_tree, &set)?.is_none() {
-            merged_set = set.clone();
-        } else {
-            let mut new_blobs = Vec::new();
-            {
-                let attrs = Attrs::with_source(
-                    Box::new(ServerAttrSource {
-                        src: &src,
-                        tree: chain_tree,
-                        view: &view,
-                    }),
-                    None,
-                );
-                for c in &set {
-                    if edits::fast_path(&src, parent_tree, chain_tree, std::slice::from_ref(c))?.is_none() {
-                        merged_set.push(c.clone());
-                        continue;
-                    }
-                    if edits::touching(&src, chain_tree, parent_tree, &c.path)?.iter().any(|m| {
-                        !view.read(&m.path)
-                            || !tip_view.read(&m.path)
-                            || !view.within_narrowing(&m.path)
-                            || !tip_view.within_narrowing(&m.path)
-                    }) {
-                        let report = build_conflict(&src, &view, against, parent_tree, chain, chain_tree, &set, job.merges, last_cid)?;
-                        return Ok(WorkerOutcome::Conflict(report));
-                    }
-                    let Some(te) = &c.new else {
-                        let report = build_conflict(&src, &view, against, parent_tree, chain, chain_tree, &set, job.merges, last_cid)?;
-                        return Ok(WorkerOutcome::Conflict(report));
-                    };
-                    let Some(oe) = sync::entry_at(&src, &chain_tree, &c.path)? else {
-                        let report = build_conflict(&src, &view, against, parent_tree, chain, chain_tree, &set, job.merges, last_cid)?;
-                        return Ok(WorkerOutcome::Conflict(report));
-                    };
-                    let be = sync::entry_at(&src, &parent_tree, &c.path)?;
-                    match merge_entry_bytes(&src, &attrs, &c.path, be.as_ref(), &oe, te)? {
-                        Some((merged_entry, blob_raw)) => {
-                            if let Some((bid, braw)) = blob_raw {
-                                new_blobs.push((bid, braw));
-                            }
-                            merged_set.push(Change {
-                                path: c.path.clone(),
-                                old: Some(oe),
-                                new: Some(merged_entry),
-                            });
-                        }
-                        None => {
-                            let report = build_conflict(&src, &view, against, parent_tree, chain, chain_tree, &set, job.merges, last_cid)?;
-                            return Ok(WorkerOutcome::Conflict(report));
-                        }
-                    }
-                }
-            }
-            for (bid, braw) in new_blobs {
-                held_bytes += braw.len();
-                src.pending.insert(bid, braw.clone());
-                objects.push((bid, braw));
-            }
-        }
-
-        let mut made = HashMap::new();
-        let tree = match edits::apply(&src, chain_tree, &merged_set, &mut made)? {
-            Ok(t) => t,
-            Err(_) => {
-                let report = build_conflict(&src, &view, against, parent_tree, chain, chain_tree, &set, job.merges, last_cid)?;
-                return Ok(WorkerOutcome::Conflict(report));
-            }
-        };
-        for (id, (raw, _)) in made {
-            let b = Bytes::from(raw);
-            held_bytes += b.len();
-            src.pending.insert(id, b.clone());
-            objects.push((id, b));
-        }
-
-        // The landing check on the merged edit set.
-        let actual_diff = edits::edit_set(&src, tree, chain_tree)?;
-        if !edits::same_edits(&actual_diff, &merged_set) {
-            return Ok(WorkerOutcome::Rejected(
-                "the server could not merge this change: its landing check failed".into(),
-                last_cid,
-            ));
-        }
-        // Guarantee 1: verify that the submitter sees the resulting diff whole.
-        if (!viewer.admin || viewer.agent)
-            && actual_diff.iter().any(|c| {
-                !view.read(&c.path)
-                    || !view.write(&c.path)
-                    || !tip_view.read(&c.path)
-                    || !tip_view.write(&c.path)
-            })
-        {
-            let msg = if let Some(c) = actual_diff
-                .iter()
-                .find(|c| viewer.agent && veil_core::hub::agent::decides_access(&c.path))
-            {
-                format!("an agent session never changes '{}', which decides access or review", c.path)
-            } else if actual_diff
-                .iter()
-                .any(|c| !view.within_narrowing(&c.path) || !tip_view.within_narrowing(&c.path))
-            {
-                sync::NARROWED_MOVE.to_string()
-            } else {
-                "your access changed since this change was submitted, and it no longer lands as it was made: make it again".into()
-            };
-            return Ok(WorkerOutcome::Rejected(msg, last_cid));
-        }
-
-        let mut preds = vec![sid];
-        if job.merges > 0 {
-            for p in &s.predecessors {
-                if !preds.contains(p) {
-                    preds.push(*p);
-                }
-            }
-        }
-        let parents = vec![chain];
-        let mut n = Snapshot {
-            parents: parents.clone(),
-            change_id: s.change_id,
-            tree,
-            description: s.description.clone(),
-            author: s.author.clone(),
-            agent: s.agent.clone(),
-            abandoned: None,
-            attempts: s.attempts.clone(),
-            timestamp: s.timestamp,
-            predecessors: preds,
-            conflicts: vec![],
-            embargo: None,
-            signature: None,
-        };
-        n.sign(&hub.identity);
-        let raw = Bytes::from(Object::Snapshot(n.clone()).encode());
-        let id = ObjectId::hash(&raw);
-        held_bytes += raw.len();
-        src.pending.insert(id, raw.clone());
-        objects.push((id, raw));
-        snapshots.push(id);
-        origins.push((id, sid));
-
-        if viewer.agent {
-            let default = job.branch == project.default_branch;
-            for v in [&view, &tip_view] {
-                match sync::agent_tip(&src, v, default, Some(chain), id)? {
-                    Some(sync::AgentTip::Narrowed) => return Ok(WorkerOutcome::Rejected(sync::NARROWED_MOVE.into(), last_cid)),
-                    Some(sync::AgentTip::Access) => return Ok(WorkerOutcome::Rejected(sync::AGENT_ACCESS_MOVE.into(), last_cid)),
-                    Some(sync::AgentTip::DefaultBranch) => return Ok(WorkerOutcome::Rejected(sync::AGENT_DEFAULT_BRANCH.into(), last_cid)),
-                    None => {}
-                }
-            }
-        }
-
-        // Full push check (`sync::complete`) on the new parent so secret scan,
-        // session narrowing and graft equivalence hold on the merged snapshot.
-        if let Err(why) = super::service::recheck_merged(&mut src, &project, &viewer, &n, &parents, &merged_set, &hub.identity)? {
-            return Ok(WorkerOutcome::Rejected(why, last_cid));
-        }
-
-        if held_bytes >= super::service::BATCH_BYTES && !objects.is_empty() {
-            let batch = std::mem::take(&mut objects);
-            for (oid, _) in &batch {
-                src.pending.remove(oid);
-            }
-            src.rt.block_on(sync::put_all(&hub, src.project, batch))?;
-            held_bytes = 0;
-        }
-
-        new_stack.push(Entry::plain(id, chain));
-        chain = id;
-        chain_tree = tree;
+        let Some(te) = &c.new else { return Ok(None) };
+        let Some(oe) = sync::entry_at(src, &chain_tree, &c.path)? else { return Ok(None) };
+        let be = sync::entry_at(src, &parent_tree, &c.path)?;
+        out.read += (oe.size + te.size + be.as_ref().map_or(0, |b| b.size)) as usize;
+        let Some((merged, blob)) = merge_entry_bytes(src, &attrs, &c.path, be.as_ref(), &oe, te)? else { return Ok(None) };
+        out.blobs.extend(blob);
+        out.set.push(Change { path: c.path.clone(), old: Some(oe), new: Some(merged) });
     }
-
-    if let Some(first) = new_stack.first_mut() {
-        first.review = match job.stack.first().and_then(|e| e.review.clone()) {
-            Some(c) => Some(c),
-            None => crate::prs::stack_review_diff(&src, &job.stack)
-                .ok()
-                .map(|d| super::ReviewClaim::Patch { patch: d.patch }),
-        };
-    }
-
-    Ok(WorkerOutcome::Requeued {
-        stack: new_stack,
-        objects,
-        snapshots,
-        origins,
-        onto: tip,
-        change_id: last_cid,
-    })
+    Ok(Some(out))
 }
 
 type MergedEntry = (TreeEntry, Option<(ObjectId, Bytes)>);

@@ -125,8 +125,8 @@ fn bug_1955_vl_land_waits_for_a_full_queue_and_says_so() {
 /// built on one, byte for byte: the same objects, the same snapshots,
 /// projections and landing records in the same order, the same tip, and
 /// the same answer for every entry. Seeded batches of two people's changes:
-/// new files, edits of one shared file (the second of two overlaps: handed
-/// to a merge), and two changes adding one path (the second conflicts).
+/// new files, edits of one shared file (the second of two overlaps: merged
+/// in the batch), and two changes adding one path (the second conflicts).
 /// And what the service then lands is what the build on one thread said.
 #[test]
 fn bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one() {
@@ -167,7 +167,7 @@ fn bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one() {
         let [one, several] = hub.rt.block_on(veil_server::landing::build_both_ways(&hub.hub(), pid, "main", 8)).expect("the batch builds both ways");
         let count = |what: &str| one.iter().filter(|l| l.contains(what)).count();
         assert!(count("object ") > 100 && count(" landed as ") >= 20, "seed {seed}: {} objects, {} landed", count("object "), count(" landed as "));
-        assert!(count(" merging on ") >= 1 && count(" conflict ") >= 1, "seed {seed}: {} merging, {} conflicts", count(" merging on "), count(" conflict "));
+        assert!(count(" merged true") >= 1 && count(" conflict ") >= 1, "seed {seed}: {} merged, {} conflicts", count(" merged true"), count(" conflict "));
         assert!(count("memo ") >= 20, "seed {seed}: {} projections", count("memo "));
         for (a, b) in one.iter().zip(&several) {
             assert_eq!(a, b, "seed {seed}");
@@ -180,19 +180,12 @@ fn bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one() {
         release_branch(&hub, pid, "main");
         for (who, t) in &tickets {
             let token = [&dev, &admin][*who];
-            let mut v = wait_ticket(&api, token, &p.name, t);
-            // (A merged change that was queued again is waited for again.)
-            for _ in 0..200 {
-                if v["state"] != "queued" && v["state"] != "merging" {
-                    break;
-                }
-                v = wait_ticket(&api, token, &p.name, t);
-            }
+            let v = wait_ticket(&api, token, &p.name, t);
             assert!(v["state"] == "landed" || v["state"] == "conflict", "seed {seed}: {v}");
             if let (1, Some(line)) = (*who, one.iter().find(|l| l.starts_with(&format!("{t} landed as ")))) {
                 assert_eq!(v["state"], "landed", "seed {seed}: {v}");
                 let landed: Vec<String> = v["landed"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
-                assert_eq!(*line, format!("{t} landed as {landed:?}"), "seed {seed}");
+                assert!(line.starts_with(&format!("{t} landed as {landed:?} merged ")), "seed {seed}: {line}");
             }
         }
     }
@@ -270,11 +263,10 @@ fn bug_1955_a_batch_lands_only_once_its_objects_are_stored() {
 
 /// BUG-1956: changes that each merge cleanly with all the others (twelve
 /// edits of twelve different lines of one file, all on one base) all land.
-/// Today a batch lands only the first of them and sends the rest to a
-/// merge each; after `MAX_MERGES` (3) rounds the ones left are answered
+/// Until the fix a batch landed only the first of them and sent the rest
+/// to a merge each; after three rounds the ones left were answered
 /// `conflict`, though nothing conflicts.
 #[test]
-#[ignore = "BUG-1956: more than about four clean overlaps of one file in flight at once are answered conflict after three merges"]
 fn bug_1956_clean_overlaps_of_one_file_all_land() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -315,6 +307,117 @@ fn bug_1956_clean_overlaps_of_one_file_all_land() {
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let want: String = (0..40).map(|i| if i % 3 == 0 && i < 36 { format!("line {i} edited\n") } else { format!("line {i}\n") }).collect();
     assert_eq!(String::from_utf8_lossy(&r.body), want);
+}
+
+/// BUG-1956: the queue's answers are a serial landing's. Seeded runs of
+/// 80 changes of one person, each editing one or two lines of one of three
+/// shared files, all made on one base (so most overlap what lands before
+/// them, and some truly conflict): each change is answered `landed` exactly
+/// when a three-way merge onto everything landed before it in the queue's
+/// order is clean, and `conflict` otherwise; each landed change lands once,
+/// in that order (the file at its landed snapshot is the serial result after
+/// it); and the branch ends as the serial run does.
+#[test]
+fn bug_1956_overlapping_landings_are_answered_as_landing_them_one_by_one_in_order() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let files: Vec<(String, String)> =
+        (0..3).map(|f| (format!("src/serial/f{f}.txt"), (0..30).map(|i| format!("file {f} line {i}\n")).collect())).collect();
+    for (path, text) in &files {
+        let made = land_edit(&api, &dev, &p.name, api.tips(Some(&dev), &p.name).unwrap().branches["main"], path, text, true);
+        assert_eq!(made.status, 200, "{}", String::from_utf8_lossy(&made.body));
+        assert_eq!(made.json()["state"], "landed", "{}", made.json());
+    }
+    for seed in 1..=2u64 {
+        let mut state = seed.wrapping_mul(0x9e3779b97f4a7c15);
+        let mut next = |n: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % n
+        };
+        let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+        let start: Vec<String> = files
+            .iter()
+            .map(|(path, _)| {
+                let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path={path}", p.name, base.hex()));
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                String::from_utf8(r.body).unwrap()
+            })
+            .collect();
+        hold_branch(&hub, pid, "main");
+        let mut submitted: Vec<(usize, String, String)> = Vec::new();
+        for i in 0..80 {
+            let f = next(3) as usize;
+            let mut lines: Vec<String> = start[f].lines().map(|l| format!("{l}\n")).collect();
+            let at = next(30) as usize;
+            lines[at] = format!("{seed}/{i} edited line {at}\n");
+            if next(3) == 0 {
+                let other = next(30) as usize;
+                lines[other] = format!("{seed}/{i} edited line {other}\n");
+            }
+            let text: String = lines.concat();
+            let r = land_edit(&api, &dev, &p.name, base, &files[f].0, &text, false);
+            assert_eq!(r.status, 200, "seed {seed}, submit {i}: {}", String::from_utf8_lossy(&r.body));
+            assert_eq!(r.json()["state"], "queued", "seed {seed}, submit {i}: {}", r.json());
+            submitted.push((f, text, r.json()["ticket"].as_str().unwrap().to_string()));
+        }
+        // The serial reference: each change in the queue's order, merged
+        // onto what landed before it.
+        let mut now = start.clone();
+        let mut want: Vec<Option<String>> = Vec::new();
+        for (f, text, _) in &submitted {
+            let merged = if now[*f] == start[*f] {
+                Ok(text.as_bytes().to_vec())
+            } else {
+                veil_core::textmerge::merge(start[*f].as_bytes(), now[*f].as_bytes(), text.as_bytes(), 7, veil_core::textmerge::Style::Diff3)
+            };
+            match merged {
+                Ok(m) => {
+                    now[*f] = String::from_utf8(m).unwrap();
+                    want.push(Some(now[*f].clone()));
+                }
+                Err(_) => want.push(None),
+            }
+        }
+        let landing = want.iter().filter(|w| w.is_some()).count();
+        assert!(landing >= 20 && landing < 80, "seed {seed}: the seed gives {landing} landings of 80, too few or no conflict");
+        release_branch(&hub, pid, "main");
+        let mut seen = std::collections::HashSet::new();
+        for ((f, _, ticket), want) in submitted.iter().zip(&want) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let v = loop {
+                let r = api.get(Some(&dev), &format!("/v1/projects/{}/land/{ticket}", p.name));
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                let v = r.json();
+                if v["state"] != "queued" && v["state"] != "merging" {
+                    break v;
+                }
+                assert!(std::time::Instant::now() < deadline, "seed {seed}: {ticket} still {v}");
+                std::thread::sleep(Duration::from_millis(25));
+            };
+            match want {
+                Some(text) => {
+                    assert_eq!(v["state"], "landed", "seed {seed}: the serial landing lands {ticket}: {v}");
+                    let landed = v["landed"].as_array().unwrap();
+                    assert_eq!(landed.len(), 1, "{v}");
+                    let at = landed[0].as_str().unwrap();
+                    assert!(seen.insert(at.to_string()), "seed {seed}: {at} answered twice");
+                    let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={at}&path={}", p.name, files[*f].0));
+                    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                    assert_eq!(String::from_utf8_lossy(&r.body), *text, "seed {seed}: {ticket} landed in its place");
+                }
+                None => assert_eq!(v["state"], "conflict", "seed {seed}: the serial landing refuses {ticket}: {v}"),
+            }
+        }
+        let tip = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+        for (f, (path, _)) in files.iter().enumerate() {
+            let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path={path}", p.name, tip.hex()));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            assert_eq!(String::from_utf8_lossy(&r.body), now[f], "seed {seed}: {path} at the tip");
+        }
+    }
 }
 
 /// A proxy in front of the test's S3 store that holds every `PUT` while

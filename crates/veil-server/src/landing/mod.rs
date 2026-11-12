@@ -375,8 +375,8 @@ pub struct Stats {
     /// change is on the branch: neither its tip nor a landing (BUG-1275).
     pub walks: AtomicU64,
     /// Submits told to come back because the branch's queue was full
-    /// (`limits::pressure`, BUG-1955), and queue entries handed to merge
-    /// workers.
+    /// (`limits::pressure`, BUG-1955), and entries landed merged by
+    /// content (BUG-1956).
     pub queue_full: AtomicU64,
     pub merging: AtomicU64,
 }
@@ -404,10 +404,6 @@ pub struct Services {
     waiting_by_person: Mutex<HashMap<i64, usize>>,
     /// The branches whose waiters here a poller answers (`poll`).
     pollers: Mutex<std::collections::HashSet<(i64, String)>>,
-    /// Monotonic token distinguishing merge-worker claims (`BUG-1883`).
-    next_claim: AtomicU64,
-    /// Content merge workers running on this server (S18).
-    pub merges: merge::Workers,
     /// What this server knows of each branch's queue, for early
     /// back-pressure (`limits::pressure`, BUG-1955).
     pub pressure: crate::limits::pressure::Gauges,
@@ -426,8 +422,6 @@ impl Default for Services {
             next_waiter: AtomicU64::new(1),
             waiting_by_person: Mutex::new(HashMap::new()),
             pollers: Mutex::new(Default::default()),
-            next_claim: AtomicU64::new(1),
-            merges: merge::Workers::default(),
             pressure: Default::default(),
             stats: Stats::default(),
         }
@@ -455,10 +449,6 @@ pub struct Waiter {
 }
 
 impl Services {
-    pub(crate) fn next_claim_token(&self) -> u64 {
-        self.next_claim.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Wait here for `ticket`'s outcome.
     pub fn register(&self, ticket: &str) -> Waiter {
         let (tx, rx) = oneshot::channel();
