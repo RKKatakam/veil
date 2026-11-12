@@ -1717,7 +1717,6 @@ impl<'a> Builder<'a> {
                     if let Some(e) = pdir.filter(|_| self.opts.materialised.is_some_and(|m| m.hidden(&path))) {
                         let files: Vec<VPath> = crate::vfs::walk_leaves(self.fs, &path, &|_| false)?.into_iter().map(|(p, _)| p).collect();
                         self.report.not_recorded.extend(files);
-                        self.report.carried.push(path.clone());
                         f.out.insert(e.clone());
                         continue;
                     }
@@ -2105,10 +2104,8 @@ impl<'a> Builder<'a> {
                 // A folder the checkout never wrote (a `--only` clone's):
                 // carried whole, never read (a thin clone would fetch it,
                 // and take its files for deletions; BUG-1945).
-                EntryKind::Dir if b.opts.materialised.is_some_and(|m| m.hidden(path)) => {
-                    b.report.carried.push(path.clone());
-                    Ok(Err(Some(e.clone())))
-                }
+                // Not a redaction: nothing to report.
+                EntryKind::Dir if b.opts.materialised.is_some_and(|m| m.hidden(path)) => Ok(Err(Some(e.clone()))),
                 EntryKind::Dir => match b.store.tree(&e.id) {
                     Ok(tree) if depth < MAX_TREE_DEPTH => Ok(Ok(Frame {
                         entry: e.clone(),
