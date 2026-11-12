@@ -250,6 +250,10 @@ pub fn mark_clone_incomplete(fs: &DiskBackend) -> Result<()> {
 /// The clone in `fs` finished ([`CLONE_INCOMPLETE`]).
 pub fn mark_clone_complete(fs: &DiskBackend) -> Result<()> {
     fs.remove_file(&VPath::new(CLONE_INCOMPLETE)?)?;
+    // Durable, as everything the clone wrote is when it returns.
+    let local = VPath::new(".veil/local")?;
+    fs.sync_dir_later(&local)?;
+    fs.sync_barrier()?;
     Ok(())
 }
 
