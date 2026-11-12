@@ -461,10 +461,11 @@ deploy/do/logs.sh --approve       # -> deploy/results/NAME/logs-<stamp>/<droplet
 ```
 
 Per droplet: every container's log (`containers.log`), `docker ps`,
-memory, disk, uptime and the kernel log's tail (`system.txt`); on the hub
-the server's counters (`server-stats.json`) and the `docker stats` samples
+memory, disk, uptime and the kernel log's tail (`system.txt`); on each
+server its counters (`server-stats.json`) and the `docker stats` samples
 of every gate (`metrics/`); on the database droplet the 30 most-called
-statements from `pg_stat_statements`. DigitalOcean's own graphs (CPU,
+statements from `pg_stat_statements`; on each YugabyteDB node the
+cluster's servers and the tablets it holds (`yb.txt`). DigitalOcean's own graphs (CPU,
 memory, disk, bandwidth per droplet) are in the control panel, since the
 droplets are created with monitoring on. For anything live:
 `ssh -i deploy/do/state/NAME/id_ed25519 root@IP docker logs -f veil-server`.
