@@ -145,7 +145,6 @@ struct Row {
     seq: i64,
     ticket: String,
     person: Person,
-    session: String,
     /// Each change with its base (`landing::stack`).
     stack: Vec<Entry>,
     /// The branch's lineage its stack was judged under.
@@ -634,7 +633,6 @@ impl Service {
                     seq: r.seq,
                     ticket: r.ticket,
                     person: Person { id: r.person_id, name: r.person_name, device_key: r.device_key, agent: None },
-                    session: r.session,
                     stack: super::decode_stack(&r.stack)?,
                     lineage: r.lineage,
                     epochs: (r.person_epoch, r.project_epoch),

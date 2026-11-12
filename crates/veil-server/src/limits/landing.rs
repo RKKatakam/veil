@@ -521,4 +521,101 @@ mod tests {
         // Turn 2+: person 1 alternates s2 (seq 5), s1 (seq 2), s2 (seq 6), s1 (seq 3), s1 (seq 4)
         assert_eq!(seqs, vec![1, 7, 5, 2, 6, 3, 4]);
     }
+
+    /// A queue read as `pick_batch` reads it: `chunk` rows at a time in its
+    /// order, after the last row read, leaving out what [`FairPick`] said.
+    /// The batch, the statements and the rows read.
+    fn pick(queue: &[Item], limit: usize, chunk: usize) -> (Vec<i64>, usize, usize) {
+        let mut pick = FairPick::new(limit);
+        let (mut at, mut statements, mut read) = (0, 0, 0);
+        let mut skip = Some(Skip::default());
+        while let Some(s) = &skip {
+            let mut next = Vec::new();
+            while at < queue.len() && next.len() < chunk {
+                let r = &queue[at];
+                at += 1;
+                if !s.people.contains(&r.person) && !s.sessions.contains(&session_id(r.person, r.session)) {
+                    next.push(Item { seq: r.seq, person: r.person, session: r.session });
+                }
+            }
+            statements += 1;
+            read += next.len();
+            let more = next.len() == chunk;
+            skip = pick.add(next);
+            if !more {
+                break;
+            }
+        }
+        (pick.finish().iter().map(|x| x.seq).collect(), statements, read)
+    }
+
+    const SESSIONS: [&str; 12] = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"];
+
+    /// BUG-1941: the batch chosen from a bounded read of the queue is the
+    /// one `fair_batch` takes from the whole queue, whatever the queue: a
+    /// few people or many, floods of one person or one session at its head
+    /// or anywhere, any batch size, any chunk.
+    #[test]
+    fn a_bounded_read_of_the_queue_picks_the_batch_the_whole_queue_gives() {
+        // A fixed seed (xorshift): the same queues every run.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for round in 0..3000 {
+            let people = 1 + rnd([1, 3, 10, 80][round % 4]);
+            let sessions = 1 + rnd([1, 3, 12][round % 3]);
+            let len = rnd([10, 300, 2000][(round / 3) % 3]) as usize;
+            // A row is of the same person as the one before it with this
+            // chance in 10 (floods), and of the same session likewise.
+            let (sticky_person, sticky_session) = (rnd(10), rnd(10));
+            let mut queue: Vec<Item> = Vec::new();
+            for seq in 0..len {
+                let last = queue.last().map(|r: &Item| (r.person, r.session));
+                let person = match last {
+                    Some((p, _)) if rnd(10) < sticky_person => p,
+                    _ => rnd(people) as i64,
+                };
+                let session = match last {
+                    Some((p, s)) if p == person && rnd(10) < sticky_session => s,
+                    _ => SESSIONS[rnd(sessions) as usize],
+                };
+                queue.push(Item { seq: seq as i64, person, session });
+            }
+            let limit = [1, 2, 7, 64][rnd(4) as usize];
+            let chunk = [1, 3, 16, 256][rnd(4) as usize];
+            let whole: Vec<i64> = fair_batch(queue.iter().map(|r| Item { seq: r.seq, person: r.person, session: r.session }).collect(), &HashSet::new(), limit)
+                .iter()
+                .map(|x| x.seq)
+                .collect();
+            let (picked, _, _) = pick(&queue, limit, chunk);
+            assert_eq!(picked, whole, "round {round}: {people} people, {sessions} sessions, {len} rows, limit {limit}, chunk {chunk}");
+        }
+    }
+
+    /// BUG-1941: what choosing a batch reads does not grow with the queue.
+    /// With a batch's worth of people at the head of the queue it is one
+    /// chunk, however long the queue; behind one person's flood it is that
+    /// person's rows at most, and never the rows behind.
+    #[test]
+    fn what_a_pick_reads_does_not_grow_with_the_queue() {
+        for len in [1_000usize, 10_000, 100_000] {
+            // 100 people in turn, each from 3 sessions.
+            let queue: Vec<Item> = (0..len).map(|i| Item { seq: i as i64, person: (i % 100) as i64, session: SESSIONS[(i / 100) % 3] }).collect();
+            let (picked, statements, read) = pick(&queue, 64, PICK_CHUNK);
+            assert_eq!(picked, (0..64).collect::<Vec<i64>>());
+            assert_eq!((statements, read), (1, PICK_CHUNK), "a queue of {len}");
+            // One person's 1,000 landings (10 sessions of 100) ahead of them.
+            let mut flood: Vec<Item> = (0..1_000).map(|i| Item { seq: -1_000 + i as i64, person: 1_000, session: SESSIONS[i / 100] }).collect();
+            flood.extend(queue);
+            let (picked, statements, read) = pick(&flood, 64, PICK_CHUNK);
+            // The flood's first row, then the first of 63 other people.
+            assert_eq!(picked[0], -1_000);
+            assert_eq!(picked[1..], (0..63).collect::<Vec<i64>>());
+            assert!(statements <= 5 && read <= 1_000 + PICK_CHUNK, "a queue of {len} behind a flood: {statements} statements read {read} rows");
+        }
+    }
 }
