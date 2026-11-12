@@ -2213,6 +2213,31 @@ pub fn land(repo: &mut Repo, remote: &str, client: &Client, rev: ObjectId, onto:
 mod tests {
     use super::*;
 
+    /// A pull reads its history on several threads (BUG-1945): each
+    /// snapshot's answer stays at its place, for a history too short to
+    /// share out and for a long one, and an error is the one of its own
+    /// snapshot.
+    #[test]
+    fn history_read_in_parallel_keeps_its_order() {
+        for n in [0usize, 1, 255, 511, 512, 5_000, 16 * 256 + 1] {
+            let items: Vec<usize> = (0..n).collect();
+            let with: Vec<bool> = (0..n).map(|i| i % 3 == 0).collect();
+            let out = in_parallel(&items, &with, |i, w| -> std::result::Result<(usize, bool), String> {
+                match *i == 4_000 {
+                    true => Err(format!("item {i}")),
+                    false => Ok((*i * 2, *w)),
+                }
+            });
+            assert_eq!(out.len(), n);
+            for (i, r) in out.into_iter().enumerate() {
+                match i == 4_000 {
+                    true => assert_eq!(r, Err("item 4000".to_string())),
+                    false => assert_eq!(r, Ok((i * 2, i % 3 == 0)), "of {n}"),
+                }
+            }
+        }
+    }
+
     /// Property 4 of the S11 review (BUG-1390's class): every rewrite of
     /// `$VEIL_HOME/hub.json` (`update_entry`: `load_file`, a change,
     /// `save_file`) keeps the fields this `vl` does not know (a later
