@@ -648,6 +648,29 @@ pub async fn extend_rows(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tip
     walk_tips(hub, project, viewer, tips, false, &Progress::default(), None).await
 }
 
+/// Read a push's new `snapshots` into the object cache, sixteen at a time,
+/// for the fills that will walk them one after another (BUG-1943: a fill
+/// learns each snapshot's id from the one above it, so by itself it reads
+/// them one round trip at a time: 11 s for 10,000 from an object store).
+/// Only a head start: a snapshot not read here is read by the walk.
+pub async fn read_ahead(hub: &Arc<Hub>, project: i64, snapshots: Vec<ObjectId>) {
+    for chunk in snapshots.chunks(2048) {
+        hub.objects.prefetch(project, chunk).await;
+        let mut set = tokio::task::JoinSet::new();
+        let mut it = chunk.iter().copied();
+        loop {
+            while set.len() < 16 {
+                let Some(id) = it.next() else { break };
+                let hub = hub.clone();
+                set.spawn(async move { hub.objects.get(project, &id).await.is_ok() });
+            }
+            if set.join_next().await.is_none() {
+                break;
+            }
+        }
+    }
+}
+
 /// How far a fill is: the projections it memoised and the rows it wrote
 /// (a number of the viewer's own snapshots, nothing else). A query that
 /// gives up waiting for the fill answers it ([`warming`]): a client waits
@@ -785,8 +808,40 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
     fn snapshot(&mut self, x: &ObjectId) -> Result<Arc<Snapshot>> {
         match self.read.remove(x) {
             Some(s) => Ok(s),
-            None => self.g.snapshot(x),
+            None => self.reading(x),
         }
+    }
+
+    fn reading(&self, x: &ObjectId) -> Result<Arc<Snapshot>> {
+        if !self.files {
+            self.g.cx.hub().query.fill_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.g.snapshot(x)
+    }
+
+    /// Does this server hold the row of real snapshot `x` (its projection
+    /// and its row are in memory)? Then nothing is asked about it, nor
+    /// read below it: a fill on top of what this server filled last reads
+    /// the new snapshots only. (Not with `files`: memory holds no marks.)
+    fn held(&mut self, x: &ObjectId) -> bool {
+        if self.files {
+            return false;
+        }
+        let (hub, project, vk) = (self.g.cx.hub(), self.g.cx.project(), self.g.vk);
+        let p = match self.pmap.get(x) {
+            Some(p) => *p,
+            None if self.admin => *x,
+            None => match hub.caches.memo(project, vk, x) {
+                Some(p) => p,
+                None => return false,
+            },
+        };
+        if p != root() && cached_row(hub, project, vk, &p).is_none() {
+            return false;
+        }
+        self.pmap.insert(*x, p);
+        self.present.insert(p);
+        true
     }
 
     /// The projections of `ids` (real), from the memo, and which of those
@@ -797,6 +852,7 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
     fn learn(&mut self, ids: &[ObjectId]) -> Result<()> {
         let unknown = |w: &Self, i: &ObjectId| w.pmap.get(i).is_none_or(|p| !w.known(p));
         let mut queue: std::collections::VecDeque<ObjectId> = ids.iter().copied().filter(|i| unknown(self, i)).collect();
+        queue.retain(|i| !self.held(i));
         if queue.is_empty() {
             return Ok(());
         }
@@ -809,9 +865,9 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             }
             // Below what was asked for: whatever cannot be read ahead is
             // left for the walk to ask about, if it gets there.
-            let Ok(s) = self.g.snapshot(&x) else { continue };
+            let Ok(s) = self.reading(&x) else { continue };
             for p in &s.parents {
-                if *p != root() && unknown(self, p) && seen.insert(*p) {
+                if *p != root() && unknown(self, p) && !self.held(p) && seen.insert(*p) {
                     queue.push_back(*p);
                 }
             }
@@ -1157,6 +1213,10 @@ pub struct State {
     /// apart from the file history's (which take minutes on a long
     /// history: no query's rows wait behind them).
     row_slots: Arc<tokio::sync::Semaphore>,
+    /// Real snapshots the walks of the rows' fills read here: the tests
+    /// count them, to show a fill reads what is new and nothing else
+    /// (BUG-1943).
+    pub fill_reads: std::sync::atomic::AtomicU64,
     /// The blame jobs of this server (S14 cycle 3).
     pub jobs: super::files::Jobs,
     /// Versions blamed (computed, not read kept) here: the tests count
@@ -1174,6 +1234,7 @@ impl Default for State {
             started: Mutex::new(HashMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_FILLS)),
             row_slots: Arc::new(tokio::sync::Semaphore::new(MAX_FILLS)),
+            fill_reads: std::sync::atomic::AtomicU64::new(0),
             jobs: super::files::Jobs::default(),
             blame_steps: std::sync::atomic::AtomicU64::new(0),
         }

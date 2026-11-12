@@ -71,7 +71,7 @@ pub(crate) fn norm(r: veil_server::error::Result<Value>) -> String {
 
 /// One query of the harness.
 #[derive(Clone, Debug)]
-enum Q {
+pub(crate) enum Q {
     Log(LogParams, Limits),
     Show(ShowParams),
     Tree(TreeParams),
@@ -114,7 +114,7 @@ where
 }
 
 /// Run `q` as `a`; a log is followed through every page (at most 60).
-fn run(th: &TestHub, h: &Hist, a: &Ask, q: &Q) -> Vec<String> {
+pub(crate) fn run(th: &TestHub, h: &Hist, a: &Ask, q: &Q) -> Vec<String> {
     let hub = h.hub.clone();
     th.rt.block_on(async {
         match q {
@@ -180,13 +180,13 @@ fn run(th: &TestHub, h: &Hist, a: &Ask, q: &Q) -> Vec<String> {
 }
 
 /// Every path any snapshot of `h` held.
-fn all_paths(h: &Hist) -> BTreeSet<String> {
+pub(crate) fn all_paths(h: &Hist) -> BTreeSet<String> {
     h.files.values().flat_map(|f| f.keys().map(|k| k.trim_end_matches('/').to_string())).collect()
 }
 
 /// The harness's queries for one viewer: revisions by branch and by the
 /// viewer's own ids, paths readable, hidden and missing.
-fn queries(rng: &mut Rng, revs: &[String], paths: &[String]) -> Vec<Q> {
+pub(crate) fn queries(rng: &mut Rng, revs: &[String], paths: &[String]) -> Vec<Q> {
     let pick = |rng: &mut Rng, v: &[String]| v[rng.below(v.len())].clone();
     let small = Limits {
         work: 12,

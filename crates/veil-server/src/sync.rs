@@ -3147,7 +3147,7 @@ async fn push_staged(
         .iter()
         .map(|c| (c.real.hex(), real_parents_of.get(&c.real).map_or(0, |(_, a)| *a)))
         .collect();
-    let pushed_snapshots = new_reals.len();
+    let pushed_snapshots: Vec<ObjectId> = completed.iter().map(|c| c.real).collect();
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
     let memos: Vec<(String, String, String, bool)> =
         deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex(), deferred.collapsed.contains(r))).collect();
@@ -3536,9 +3536,10 @@ async fn push_staged(
         // after the push asks for the tip's row). A small push's rows are
         // written with its derived data (`derive::finish_landing_run`), or
         // by the first query that names its tip.
-        if pushed_snapshots > 16 {
+        if pushed_snapshots.len() > 16 {
             let (hub, id, moved) = (hub.clone(), project.id, public_moved.clone());
             tokio::spawn(async move {
+                crate::query::graph::read_ahead(&hub, id, pushed_snapshots).await;
                 if let Err(e) = crate::derive::memo_tips(&hub, id, &moved).await {
                     eprintln!("veil-server: filling the graphs of project {id} after a push: {e:?}");
                 }
