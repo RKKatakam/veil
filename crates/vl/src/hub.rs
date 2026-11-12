@@ -1162,13 +1162,20 @@ pub fn pull_moving(
         .collect();
     want_tips.sort();
     want_tips.dedup();
-    // A repository made for this clone holds only the root snapshot and
-    // its empty tree: nothing to probe the disk for, object by object.
+    // A repository made for this clone holds only the root snapshot, its
+    // empty tree and the empty change its workspace starts on (`vl clone`
+    // makes the repository with its workspace): nothing to probe the disk
+    // for, object by object. (Each probe of an object that is not there
+    // looks for its file and lists the pack directory: 126,000 of them in a
+    // clone of one directory of 10,000 snapshots, BUG-1945. The test was
+    // "every head is the root", which no clone's repository passes.)
     let root = tx.repo().root_id();
-    let fresh = stop.is_empty() && tx.view.heads.iter().all(|h| *h == root);
     let empty_tree = tx.repo().snapshot(&root)?.tree;
+    let starts_empty = |h: &ObjectId| *h == root || tx.repo().snapshot(h).is_ok_and(|s| s.parents == [root] && s.tree == empty_tree);
+    let fresh = stop.is_empty() && tx.view.heads.iter().all(starts_empty);
+    let fresh_heads: Vec<ObjectId> = tx.view.heads.iter().copied().collect();
     let have = |id: &ObjectId| match (fresh, main_only) {
-        (true, _) => *id == root || *id == empty_tree,
+        (true, _) => *id == root || *id == empty_tree || fresh_heads.contains(id),
         (false, true) => store.has_main(id),
         (false, false) => store.has(id),
     };
@@ -1186,28 +1193,42 @@ pub fn pull_moving(
     let limit = store.cache_limit().filter(|_| thin).unwrap_or(u64::MAX);
     let mut content_bytes = 0u64;
     let mut new_snaps = Vec::new();
+    // Whether a new snapshot names, as the version it replaces, something
+    // a repository made for this clone holds (`supersede_landed`).
+    let mut replaces_local = false;
     if !want_tips.is_empty() {
         // A thin clone takes the tips alone; a later pull, the new
         // snapshots down to what it has (a page at most).
         let first = !tx.view.remote_tags.keys().any(|k| k.starts_with(&prefix));
         let page = thin.then_some(if first { want_tips.len() } else { veil_core::promisor::HISTORY_PAGE });
-        for (id, raw) in client.history(want_tips, stop, page)? {
-            let held = have(&id);
+        let history = client.history(want_tips, stop, page)?;
+        let held: Vec<bool> = history.iter().map(|(id, _)| have(id)).collect();
+        // Each snapshot decoded and its signature checked on every core:
+        // 40 µs a snapshot, most of the first pull of a long history when
+        // done one after another (BUG-1945). What follows is in order, as
+        // before.
+        let read = in_parallel(&history, &held, |(_, raw), held| -> Result<Option<(ObjectId, bool, bool)>> {
             // A widening pull, and a full pull from another remote, walk
             // what each snapshot reaches even when they hold the snapshot:
             // its trees and files may be in the cache, or not fetched
             // (BUG-1292).
-            if held && !main_only {
-                continue;
+            if *held && !main_only {
+                return Ok(None);
             }
-            let Object::Snapshot(s) = Object::decode(&raw)? else {
+            let Object::Snapshot(s) = Object::decode(raw)? else {
                 bail!("the server sent a non-snapshot in history");
             };
-            if s.signature_valid() != Some(true) && !held {
+            let local = s.predecessors.iter().any(|p| *p == root || fresh_heads.contains(p));
+            Ok(Some((s.tree, s.signature_valid() == Some(true), local)))
+        });
+        for (((id, raw), held), read) in history.into_iter().zip(held).zip(read) {
+            let Some((tree, signed, local)) = read? else { continue };
+            replaces_local |= local;
+            if !signed && !held {
                 report.warnings.push(format!("snapshot {} carries no valid signature", id.short()));
             }
             if !thin || Some(id) == checked_out || tips.tested.values().any(|t| *t == id) {
-                new_snaps.push((id, s.tree));
+                new_snaps.push((id, tree));
             }
             if !held && incoming.put(id, raw, "")? {
                 report.objects_copied += 1;
@@ -1220,7 +1241,7 @@ pub fn pull_moving(
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut frontier: Vec<(ObjectId, String, ObjectId, u64)> = Vec::new();
     for (snap, tree) in &new_snaps {
-        if !have(tree) && seen.insert(*tree) {
+        if seen.insert(*tree) && !have(tree) {
             frontier.push((*snap, String::new(), *tree, 0));
         }
     }
@@ -1273,7 +1294,7 @@ pub fn pull_moving(
                 _ => {}
             }
             for (cid, p, size) in children {
-                if !have(&cid) && seen.insert(cid) {
+                if seen.insert(cid) && !have(&cid) {
                     if daemon {
                         parents.insert(cid, w.id);
                     }
@@ -1431,11 +1452,35 @@ pub fn pull_moving(
         }
         false => None,
     };
-    if moved.is_none() {
+    // A repository made for this clone holds the root and the empty change
+    // its workspace starts on, and nothing else that could have landed:
+    // unless a new snapshot replaces one of those, there is nothing to look
+    // for (reading each new snapshot again to find that out was 80 ms of a
+    // clone of 10,000).
+    if moved.is_none() && !(fresh && !replaces_local) {
         supersede_landed(&mut tx, &new_snaps, &old_tips)?;
     }
     tx.commit()?;
     Ok((report, moved))
+}
+
+/// `f` of each of `items` with its `with`, in their order, on up to 16
+/// threads when there are enough of them to share out.
+fn in_parallel<T: Sync, W: Sync, R: Send>(items: &[T], with: &[W], f: impl Fn(&T, &W) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16).min(items.len() / 256);
+    if threads < 2 {
+        return items.iter().zip(with).map(|(i, w)| f(i, w)).collect();
+    }
+    let chunk = items.len().div_ceil(threads);
+    let f = &f;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = items
+            .chunks(chunk)
+            .zip(with.chunks(chunk))
+            .map(|(i, w)| s.spawn(move || i.iter().zip(w).map(|(i, w)| f(i, w)).collect::<Vec<R>>()))
+            .collect();
+        parts.into_iter().flat_map(|p| p.join().expect("a worker reading history panicked")).collect()
+    })
 }
 
 /// One row for a landed change (BUG-1910). The server lands a change as a
