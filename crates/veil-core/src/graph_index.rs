@@ -628,12 +628,35 @@ impl GraphIndex {
         roots: impl IntoIterator<Item = ObjectId>,
         candidates: &HashSet<ObjectId>,
     ) -> Result<HashSet<ObjectId>> {
+        self.reachable_among_tips(repo, roots, candidates, &HashSet::new(), &HashSet::new())
+    }
+
+    /// [`GraphIndex::reachable_among`], told `tips`: snapshots none of
+    /// which descends from another, with the parents of each (`under`).
+    /// The answer is the same and the walk shorter: whatever is one of
+    /// them, one of their parents or below one cannot be above a tip, so
+    /// the walk stops there once it is below every candidate that is not
+    /// a tip. Without it, a candidate that is an old tip (the head of a
+    /// branch left long ago) makes the walk read all the history since.
+    pub fn reachable_among_tips(
+        &self,
+        repo: &Repo,
+        roots: impl IntoIterator<Item = ObjectId>,
+        candidates: &HashSet<ObjectId>,
+        tips: &HashSet<ObjectId>,
+        under: &HashSet<ObjectId>,
+    ) -> Result<HashSet<ObjectId>> {
         self.with(repo, |w| {
+            // The lowest candidate, and the lowest that is not a tip.
             let mut floor = Gen::MAX;
+            let mut floor_other = Gen::MAX;
             let mut wanted = HashSet::new();
             for c in candidates {
                 if let Some(e) = w.entry(c)? {
                     floor = floor.min(e.generation);
+                    if !tips.contains(c) {
+                        floor_other = floor_other.min(e.generation);
+                    }
                     wanted.insert(*c);
                 }
             }
@@ -642,8 +665,11 @@ impl GraphIndex {
                 return Ok(found);
             }
             let mut seen = HashSet::new();
-            let mut stack: Vec<ObjectId> = roots.into_iter().collect();
-            while let Some(id) = stack.pop() {
+            // Each with whether it was reached through a tip or a tip's
+            // parent (a fact about the snapshot, whichever way the walk
+            // comes to it first).
+            let mut stack: Vec<(ObjectId, bool)> = roots.into_iter().map(|r| (r, false)).collect();
+            while let Some((id, below)) = stack.pop() {
                 if !seen.insert(id) {
                     continue;
                 }
@@ -657,11 +683,12 @@ impl GraphIndex {
                         break;
                     }
                 }
-                if e.generation == floor {
+                let below = below || tips.contains(&id) || under.contains(&id);
+                if e.generation == floor || (below && e.generation <= floor_other) {
                     continue;
                 }
                 let Some(s) = w.snapshot(&id)? else { continue };
-                stack.extend(s.parents.iter().filter(|p| !seen.contains(*p)).copied());
+                stack.extend(s.parents.iter().filter(|p| !seen.contains(*p)).map(|p| (*p, below)));
             }
             Ok(found)
         })

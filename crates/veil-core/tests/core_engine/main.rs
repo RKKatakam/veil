@@ -18,6 +18,7 @@ mod embargo_release;
 mod engine;
 mod checkout_speed;
 mod graph_index;
+mod heads;
 mod history_rename;
 mod history_tools;
 mod mount_recording;
