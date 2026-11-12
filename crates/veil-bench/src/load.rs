@@ -198,7 +198,14 @@ pub struct Args {
     /// `landing`: the agents are this many people's, in turn (1: one
     /// person's, as before; the server bounds and orders landings by person).
     pub people: usize,
+    /// `landing`, open loop: the offered rate over the measured window, as
+    /// `(landings a second, seconds)` steps; empty: the run's rate
+    /// throughout, for `duration`.
+    pub steps: Vec<(f64, f64)>,
 }
+
+/// How often a landing run's time series takes a row ([`series_row`]).
+const SERIES_EVERY: Duration = Duration::from_secs(10);
 
 /// `--mix`: the shared files (`w/shared/sN`) and each one's slots (a line
 /// an agent owns, then three that nobody changes), and the hot files.
@@ -323,6 +330,9 @@ struct Counters {
     ops: AtomicU64,
     collisions: AtomicU64,
     busy: AtomicU64,
+    /// Answers that told a landing agent to come back later (`429` or `503`
+    /// with `retry_after_ms`), each waited out before the next submit.
+    slowed: AtomicU64,
     /// Branches landed on `main` (`--merge-every`).
     merges: AtomicU64,
     errors: AtomicU64,
@@ -782,6 +792,14 @@ impl Agent<'_> {
             let req = json!({"onto": "main", "base": base.hex(), "description": format!("land {}", self.files),
                 "edits": [{"path": path, "put": {"text": text}}]});
             let r = self.api.post_json(Some(self.token), &self.path("/land"), &req)?;
+            // Told to come back later: waited out as `vl land` does, within
+            // the landing's deadline (its latency counts the waits).
+            if let Some(ms) = wait_asked(&r) {
+                self.c.count(&self.c.slowed, 1);
+                let left = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(Duration::from_millis(ms).min(left));
+                continue;
+            }
             if r.status == 503 {
                 self.c.count(&self.c.busy, 1);
                 backoff(attempt);
@@ -804,6 +822,17 @@ impl Agent<'_> {
             }
         }
     }
+}
+
+/// The milliseconds a `429` or `503` answer asks the caller to wait before
+/// it sends the request again (`retry_after_ms`), with a few more so that
+/// the agents told so together do not come back together.
+fn wait_asked(r: &Reply) -> Option<u64> {
+    if !matches!(r.status, 429 | 503) {
+        return None;
+    }
+    let ms = serde_json::from_slice::<serde_json::Value>(&r.body).ok()?["retry_after_ms"].as_u64()?;
+    Some(ms + u64::from(veil_core::crypto::random_bytes::<1>()[0]) % (ms / 8).max(1))
 }
 
 /// Capped, jittered backoff after a busy server.
@@ -1169,6 +1198,9 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         })
         .collect();
     let mut result = json!({});
+    // Landings scheduled so far (open loop), and the time series' end.
+    let scheduled = AtomicU64::new(0);
+    let series_stop = AtomicBool::new(false);
     std::thread::scope(|s| -> Result<()> {
         for i in 0..clients {
             let p = i % projects;
@@ -1359,26 +1391,35 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         }
         ready.wait();
         // Open loop: schedule landings at `rate`, round robin over the projects.
-        let schedule = |until: Instant, start: Instant, mut k: u64| -> u64 {
-            if let (Mode::Land | Mode::Branches | Mode::Api | Mode::Landing, Rate::PerSecond(r)) = (a.mode, rate) {
+        // `(k, at)`: the landings scheduled so far, and when the next one is
+        // due; `rate_at` is the offered rate at a time (`--steps`).
+        let schedule = |until: Instant, (mut k, mut at): (u64, Instant), rate_at: &dyn Fn(Instant) -> f64| -> (u64, Instant) {
+            if let (Mode::Land | Mode::Branches | Mode::Api | Mode::Landing, Rate::PerSecond(_)) = (a.mode, rate) {
                 loop {
-                    let at = start + Duration::from_secs_f64(k as f64 / r);
                     if at >= until {
-                        return k;
+                        return (k, at);
                     }
                     if let Some(wait) = at.checked_duration_since(Instant::now()) {
                         std::thread::sleep(wait);
                     }
                     let _ = queues[(k as usize) % projects].0.send(at);
+                    scheduled.fetch_add(1, Ordering::Relaxed);
                     k += 1;
+                    at += Duration::from_secs_f64(1.0 / rate_at(at));
                 }
             } else {
                 std::thread::sleep(until.saturating_duration_since(Instant::now()));
-                k
+                (k, at)
             }
         };
+        let flat = match rate {
+            Rate::PerSecond(r) => r,
+            Rate::Max => f64::INFINITY,
+        };
+        let stepped = a.mode == Mode::Landing && !a.steps.is_empty();
+        let duration = if stepped { Duration::from_secs_f64(a.steps.iter().map(|s| s.1).sum()) } else { a.duration };
         let start = Instant::now();
-        let k = schedule(start + a.warmup, start, 0);
+        let next = schedule(start + a.warmup, (0, start), &|_| flat);
         // The measured window.
         let before_server = cx.server_pid.and_then(cpu_of);
         let before_db = db_cpu(a.db_container.as_deref());
@@ -1399,9 +1440,51 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         let (flood_ops0, flood_errors0) = (fl.ops.load(Ordering::Relaxed), fl.errors.load(Ordering::Relaxed));
         c.measuring.store(true, Ordering::Relaxed);
         let t0 = Instant::now();
-        schedule(t0 + a.duration, start, k);
+        // The offered rate over the window: the step `at` falls in.
+        let rate_at = |at: Instant| -> f64 {
+            if !stepped {
+                return flat;
+            }
+            let mut t = at.saturating_duration_since(t0).as_secs_f64();
+            for (r, secs) in &a.steps {
+                if t < *secs {
+                    return *r;
+                }
+                t -= secs;
+            }
+            a.steps.last().map_or(flat, |s| s.0)
+        };
+        // A landing run's time series: a row every `SERIES_EVERY`.
+        let series = (a.mode == Mode::Landing).then(|| {
+            let (c, scheduled, series_stop) = (&c, &scheduled, &series_stop);
+            s.spawn(move || {
+                let mut rows = Vec::new();
+                let mut last = SeriesPoint::take(cx, c, scheduled, t0);
+                let mut due = t0 + SERIES_EVERY;
+                loop {
+                    let stopping = series_stop.load(Ordering::Relaxed);
+                    if !stopping && Instant::now() < due {
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    let now = SeriesPoint::take(cx, c, scheduled, t0);
+                    // The last, partial row only if it is long enough to say something.
+                    if !stopping || now.at - last.at > 1.0 {
+                        rows.push(series_row(cx, c, &last, &now));
+                    }
+                    if stopping {
+                        return rows;
+                    }
+                    last = now;
+                    due += SERIES_EVERY;
+                }
+            })
+        });
+        schedule(t0 + duration, next, &rate_at);
         let elapsed = t0.elapsed().as_secs_f64();
         c.measuring.store(false, Ordering::Relaxed);
+        series_stop.store(true, Ordering::Relaxed);
+        let series = series.map(|h| h.join().unwrap_or_default());
         let server_cpu = cx.server_pid.and_then(cpu_of).zip(before_server).map(|(b, a)| b - a);
         let db = db_cpu(a.db_container.as_deref()) - before_db;
         let me = cpu_of(std::process::id()).zip(before_self).map(|(b, a)| b - a);
@@ -1473,6 +1556,9 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "background_landings": bg.ops.load(Ordering::Relaxed),
             "background_errors": bg.errors.load(Ordering::Relaxed),
         });
+        result["series"] = json!(series);
+        result["steps"] = json!(if stepped { a.steps.clone() } else { Vec::new() });
+        result["slowed"] = json!(c.slowed.load(Ordering::Relaxed));
         result["protected"] = json!(a.protected);
         result["mix"] = json!(a.mix);
         result["people"] = json!(a.people.max(1));
@@ -1520,6 +1606,116 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         result["derive_behind"] = json!(behind);
     }
     Ok(result)
+}
+
+/// What a landing run's time series reads at one moment.
+struct SeriesPoint {
+    /// Seconds since the measured window began.
+    at: f64,
+    scheduled: u64,
+    ops: u64,
+    errors: u64,
+    slowed: u64,
+    collisions: u64,
+    /// How many latencies were recorded so far.
+    latencies: usize,
+    server: Option<serde_json::Value>,
+    /// Landings waiting in the server's queue (`queued` or `merging`).
+    queue: Option<i64>,
+    xid: Option<i64>,
+}
+
+impl SeriesPoint {
+    fn take(cx: &Ctx<'_>, c: &Counters, scheduled: &AtomicU64, t0: Instant) -> SeriesPoint {
+        let queue = cx.stats.and_then(|(rt, url)| {
+            rt.block_on(async {
+                let mut c = <sqlx::PgConnection as sqlx::Connection>::connect(url).await.ok()?;
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM landing_queue WHERE state IN ('queued', 'merging')").fetch_one(&mut c).await.ok()
+            })
+        });
+        SeriesPoint {
+            at: t0.elapsed().as_secs_f64(),
+            scheduled: scheduled.load(Ordering::Relaxed),
+            ops: c.ops.load(Ordering::Relaxed),
+            errors: c.errors.load(Ordering::Relaxed),
+            slowed: c.slowed.load(Ordering::Relaxed),
+            collisions: c.collisions.load(Ordering::Relaxed),
+            latencies: c.latencies.lock().unwrap().len(),
+            server: cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f)),
+            queue,
+            xid: cx.stats.and_then(|(rt, url)| next_xid(rt, url)),
+        }
+    }
+}
+
+/// One row of a landing run's time series: what happened between two
+/// points. Rates are per second of the interval; `landed` is the server's
+/// own count, `finished` the landings the agents saw answered; the
+/// latencies are of the landings answered in the interval.
+fn series_row(cx: &Ctx<'_>, c: &Counters, a: &SeriesPoint, b: &SeriesPoint) -> serde_json::Value {
+    let dt = (b.at - a.at).max(1e-9);
+    let stat = |k: &str| Some(b.server.as_ref()?[k].as_f64()? - a.server.as_ref()?[k].as_f64()?);
+    let mut lat: Vec<f64> = c.latencies.lock().unwrap().get(a.latencies..b.latencies).map(<[f64]>::to_vec).unwrap_or_default();
+    lat.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let landed = stat("landing_landed");
+    let commits = cx.stats.zip(a.xid.zip(b.xid)).and_then(|((rt, url), (from, to))| db_commits(rt, url, from, to));
+    let per = |x: Option<f64>, n: Option<f64>| x.zip(n).filter(|(_, n)| *n > 0.0).map(|(x, n)| x / n);
+    json!({
+        "t_s": b.at,
+        "offered_per_s": (b.scheduled - a.scheduled) as f64 / dt,
+        "landed_per_s": landed.map(|n| n / dt),
+        "finished_per_s": (b.ops - a.ops) as f64 / dt,
+        "queue": b.queue,
+        "p50_ms": percentile(&lat, 0.5),
+        "p99_ms": percentile(&lat, 0.99),
+        "errors": b.errors - a.errors,
+        "slowed": b.slowed - a.slowed,
+        "collisions": b.collisions - a.collisions,
+        "batches": stat("landing_batches"),
+        "landings_per_batch": per(landed, stat("landing_batches")),
+        "commits_per_landing": per(commits, landed),
+        "pick_statements": stat("landing_pick_statements"),
+        "pick_rows": stat("landing_pick_rows"),
+        "review_asks": stat("landing_review_asks"),
+    })
+}
+
+/// A landing run's time series as lines of text (`markdown`: a table).
+fn series_text(r: &serde_json::Value, markdown: bool) -> String {
+    let Some(rows) = r["series"].as_array().filter(|s| !s.is_empty()) else { return String::new() };
+    let f = |x: &serde_json::Value, d: usize| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{v:.d$}")).unwrap_or_else(|| "–".into());
+    let cols: [(&str, &str, usize); 15] = [
+        ("t (s)", "t_s", 0),
+        ("offered/s", "offered_per_s", 0),
+        ("landed/s", "landed_per_s", 0),
+        ("finished/s", "finished_per_s", 0),
+        ("queue", "queue", 0),
+        ("p50 ms", "p50_ms", 0),
+        ("p99 ms", "p99_ms", 0),
+        ("told to wait", "slowed", 0),
+        ("errors", "errors", 0),
+        ("collisions", "collisions", 0),
+        ("per batch", "landings_per_batch", 1),
+        ("commits/landing", "commits_per_landing", 2),
+        ("pick stmts", "pick_statements", 0),
+        ("pick rows", "pick_rows", 0),
+        ("review asks", "review_asks", 0),
+    ];
+    let mut out = String::new();
+    if markdown {
+        out.push_str(&format!("| {} |\n|{}\n", cols.map(|c| c.0).join(" | "), "---:|".repeat(cols.len())));
+    } else {
+        out.push_str(&format!("      {}\n", cols.map(|c| format!("{:>10}", c.0)).join(" ")));
+    }
+    for row in rows {
+        let cells = cols.map(|c| f(&row[c.1], c.2));
+        if markdown {
+            out.push_str(&format!("| {} |\n", cells.join(" | ")));
+        } else {
+            out.push_str(&format!("      {}\n", cells.map(|c| format!("{c:>10}")).join(" ")));
+        }
+    }
+    out
 }
 
 /// Branches of `projects` whose derived history is not their tip.
@@ -1601,6 +1797,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
                 eprintln!("load: {:?} projects={projects} clients={clients} rate={rate:?}{}", a.mode, if via { " via the cache" } else { "" });
                 let mut r = run_one(&cx, a, projects, clients, rate, cache.as_ref().filter(|_| via))?;
                 eprintln!("      {}", line(&r));
+                eprint!("{}", series_text(&r, false));
                 // A flood's work is counted against the quiet runs' operations:
                 // the cost gates do not apply to them.
                 let missed = if a.flood > 0 { Vec::new() } else { missed_gates(&r, a.background) };
@@ -1735,6 +1932,21 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
                 f(&r["landing_commit_ms_per_batch"], 1),
             ));
         }
+    }
+    for r in v["runs"].as_array().into_iter().flatten().filter(|r| r["series"].as_array().is_some_and(|s| !s.is_empty())) {
+        out.push_str(&format!(
+            "\nTime series, {} clients, {}: a row every {} s (landed: the server's count; finished: answered to an agent).\n\n{}",
+            r["clients"],
+            match r["steps"].as_array().filter(|s| !s.is_empty()) {
+                Some(steps) => format!(
+                    "offered {}",
+                    steps.iter().map(|s| format!("{}/s for {} s", f(&s[0], 0), f(&s[1], 0))).collect::<Vec<_>>().join(", then ")
+                ),
+                None => format!("{}/s offered", r["rate"].as_str().map(str::to_string).unwrap_or_else(|| f(&r["rate"], 0))),
+            },
+            SERIES_EVERY.as_secs(),
+            series_text(r, true)
+        ));
     }
     let objects: Vec<&serde_json::Value> = v["runs"].as_array().into_iter().flatten().filter(|r| r["mode"] == "objects").collect();
     if !objects.is_empty() {
