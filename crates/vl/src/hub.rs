@@ -736,24 +736,6 @@ impl Client {
         )
     }
 
-    /// The trees of `snapshot` from its root down to folder `path`, and
-    /// every tree below it, in one request (`subtree`, revision 7, at most
-    /// the server's bound): each checked against its id. They are taken
-    /// only where a walk from a tree the caller trusts reaches them.
-    pub fn subtree(&self, snapshot: ObjectId, path: &str) -> Result<HashMap<ObjectId, Vec<u8>>> {
-        let route = format!("/subtree?snapshot={}&path={}", snapshot.hex(), percent(path));
-        let body = self.ok("GET", &self.url.project_path(&route), None)?;
-        let frames = encoding::split_frames(&body)?;
-        let mut out = HashMap::with_capacity(frames.len());
-        let mut ids = frames.iter().map(|(id, _)| *id);
-        for d in Decoded::parallel(&frames)? {
-            for range in d.objects {
-                out.insert(ids.next().expect("one id per frame"), d.bytes[range].to_vec());
-            }
-        }
-        Ok(out)
-    }
-
     /// A fetch of many objects, each handed to `f` with its want
     /// as its part arrives (BUG-859): `wants` split into parts of about
     /// [`FETCH_BYTES`] by the sizes tree entries carry (`sizes`, one per
@@ -1355,26 +1337,9 @@ pub fn pull_moving(
         chain.reverse();
         chain
     };
-    // A thin clone's first fetch (BUG-1945): the trees of what it checks
-    // out, every level, in one request where the server answers `subtree`;
-    // the walk below takes each where it reaches it, and asks for the rest
-    // (the files, any level past the server's bound) as before. Any answer
-    // but the trees is no answer: the walk asks level by level.
-    let mut prefetched: HashMap<ObjectId, Vec<u8>> = HashMap::new();
-    if thin && fresh && tips.revision >= veil_core::hub::wire::SUBTREE_REVISION {
-        for (snap, tree) in &new_snaps {
-            if !have(tree) {
-                prefetched.extend(client.subtree(*snap, only.unwrap_or("")).unwrap_or_default());
-            }
-        }
-    }
     while !frontier.is_empty() {
         let asked: Vec<(ObjectId, Vec<ObjectId>, ObjectId)> = match daemon {
-            true => frontier
-                .iter()
-                .filter(|(_, _, id, _)| !prefetched.contains_key(id))
-                .filter_map(|(snap, _, id, _)| Some((*roots.get(snap)?, chain_of(&parents, id), *id)))
-                .collect(),
+            true => frontier.iter().filter_map(|(snap, _, id, _)| Some((*roots.get(snap)?, chain_of(&parents, id), *id))).collect(),
             false => Vec::new(),
         };
         let mut next = Vec::new();
@@ -1425,16 +1390,6 @@ pub fn pull_moving(
             }
             Ok(())
         };
-        if !prefetched.is_empty() {
-            let mut rest = Vec::new();
-            for (snap, path, id, size) in frontier.drain(..) {
-                match prefetched.remove(&id) {
-                    Some(raw) => handle(snap, &Want { path, id, snapshot: Some(snap) }, raw)?,
-                    None => rest.push((snap, path, id, size)),
-                }
-            }
-            frontier = rest;
-        }
         if !asked.is_empty() {
             let mut got = crate::thin::via_daemon(&client.url, client.identity(), &asked);
             if !got.is_empty() {

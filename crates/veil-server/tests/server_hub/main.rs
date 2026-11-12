@@ -60,5 +60,3 @@ mod rc_server;
 mod rc_client;
 mod warm;
 mod landing_speed;
-mod subtree;
-mod clone_fast;

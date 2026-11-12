@@ -46,11 +46,8 @@ pub const PROTOCOL: u32 = 1;
 /// object routes ([`super::grant`]); 4, history answers pages
 /// ([`HistoryRequest::limit`]), for thin clones; 5, `q/resolve` names the
 /// snapshots of the caller's history by id prefix ([`Resolved`]); 6,
-/// `q/generations` gives their generations ([`Generations`]); 7,
-/// `subtree` answers the trees of a folder, every level, in one request.
-pub const REVISION: u32 = 7;
-/// The revision that answers `subtree` (see [`REVISION`]).
-pub const SUBTREE_REVISION: u32 = 7;
+/// `q/generations` gives their generations ([`Generations`]).
+pub const REVISION: u32 = 6;
 
 /// The request header in which `vl` says the newest repository format it
 /// reads (`repo::REPO_FORMAT`). A client that sends none is taken to read

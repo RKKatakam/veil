@@ -200,18 +200,13 @@ pub fn clone(url: &HubUrl, dest: Option<&Path>, only: Option<&str>, thin: Option
         bail!("destination {} is not empty", dest.display());
     }
     // A clone of one directory keeps its S1 form (every snapshot, that
-    // directory's files): S3 does not combine it with a thin clone. (A thin
-    // one would show the folders it never wrote as deleted: its hidden
-    // paths are files, and a thin clone can read every folder's tree.)
+    // directory's files): S3 does not combine it with a thin clone.
     let thin = if only.is_some() { None } else { thin };
     let created = !dest.exists();
     std::fs::create_dir_all(&dest)?;
     let dest = dest.canonicalize()?;
-    let r = clone_populate(url, &dest, only.as_deref(), thin, created);
+    let r = clone_populate(url, &dest, only.as_deref(), thin);
     if r.is_err() {
-        // Deferred flushes of what is removed now (BUG-1945): made, and
-        // deferring stops.
-        let _ = veil_core::vfs::flush_deferred();
         let _ = if created {
             std::fs::remove_dir_all(&dest)
         } else {
@@ -231,21 +226,11 @@ pub fn clone(url: &HubUrl, dest: Option<&Path>, only: Option<&str>, thin: Option
     r
 }
 
-/// `fresh`: the clone made `dest` (nothing was there).
-fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>, mut thin: Option<u64>, fresh: bool) -> Result<ExitCode> {
+fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>, mut thin: Option<u64>) -> Result<ExitCode> {
     let identity = load_identity()?;
     let client = Client::new(url, identity.clone())?;
     let fs = Arc::new(DiskBackend::new(dest));
     crate::ctx::mark_clone_incomplete(&fs)?;
-    // A clone into a directory it made (BUG-1945): the set-up's flushes
-    // (about 60 of `init`, two transactions) are made at once, on several
-    // threads, before the checkout's journal is written. Until then the
-    // marker above, durable already, makes every command refuse the
-    // directory, and a failed clone removes it: nothing that looks usable
-    // is ever left that is not. Never for a directory that was there.
-    if fresh {
-        veil_core::vfs::defer_durability();
-    }
     let mut repo = Repo::init_for_clone_at(fs.clone(), Some(identity.clone()), &user_for(&identity), veil_core::repo::REPO_FORMAT)?;
     let mut config = repo.config().clone();
     config.remotes.insert(
@@ -292,16 +277,6 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>, mut thin: Optio
         // every snapshot keeps it unchanged.
         let (_, hidden) = hub::restrict_to(repo.store(), to, o)?;
         partial = Some((hub::without(repo.store(), to, o)?, hidden));
-    }
-    if fresh {
-        // Debug builds only: a power cut here, where the most is deferred.
-        #[cfg(debug_assertions)]
-        if let Ok(keep) = std::env::var("VEIL_TEST_CLONE_POWER_CUT") {
-            veil_core::vfs::lose_deferred_for_test(keep.parse().unwrap_or(0));
-            std::process::exit(137);
-        }
-        // Everything the checkout's journal vouches for is durable first.
-        veil_core::vfs::flush_deferred().context("making the clone durable")?;
     }
     // Journalled, so a clone killed here is finished by the next command
     // (BUG-830).

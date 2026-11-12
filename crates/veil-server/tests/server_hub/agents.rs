@@ -1598,9 +1598,6 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         ("/v1/projects/{p}/tips", "rev"),
         ("/v1/projects/{p}/history", "rev"),
         ("/v1/projects/{p}/fetch", "tree"),
-        // Round 5 (BUG-1945): the trees of a folder in one answer; its path
-        // through `Ask::file_path`, each tree a want of `fetch` (narrowed there).
-        ("/v1/projects/{p}/subtree", "tree"),
         ("/v1/projects/{p}/objects", "none"),
         ("/v1/projects/{p}/push", "write"),
         ("/v1/projects/{p}/changes", "write"),
@@ -1727,8 +1724,6 @@ fn every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed() {
         assert!(b.contains("ask.file_path(") || b.contains("ask.log_path("), "query route {f} takes its path without Ask::file_path");
     }
     assert!(SYNC.contains("let narrowed_dir = !view.within_narrowing(&w.path);"), "fetch serves the tree without the narrowing");
-    const SUBTREE: &str = include_str!("../../src/subtree.rs");
-    assert!(SUBTREE.contains("let path = ask.file_path(") && SUBTREE.contains("sync::fetch(&hub, &ask.project, &ask.viewer"), "the subtree route takes its path without Ask::file_path, or answers without fetch's checks");
     // Every route that takes or returns a path outside `q/` is narrowed in
     // its handler (BUG-1537), and no route is left open.
     assert!(!classes.iter().any(|(_, c)| c.starts_with("open:")), "a route is still open: {classes:?}");

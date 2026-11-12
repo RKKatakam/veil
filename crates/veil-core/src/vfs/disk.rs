@@ -535,75 +535,11 @@ fn write_synced(path: &Path, data: &[u8], secret: Option<bool>) -> io::Result<()
     full_sync(&f)
 }
 
-/// The flushes a fresh clone's set-up deferred ([`defer_durability`]):
-/// the files and directories, each by a descriptor of its own.
-static DEFERRED: std::sync::Mutex<Option<Vec<fs::File>>> = std::sync::Mutex::new(None);
-
-/// Most flushes [`DEFERRED`] holds (descriptors): past it they are made at
-/// once, on several threads, and deferring goes on.
-const DEFERRED_MAX: usize = 512;
-
-/// From now until [`flush_deferred`], every flush to stable storage of this
-/// process is recorded instead of made: **for `vl clone` into a directory
-/// it creates, and nothing else.** It is safe there only because nothing
-/// exists before the clone, the clone's marker that it has not finished is
-/// durable before this starts, every command refuses a directory holding
-/// that marker unless the checkout's journal exists, and the clone flushes
-/// everything before it writes that journal (or removes its directory when
-/// it fails). Then an interruption at any point leaves no directory, or one
-/// `vl` refuses or completes.
-pub fn defer_durability() {
-    *DEFERRED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
-}
-
-/// Make every flush deferred since [`defer_durability`] (on several
-/// threads, as a barrier does), and stop deferring. An error is the first
-/// flush that failed: nothing written since the deferral began may be
-/// taken as durable.
-pub fn flush_deferred() -> Result<()> {
-    let files = DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
-    flush_files(&files).map_err(|e| VeilError::Io { path: "the clone's files".into(), source: e })
-}
-
-/// Debug builds only, for interruption tests: a power cut before
-/// [`flush_deferred`]: every regular file whose flush was deferred loses
-/// its content (cut to `keep` bytes at most; directories are left as they
-/// are), and deferring stops. Nothing deferred is flushed.
-#[cfg(debug_assertions)]
-pub fn lose_deferred_for_test(keep: u64) {
-    for f in DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default() {
-        if f.metadata().is_ok_and(|m| m.is_file() && m.len() > keep) {
-            let _ = f.set_len(keep);
-        }
-    }
-}
-
-fn flush_files(files: &[fs::File]) -> io::Result<()> {
-    for_each_parallel(files, SYNC_WORKERS, 1, sync_now)
-}
-
-/// Flush `f` to stable storage, or record it while a fresh clone defers
-/// its flushes ([`defer_durability`]).
-pub(super) fn full_sync(f: &fs::File) -> io::Result<()> {
-    let mut deferred = DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(list) = deferred.as_mut() {
-        list.push(f.try_clone()?);
-        if list.len() >= DEFERRED_MAX {
-            let full = std::mem::take(list);
-            drop(deferred);
-            return flush_files(&full);
-        }
-        return Ok(());
-    }
-    drop(deferred);
-    sync_now(f)
-}
-
 /// Flush `f` to stable storage. On macOS `File::sync_all` is
 /// `fcntl(F_FULLFSYNC)`, the only call that empties the drive's write cache;
 /// filesystems that do not implement it (some network and FUSE ones) get a
 /// plain `fsync`, the best they offer.
-fn sync_now(f: &fs::File) -> io::Result<()> {
+pub(super) fn full_sync(f: &fs::File) -> io::Result<()> {
     match f.sync_all() {
         #[cfg(target_os = "macos")]
         Err(e) if fullfsync_unsupported(&e) => plain_fsync(f),
