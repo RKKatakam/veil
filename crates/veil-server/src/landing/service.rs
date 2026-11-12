@@ -820,11 +820,12 @@ impl Service {
                 let diffs: Vec<(usize, crate::prs::StackReviewDiff)> = if pending_stacks.is_empty() {
                     Vec::new()
                 } else {
+                    // Each stack's diff on its own, on several threads (a
+                    // third of a millisecond each, one after another: 22 ms
+                    // of a protected branch's batch, BUG-1955); the first
+                    // that fails is the batch's error, as before.
                     sync::blocking(hub, self.project, move |src| {
-                        pending_stacks
-                            .into_iter()
-                            .map(|(i, st)| Ok((i, crate::prs::stack_review_diff(src, &st)?)))
-                            .collect()
+                        on_threads(&pending_stacks, build_threads(), |(i, st)| Ok((*i, crate::prs::stack_review_diff(src, st)?))).into_iter().collect()
                     })
                     .await?
                 };
@@ -1712,26 +1713,29 @@ fn build_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
 }
 
+/// `f` of each of `items`, in their order, on up to `threads` threads (at
+/// least 8 items a thread; with one thread, or few items, here).
+fn on_threads<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let per = items.len().div_ceil(threads.max(1)).max(8);
+    if threads < 2 || items.len() <= per {
+        return items.iter().map(f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = items.chunks(per).map(|part| s.spawn(move || part.iter().map(f).collect::<Vec<R>>())).collect();
+        parts.into_iter().flat_map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
+    })
+}
+
 /// [`read_entry`] of each entry, on `threads` threads (BUG-1955: a batch
 /// was built on one core of the machine's). `None` for an entry whose read
 /// failed, and for all with one thread: [`entry`] reads it in its turn, and
 /// answers what it always did.
 fn read_ahead(src: &Source, entries: &[Prepared], threads: usize) -> Vec<Option<Read>> {
-    let per = entries.len().div_ceil(threads.max(1)).max(8);
-    if threads < 2 || entries.len() <= per {
-        return entries.iter().map(|_| None).collect();
+    match threads {
+        0 | 1 => entries.iter().map(|_| None).collect(),
+        _ => on_threads(entries, threads, |p| read_entry(src, &p.row.stack).ok()),
     }
-    std::thread::scope(|s| {
-        let parts: Vec<_> = entries
-            .chunks(per)
-            .map(|part| s.spawn(move || part.iter().map(|p| read_entry(src, &p.row.stack).ok()).collect::<Vec<_>>()))
-            .collect();
-        parts
-            .into_iter()
-            .zip(entries.chunks(per))
-            .flat_map(|(h, part)| h.join().unwrap_or_else(|_| part.iter().map(|_| None).collect()))
-            .collect()
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
