@@ -79,8 +79,14 @@ echo "== disk"
 df -h "$ROOT" | tail -1
 
 echo "== starting PostgreSQL and MinIO ($TAG)"
-D run -d --name "$PG" -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 \
-    postgres:17-alpine -c max_connections=500 -c shared_preload_libraries=pg_stat_statements >/dev/null || exit 1
+# The memory settings of the deployment's database (deploy/do/configure.sh:
+# 4 GB of shared buffers): with PostgreSQL's default 128 MB a landing run's
+# database (1.5 GB after three minutes) is written out by the backends
+# themselves, a third of their time (BUG-1955). Durability as deployed
+# (`synchronous_commit = on`).
+D run -d --name "$PG" -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 --shm-size=1g \
+    postgres:17-alpine -c max_connections=500 -c shared_preload_libraries=pg_stat_statements \
+    -c shared_buffers=4GB -c effective_cache_size=12GB -c synchronous_commit=on >/dev/null || exit 1
 D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 \
     bitnamilegacy/minio:latest >/dev/null || exit 1
 PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000)
@@ -90,8 +96,17 @@ wait_for MinIO 120 curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live"
 wait_for PostgreSQL 60 D exec "$PG" psql -U veil -d veil -c "select 1"
 D exec "$PG" psql -q -U veil -d veil -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements" >/dev/null || exit 1
 PG_ID=$(D inspect -f '{{.Id}}' "$PG")
-DB_URL=postgres://veil:veil@127.0.0.1:$PG_PORT/veil
-echo "   postgres :$PG_PORT  minio :$S3_PORT"
+# Straight to the container's address where it answers, as a database on
+# its own host would be reached: through the published port every
+# statement went through docker-proxy, which took 3 of the machine's 32
+# threads during a landing run (BUG-1955).
+PG_ADDR=$(D inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$PG")
+if [[ -n "$PG_ADDR" ]] && timeout 2 bash -c "exec 3<>/dev/tcp/$PG_ADDR/5432" 2>/dev/null; then
+    DB_URL=postgres://veil:veil@$PG_ADDR:5432/veil
+else
+    DB_URL=postgres://veil:veil@127.0.0.1:$PG_PORT/veil
+fi
+echo "   postgres :$PG_PORT ($DB_URL)  minio :$S3_PORT"
 
 SERVER_ARGS=(--server "${SERVER_BIN:-$ROOT/target/release/veil-server}" --database-url "$DB_URL")
 if [[ "${OBJECTS:-s3}" != "local" ]]; then
