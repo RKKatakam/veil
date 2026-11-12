@@ -3330,7 +3330,8 @@ impl Ahead {
             prefetch: env.prefetch,
             deleted_secrets: None,
             ahead: None,
-            depth_base: task.depth - 1,
+            // The walk's stack below `path` sits on the `depth` frames above.
+            depth_base: task.depth,
         };
         let built = b.build_dir(&task.path, task.sub.clone());
         let result = AheadResult {
@@ -3423,7 +3424,7 @@ mod tests {
     fn a_full_scan_on_several_threads_records_what_the_serial_walk_records() {
         use std::{os::unix::fs::PermissionsExt, sync::Arc};
 
-        use crate::{statcache::StatCache, DiskBackend, Identity, Repo, StorageBackend, VPath};
+        use crate::{statcache::StatCache, tree::MAX_TREE_DEPTH, DiskBackend, Identity, Repo, StorageBackend, VPath};
 
         if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
             return;
@@ -3460,6 +3461,10 @@ mod tests {
                 }
                 write(&format!("d{a}/skip/x.txt"), b"never");
             }
+            // A chain of folders past the nesting limit, in a subtree built
+            // ahead: cut where the serial walk cuts it.
+            let chain: Vec<&str> = vec!["c"; MAX_TREE_DEPTH + 2];
+            write(&format!("d{}/e{}/{}/end.txt", seed % 6, (seed + 1) % 6, chain.join("/")), b"deep");
             let wc = repo.workspace_wc("default").unwrap();
             let mut cache = StatCache::new();
             repo.snapshot_workspace_cached("default", &*fs, Some(&mut cache)).unwrap();
@@ -3545,7 +3550,7 @@ mod tests {
         // The seeds met what they were meant to: unreadable files and
         // folders, nested repositories, secrets (links are in the tree).
         let all = seen.join("\n");
-        for what in ["Permission denied", "nested: [VPath(\"d", "isolated: [VPath"] {
+        for what in ["Permission denied", "nested: [VPath(\"d", "isolated: [VPath", "directory nesting exceeds"] {
             assert!(all.contains(what), "no seed met {what}: {all}");
         }
 
