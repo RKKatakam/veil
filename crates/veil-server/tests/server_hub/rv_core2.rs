@@ -1876,7 +1876,6 @@ fn bug_1885_deleted_branches_stop_counting_toward_max_branches_at_once() {
 /// and is answered. The change must not land unapproved after that answer:
 /// either the push waits for the batch, or the batch refuses the change.
 #[test]
-#[ignore = "BUG-2061: a rules change on the default branch does not wait for a batch on another protected branch"]
 fn bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits() {
     let th = TestHub::start();
     let p = setup_project(&th);
@@ -1930,4 +1929,127 @@ fn bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits() {
             assert_eq!(done["state"], "landed", "{done}");
         }
     });
+    // The tighter rules are in force from then on: the next such change waits for an approval.
+    let dev_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["dev"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "dev", "base": dev_tip.hex(), "edits": [put("src/docs/y.md", "y\n")], "description": "doc 2", "wait": true}),
+    );
+    assert_eq!((r.status, r.json()["code"].as_str()), (409, Some("not_ready")), "landed unapproved under the tighter rules: {}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("not ready to land"), "{}", String::from_utf8_lossy(&r.body));
+}
+
+/// BUG-2061, an embargo's release: `prs::embargo::finish_release` moves the
+/// embargo's holds into `pr_holds`. `dev` is protected and `src/docs/**`
+/// needs checks only; a security member has asked for changes on the
+/// embargo's PR of `src/docs/held.md` (a hold kept with the embargo until
+/// it is released); a change of that path is queued on `dev` and its batch
+/// is held after its review check, at its entry's row. The embargo is then
+/// released. The change must not land after the release is answered with
+/// the hold in force: either the release waits for the batch, or the batch
+/// refuses the change.
+#[test]
+fn bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (dev_tok, admin_tok, sec_tok) = (p.dev.token(), p.admin.token(), p.sec.token());
+    write_files(&p.dir, &[(".veilrules", "[branches.dev]\nprotected = true\n\n[review]\nchecks_only = [\"src/docs/**\"]\n")]);
+    p.admin.commit_main(&p.dir, "protect dev; src/docs needs checks only");
+    p.admin.ok(&p.dir, &["push"]);
+    let main = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "dev", "expected": null, "new": main.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+
+    // The embargo, of `src/docs/held.md`, for the security group, and its PR.
+    let dir = p.admin.dir("emb-2061");
+    p.admin.ok(p.admin.home.path(), &["clone", &th.url(&p.name), dir.to_str().unwrap()]);
+    write_files(&dir, &[("src/docs/held.md", "the embargoed fix\n")]);
+    p.admin.ok(&dir, &["commit", "--no-advance", "-m", "an embargoed fix"]);
+    let out = p.admin.ok(&dir, &["merge", "@-", "--into", "main", "--embargo-for", "security", "-m", "an embargoed fix"]);
+    let eid = out
+        .split_whitespace()
+        .map(|w| w.trim_end_matches(':'))
+        .find(|w| w.len() == 10 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| panic!("no embargo id in: {out}"))
+        .to_string();
+    p.admin.ok(&dir, &["push"]);
+    let pr = api.post_json(Some(&admin_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": format!("embargo/{eid}"), "title": "the fix"}));
+    assert_eq!(pr.status, 200, "{}", String::from_utf8_lossy(&pr.body));
+    let (pr_id, patch) = (pr.json()["id"].as_str().unwrap().to_string(), pr.json()["patch"].as_str().unwrap().to_string());
+    let sig = p.sec.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, "request-changes"));
+    let r = api.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+        &json!({"patch": patch, "verdict": "request-changes", "signature": sig}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let h = th.hub();
+    let holds = |table: &str| -> i64 {
+        th.rt
+            .block_on(
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE project_id = $1 AND path = 'src/docs/held.md'"))
+                    .bind(pid)
+                    .fetch_one(&h.db),
+            )
+            .unwrap()
+    };
+    assert_eq!((holds("pr_embargo_holds"), holds("pr_holds")), (1, 0), "the hold is kept with the embargo");
+
+    hold_lease(&th, pid, "dev");
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "dev", "base": main.hex(), "edits": [put("src/docs/held.md", "dev's text\n")], "description": "doc", "wait": false}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "queued", "{}", r.json());
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    let mut held = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt
+        .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
+        .unwrap();
+    release_lease(&th, pid, "dev");
+    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entry's row"));
+
+    let answered = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let releasing = scope.spawn(|| {
+            let r = api.post_json(Some(&admin_tok), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+            answered.store(true, Ordering::SeqCst);
+            r
+        });
+        std::thread::sleep(Duration::from_secs(3));
+        let answered_while_held = answered.load(Ordering::SeqCst);
+        th.rt.block_on(held.rollback()).unwrap();
+        let rel = releasing.join().unwrap();
+        assert_eq!(rel.status, 200, "{}", String::from_utf8_lossy(&rel.body));
+        let released: Option<i64> = th
+            .rt
+            .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2").bind(pid).bind(&eid).fetch_one(&h.db))
+            .unwrap();
+        assert!(released.is_some(), "the embargo was released");
+        assert_eq!((holds("pr_embargo_holds"), holds("pr_holds")), (0, 1), "the release made the hold public");
+        let done = outcome(&api, &dev_tok, &p.name, &ticket);
+        if answered_while_held {
+            assert_eq!(done["state"], "rejected", "landed on a held path after the release was answered: {done}");
+        } else {
+            assert_eq!(done["state"], "landed", "{done}");
+        }
+    });
+    // The hold is in force from then on.
+    let dev_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["dev"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "dev", "base": dev_tip.hex(), "edits": [put("src/docs/held.md", "again\n")], "description": "doc 2", "wait": true}),
+    );
+    assert_eq!((r.status, r.json()["code"].as_str()), (409, Some("not_ready")), "landed on a held path: {}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("asked for changes"), "{}", String::from_utf8_lossy(&r.body));
 }
