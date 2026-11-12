@@ -5814,7 +5814,8 @@ fn no_event_or_report_reveals_hidden_paths_names_counts_or_content() {
     let _ = pid;
 }
 
-/// S18 Guarantee 3: A re-queued change lands at most once.
+/// S18 Guarantee 3: A merged change lands at most once (merged in the
+/// batch since BUG-1956, never queued again).
 #[test]
 fn a_requeued_change_lands_at_most_once() {
     let hub = TestHub::start();
@@ -5830,7 +5831,7 @@ fn a_requeued_change_lands_at_most_once() {
     assert_eq!(s["state"], "landed", "{s}");
     let main0 = real_tip(&hub, pid);
 
-    // Subscribe to events as dev to observe `requeued` then `landed`.
+    // Subscribe to events as dev to observe `landed`, merged once.
     let stream_resp = api.get_unread(
         &format!("/v1/projects/{}/events", p.name),
         &[("authorization", &format!("Bearer {dev_tok}"))],
@@ -5870,7 +5871,8 @@ fn a_requeued_change_lands_at_most_once() {
     );
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let v = r.json();
-    assert_eq!(v["state"], "landed", "re-queued change should land: {v}");
+    assert_eq!(v["state"], "landed", "the overlapping change should land merged: {v}");
+    assert_eq!(v["merges"], 1, "{v}");
 
     // Verify the change landed on main exactly once.
     let landed_cids: Vec<_> = chain(&hub, pid, main0).into_iter().map(|(_, s)| s.change_id).collect();
@@ -5894,13 +5896,11 @@ fn a_requeued_change_lands_at_most_once() {
         "re-submitted change must still be on main only once"
     );
 
-    // Verify dev's event stream saw `requeued` and `landed`.
+    // Dev's event stream saw it land, merged, and never queued again.
     let events = read_sse_events(stream_resp, 10, Duration::from_secs(3));
     let states: Vec<&str> = events.iter().filter_map(|(_, d)| d["state"].as_str()).collect();
-    assert!(
-        states.contains(&"requeued") && states.contains(&"landed"),
-        "expected requeued and landed events, got: {events:?}"
-    );
+    assert!(states.contains(&"landed") && !states.contains(&"requeued"), "expected a landed event and no requeued one, got: {events:?}");
+    assert!(events.iter().any(|(_, d)| d["state"] == "landed" && d["merges"] == 1), "{events:?}");
 }
 
 /// S18 Guarantee 4: The event stream is bounded per connection and per person.
@@ -6021,10 +6021,11 @@ fn a_slow_or_absent_reader_never_holds_server_memory() {
     assert_eq!(h.events.held_bytes(), 0, "evicted slow reader must hold 0 bytes in server memory");
 }
 
-/// Content merges respect `.veilattributes` (`-merge` / `binary` vs `merge=union`)
-/// and re-queue at most `MAX_MERGES` (3) times before answering `conflict`.
+/// Content merges respect `.veilattributes` (`-merge` / `binary` vs `merge=union`),
+/// and a clean merge lands however often the entry was merged before
+/// (BUG-1956: a cap of three re-queued merges answered clean overlaps `conflict`).
 #[test]
-fn merge_attempts_cap_at_three_and_veilattributes_govern_content_merge() {
+fn veilattributes_govern_content_merge_and_a_clean_merge_is_never_capped() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
@@ -6084,7 +6085,7 @@ fn merge_attempts_cap_at_three_and_veilattributes_govern_content_merge() {
     let chlog = String::from_utf8(real_file(&hub, pid, "src/CHANGELOG.md").unwrap()).unwrap();
     assert!(chlog.contains("- admin entry") && chlog.contains("- dev entry"), "{chlog}");
 
-    // 3. `MAX_MERGES` cap (3): a queued row that has already been merged 3 times is not merged a 4th time.
+    // 3. A queued row a server before BUG-1956's fix merged 3 times (its old cap) is merged again and lands.
     let dev_base_cap = tip_for(&hub, &dev_tok, &p.name);
     let admin_base_cap = tip_for(&hub, &admin_tok, &p.name);
     let cap_setup = land(&api, &admin_tok, &p.name, admin_base_cap, json!([put("src/CHANGELOG.md", &format!("{chlog}- admin cap\n"))]), true).json();
@@ -6097,7 +6098,7 @@ fn merge_attempts_cap_at_three_and_veilattributes_govern_content_merge() {
     hub.rt
         .block_on(
             sqlx::query("UPDATE landing_queue SET merges = $1 WHERE project_id = $2 AND ticket = $3")
-                .bind(veil_server::landing::merge::MAX_MERGES as i64)
+                .bind(3i64)
                 .bind(pid)
                 .bind(&cap_ticket)
                 .execute(&h.db),
@@ -6105,8 +6106,10 @@ fn merge_attempts_cap_at_three_and_veilattributes_govern_content_merge() {
         .unwrap();
     release(&hub, pid);
     let capped = outcome(&api, &dev_tok, &p.name, &cap_ticket);
-    assert_eq!(capped["state"], "conflict", "4th merge attempt past MAX_MERGES must conflict: {capped}");
-    assert_eq!(capped["merges"], veil_server::landing::merge::MAX_MERGES, "{capped}");
+    assert_eq!(capped["state"], "landed", "a clean merge lands, however often merged before: {capped}");
+    assert_eq!(capped["merges"], 4, "{capped}");
+    let chlog = String::from_utf8(real_file(&hub, pid, "src/CHANGELOG.md").unwrap()).unwrap();
+    assert!(chlog.contains("- admin cap") && chlog.contains("- dev cap"), "{chlog}");
 }
 
 // ---- S18 review (s18r1): guarantees 1–6 and BUG-1682..BUG-1684 ------------------------------

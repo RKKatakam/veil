@@ -131,108 +131,57 @@ impl Drop for TxGuard<'_> {
     }
 }
 
-/// Submit an overlapping landing and hold its merge worker's commit while the
-/// row is `merging`. On PostgreSQL, holds `LOCK TABLE origins IN EXCLUSIVE MODE`
-/// and waits for `INSERT INTO origins%`; on YugabyteDB (which rejects `LOCK TABLE
-/// ... EXCLUSIVE`), locks `access_epochs (pid, -1) FOR UPDATE` as soon as the
-/// row enters `merging` so `run_worker`'s `guard_root_write` (`FOR SHARE`) waits
-/// while `renew_task` keeps renewing `landing_queue`.
-///
-/// On YugabyteDB the worker may commit before the lock is taken (seen under
-/// a full suite's load): that entry has landed, and `submit` is asked for
-/// another, with the next `round`. It must submit a new change each round
-/// ([`submit_a_change_to_merge`]): the same change submitted again is
-/// refused as landed already (BUG-1524), which is what failed these tests
-/// now and then.
-fn hold_worker_in_merging<'a>(
-    rt: &'a tokio::runtime::Runtime,
-    db: &sqlx::PgPool,
-    pid: i64,
-    mut submit: impl FnMut(usize) -> String,
-) -> (String, TxGuard<'a>) {
-    if !rt.block_on(is_yugabyte(db)) {
-        let mut lock = rt.block_on(db.begin()).unwrap();
-        rt.block_on(sqlx::query("LOCK TABLE origins IN EXCLUSIVE MODE").execute(&mut *lock)).unwrap();
-        let guard = TxGuard(rt, Some(lock));
-        let ticket = submit(0);
-        let until = Instant::now() + Duration::from_secs(30);
-        loop {
-            let st: String = rt
-                .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(db))
-                .unwrap();
-            let waiting: i64 = rt
-                .block_on(
-                    sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO origins%'")
-                        .fetch_one(db),
-                )
-                .unwrap();
-            if st == "merging" && waiting > 0 {
-                return (ticket, guard);
-            }
-            assert!(Instant::now() < until, "the entry was handed to a merge worker: {st}");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    rt.block_on(
-        sqlx::query("INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 0, 0) ON CONFLICT DO NOTHING")
+/// A queued change of dev's that needs a content merge, left `merging` with
+/// a live claim of `holder` for `claim_ms`, as a server before BUG-1956's
+/// fix left the entries its merge workers had (the batch merges them
+/// itself since): `submit` holds `main`'s lease for the test (the hold it is
+/// given) before it queues the change, which is then marked so, and the
+/// lease is given back.
+fn left_merging(hub: &TestHub, pid: i64, holder: &str, claim_ms: i64, submit: impl FnOnce(&dyn Fn()) -> String) -> String {
+    let db = hub.hub().db.clone();
+    let hold = || {
+        hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, 'main', 'test', 1, $2) \
+                 ON CONFLICT (project_id, branch) DO UPDATE SET holder = 'test', epoch = landing_leases.epoch + 1, expires_at = $2",
+            )
             .bind(pid)
-            .execute(db),
-    )
-    .unwrap();
-    let state = |ticket: &str| -> String {
-        rt.block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(ticket).fetch_one(db))
-            .unwrap()
+            .bind(veil_core::now_millis() + 600_000)
+            .execute(&db),
+        )
+        .unwrap();
     };
-    for attempt in 0..5 {
-        let ticket = submit(attempt);
-        let until = Instant::now() + Duration::from_secs(30);
-        loop {
-            let st: String = rt
-                .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(db))
-                .unwrap();
-            if st == "merging" {
-                let mut lock = rt.block_on(db.begin()).unwrap();
-                rt.block_on(
-                    sqlx::query("SELECT 1 FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE")
-                        .bind(pid)
-                        .execute(&mut *lock),
-                )
-                .unwrap();
-                let guard = TxGuard(rt, Some(lock));
-                let st_after: String = rt
-                    .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(db))
-                    .unwrap();
-                if st_after == "merging" {
-                    std::thread::sleep(Duration::from_millis(400));
-                    return (ticket, guard);
-                }
-                guard.rollback();
-                break;
-            }
-            assert!(Instant::now() < until || attempt < 4, "entry did not stay in merging on YugabyteDB: {st}");
-            if st != "queued" || Instant::now() >= until {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        // The worker was not held: its entry lands, and the next round's
-        // change is made on it.
-        let until = Instant::now() + Duration::from_secs(60);
-        while matches!(state(&ticket).as_str(), "queued" | "merging") && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(state(&ticket), "landed", "round {attempt}: the entry whose worker was not held");
-    }
-    panic!("could not trap worker in merging on YugabyteDB");
+    let ticket = submit(&hold);
+    let n = hub
+        .rt
+        .block_on(
+            sqlx::query(
+                "UPDATE landing_queue SET state = 'merging', \
+                 result = jsonb_build_object('holder', $3::TEXT, 'token', 1, 'expires_at', (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT + $4::BIGINT)::TEXT \
+                 WHERE project_id = $1 AND ticket = $2 AND state = 'queued'",
+            )
+            .bind(pid)
+            .bind(&ticket)
+            .bind(holder)
+            .bind(claim_ms)
+            .execute(&db),
+        )
+        .unwrap()
+        .rows_affected();
+    assert_eq!(n, 1, "the queued entry is marked merging");
+    hub.rt
+        .block_on(sqlx::query("UPDATE landing_leases SET expires_at = 0 WHERE project_id = $1 AND branch = 'main' AND holder = 'test'").bind(pid).execute(&db))
+        .unwrap();
+    ticket
 }
 
 /// Queue a change of dev's that needs a content merge to land, and return
 /// its ticket: dev edits line 2 of `file` on `main`'s tip, the admin lands
 /// an edit of line 28 first, then dev's change is submitted (`wait: false`,
-/// answered `queued`). Each `round` makes new edits, on what the round
+/// answered `queued`, after `hold`). Each `round` makes new edits, on what the round
 /// before left on `main` (both of its changes landed).
-fn submit_a_change_to_merge(api: &Api, admin_tok: &str, dev_tok: &str, project: &str, file: &str, round: usize) -> String {
+fn submit_a_change_to_merge(api: &Api, admin_tok: &str, dev_tok: &str, project: &str, file: &str, round: usize, hold: &dyn Fn()) -> String {
     // The file with line 2 as dev's `two`th round left it and line 28 as
     // the admin's `last`th did (`None`: as first written).
     let text = |two: Option<usize>, last: Option<usize>| {
@@ -265,6 +214,7 @@ fn submit_a_change_to_merge(api: &Api, admin_tok: &str, dev_tok: &str, project: 
     assert_eq!(r.status, 200, "round {round}: {}", String::from_utf8_lossy(&r.body));
     let change: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
     land_as_admin(text(before, Some(round)));
+    hold();
     let r = api.post_json(
         Some(dev_tok),
         &format!("/v1/projects/{project}/land"),
@@ -426,15 +376,14 @@ fn bug_1880_a_change_reverted_twice_while_queued_needs_a_person_in_the_batch() {
     assert_eq!(file("src/twice-1880.rs"), 404, "the change reverted twice is on main");
 }
 
-/// BUG-1880's fix checks the review again in the batch's transaction, but
-/// reads it without a lock (`READ COMMITTED`): a reviewer who takes the
-/// approval back after that read and before the batch commits is answered
-/// `ready: false`, and the change still lands. The window is the batch's
-/// transaction after that read (milliseconds; longer when it waits for a
-/// row, as here).
+/// BUG-1886: every landing meets the review rules in force when it commits.
+/// BUG-1880's fix checks the review again in the batch's transaction; until
+/// BUG-1886's fix it read it without a lock, and a reviewer who took the
+/// approval back after that read and before the batch committed was answered
+/// `ready: false` while the change still landed. Now the reviewer's verdict
+/// waits for the batch (the review gate), and is written after the landing.
 #[test]
-#[ignore = "BUG-1886: an approval withdrawn while the landing batch commits still lands"]
-fn bug_1886_an_approval_withdrawn_while_the_batch_commits_still_lands() {
+fn bug_1886_an_approval_withdrawn_while_the_batch_commits_waits_for_the_batch() {
     let th = TestHub::start();
     let p = setup_project(&th);
     let api = th.api();
@@ -494,20 +443,27 @@ fn bug_1886_an_approval_withdrawn_while_the_batch_commits_still_lands() {
     release_lease(&th, pid, "main");
     th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
 
-    // Its reviewer takes the approval back, and is told the PR is not ready.
-    let r = review("request-changes");
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["review"]["ready"], false, "the PR is no longer ready to land");
+    // Its reviewer takes the approval back: the verdict waits for the batch
+    // that read the approval.
+    let withdrawn = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reviewer = scope.spawn(|| {
+            let r = review("request-changes");
+            withdrawn.store(true, Ordering::SeqCst);
+            r
+        });
+        th.rt.block_on(wait_for_sql_lock(&h.db, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the batch"));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!withdrawn.load(Ordering::SeqCst), "the verdict was written while the batch that read the approval was open");
 
-    th.rt.block_on(held.rollback()).unwrap();
-    let done = outcome(&api, &dev_tok, &p.name, &ticket);
-    assert_ne!(done["state"], "queued", "the entry was answered: {done}");
-    assert_eq!(
-        api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"],
-        base,
-        "a change whose only approval was withdrawn (its reviewer told so) landed on protected main: {done}"
-    );
-    assert_eq!(done["state"], "rejected", "{done}");
+        th.rt.block_on(held.rollback()).unwrap();
+        let done = outcome(&api, &dev_tok, &p.name, &ticket);
+        assert_eq!(done["state"], "landed", "the change lands, approved when it committed: {done}");
+        let r = reviewer.join().unwrap();
+        // Written after the landing (or refused: the PR may be landed with it).
+        assert!(r.status == 200 || r.status == 409, "{}", String::from_utf8_lossy(&r.body));
+    });
+    assert_ne!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"], base, "the change landed");
 }
 
 /// BUG-1880 variants: (1) `.veilrules` tightened by an entry ahead in the
@@ -1264,18 +1220,18 @@ fn bug_1883_a_merging_entry_of_a_server_that_went_away_is_never_answered() {
     let pid = project_id(&a, &p.name);
     let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
     let db = b.hub().db.clone();
-    // The merge worker's commit waits, so that the server stops while the
-    // entry is `merging`.
-    let (ticket, lock) =
-        hold_worker_in_merging(&b.rt, &db, pid, |round| submit_a_change_to_merge(&api_a, &admin_tok, &dev_tok, &p.name, "src/merge-1883.txt", round));
+    // The entry is `merging`, claimed by a server that then stops (for 10 s,
+    // as long as its claim was last renewed for).
+    let ticket = left_merging(&a, pid, "gone", 10_000, |hold| {
+        submit_a_change_to_merge(&api_a, &admin_tok, &dev_tok, &p.name, "src/merge-1883.txt", 0, hold)
+    });
     let state = || -> String {
         b.rt.block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(&db)).unwrap()
     };
     // The server with the worker goes away; the other keeps running.
     drop(api_a);
     drop(a);
-    lock.rollback();
-    assert_eq!(state(), "merging", "the worker's commit went with its server");
+    assert_eq!(state(), "merging", "the claim is live a while yet");
 
     // The entry's submitter asks the server that is left.
     let until = Instant::now() + Duration::from_secs(45);
@@ -1288,7 +1244,7 @@ fn bug_1883_a_merging_entry_of_a_server_that_went_away_is_never_answered() {
         }
     };
     assert_eq!(done["state"], "landed", "45 s after its server went away the entry is still `{}` in the queue: {done}", state());
-    assert_eq!(done["merges"], 1, "only the surviving worker's merge counts: {done}");
+    assert_eq!(done["merges"], 1, "merged once, by the batch that landed it: {done}");
 }
 
 /// BUG-1883: starting another server (`landing::resume`) does not reset a live
@@ -1303,9 +1259,10 @@ fn bug_1883_peer_resume_preserves_live_merge_claims() {
     let pid = project_id(&a, &p.name);
     let (dev_tok, admin_tok) = (p.dev.token(), p.admin.token());
     let db = a.hub().db.clone();
-    // Hold the merge worker's commit so `a` stays in `merging` with a live claim.
-    let (ticket, lock) =
-        hold_worker_in_merging(&a.rt, &db, pid, |round| submit_a_change_to_merge(&api_a, &admin_tok, &dev_tok, &p.name, "src/merge-1883-peer.txt", round));
+    // The entry is `merging` with a live claim of a running peer's.
+    let ticket = left_merging(&a, pid, "peer", 5_000, |hold| {
+        submit_a_change_to_merge(&api_a, &admin_tok, &dev_tok, &p.name, "src/merge-1883-peer.txt", 0, hold)
+    });
 
     // Peer `b` runs `landing::resume`: `a`'s live claim must NOT be reset to `queued`.
     b.rt.block_on(veil_server::landing::resume(b.hub()));
@@ -1316,7 +1273,7 @@ fn bug_1883_peer_resume_preserves_live_merge_claims() {
     assert_eq!(st_after_resume, "merging", "peer resume must not reset a live merge claim");
     assert!(claim_after_resume.is_some(), "live claim metadata must remain intact");
 
-    lock.rollback();
+    // Once the claim expires, the entry is queued again and lands.
     let done = outcome(&api_b, &dev_tok, &p.name, &ticket);
     assert_eq!(done["state"], "landed", "{done}");
     assert_eq!(done["merges"], 1, "no duplicate merge counted when peer runs resume: {done}");
@@ -1907,4 +1864,70 @@ fn bug_1885_deleted_branches_stop_counting_toward_max_branches_at_once() {
     assert_eq!(search_head_after, search_head_before, "search_heads left for existing purge/GC");
     let file_r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?path=src/cap_keep.rs", p.name));
     assert_eq!(file_r.status, 200, "referenced object remains intact");
+}
+
+/// BUG-2061 (BUG-1886's class, left by its fix): `dev`'s protection comes
+/// from the default branch's `.veilrules`, which the batch landing on `dev`
+/// reads without a lock (`prs::rules_unchanged_in_tx` reads `main`'s tip
+/// before it takes the review gate). `dev` is protected and `src/docs/**`
+/// needs no approval; a change of `src/docs/` is queued on `dev`, and its
+/// batch is held after its review check, at its entry's row. The admin then
+/// pushes `.veilrules` to `main` without `checks_only` (one approval needed)
+/// and is answered. The change must not land unapproved after that answer:
+/// either the push waits for the batch, or the batch refuses the change.
+#[test]
+#[ignore = "BUG-2061: a rules change on the default branch does not wait for a batch on another protected branch"]
+fn bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let dev_tok = p.dev.token();
+    write_files(&p.dir, &[(".veilrules", "[branches.dev]\nprotected = true\n\n[review]\nchecks_only = [\"src/docs/**\"]\n")]);
+    p.admin.commit_main(&p.dir, "protect dev; src/docs needs checks only");
+    p.admin.ok(&p.dir, &["push"]);
+    let main = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "dev", "expected": null, "new": main.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+
+    hold_lease(&th, pid, "dev");
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "dev", "base": main.hex(), "edits": [put("src/docs/x.md", "x\n")], "description": "doc", "wait": false}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "queued", "{}", r.json());
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    let h = th.hub();
+    let mut held = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt
+        .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
+        .unwrap();
+    release_lease(&th, pid, "dev");
+    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entry's row"));
+
+    let answered = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let pushing = scope.spawn(|| {
+            write_files(&p.dir, &[(".veilrules", "[branches.dev]\nprotected = true\n")]);
+            p.admin.commit_main(&p.dir, "src/docs needs an approval");
+            p.admin.ok(&p.dir, &["push"]);
+            answered.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_secs(3));
+        let answered_while_held = answered.load(Ordering::SeqCst);
+        th.rt.block_on(held.rollback()).unwrap();
+        pushing.join().unwrap();
+        let done = outcome(&api, &dev_tok, &p.name, &ticket);
+        if answered_while_held {
+            assert_eq!(done["state"], "rejected", "landed unapproved after the tighter rules were answered: {done}");
+        } else {
+            assert_eq!(done["state"], "landed", "{done}");
+        }
+    });
 }

@@ -27,7 +27,10 @@ pub use service::ATTACH_BUDGET;
 
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicU64, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -375,8 +378,8 @@ pub struct Stats {
     /// change is on the branch: neither its tip nor a landing (BUG-1275).
     pub walks: AtomicU64,
     /// Submits told to come back because the branch's queue was full
-    /// (`limits::pressure`, BUG-1955), and queue entries handed to merge
-    /// workers.
+    /// (`limits::pressure`, BUG-1955), and entries landed merged by
+    /// content (BUG-1956).
     pub queue_full: AtomicU64,
     pub merging: AtomicU64,
 }
@@ -404,14 +407,13 @@ pub struct Services {
     waiting_by_person: Mutex<HashMap<i64, usize>>,
     /// The branches whose waiters here a poller answers (`poll`).
     pollers: Mutex<std::collections::HashSet<(i64, String)>>,
-    /// Monotonic token distinguishing merge-worker claims (`BUG-1883`).
-    next_claim: AtomicU64,
-    /// Content merge workers running on this server (S18).
-    pub merges: merge::Workers,
     /// What this server knows of each branch's queue, for early
     /// back-pressure (`limits::pressure`, BUG-1955).
     pub pressure: crate::limits::pressure::Gauges,
     pub stats: Stats,
+    /// The server is stopping cleanly ([`stop`]): no service starts, and
+    /// each running one ends after its batch being committed.
+    stopping: AtomicBool,
 }
 
 const RETRY_LEASE: Duration = Duration::from_millis(500);
@@ -426,10 +428,9 @@ impl Default for Services {
             next_waiter: AtomicU64::new(1),
             waiting_by_person: Mutex::new(HashMap::new()),
             pollers: Mutex::new(Default::default()),
-            next_claim: AtomicU64::new(1),
-            merges: merge::Workers::default(),
             pressure: Default::default(),
             stats: Stats::default(),
+            stopping: AtomicBool::new(false),
         }
     }
 }
@@ -455,10 +456,6 @@ pub struct Waiter {
 }
 
 impl Services {
-    pub(crate) fn next_claim_token(&self) -> u64 {
-        self.next_claim.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Wait here for `ticket`'s outcome.
     pub fn register(&self, ticket: &str) -> Waiter {
         let (tx, rx) = oneshot::channel();
@@ -501,6 +498,9 @@ impl Services {
 pub fn ensure(hub: &Arc<Hub>, project: i64, branch: &str) {
     let key = (project, branch.to_string());
     let s = &hub.landing;
+    if s.stopping() {
+        return;
+    }
     {
         let running = s.running.lock().unwrap();
         if let Some(r) = running.get(&key) {
@@ -536,13 +536,54 @@ pub fn ensure(hub: &Arc<Hub>, project: i64, branch: &str) {
         hub.landing.running.lock().unwrap().remove(&key);
         // An entry submitted while it was stopping (or held by another server
         // that may stop before answering, `BUG-1883`) is not left waiting.
-        if service::has_ready(&hub, project, &key.1).await.unwrap_or(false) {
+        // Held elsewhere, the lease is asked for again as often as a submit
+        // here would ask (`RETRY_LEASE`): a server that stops cleanly gives
+        // it up at once (BUG-1970), and it is taken over as soon.
+        if !hub.landing.stopping() && service::has_ready(&hub, project, &key.1).await.unwrap_or(false) {
             if held_elsewhere {
-                tokio::time::sleep(Duration::from_millis(LEASE_MS as u64 + 100)).await;
+                tokio::time::sleep(RETRY_LEASE).await;
             }
             ensure(&hub, project, &key.1);
         }
     });
+}
+
+/// Most a clean stop waits for this server's landing services to end.
+const STOP_WAIT: Duration = Duration::from_secs(15);
+
+/// Stop this server's landing services for a clean stop (BUG-1970): none
+/// starts again; each running one commits the batch it is committing (or
+/// that batch fails), builds no other, and gives its lease up (`expires_at
+/// = 0`, its fencing epoch kept: whoever takes it next has a later one, and
+/// this server lands nothing more), so another server takes the branch over
+/// at once instead of after the lease runs out. Waits for them, at most
+/// `STOP_WAIT` (a crash, or a service still running then, relies on the
+/// lease's expiry).
+pub async fn stop(hub: &Arc<Hub>) {
+    let s = &hub.landing;
+    s.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+    let until = Instant::now() + STOP_WAIT;
+    loop {
+        let wakes: Vec<Arc<Notify>> = s.running.lock().unwrap().values().map(|r| r.wake.clone()).collect();
+        if wakes.is_empty() {
+            return;
+        }
+        if Instant::now() > until {
+            eprintln!("veil-server: {} landing services still running at the stop: their leases expire", wakes.len());
+            return;
+        }
+        for w in wakes {
+            w.notify_one();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+impl Services {
+    /// Is this server stopping ([`stop`])?
+    pub(crate) fn stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Start the services of every branch with queued or merging entries (a server

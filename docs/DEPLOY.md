@@ -438,16 +438,21 @@ wrongly refused changes after the failover would show only in those
 counts (each agent writes a file of its own, so a plain run expects no
 conflicts).
 
-The database is the authority here because the benchmark tool does not
-log which change each of its landings was: it counts them. Its count over
-the measured window must not exceed the database's (it is lower by the
+The database is the authority here. The benchmark tool's count over the
+measured window must not exceed the database's (it is lower by the
 warm-up's landings and by **answers lost with the stopped server**: the
 ticket was accepted and landed, but the agent saw a broken connection).
-Telling those apart change by change needs the tool to write each landed
-snapshot id (the `landed` answer of `POST …/land`) and each submit that
-ended in an error to a file; then "every change the tool saw land is on
-`main` once" can be checked from both sides. That is a change to
-`crates/veil-bench/src/load.rs` (`land_service`), not made by the kit.
+To tell those apart change by change, `veil-bench load --mode landing`
+also writes, beside its results (`--out X.json` gives
+`X.landings.jsonl`), one JSON line for each landing an agent was answered
+`landed` (`ticket`, `change`, the `landed` snapshot ids, `project`,
+`at_ms`) and one for each submit that failed (`failed`: the error, and the
+`ticket` when the server gave one), from the start of the run, warm-up
+included. With it "every change the tool was told landed is on `main`
+once" can be checked from both sides: each `change` of the file on
+`main`'s first-parent line exactly once, and a failed submit's `ticket`,
+when it has one, looked up in `landing_queue`. The gate does not read the
+file yet (`failover.sql` judges from the database alone).
 
 ### 6.2 The results directory
 
