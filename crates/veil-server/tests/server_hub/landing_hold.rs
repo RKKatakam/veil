@@ -684,3 +684,312 @@ fn bug_2060_an_edit_the_tip_already_holds_merges_cleanly() {
     assert_eq!(file("src/same/new.txt"), (200, "the same new file\n".to_string()));
     assert_eq!(file("src/same/own.txt"), (200, "its own edit\n".to_string()));
 }
+
+/// One change of [`bug_1956_every_kind_of_edit_lands_as_landing_them_one_by_one`]:
+/// who submits it, on which base, and its edits.
+#[derive(Clone)]
+struct Planned {
+    person: usize,
+    base: veil_core::ObjectId,
+    edits: Vec<serde_json::Value>,
+    /// The index of the earlier change it repeats exactly (an edit the tip
+    /// may already hold, BUG-2060).
+    repeats: Option<usize>,
+}
+
+fn kinds_put(path: &str, text: &str, executable: bool) -> serde_json::Value {
+    if executable {
+        serde_json::json!({"path": path, "put": {"text": text, "executable": true}})
+    } else {
+        serde_json::json!({"path": path, "put": {"text": text}})
+    }
+}
+
+fn kinds_delete(path: &str) -> serde_json::Value {
+    serde_json::json!({"path": path, "delete": true})
+}
+
+fn edit_paths(edits: &[serde_json::Value]) -> Vec<String> {
+    edits.iter().map(|e| e["path"].as_str().unwrap().to_string()).collect()
+}
+
+fn overlap(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+/// The landing answer of a ticket once it is no longer queued.
+fn settled(api: &Api, token: &str, project: &str, ticket: &str) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let r = api.get(Some(token), &format!("/v1/projects/{project}/land/{ticket}"));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v = r.json();
+        if v["state"] != "queued" && v["state"] != "merging" {
+            return v;
+        }
+        assert!(std::time::Instant::now() < deadline, "{ticket} still {v}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The id of the root tree of snapshot `rev`, as the admin (who sees all of it) reads it.
+fn root_tree(api: &Api, admin: &str, project: &str, rev: &str) -> String {
+    let r = api.get(Some(admin), &format!("/v1/projects/{project}/q/tree?rev={rev}"));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    r.json()["id"].as_str().unwrap().to_string()
+}
+
+/// BUG-1956: a batch's answers and trees are those of landing its changes
+/// one by one in the queue's order, for every kind of edit: line edits of
+/// text files, deletes, renames, a file replaced by a folder and a folder
+/// by a file (and a folder made from a file turned back into one, on a
+/// later base), binary files, the executable bit, a file over the 1 MiB
+/// merge cap, `.veilattributes` rules (`merge=union`, `-merge`), changes
+/// repeated exactly (an edit the tip already holds, BUG-2060), and three
+/// people submitting in an uneven mix (the batch takes them in fair-share
+/// order: round-robin over people by their first entry, each person's in
+/// order). Seeded runs of 60 changes on two bases, queued while the branch
+/// is held so that they land in one batch; then the same changes land one
+/// at a time onto a branch at the same tip, in the fair-share order. Each
+/// is answered the same both ways, and each landed one's tree is the same;
+/// a change repeated with nothing landed on its paths between lands.
+#[test]
+fn bug_1956_every_kind_of_edit_lands_as_landing_them_one_by_one() {
+    let hub = TestHub::start();
+    for seed in 1..=2u64 {
+        every_kind_of_edit_run(&hub, seed);
+    }
+}
+
+fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
+    const K: &str = "src/k";
+    let p = setup_project(hub);
+    let pid = project_id_of(hub, &p.name);
+    let api = hub.api();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.carol.name, "--confirm", &p.carol.fingerprint()]);
+    let tokens = [p.dev.token(), p.admin.token(), p.carol.token()];
+    let admin = tokens[1].clone();
+    let text30 = |tag: &str| -> String { (0..30).map(|i| format!("{tag} line {i}\n")).collect() };
+    let big: String = (0..20_000).map(|i| format!("big line {i:06} of a file over the merge cap\n")).collect();
+    assert!(big.len() as u64 > veil_server::landing::merge::MAX_MERGE_FILE_BYTES, "{}", big.len());
+    let run_text = |r: usize| format!("#!/bin/sh\necho run {r}\n");
+    let mut made = vec![kinds_put(&format!("{K}/.veilattributes"), "*.union merge=union\n*.lock -merge\n", false)];
+    for f in 0..4 {
+        made.push(kinds_put(&format!("{K}/t{f}.txt"), &text30(&format!("t{f}")), false));
+        made.push(kinds_put(&format!("{K}/old{f}.txt"), &text30(&format!("old{f}")), false));
+    }
+    for i in 0..2 {
+        made.push(kinds_put(&format!("{K}/bin{i}.dat"), &format!("\u{0}BIN {i}\n"), false));
+        made.push(kinds_put(&format!("{K}/run{i}.sh"), &run_text(i), false));
+        made.push(kinds_put(&format!("{K}/node{i}"), &format!("node {i}\n"), false));
+        made.push(kinds_put(&format!("{K}/tree{i}/inner.txt"), &format!("tree {i}\n"), false));
+    }
+    made.push(kinds_put(&format!("{K}/big.txt"), &big, false));
+    made.push(kinds_put(&format!("{K}/log.union"), "entry 0\nentry 1\n", false));
+    made.push(kinds_put(&format!("{K}/dep.lock"), &text30("dep"), false));
+    let tip = |api: &Api| api.tips(Some(&admin), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&admin),
+        &format!("/v1/projects/{}/land", p.name),
+        &serde_json::json!({"onto": "main", "base": tip(&api).hex(), "edits": made, "description": "the files", "wait": true}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    let x = tip(&api);
+    // The later base: `node1` is a folder there, and `t0`'s first line is another.
+    let r = api.post_json(
+        Some(&admin),
+        &format!("/v1/projects/{}/land", p.name),
+        &serde_json::json!({"onto": "main", "base": x.hex(), "edits": [
+            kinds_delete(&format!("{K}/node1")),
+            kinds_put(&format!("{K}/node1/inner.txt"), "made a folder\n", false),
+            kinds_put(&format!("{K}/t0.txt"), &text30("t0").replacen("t0 line 0\n", "t0 line 0 on y\n", 1), false),
+        ], "description": "node1 a folder", "wait": true}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    let y = tip(&api);
+
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x2070;
+    let mut next = |n: u64| {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 33) % n
+    };
+    let mut plan: Vec<Planned> = Vec::new();
+    let mut bigs = 0;
+    for i in 0..60 {
+        let person = match next(10) {
+            0..=4 => 0,
+            5..=7 => 1,
+            _ => 2,
+        };
+        let on_y = next(4) == 0;
+        let base = if on_y { y } else { x };
+        let mut op = |next: &mut dyn FnMut(u64) -> u64, kind: u64| -> Vec<serde_json::Value> {
+            match kind {
+                0 => {
+                    let f = next(4) as usize;
+                    let mut lines: Vec<String> = text30(&format!("t{f}")).lines().map(|l| format!("{l}\n")).collect();
+                    if on_y && f == 0 {
+                        lines[0] = "t0 line 0 on y\n".into();
+                    }
+                    let at = next(30) as usize;
+                    lines[at] = format!("{seed}/{i} edited line {at}\n");
+                    if next(3) == 0 {
+                        let other = next(30) as usize;
+                        lines[other] = format!("{seed}/{i} edited line {other}\n");
+                    }
+                    vec![kinds_put(&format!("{K}/t{f}.txt"), &lines.concat(), false)]
+                }
+                1 => vec![kinds_delete(&format!("{K}/old{}.txt", next(4)))],
+                2 => {
+                    let o = next(4);
+                    vec![kinds_delete(&format!("{K}/old{o}.txt")), kinds_put(&format!("{K}/ren{o}_{seed}_{i}.txt"), &text30(&format!("old{o}")), false)]
+                }
+                3 if on_y => vec![kinds_delete(&format!("{K}/node1/inner.txt")), kinds_put(&format!("{K}/node1"), &format!("{seed}/{i} a file again\n"), false)],
+                3 => {
+                    let n = next(2);
+                    vec![kinds_delete(&format!("{K}/node{n}")), kinds_put(&format!("{K}/node{n}/inner.txt"), &format!("{seed}/{i} a folder\n"), false)]
+                }
+                4 => {
+                    let t = next(2);
+                    vec![kinds_delete(&format!("{K}/tree{t}/inner.txt")), kinds_put(&format!("{K}/tree{t}"), &format!("{seed}/{i} a file\n"), false)]
+                }
+                5 => vec![kinds_put(&format!("{K}/bin{}.dat", next(2)), &format!("\u{0}{seed}/{i} BIN\n"), false)],
+                6 => {
+                    let r = next(2) as usize;
+                    let text = if next(2) == 0 { run_text(r) } else { format!("{}echo {seed}/{i}\n", run_text(r)) };
+                    vec![kinds_put(&format!("{K}/run{r}.sh"), &text, true)]
+                }
+                7 if bigs < 3 => {
+                    bigs += 1;
+                    let at = next(20_000) as usize;
+                    let edited = big.replacen(&format!("big line {at:06} "), &format!("big line {at:06} {seed}/{i} "), 1);
+                    vec![kinds_put(&format!("{K}/big.txt"), &edited, false)]
+                }
+                8 => vec![kinds_put(&format!("{K}/log.union"), &format!("entry 0\nentry 1\n{seed}/{i} entry\n"), false)],
+                _ => {
+                    let mut lines: Vec<String> = text30("dep").lines().map(|l| format!("{l}\n")).collect();
+                    let at = next(30) as usize;
+                    lines[at] = format!("{seed}/{i} dep {at}\n");
+                    vec![kinds_put(&format!("{K}/dep.lock"), &lines.concat(), false)]
+                }
+            }
+        };
+        // About one in six repeats an earlier change exactly.
+        let earlier: Vec<usize> = (0..plan.len()).filter(|&j| plan[j].base == base && plan[j].repeats.is_none()).collect();
+        if !earlier.is_empty() && next(6) == 0 {
+            let j = earlier[next(earlier.len() as u64) as usize];
+            plan.push(Planned { person, base, edits: plan[j].edits.clone(), repeats: Some(j) });
+            continue;
+        }
+        let kind = next(10);
+        let mut edits = op(&mut next, kind);
+        if next(4) == 0 {
+            let more = op(&mut next, next_kind(kind));
+            if !edit_paths(&more).iter().any(|a| edit_paths(&edits).iter().any(|b| overlap(a, b))) {
+                edits.extend(more);
+            }
+        }
+        plan.push(Planned { person, base, edits, repeats: None });
+    }
+
+    // Queued while the branch is held: one batch.
+    hold_branch(hub, pid, "main");
+    let mut tickets = Vec::new();
+    for (i, c) in plan.iter().enumerate() {
+        let r = api.post_json(
+            Some(&tokens[c.person]),
+            &format!("/v1/projects/{}/land", p.name),
+            &serde_json::json!({"onto": "main", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": false}),
+        );
+        assert_eq!(r.status, 200, "seed {seed}, submit {i}: {}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["state"], "queued", "seed {seed}, submit {i}: {}", r.json());
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    release_branch(hub, pid, "main");
+    let answers: Vec<serde_json::Value> = tickets.iter().zip(&plan).map(|(t, c)| settled(&api, &tokens[c.person], &p.name, t)).collect();
+    let batches: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(DISTINCT done_at) FROM landing_queue WHERE project_id = $1 AND ticket = ANY($2)")
+                .bind(pid)
+                .bind(&tickets)
+                .fetch_one(&hub.hub().db),
+        )
+        .unwrap();
+    assert_eq!(batches, 1, "seed {seed}: the changes landed in more than one batch (the reference's order assumes one)");
+
+    // The fair-share order: round-robin over people by their first change.
+    let mut people: Vec<usize> = Vec::new();
+    for c in &plan {
+        if !people.contains(&c.person) {
+            people.push(c.person);
+        }
+    }
+    let mut queues: Vec<std::collections::VecDeque<usize>> = people.iter().map(|who| (0..plan.len()).filter(|&i| plan[i].person == *who).collect()).collect();
+    let mut order = Vec::new();
+    while queues.iter().any(|q| !q.is_empty()) {
+        for q in queues.iter_mut() {
+            if let Some(i) = q.pop_front() {
+                order.push(i);
+            }
+        }
+    }
+
+    // One by one, onto a branch at the batch's starting tip, in that order.
+    let r = api.post_json(
+        Some(&admin),
+        &format!("/v1/projects/{}/push", p.name),
+        &serde_json::json!({"updates": [{"branch": "serial", "expected": null, "new": y.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+    let mut serial: Vec<Option<serde_json::Value>> = vec![None; plan.len()];
+    for &i in &order {
+        let c = &plan[i];
+        let r = api.post_json(
+            Some(&tokens[c.person]),
+            &format!("/v1/projects/{}/land", p.name),
+            &serde_json::json!({"onto": "serial", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": true}),
+        );
+        assert_eq!(r.status, 200, "seed {seed}, serial {i}: {}", String::from_utf8_lossy(&r.body));
+        serial[i] = Some(r.json());
+    }
+    let mut kinds = std::collections::BTreeMap::new();
+    for (pos, &i) in order.iter().enumerate() {
+        let (got, want) = (&answers[i], serial[i].as_ref().unwrap());
+        *kinds.entry(want["state"].as_str().unwrap_or("?").to_string()).or_insert(0) += 1;
+        assert_eq!(got["state"], want["state"], "seed {seed}: change {i} (place {pos}, {:?}) answered otherwise in the batch: {got} / one by one: {want}", edit_paths(&plan[i].edits));
+        if want["state"] == "landed" {
+            let (g, w) = (got["landed"].as_array().unwrap(), want["landed"].as_array().unwrap());
+            assert_eq!(g.len(), 1, "{got}");
+            assert_eq!(w.len(), 1, "{want}");
+            assert_eq!(
+                root_tree(&api, &admin, &p.name, g[0].as_str().unwrap()),
+                root_tree(&api, &admin, &p.name, w[0].as_str().unwrap()),
+                "seed {seed}: change {i} (place {pos}) landed another tree in the batch"
+            );
+        }
+        // A change repeated with nothing landed on its paths since the one it repeats lands (BUG-2060).
+        if let Some(j) = plan[i].repeats {
+            let first = order.iter().position(|&k| k == j).unwrap();
+            let paths = edit_paths(&plan[i].edits);
+            let touched_between = order[first + 1..pos]
+                .iter()
+                .any(|&k| answers[k]["state"] == "landed" && edit_paths(&plan[k].edits).iter().any(|a| paths.iter().any(|b| overlap(a, b))));
+            if first < pos && answers[j]["state"] == "landed" && !touched_between {
+                assert_eq!(got["state"], "landed", "seed {seed}: change {i} repeats {j}, which landed, with nothing landed on {paths:?} since: {got}");
+            }
+        }
+    }
+    let main_tip = tip(&api);
+    let serial_tip = api.tips(Some(&admin), &p.name).unwrap().branches["serial"];
+    assert_eq!(root_tree(&api, &admin, &p.name, &main_tip.hex()), root_tree(&api, &admin, &p.name, &serial_tip.hex()), "seed {seed}: the tips differ");
+    let landed = kinds.get("landed").copied().unwrap_or(0);
+    assert!(landed >= 15 && kinds.get("conflict").copied().unwrap_or(0) >= 5, "seed {seed}: a mix too thin to test: {kinds:?}");
+}
+
+/// Another kind of edit than `kind` for a change's second edit.
+fn next_kind(kind: u64) -> u64 {
+    (kind + 3) % 10
+}
