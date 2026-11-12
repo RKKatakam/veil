@@ -308,3 +308,85 @@ fn no_head_descends_from_another_after_any_sequence_of_rewrites() {
         }
     }
 }
+
+/// A snapshot on `parents` with the empty tree, as history from elsewhere.
+fn foreign(repo: &Repo, parents: Vec<ObjectId>, at: i64) -> veil_core::Snapshot {
+    veil_core::Snapshot {
+        parents,
+        change_id: veil_core::ChangeId([at as u8; 16]),
+        tree: repo.store().empty_tree().unwrap(),
+        description: veil_core::object::Text::default(),
+        author: "t".into(),
+        timestamp: 1_700_000_000_000 + at,
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    }
+}
+
+/// The review of `clifast` (guarantee 3, "history that arrives later"): two
+/// heads that a withheld snapshot stands between (the source of an
+/// unreleased embargo: `Held` reads `None` for it) are both heads, rightly,
+/// while it is withheld. When it arrives (the release, pulled: no head
+/// moves, so no operation need be recorded), the lower head is an ancestor
+/// of the upper one, and the next rewrite drops it: `drop_ancestor_heads`
+/// read the range at every rewrite. With `settled_heads` the rewrite takes
+/// the heads it started from as known apart, because the operation before
+/// it rewrote something, and the lower head stays a head at every later
+/// rewrite (every `vl commit` is one).
+///
+/// `settled`: whether a rewrite was recorded while the snapshot was
+/// withheld (the heads are then "known apart" when it arrives).
+fn heads_after_withheld_history_arrives(settled: bool) -> (HashSet<ObjectId>, HashSet<ObjectId>) {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let mut repo = Repo::init(backend, None, "t").unwrap();
+    let root = repo.root_id();
+    let old = change_on(&mut repo, root, "old.txt");
+    // A line beside it, whose tip the rewrites below describe: higher than
+    // everything else here, as a working copy's change is.
+    let mut other = root;
+    for i in 0..6 {
+        other = change_on(&mut repo, other, &format!("line{i}.txt"));
+    }
+    // `between` stands on the old head and is withheld: known by its id
+    // (what another repository names it) as the parent of `upper`.
+    let between = foreign(&repo, vec![old], 1);
+    let elsewhere = Repo::init(Arc::new(MemoryBackend::new()), None, "t").unwrap();
+    let between_id = elsewhere.store().put_snapshot(&between).unwrap();
+    let mut tx = repo.transaction("a pull: the upper snapshot, its parent withheld").unwrap();
+    let upper = tx.repo().store().put_snapshot(&foreign(tx.repo(), vec![between_id], 2)).unwrap();
+    tx.add_head(upper).unwrap();
+    tx.commit().unwrap();
+    assert!(repo.held().snapshot(&between_id).unwrap().is_none(), "withheld");
+    assert_eq!(heads(&repo), HashSet::from([old, other, upper]));
+    if settled {
+        other = repo.describe(other, "described while the parent is withheld").unwrap();
+        assert_eq!(heads(&repo), HashSet::from([old, other, upper]), "nothing held joins the heads yet");
+    }
+
+    // The withheld snapshot arrives; no reference moves.
+    assert_eq!(repo.store().put_snapshot(&between).unwrap(), between_id);
+    assert!(repo.held().ancestors(&upper).unwrap().contains(&old), "the old head is under the upper one now");
+
+    let other = repo.describe(other, "described after it arrived").unwrap();
+    (heads(&repo), HashSet::from([other, upper]))
+}
+
+/// The reference: the first rewrite after the history arrived, on an
+/// operation that rewrote nothing, drops the head that is now under another.
+#[test]
+fn a_head_that_arrived_history_puts_under_another_is_dropped_by_the_next_rewrite() {
+    let (heads, expected) = heads_after_withheld_history_arrives(false);
+    assert_eq!(heads, expected);
+}
+
+#[test]
+#[ignore = "BUG-1960: a head that history arriving later (a withheld parent, released) puts under another head stays a head at every later rewrite, when the operation before rewrote something"]
+fn bug_1960_a_head_that_arrived_history_puts_under_another_is_dropped_after_an_operation_that_rewrote() {
+    let (heads, expected) = heads_after_withheld_history_arrives(true);
+    assert_eq!(heads, expected, "the old head is an ancestor of the upper head, and still a head");
+}
