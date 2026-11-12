@@ -815,7 +815,8 @@ fn bug_2070_an_edit_the_tip_already_holds_merges_cleanly_whatever_the_file() {
 #[derive(Clone)]
 struct Planned {
     person: usize,
-    base: veil_core::ObjectId,
+    /// 0: the first base, 1: the later one.
+    base: usize,
     edits: Vec<serde_json::Value>,
     /// The index of the earlier change it repeats exactly (an edit the tip
     /// may already hold, BUG-2060).
@@ -860,9 +861,9 @@ fn settled(api: &Api, token: &str, project: &str, ticket: &str) -> serde_json::V
     }
 }
 
-/// The id of the root tree of snapshot `rev`, as the admin (who sees all of it) reads it.
-fn root_tree(api: &Api, admin: &str, project: &str, rev: &str) -> String {
-    let r = api.get(Some(admin), &format!("/v1/projects/{project}/q/tree?rev={rev}"));
+/// The id of the root tree of snapshot `rev`, as the holder of `token` reads it.
+fn root_tree(api: &Api, token: &str, project: &str, rev: &str) -> String {
+    let r = api.get(Some(token), &format!("/v1/projects/{project}/q/tree?rev={rev}"));
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     r.json()["id"].as_str().unwrap().to_string()
 }
@@ -923,7 +924,11 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
     );
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    // Each base as each person sees it (a submit names its base in the
+    // submitter's own ids).
+    let seen = || -> Vec<veil_core::ObjectId> { tokens.iter().map(|t| api.tips(Some(t), &p.name).unwrap().branches["main"]).collect() };
     let x = tip(&api);
+    let x_seen = seen();
     // The later base: `node1` is a folder there, and `t0`'s first line is another.
     let dir = p.admin.dir(&format!("kinds-{seed}"));
     p.admin.ok(p.admin.home.path(), &["clone", &hub.url(&p.name), dir.to_str().unwrap()]);
@@ -936,6 +941,7 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
     let made_y = settled(&api, &admin, &p.name, &vl_land(&p.admin, &dir, &format!("y{seed}"), "main"));
     assert_eq!(made_y["state"], "landed", "{made_y}");
     let y = tip(&api);
+    let bases = [x_seen, seen()];
 
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x2070;
     let mut next = |n: u64| {
@@ -951,7 +957,7 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
             _ => 2,
         };
         let on_y = next(4) == 0;
-        let base = if on_y { y } else { x };
+        let base = usize::from(on_y);
         let mut op = |next: &mut dyn FnMut(u64) -> u64, kind: u64| -> Vec<serde_json::Value> {
             match kind {
                 0 => {
@@ -1026,8 +1032,8 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
         if swaps_a_folder(&c.edits) {
             c.person = 1;
             let (one, two) = (format!("c{seed}b{i}"), format!("c{seed}s{i}"));
-            vl_change(&p.admin, &dir, c.base, &c.edits, &one);
-            vl_change(&p.admin, &dir, c.base, &c.edits, &two);
+            vl_change(&p.admin, &dir, bases[c.base][1], &c.edits, &one);
+            vl_change(&p.admin, &dir, bases[c.base][1], &c.edits, &two);
             c.made = Some((one, two));
         }
     }
@@ -1041,7 +1047,7 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
             tickets.push(vl_land(&p.admin, &dir, one, "main"));
             continue;
         }
-        let ask = serde_json::json!({"onto": "main", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": false});
+        let ask = serde_json::json!({"onto": "main", "base": bases[c.base][c.person].hex(), "edits": c.edits, "description": format!("change {i}"), "wait": false});
         let r = api.post_json(Some(&tokens[c.person]), &format!("/v1/projects/{}/land", p.name), &ask);
         assert_eq!(r.status, 200, "seed {seed}, submit {i}: {}", String::from_utf8_lossy(&r.body));
         assert_eq!(r.json()["state"], "queued", "seed {seed}, submit {i}: {}", r.json());
@@ -1091,7 +1097,7 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
             serial[i] = Some(settled(&api, &admin, &p.name, &vl_land(&p.admin, &dir, two, "serial")));
             continue;
         }
-        let ask = serde_json::json!({"onto": "serial", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": true});
+        let ask = serde_json::json!({"onto": "serial", "base": bases[c.base][c.person].hex(), "edits": c.edits, "description": format!("change {i}"), "wait": true});
         let r = api.post_json(Some(&tokens[c.person]), &format!("/v1/projects/{}/land", p.name), &ask);
         assert_eq!(r.status, 200, "seed {seed}, serial {i}: {}", String::from_utf8_lossy(&r.body));
         serial[i] = Some(r.json());
@@ -1105,9 +1111,11 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
             let (g, w) = (got["landed"].as_array().unwrap(), want["landed"].as_array().unwrap());
             assert_eq!(g.len(), 1, "{got}");
             assert_eq!(w.len(), 1, "{want}");
+            // (In the submitter's ids, which its answers name.)
+            let token = &tokens[plan[i].person];
             assert_eq!(
-                root_tree(&api, &admin, &p.name, g[0].as_str().unwrap()),
-                root_tree(&api, &admin, &p.name, w[0].as_str().unwrap()),
+                root_tree(&api, token, &p.name, g[0].as_str().unwrap()),
+                root_tree(&api, token, &p.name, w[0].as_str().unwrap()),
                 "seed {seed}: change {i} (place {pos}) landed another tree in the batch"
             );
         }

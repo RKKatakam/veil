@@ -1962,7 +1962,7 @@ fn bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them() {
     // The embargo, of `src/docs/held.md`, for the security group, and its PR.
     let dir = p.admin.dir("emb-2061");
     p.admin.ok(p.admin.home.path(), &["clone", &th.url(&p.name), dir.to_str().unwrap()]);
-    write_files(&dir, &[("src/docs/held.md", "the embargoed fix\n")]);
+    write_files(&dir, &[("src/docs/fix.md", "the embargoed fix\n")]);
     p.admin.ok(&dir, &["commit", "--no-advance", "-m", "an embargoed fix"]);
     let out = p.admin.ok(&dir, &["merge", "@-", "--into", "main", "--embargo-for", "security", "-m", "an embargoed fix"]);
     let eid = out
@@ -1972,7 +1972,18 @@ fn bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them() {
         .unwrap_or_else(|| panic!("no embargo id in: {out}"))
         .to_string();
     p.admin.ok(&dir, &["push"]);
-    let pr = api.post_json(Some(&admin_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": format!("embargo/{eid}"), "title": "the fix"}));
+    // A PR onto the line, of a change on top of it: it stays open at the
+    // release (retargeted), and its holds become `pr_holds`.
+    let line = format!("embargo/{eid}");
+    let line_tip = api.tips(Some(&admin_tok), &p.name).unwrap().branches[&line];
+    let top = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": line_tip.hex(), "description": "on top of the fix", "edits": [put("src/docs/held.md", "more of the fix\n")]}),
+    );
+    assert_eq!(top.status, 200, "{}", String::from_utf8_lossy(&top.body));
+    let top_snap = top.json()["snapshot"].as_str().unwrap().to_string();
+    let pr = api.post_json(Some(&admin_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": top_snap, "onto": line, "title": "more of the fix"}));
     assert_eq!(pr.status, 200, "{}", String::from_utf8_lossy(&pr.body));
     let (pr_id, patch) = (pr.json()["id"].as_str().unwrap().to_string(), pr.json()["patch"].as_str().unwrap().to_string());
     let sig = p.sec.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, "request-changes"));
@@ -2045,6 +2056,8 @@ fn bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them() {
             .unwrap();
         assert!(released.is_some(), "the embargo was released");
         assert_eq!((holds("pr_embargo_holds"), holds("pr_holds")), (0, 1), "the release made the hold public");
+        let shown = api.get(Some(&admin_tok), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+        assert_eq!((shown.json()["state"].as_str(), shown.json()["target"].as_str()), (Some("open"), Some("main")), "{}", shown.json());
         let done = outcome(&api, &dev_tok, &p.name, &ticket);
         if answered_while_held {
             assert_eq!(done["state"], "rejected", "landed on a held path after the release was answered: {done}");
