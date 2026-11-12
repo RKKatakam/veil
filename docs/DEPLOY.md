@@ -135,7 +135,7 @@ What `configure.sh` sets up, and why:
   writes are spread over the cluster. Veil's schema (migrations 1 to 36) is
   many small tables and indexes: a node holds a replica of every tablet,
   about three times the number of tables and indexes in all. The
-  rehearsal's count is in §9.
+  rehearsal's count is in §9.1 (122 per node at one tablet per table).
 - **The tablet-replica limit lifted on every master**:
   `yugabyted` turns `enforce_tablet_replica_limits` on at each start,
   whatever `--master_flags` says (the same as `scripts/verify-server.sh`
@@ -492,7 +492,36 @@ appears as hourly line items.
 
 ### 9.1 The rehearsal of 2026-11-12 (the multi-machine topology)
 
-REHEARSAL-2026-11-12
+`deploy/compose/rehearsal.sh` on the development machine (32 cores, 30 GB,
+Docker 28; shared with other work), `dokit2`, images `veil-server:dokit2`
+and `veil-bench:dokit2`, three YugabyteDB nodes (one tablet per table,
+2.25 GB each), two servers behind HAProxy, one driver, every gate at the
+rehearsal's sizes (`rehearsal.sh`: seconds, tens of agents). **These
+numbers are for the flow only:** one machine played nine, so they measure
+nothing about Veil across machines, and the scaling ratios below say
+nothing about scaling (both servers shared the machine and the database).
+
+| Step | Outcome | What it showed |
+|---|---|---|
+| bring-up | **ok**, 59 s | three YugabyteDB nodes joined one at a time (two joining at once failed: one was killed mid-start, so both `rehearsal.sh` and `configure.sh` join them one by one); three copies of every tablet (`numReplicas: 3`); 122 tablets on each node after migrations 1 to 36 with one tablet per table (so about 370 per node with the paid run's three per table); both servers healthy; HTTPS through the balancer with the run's CA |
+| `pull` | ok | 6,226 and 13,574 pulls/s (10 and 50 agents); 1.1 and 1.4 statements per pull |
+| `land`, `api` | ok | 40 and 262 landings/s (1 and 10 agents); API 25 and 369/s |
+| `branches` | ok | the cost curve 49 and 252 pushes/s; **the headline** with 10 and 30 agents merging every 5th push: 81 and 160 pushes/s, 161 merges into `main` in 10 s with 10 agents (`branch_merges`), no errors |
+| `landing` | ok | 40 agents of 4 people, 50/s offered, 10 s: plain 49.5/s, protected 50.2/s, with the mix 50.1/s (p99 386 to 424 ms) |
+| `scaling` | ok (flow) | `scaling.md` made from both server counts: pulls 10,099 → 11,848/s, pushes 333 → 288/s, landings across 4 projects 213 → 177/s with 1 → 2 servers |
+| `failover` | **exactly once: pass; pause: miss** | stopped (`docker stop`) and, in a second run, killed: the lease moved to the other server (epoch 1 → 2); no ticket left queued; every landed change recorded and on `main`'s line once; `main` = 2 set-up snapshots + 1,622 landed changes, exactly; the tool's 1,582 (1,578) landings ≤ the database's 1,622, with 0 (2) errors. **Longest pause after the stop: 2,413 ms (stop), 2,358 ms (kill)**, against 368 to 402 ms before and a target of 2 s: BUG-1970 |
+| `objects` | ok | 1,183 reads/s through the server, 2,114 through the cache |
+| `openscion` | ok (1,000 files, 1 run) | import 96 ms (Git 132), clone 226 (173), commit one file 20 (35), clone one directory 59 (62) |
+| `scale` (`tiny`) | ok | initial push 2.5 s, server 19 → 71 MiB; thin clone 0.28 s |
+| teardown | **ok** | `nothing of veil-dokit-r1 remains (containers, volumes, networks)` |
+
+Found by this rehearsal: the failover pause (**BUG-1970**); and three
+things in the kit, fixed in it: two YugabyteDB nodes joining at once; the
+server ignoring `docker stop` (SIGTERM, as PID 1) until killed, fixed by
+the image's `STOPSIGNAL SIGINT`; and the failover check counting the
+server's landed-from-itself records as second landings. The tool's
+database-commit counter reads 0 on YugabyteDB (it counts PostgreSQL
+transaction ids): commits per landing are measured on PostgreSQL only.
 
 ### 9.2 The rehearsal of 2026-11-09 (one server, PostgreSQL)
 
