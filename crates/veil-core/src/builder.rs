@@ -1063,6 +1063,22 @@ pub fn build_tree_watched(
     cache: Option<&mut StatCache>,
     watch: Option<&WatchPlan>,
 ) -> Result<(ObjectId, BuildReport)> {
+    Ok(build_tree_planned(store, fs, opts, cache, watch, false)?.expect("built whether or not the plan applies"))
+}
+
+/// [`build_tree_watched`], or `None` without building anything when
+/// `watched_only` and the watcher's plan does not apply (a policy or key
+/// change, a rescan): a caller that only wants the watched build's answer
+/// (`Repo::snapshot_workspace_with`'s look before a transaction) never
+/// scans the whole working copy for it.
+pub(crate) fn build_tree_planned(
+    store: &ObjectStore,
+    fs: &dyn StorageBackend,
+    opts: &BuildOptions,
+    cache: Option<&mut StatCache>,
+    watch: Option<&WatchPlan>,
+    watched_only: bool,
+) -> Result<Option<(ObjectId, BuildReport)>> {
     #[cfg(feature = "os")]
     secrets::prepare();
     let parent = opts.parent_tree.map(|t| store.tree(&t)).transpose()?;
@@ -1108,6 +1124,9 @@ pub fn build_tree_watched(
             && matches!(opts.line_endings, LineEndings::Convert)
             && !key_changed
     });
+    if watched_only && watch.is_none() {
+        return Ok(None);
+    }
     // With the plan, only the directories it inspects are looked up (and
     // decoded, in a cache as loaded).
     let run = match (cache.as_deref_mut(), key) {
@@ -1190,7 +1209,7 @@ pub fn build_tree_watched(
     if let (Some(c), Some(run)) = (cache, b.cache.take()) {
         c.end_run(run);
     }
-    Ok((id, b.report))
+    Ok(Some((id, b.report)))
 }
 
 impl<'a> Builder<'a> {
