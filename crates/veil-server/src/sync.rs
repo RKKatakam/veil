@@ -3530,17 +3530,18 @@ async fn push_staged(
         .filter(|b| veil_core::embargo::embargo_id_of_branch(b).is_none())
         .collect();
     if !public_moved.is_empty() {
-        // A push of many snapshots: every view key's graph is filled from
-        // now on, beside the derived data and not after it (BUG-1943: the
-        // diffs of 10,000 snapshots take minutes, and a clone a second
-        // after the push asks for the tip's row). A small push's rows are
-        // written with its derived data (`derive::finish_landing_run`), or
-        // by the first query that names its tip.
+        // A push of many snapshots: every view key's rows are filled from
+        // now on (the new snapshots read ahead first), beside the derived
+        // data and not after it (BUG-1943: the diffs of 10,000 snapshots
+        // take minutes, and a clone a second after the push asks for the
+        // tip's row). A small push's rows are written with its derived
+        // data (`derive::finish_landing_run`), or by the first query that
+        // names its tip.
         if pushed_snapshots.len() > 16 {
             let (hub, id, moved) = (hub.clone(), project.id, public_moved.clone());
             tokio::spawn(async move {
                 crate::query::graph::read_ahead(&hub, id, pushed_snapshots).await;
-                if let Err(e) = crate::derive::memo_tips(&hub, id, &moved).await {
+                if let Err(e) = crate::derive::rows_of_tips(&hub, id, &moved).await {
                     eprintln!("veil-server: filling the graphs of project {id} after a push: {e:?}");
                 }
             });

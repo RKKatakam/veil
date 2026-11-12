@@ -32,9 +32,12 @@
 //!   history and that of everything below it is written. Blame and the
 //!   history of a path wait for it ([`ensure_files`]); nothing else does.
 //!
-//! Both run eagerly when a push or a landing moves a branch
-//! (`derive::memo_tips`), and when a query names a tip not filled yet: by
-//! one background fill of each part per view key. Rows are written parents
+//! Both run eagerly: a landing queues the file history's fill, which
+//! writes the rows it finds missing with it (`derive::memo_tips`); a push
+//! of many snapshots queues the rows' fill at once, and that one the file
+//! history's (`derive::rows_of_tips`). And a query that names a tip not
+//! filled yet fills its rows: by one background fill of each part per view
+//! key. Rows are written parents
 //! first, each insert `ON CONFLICT DO NOTHING`: a row's presence means its
 //! ancestors' are present, and two servers extending at once write the same
 //! rows (`real` may name either of two real snapshots with one projection;
@@ -631,6 +634,7 @@ pub async fn blocking<T: Send + 'static>(hub: &Arc<Hub>, project: i64, f: impl F
 /// walked here once per view key, never by a query that finds their rows.
 /// Blame and the history of a path call it through [`ensure_files`], a
 /// landing through [`prefill`]: once per view key, in the background.
+/// Rows a query's own fill wrote before it ([`extend_rows`]) are marked.
 pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<Vec<ObjectId>> {
     walk_tips(hub, project, viewer, tips, true, &Progress::default(), None).await
 }
@@ -1416,21 +1420,33 @@ async fn filled(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[Obje
     }
 }
 
-/// Queue the fill of `viewer`'s graph up to `tips` (its rows, then its
-/// file history) unless it holds them already, and return at once: what a
-/// push and a landing do for each view key (`derive::memo_tips`). The
-/// deriver never waits for a fill, so a long first fill cannot hold up
-/// deriving this or any project, and waiting it holds no connection, lock
-/// or slot (the fill's own task waits for those).
+/// Queue the fill of `viewer`'s graph up to `tips`, its rows with their
+/// file history, unless it holds them already, and return at once: what a
+/// landing does for each view key (`derive::memo_tips`). One fill and one
+/// transaction a batch for both, as a landing's fill always was (a query
+/// that needs a row sooner fills it itself, [`ensure`]). The deriver never
+/// waits for a fill, so a long first fill cannot hold up deriving this or
+/// any project, and waiting it holds no connection, lock or slot (the
+/// fill's own task waits for those).
 pub async fn prefill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<()> {
     let vk = project.view(viewer).key();
-    if warm(hub, project.id, &vk, viewer.admin, tips, false).await?.is_none() {
-        // Its rows: their fill queues the file history's when it is done.
-        start_or_join(hub, project, viewer, &vk, tips, false);
-    } else if warm(hub, project.id, &vk, viewer.admin, tips, true).await?.is_none() {
+    if warm(hub, project.id, &vk, viewer.admin, tips, true).await?.is_none() {
         start_or_join(hub, project, viewer, &vk, tips, true);
     }
     Ok(())
+}
+
+/// [`prefill`], the rows first: their fill, which queues the file
+/// history's when it is done. What a push of many snapshots does for each
+/// view key (`derive::rows_of_tips`, BUG-1943): its people read it within
+/// the second, and the history of its files some minutes later.
+pub async fn prefill_rows(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<()> {
+    let vk = project.view(viewer).key();
+    if warm(hub, project.id, &vk, viewer.admin, tips, false).await?.is_none() {
+        start_or_join(hub, project, viewer, &vk, tips, false);
+        return Ok(());
+    }
+    prefill(hub, project, viewer, tips).await
 }
 
 /// The viewer's ids of `tips` if their graph holds them all: their rows,
