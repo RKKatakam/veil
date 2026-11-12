@@ -83,8 +83,9 @@ pub const BATCH_BYTES: usize = 8 << 20;
 /// background fill's.
 pub const ATTACH_BUDGET: usize = 256;
 /// Most bytes a batch's content merges read (the three versions of each
-/// file merged; BUG-1956): an entry that needs more comes first in the
-/// next batch, where it is merged whatever its size (each file is at most
+/// file merged; BUG-1956): the batch ends before an entry that needs more,
+/// which a later batch merges whatever its size once it comes first in it
+/// (`docs/HUB.md` §13.30; each file is at most
 /// `merge::MAX_MERGE_FILE_BYTES`). A line merge's cost is linear in what it
 /// reads (`veil_core::textmerge`).
 const MERGE_BYTES: usize = 4 << 20;

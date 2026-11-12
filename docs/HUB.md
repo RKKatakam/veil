@@ -4828,10 +4828,13 @@ and `crates/veil-core/src/hub/land.rs`.
   the answers are a serial landing's, in order, exactly once. There is no
   re-queue, no `land.requeued` event, no `MAX_MERGES` cap and no worker
   pool; a landed answer's `merges` counts one more when the batch merged it.
-  A batch's merges read at most 4 MiB (`MERGE_BYTES`; an entry that needs
-  more comes first in the next batch, where it is merged whatever its size),
-  and the lease is renewed while a batch builds. The access checks a worker
-  made are the batch's own (`entry`, and the push's checks again on the new
+  A batch's merges read at most 4 MiB (`MERGE_BYTES`): the batch ends
+  before an entry that needs more, as it does at its byte bound
+  (`BATCH_BYTES`), and the next batch is picked again in the fair-share
+  order (S24). It is first in a later batch at the latest once no older
+  entry is queued (every batch answers at least one), and, first, it is
+  merged whatever its size: it is never put off for good. The lease is
+  renewed while a batch builds. The access checks a worker made are the batch's own (`entry`, and the push's checks again on the new
   parent, `service::recheck`, for every merged change). Rows left `merging`
   by a server before the fix are queued again when their claim expires
   (`landing::resume`, `reclaim_expired_merges`). Until then, a batch landed
