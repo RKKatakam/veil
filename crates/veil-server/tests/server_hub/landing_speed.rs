@@ -251,7 +251,7 @@ fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
             (from..from + n)
                 .map(|i| {
                     let who = (i % 300) as usize;
-                    let session = if who % 2 == 0 { format!("s{}-{}", who, (i / 300) % 3) } else { String::new() };
+                    let session = if who.is_multiple_of(2) { format!("s{}-{}", who, (i / 300) % 3) } else { String::new() };
                     (people[who], session, 1_000_000 + i, 0)
                 })
                 .collect()
