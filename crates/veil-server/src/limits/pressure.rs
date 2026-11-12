@@ -125,11 +125,13 @@ impl Gauge {
 }
 
 type Branch = (i64, String);
+/// A branch's gauge, and the lock its one reader holds.
+type Shared = (Mutex<Gauge>, tokio::sync::Mutex<()>);
 
 /// Every branch's gauge on this server.
 #[derive(Default)]
 pub struct Gauges {
-    by: Mutex<HashMap<Branch, Arc<(Mutex<Gauge>, tokio::sync::Mutex<()>)>>>,
+    by: Mutex<HashMap<Branch, Arc<Shared>>>,
 }
 
 /// A refused submit: what to say, and when to come back.
