@@ -703,11 +703,49 @@ impl<'r> Transaction<'r> {
         if parent_roots.is_empty() {
             return Ok(());
         }
-        let redundant = self.repo.held().reachable_among(parent_roots, &candidates)?;
+        let (tips, under) = self.settled_heads()?;
+        let redundant = self.repo.held().reachable_among_tips(parent_roots, &candidates, &tips, &under)?;
         for h in redundant {
             self.view.heads.remove(&h);
         }
         Ok(())
+    }
+
+    /// The heads this transaction started from, with the parents of each,
+    /// when none of those heads is known to descend from another; nothing
+    /// otherwise. [`Transaction::drop_ancestor_heads`] then stops at them
+    /// instead of reading the history between the newest head and the
+    /// oldest (every snapshot since a branch left long ago, at each commit).
+    ///
+    /// Known when the operation this transaction builds on rewrote
+    /// something: its commit ended with [`Transaction::drop_ancestor_heads`],
+    /// and left the heads this transaction starts from. Not for a merge of
+    /// concurrent operations (it moves heads after that step), and not in a
+    /// thin clone (history it fetches later can join two of its heads).
+    /// An operation written before heads were dropped this way, or history
+    /// that arrives later (a withheld parent), can leave a head that
+    /// another descends from: it stays, as it did before, until a
+    /// transaction that does not start from such an operation reads the
+    /// whole range again.
+    fn settled_heads(&self) -> Result<(HashSet<ObjectId>, HashSet<ObjectId>)> {
+        let unknown = || Ok((HashSet::new(), HashSet::new()));
+        if self.merge.is_some() || self.base.len() != 1 || self.repo.store.is_partial() {
+            return unknown();
+        }
+        let Some(op) = self.repo.ops.try_get(&self.base[0]).ok().flatten() else { return unknown() };
+        if op.parents.len() > 1 || op.rewritten.is_empty() || op.view.heads != self.start_view.heads {
+            return unknown();
+        }
+        let tips: HashSet<ObjectId> = self.start_view.heads.iter().copied().collect();
+        let mut under = HashSet::new();
+        for h in &tips {
+            // One that cannot be read (it is no head any more) names no
+            // parents: the walk reads past them as before.
+            if let Ok(Some(s)) = self.repo.held().snapshot(h) {
+                under.extend(s.parents.iter().copied());
+            }
+        }
+        Ok((tips, under))
     }
 
     /// Rebase each recorded attempt in `attempts` onto `new_parents` under

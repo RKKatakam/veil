@@ -33,7 +33,10 @@
 //! [`MemoryBackend`](crate::MemoryBackend) the stamp is a generation counter
 //! and there is no window at all.
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, OnceLock},
+};
 
 use crate::{
     error::Result,
@@ -230,11 +233,104 @@ pub fn key_state(keys: &Keychain) -> Result<ObjectId> {
 }
 
 /// A working copy's stat cache. See the module docs.
+///
+/// A loaded cache keeps its records encoded until something needs them
+/// all: a build the file watcher narrows decodes only the directories it
+/// inspects (`StatCache::begin_watched_run`), and a command that records
+/// nothing new decodes none. (Decoding 35,000 records
+/// is 10 ms, and dropping them 4 ms, of every command; BUG-1944.)
 #[derive(Clone, Debug, Default)]
 pub struct StatCache {
     key: Option<CacheKey>,
-    records: HashMap<VPath, Record>,
+    /// Every record, decoded from `loaded` when first needed.
+    records: OnceLock<HashMap<VPath, Record>>,
+    /// The cache file's records, not decoded yet (`records` is unset), with
+    /// what watched builds found since.
+    loaded: Option<Loaded>,
     dirty: bool,
+}
+
+/// The records of a cache file, encoded: the file's checksum was verified
+/// when it was read.
+#[derive(Clone, Debug)]
+struct Loaded {
+    file: Arc<Vec<u8>>,
+    /// Where the first record starts in `file` (the last ends at its
+    /// checksum).
+    start: usize,
+    count: u64,
+    /// What watched builds that left the cache as it is on disk replaced,
+    /// oldest first: applied when the records are decoded.
+    patches: Vec<Patch>,
+}
+
+impl Loaded {
+    fn encoded(&self) -> &[u8] {
+        &self.file[self.start..self.file.len() - 32]
+    }
+
+    /// Every record, as the builds since the load left them. Records that
+    /// do not decode are no records: an empty cache.
+    fn decode(&self) -> HashMap<VPath, Record> {
+        let mut records = decode_records(self.encoded(), self.count, None).unwrap_or_default();
+        for p in &self.patches {
+            p.apply(&mut records);
+        }
+        records
+    }
+}
+
+/// What one watched build ([`StatCache::begin_watched_run`]) found: the
+/// records of the directories it listed, and of the directories that are
+/// gone, are replaced by `new`.
+#[derive(Clone, Debug)]
+struct Patch {
+    visited: HashSet<VPath>,
+    deleted: Vec<VPath>,
+    new: HashMap<VPath, Record>,
+}
+
+impl Patch {
+    fn apply(&self, records: &mut HashMap<VPath, Record>) {
+        let visited: HashSet<&str> = self.visited.iter().map(VPath::as_str).collect();
+        records.retain(|path, _| kept_by_watched_run(path.as_str(), &visited, &self.deleted));
+        records.extend(self.new.iter().map(|(p, r)| (p.clone(), r.clone())));
+    }
+}
+
+/// The directory of `path`, as text (the root: empty).
+fn dir_of(path: &str) -> &str {
+    path.rfind('/').map_or("", |i| &path[..i])
+}
+
+/// [`VPath::starts_with`], on text.
+fn below(path: &str, prefix: &str) -> bool {
+    prefix.is_empty() || path == prefix || (path.len() > prefix.len() && path.starts_with(prefix) && path.as_bytes()[prefix.len()] == b'/')
+}
+
+/// Does a watched build that listed the directories `visited` and found
+/// the directories `deleted` gone keep the last run's record for `path`?
+/// (Not one in a directory it listed: those it carried over itself.)
+fn kept_by_watched_run(path: &str, visited: &HashSet<&str>, deleted: &[VPath]) -> bool {
+    !visited.contains(dir_of(path)) && !deleted.iter().any(|p| below(path, p.as_str()))
+}
+
+/// The records a watched build looks up: of the files directly in `dirs`,
+/// and of everything below `subtrees` (`WatchPlan::inspect_leaves`).
+pub(crate) struct Lookups<'a> {
+    pub(crate) dirs: HashSet<&'a str>,
+    pub(crate) subtrees: Vec<&'a str>,
+}
+
+impl Lookups<'_> {
+    fn is_empty(&self) -> bool {
+        self.dirs.is_empty() && self.subtrees.is_empty()
+    }
+
+    fn covers(&self, path: &str) -> bool {
+        let dir = dir_of(path);
+        self.dirs.contains(dir) || self.subtrees.iter().any(|s| below(dir, s))
+    }
 }
 
 impl StatCache {
@@ -245,9 +341,27 @@ impl StatCache {
     /// Load from `fs`. A missing, unreadable or corrupt cache is simply empty.
     pub fn load(fs: &dyn StorageBackend, path: &VPath) -> StatCache {
         match fs.read_opt(path) {
-            Ok(Some(raw)) => decode(&raw).unwrap_or_default(),
+            Ok(Some(raw)) => decode(raw).unwrap_or_default(),
             _ => StatCache::default(),
         }
+    }
+
+    /// Every record (decoded now, if the cache was loaded and nothing
+    /// needed them all yet).
+    fn all(&self) -> &HashMap<VPath, Record> {
+        self.records.get_or_init(|| self.loaded.as_ref().map(Loaded::decode).unwrap_or_default())
+    }
+
+    fn all_mut(&mut self) -> &mut HashMap<VPath, Record> {
+        self.all();
+        self.loaded = None;
+        self.records.get_mut().expect("decoded by `all`")
+    }
+
+    /// Forget every record, decoding none.
+    fn drop_all(&mut self) {
+        self.loaded = None;
+        self.records = OnceLock::new();
     }
 
     /// Persist if anything changed since the last load or save.
@@ -260,11 +374,11 @@ impl StatCache {
     }
 
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.all().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.all().is_empty()
     }
 
     pub fn key(&self) -> Option<&CacheKey> {
@@ -276,33 +390,34 @@ impl StatCache {
     }
 
     pub fn get(&self, path: &VPath) -> Option<&Record> {
-        self.records.get(path)
+        self.all().get(path)
     }
 
     /// The record for `path` if it can vouch for a file stat'ing as `meta`.
     pub fn trusted(&self, path: &VPath, meta: &Metadata) -> Option<&Record> {
         let exact = self.key.as_ref()?.exact;
         let stamp = Stamp::of(meta)?;
-        self.records.get(path).filter(|r| r.vouches_for(&stamp, exact))
+        self.all().get(path).filter(|r| r.vouches_for(&stamp, exact))
     }
 
     /// Forget `path` and everything below it (called for every path a
     /// checkout writes or removes).
     pub fn invalidate(&mut self, path: &VPath) {
-        let before = self.records.len();
+        let records = self.all_mut();
+        let before = records.len();
         if path.is_root() {
-            self.records.clear();
+            records.clear();
         } else {
-            self.records.remove(path);
+            records.remove(path);
             let prefix = path.child_prefix();
-            self.records.retain(|p, _| !p.as_str().starts_with(&prefix));
+            records.retain(|p, _| !p.as_str().starts_with(&prefix));
         }
-        self.dirty |= self.records.len() != before;
+        self.dirty |= self.all().len() != before;
     }
 
     /// Every record, in no particular order.
     pub fn records(&self) -> impl Iterator<Item = (&VPath, &Record)> {
-        self.records.iter()
+        self.all().iter()
     }
 
     /// Vouch for files whose content the caller knows without reading them
@@ -314,21 +429,22 @@ impl StatCache {
     /// of a build.
     pub fn vouch(&mut self, key: CacheKey, records: impl IntoIterator<Item = (VPath, Record)>) {
         if self.key.as_ref() != Some(&key) {
-            self.records.clear();
+            self.drop_all();
             self.key = Some(key);
         }
         let exact = self.key.as_ref().is_some_and(|k| k.exact);
+        let all = self.all_mut();
         for (path, rec) in records {
             if rec.vouches_for(&rec.stamp, exact) {
-                self.records.insert(path, rec);
+                all.insert(path, rec);
             }
         }
         self.dirty = true;
     }
 
     pub fn clear(&mut self) {
-        self.dirty |= !self.records.is_empty();
-        self.records.clear();
+        self.dirty |= !self.all().is_empty();
+        self.drop_all();
     }
 
     /// Start a build: drop everything if the key changed, then hand the
@@ -336,11 +452,11 @@ impl StatCache {
     pub(crate) fn begin_run(&mut self, key: CacheKey, clock: StatClock) -> CacheRun {
         let key_changed = self.key.as_ref() != Some(&key);
         if key_changed {
-            self.records.clear();
+            self.drop_all();
             self.key = Some(key);
             self.dirty = true;
         }
-        let old = std::mem::take(&mut self.records);
+        let old = std::mem::take(self.all_mut());
         CacheRun {
             new: HashMap::new(),
             old_len: old.len(),
@@ -348,28 +464,82 @@ impl StatCache {
             verified_at: clock.now,
             exact: clock.exact,
             changed: false,
-            key_changed,
             visited_dirs: None,
+            encoded: None,
+        }
+    }
+
+    /// [`StatCache::begin_run`] for a build the file watcher narrows to
+    /// `lookups`, under an unchanged `key`: only the directories the build
+    /// lists are replaced at [`StatCache::end_run`], the records of every
+    /// other stay. When the cache is as it was loaded, only the records
+    /// the build can look up are decoded, and the others stay encoded
+    /// unless the build ends with something to save.
+    pub(crate) fn begin_watched_run(&mut self, key: CacheKey, clock: StatClock, lookups: &Lookups<'_>) -> CacheRun {
+        let narrowed = match &self.loaded {
+            Some(l) if self.records.get().is_none() && l.patches.is_empty() && self.key.as_ref() == Some(&key) => match lookups.is_empty() {
+                true => Some((HashMap::new(), l.count as usize)),
+                false => decode_records(l.encoded(), l.count, Some(lookups)).map(|m| (m, l.count as usize)),
+            },
+            _ => None,
+        };
+        let Some((old, old_len)) = narrowed else {
+            let mut run = self.begin_run(key, clock);
+            run.visited_dirs = Some(Default::default());
+            return run;
+        };
+        CacheRun {
+            new: HashMap::new(),
+            old_len,
+            encoded: Some(old.keys().cloned().collect()),
+            old,
+            verified_at: clock.now,
+            exact: clock.exact,
+            changed: false,
+            visited_dirs: Some(Default::default()),
         }
     }
 
     pub(crate) fn end_run(&mut self, mut run: CacheRun) {
-        if let Some((visited, deleted_prefixes)) = run.visited_dirs.take() {
-            if visited.is_empty() && deleted_prefixes.is_empty() && run.new.is_empty() && !run.changed {
-                self.records = run.old;
+        if let Some((visited, deleted)) = run.visited_dirs.take() {
+            let untouched = visited.is_empty() && deleted.is_empty() && run.new.is_empty() && !run.changed;
+            if let Some(decoded) = run.encoded.take() {
+                // The other records are still encoded (`self.loaded`).
+                if untouched {
+                    return;
+                }
+                // How many records the run leaves: those it decoded are all
+                // the cache holds for the directories it listed. A
+                // directory that is gone may hold others: counted below.
+                let names: HashSet<&str> = visited.iter().map(VPath::as_str).collect();
+                let replaced = decoded.iter().filter(|p| !kept_by_watched_run(p.as_str(), &names, &deleted)).count();
+                let same = !run.changed && deleted.is_empty() && run.old_len - replaced + run.new.len() == run.old_len;
+                let patch = Patch { visited, deleted, new: run.new };
+                match (&mut self.loaded, same) {
+                    // Nothing to save: the file stays the cache, with what
+                    // this run found for this process.
+                    (Some(l), true) => l.patches.push(patch),
+                    _ => {
+                        let records = self.all_mut();
+                        patch.apply(records);
+                        self.dirty |= run.changed || self.all().len() != run.old_len;
+                    }
+                }
                 return;
             }
-            run.old.retain(|path, _| {
-                let dir = path.parent().unwrap_or_else(VPath::root);
-                !visited.contains(&dir) && !deleted_prefixes.iter().any(|p| path.starts_with(p))
-            });
+            if untouched {
+                self.records = OnceLock::from(run.old);
+                return;
+            }
+            let names: HashSet<&str> = visited.iter().map(VPath::as_str).collect();
+            run.old.retain(|path, _| kept_by_watched_run(path.as_str(), &names, &deleted));
             run.old.extend(run.new);
             self.dirty |= run.changed || run.old.len() != run.old_len;
-            self.records = run.old;
+            self.records = OnceLock::from(run.old);
             return;
         }
         self.dirty |= run.changed || run.new.len() != run.old_len;
-        self.records = run.new;
+        self.records = OnceLock::from(run.new);
     }
 }
 
@@ -384,11 +554,15 @@ pub(crate) struct CacheRun {
     verified_at: i64,
     exact: bool,
     changed: bool,
-    pub(crate) key_changed: bool,
     /// When set (a watched partial build): the directories actually listed
     /// during this run, and the directory prefixes deleted from the tree.
     /// Records in `old` outside these directories are kept untouched.
     pub(crate) visited_dirs: Option<(std::collections::HashSet<VPath>, Vec<VPath>)>,
+    /// A watched build on a cache still encoded
+    /// ([`StatCache::begin_watched_run`]): the paths whose records were
+    /// decoded into `old` (all it holds for the directories the build can
+    /// list).
+    encoded: Option<Vec<VPath>>,
 }
 
 impl CacheRun {
@@ -396,10 +570,6 @@ impl CacheRun {
     #[cfg(feature = "os")]
     pub(crate) fn len(&self) -> usize {
         self.old_len
-    }
-
-    pub(crate) fn enable_partial(&mut self) {
-        self.visited_dirs = Some((std::collections::HashSet::new(), Vec::new()));
     }
 
     pub(crate) fn note_visited_dir(&mut self, dir: &VPath) {
@@ -496,7 +666,8 @@ impl CacheRun {
 // hash; any mismatch just yields an empty cache.
 
 fn encode(c: &StatCache) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + c.records.len() * 128);
+    let records = c.all();
+    let mut out = Vec::with_capacity(64 + records.len() * 128);
     out.extend_from_slice(MAGIC);
     put_u32(&mut out, VERSION);
     match &c.key {
@@ -508,11 +679,11 @@ fn encode(c: &StatCache) -> Vec<u8> {
         }
         None => out.push(0),
     }
-    let mut paths: Vec<&VPath> = c.records.keys().collect();
+    let mut paths: Vec<&VPath> = records.keys().collect();
     paths.sort();
     put_u64(&mut out, paths.len() as u64);
     for p in paths {
-        let r = &c.records[p];
+        let r = &records[p];
         put_bytes(&mut out, p.as_str().as_bytes());
         put_i64(&mut out, r.stamp.mtime);
         put_opt_i64(&mut out, r.stamp.ctime);
@@ -551,7 +722,9 @@ fn encode(c: &StatCache) -> Vec<u8> {
     out
 }
 
-fn decode(raw: &[u8]) -> Option<StatCache> {
+/// The cache in file `raw`: its checksum, header and key are checked now,
+/// its records when they are decoded ([`Loaded::decode`]).
+fn decode(raw: Vec<u8>) -> Option<StatCache> {
     let (body, sum) = raw.split_at(raw.len().checked_sub(32)?);
     if blake3::hash(body).as_bytes() != sum {
         return None;
@@ -569,10 +742,30 @@ fn decode(raw: &[u8]) -> Option<StatCache> {
         }),
         _ => return None,
     };
-    let n = r.u64()?;
-    let mut records = HashMap::with_capacity(n.min(1 << 20) as usize);
+    let count = r.u64()?;
+    let start = body.len() - r.0.len();
+    Some(StatCache {
+        key,
+        records: OnceLock::new(),
+        loaded: Some(Loaded {
+            file: Arc::new(raw),
+            start,
+            count,
+            patches: Vec::new(),
+        }),
+        dirty: false,
+    })
+}
+
+/// The `n` records encoded in `raw`: all of them, or those `only` covers
+/// (the others are checked for their shape, and skipped). `None` if they
+/// are not `n` well-formed records and nothing else.
+fn decode_records(raw: &[u8], n: u64, only: Option<&Lookups<'_>>) -> Option<HashMap<VPath, Record>> {
+    let mut r = Reader(raw);
+    let mut records = HashMap::with_capacity(if only.is_some() { 0 } else { n.min(1 << 20) as usize });
     for _ in 0..n {
-        let path = VPath::new(std::str::from_utf8(r.bytes()?).ok()?).ok()?;
+        let path = std::str::from_utf8(r.bytes()?).ok()?;
+        let wanted = only.is_none_or(|l| l.covers(path));
         let mtime = r.i64()?;
         let ctime = r.opt_i64()?;
         let inode = match r.u8()? {
@@ -609,8 +802,11 @@ fn decode(raw: &[u8]) -> Option<StatCache> {
             size,
             executable: flags & 1 != 0,
         };
+        if !wanted {
+            continue;
+        }
         records.insert(
-            path,
+            VPath::new(path).ok()?,
             Record {
                 stamp,
                 verified_at,
@@ -624,11 +820,7 @@ fn decode(raw: &[u8]) -> Option<StatCache> {
     if !r.0.is_empty() {
         return None;
     }
-    Some(StatCache {
-        key,
-        records,
-        dirty: false,
-    })
+    Some(records)
 }
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -764,45 +956,256 @@ mod tests {
             }),
             ..Default::default()
         };
-        c.records.insert(VPath::new("a/b.txt").unwrap(), rec(5, 9));
+        c.all_mut().insert(VPath::new("a/b.txt").unwrap(), rec(5, 9));
         let mut r2 = rec(6, 9);
         r2.sealed = None;
         r2.stamp.ctime = None;
         r2.stamp.inode = None;
-        c.records.insert(VPath::new("c").unwrap(), r2);
+        c.all_mut().insert(VPath::new("c").unwrap(), r2);
         let mut r3 = rec(7, 9);
         r3.eol = Some(EolFact {
             attributes: [2; 16],
             renormalize: true,
             recorded: Some(ObjectId::hash(b"lf")),
         });
-        c.records.insert(VPath::new("d.bat").unwrap(), r3);
+        c.all_mut().insert(VPath::new("d.bat").unwrap(), r3);
         let mut r4 = rec(8, 9);
         r4.eol = Some(EolFact {
             attributes: [0; 16],
             renormalize: false,
             recorded: None,
         });
-        c.records.insert(VPath::new("e.png").unwrap(), r4);
+        c.all_mut().insert(VPath::new("e.png").unwrap(), r4);
         let raw = encode(&c);
-        let back = decode(&raw).unwrap();
+        let back = decode(raw.clone()).unwrap();
         assert_eq!(back.key, c.key);
-        assert_eq!(back.records, c.records);
+        // Decoded when first needed, not when the file is read.
+        assert!(back.records.get().is_none());
+        assert_eq!(back.all(), c.all());
+        assert_eq!(back.len(), 4);
         let mut bad = raw.clone();
         bad[MAGIC.len() + 10] ^= 1;
-        assert!(decode(&bad).is_none());
-        assert!(decode(&raw[..raw.len() - 1]).is_none());
-        assert!(decode(b"").is_none());
+        assert!(decode(bad).is_none());
+        assert!(decode(raw[..raw.len() - 1].to_vec()).is_none());
+        assert!(decode(Vec::new()).is_none());
+    }
+
+    /// A file whose checksum holds but whose records are not records (only
+    /// a writer of `.veil/local` makes one): an empty cache under its key,
+    /// for a full build and for a watched one.
+    #[test]
+    fn records_that_do_not_decode_are_no_records() {
+        let c = sample();
+        let raw = encode(&c);
+        // The count says one record more than there are.
+        let at = MAGIC.len() + 4 + 1 + 1 + 32 + 32 + 1;
+        let mut body = raw[..raw.len() - 32].to_vec();
+        let n = u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
+        assert_eq!(n, c.len() as u64, "the count is where this test expects it");
+        body[at..at + 8].copy_from_slice(&(n + 1).to_le_bytes());
+        let sum = blake3::hash(&body);
+        body.extend_from_slice(sum.as_bytes());
+        let back = decode(body.clone()).unwrap();
+        assert_eq!(back.key, c.key);
+        assert!(back.is_empty());
+        let mut back = decode(body).unwrap();
+        let lookups = Lookups { dirs: HashSet::from(["a"]), subtrees: vec![] };
+        let run = back.begin_watched_run(c.key.clone().unwrap(), CLOCK, &lookups);
+        assert!(run.old.is_empty());
+        back.end_run(run);
+        assert!(back.is_empty());
+    }
+
+    const CLOCK: StatClock = StatClock { now: 9, exact: false };
+
+    /// Records in the root, in `a`, below it, beside it (`ab`), and in `b`.
+    fn sample() -> StatCache {
+        let mut c = StatCache {
+            key: Some(CacheKey {
+                policy: Some(ObjectId::hash(b"p")),
+                keys: ObjectId::hash(b"k"),
+                exact: false,
+            }),
+            ..Default::default()
+        };
+        for (i, p) in ["top", "a/x", "a/y", "a/s/t", "a/s/u/v", "ab/x", "b/z", "b/c/w"].into_iter().enumerate() {
+            c.all_mut().insert(VPath::new(p).unwrap(), rec(i as i64, 9));
+        }
+        c
+    }
+
+    fn vp(s: &str) -> VPath {
+        VPath::new(s).unwrap()
+    }
+
+    #[test]
+    fn lookups_cover_the_files_of_their_directories_and_everything_below_their_subtrees() {
+        let l = Lookups { dirs: HashSet::from(["a", ""]), subtrees: vec!["b/c"] };
+        for (path, covered) in [
+            ("top", true),
+            ("a/x", true),
+            ("a/s/t", false),
+            ("ab/x", false),
+            ("b/z", false),
+            ("b/c/w", true),
+            ("b/c/d/e", true),
+            ("b/cd/e", false),
+        ] {
+            assert_eq!(l.covers(path), covered, "{path}");
+        }
+        let all = Lookups { dirs: HashSet::new(), subtrees: vec![""] };
+        assert!(all.covers("top") && all.covers("a/s/t"));
+        assert!(!Lookups { dirs: HashSet::new(), subtrees: vec![] }.covers("top"));
+    }
+
+    /// A watched build on a cache as loaded (its records encoded, only
+    /// those it can look up decoded) ends exactly as on a cache whose
+    /// records were all decoded first: the same records, and the same
+    /// answer to "is there something to save".
+    #[test]
+    fn a_watched_run_on_a_loaded_cache_ends_as_one_on_decoded_records() {
+        type Script = fn(&mut CacheRun);
+        // Each build does what the builder does in a directory it lists:
+        // notes it, takes the records it trusts and carries them over,
+        // learns the others.
+        let scripts: Vec<(&str, Lookups<'static>, Script, bool, bool)> = vec![
+            // name, what the plan inspects, the build, something to save?, still encoded after?
+            ("nothing changed anywhere", Lookups { dirs: HashSet::new(), subtrees: vec![] }, |_| {}, false, true),
+            (
+                "a directory listed, every record carried over",
+                Lookups { dirs: HashSet::from(["a"]), subtrees: vec![] },
+                |run| {
+                    run.note_visited_dir(&vp("a"));
+                    for p in ["a/x", "a/y"] {
+                        let (path, kept) = run.old.remove_entry(&vp(p)).unwrap();
+                        run.keep_taken(path, kept);
+                    }
+                },
+                false,
+                true,
+            ),
+            (
+                "a record replaced by one that is not worth a save (a file edited just before the commit)",
+                Lookups { dirs: HashSet::from(["a"]), subtrees: vec![] },
+                |run| {
+                    run.note_visited_dir(&vp("a"));
+                    let (path, kept) = run.old.remove_entry(&vp("a/x")).unwrap();
+                    run.keep_taken(path, kept);
+                    // `a/y` read again: its old record stays behind in `old`.
+                    run.new.insert(vp("a/y"), rec(77, 9));
+                },
+                false,
+                true,
+            ),
+            (
+                "a record learnt that is worth a save",
+                Lookups { dirs: HashSet::from(["a"]), subtrees: vec![] },
+                |run| {
+                    run.note_visited_dir(&vp("a"));
+                    let (path, kept) = run.old.remove_entry(&vp("a/x")).unwrap();
+                    run.keep_taken(path, kept);
+                    run.new.insert(vp("a/y"), rec(78, 9));
+                    run.changed = true;
+                },
+                true,
+                false,
+            ),
+            (
+                "a file gone from a listed directory",
+                Lookups { dirs: HashSet::from(["a"]), subtrees: vec![] },
+                |run| {
+                    run.note_visited_dir(&vp("a"));
+                    let (path, kept) = run.old.remove_entry(&vp("a/x")).unwrap();
+                    run.keep_taken(path, kept);
+                },
+                true,
+                false,
+            ),
+            (
+                "a new file in the root",
+                Lookups { dirs: HashSet::from([""]), subtrees: vec![] },
+                |run| {
+                    run.note_visited_dir(&VPath::root());
+                    let (path, kept) = run.old.remove_entry(&vp("top")).unwrap();
+                    run.keep_taken(path, kept);
+                    run.new.insert(vp("new"), rec(79, 9));
+                    run.changed = true;
+                },
+                true,
+                false,
+            ),
+            (
+                "a directory gone, with records the run never decoded below it",
+                Lookups { dirs: HashSet::from([""]), subtrees: vec![] },
+                |run| {
+                    run.note_visited_dir(&VPath::root());
+                    let (path, kept) = run.old.remove_entry(&vp("top")).unwrap();
+                    run.keep_taken(path, kept);
+                    run.note_deleted_dir(vp("b"));
+                },
+                true,
+                false,
+            ),
+            (
+                "a subtree walked whole",
+                Lookups { dirs: HashSet::new(), subtrees: vec!["a"] },
+                |run| {
+                    for d in ["a", "a/s", "a/s/u"] {
+                        run.note_visited_dir(&vp(d));
+                    }
+                    for p in ["a/x", "a/y", "a/s/t"] {
+                        let (path, kept) = run.old.remove_entry(&vp(p)).unwrap();
+                        run.keep_taken(path, kept);
+                    }
+                    run.new.insert(vp("a/s/u/v"), rec(80, 9));
+                },
+                false,
+                true,
+            ),
+        ];
+        for (name, lookups, script, saves, encoded_after) in scripts {
+            let raw = encode(&sample());
+            let key = sample().key.unwrap();
+            // As loaded.
+            let mut loaded = decode(raw.clone()).unwrap();
+            let mut run = loaded.begin_watched_run(key.clone(), CLOCK, &lookups);
+            assert!(run.encoded.is_some(), "{name}: the run decodes only what it looks up");
+            assert!(run.old.keys().all(|p| lookups.covers(p.as_str())), "{name}");
+            script(&mut run);
+            loaded.end_run(run);
+            assert_eq!(loaded.records.get().is_none(), encoded_after, "{name}: records still encoded after the run");
+            // With every record decoded first.
+            let mut decoded = decode(raw).unwrap();
+            assert_eq!(decoded.len(), 8);
+            let mut run = decoded.begin_watched_run(key, CLOCK, &lookups);
+            assert!(run.encoded.is_none(), "{name}");
+            script(&mut run);
+            decoded.end_run(run);
+            assert_eq!(loaded.dirty, saves, "{name}: something to save");
+            assert_eq!(decoded.dirty, saves, "{name}: something to save (decoded first)");
+            assert_eq!(loaded.all(), decoded.all(), "{name}");
+            // And what is saved, or kept for the next build of this
+            // process, reads back the same.
+            assert_eq!(decode(encode(&loaded)).unwrap().all(), decoded.all(), "{name}");
+            // A second watched build of the process sees what the first left.
+            let mut again = loaded.clone();
+            let run = again.begin_watched_run(sample().key.unwrap(), CLOCK, &Lookups { dirs: HashSet::from(["a"]), subtrees: vec![] });
+            let seen: HashSet<&VPath> = run.old.keys().collect();
+            let expect: HashSet<&VPath> = decoded.all().keys().filter(|p| run.encoded.is_none() || p.as_str().starts_with("a/") && !p.as_str()[2..].contains('/')).collect();
+            assert_eq!(seen, expect, "{name}: a second build");
+            again.end_run(run);
+            assert_eq!(again.all(), decoded.all(), "{name}: after a second build that changed nothing");
+        }
     }
 
     #[test]
     fn invalidate_removes_subtrees() {
         let mut c = StatCache::default();
         for p in ["a", "a/x", "a/y/z", "ab", "b"] {
-            c.records.insert(VPath::new(p).unwrap(), rec(1, 2));
+            c.all_mut().insert(VPath::new(p).unwrap(), rec(1, 2));
         }
         c.invalidate(&VPath::new("a").unwrap());
-        let mut left: Vec<_> = c.records.keys().map(|p| p.to_string()).collect();
+        let mut left: Vec<_> = c.all().keys().map(|p| p.to_string()).collect();
         left.sort();
         assert_eq!(left, vec!["ab", "b"]);
         assert!(c.dirty);

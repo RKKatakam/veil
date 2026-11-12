@@ -1963,6 +1963,20 @@ impl<'r> Held<'r> {
         self.0.graph.reachable_among(self.0, roots, wanted)
     }
 
+    /// [`Held::reachable_among`], told `tips` (snapshots none of which
+    /// descends from another) and their parents (`under`): the same
+    /// answer, without reading what lies below them
+    /// (`GraphIndex::reachable_among_tips`).
+    pub fn reachable_among_tips(
+        &self,
+        roots: impl IntoIterator<Item = ObjectId>,
+        wanted: &HashSet<ObjectId>,
+        tips: &HashSet<ObjectId>,
+        under: &HashSet<ObjectId>,
+    ) -> Result<HashSet<ObjectId>> {
+        self.0.graph.reachable_among_tips(self.0, roots, wanted, tips, under)
+    }
+
     /// Held snapshots reachable from `roots` whose index entry `keep`s,
     /// after indexing them (candidates for a change-id prefix or a flag;
     /// the caller confirms what it uses against the store).
