@@ -42,7 +42,7 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 # with ring, as everywhere else: no OpenSSL, no native-tls.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-ring-webpki"] }
 # The S3 object store: request signing without the AWS SDK, sent with reqwest.
-rusty-s3 = "0.8"
+rusty-s3 = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # The object-store trait is async and object safe.
 async-trait = "0.1"
