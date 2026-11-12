@@ -50,6 +50,23 @@ fn a_fresh_clone_cut_before_its_one_flush_is_refused_never_usable() {
             assert!(err.contains(REFUSED), "keep {keep}: {args:?}: {err}");
         }
     }
+    // Lost with everything else: `repo.json` too. Inside a repository of
+    // its own (a clone made in a working copy), the directory is still the
+    // interrupted clone, refused, never a folder of the repository above.
+    let outer = admin.dir("outer");
+    std::fs::create_dir_all(&outer).unwrap();
+    admin.ok(&outer, &["init"]);
+    let d = outer.join("inner");
+    let out = admin
+        .command(admin.home.path(), &["clone", &hub.url(&name), d.to_str().unwrap()])
+        .env("VEIL_TEST_CLONE_POWER_CUT", "0")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(137), "{}", String::from_utf8_lossy(&out.stderr));
+    std::fs::remove_file(d.join(".veil/repo.json")).unwrap();
+    let r = admin.run(&d, &["status"]);
+    assert!(!r.status.success(), "the interrupted clone was taken as a folder of the repository above");
+    assert!(String::from_utf8_lossy(&r.stderr).contains(REFUSED), "{}", String::from_utf8_lossy(&r.stderr));
     let ok = admin.dir("whole");
     let out = admin.ok(admin.home.path(), &["clone", &hub.url(&name), ok.to_str().unwrap()]);
     assert!(out.contains("Cloned"), "{out}");

@@ -277,7 +277,11 @@ fn check_clone_finished(root: &Path) -> Result<()> {
 pub fn find_root(start: &Path) -> Option<PathBuf> {
     let mut cur = Some(start);
     while let Some(d) = cur {
-        if d.join(VEIL_DIR).join("repo.json").is_file() {
+        // A clone that has not finished is its own repository even before
+        // its `repo.json` is durable (BUG-1945: a fresh clone's flushes
+        // come at once): it is refused there, never a folder of a
+        // repository above.
+        if d.join(VEIL_DIR).join("repo.json").is_file() || d.join(CLONE_INCOMPLETE).is_file() {
             return Some(d.to_path_buf());
         }
         // Never from inside a `vl ws exec` sandbox
