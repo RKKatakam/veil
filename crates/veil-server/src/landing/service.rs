@@ -377,6 +377,15 @@ impl Storing {
     }
 }
 
+/// `f` as [`crate::db::transaction`] takes it, so that it can be passed by
+/// reference and run again.
+fn tx_fn<T, F>(f: F) -> F
+where
+    F: for<'t> FnMut(&'t mut sqlx::PgConnection) -> crate::db::TxFuture<'t, T>,
+{
+    f
+}
+
 /// How a batch's commit ended.
 enum Committed {
     Ok,
@@ -1186,7 +1195,8 @@ impl Service {
         let old_tip_id = b.old_tip;
         let tx_results = results.clone();
         let tx_hub = hub.clone();
-        let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+        let stored_outside = stored.clone();
+        let mut run = tx_fn(move |c| {
             let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing, active_review_checks, review_guard, claim_tokens) = (
                 ls.clone(),
                 ll.clone(),
@@ -1487,12 +1497,24 @@ impl Service {
                         .execute(&mut *c)
                         .await?;
                 }
-                // What the batch made is stored before the branch names it.
+                // What the batch made is stored before the branch names it:
+                // waited for here a little only, so that a slow store never
+                // holds the lease's row (and the branch's other servers)
+                // for long; past that, outside the transaction, which then
+                // runs again (BUG-1982).
+                if tokio::time::timeout(STORE_IN_TRANSACTION, Storing::wait(&stored)).await.is_err() {
+                    return Err(Error::conflict(STORE_SLOW));
+                }
                 Storing::wait(&stored).await?;
                 Ok((results, marked))
             })
-        })
-        .await;
+        });
+        let r = loop {
+            match crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, &mut run).await {
+                Err(Error::Api { code: "conflict", message, .. }) if message == STORE_SLOW => Storing::wait(&stored_outside).await?,
+                r => break r,
+            }
+        };
         let (results, marked_prs) = match r {
             Ok(r) => r,
             Err(Error::Api { code: "conflict", message, .. }) if message == LEASE_LOST => {
@@ -1643,6 +1665,13 @@ async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> 
 
 const LEASE_LOST: &str = "the landing lease was lost";
 const MOVED: &str = "the branch moved under the landing service";
+/// A batch's objects were not stored within [`STORE_IN_TRANSACTION`] of its
+/// transaction's last statement: it is rolled back, waits for them without
+/// holding anything, and runs again (BUG-1982).
+const STORE_SLOW: &str = "the batch's objects are still being stored";
+/// How long a batch's transaction waits for its objects before it lets go
+/// of the lease's row: half the lease.
+const STORE_IN_TRANSACTION: Duration = Duration::from_millis(LEASE_MS as u64 / 2);
 /// An entry whose stack was judged under another lineage of the branch.
 const RESET: &str = "the branch was reset since this change was submitted (a forced push, or deleted and made again): submit it again";
 const MEMO_RACE: &str = "a projection memo was stored meanwhile with another value";

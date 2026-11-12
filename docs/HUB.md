@@ -5417,6 +5417,11 @@ transaction per landing instead of 23.
    names nothing that is not stored (a batch whose objects cannot be
    stored rolls back and is built again; a transaction run again finds the
    store's outcome). Measured: 57 to 45 ms a batch with the gate's mix.
+   The transaction waits for them at most half a lease (1 s): past that
+   it rolls back, the batch waits for its objects holding nothing, and
+   its transaction runs again, so a slow or hung object store never holds
+   the lease's row, which the branch's other servers need to take the
+   lease over once it expires (BUG-1982).
 11. **A landing behind a backlog in its project's gate is told at once**
    (`limits/gate.rs` `WRITE_BACKLOG`, BUG-1955). Past what a project's
    submits get through its bulkhead (48 places with 64 database

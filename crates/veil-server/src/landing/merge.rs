@@ -189,7 +189,6 @@ impl AttrSource for ServerAttrSource<'_> {
     }
 }
 
-/// Do paths `a` and `b` overlap (the same path, or one inside the other)?
 /// Build a visibility-safe [`ConflictReport`] for an entry whose `set` (made
 /// on `base_snap` with tree `parent_tree`) conflicts with `tip_snap` (tree
 /// `chain_tree`).

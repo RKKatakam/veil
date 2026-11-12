@@ -316,3 +316,98 @@ fn bug_1956_clean_overlaps_of_one_file_all_land() {
     let want: String = (0..40).map(|i| if i % 3 == 0 && i < 36 { format!("line {i} edited\n") } else { format!("line {i}\n") }).collect();
     assert_eq!(String::from_utf8_lossy(&r.body), want);
 }
+
+/// A proxy in front of the test's S3 store that holds every `PUT` while
+/// `stall` is set (reads go through): object writes that hang.
+fn stalling_s3(stall: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::atomic::Ordering,
+    };
+    let upstream = std::env::var("VEIL_TEST_S3_ENDPOINT").expect("VEIL_TEST_S3_ENDPOINT");
+    let upstream = upstream.trim_start_matches("http://").trim_end_matches('/').to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let Ok(server) = TcpStream::connect(&upstream) else { continue };
+            let (mut c_in, mut s_out) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+            let stall = stall.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 64 << 10];
+                while let Ok(n) = c_in.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    while buf.starts_with(b"PUT ") && stall.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    if s_out.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                let _ = s_out.shutdown(std::net::Shutdown::Write);
+            });
+            let (mut s_in, mut c_out) = (server, client);
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut s_in, &mut c_out);
+                let _ = c_out.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    format!("http://{at}")
+}
+
+/// BUG-1982: while a batch's objects are being stored, its transaction
+/// holds the branch's lease row only briefly: a store that hangs never
+/// keeps the branch's other servers from its lease (they take it once it
+/// expires), and nothing of the batch lands until its objects are stored.
+/// Once they are, it lands.
+#[test]
+fn bug_1982_a_hung_object_store_never_holds_the_branchs_lease_row() {
+    use std::sync::{atomic::Ordering, Arc};
+    let url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL");
+    let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hub = TestHub::start_with_s3(&url, Duration::from_secs(3600), Some(stalling_s3(stall.clone())));
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    hold_branch(&hub, pid, "main");
+    let r = land_edit(&api, &dev, &p.name, base, "src/hung/f.rs", "hung\n", false);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    stall.store(true, Ordering::SeqCst);
+    release_branch(&hub, pid, "main");
+    // The batch is built and its objects' writes hang.
+    std::thread::sleep(Duration::from_secs(4));
+    let db = hub.hub().db.clone();
+    let locked: Result<String, sqlx::Error> = hub.rt.block_on(async {
+        let mut tx = db.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '2s'").execute(&mut *tx).await?;
+        let holder: String = sqlx::query_scalar("SELECT holder FROM landing_leases WHERE project_id = $1 AND branch = 'main' FOR UPDATE")
+            .bind(pid)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.rollback().await?;
+        Ok(holder)
+    });
+    let holder = locked.expect("the lease's row was held while the batch's objects were being stored");
+    assert_ne!(holder, "test", "the service never took the lease");
+    let state: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(&ticket).fetch_one(&db))
+        .unwrap();
+    assert_eq!(state, "queued", "a batch whose objects were not stored changed its ticket");
+    assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], base, "a batch whose objects were not stored moved the branch");
+
+    stall.store(false, Ordering::SeqCst);
+    let v = wait_ticket(&api, &dev, &p.name, &ticket);
+    assert_eq!(v["state"], "landed", "{v}");
+    let tip = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path=src/hung/f.rs", p.name, tip.hex()));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(String::from_utf8_lossy(&r.body), "hung\n");
+}

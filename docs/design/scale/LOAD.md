@@ -1066,8 +1066,11 @@ landing):
 "Old": the benchmark as it was (128 MB of shared buffers, `docker-proxy`);
 "new": as now. `a2fff143` is the start of this work (BUG-1940 to 1942
 fixed); `af997c49` the branch's first part (`touching`, read-ahead,
-back-pressure, a random slot first). The `--mix` row of `a2fff143`, old,
-is BUG-1955's own run. Per 10 s, the plain runs on `landhold2` hold 922
+back-pressure, a random slot first). The `landhold2`, new rows were
+measured at `26808b17` (unprotected) and `a9dbb0a5`, and the ten minutes
+below at `ce38e9bf`: the branch's server code but the gate's early answer
+(`e513cedb`, HUB §13.32 item 11), which the overload run below has. The
+`--mix` row of `a2fff143`, old, is BUG-1955's own run. Per 10 s, the plain runs on `landhold2` hold 922
 to 1,069/s for the whole three minutes, p99 400 to 1,270 ms; the mix
 holds 980 to 1,076/s for 90 s, then 810 to 950/s with the queue at its
 bound.
