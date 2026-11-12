@@ -168,3 +168,23 @@ fn an_admins_session_narrowed_to_src_gets_nothing_outside_it_on_this_weeks_route
     assert!(has_marker(&got, PUBLIC_MARK), "the narrowed session reads src/");
     assert!(has_marker(&got, NESTED_MARK), "the admin's narrowed session reads src/'s restricted folder");
 }
+
+/// `docs/HUB.md` §13.27 (a narrowed session sees only its paths on every
+/// route; BUG-1536: its statistics are taken over its paths alone) and
+/// §13.25 (health is for the project's admins: "the counts include work by
+/// people and on folders others may not see"). An admin's agent session
+/// narrowed to `src/` is refused health, as `ci::can_see_check` refuses it
+/// admin-only results; the admin's own session reads it.
+#[test]
+#[ignore = "BUG-1995: a narrowed agent session of an admin reads the whole project's health counts"]
+fn bug_1995_a_narrowed_session_of_an_admin_is_refused_the_projects_health() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin = p.admin.token();
+    let r = api.get(Some(&admin), &format!("/v1/projects/{}/health", p.name));
+    assert_eq!(r.status, 200, "the admin reads the project's health: {}", body(&r));
+    let agent = agent_token(&hub, &admin, &p.name, &["src"]);
+    let r = api.get(Some(&agent), &format!("/v1/projects/{}/health", p.name));
+    assert_eq!((r.status, r.json()["code"].clone()), (403, json!("forbidden")), "{}", body(&r));
+}
