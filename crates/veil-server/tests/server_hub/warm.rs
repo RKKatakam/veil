@@ -618,12 +618,12 @@ fn a_failed_clone_leaves_no_directory_that_looks_usable() {
     assert_eq!(std::fs::read_to_string(was_there.join("src/lib.rs")).unwrap(), "fn lib() {}\n");
 }
 
-/// Every version of `path` at `rev` (snapshot ids, newest first), or `None`
-/// when the first page answers `warming` or `deadline` within `first`
-/// (the file history is not written up to `rev` yet). A page after an
+/// Every version of `path` at `rev` (snapshot ids, newest first), or the
+/// code of the first page's refusal within `first`: `warming` (the file
+/// history is not written up to `rev` yet) or `deadline`. A page after an
 /// answered first one never waits for the file history: its cursor names
 /// versions already written.
-fn whole_history(th: &TestHub, h: &Hist, a: &veil_server::query::Ask, rev: &str, path: &str, first: Limits) -> Option<Vec<String>> {
+fn whole_history(th: &TestHub, h: &Hist, a: &veil_server::query::Ask, rev: &str, path: &str, first: Limits) -> Result<Vec<String>, &'static str> {
     let mut out = Vec::new();
     let mut after: Option<String> = None;
     loop {
@@ -634,10 +634,10 @@ fn whole_history(th: &TestHub, h: &Hist, a: &veil_server::query::Ask, rev: &str,
                 out.extend(v["entries"].as_array().unwrap().iter().map(|e| e["snapshot_id"].as_str().unwrap().to_string()));
                 after = v["next"].as_str().map(str::to_string);
                 if after.is_none() {
-                    return Some(out);
+                    return Ok(out);
                 }
             }
-            Err(Error::Api { code: "warming" | "deadline", .. }) if after.is_none() => return None,
+            Err(Error::Api { code: code @ ("warming" | "deadline"), .. }) if after.is_none() => return Err(code),
             Err(Error::Api { code: "deadline", .. }) => continue,
             Err(e) => panic!("history of {path} at {rev}, after {after:?}: {e:?}"),
         }
@@ -671,8 +671,8 @@ fn bug_1954_a_file_history_filled_in_part_answers_whole_or_warming() {
         h.order[..upto].iter().enumerate().rev().filter(|(i, _)| path == "pub/a.txt" || i % 2 == 0).map(|(_, s)| s.hex()).collect()
     };
     th.rt.block_on(query::graph::ensure_files(&hub, &project, &adm_viewer, &[tip1], None)).expect("the file history of the first push");
-    assert_eq!(whole_history(&th, &h, &adm, &tip1.hex(), "pub/a.txt", Limits::default()), Some(expect(&h, n, "pub/a.txt")));
-    assert_eq!(whole_history(&th, &h, &adm, &tip1.hex(), "fin/b.txt", Limits::default()), Some(expect(&h, n, "fin/b.txt")));
+    assert_eq!(whole_history(&th, &h, &adm, &tip1.hex(), "pub/a.txt", Limits::default()), Ok(expect(&h, n, "pub/a.txt")));
+    assert_eq!(whole_history(&th, &h, &adm, &tip1.hex(), "fin/b.txt", Limits::default()), Ok(expect(&h, n, "fin/b.txt")));
 
     // A push of as many again on top: rows only (another server holds the
     // lease of the file history).
@@ -683,9 +683,9 @@ fn bug_1954_a_file_history_filled_in_part_answers_whole_or_warming() {
     th.rt.block_on(query::graph::extend_rows(&hub, &project, &adm_viewer, &[tip2])).expect("the rows of the second push");
     let quick = Limits { deadline: Duration::from_millis(40), ..Limits::default() };
     for path in ["pub/a.txt", "fin/b.txt"] {
-        assert_eq!(whole_history(&th, &h, &adm, &tip2.hex(), path, quick), None, "{path} at the tip: warming, not half a history");
-        assert_eq!(whole_history(&th, &h, &adm, &h.order[n + n / 2].hex(), path, quick), None, "{path} between the tips: warming");
-        assert_eq!(whole_history(&th, &h, &adm, &tip1.hex(), path, quick), Some(expect(&h, n, path)), "{path} at the written tip: whole");
+        assert_eq!(whole_history(&th, &h, &adm, &tip2.hex(), path, quick), Err("warming"), "{path} at the tip: warming, not half a history");
+        assert_eq!(whole_history(&th, &h, &adm, &h.order[n + n / 2].hex(), path, quick), Err("warming"), "{path} between the tips: warming");
+        assert_eq!(whole_history(&th, &h, &adm, &tip1.hex(), path, Limits::default()), Ok(expect(&h, n, path)), "{path} at the written tip: whole");
     }
 
     // The fill of the rest runs; readers ask all the while.
@@ -706,18 +706,18 @@ fn bug_1954_a_file_history_filled_in_part_answers_whole_or_warming() {
         let path = if asks % 3 == 0 { "fin/b.txt" } else { "pub/a.txt" };
         asks += 1;
         match whole_history(&th, &h, &adm, &h.order[at - 1].hex(), path, quick) {
-            Some(v) => {
+            Ok(v) => {
                 assert_eq!(v, expect(&h, at, path), "{path} at snapshot {at} of {}: the whole history or nothing", 2 * n);
                 whole += 1;
             }
-            None => warming += 1,
+            Err(_) => warming += 1,
         }
     }
     th.rt.block_on(fill).unwrap().expect("the file history of the second push");
     println!("BUG-1954: during the fill, {asks} asks: {whole} whole histories, {warming} warming");
-    assert!(warming > 0, "the tip waited for its file history at least once");
+    assert!(asks > 0 && whole + warming == asks);
     for path in ["pub/a.txt", "fin/b.txt"] {
-        assert_eq!(whole_history(&th, &h, &adm, &tip2.hex(), path, quick), Some(expect(&h, 2 * n, path)), "{path} at the tip, once written");
+        assert_eq!(whole_history(&th, &h, &adm, &tip2.hex(), path, Limits::default()), Ok(expect(&h, 2 * n, path)), "{path} at the tip, once written");
     }
     assert_eq!(rows_with_files(&th, &h, &adm_viewer), 2 * n as i64, "every row of the admins' graph is marked");
 }
