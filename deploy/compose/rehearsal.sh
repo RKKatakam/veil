@@ -140,9 +140,12 @@ healthy() { # service: wait until its health check passes
 echo "== bringing up $PROJECT (tag $TAG, database $DB, balancer on 127.0.0.1:$LB_PORT)"
 t_up=$SECONDS
 if [ "$DB" = yb ]; then
-    C up -d --wait --wait-timeout 600 yb1 || { echo "rehearsal: yb1 did not come up"; diagnose; exit 1; }
-    C up -d --wait --wait-timeout 600 yb2 yb3 || { echo "rehearsal: yb2/yb3 did not come up"; diagnose; exit 1; }
-    for i in $(seq 90); do n=$(C exec -T yb1 bin/ysqlsh -h yb1 -tAc 'select count(*) from yb_servers()' 2>/dev/null || true); [ "$n" = 3 ] && break; sleep 2; done
+    # One node at a time: two yugabyted joining at once fail (one was killed
+    # mid-start, 2026-11-12). configure.sh joins them one by one as well.
+    for y in 1 2 3; do
+        C up -d --wait --wait-timeout 600 "yb$y" || { echo "rehearsal: yb$y did not come up"; diagnose; exit 1; }
+        for i in $(seq 90); do n=$(C exec -T yb1 bin/ysqlsh -h yb1 -tAc 'select count(*) from yb_servers()' 2>/dev/null || true); [ "$n" = "$y" ] && break; sleep 2; done
+    done
     echo "   YugabyteDB nodes in the cluster: $n"; [ "$n" = 3 ] || { diagnose; exit 1; }
     # yugabyted turns the tablet-replica limit on at every start whatever
     # --master_flags says: lift it on every master (docs/DEPLOY.md §2).
