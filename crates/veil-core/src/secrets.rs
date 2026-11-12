@@ -70,7 +70,7 @@ use regex::bytes::Regex;
 
 /// Bumped whenever the rules change, so cached "scanned clean" facts (see
 /// `statcache`) from an older scanner are not reused.
-pub const RULES_VERSION: u32 = 7;
+pub const RULES_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
@@ -1662,6 +1662,26 @@ fn config_line(text: &[u8], kw: usize) -> bool {
     s.iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
+/// Is a `url-password` match (`://user:password@h`, or `:\/\/…`) URL
+/// syntax, not bytes of binary data that happen to fit the pattern's
+/// classes (BUG-1985)? A scheme character (`[A-Za-z0-9+.-]`, RFC 3986)
+/// comes right before the `:`; the match has no control byte (C0 or DEL:
+/// never in a URL, and about one random byte in nine); and it is UTF-8
+/// (ASCII, or an IRI's UTF-8, RFC 3987). A match that is not UTF-8 (a
+/// Latin-1 `ä` typed into a URL) still counts in text: where no NUL is
+/// within 4 KiB around it (random and compressed data have a NUL every 256
+/// bytes on average). The pattern itself is unchanged, so the prefilter
+/// and the regex's size are too; and since a match holds no `/` after its
+/// `://`, no other URL starts inside one this rejects.
+fn url_syntax(prev: Option<u8>, text: &[u8], m: std::ops::Range<usize>) -> bool {
+    let scheme = prev.is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    let bytes = &text[m.clone()];
+    if !scheme || bytes.iter().any(|&b| b < 0x20 || b == 0x7f) {
+        return false;
+    }
+    std::str::from_utf8(bytes).is_ok() || memchr::memchr(0, &text[m.start.saturating_sub(4096)..(m.end + 4096).min(text.len())]).is_none()
+}
+
 /// Is the password of a `scheme://user:password@host` URL a credential,
 /// not a placeholder (`user:password@`, `postgres:postgres@`,
 /// `${USER}:${PASS}@`, `<user>:<password>@`, `****`)? It is judged
@@ -1989,7 +2009,7 @@ fn search_with<'r>(
             Check::Assignment if assign.is_some_and(|g| caps.get(g.g).is_some()) => app_password(token),
             Check::Assignment if key == Some(Key::Generic) => key_value(token),
             Check::Assignment => plausible_value(token),
-            Check::UrlPassword => plausible_url_password(token),
+            Check::UrlPassword => url_syntax(prev, text, whole.range()) && plausible_url_password(token),
             Check::PemHeader => {
                 let around = &text[whole.start().saturating_sub(256)..(whole.end() + 256).min(text.len())];
                 let binary = stripped || around.contains(&0);

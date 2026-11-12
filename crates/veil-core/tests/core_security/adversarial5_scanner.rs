@@ -474,11 +474,95 @@ fn scanner_false_positive_rate() {
 /// 1,400 matches (11 of 15,000 measured), and the file is quarantined:
 /// kept local, reported, never recorded.
 #[test]
-#[ignore = "BUG-1985: the url-password rule matches random binary data (about one 12 MiB file of random bytes in 1,400), and the file is quarantined"]
 fn bug_1985_random_bytes_are_not_a_url_password() {
     let hex = "155a96f6c76843cd3a2f2f641a8342768e7eb7e79503483a8cd60489138f0eb0b130f3d453dc588a3d8494aaa6b32e51c4d1f3fedf934db59ef3043894d493dd40732df5";
     let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
     assert_eq!(bytes.len(), 68);
     let found = scan(&bytes);
     assert!(found.is_empty(), "random bytes taken for a secret: {:?}", found.iter().map(|f| f.rule).collect::<Vec<_>>());
+}
+
+/// The URL rule's findings in `data`.
+fn url_passwords(data: &[u8]) -> usize {
+    scan(data).iter().filter(|f| f.rule == "url-password").count()
+}
+
+/// BUG-1985 control: the URL passwords the rule exists for are still found
+/// in every form a file holds them: ASCII and UTF-8 text, a Latin-1 file,
+/// UTF-16, the start and end of a file, a long line, JSON (and its `\/`
+/// escapes), YAML, TOML, `.env`, CRLF line ends, and a URL compiled into a
+/// binary between NUL bytes and random data.
+#[test]
+fn bug_1985_url_passwords_in_files_are_still_found() {
+    let url = "postgres://app:Xk9mQ2vL7pR4@db.example.com:5432/app";
+    let mut random = Rng(0x1985);
+    let noise = |n: usize, rng: &mut Rng| -> Vec<u8> { (0..n).map(|_| rng.next() as u8).collect() };
+    let mut binary = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
+    binary.extend(noise(4096, &mut random));
+    binary.extend(b"\0\0\0");
+    binary.extend(url.as_bytes());
+    binary.extend(b"\0\0");
+    binary.extend(noise(4096, &mut random));
+    let mut long_line = "x".repeat(200_000);
+    long_line.push_str(&format!(" {url} "));
+    long_line.push_str(&"y".repeat(200_000));
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        (".env", format!("PORT=8080\nDATABASE_URL={url}\nDEBUG=0\n").into()),
+        (".env, CRLF", format!("PORT=8080\r\nDATABASE_URL={url}\r\nDEBUG=0\r\n").into()),
+        ("start of the file", url.into()),
+        ("end of the file, no newline", b"# config\nREDIS=redis://:Xk9mQ2vL7pR4wZ@c".to_vec()),
+        ("only the URL, host of one letter", b"amqp://svc:Zt8nB3cXk9mQ2vL7@m".to_vec()),
+        ("long line", long_line.into()),
+        ("JSON", format!("{{\"db\": {{\"url\": \"{url}\", \"pool\": 5}}}}\n").into()),
+        ("JSON with \\/ escapes", b"{\"url\":\"mongodb+srv:\\/\\/svc:Zt8nB3cXk9mQ2vL7@cluster0.example.net\\/app\"}\n".to_vec()),
+        ("YAML", b"database:\n  url: \"amqps://svc:Zt8nB3cXk9mQ2vL7@mq.example.com:5671\"\n".to_vec()),
+        ("YAML, CRLF", b"database:\r\n  url: amqps://svc:Zt8nB3cXk9mQ2vL7@mq.example.com:5671\r\n".to_vec()),
+        ("TOML", b"[database]\nurl = \"mysql://root:Xk9mQ2vL7pR4@127.0.0.1:3306/app\"\n".to_vec()),
+        ("a percent-encoded user", b"git clone https://deploy%40corp:s3cr3tP4ssw0rd@git.example.com/r.git\n".to_vec()),
+        ("an IPv6 host", b"U=postgres://app:Xk9mQ2vL7pR4@[::1]:5432/app\n".to_vec()),
+        ("UTF-8 text around", format!("# Datenbank für die Produktion — prüfen ✓\nDATABASE_URL={url}\n# 数据库\n").into()),
+        ("a UTF-8 password", "DATABASE_URL=postgres://app:Pässwört-X9k2q@db.example.com/app\n".into()),
+        ("a UTF-8 user", "DATABASE_URL=postgres://jürgen:Xk9mQ2vL7pR4@db.example.com/app\n".into()),
+        ("Latin-1 text around", b"# Datenbank f\xfcr die Produktion\nDATABASE_URL=postgres://app:Xk9mQ2vL7pR4@db\n".to_vec()),
+        ("a Latin-1 password", b"# Datenbank f\xfcr die Produktion\nDATABASE_URL=postgres://app:P\xe4\xdfwort-X9k2q@db\n".to_vec()),
+        ("UTF-16LE with a BOM", with_bom(&format!("DATABASE_URL={url}\r\n"))),
+        ("compiled into a binary", binary),
+    ];
+    for (name, data) in &cases {
+        assert_eq!(url_passwords(data), 1, "{name}: {:?}", scan(data).iter().map(|f| f.rule).collect::<Vec<_>>());
+    }
+}
+
+/// BUG-1985: seeded random buffers with `://` planted every 256 to 767
+/// bytes (once in two right after a scheme letter), so that the rest of a
+/// URL is random bytes: none is taken for a URL password. Before the fix
+/// the rule matched about once per 1,000 of these `://`, so this run of
+/// about 25,000 found some 25.
+#[test]
+fn bug_1985_random_buffers_hold_no_url_password() {
+    let mut rng = Rng(0x5eed_1985);
+    let mut planted = 0;
+    for i in 0..48 {
+        let mut data: Vec<u8> = (0..256 << 10).map(|_| rng.next() as u8).collect();
+        let mut at = 0;
+        loop {
+            at += 256 + (rng.next() % 512) as usize;
+            if at + 3 > data.len() {
+                break;
+            }
+            data[at..at + 3].copy_from_slice(b"://");
+            if planted % 2 == 0 {
+                data[at - 1] = rng.pick(b"abcdefghijklmnopqrstuvwxyz0123456789");
+            }
+            planted += 1;
+        }
+        let found = scan(&data);
+        assert!(found.is_empty(), "buffer {i}: {:?}", found.iter().map(|f| f.rule).collect::<Vec<_>>());
+    }
+    assert!(planted > 20_000, "{planted}");
+    // And buffers of plain random bytes, the reproduction's kind.
+    for i in 0..8 {
+        let data: Vec<u8> = (0..1 << 20).map(|_| rng.next() as u8).collect();
+        assert_eq!(url_passwords(&data), 0, "plain buffer {i}");
+    }
 }
