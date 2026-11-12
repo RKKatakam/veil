@@ -87,7 +87,7 @@ impl Server {
         let help = Command::new(bin).arg("--help").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
         if help.contains("--device-rate") {
             let unlimited = "1000000000/1000000000";
-            cmd.args(["--device-rate", unlimited, "--anonymous-rate", unlimited, "--max-connections", "65536"]);
+            cmd.args(["--device-rate", unlimited, "--anonymous-rate", unlimited, "--max-connections", "262144"]);
         }
         let log = data.with_extension("log");
         let mut child = cmd

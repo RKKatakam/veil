@@ -574,6 +574,118 @@ its run overlapped this round's load tests.
   chain itself cannot shrink without a format change: each name must wait
   for what it depends on.
 
+## Gate runs on `22b9d837` (2026-11-12)
+
+The phase 2 gate (G2, `docs/design/server/phase-2-thin-clients.md` §7 and
+§8): Git beside Veil on the same machine. Product code is `integration` @
+`22b9d837`; the branch `gates` adds bench-tool commits only. Release
+builds, the bench directory in the worktree's `.scratch/` (ext4, NVMe),
+PostgreSQL 17 and MinIO in Docker, Git 2.53, every run through
+`~/.cache/veil-orch/bench-quiet.sh`, alone on the machine. The server's
+numbers of the same day are in `LOAD.md`.
+
+### 1,000 and 10,000 files
+
+```sh
+bash ~/.cache/veil-orch/bench-quiet.sh scripts/bench-server.sh openscion                 # load 3.96 before, 3.86 after
+OBJECTS=local bash ~/.cache/veil-orch/bench-quiet.sh scripts/bench-server.sh openscion   # load 3.86 before, 3.29 after
+```
+
+Median of 5 processes; each cell is the MinIO run / the local-directory
+run. `veil-bench openscion` now measures, after its four OpenScion cases,
+`status` and `log -n 20` beside Git, then status and the one-file commit
+again after `vl daemon stop`. **The Veil daemon starts on demand, so the
+four OpenScion cases have always run with it and its file watcher (S7)
+on**: "commit one changed file" is the commit with the watcher.
+
+| Files | Workload | Veil (ms) | Git (ms) | Target | Result |
+|---:|---|---:|---:|---|---|
+| 1,000 | import a directory | 56.3 / 66.5 | 105.7 / 101.7 | beat Git (OpenScion: 22) | **pass** (1.5 to 1.9× faster) |
+| 1,000 | clone everything (server) | 158.8 / 162.6 | 233.1 / 206.0 | beat Git (51) | **pass** |
+| 1,000 | clone one directory (thin clone, server) | 70.9 / 78.3 | 70.4 / 60.1 | beat Git (6.1) | **miss** (level, then 1.3× slower; BUG-1945) |
+| 1,000 | commit one changed file, watcher on | 8.5 / 8.5 | 4.2 / 4.3 | beat Git (2.5) | **miss** (2.0× slower; BUG-1944) |
+| 1,000 | commit one changed file, daemon stopped (a scan) | 16.8 / 13.3 | 12.5 / 4.6 | — | the watcher saves 5 to 8 ms |
+| 1,000 | status, clean, watcher on | 6.2 / 7.0 | 3.1 / 3.5 | — | 2.0× slower |
+| 1,000 | status, clean, daemon stopped | 16.4 / 9.5 | 3.8 / 3.3 | — | |
+| 1,000 | log -n 20 | 6.8 / 7.7 | 2.1 / 1.9 | — | 3 to 4× slower |
+| 10,000 | import a directory | 281.9 / 326.3 | 811.6 / 811.2 | beat Git (245) | **pass** (2.5 to 2.9× faster) |
+| 10,000 | clone everything (server) | 620.7 / 566.4 | 573.3 / 568.8 | beat Git (544) | level (1.08× slower, then 0.4 % faster) |
+| 10,000 | clone one directory (thin clone, server) | 53.9 / 38.6 | 62.3 / 49.8 | beat Git (25) | **pass** (1.2 to 1.3× faster) |
+| 10,000 | commit one changed file, watcher on | 12.3 / 12.7 | 8.3 / 8.7 | beat Git (22) | **miss** (1.5× slower; BUG-1944); OpenScion's 22 ms met |
+| 10,000 | commit one changed file, daemon stopped (a scan) | 25.9 / 20.1 | 7.8 / 7.3 | — | the watcher saves 7 to 14 ms |
+| 10,000 | status, clean, watcher on | 18.5 / 18.1 | 16.5 / 13.7 | — | 1.1 to 1.3× slower |
+| 10,000 | status, clean, daemon stopped | 21.4 / 16.4 | 8.1 / 8.5 | — | |
+| 10,000 | log -n 20 | 20.4 / 17.8 | 4.4 / 4.2 | — | 4 to 5× slower |
+
+In one process, in memory (as OpenScion measures; the MinIO run), every
+OpenScion target is met as before: import 14.0 and 136.2 ms, clone
+everything 11.5 and 104.7 ms, commit one changed file 0.97 and 7.68 ms.
+
+The watcher alone, on 20,500 files (`bash ~/.cache/veil-orch/bench-quiet.sh
+cargo test --release -p vl --test cli_bench -- --ignored --nocapture
+bench_status::status_on_20k_files`, load 3.29 before, 2.82 after; medians of
+10): status of an unchanged tree 28.4 ms by a scan and 17.6 ms with the
+watcher; status with one file edited 41.3 → 28.6 ms; commit of one edited
+file 43.7 → 33.1 ms (54.6 → 32.5 ms when S7 was measured).
+
+### The 1 GB profile
+
+35,001 files, 1.15 GB, 10,022 snapshots (profile `1g`, seed 1).
+
+```sh
+bash ~/.cache/veil-orch/bench-quiet.sh scripts/bench-server.sh 1g   # load 3.62 before, 10.32 after; again: 15.10 before (it waited 10 s), 6.26 after
+bash ~/.cache/veil-orch/bench-quiet.sh bash .scratch/git-1g.sh      # load 10.32 before, 5.80 after
+```
+
+The harness has no Git column on this profile, so Git was run by hand
+(`.scratch/git-1g.sh`, not committed): the same generated repository
+(`veil-bench gen --profile 1g --plain --seed 1`), its working copy checked
+out, and a Git repository made from that tree with one commit, because the
+generator's history exists only in Veil. Git therefore clones and logs one
+commit where Veil has 10,022 snapshots. Local cases are the median of 5
+processes; the server cases are one run each, the first run / the rerun.
+
+| Case | Veil | Git | Result |
+|---|---:|---:|---|
+| import a directory (first snapshot) | 4.24 s | 10.86 s | **Veil 2.6× faster** |
+| clone, thin (the default) | **fails** after 64.1 s / 63.8 s: "this history is being prepared for you; try again in a few seconds (warming)" | 29.2 s (one commit, everything) | **miss: the clone fails** (BUG-1943); it took 8.0 s on 2026-11-07 |
+| clone, full (`--full`, all 10,022 snapshots) | 55.3 s / 55.9 s | 29.2 s (one commit) | not comparable: Git has no history here |
+| clone one directory (`--only docs`, 1,317 files) | 3.98 s / 5.43 s | 0.41 s (`--filter=blob:none --sparse`) | **miss** (10 to 13× slower; BUG-1945) |
+| status, clean (daemon and watcher on) | 102 ms | 32 ms | **miss** (3.2× slower; BUG-1944) |
+| status, clean (daemon stopped: a scan) | 98 ms | 28 ms | the watcher saves nothing at this size |
+| status in the full clone, clean (server table) | 91 ms / 80 ms | — | |
+| commit one changed file (watcher on) | 165 ms | 27 ms | **miss** (6.1× slower; BUG-1944) |
+| commit one changed file (daemon stopped) | 165 ms | 24 ms | |
+| log -n 20 | 102 ms | 3 ms | **miss** (Git reads a few commits) |
+| push, 1 new snapshot / pull, nothing new | 167 ms / 103 ms (rerun 175 / 93) | — | |
+| pull, 1 new snapshot (median of 3) | 119 ms / 94 ms; the first pull after the full clone waited about 40 s for the same `warming` | — | |
+| client peak memory (gate 512 MiB) | 480 MiB (full clone) | — | **pass** |
+| server peak memory (gate 1 GB) | 965 MiB / 936 MiB (the full clone) | — | **pass**, with 59 to 88 MiB to spare |
+
+`status` and `log -n 20` in the thin clone did not run: they need the thin
+clone.
+
+### What the numbers say
+
+* **Import and clone everything beat Git or match it** at every size, as
+  before.
+* **Commit one changed file does not beat Git** (BUG-1944), with the
+  watcher or without it. The watcher brings the commit from 13 to 26 ms
+  down to 8.5 ms (1,000 files) and 12.5 ms (10,000), which is 1.5 to 2.0×
+  Git. At 35,000 files with 10,000 snapshots the commit takes 165 ms and a
+  clean status 100 ms, the same with the daemon stopped: at this size the
+  watcher spares nothing, and the time is not in the scan.
+* **The default clone of the 1 GB project fails** (BUG-1943), twice out of
+  two. It ran straight after the first push of 10,022 snapshots; the full
+  clone after it (55 s) worked, the first pull in it waited about 40 s,
+  and by the time of `clone --only docs` the answer was ready. The thin
+  clone asks the server's query API for history (S16), which answers
+  `warming` until the person's graph is filled, and `vl` waits for that
+  only so long (BUG-1913's fix).
+* **Clone one directory** beats Git at 10,000 files and is level or behind
+  at 1,000 (BUG-1945). On the 1 GB profile it takes 4 to 5 s against
+  Git's 0.4 s.
+
 ## Next
 
 1. **Clone one directory** (Git's level, not below): the ~60 sequential
