@@ -230,8 +230,11 @@ impl Hist {
                     let h = hub.clone();
                     set.spawn(async move { h.objects.put(project, &id, raw.into()).await.unwrap() });
                 }
-                if set.join_next().await.is_none() {
-                    break;
+                // A write that failed fails the setup here (BUG-1953): a
+                // lost object must not surface later as "missing object".
+                match set.join_next().await {
+                    None => break,
+                    Some(written) => written.expect("an object write of the setup"),
                 }
             }
         });

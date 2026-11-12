@@ -294,8 +294,21 @@ struct TlsDatabase {
     _dir: tempfile::TempDir,
 }
 
+/// The certificate a [`TlsDatabase`] presents: for `localhost`, signed by
+/// its CA; the same but expired; or signed by its own key.
+#[derive(Clone, Copy, PartialEq)]
+enum Leaf {
+    Signed,
+    Expired,
+    SelfSigned,
+}
+
 impl TlsDatabase {
     fn start(rt: &tokio::runtime::Runtime, url: &str) -> TlsDatabase {
+        Self::presenting(rt, url, Leaf::Signed)
+    }
+
+    fn presenting(rt: &tokio::runtime::Runtime, url: &str, leaf: Leaf) -> TlsDatabase {
         use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let authority = |name: &str| {
@@ -308,7 +321,14 @@ impl TlsDatabase {
         };
         let (ca_params, ca_key, ca_pem) = authority("Veil test CA");
         let key = KeyPair::generate().unwrap();
-        let cert = CertificateParams::new(vec!["localhost".to_string()]).unwrap().signed_by(&key, &Issuer::from_params(&ca_params, &ca_key)).unwrap();
+        let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        if leaf == Leaf::Expired {
+            (params.not_before, params.not_after) = (rcgen::date_time_ymd(2020, 1, 1), rcgen::date_time_ymd(2021, 1, 1));
+        }
+        let cert = match leaf {
+            Leaf::SelfSigned => params.self_signed(&key).unwrap(),
+            _ => params.signed_by(&key, &Issuer::from_params(&ca_params, &ca_key)).unwrap(),
+        };
         let dir = tempfile::Builder::new().prefix("veil-tls-db").tempdir().unwrap();
         let (ca, another_ca) = (dir.path().join("ca.pem"), dir.path().join("another-ca.pem"));
         std::fs::write(&ca, ca_pem).unwrap();
@@ -449,7 +469,7 @@ fn bug_1928_a_database_url_that_asks_for_tls_in_words_the_server_does_not_know_i
 /// upgrade is not supported" before the handshake. Now `sslmode=require`
 /// encrypts, `verify-ca` and `verify-full` also check the certificate
 /// against `sslrootcert` and its name, and a URL without `sslmode` asks for
-/// no TLS, as before. (`verify-ca` should not check the name: BUG-1909.)
+/// no TLS, as before. (`verify-ca` does not check the name: BUG-1909.)
 #[test]
 fn bug_1590_the_server_connects_to_a_database_that_requires_tls() {
     let rt = runtime();
@@ -494,21 +514,47 @@ fn bug_1590_the_server_connects_to_a_database_that_requires_tls() {
     drop_database(&rt, &name);
 }
 
-/// BUG-1909: `sslmode=verify-ca` is to check that the database's
-/// certificate is the CA's and nothing about its name (a database reached
-/// by an address or a private name its certificate does not carry). sqlx
-/// 0.8.6 forgives only the name error older rustls versions gave, so with
-/// the rustls in the tree (0.23.46) `verify-ca` refuses what `verify-full`
-/// refuses. It fails closed: nothing is accepted that should not be.
+/// BUG-1909: `sslmode=verify-ca` checks that the database's certificate is
+/// the CA's and nothing about its name (a database reached by an address or
+/// a private name its certificate does not carry). sqlx 0.8.6 forgave only
+/// the name error older rustls versions gave, so with the rustls in the tree
+/// (0.23.46) `verify-ca` refused what `verify-full` refuses; the workspace
+/// patches `sqlx-core` (`vendor/sqlx-core`) to forgive both forms. A
+/// certificate of another CA is still refused, whatever its name.
 #[test]
-#[ignore = "BUG-1909: sslmode=verify-ca also checks the certificate's name (sqlx 0.8.6 with rustls 0.23.46), so it refuses a database reached by a name its certificate lacks"]
 fn bug_1909_verify_ca_does_not_check_the_certificates_name() {
     let rt = runtime();
     let (url, name) = fresh_database(&rt);
     let tls = TlsDatabase::start(&rt, &url);
-    let ca = tls.ca.display();
+    let (ca, another_ca) = (tls.ca.display().to_string(), tls.another_ca.display().to_string());
     // The certificate is for `localhost`; the CA is the one given.
     assert_eq!(select_one(&rt, &tls.url("127.0.0.1", &format!("sslmode=verify-ca&sslrootcert={ca}"))), Ok(1));
     assert_eq!(tls.seen(), (1, 0));
+    // Not the CA given, and not the name either: refused for the CA.
+    let refused = select_one(&rt, &tls.url("127.0.0.1", &format!("sslmode=verify-ca&sslrootcert={another_ca}"))).unwrap_err();
+    assert!(refused.contains("invalid peer certificate: UnknownIssuer"), "{refused}");
+    // `verify-full` still checks the name.
+    let refused = select_one(&rt, &tls.url("127.0.0.1", &format!("sslmode=verify-full&sslrootcert={ca}"))).unwrap_err();
+    assert!(refused.contains("invalid peer certificate: certificate not valid for name \"127.0.0.1\""), "{refused}");
+    assert_eq!(tls.seen(), (1, 0), "no refused certificate carried a connection");
+    drop_database(&rt, &name);
+}
+
+/// BUG-1909's patch forgives only the name: under `verify-ca`, a database
+/// whose certificate is expired, or signed by its own key rather than the CA
+/// given, is refused, reached by its certificate's name or by an address.
+#[test]
+fn bug_1909_verify_ca_still_refuses_an_expired_or_self_signed_certificate() {
+    let rt = runtime();
+    let (url, name) = fresh_database(&rt);
+    for (leaf, why) in [(Leaf::Expired, "invalid peer certificate: certificate expired"), (Leaf::SelfSigned, "invalid peer certificate: UnknownIssuer")] {
+        let tls = TlsDatabase::presenting(&rt, &url, leaf);
+        let ca = tls.ca.display().to_string();
+        for host in ["localhost", "127.0.0.1"] {
+            let refused = select_one(&rt, &tls.url(host, &format!("sslmode=verify-ca&sslrootcert={ca}"))).unwrap_err();
+            assert!(refused.contains(why), "{host}: {refused}");
+        }
+        assert_eq!(tls.seen(), (0, 0), "no refused certificate carried a connection");
+    }
     drop_database(&rt, &name);
 }

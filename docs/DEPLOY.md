@@ -251,9 +251,10 @@ Without `sslrootcert`, `verify-ca` and `verify-full` accept the public
 certificate authorities (Mozilla's list, built in). `PGSSLMODE` and
 `PGSSLROOTCERT` in the environment do the same as the two parameters. A
 database that accepts only TLS refuses a URL without `sslmode` ("no
-pg_hba.conf entry … no encryption"). At present `verify-ca` also checks
-the name, as `verify-full` does (BUG-1909): reach the database by a name
-its certificate carries. Proven against PostgreSQL 17 with `ssl = on` and
+pg_hba.conf entry … no encryption"). `verify-ca` checks the CA and not
+the name (BUG-1909, fixed: the workspace patches `sqlx-core` 0.8.6 for it),
+so a database reached by an address its certificate does not carry is
+accepted when its CA is the one given. Proven against PostgreSQL 17 with `ssl = on` and
 only `hostssl` lines; not yet run against a managed service.
 
 ## 4. Local rehearsal

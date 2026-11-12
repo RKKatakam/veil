@@ -241,11 +241,13 @@ const S3_FIRST_WAIT: Duration = Duration::from_millis(25);
 const S3_MOST_WAIT: Duration = Duration::from_secs(1);
 
 /// Send an S3 request (`make` builds it afresh for each try) and read its
-/// answer, again while the answer is a server error (5xx) or 429, or the
-/// request fails, for at most [`S3_RETRY_FOR`] (BUG-861). A connection the
-/// store closed, reset or timed out, before or during the answer, and the
-/// store's own transient errors (500, 503 "slow down", 429 "too many
-/// requests": MinIO under load, BUG-1005), are tried again:
+/// answer, again while the answer is a server error (5xx), 429 or 499, or
+/// the request fails, for at most [`S3_RETRY_FOR`] (BUG-861). A connection
+/// the store closed, reset or timed out, before or during the answer, and
+/// the store's own transient errors (500, 503 "slow down", 429 "too many
+/// requests": MinIO under load, BUG-1005; 499, MinIO's answer to a request
+/// its own shutdown cancelled, as a MinIO just started for a setup step
+/// stops, BUG-1953), are tried again:
 /// every request the store sends is idempotent (GET, HEAD, DELETE, and PUT
 /// of a key that names its content or a pack's fresh random name).
 async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
@@ -270,7 +272,7 @@ async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers:
             Err(e) => Err(e),
         };
         if let Ok((status, headers, body)) = answer {
-            if !(status.is_server_error() || status.as_u16() == 429) {
+            if !(status.is_server_error() || matches!(status.as_u16(), 429 | 499)) {
                 return Ok((status.as_u16(), headers, body));
             }
             let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
