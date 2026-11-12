@@ -597,7 +597,7 @@ impl Agent<'_> {
                     }
                     // `--merge-every`: the branch lands on `main` (what of it
                     // has not landed yet), through the landing service.
-                    if self.merge_every > 0 && self.branch != "main" && self.files % self.merge_every == 0 {
+                    if self.merge_every > 0 && self.branch != "main" && self.files.is_multiple_of(self.merge_every) {
                         self.c.requests.fetch_add(1, Ordering::Relaxed);
                         let r = self.api.post_json(Some(self.token), &self.path("/land"), &json!({"onto": "main", "snapshot": snap.hex()}))?;
                         ok(&r, "land the branch")?;
@@ -1012,6 +1012,7 @@ fn unique(prefix: &str) -> String {
 /// Create a project as `admin`: group `agents` (with `agent`), the policy
 /// `w/  agents`, and a first snapshot, with `seed` files of 4 KiB in
 /// `w/seed/`.
+#[allow(clippy::too_many_arguments)]
 fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, more: &[(String, String)], seed: usize, protected: bool, mix: bool) -> Result<String> {
     let name = unique("load-");
     ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}"), &json!({}))?, "create project")?;
