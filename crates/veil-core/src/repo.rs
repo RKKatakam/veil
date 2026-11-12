@@ -1963,6 +1963,20 @@ impl<'r> Held<'r> {
         self.0.graph.reachable_among(self.0, roots, wanted)
     }
 
+    /// [`Held::reachable_among`], told `tips` (snapshots none of which
+    /// descends from another) and their parents (`under`): the same
+    /// answer, without reading what lies below them
+    /// (`GraphIndex::reachable_among_tips`).
+    pub fn reachable_among_tips(
+        &self,
+        roots: impl IntoIterator<Item = ObjectId>,
+        wanted: &HashSet<ObjectId>,
+        tips: &HashSet<ObjectId>,
+        under: &HashSet<ObjectId>,
+    ) -> Result<HashSet<ObjectId>> {
+        self.0.graph.reachable_among_tips(self.0, roots, wanted, tips, under)
+    }
+
     /// Held snapshots reachable from `roots` whose index entry `keep`s,
     /// after indexing them (candidates for a change-id prefix or a flag;
     /// the caller confirms what it uses against the store).
@@ -2067,5 +2081,27 @@ impl Repo {
     /// Persist the history index's new entries (best effort).
     pub(crate) fn persist_index(&self) {
         self.graph.persist(self);
+    }
+
+    /// Does the history index persist (not over a network)?
+    pub(crate) fn graph_persists(&self) -> bool {
+        self.graph.persists()
+    }
+
+    /// [`GraphIndex::voids`].
+    pub(crate) fn graph_voids(&self) -> u64 {
+        self.graph.voids()
+    }
+
+    /// [`GraphIndex::missing_below`].
+    pub(crate) fn graph_missing_below(&self, heads: &[ObjectId], voids: u64) -> Result<Option<Vec<ObjectId>>> {
+        self.graph.missing_below(self, heads, voids)
+    }
+
+    /// Drop the history index, to be computed again: after a thin clone is
+    /// made full, whose entries at its boundary list no missing parents
+    /// (BUG-1960).
+    pub fn discard_history_index(&self) {
+        self.graph.discard();
     }
 }

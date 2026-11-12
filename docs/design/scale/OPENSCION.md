@@ -686,6 +686,145 @@ clone.
   at 1,000 (BUG-1945). On the 1 GB profile it takes 4 to 5 s against
   Git's 0.4 s.
 
+## Performance round 4: the 1 GB profile's fixed costs, clone one directory (2026-11-12)
+
+Branch `clifast` (on `1cf4bcb6`), for BUG-1944 and BUG-1945. No durable
+write was merged, moved or dropped: the six barriers of a commit are as
+round 3 left them.
+
+### What the 100 ms was
+
+Profiled with timing marks in an instrumented build and `strace -c` (the
+kernel refuses `perf` here), in the generated repository of the gate run
+(`veil-bench gen --profile 1g --plain --seed 1`, then `vl new main`).
+
+| Where (ms) | status, clean | commit one file |
+|---|---:|---:|
+| A full scan of 35,001 files: **the watcher's plan was dropped** | 62 | 62 |
+| The stat cache (4.6 MB, 35,000 records) decoded, and dropped at exit | 10 to 15, 4 | 10 to 15, 4 |
+| `drop_ancestor_heads`: every snapshot between the newest and the oldest head read | | 66 |
+| Everything else (process, `Repo::open`, the transaction, the durable chain) | 5 | 15 |
+
+* **The watcher was never used on this profile.** The generator writes its
+  own (empty) `.veilpolicy` through an ephemeral workspace while `vl init`
+  had accepted its default text: the checked-out repository had a policy
+  change waiting for `vl policy accept`, and `build_tree_watched` drops the
+  watcher's plan under one (S7's rule), so `status`, `log` and `commit`
+  each scanned the whole tree, with the daemon or without it. `veil-bench
+  gen` now records the policy it writes as the accepted one, as a commit
+  of the member's own edit does. The rule stands: a project with a policy
+  change pending still scans at every command, without saying so. Lifting
+  it needs the watch record to say which accepted policy it was taken
+  under (the accepted policy is one per repository, the record one per
+  working copy), which is a security change of its own.
+* **`Transaction::drop_ancestor_heads`** (BUG-1830's fix, a day old) asks
+  which heads another head descends from, by a walk from every head's
+  parents down to the generation of the oldest head. The profile has two
+  heads of old side branches, so each rewrite read all the history since
+  (walks take a snapshot's parents from the object, never from the
+  index). When the operation a transaction builds on rewrote something,
+  its commit ended with this same step: the heads the transaction starts
+  from do not descend from one another, nothing under them can be above
+  one of them, and the walk stops at them and their parents
+  (`GraphIndex::reachable_among_tips`): 66 ms to 0.04. After an operation
+  that rewrote nothing (`vl new`, a pull, a tag), in a merge of concurrent
+  operations and in a thin clone the walk is as before, once.
+* **The stat cache** stays encoded after its checksum, header and key are
+  checked (`statcache::Loaded`). A build the watcher narrows decodes only
+  the records of the directories it inspects (one pass over the file, 2
+  ms at this size) and keeps what it found beside the encoded records
+  unless there is something to save; a command that records nothing
+  decodes none.
+
+### Clone one directory on the 1 GB profile
+
+`vl clone --only docs` fetches every snapshot (10,054 here) and every
+version of the directory's trees and files (30,527 objects, 44 MiB): its
+S1 form. Git's `--filter=blob:none --sparse` clone of the same tree has
+one commit. On a local server (objects in a directory), of 1.9 s:
+
+* 126,000 listings of `objects/pack`: `hub::pull_moving` skips probing the
+  disk in a fresh repository, but tested "fresh" as "every head is the
+  root", and a clone's repository is made with its workspace, whose empty
+  change is the head. Each object asked about was then looked for as a
+  loose file and by listing the pack directory again, once per snapshot
+  naming it (0.7 s). The test accepts empty changes on the root, and an
+  id is probed once.
+* Each snapshot of the history decoded and its signature checked, one
+  after another: 390 ms, now on up to 16 threads (150 ms with the pack
+  writes that stay in order).
+* `supersede_landed` read each new snapshot again (80 ms): skipped in a
+  fresh repository when no new snapshot replaces what it holds. The
+  history index of 10,054 snapshots (115 ms) is then built by the new
+  change instead.
+
+What remains of 1.03 s: ten rounds of trees and files, one request per
+level (about 570 ms with the server's reads), the history index (115 ms),
+the checkout (80 to 100 ms), the history request (50 ms).
+
+### Results
+
+The 1 GB profile, medians of 9 processes, twice (through `bench-quiet.sh`:
+load 15, then load 1; the machine's governor is `powersave`, and single
+runs of a 10 ms command spread from 6 to 21 ms on the idle machine).
+"Before" is the base binary in the repository as the generator left it;
+"after", this branch with the policy accepted, as the generator now leaves
+it. Git on the same tree, one commit. The gate run's numbers
+(`22b9d837`) were 102, 165, 102 ms and 3.98 / 5.43 s (MinIO).
+
+| Case (1 GB profile) | Before | After | Git | Result |
+|---|---:|---:|---:|---|
+| status, clean (watcher on) | 78 / 79 ms | 11.0 / 8.6 ms | 29 / 31 ms | **Veil 2.6 to 3.6× faster** |
+| commit one changed file (watcher on) | 147 / 149 ms | 22.0 / 26.2 ms | 26.2 / 28.2 ms (33 / 35 with `core.fsync=all`) | level to ahead |
+| log -n 20 | 79 / 83 ms | 10.1 / 22.8 ms (repeated: 10.7 and 12.6) | 1.1 / 2.1 ms | **miss**: 8 ms of fixed costs |
+| status, clean (daemon stopped: a scan) | 98 ms (gate run) | 71 / 70 ms | 29 / 31 ms | a scan is 2 µs a file |
+| commit one changed file (daemon stopped) | 165 ms (gate run) | 79 / 76 ms | 26 / 28 ms | |
+| clone one directory (`--only docs`, local server) | 1.76 / 1.80 s | 1.02 / 1.04 s | 0.44 / 0.43 s | **miss** (2.4×; Git has one commit) |
+
+1,000 and 10,000 files, `scripts/bench-server.sh openscion` after the
+machine's restart (a new kernel: Git's own numbers moved, so "before" was
+run again the same day with the base `vl`, MinIO, load 15); "after" is the
+MinIO run / the local-directory run, with Git's numbers of those runs.
+
+| Files | Case | Before | After | Git | Result |
+|---:|---|---:|---:|---:|---|
+| 1,000 | commit one changed file (watcher) | 8.2 | 8.8 / 8.8 | 4.9 / 4.7 | **miss** (1.8×) |
+| 10,000 | commit one changed file (watcher) | 13.5 | 9.2 / 10.0 | 8.1 / 8.6 | **miss** (1.14×) |
+| 1,000 | clone one directory | 49.0 | 51.0 / 51.1 | 47.0 / 43.8 | **miss** (1.1×) |
+| 10,000 | clone one directory | 59.1 | 54.6 / 53.4 | 55.6 / 45.8 | level / miss |
+| 1,000 | status, clean (watcher) | 3.9 | 4.0 / 3.6 | 2.2 / 1.9 | behind by 1.7 ms |
+| 10,000 | status, clean (watcher) | 7.9 | 4.1 / 4.5 | 5.2 / 4.6 | **Veil ahead or level** |
+| 1,000 | log -n 20 | 5.0 | 5.0 / 4.5 | 1.1 / 1.0 | behind by 3.5 ms |
+| 10,000 | log -n 20 | 8.9 | 5.5 / 5.1 | 1.4 / 1.3 | behind by 4 ms |
+| 10,000 | status, clean (daemon stopped) | 18.5 | 14.2 / 14.4 | 5.8 / 6.7 | a scan |
+| 10,000 | commit one changed file (daemon stopped) | 20.2 | 18.5 / 17.9 | 6.7 / 8.3 | a scan |
+
+### What remains, and why
+
+* **The commit at 1,000 files (8.8 ms against 4.8)** is its durable chain
+  and its fixed costs, as round 3 said: the objects' barrier 1.8 ms, the
+  operation 0.7, the checkout record's file and directory 0.9 (3.4 ms
+  that Git, which makes no `fsync` by default, does not pay), the process
+  and `Repo::open` 2, the policy 0.5, the transaction and the walk 1.5.
+  Beating Git there means fewer barriers, which is an owner decision
+  about durability or a format change, not overhead. A lost checkout
+  record is a state every command already repairs (BUG-361's path), so
+  its directory's barrier is the one candidate; it was left in.
+* **`log -n 20` (5 ms, 10 ms on the 1 GB profile)** records the working
+  copy first, as every command does: the watcher's answer and an empty
+  transaction (1.5 ms), and on the 1 GB profile the stat cache file's
+  read and checksum (2 ms; checking it only when records are decoded
+  would spare it) and 24 pack indexes read at open (1.3 ms).
+* **A policy change pending `vl policy accept`** turns the watcher off
+  (above).
+* **The stat cache is rewritten whole, with a barrier,** when a build
+  learns something worth keeping (4.6 MB at 35,000 files, about 20 ms):
+  not in these numbers, where the commit follows the edit within the
+  racy window. The cache needs no durability (a stale record is checked
+  against the file's stat), as the history index does not.
+* **Clone one directory:** the rounds per level, and its S1 form (all
+  history of the directory) against a thin clone's.
+
 ## Next
 
 1. **Clone one directory** (Git's level, not below): the ~60 sequential

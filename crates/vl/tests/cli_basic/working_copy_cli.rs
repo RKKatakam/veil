@@ -398,6 +398,212 @@ mod s7_watcher {
         let _ = tok1;
     }
 
+    /// The review of `clifast` (guarantee 1): a walk of edits (same size, in
+    /// the same instant as the command), creations, deletions, renames of
+    /// files and directories, mode changes, a file replaced by a directory
+    /// and the reverse, in directories whose names share prefixes; with the
+    /// daemon stopped and started, and the stat cache file deleted,
+    /// truncated, corrupted or put back from an earlier command (stale).
+    /// After every step `vl status` and the recorded tree of the watched
+    /// working copy are those of one that scans with the watcher off, and
+    /// `vl commit` records the same.
+    #[test]
+    fn clifast_review_status_and_commit_with_the_watcher_match_a_full_scan_over_a_walk_of_changes() {
+        for seed in [1u64, 2, 3] {
+            let env = Env::new();
+            let w = env.dir("watched");
+            let s = env.dir("scanned");
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = |n: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % n as u64) as usize
+            };
+            for p in [&w, &s] {
+                write(p, "a/f", "one\n");
+                write(p, "a/b/f", "two\n");
+                write(p, "a/b2/f", "three\n");
+                write(p, "top", "four\n");
+                env.ok(p, &["init"]);
+            }
+            write(&s, ".veil/local/config.toml", "watch = false\n");
+            env.ok(&w, &["commit", "-m", "initial"]);
+            env.ok(&s, &["commit", "-m", "initial"]);
+            let same = |at: &str| {
+                let st = |p: &Path| -> serde_json::Value { serde_json::from_str(&env.stdout(p, &["status", "--json"])).unwrap() };
+                let (vw, vs) = (st(&w), st(&s));
+                assert_eq!(vw["changes"], vs["changes"], "seed {seed}, {at}: `vl status` with the watcher against a full scan");
+                let ls = |p: &Path| -> serde_json::Value { serde_json::from_str(&env.stdout(p, &["ls", "--json", "-r", "@"])).unwrap() };
+                let (lw, lsc) = (ls(&w), ls(&s));
+                assert_eq!(lw["entries"], lsc["entries"], "seed {seed}, {at}: the recorded tree with the watcher against a full scan");
+            };
+            same("start");
+            assert!(checkout_token(&w).is_some(), "the watcher is on");
+            const DIRS: &[&str] = &["", "a", "a/b", "a/b2", "a/b.x", "a/b/c", "a.d", "ab", "z é"];
+            const NAMES: &[&str] = &["f", "f2", "f.txt", "a", "b", "b2", "é ü"];
+            let files = |root: &Path| -> Vec<String> {
+                fn go(root: &Path, dir: &Path, out: &mut Vec<String>) {
+                    let mut names: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+                    names.sort_by_key(|e| e.file_name());
+                    for e in names {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with(".veil") {
+                            continue;
+                        }
+                        match e.file_type().unwrap().is_dir() {
+                            true => go(root, &e.path(), out),
+                            false => out.push(e.path().strip_prefix(root).unwrap().to_string_lossy().to_string()),
+                        }
+                    }
+                }
+                let mut out = Vec::new();
+                go(root, root, &mut out);
+                out
+            };
+            let mut kept_cache: Option<Vec<u8>> = None;
+            let cache = w.join(".veil/local/statcache/default.cache");
+            for step in 0..28 {
+                let existing = files(&w);
+                assert_eq!(existing, files(&s), "the two working copies hold the same files");
+                let what = if existing.len() < 3 { 0 } else { next(12) };
+                let dir = DIRS[next(DIRS.len())];
+                let name = NAMES[next(NAMES.len())];
+                let target = if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") };
+                let pick = existing.get(next(existing.len().max(1))).cloned().unwrap_or_default();
+                let text = format!("{seed} {step} {}\n", next(1000));
+                for p in [&w, &s] {
+                    let clear = |path: &Path| {
+                        // Whatever stands in the way of a file at `path` goes.
+                        let mut up = path.parent();
+                        while let Some(d) = up.filter(|d| d.starts_with(p) && *d != p.as_path()) {
+                            if d.is_file() {
+                                std::fs::remove_file(d).unwrap();
+                            }
+                            up = d.parent();
+                        }
+                        if path.is_dir() {
+                            std::fs::remove_dir_all(path).unwrap();
+                        }
+                    };
+                    match what {
+                        0..=2 => {
+                            clear(&p.join(&target));
+                            write(p, &target, &text);
+                        }
+                        3 | 4 => {
+                            // The same size, written at once.
+                            let old = read(p, &pick);
+                            let mut new = old.clone().into_bytes();
+                            new[0] = if new[0] == b'x' { b'y' } else { b'x' };
+                            std::fs::write(p.join(&pick), new).unwrap();
+                        }
+                        5 => std::fs::remove_file(p.join(&pick)).unwrap(),
+                        6 => {
+                            // A directory removed with what it holds.
+                            if let Some((d, _)) = pick.split_once('/') {
+                                std::fs::remove_dir_all(p.join(d)).unwrap();
+                            }
+                        }
+                        7 => {
+                            let mode = if std::fs::metadata(p.join(&pick)).unwrap().permissions().mode() & 0o100 != 0 { 0o644 } else { 0o755 };
+                            std::fs::set_permissions(p.join(&pick), std::fs::Permissions::from_mode(mode)).unwrap();
+                        }
+                        8 => {
+                            // A file renamed.
+                            if pick != target && !p.join(&target).starts_with(p.join(&pick)) {
+                                clear(&p.join(&target));
+                                if p.join(&pick).is_file() {
+                                    std::fs::create_dir_all(p.join(&target).parent().unwrap()).unwrap();
+                                    std::fs::rename(p.join(&pick), p.join(&target)).unwrap();
+                                }
+                            }
+                        }
+                        9 => {
+                            // A directory renamed, to a name that shares its prefix.
+                            if let Some((d, _)) = pick.split_once('/') {
+                                let to = format!("{d}{}", step % 3);
+                                if !p.join(&to).exists() {
+                                    std::fs::rename(p.join(d), p.join(&to)).unwrap();
+                                }
+                            }
+                        }
+                        10 => {
+                            // A file replaced by a directory of its name.
+                            std::fs::remove_file(p.join(&pick)).unwrap();
+                            write(p, &format!("{pick}/inside"), &text);
+                        }
+                        _ => {
+                            // A directory replaced by a file of its name.
+                            if let Some((d, _)) = pick.split_once('/') {
+                                std::fs::remove_dir_all(p.join(d)).unwrap();
+                                write(p, d, &text);
+                            }
+                        }
+                    }
+                }
+                // Between two commands: the daemon, and the cache file.
+                let between = next(12);
+                match between {
+                    // The change is made while the daemon is running, and it
+                    // is stopped before the command; or it is restarted.
+                    0 => {
+                        env.ok(&w, &["daemon", "stop"]);
+                    }
+                    1 => {
+                        env.ok(&w, &["daemon", "stop"]);
+                        env.ok(&w, &["daemon", "start"]);
+                    }
+                    2 => {
+                        let _ = std::fs::remove_file(&cache);
+                    }
+                    3 => {
+                        if let Ok(raw) = std::fs::read(&cache) {
+                            std::fs::write(&cache, &raw[..raw.len() / 2]).unwrap();
+                        }
+                    }
+                    4 => {
+                        if let Ok(mut raw) = std::fs::read(&cache) {
+                            let at = raw.len() / 2;
+                            raw[at] ^= 0x20;
+                            std::fs::write(&cache, raw).unwrap();
+                        }
+                    }
+                    5 => kept_cache = std::fs::read(&cache).ok(),
+                    6 => {
+                        if let Some(old) = &kept_cache {
+                            std::fs::write(&cache, old).unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+                // A record made within 100 ms of a file's last change vouches
+                // for nothing: some commands come later, so that the next
+                // ones find records they use.
+                if next(3) == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(130));
+                }
+                same(&format!("step {step} (change {what})"));
+                if between == 0 {
+                    env.ok(&w, &["daemon", "start"]);
+                }
+                if next(4) == 0 {
+                    same(&format!("step {step}, again"));
+                }
+                if next(5) == 0 {
+                    env.ok(&w, &["commit", "-m", &format!("step {step}")]);
+                    env.ok(&s, &["commit", "-m", &format!("step {step}")]);
+                    same(&format!("step {step}, committed"));
+                }
+            }
+            same("the end");
+            same("the end, again");
+            assert!(checkout_token(&w).is_some(), "seed {seed}: the watcher is still on");
+            let status = env.ok(&w, &["daemon", "status"]);
+            assert!(status.contains("watching  1 working cop(ies)"), "seed {seed}: {status}");
+        }
+    }
+
     /// Guarantee 2: The watcher never reads or reports anything outside the
     /// working copy, never follows symlinks (to files or directories) out of
     /// it, and never descends into nested `.veil` repositories.

@@ -68,6 +68,7 @@ pub mod error;
 pub mod fsck;
 pub mod gc;
 pub mod graph_index;
+pub(crate) mod settled;
 pub mod hub;
 pub mod hunks;
 pub mod grep;

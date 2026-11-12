@@ -935,8 +935,17 @@ fn the_daemons_memory_stays_within_its_budget() {
     std::fs::create_dir_all(&dir).unwrap();
     admin.ok(&dir, &["init"]);
     for i in 0..2 {
-        // Incompressible: random bytes.
-        let big: Vec<u8> = (0..(12 << 20) / 32).flat_map(|_| veil_core::crypto::random_bytes::<32>()).collect();
+        // Incompressible: random bytes, but never what the secret scanner
+        // takes for a secret. About one 12 MiB file of random bytes in
+        // 1,400 matches its `url-password` rule, and `vl commit`
+        // quarantines it (kept local, reported, never pushed): the pushed
+        // tree then held one file (BUG-1980, BUG-1985).
+        let big = loop {
+            let big: Vec<u8> = (0..(12 << 20) / 32).flat_map(|_| veil_core::crypto::random_bytes::<32>()).collect();
+            if veil_core::secrets::scan(&big).is_empty() {
+                break big;
+            }
+        };
         std::fs::write(dir.join(format!("big{i}.bin")), big).unwrap();
     }
     admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);

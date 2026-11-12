@@ -856,6 +856,15 @@ impl WatchPlan {
         self.dirs.contains(dir) || self.in_dirty_subtree(dir)
     }
 
+    /// The stat cache records the build looks up: those of the files in
+    /// the directories [`WatchPlan::inspect_leaves`] names.
+    pub(crate) fn lookups(&self) -> crate::statcache::Lookups<'_> {
+        crate::statcache::Lookups {
+            dirs: self.dirs.iter().map(VPath::as_str).collect(),
+            subtrees: self.subtrees.iter().map(VPath::as_str).collect(),
+        }
+    }
+
     /// Direct child directory names of `dir` (when `!self.inspect_leaves(dir)`)
     /// that must be opened.
     pub fn must_open_children(&self, dir: &VPath) -> Vec<String> {
@@ -1080,10 +1089,11 @@ pub fn build_tree_watched(
     // The cache only works on backends whose stamps can be trusted. The
     // clock is read before any file is stat'ed (see `statcache`).
     let mut cache = cache;
-    let mut run = match (cache.as_deref_mut(), fs.stat_clock()) {
-        (Some(c), Some(clock)) => Some(c.begin_run(CacheKey::compute(fs, &store.keys, clock)?, clock)),
+    let key = match (cache.as_deref(), fs.stat_clock()) {
+        (Some(_), Some(clock)) => Some((CacheKey::compute(fs, &store.keys, clock)?, clock)),
         _ => None,
     };
+    let key_changed = key.as_ref().is_some_and(|(k, _)| cache.as_deref().and_then(StatCache::key) != Some(k));
     // The watcher's plan applies only when we have a parent tree, policy and
     // keys have not changed, no unaccepted policy guards the working copy,
     // no scanner rescan or renormalization is requested, and no sandbox
@@ -1096,13 +1106,17 @@ pub fn build_tree_watched(
             && !opts.rescan
             && opts.injected.is_none()
             && matches!(opts.line_endings, LineEndings::Convert)
-            && !run.as_ref().is_some_and(|r| r.key_changed)
+            && !key_changed
     });
-    if watch.is_some() {
-        if let Some(r) = run.as_mut() {
-            r.enable_partial();
-        }
-    }
+    // With the plan, only the directories it inspects are looked up (and
+    // decoded, in a cache as loaded).
+    let run = match (cache.as_deref_mut(), key) {
+        (Some(c), Some((key, clock))) => Some(match watch {
+            Some(w) => c.begin_watched_run(key, clock, &w.lookups()),
+            None => c.begin_run(key, clock),
+        }),
+        _ => None,
+    };
     // Large working copies on a disk are listed ahead of the walk (see
     // `prefetch`), from now on: after the clock reading the cache run
     // took. With a watcher plan we only list the dirty directories, so

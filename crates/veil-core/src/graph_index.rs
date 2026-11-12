@@ -98,6 +98,9 @@ pub const FLAG_EMBARGO: u8 = 1;
 /// Flag: the snapshot or one of its ancestors in the store has [`FLAG_EMBARGO`].
 pub const FLAG_EMBARGO_LINE: u8 = 2;
 
+/// The most missing parents [`GraphIndex::missing_below`] lists.
+pub const MAX_MISSING: usize = 4096;
+
 /// A generation (see the module docs).
 pub type Gen = u64;
 
@@ -243,6 +246,9 @@ struct State {
     /// no generation from its server (it could not be reached): lower
     /// bounds. Never persisted, and invisible to `Exact` walks (BUG-1291).
     partial: HashSet<ObjectId>,
+    /// How many times this process dropped the index: what was known
+    /// missing before is forgotten then (`GraphIndex::missing_below`).
+    voids: u64,
 }
 
 impl State {
@@ -265,6 +271,7 @@ impl State {
         *self = State {
             loaded: true,
             epoch,
+            voids: self.voids,
             ..State::default()
         };
     }
@@ -449,6 +456,7 @@ impl GraphIndex {
             false => 0,
         };
         st.reset(epoch);
+        st.voids += 1;
     }
 
     /// Re-check, after the store may have gained snapshots (a commit, a
@@ -599,6 +607,58 @@ impl GraphIndex {
         }
     }
 
+    /// Does this index persist its entries?
+    pub(crate) fn persists(&self) -> bool {
+        self.persist
+    }
+
+    /// Drop every entry, in memory and on disk, to be computed again.
+    pub fn discard(&self) {
+        let mut st = self.lock();
+        self.void(&mut st);
+    }
+
+    /// How many times this process dropped the index so far: pass it to
+    /// [`GraphIndex::missing_below`] before a walk whose missing parents
+    /// it is to list.
+    pub fn voids(&self) -> u64 {
+        self.lock().voids
+    }
+
+    /// Every parent this index took as missing, after computing the entries
+    /// of `heads` and all below them, when none of them is in the store:
+    /// what could later join two of `heads` (a snapshot's parents never
+    /// change, so a head's held history grows only when one of these
+    /// arrives; `crate::settled`). `None` when one has arrived (the index
+    /// is then dropped), when the index was dropped since `voids` was read
+    /// (what the walk then took as missing is no longer listed: BUG-2010),
+    /// when a head is not held, when an entry is a thin clone's lower
+    /// bound, or when there are more than [`MAX_MISSING`].
+    pub fn missing_below(&self, repo: &Repo, heads: &[ObjectId], voids: u64) -> Result<Option<Vec<ObjectId>>> {
+        let mut st = self.lock();
+        self.ensure_loaded(repo, &mut st);
+        if any_arrived(repo, &st.missing) {
+            self.void(&mut st);
+            return Ok(None);
+        }
+        if st.voids != voids {
+            return Ok(None);
+        }
+        let mut w = Walker { repo, st: &mut st, exact: false };
+        for h in heads {
+            if w.entry(h)?.is_none() {
+                return Ok(None);
+            }
+        }
+        // Those just computed were found missing just now.
+        if !st.partial.is_empty() || st.missing.len() > MAX_MISSING {
+            return Ok(None);
+        }
+        let mut out: Vec<ObjectId> = st.missing.iter().copied().collect();
+        out.sort();
+        Ok(Some(out))
+    }
+
     // ---- queries --------------------------------------------------------
 
     /// The generation of snapshot `id`; `None` if the store does not hold it.
@@ -628,12 +688,35 @@ impl GraphIndex {
         roots: impl IntoIterator<Item = ObjectId>,
         candidates: &HashSet<ObjectId>,
     ) -> Result<HashSet<ObjectId>> {
+        self.reachable_among_tips(repo, roots, candidates, &HashSet::new(), &HashSet::new())
+    }
+
+    /// [`GraphIndex::reachable_among`], told `tips`: snapshots none of
+    /// which descends from another, with the parents of each (`under`).
+    /// The answer is the same and the walk shorter: whatever is one of
+    /// them, one of their parents or below one cannot be above a tip, so
+    /// the walk stops there once it is below every candidate that is not
+    /// a tip. Without it, a candidate that is an old tip (the head of a
+    /// branch left long ago) makes the walk read all the history since.
+    pub fn reachable_among_tips(
+        &self,
+        repo: &Repo,
+        roots: impl IntoIterator<Item = ObjectId>,
+        candidates: &HashSet<ObjectId>,
+        tips: &HashSet<ObjectId>,
+        under: &HashSet<ObjectId>,
+    ) -> Result<HashSet<ObjectId>> {
         self.with(repo, |w| {
+            // The lowest candidate, and the lowest that is not a tip.
             let mut floor = Gen::MAX;
+            let mut floor_other = Gen::MAX;
             let mut wanted = HashSet::new();
             for c in candidates {
                 if let Some(e) = w.entry(c)? {
                     floor = floor.min(e.generation);
+                    if !tips.contains(c) {
+                        floor_other = floor_other.min(e.generation);
+                    }
                     wanted.insert(*c);
                 }
             }
@@ -642,8 +725,11 @@ impl GraphIndex {
                 return Ok(found);
             }
             let mut seen = HashSet::new();
-            let mut stack: Vec<ObjectId> = roots.into_iter().collect();
-            while let Some(id) = stack.pop() {
+            // Each with whether it was reached through a tip or a tip's
+            // parent (a fact about the snapshot, whichever way the walk
+            // comes to it first).
+            let mut stack: Vec<(ObjectId, bool)> = roots.into_iter().map(|r| (r, false)).collect();
+            while let Some((id, below)) = stack.pop() {
                 if !seen.insert(id) {
                     continue;
                 }
@@ -657,11 +743,12 @@ impl GraphIndex {
                         break;
                     }
                 }
-                if e.generation == floor {
+                let below = below || tips.contains(&id) || under.contains(&id);
+                if e.generation == floor || (below && e.generation <= floor_other) {
                     continue;
                 }
                 let Some(s) = w.snapshot(&id)? else { continue };
-                stack.extend(s.parents.iter().filter(|p| !seen.contains(*p)).copied());
+                stack.extend(s.parents.iter().filter(|p| !seen.contains(*p)).map(|p| (*p, below)));
             }
             Ok(found)
         })
