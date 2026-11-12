@@ -235,9 +235,9 @@ pub fn key_state(keys: &Keychain) -> Result<ObjectId> {
 /// A working copy's stat cache. See the module docs.
 ///
 /// A loaded cache keeps its records encoded until something needs them
-/// all ([`StatCache::all`]): a build the file watcher narrows decodes only
-/// the directories it inspects ([`StatCache::begin_watched_run`]), and a
-/// command that records nothing new decodes none. (Decoding 35,000 records
+/// all: a build the file watcher narrows decodes only the directories it
+/// inspects (`StatCache::begin_watched_run`), and a command that records
+/// nothing new decodes none. (Decoding 35,000 records
 /// is 10 ms, and dropping them 4 ms, of every command; BUG-1944.)
 #[derive(Clone, Debug, Default)]
 pub struct StatCache {
