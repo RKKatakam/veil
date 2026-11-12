@@ -4629,7 +4629,11 @@ mod s21_c4 {
                 waiters.push(hub.landing.register(&t));
             }
             let start = tokio::time::Instant::now();
-            let deadline = start + std::time::Duration::from_millis(200);
+            // A deadline long enough that an answer "at once" is told from one at
+            // the deadline with MAX_WAITING_PER_PERSON (1,000) waiters at once on
+            // YugabyteDB too: with 200 ms and a 100 ms line, the two refusals took
+            // over 100 ms there and the test failed (2026-11-12).
+            let deadline = start + std::time::Duration::from_secs(4);
             let mut handles = Vec::new();
             for w in waiters {
                 let h = hub.clone();
@@ -4644,7 +4648,7 @@ mod s21_c4 {
                 assert_eq!(r.state, veil_core::hub::land::LandState::Queued);
                 results.push(elapsed);
             }
-            let fast = results.iter().filter(|d| **d < std::time::Duration::from_millis(100)).count();
+            let fast = results.iter().filter(|d| **d < std::time::Duration::from_secs(2)).count();
             assert_eq!(fast, 2, "exactly the 2 waiters past MAX_WAITING_PER_PERSON answered immediately: {results:?}");
         });
     }
