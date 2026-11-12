@@ -399,7 +399,7 @@ const STATE_VERSION: u32 = 1;
 const MAX_STATE: u64 = 1 << 20;
 
 /// `.veil/local/bisect.json`: device-local, read by `vl bisect` only.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct State {
     version: u32,
@@ -425,7 +425,7 @@ struct State {
     log: Vec<LogLine>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct LogLine {
     /// `start-bad`, `start-good`, `good`, `bad`, `skip`, `found`.
@@ -528,6 +528,28 @@ fn save(ctx: &Ctx, s: &State) -> Result<()> {
     Ok(())
 }
 
+/// `vl bisect run`'s write. Its command ran outside the directory's lock
+/// (it may take hours, and every command here waits for that lock), so
+/// the state is written only if it is still what this run read or wrote
+/// last (`on_disk`): a verdict another `vl bisect` marked meanwhile, or
+/// its `reset`, is kept, and the run stops and says so (BUG-1914).
+fn save_run(ctx: &mut Ctx, on_disk: &mut State, s: &State) -> Result<()> {
+    let _wc = ctx.lock_dir(None)?;
+    let now = load(ctx)?.map(|(now, _)| now);
+    if now.as_ref() != Some(&*on_disk) {
+        bail!(
+            "the bisection changed while `vl bisect run` was running ({}): this run stops, and wrote nothing over it",
+            match now {
+                Some(_) => "another `vl bisect` command wrote to it; `vl bisect run` goes on from there",
+                None => "`vl bisect reset` ended it",
+            }
+        );
+    }
+    save(ctx, s)?;
+    *on_disk = s.clone();
+    Ok(())
+}
+
 fn note(s: &mut State, action: &str, id: &ObjectId, code: Option<i32>) {
     s.log.push(LogLine { action: action.to_string(), snapshot: id.hex(), code });
 }
@@ -618,9 +640,16 @@ fn mark(ids: &mut Ids, s: &mut State, verdict: Verdict, id: ObjectId, code: Opti
 }
 
 /// `vl bisect`.
+///
+/// One command at a time reads the state, decides and writes it
+/// (BUG-1914): `start`, a verdict and `reset` do all three under the
+/// directory's lock ([`Ctx::lock_dir`], which also reads the repository
+/// again, as the command before left it), so no verdict is written over
+/// another's; `run` takes it for each write (`save_run`).
 pub fn bisect(ctx: &mut Ctx, cmd: &BisectCmd) -> Result<ExitCode> {
     match cmd {
         BisectCmd::Start { bad, good } => {
+            let _wc = ctx.lock_dir(None)?;
             match load(ctx) {
                 Ok(None) => {}
                 Ok(Some(_)) => bail!("a bisection is already in progress (`vl bisect log` shows it); {RESET_HINT}"),
@@ -657,6 +686,7 @@ pub fn bisect(ctx: &mut Ctx, cmd: &BisectCmd) -> Result<ExitCode> {
                 BisectCmd::Bad { .. } => Verdict::Bad,
                 _ => Verdict::Skip,
             };
+            let _wc = ctx.lock_dir(None)?;
             let (mut s, mut ids) = load(ctx)?.ok_or_else(|| anyhow!("no bisection in progress (`vl bisect start --bad REV --good REV`)"))?;
             let id = match rev {
                 Some(r) => ctx.rev(r)?,
@@ -685,17 +715,18 @@ pub fn bisect(ctx: &mut Ctx, cmd: &BisectCmd) -> Result<ExitCode> {
         }
         BisectCmd::Run { with_isolated, trust_partial, command } => {
             let (mut s, mut ids) = load(ctx)?.ok_or_else(|| anyhow!("no bisection in progress (`vl bisect start --bad REV --good REV`)"))?;
+            let mut on_disk = s.clone();
             loop {
                 let step = bisect::next(&ctx.repo, &ids.bad, &ids.good, &ids.skip)?;
                 let Some(candidate) = take_step(ctx, &mut s, step, false)? else {
-                    save(ctx, &s)?;
+                    save_run(ctx, &mut on_disk, &s)?;
                     return Ok(ExitCode::SUCCESS);
                 };
                 let (code, partial) = run_on(ctx, &candidate, *with_isolated, command)?;
                 let mut verdict = bisect::verdict(code);
                 if verdict == Verdict::Abort {
                     s.current = None;
-                    save(ctx, &s)?;
+                    save_run(ctx, &mut on_disk, &s)?;
                     bail!(
                         "bisect run stopped: `{}` exited with {code} on {} (0 good, 125 skip, 1-127 bad; anything else aborts)",
                         safe(&command.join(" ")),
@@ -713,10 +744,11 @@ pub fn bisect(ctx: &mut Ctx, cmd: &BisectCmd) -> Result<ExitCode> {
                 };
                 println!("  {word} (exit {code})");
                 mark(&mut ids, &mut s, verdict, candidate, Some(code));
-                save(ctx, &s)?;
+                save_run(ctx, &mut on_disk, &s)?;
             }
         }
         BisectCmd::Reset => {
+            let _wc = ctx.lock_dir(None)?;
             let state = match load(ctx) {
                 Ok(s) => s,
                 Err(e) => {

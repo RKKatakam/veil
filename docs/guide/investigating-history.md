@@ -210,6 +210,12 @@ and anything else, a signal included, stops the bisection, as in Git.
 * The state lives in `.veil/local/bisect.json` on this device only.
   Nothing else reads it; if it is damaged, `vl bisect` asks you to run
   `vl bisect reset`, which removes it.
+* `vl bisect` commands given at once take turns, each starting from what
+  the one before wrote. `vl bisect run` does not make the others wait
+  while `CMD` runs: if you mark a snapshot or run `vl bisect reset`
+  meanwhile, the run stops at its next step and writes nothing over what
+  you did ("the bisection changed while `vl bisect run` was running");
+  `vl bisect run` again goes on from there.
 
 `vl serve` offers `blame` and `grep`, never `bisect`: `bisect run`
 executes code.
