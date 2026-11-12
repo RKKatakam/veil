@@ -472,7 +472,7 @@ fn reachable_among_tips_answers_as_the_full_walk_for_tips_that_are_apart() {
 /// operation).
 #[test]
 fn no_head_descends_from_another_after_a_rewrite_whatever_came_before() {
-    let (mut rewrites_checked, mut merges_seen) = (0, 0);
+    let (mut rewrites_checked, mut merges_seen, mut reverts) = (0, 0, 0);
     for seed in 1..=50u64 {
         let mut next = xorshift(seed);
         let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -483,7 +483,7 @@ fn no_head_descends_from_another_after_a_rewrite_whatever_came_before() {
             let wc = repo.workspace_wc("default").unwrap();
             let mut free: Vec<ObjectId> = repo.held().visible().unwrap().into_iter().filter(|id| *id != root && *id != wc).collect();
             free.sort();
-            let what = if free.len() < 2 { 0 } else { next(12) };
+            let what = if free.len() < 2 { 0 } else { next(14) };
             let pick = |next: &mut dyn FnMut(usize) -> usize| free[next(free.len())];
             match what {
                 0 | 1 => {
@@ -558,6 +558,21 @@ fn no_head_descends_from_another_after_a_rewrite_whatever_came_before() {
                         tx.commit().unwrap();
                     }
                 }
+                11 | 12 => {
+                    // `vl undo` and `vl redo`: a 3-way revert of what one
+                    // command changed, when there is one to take back.
+                    let done = match what {
+                        11 => repo.undo_keeping_edits("default"),
+                        _ => repo.redo_keeping_edits("default"),
+                    };
+                    match done {
+                        Ok(_) => reverts += 1,
+                        Err(e) => {
+                            let e = e.to_string();
+                            assert!(e.contains("nothing to") || e.contains("cannot undo") || e.contains("cannot redo") || e.contains("merges concurrent"), "seed {seed}, step {step}: {e}");
+                        }
+                    }
+                }
                 _ => {
                     // Two processes at once: each describes a change from
                     // the same state (the second in a copy of the
@@ -603,4 +618,5 @@ fn no_head_descends_from_another_after_a_rewrite_whatever_came_before() {
     }
     assert!(rewrites_checked > 500, "the walk checked {rewrites_checked} rewrites");
     assert!(merges_seen > 20, "the walk merged concurrent operations {merges_seen} times");
+    assert!(reverts > 50, "the walk undid or redid {reverts} commands");
 }
