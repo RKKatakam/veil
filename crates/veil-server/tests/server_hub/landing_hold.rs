@@ -685,6 +685,43 @@ fn bug_2060_an_edit_the_tip_already_holds_merges_cleanly() {
     assert_eq!(file("src/same/own.txt"), (200, "its own edit\n".to_string()));
 }
 
+/// A change made with `vl` in `dir` (the person's clone of the project) on
+/// `base`, by applying `edits` (in the form of `/land`'s) to its files, and
+/// given the tag `name`, for `vl push`: its snapshot id. (`/land`'s edits
+/// cannot replace a file by a folder, or a folder by a file, in one change.)
+fn vl_change(who: &Person, dir: &std::path::Path, base: veil_core::ObjectId, edits: &[serde_json::Value], name: &str) -> veil_core::ObjectId {
+    use std::os::unix::fs::PermissionsExt;
+    who.ok(dir, &["new", &base.hex()]);
+    for e in edits.iter().filter(|e| e["delete"] == true) {
+        let path = dir.join(e["path"].as_str().unwrap());
+        std::fs::remove_file(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let mut d = path.parent().unwrap().to_path_buf();
+        while d != dir && std::fs::read_dir(&d).unwrap().next().is_none() {
+            std::fs::remove_dir(&d).unwrap();
+            d = d.parent().unwrap().to_path_buf();
+        }
+    }
+    for e in edits.iter().filter(|e| e.get("put").is_some()) {
+        let path = dir.join(e["path"].as_str().unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, e["put"]["text"].as_str().unwrap()).unwrap();
+        let mode = if e["put"]["executable"] == true { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    who.ok(dir, &["commit", "-m", name]);
+    let log: serde_json::Value = serde_json::from_str(&who.ok(dir, &["log", "-r", "@-", "-n", "1", "--json"])).unwrap();
+    let snap = veil_core::ObjectId::from_hex(log["entries"][0]["snapshot_id"].as_str().unwrap()).unwrap();
+    who.ok(dir, &["tag", "set", name, "-r", "@-", "--force"]);
+    snap
+}
+
+/// Whether `edits` replace a file by a folder or a folder by a file
+/// (which only [`vl_change`] makes).
+fn swaps_a_folder(edits: &[serde_json::Value]) -> bool {
+    let paths = edit_paths(edits);
+    paths.iter().any(|a| paths.iter().any(|b| a != b && overlap(a, b)))
+}
+
 /// BUG-2070 (BUG-2060's class, left by its fix): an edit the tip already
 /// holds is no edit of the merged change whatever the file: a binary file,
 /// a file over the 1 MiB merge cap, a `-merge` file, a file whose base was
@@ -697,50 +734,59 @@ fn bug_2070_an_edit_the_tip_already_holds_merges_cleanly_whatever_the_file() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let api = hub.api();
-    let dev = p.dev.token();
-    let land = |base: veil_core::ObjectId, edits: serde_json::Value| {
+    let admin = p.admin.token();
+    let land = |snapshot: veil_core::ObjectId| {
         let r = api.post_json(
-            Some(&dev),
+            Some(&admin),
             &format!("/v1/projects/{}/land", p.name),
-            &serde_json::json!({"onto": "main", "base": base.hex(), "edits": edits, "description": "bug 2070", "wait": true}),
+            &serde_json::json!({"onto": "main", "snapshot": snapshot.hex(), "wait": true}),
         );
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         r.json()
     };
-    let tip = || api.tips(Some(&dev), &p.name).unwrap().branches["main"];
-    let big: String = (0..20_000).map(|i| format!("big line {i:06} of a file over the merge cap\n")).collect();
-    let made = land(
-        tip(),
-        serde_json::json!([
+    let tip = || api.tips(Some(&admin), &p.name).unwrap().branches["main"];
+    let big: String = (0..30_000).map(|i| format!("big line {i:06} of a file over the merge cap\n")).collect();
+    assert!(big.len() as u64 > veil_server::landing::merge::MAX_MERGE_FILE_BYTES);
+    let r = api.post_json(
+        Some(&admin),
+        &format!("/v1/projects/{}/land", p.name),
+        &serde_json::json!({"onto": "main", "base": tip().hex(), "description": "the files", "wait": true, "edits": [
             {"path": "src/held/.veilattributes", "put": {"text": "*.lock -merge\n"}},
             {"path": "src/held/bin.dat", "put": {"text": "\u{0}BIN 0\n"}},
             {"path": "src/held/big.txt", "put": {"text": big}},
             {"path": "src/held/dep.lock", "put": {"text": "dep 1\ndep 2\n"}},
             {"path": "src/held/node", "put": {"text": "a file\n"}},
             {"path": "src/held/tree/inner.txt", "put": {"text": "in a folder\n"}},
-        ]),
+        ]}),
     );
-    assert_eq!(made["state"], "landed", "{made}");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "landed", "{}", r.json());
     let base = tip();
-    let edits = serde_json::json!([
-        {"path": "src/held/bin.dat", "put": {"text": "\u{0}BIN 1\n"}},
-        {"path": "src/held/big.txt", "put": {"text": big.replacen("big line 000007 ", "big line 000007 edited ", 1)}},
-        {"path": "src/held/dep.lock", "put": {"text": "dep 1\ndep 3\n"}},
-        {"path": "src/held/node", "delete": true},
-        {"path": "src/held/node/inner.txt", "put": {"text": "now a folder\n"}},
-        {"path": "src/held/tree/inner.txt", "delete": true},
-        {"path": "src/held/tree", "put": {"text": "now a file\n"}},
-    ]);
-    let first = land(base, edits.clone());
-    assert_eq!(first["state"], "landed", "{first}");
+    let dir = p.admin.dir("held-2070");
+    p.admin.ok(p.admin.home.path(), &["clone", &hub.url(&p.name), dir.to_str().unwrap()]);
+    let edits = vec![
+        serde_json::json!({"path": "src/held/bin.dat", "put": {"text": "\u{0}BIN 1\n"}}),
+        serde_json::json!({"path": "src/held/big.txt", "put": {"text": big.replacen("big line 000007 ", "big line 000007 edited ", 1)}}),
+        serde_json::json!({"path": "src/held/dep.lock", "put": {"text": "dep 1\ndep 3\n"}}),
+        serde_json::json!({"path": "src/held/node", "delete": true}),
+        serde_json::json!({"path": "src/held/node/inner.txt", "put": {"text": "now a folder\n"}}),
+        serde_json::json!({"path": "src/held/tree/inner.txt", "delete": true}),
+        serde_json::json!({"path": "src/held/tree", "put": {"text": "now a file\n"}}),
+    ];
+    let mut own = edits.clone();
+    own.push(serde_json::json!({"path": "src/held/own.txt", "put": {"text": "its own edit\n"}}));
+    let first = vl_change(&p.admin, &dir, base, &edits, "held-first");
+    let second = vl_change(&p.admin, &dir, base, &own, "held-second");
+    let third = vl_change(&p.admin, &dir, base, &edits, "held-third");
+    p.admin.ok(&dir, &["push"]);
+    let landed = land(first);
+    assert_eq!(landed["state"], "landed", "{landed}");
     let after_first = tip();
-    let mut again = edits.as_array().unwrap().clone();
-    again.push(serde_json::json!({"path": "src/held/own.txt", "put": {"text": "its own edit\n"}}));
-    let second = land(base, serde_json::Value::Array(again));
-    assert_eq!(second["state"], "landed", "a clean three-way merge lands: {second}");
-    assert_eq!(second["merges"], 1, "{second}");
+    let landed = land(second);
+    assert_eq!(landed["state"], "landed", "a clean three-way merge lands: {landed}");
+    assert_eq!(landed["merges"], 1, "{landed}");
     let file = |rev: veil_core::ObjectId, path: &str| {
-        let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path={path}", p.name, rev.hex()));
+        let r = api.get(Some(&admin), &format!("/v1/projects/{}/q/file?rev={}&path={path}", p.name, rev.hex()));
         (r.status, r.body)
     };
     let now = tip();
@@ -751,8 +797,13 @@ fn bug_2070_an_edit_the_tip_already_holds_merges_cleanly_whatever_the_file() {
     }
     assert_eq!(file(now, "src/held/own.txt"), (200, b"its own edit\n".to_vec()));
     // Every edit held by the tip: the change lands, empty.
-    let third = land(base, edits);
-    assert_eq!(third["state"], "landed", "a clean three-way merge lands: {third}");
+    let landed = land(third);
+    assert_eq!(landed["state"], "landed", "a clean three-way merge lands: {landed}");
+    assert_eq!(
+        api.get(Some(&admin), &format!("/v1/projects/{}/q/tree?rev={}", p.name, tip().hex())).json()["id"],
+        api.get(Some(&admin), &format!("/v1/projects/{}/q/tree?rev={}", p.name, now.hex())).json()["id"],
+        "an empty change"
+    );
 }
 
 /// One change of [`bug_1956_every_kind_of_edit_lands_as_landing_them_one_by_one`]:
@@ -765,6 +816,9 @@ struct Planned {
     /// The index of the earlier change it repeats exactly (an edit the tip
     /// may already hold, BUG-2060).
     repeats: Option<usize>,
+    /// Made with `vl` (it replaces a file by a folder or back): its two
+    /// copies, for the batch and for the one-by-one run.
+    made: Option<(veil_core::ObjectId, veil_core::ObjectId)>,
 }
 
 fn kinds_put(path: &str, text: &str, executable: bool) -> serde_json::Value {
@@ -840,7 +894,7 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
     let tokens = [p.dev.token(), p.admin.token(), p.carol.token()];
     let admin = tokens[1].clone();
     let text30 = |tag: &str| -> String { (0..30).map(|i| format!("{tag} line {i}\n")).collect() };
-    let big: String = (0..20_000).map(|i| format!("big line {i:06} of a file over the merge cap\n")).collect();
+    let big: String = (0..30_000).map(|i| format!("big line {i:06} of a file over the merge cap\n")).collect();
     assert!(big.len() as u64 > veil_server::landing::merge::MAX_MERGE_FILE_BYTES, "{}", big.len());
     let run_text = |r: usize| format!("#!/bin/sh\necho run {r}\n");
     let mut made = vec![kinds_put(&format!("{K}/.veilattributes"), "*.union merge=union\n*.lock -merge\n", false)];
@@ -933,7 +987,7 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
                 }
                 7 if bigs < 3 => {
                     bigs += 1;
-                    let at = next(20_000) as usize;
+                    let at = next(30_000) as usize;
                     let edited = big.replacen(&format!("big line {at:06} "), &format!("big line {at:06} {seed}/{i} "), 1);
                     vec![kinds_put(&format!("{K}/big.txt"), &edited, false)]
                 }
@@ -950,7 +1004,7 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
         let earlier: Vec<usize> = (0..plan.len()).filter(|&j| plan[j].base == base && plan[j].repeats.is_none()).collect();
         if !earlier.is_empty() && next(6) == 0 {
             let j = earlier[next(earlier.len() as u64) as usize];
-            plan.push(Planned { person, base, edits: plan[j].edits.clone(), repeats: Some(j) });
+            plan.push(Planned { person, base, edits: plan[j].edits.clone(), repeats: Some(j), made: None });
             continue;
         }
         let kind = next(10);
@@ -961,18 +1015,32 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
                 edits.extend(more);
             }
         }
-        plan.push(Planned { person, base, edits, repeats: None });
+        plan.push(Planned { person, base, edits, repeats: None, made: None });
     }
+    // The changes that replace a file by a folder or back, made with `vl` by
+    // the admin, twice each.
+    let dir = p.admin.dir(&format!("kinds-{seed}"));
+    p.admin.ok(p.admin.home.path(), &["clone", &hub.url(&p.name), dir.to_str().unwrap()]);
+    for (i, c) in plan.iter_mut().enumerate() {
+        if swaps_a_folder(&c.edits) {
+            c.person = 1;
+            let one = vl_change(&p.admin, &dir, c.base, &c.edits, &format!("c{seed}b{i}"));
+            let two = vl_change(&p.admin, &dir, c.base, &c.edits, &format!("c{seed}s{i}"));
+            c.made = Some((one, two));
+        }
+    }
+    assert!(plan.iter().filter(|c| c.made.is_some()).count() >= 3, "seed {seed}: too few folder changes");
+    p.admin.ok(&dir, &["push"]);
 
     // Queued while the branch is held: one batch.
     hold_branch(hub, pid, "main");
     let mut tickets = Vec::new();
     for (i, c) in plan.iter().enumerate() {
-        let r = api.post_json(
-            Some(&tokens[c.person]),
-            &format!("/v1/projects/{}/land", p.name),
-            &serde_json::json!({"onto": "main", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": false}),
-        );
+        let ask = match c.made {
+            Some((one, _)) => serde_json::json!({"onto": "main", "snapshot": one.hex(), "wait": false}),
+            None => serde_json::json!({"onto": "main", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": false}),
+        };
+        let r = api.post_json(Some(&tokens[c.person]), &format!("/v1/projects/{}/land", p.name), &ask);
         assert_eq!(r.status, 200, "seed {seed}, submit {i}: {}", String::from_utf8_lossy(&r.body));
         assert_eq!(r.json()["state"], "queued", "seed {seed}, submit {i}: {}", r.json());
         tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
@@ -1017,11 +1085,11 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
     let mut serial: Vec<Option<serde_json::Value>> = vec![None; plan.len()];
     for &i in &order {
         let c = &plan[i];
-        let r = api.post_json(
-            Some(&tokens[c.person]),
-            &format!("/v1/projects/{}/land", p.name),
-            &serde_json::json!({"onto": "serial", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": true}),
-        );
+        let ask = match c.made {
+            Some((_, two)) => serde_json::json!({"onto": "serial", "snapshot": two.hex(), "wait": true}),
+            None => serde_json::json!({"onto": "serial", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": true}),
+        };
+        let r = api.post_json(Some(&tokens[c.person]), &format!("/v1/projects/{}/land", p.name), &ask);
         assert_eq!(r.status, 200, "seed {seed}, serial {i}: {}", String::from_utf8_lossy(&r.body));
         serial[i] = Some(r.json());
     }

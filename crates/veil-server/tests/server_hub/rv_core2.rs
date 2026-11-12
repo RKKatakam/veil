@@ -1956,16 +1956,6 @@ fn bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them() {
     let api = th.api();
     let pid = project_id(&th, &p.name);
     let (dev_tok, admin_tok, sec_tok) = (p.dev.token(), p.admin.token(), p.sec.token());
-    write_files(&p.dir, &[(".veilrules", "[branches.dev]\nprotected = true\n\n[review]\nchecks_only = [\"src/docs/**\"]\n")]);
-    p.admin.commit_main(&p.dir, "protect dev; src/docs needs checks only");
-    p.admin.ok(&p.dir, &["push"]);
-    let main = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
-    let r = api.post_json(
-        Some(&dev_tok),
-        &format!("/v1/projects/{}/push", p.name),
-        &json!({"updates": [{"branch": "dev", "expected": null, "new": main.hex()}], "force": false}),
-    );
-    assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
 
     // The embargo, of `src/docs/held.md`, for the security group, and its PR.
     let dir = p.admin.dir("emb-2061");
@@ -2001,6 +1991,23 @@ fn bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them() {
             .unwrap()
     };
     assert_eq!((holds("pr_embargo_holds"), holds("pr_holds")), (1, 0), "the hold is kept with the embargo");
+
+    // `dev` protected, `src/docs/**` checks only.
+    let r = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "base": api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"].hex(), "wait": true, "description": "protect dev",
+                "edits": [put(".veilrules", "[branches.dev]\nprotected = true\n\n[review]\nchecks_only = [\"src/docs/**\"]\n")]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    let main = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "dev", "expected": null, "new": main.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
 
     hold_lease(&th, pid, "dev");
     let r = api.post_json(
