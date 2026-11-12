@@ -202,7 +202,9 @@ pub struct DeriveLag {
 pub async fn route(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Report>> {
     caller.signed_in()?;
     let (project, viewer) = crate::perm::open(&hub, &p, &caller).await?;
-    if !viewer.admin {
+    // A narrowed agent session sees statistics over its own paths only
+    // (BUG-1536), and these counts are the whole project's (BUG-1995).
+    if !viewer.admin || viewer.only.is_some() {
         return Err(Error::forbidden("only the project's admins see its health"));
     }
     let (since_start, last_minute) = hub.limits.health.read(project.id);

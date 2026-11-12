@@ -60,5 +60,6 @@ mod rc_server;
 mod rc_client;
 mod warm;
 mod landing_speed;
+mod hunt_access;
 mod landing_hold;
 mod store_s3;
