@@ -1056,12 +1056,28 @@ impl Service {
         // Each change landed, by its id and author, for the branch's lineage:
         // "already landed" asks it whatever its submitted snapshot (BUG-1522,
         // BUG-1527).
-        let empty_fresh = HashMap::new();
+        // The authors the server recorded, of all of them in one statement
+        // (they were asked one landing after another, a round trip each:
+        // BUG-1955); one it did not record is found as before.
+        let recorded: HashMap<ObjectId, (Vec<ObjectId>, i64)> = {
+            let hex: Vec<String> = b.landings.iter().filter(|(_, r)| r.change.is_some()).map(|(sid, _)| sid.hex()).collect();
+            let rows: Vec<(String, i64)> = match hex.is_empty() {
+                true => Vec::new(),
+                false => {
+                    sqlx::query_as("SELECT id, author FROM snapshots WHERE project_id = $1 AND id = ANY($2) AND author <> 0")
+                        .bind(self.project)
+                        .bind(&hex)
+                        .fetch_all(&hub.db)
+                        .await?
+                }
+            };
+            rows.into_iter().filter_map(|(id, a)| Some((ObjectId::from_hex(&id).ok()?, (Vec::new(), a)))).collect()
+        };
         let mut snap_authors: HashMap<ObjectId, i64> = HashMap::new();
         let (mut cc, mut ca, mut cl) = (Vec::new(), Vec::new(), Vec::new());
         for (sid, r) in &b.landings {
             if let Some(c) = &r.change {
-                if let Some(a) = super::snapshot_author(hub, self.project, *sid, &empty_fresh).await? {
+                if let Some(a) = super::snapshot_author(hub, self.project, *sid, &recorded).await? {
                     snap_authors.insert(r.landed, a);
                     cc.push(c.clone());
                     ca.push(a);
