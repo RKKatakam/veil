@@ -829,8 +829,9 @@ CAS, and it applies these rules in order:
      be a word, a number or a reference (`user:password@`,
      `postgres:postgres@`, `${USER}:${PASS}@` do not count); it is judged
      percent-decoded, may contain `:`, and `:\/\/` (JSON) counts as `://`.
-     The URL must be URL syntax (scanner v8, BUG-1985): a scheme character
-     right before `://`, no control byte, and UTF-8, or, when not (a
+     The URL must be URL syntax (scanner v8, BUG-1985): a visible ASCII
+     character right before `://` (a scheme, or a template that supplies
+     one: `${DB_SCHEME}://`), no control byte, and UTF-8, or, when not (a
      Latin-1 file), no NUL within 4 KiB, so random binary data is not
      taken for one.
      `secrets::RULES_VERSION` is part of the stat-cache key, so "scanned

@@ -527,6 +527,18 @@ fn bug_1985_url_passwords_in_files_are_still_found() {
         ("a Latin-1 password", b"# Datenbank f\xfcr die Produktion\nDATABASE_URL=postgres://app:P\xe4\xdfwort-X9k2q@db\n".to_vec()),
         ("UTF-16LE with a BOM", with_bom(&format!("DATABASE_URL={url}\r\n"))),
         ("compiled into a binary", binary),
+        ("UTF-16BE, no BOM", "DATABASE_URL=postgres://app:Xk9mQ2vL7pR4@db\r\n".encode_utf16().flat_map(|u| u.to_be_bytes()).collect()),
+        ("a Latin-1 password in UTF-16LE", utf16le("DATABASE_URL=postgres://app:P\u{e4}\u{df}wort-X9k2q@db\r\n")),
+        ("NUL-separated (an environ dump)", format!("PATH=/usr/bin\0DATABASE_URL={url}\0HOME=/root\0").into()),
+        ("a scheme with +", b"U=postgresql+asyncpg://app:Xk9mQ2vL7pR4@db/app\n".to_vec()),
+        // A scheme supplied by a template, a variable or a joined string
+        // (the old rule found these; review of BUG-1985's fix).
+        ("a ${VAR} scheme", b"DATABASE_URL=${DB_SCHEME}://app:Xk9mQ2vL7pR4@db.example.com/app\n".to_vec()),
+        ("a Helm {{ }} scheme", b"url: \"{{ .Values.scheme }}://app:Xk9mQ2vL7pR4@db.example.com\"\n".to_vec()),
+        ("a $(VAR) scheme", b"URL = $(SCHEME)://app:Xk9mQ2vL7pR4@db.example.com\n".to_vec()),
+        ("a %VAR% scheme", b"set URL=%SCHEME%://app:Xk9mQ2vL7pR4@db.example.com\r\n".to_vec()),
+        ("an f-string scheme", b"u = f\"{scheme}://app:Xk9mQ2vL7pR4@db.example.com\"\n".to_vec()),
+        ("a joined string", b"const u = proto + \"://app:Xk9mQ2vL7pR4@db.example.com\";\n".to_vec()),
     ];
     for (name, data) in &cases {
         assert_eq!(url_passwords(data), 1, "{name}: {:?}", scan(data).iter().map(|f| f.rule).collect::<Vec<_>>());

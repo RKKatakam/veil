@@ -1664,8 +1664,11 @@ fn config_line(text: &[u8], kw: usize) -> bool {
 
 /// Is a `url-password` match (`://user:password@h`, or `:\/\/…`) URL
 /// syntax, not bytes of binary data that happen to fit the pattern's
-/// classes (BUG-1985)? A scheme character (`[A-Za-z0-9+.-]`, RFC 3986)
-/// comes right before the `:`; the match has no control byte (C0 or DEL:
+/// classes (BUG-1985)? A visible ASCII character comes right before the
+/// `:`: a scheme's last (`[A-Za-z0-9+.-]`, RFC 3986), or the end of what
+/// supplies the scheme (`${DB_SCHEME}://`, `{{ .Values.scheme }}://`,
+/// `$(SCHEME)://`, `%SCHEME%://`, `scheme + "://…`); the match has no
+/// control byte (C0 or DEL:
 /// never in a URL, and about one random byte in nine); and it is UTF-8
 /// (ASCII, or an IRI's UTF-8, RFC 3987). A match that is not UTF-8 (a
 /// Latin-1 `ä` typed into a URL) still counts in text: where no NUL is
@@ -1674,7 +1677,7 @@ fn config_line(text: &[u8], kw: usize) -> bool {
 /// and the regex's size are too; and since a match holds no `/` after its
 /// `://`, no other URL starts inside one this rejects.
 fn url_syntax(prev: Option<u8>, text: &[u8], m: std::ops::Range<usize>) -> bool {
-    let scheme = prev.is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    let scheme = prev.is_some_and(|b| b.is_ascii_graphic());
     let bytes = &text[m.clone()];
     if !scheme || bytes.iter().any(|&b| b < 0x20 || b == 0x7f) {
         return false;
