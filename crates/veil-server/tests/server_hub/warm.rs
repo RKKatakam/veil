@@ -322,21 +322,20 @@ fn rows_without_file_history_answer_exactly_as_the_viewers_copy() {
             let quick = Limits { deadline: Duration::from_millis(40), ..Limits::default() };
             let mut warming = 0usize;
             for q in of_files.iter().take(10) {
-                let (mine, theirs) = match q {
-                    Q::Blame(p, _) => (
-                        th.rt.block_on(query::blame(&h.hub, &mine_ask, p.clone(), quick)),
-                        th.rt.block_on(query::blame(&copy.hub, &copy_ask, p.clone(), Limits::default())),
-                    ),
-                    Q::History(p, _) => (
-                        th.rt.block_on(query::history(&h.hub, &mine_ask, p.clone(), quick)),
-                        th.rt.block_on(query::history(&copy.hub, &copy_ask, p.clone(), Limits::default())),
-                    ),
+                let mine = match q {
+                    Q::Blame(p, _) => th.rt.block_on(query::blame(&h.hub, &mine_ask, p.clone(), quick)),
+                    Q::History(p, _) => th.rt.block_on(query::history(&h.hub, &mine_ask, p.clone(), quick)),
                     _ => unreachable!(),
                 };
                 match code(&mine).as_str() {
                     "warming" => warming += 1,
                     _ => {
                         assert!(mine.is_err(), "seed {seed}, {who}: an answer from half a file history: {q:?}");
+                        let theirs = match q {
+                            Q::Blame(p, _) => th.rt.block_on(query::blame(&copy.hub, &copy_ask, p.clone(), Limits::default())),
+                            Q::History(p, _) => th.rt.block_on(query::history(&copy.hub, &copy_ask, p.clone(), Limits::default())),
+                            _ => unreachable!(),
+                        };
                         assert_eq!(norm(mine), norm(theirs), "seed {seed}, {who}: {q:?}");
                     }
                 }
@@ -346,6 +345,11 @@ fn rows_without_file_history_answer_exactly_as_the_viewers_copy() {
             // The other server is done: the file history is written here,
             // and blame and the history of a path answer as the copy's.
             release(&th, &h);
+            // (Of every branch, as the copy's is: the work a history of a
+            // path takes counts the path's changes on other lines too.)
+            th.rt.block_on(query::graph::ensure_files(&h.hub, &project, &viewer, &tips, None)).unwrap();
+            forget_blames(&th, &h);
+            forget_blames(&th, &copy);
             for q in &of_files {
                 let (real, theirs) = (run(&th, &h, &mine_ask, q), run(&th, &copy, &copy_ask, q));
                 assert_eq!(real, theirs, "seed {seed}, {who}: {q:?}");
