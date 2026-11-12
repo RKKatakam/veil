@@ -164,7 +164,10 @@ pub struct Running {
 }
 
 impl Running {
+    /// A clean stop: the landing services end and give their leases up
+    /// (`landing::stop`, BUG-1970), then the server stops serving.
     pub async fn stop(self) {
+        landing::stop(&self.hub).await;
         let _ = self.shutdown.send(true);
         let _ = self.task.await;
     }

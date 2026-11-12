@@ -1074,6 +1074,7 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
             (key.clone(), lines.clone(), prid.clone(), pr_emb.clone(), r.clone(), moved.clone(), source_branch.clone());
         Box::pin(async move {
             crate::pack_gc::guard_root_write(&mut *c, project, gc_epoch).await?;
+            close_review_gate(&mut *c, project).await?;
             let class = class::put_class_for(&mut *c, project, &key, &lines, &pr_emb).await?;
             // The compare-and-swap: two new revisions at once, one wins.
             let moved_on = sqlx::query(
@@ -2052,6 +2053,29 @@ pub async fn verify_landing_review(
         reasons.push(format!("{h} asked for changes"));
     }
     Ok(Err(format!("{NOT_READY} {}", reasons.join("; "))))
+}
+
+/// The review gate of a project (BUG-1886): a transaction-scoped advisory
+/// lock that a landing batch's transaction takes shared before it reads the
+/// review rules' rows again (`prs`, `pr_reviews`, `pr_holds`), and that every
+/// write which can make a change not ready takes exclusively, first: a
+/// verdict and the holds it places ([`review::put_verdict`]) and a PR's new
+/// revision. Either the write commits before the batch reads (the batch sees
+/// it), or it waits until the batch has committed: every landing meets the
+/// review rules in force when it commits. Batches do not wait for one
+/// another.
+const REVIEW_GATE_BASE: i64 = 0x7665_696c_7276_6774; // "veilrvgt"
+
+/// Take the review gate of `project` exclusively, for this transaction.
+pub(crate) async fn close_review_gate(c: &mut sqlx::PgConnection, project: i64) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(REVIEW_GATE_BASE ^ project).execute(&mut *c).await?;
+    Ok(())
+}
+
+/// Take the review gate of `project` shared, for this transaction.
+pub(crate) async fn share_review_gate(c: &mut sqlx::PgConnection, project: i64) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(REVIEW_GATE_BASE ^ project).execute(&mut *c).await?;
+    Ok(())
 }
 
 /// One entry of a landing batch, for [`verify_landing_reviews`]: what

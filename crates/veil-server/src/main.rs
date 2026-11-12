@@ -241,12 +241,15 @@ async fn serve() -> anyhow::Result<()> {
     }
     let hub = running.hub.clone();
     let mut usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    // SIGTERM stops it cleanly too, as SIGINT does (BUG-1970).
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut n = 0u64;
     // Written once at start: it says this server answers SIGUSR1.
     let _ = std::fs::write(data.join("stats.json"), serde_json::to_vec(&stats(&hub, 0))?);
     loop {
         tokio::select! {
             r = tokio::signal::ctrl_c() => { r?; break; }
+            _ = term.recv() => break,
             _ = usr1.recv() => {
                 n += 1;
                 let path = data.join("stats.json");
@@ -278,10 +281,12 @@ async fn cache(config: veil_server::cache::Config) -> anyhow::Result<()> {
         }
     };
     write(0);
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut n = 0;
     loop {
         tokio::select! {
             r = tokio::signal::ctrl_c() => { r?; break; }
+            _ = term.recv() => break,
             _ = usr1.recv() => { n += 1; write(n); }
         }
     }

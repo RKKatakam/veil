@@ -376,15 +376,14 @@ fn bug_1880_a_change_reverted_twice_while_queued_needs_a_person_in_the_batch() {
     assert_eq!(file("src/twice-1880.rs"), 404, "the change reverted twice is on main");
 }
 
-/// BUG-1880's fix checks the review again in the batch's transaction, but
-/// reads it without a lock (`READ COMMITTED`): a reviewer who takes the
-/// approval back after that read and before the batch commits is answered
-/// `ready: false`, and the change still lands. The window is the batch's
-/// transaction after that read (milliseconds; longer when it waits for a
-/// row, as here).
+/// BUG-1886: every landing meets the review rules in force when it commits.
+/// BUG-1880's fix checks the review again in the batch's transaction; until
+/// BUG-1886's fix it read it without a lock, and a reviewer who took the
+/// approval back after that read and before the batch committed was answered
+/// `ready: false` while the change still landed. Now the reviewer's verdict
+/// waits for the batch (the review gate), and is written after the landing.
 #[test]
-#[ignore = "BUG-1886: an approval withdrawn while the landing batch commits still lands"]
-fn bug_1886_an_approval_withdrawn_while_the_batch_commits_still_lands() {
+fn bug_1886_an_approval_withdrawn_while_the_batch_commits_waits_for_the_batch() {
     let th = TestHub::start();
     let p = setup_project(&th);
     let api = th.api();
@@ -444,20 +443,27 @@ fn bug_1886_an_approval_withdrawn_while_the_batch_commits_still_lands() {
     release_lease(&th, pid, "main");
     th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
 
-    // Its reviewer takes the approval back, and is told the PR is not ready.
-    let r = review("request-changes");
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["review"]["ready"], false, "the PR is no longer ready to land");
+    // Its reviewer takes the approval back: the verdict waits for the batch
+    // that read the approval.
+    let withdrawn = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reviewer = scope.spawn(|| {
+            let r = review("request-changes");
+            withdrawn.store(true, Ordering::SeqCst);
+            r
+        });
+        th.rt.block_on(wait_for_sql_lock(&h.db, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the batch"));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!withdrawn.load(Ordering::SeqCst), "the verdict was written while the batch that read the approval was open");
 
-    th.rt.block_on(held.rollback()).unwrap();
-    let done = outcome(&api, &dev_tok, &p.name, &ticket);
-    assert_ne!(done["state"], "queued", "the entry was answered: {done}");
-    assert_eq!(
-        api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"],
-        base,
-        "a change whose only approval was withdrawn (its reviewer told so) landed on protected main: {done}"
-    );
-    assert_eq!(done["state"], "rejected", "{done}");
+        th.rt.block_on(held.rollback()).unwrap();
+        let done = outcome(&api, &dev_tok, &p.name, &ticket);
+        assert_eq!(done["state"], "landed", "the change lands, approved when it committed: {done}");
+        let r = reviewer.join().unwrap();
+        // Written after the landing (or refused: the PR may be landed with it).
+        assert!(r.status == 200 || r.status == 409, "{}", String::from_utf8_lossy(&r.body));
+    });
+    assert_ne!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"], base, "the change landed");
 }
 
 /// BUG-1880 variants: (1) `.veilrules` tightened by an entry ahead in the

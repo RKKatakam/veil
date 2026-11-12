@@ -514,3 +514,95 @@ fn bug_1982_a_hung_object_store_never_holds_the_branchs_lease_row() {
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(String::from_utf8_lossy(&r.body), "hung\n");
 }
+
+/// BUG-1970: a clean stop ends the batch being committed, then gives the
+/// branch's lease up, and another server takes the branch over at once (not
+/// after the lease runs out, as after a crash). Two servers on one
+/// database: `a` holds `main`'s lease and is committing a batch, held at its
+/// entry's row; `a` is stopped (`Running::stop`, what SIGINT and SIGTERM
+/// do). The stop waits for that batch, which lands; the lease is then given
+/// up with its fencing epoch kept; a landing on `b` takes the lease (the
+/// next epoch) and lands well within the lease's time.
+#[test]
+fn bug_1970_a_clean_stop_ends_its_batch_and_gives_the_lease_up_at_once() {
+    let a = TestHub::start();
+    let p = setup_project(&a);
+    let b = TestHub::beside(&a);
+    let pid = project_id_of(&a, &p.name);
+    let (api_a, api_b) = (a.api(), b.api());
+    let dev = p.dev.token();
+    let db = b.hub().db.clone();
+    let lease = || -> (String, i64, i64) {
+        b.rt.block_on(
+            sqlx::query_as("SELECT holder, epoch, expires_at FROM landing_leases WHERE project_id = $1 AND branch = 'main'")
+                .bind(pid)
+                .fetch_one(&db),
+        )
+        .unwrap()
+    };
+    let base = api_a.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    hold_branch(&a, pid, "main");
+    let r = land_edit(&api_a, &dev, &p.name, base, "src/stop/one.txt", "one\n", false);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "queued", "{}", r.json());
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    // `a`'s batch is held at the entry's row, which it writes in its commit.
+    let mut held = b.rt.block_on(db.begin()).unwrap();
+    b.rt.block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held)).unwrap();
+    release_branch(&a, pid, "main");
+    let yugabyte = b.rt.block_on(sqlx::query_scalar::<_, String>("SELECT version()").fetch_one(&db)).unwrap().contains("-YB-");
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: i64 = b
+            .rt
+            .block_on(
+                sqlx::query_scalar(if yugabyte {
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND query LIKE 'UPDATE landing_queue AS q%'"
+                } else {
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'UPDATE landing_queue AS q%'"
+                })
+                .fetch_one(&db),
+            )
+            .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(std::time::Instant::now() < until, "`a`'s batch never reached its entry's row");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (holder_a, epoch_a, _) = lease();
+    assert_ne!(holder_a, "test");
+
+    std::thread::scope(|scope| {
+        let stopping = scope.spawn(move || drop(a));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!stopping.is_finished(), "the stop waits for the batch being committed");
+        let (h, e, expires) = lease();
+        assert_eq!((&h, e), (&holder_a, epoch_a));
+        assert_ne!(expires, 0, "the lease is kept while its batch commits");
+        b.rt.block_on(held.rollback()).unwrap();
+        stopping.join().unwrap();
+    });
+    let (h, e, expires) = lease();
+    assert_eq!((&h, e), (&holder_a, epoch_a), "the epoch is kept");
+    assert_eq!(expires, 0, "a clean stop gives the lease up");
+    let v = wait_ticket(&api_b, &dev, &p.name, &ticket);
+    assert_eq!(v["state"], "landed", "the batch being committed at the stop landed: {v}");
+
+    let tip = api_b.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let t = std::time::Instant::now();
+    let r = land_edit(&api_b, &dev, &p.name, tip, "src/stop/two.txt", "two\n", true);
+    let took = t.elapsed();
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    assert!(took < Duration::from_millis(veil_server::landing::LEASE_MS as u64), "`b` took {took:?} to land: as long as the lease");
+    let (h2, e2, _) = lease();
+    assert_ne!(h2, holder_a);
+    assert_eq!(e2, epoch_a + 1, "the next holder fences the stopped one out");
+    let tip = api_b.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    for (path, text) in [("src/stop/one.txt", "one\n"), ("src/stop/two.txt", "two\n")] {
+        let r = api_b.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path={path}", p.name, tip.hex()));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(String::from_utf8_lossy(&r.body), text);
+    }
+}

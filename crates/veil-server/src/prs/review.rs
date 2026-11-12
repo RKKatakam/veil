@@ -175,6 +175,7 @@ pub async fn put_verdict(
     crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let (pr, verdict, patch, device, signature, body) = (pr.clone(), verdict.clone(), patch.clone(), device.clone(), signature.clone(), body.clone());
         Box::pin(async move {
+            super::close_review_gate(&mut *c, project).await?;
             let stored = sqlx::query(
                 "INSERT INTO pr_reviews (project_id, pr, revision, person, verdict, patch, agent, device, signature, body, at) \
                  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 WHERE NOT $12 OR EXISTS \

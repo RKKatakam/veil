@@ -407,6 +407,9 @@ enum Committed {
 /// Run the service of `branch` while it has work, then release the lease.
 /// `Ok(true)`: another server holds the lease.
 pub(super) async fn run(hub: &Arc<Hub>, project: i64, branch: &str, wake: Arc<Notify>) -> Result<bool> {
+    if hub.landing.stopping() {
+        return Ok(false);
+    }
     let Some(epoch) = take_lease(hub, project, branch).await? else { return Ok(true) };
     let name: Option<String> = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project).fetch_optional(&hub.db).await?;
     let Some(name) = name else { return Ok(false) };
@@ -460,6 +463,14 @@ impl Service {
         let mut renewed = Instant::now();
         let mut cleaned: Option<Instant> = None;
         loop {
+            // A clean stop (BUG-1970): the batch being committed ends, and
+            // nothing more is built; `run` then gives the lease up.
+            if self.hub.landing.stopping() {
+                if let Some(f) = inflight.take() {
+                    self.finish(f, &mut state).await?;
+                }
+                return Ok(());
+            }
             // A change of access or rules is committed before anything is
             // built after it: later entries are checked against it.
             if inflight.as_ref().is_some_and(|f| f.alone) {
@@ -524,6 +535,11 @@ impl Service {
                     }
                 }
             };
+            // Stopping: built for nothing (the batch being committed ends at
+            // the top of the loop).
+            if self.hub.landing.stopping() {
+                continue;
+            }
             self.hub.landing.stats.build_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             // Its objects are stored while the batch before it commits (they
             // are content-addressed: stored for a batch that is then
@@ -1328,6 +1344,10 @@ impl Service {
                             return Err(Error::conflict(MOVED));
                         }
                         if guard.protected || guard.reverted_twice {
+                            // Read under the review gate, shared: a
+                            // verdict, hold or new revision written meanwhile
+                            // is read here or waits for this commit (BUG-1886).
+                            crate::prs::share_review_gate(&mut *c, pid).await?;
                             // In a few statements for the whole batch
                             // (BUG-1942): this transaction holds the
                             // branch's row.
