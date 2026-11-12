@@ -125,10 +125,11 @@ fn hunt_project(hub: &TestHub) -> (Project, Vec<String>) {
     let r = api.post_json(Some(&admin), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "hunt-bill", "title": PR_MARK, "body": PR_MARK}));
     assert_eq!(r.status, 200, "the admin opens a PR of it: {}", body(&r));
     let pr = r.json()["id"].as_str().unwrap().to_string();
+    let fin_tip = api.tips(Some(&p.fin.token()), &p.name).unwrap().branches["main"];
     let r = api.post_json(
         Some(&p.fin.token()),
         &format!("/v1/projects/{}/checks", p.name),
-        &json!({"snapshot": base.hex(), "name": "ci/fin", "state": "fail", "summary": CHECK_MARK, "log": CHECK_MARK}),
+        &json!({"snapshot": fin_tip.hex(), "name": "ci/fin", "state": "fail", "summary": CHECK_MARK, "log": CHECK_MARK}),
     );
     assert_eq!(r.status, 200, "finance posts a check on the tip: {}", body(&r));
     // Controls: the admin sees both.
