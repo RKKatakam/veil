@@ -429,8 +429,13 @@ impl Default for Services {
 /// no bulkhead place while they wait, BUG-1635); the rest answer at once.
 pub const MAX_WAITING: usize = 10_000;
 /// Most landings one person may have waiting for their outcome on one server
-/// at once (S24).
-pub const MAX_WAITING_PER_PERSON: usize = 128;
+/// at once (S24): as many as the person may have queued in a project
+/// (`limits::landing::MAX_PERSON_OUTSTANDING`). It was 128, which one
+/// person's agents reach at 1,000 landings a second as soon as a landing
+/// takes over an eighth of a second: the rest were answered `queued` at once
+/// (BUG-1940; behind the lock that made them go one at a time it never
+/// showed).
+pub const MAX_WAITING_PER_PERSON: usize = crate::limits::landing::MAX_PERSON_OUTSTANDING;
 
 /// A submitter's wait for its ticket, registered before the submit commits
 /// so that the outcome is never missed.
