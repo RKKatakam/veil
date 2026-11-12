@@ -20,6 +20,7 @@ while read -r role name size; do
             hub) remote "$ip" 'docker kill -s USR1 veil-server >/dev/null 2>&1; sleep 1; docker exec veil-server cat /var/lib/veil/stats.json' > "$d/server-stats.json" 2>/dev/null || true
                  copy_from "$ip" /srv/metrics "$d/" || true ;;
             db)  remote "$ip" 'docker exec pg psql -U veil -d veil -c "select calls, mean_exec_time, left(query,80) q from pg_stat_statements order by calls desc limit 30"' > "$d/pg-stat-statements.txt" 2>&1 || true ;;
+            yb)  remote "$ip" "docker exec yb bin/ysqlsh -h $(priv_of "$name") -c 'select * from yb_servers()' -c 'select count(*) as tablets_here from yb_local_tablets'" > "$d/yb.txt" 2>&1 || true ;;
         esac
     else
         remote "$ip" 'for c in $(docker ps -aq); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); echo "### $n"; docker logs --tail 5000 $c 2>&1; done'
@@ -28,6 +29,7 @@ while read -r role name size; do
             hub) remote "$ip" 'docker kill -s USR1 veil-server >/dev/null 2>&1; sleep 1; docker exec veil-server cat /var/lib/veil/stats.json'
                  copy_from "$ip" /srv/metrics "$d/" ;;
             db)  remote "$ip" 'docker exec pg psql -U veil -d veil -c "select calls, mean_exec_time, left(query,80) q from pg_stat_statements order by calls desc limit 30"' ;;
+            yb)  remote "$ip" "docker exec yb bin/ysqlsh -h PRIVATE_IP -c 'select * from yb_servers()' -c 'select count(*) as tablets_here from yb_local_tablets'" ;;
         esac
     fi
 done < <(droplets)

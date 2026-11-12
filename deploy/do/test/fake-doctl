@@ -29,6 +29,7 @@ case "$*" in
     "compute ssh-key list"*)         [ "${FAKE_DOCTL_STATE:-created}" = created ] && echo "4242 ${FAKE_NAME:-veil-test}"; true ;;
     "compute volume list"*)          [ -n "${FAKE_VOLUMES:-}" ] && printf '%s\n' "$FAKE_VOLUMES"; true ;;
     "compute reserved-ip list"*)     [ -n "${FAKE_RESERVED_IPS:-}" ] && printf '%s\n' "$FAKE_RESERVED_IPS"; true ;;
+    "compute load-balancer list"*)   [ -n "${FAKE_LBS:-}" ] && printf '%s\n' "$FAKE_LBS"; true ;;
     "compute size list"*)            printf 'c-16 0.5\nc-8 0.25\n' ;;
-    *) ;;  # tag create/delete, firewall delete, ssh-key delete, snapshot/load-balancer list: nothing
+    *) ;;  # tag create/delete, firewall delete, ssh-key delete, snapshot list: nothing
 esac

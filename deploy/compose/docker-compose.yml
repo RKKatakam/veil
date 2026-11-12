@@ -1,22 +1,55 @@
-# The local rehearsal of Veil's deployment (docs/DEPLOY.md): the same
-# veil-server and veil-bench images as the DigitalOcean test, with
-# PostgreSQL 17 and MinIO standing in for the database droplet and Spaces.
+# The local rehearsal of Veil's multi-machine test (docs/DEPLOY.md §4,
+# docs/REPRODUCE.md): the paid topology on one machine, small. Three
+# YugabyteDB nodes (profile `yb`; or PostgreSQL 17, profile `pg`), MinIO
+# standing in for Spaces, two servers on the one database and bucket,
+# HAProxy in front of them (the one address), and the load driver.
+# deploy/compose/rehearsal.sh brings it up in order and runs the gates;
+# every variable below comes from the env file it writes.
 #
-#   deploy/compose/rehearsal.sh          # build, bring up, run the short gates, tear down
-#
-# Variables (deploy/compose/rehearsal.sh sets them; see .env.example):
-#   TAG           the image tag (deploy/docker/build.sh prints it)
-#   DB_PASSWORD   PostgreSQL password (rehearsal only)
-#   S3_KEY, S3_SECRET   MinIO root credentials (rehearsal only)
-#   HUB_PORT      host port for the server (default 18443), CACHE_PORT (18444)
-#   TLS_DIR       the directory deploy/tls/mkcert.sh wrote (ca.pem, server.pem, server-key.pem)
-#
-# Image versions are pinned; PostgreSQL and MinIO are the ones
-# scripts/verify-server.sh and scripts/bench-server.sh test against.
+# Every container has a memory limit; the defaults add up to under 12 GB.
+x-server: &server
+  image: veil-server:${TAG:?set TAG}
+  command: ["--listen", "0.0.0.0:8443", "--data", "/var/lib/veil", "--db-connections", "${DB_CONNECTIONS:-16}",
+            "--s3-endpoint", "http://minio:9000", "--s3-bucket", "veil-rehearsal", "--tls-cert", "/tls/server.pem", "--tls-key", "/tls/server-key.pem",
+            "--device-rate", "1000000000/1000000000", "--anonymous-rate", "1000000000/1000000000", "--max-connections", "262144"]
+  mem_limit: ${HUB_MEM:-1g}
+  ulimits: { nofile: { soft: 1048576, hard: 1048576 } }
+
+x-yb: &yb
+  image: ${YB_IMAGE:?set YB_IMAGE}
+  profiles: ["yb"]
+  mem_limit: ${YB_MEM:-2304m}
+  ulimits: { nofile: { soft: 1048576, hard: 1048576 } }
+  volumes: []
+  healthcheck:
+    test: ["CMD-SHELL", "bin/ysqlsh -h $$(hostname) -tAc 'select 1' >/dev/null"]
+    interval: 3s
+    timeout: 5s
+    retries: 200
+
 services:
+  yb1:
+    <<: *yb
+    hostname: yb1
+    command: ["bin/yugabyted", "start", "--background=false", "--advertise_address=yb1", "--tserver_flags=${YB_TSERVER_FLAGS}", "--master_flags=${YB_MASTER_FLAGS}"]
+    volumes: [yb1data:/root/var]
+  yb2:
+    <<: *yb
+    hostname: yb2
+    command: ["bin/yugabyted", "start", "--background=false", "--advertise_address=yb2", "--join=yb1", "--tserver_flags=${YB_TSERVER_FLAGS}", "--master_flags=${YB_MASTER_FLAGS}"]
+    volumes: [yb2data:/root/var]
+  yb3:
+    <<: *yb
+    hostname: yb3
+    command: ["bin/yugabyted", "start", "--background=false", "--advertise_address=yb3", "--join=yb1", "--tserver_flags=${YB_TSERVER_FLAGS}", "--master_flags=${YB_MASTER_FLAGS}"]
+    volumes: [yb3data:/root/var]
+
   postgres:
-    image: postgres:17-alpine
-    command: ["postgres", "-c", "max_connections=1000", "-c", "shared_preload_libraries=pg_stat_statements"]
+    image: ${PG_IMAGE:?set PG_IMAGE}
+    profiles: ["pg"]
+    command: ["postgres", "-c", "max_connections=1000", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "shared_buffers=512MB"]
+    mem_limit: ${PG_MEM:-3g}
+    shm_size: 512m
     environment:
       POSTGRES_USER: veil
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
@@ -33,7 +66,8 @@ services:
   minio:
     # MinIO no longer publishes images on Docker Hub; this is the server
     # binary as Bitnami last packaged it (docs/HUB.md §13.1).
-    image: bitnamilegacy/minio:latest
+    image: ${MINIO_IMAGE:?set MINIO_IMAGE}
+    mem_limit: ${MINIO_MEM:-512m}
     environment:
       MINIO_ROOT_USER: ${S3_KEY:?set S3_KEY}
       MINIO_ROOT_PASSWORD: ${S3_SECRET:?set S3_SECRET}
@@ -47,101 +81,76 @@ services:
 
   # The migrations run once, before any server starts (BUG-838).
   migrate:
-    image: veil-server:${TAG:?set TAG}
-    command: ["migrate"]
-    environment:
-      VEIL_DATABASE_URL: postgres://veil:${DB_PASSWORD}@postgres:5432/veil
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  veil-server:
     image: veil-server:${TAG}
-    command:
-      - --listen
-      - 0.0.0.0:8443
-      - --data
-      - /var/lib/veil
-      - --db-connections
-      - "64"
-      - --s3-endpoint
-      - http://minio:9000
-      - --s3-bucket
-      - veil-rehearsal
-      - --tls-cert
-      - /tls/server.pem
-      - --tls-key
-      - /tls/server-key.pem
+    command: ["migrate"]
+    mem_limit: 512m
     environment:
-      VEIL_DATABASE_URL: postgres://veil:${DB_PASSWORD}@postgres:5432/veil
+      VEIL_DATABASE_URL: ${DB_URL_1:?set DB_URL_1}
+
+  hub1:
+    <<: *server
+    environment:
+      VEIL_DATABASE_URL: ${DB_URL_1}
       VEIL_S3_ACCESS_KEY: ${S3_KEY}
       VEIL_S3_SECRET_KEY: ${S3_SECRET}
     volumes:
-      - hubdata:/var/lib/veil
+      - hub1data:/var/lib/veil
       - ${TLS_DIR:?set TLS_DIR}:/tls:ro
-    ports:
-      - "127.0.0.1:${HUB_PORT:-18443}:8443"
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-      minio:
-        condition: service_healthy
 
-  # A regional cache in front of the server (docs/HUB.md §13.18). It reads
-  # the server's cache token from the server's data directory (read-only).
-  veil-cache:
+  # Servers behind one address are one server to a client: the second
+  # gets the first's identity, receipt key, grant key and cache token
+  # (configure.sh does the same over SSH).
+  hub2-keys:
     image: veil-server:${TAG}
-    command:
-      - cache
-      - --upstream
-      - https://veil-server:8443
-      - --upstream-ca
-      - /tls/ca.pem
-      - --token-file
-      - /hub/hub-cache-token
-      - --dir
-      - /var/lib/veil-cache
-      - --listen
-      - 0.0.0.0:8444
-      - --size
-      - 2G
-      - --memory
-      - 128M
-      - --tls-cert
-      - /tls/server.pem
-      - --tls-key
-      - /tls/server-key.pem
-    environment:
-      VEIL_HEALTH_URL: https://127.0.0.1:8444/v1/epochs
+    user: "0"
+    entrypoint: ["sh", "-c", "cd /hub1 && cp hub-identity.json hub-receipt-key hub-grant-key hub-cache-token /hub2/ && chown 10001:10001 /hub2/hub-* && chmod 600 /hub2/hub-*"]
+    mem_limit: 64m
     volumes:
-      - hubdata:/hub:ro
-      - cachedata:/var/lib/veil-cache
-      - ${TLS_DIR}:/tls:ro
-    ports:
-      - "127.0.0.1:${CACHE_PORT:-18444}:8444"
-    depends_on:
-      veil-server:
-        condition: service_healthy
+      - hub1data:/hub1:ro
+      - hub2data:/hub2
 
-  # The load driver: `docker compose run --rm bench load --url https://veil-server:8443 …`
+  hub2:
+    <<: *server
+    environment:
+      VEIL_DATABASE_URL: ${DB_URL_2:?set DB_URL_2}
+      VEIL_S3_ACCESS_KEY: ${S3_KEY}
+      VEIL_S3_SECRET_KEY: ${S3_SECRET}
+    volumes:
+      - hub2data:/var/lib/veil
+      - ${TLS_DIR}:/tls:ro
+
+  # The balancer: HAProxy, TLS passed through (deploy/lb/haproxy-cfg.sh).
+  lb:
+    image: ${HAPROXY_IMAGE:?set HAPROXY_IMAGE}
+    mem_limit: 256m
+    ulimits: { nofile: { soft: 1048576, hard: 1048576 } }
+    volumes:
+      - ${LB_CFG:?set LB_CFG}:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "127.0.0.1:${LB_PORT:-18443}:8443"
+
+  # The load driver: `docker compose run --rm bench load --url https://lb:8443 …`.
+  # Its database URL is for the statement and commit counters only.
   bench:
     image: veil-bench:${TAG}
     profiles: ["bench"]
+    mem_limit: ${BENCH_MEM:-2g}
+    ulimits: { nofile: { soft: 1048576, hard: 1048576 } }
     environment:
-      VEIL_DATABASE_URL: postgres://veil:${DB_PASSWORD}@postgres:5432/veil
+      VEIL_DATABASE_URL: ${DB_URL_1}
       VEIL_S3_ACCESS_KEY: ${S3_KEY}
       VEIL_S3_SECRET_KEY: ${S3_SECRET}
     volumes:
       - benchwork:/work
-      - ./results:/work/results
+      - ${RESULTS_DIR:?set RESULTS_DIR}:/work/results
       - ${TLS_DIR}:/tls:ro
-    depends_on:
-      veil-server:
-        condition: service_healthy
 
 volumes:
+  yb1data:
+  yb2data:
+  yb3data:
   pgdata:
   miniodata:
-  hubdata:
-  cachedata:
+  hub1data:
+  hub2data:
   benchwork:

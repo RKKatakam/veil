@@ -17,9 +17,11 @@ FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc
 WORKDIR /src
 COPY . .
 ENV CARGO_INCREMENTAL=0 CARGO_NET_RETRY=10
+# Parallel compile jobs (build.sh passes CARGO_BUILD_JOBS as VEIL_BUILD_JOBS; empty: one per core).
+ARG VEIL_BUILD_JOBS=
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --locked --release -p vl -p veil-server -p veil-bench \
+    cargo build --locked --release ${VEIL_BUILD_JOBS:+-j $VEIL_BUILD_JOBS} -p vl -p veil-server -p veil-bench \
     && mkdir -p /out && cp target/release/vl target/release/veil-server target/release/veil-bench /out/ \
     && strip /out/vl /out/veil-server /out/veil-bench
 
@@ -47,6 +49,10 @@ EXPOSE 8443
 # cache from before BUG-1592's fix advertises h2 but serves HTTP/1 only,
 # which breaks an HTTP/2 client's stream.
 ENV VEIL_HEALTH_URL=https://127.0.0.1:8443/v1/epochs
+# `docker stop` asks the server to stop as Ctrl-C does: as PID 1 it would
+# ignore SIGTERM (it handles SIGINT only), and Docker would kill it after
+# the stop timeout instead.
+STOPSIGNAL SIGINT
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
     CMD case "$(curl -ksS --http1.1 -o /dev/null -w '%{http_code}' --max-time 2 "$VEIL_HEALTH_URL")" in 2*|4*) exit 0;; *) exit 1;; esac
 ENTRYPOINT ["/usr/local/bin/veil-server"]

@@ -28,7 +28,7 @@ droplets | while read -r role name size; do printf '   %-10s %-22s %s\n' "$role"
 BUCKET=${BUCKET:-$NAME-objects-$(openssl rand -hex 3)}
 echo "   Spaces bucket $BUCKET at $SPACES_ENDPOINT (created by the server at first start)"
 est=$("$DO_HERE/estimate.sh" 2>/dev/null) || { "$DO_HERE/estimate.sh" >/dev/null; exit 1; }
-printf '%s\n' "$est" | tail -4 | sed 's/^/   /'
+printf '%s\n' "$est" | grep -E '^(hourly rate|planned|24 hours|a whole month)' | sed 's/^/   /'
 [ $APPROVED = 1 ] || echo "== dry run: the commands that --approve would run follow"
 
 if [ $APPROVED = 1 ]; then
