@@ -41,7 +41,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6). **Built** (`HUB.md` §13.15) | S1 |
 | S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7). **Built** (`HUB.md` §13.20), with staged uploads (BUG-930) and checks several at once (BUG-865) | S5, S27 |
 | S29 | 2 | Merging packs and pack garbage collection (`storage-and-cost.md` §8) | S28 |
-| G2 | 2 | Phase 2 gate run | S3–S11, S27–S29 |
+| G2 | 2 | Phase 2 gate run: **run on 2026-11-12** (`22b9d837`), with misses (below) | S3–S11, S27–S29 |
 | S12 | 3 | Derived-data framework, commit graph, changed paths, per-rule lists, eager projection memos at each branch move | S1 |
 | S13 | 3 | Query API with per-viewer projection, and the projection-equivalence harness. **Built** (phase 3 §11) | S12 |
 | S14 | 3 | Blame and file history | S13 |
@@ -57,7 +57,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S24 | 4 | Rate limits, health metrics, failure isolation | S17 |
 | S25 | 4 | Web client, first version (no secrets) | S13, S21 |
 | S26 | 4 | Secrets in the browser (approved by the owner, 2026-11-11) | S25, S2 |
-| G4 | 4 | Phase 4 gate run | S17–S24 |
+| G4 | 4 | Phase 4 gate run: **run on 2026-11-12** (`22b9d837`), **missed** (below) | S17–S24 |
 
 **Phases overlap.** The dependencies are between milestones, not phases: phase 3's derived data (S12) and phase 4's landing service (S17) do not wait for the whole of phase 2.
 
@@ -94,12 +94,39 @@ The owner's goal: every milestone of phases 1–4 built, reviewed and merged, th
 |---|---|
 | **Built and merged** | S1, S2 (phase 1); S3–S11, S27, S28, S29 (phase 2); S12–S16 (phase 3); S17–S26 (phase 4), **S26 included**: secrets in the browser, which the owner approved on 2026-11-11; the deployment kit (`deploy/`, `docs/DEPLOY.md`) |
 | **Reviewed** | Each milestone by its own review loop; phase 1's client security pass (BUG-1800 to 1804) and the deep review after phase 2 (BUG-1780 to 1786); then **one review of the whole code base, in eight passes** (2026-11-10 and 11), which filed BUG-1830 to BUG-1908. All of those are fixed and merged but two, which are open in `docs/BUGS.md`: BUG-1886 (an approval withdrawn while the landing batch commits) and BUG-1892 (sign-ups from one address that vouch for each other; its fix waits for the owner's choice) |
-| **Left: gate runs** | **G2** (phase 2: Git beside Veil on the 1 GB profile, on a quiet machine); **G4** (phase 4: landing, then bisect); **the blame speed gate again** (part of G3, S16: a first blame of 10,000 versions within 1 s), because the server's blame line maps changed after it was measured (BUG-1893, BUG-1895, BUG-1896) |
+| **Gate runs: done, 2026-11-12** | G2, G4 and the blame speed gate were run on `22b9d837` ("Gate results" below; `docs/design/scale/LOAD.md` and `OPENSCION.md`, "Gate runs on `22b9d837`"). The blame gate passes. **G4 misses** (BUG-1940 to 1942), and G2 has misses (BUG-1943 to 1948). **Left:** those bugs, then G4 again; the bisect gate and the failover run, which have no benchmark yet |
 | **Left: the DigitalOcean test** | The gate benchmarks at the real scale, with the deployment kit. **Nothing is rented before the owner approves it** (product decision 17) |
 
 Bugs still open are the rows of `docs/BUGS.md` whose first cell says open.
 
-### The waves, as they were built (all merged; G2 and G4 are still to run)
+### Gate results (2026-11-12, `integration` @ `22b9d837`)
+
+Measured alone on the development machine through `bench-quiet.sh`; commands, loads and full tables in `docs/design/scale/LOAD.md` and `docs/design/scale/OPENSCION.md` ("Gate runs on `22b9d837`"). "Before this week" is a build of `404ca2c1`, without the review's fixes.
+
+| Gate | Result | Target | |
+|---|---|---|---|
+| **G4** landings/s into one `main`, one person's agents (the benchmark as it was) | 464 (1,000 agents), 484 (10,000); 564 and 496 before this week; 993 and 943 on 2026-11-08 | 1,000 sustained | **miss** (BUG-1940: S24 part B serializes one person's landings) |
+| G4, the agents spread over 100 people, unprotected, 15 s | 924 and 958 (p50 205 and 310 ms, p99 1.29 and 0.75 s); 1,003 and 974 before this week | 1,000; p50 150 ms; p99 1 s | **miss** by 4 to 8 %; met with 256 database connections at 1,000 agents (1,010/s, p50 132 ms, p99 666 ms) |
+| G4, the same for three minutes | 220/s seen by the agents (309 before this week), with stalls; **500/s offered holds** (p50 104 ms, p99 925 ms), 750/s does not | 1,000 sustained | **miss** (BUG-1941: past its capacity the service slows down as its queue grows) |
+| G4, 100 people, protected `main` (review rules at 0 approvals), 15 s | 721 and 721 (p99 4.7 s); 1,006 and 1,009 before this week; over three minutes 106 (314 before) | the same | **miss** (BUG-1942: BUG-1880's fix asks the review rules three times per change) |
+| G4 as designed: protected, 95 / 3 / 2 % mix, 10,000 agents, 10 minutes | 125/s over the run, falling from about 190 to about 40; p99 44 s. Offered 300/s, the same shape holds for three minutes at p50 41 ms, p99 589 ms | 1,000 sustained, p99 1 s | **miss: the service collapses past its capacity** (BUG-1941: each batch reads the whole queue) |
+| G4 database commits per landing | 1.41 to 1.45 with full batches | at most 1.5 | pass |
+| G4 PRs: 100,000 in 50 classes; list, search; open, update | 6.3 ms, 22.4 ms; 8.7 ms, 9.4 ms (medians) | 50 ms; 100 ms | pass (the test had to be repaired first, BUG-1950) |
+| G4 bisect (10,000 landings), failover, thin pulls beside the landings | not run: no benchmark | | |
+| **G3** first blame of 10,000 versions | 425 ms (local objects), 528 ms (S3) | 1 s | pass |
+| G3 precomputed blame, p99 | 25.0 ms | 50 ms | pass |
+| **G2** Git beside Veil, 1,000 and 10,000 files: import; clone everything | 1.5 to 2.9× faster; faster at 1,000, level at 10,000 | beat Git | pass |
+| G2 commit one changed file with the watcher | 8.5 ms against 4.3 (1,000 files), 12.5 against 8.5 (10,000), 165 against 27 (1 GB profile) | beat Git | **miss** (BUG-1944) |
+| G2 clone one directory | level to 1.3× slower at 1,000 files; 1.2 to 1.3× faster at 10,000; 4 to 5 s against 0.4 s on the 1 GB profile | beat Git | **miss** at 1,000 files and at 1 GB (BUG-1945) |
+| G2 the default (thin) clone of the 1 GB profile | fails after 64 s, twice (8.0 s on 2026-11-07) | — | **miss** (BUG-1943) |
+| G2 fresh workspace, 2,000 to 200,000 files | cold 242 to 288 ms, warm 117 to 259 ms | 2 s cold, 300 ms warm | pass |
+| G2 pulls/s, `main` moving 20/s | 14,002 and 13,371 (10 and 100 agents); 1,467 with 1,000 agents | 10,000 | pass; **miss** at 1,000 agents (BUG-1947) |
+| G2 object reads from the regional cache | 99.98 to 100 % | 99 % | pass |
+| G2 cost: statements per warm pull; storage writes per push; server memory on the 1 GB profile | 3.0; 2.0; 965 MiB | 5; 2; 1 GB | pass |
+| G2 cost: database commits per push | 1.00 alone; 1.18 to 2.40 with pushes at once | 1 | **miss** (BUG-1946; the same before this week) |
+| G2 landings/s across 100 projects | 1,323 (push), 617 (API) | 4,000 | **miss** (BUG-1948; the same before this week) |
+
+### The waves, as they were built (all merged; G2 and G4 were run on 2026-11-12)
 
 | Wave | Starts when | Milestones | What each carries beyond its row |
 |---|---|---|---|
@@ -113,8 +140,8 @@ Bugs still open are the rows of `docs/BUGS.md` whose first cell says open.
 | **B** | S21 merges | **S25** | |
 | **C** | S21, S22 | **S23** | |
 | **C** | S14, S19 | **S20** | |
-| **C** | phase 2 in | **G2** | Git beside Veil on the 1 GB profile (thin and full clone, status, log), on a quiet machine |
-| **D** | S17, S18, S24 (landing), S20 (bisect) | **G4** | |
+| **C** | phase 2 in | **G2** | Git beside Veil on the 1 GB profile (thin and full clone, status, log), on a quiet machine. **Run 2026-11-12:** import and full clone beat or match Git; the thin clone of the 1 GB profile fails (BUG-1943); commit, status and log are behind Git (BUG-1944) |
+| **D** | S17, S18, S24 (landing), S20 (bisect) | **G4** | **Run 2026-11-12: missed.** One person's agents land 464 to 484/s, 100 people's 924 to 958/s unprotected and 721/s on a protected `main`; the 10-minute run collapses (BUG-1940 to 1942). The PR gate passes; no bisect benchmark exists |
 | — | owner approves | S26 | approved by the owner on 2026-11-11, built and merged (product decision 13) |
 
 ### Also on the plan (not milestones)

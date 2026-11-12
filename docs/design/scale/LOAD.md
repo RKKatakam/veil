@@ -582,6 +582,394 @@ rose to 88 during the 10,000-agent point.
 Raw results (not committed): `.scratch/bench21.log`, `.scratch/bench-results/server-landing-e56f4848-20261108T142211Z*`, `…T142409Z*`.
 
 
+## Gate runs on `22b9d837` (2026-11-12)
+
+The gates of phases 2, 3 (blame) and 4 on the final code: `integration` @
+`22b9d837`. The branch `gates` adds commits to the bench tool and one
+test only (no product code), so the results are labelled `8148b427` to
+`47d4f170`. Release builds, PostgreSQL 17 and MinIO in Docker, every run
+through `~/.cache/veil-orch/bench-quiet.sh`, one at a time, alone on the
+machine (32 threads, 30 GB) but for the one run marked "not alone". "Load" is the 1-minute load average the
+script prints before and after; an "after" above 16 is the benchmark's own
+(1,000 or 10,000 client threads) in every run below. "Before this week"
+is a server built from `404ca2c1` (`integration` on 2026-11-11 02:01,
+every milestone but S26 merged and none of the review's fixes), given to
+the same bench as `SERVER_BIN`. Git beside Veil is in `OPENSCION.md`;
+confirmed misses are `docs/BUGS.md` BUG-1940 to BUG-1949.
+
+**The bench tool, changed for these runs** (`crates/veil-bench`):
+
+* `load --protected`: `main` is a protected branch (`.veilrules`), its
+  `[review]` rules at 0 approvals. **The benchmark cannot make a protected
+  branch with approvals** (it opens no PRs): "protected" below always means
+  this, the review checks of the landing path with nothing to approve.
+* `load --mix`: 3 % of the landings change one line of a shared file read
+  at the tip (`GET …/q/file`, then a landing on that tip: a content merge
+  when another agent's line landed meanwhile), 2 % write one of 16 hot
+  files on the agent's last landing (a conflict whenever someone wrote it
+  since, then a new submit on the tip), the rest are a new file in the
+  agent's own folder, as before.
+* `load --people N`: the agents belong to N people in turn. They were all
+  one person's, and the server serializes and bounds landings per person
+  since S24 part B.
+* `load --merge-every N` (`branches`): the agent lands its branch on `main`
+  through the landing service after every N pushes.
+* The server it starts gets `--max-connections 262144`: one address may
+  open an eighth (S24), and 65,536 left 8,192 for 10,000 agents
+  (BUG-1951). Idle agents stop at once at the end of a point: 10,000 took
+  17 minutes (BUG-1952).
+
+### G4: one `main`, 1,000 landings a second (phase 4 §7)
+
+`OBJECTS=local LANDING_CLIENTS=1000,10000 LANDING_RATES=1000
+scripts/bench-server.sh landing [-- flags]`: open loop at 1,000/s, 15 s a
+point after a 3 s warm-up, objects in a local directory, as every run of
+"The landing service" above. Gates: 1,000/s sustained, p50 under 150 ms,
+p99 under 1 s, at most 1.5 database commits per landing, every agent
+served. Latency is from the scheduled time, so a backlog shows.
+
+| `main` | Server | People | Agents | Landed (/s) | p50 (ms) | p99 (ms) | Agents that landed | Landings per batch | Prepare (ms/batch) | Store objects (ms/batch) | Transaction (ms/batch) | DB commits per landing | DB statements per landing | Storage writes per landing | Load before / after |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| unprotected | before this week | 1 | 1,000 | 564 | 4,991 | 7,997 | 1,000 | 3.9 | 3.3 | 3.7 | 4.5 | 2.04 | 34.5 | 14.1 | 1.4 / 8.4 |
+| unprotected | before this week | 1 | 10,000 | 496 | 5,384 | 9,183 | 7,410 | 2.8 | 0.9 | 3.3 | 4.6 | 2.88 | 43.1 | 14.1 | |
+| unprotected | `22b9d837` | 1 | 1,000 | **464** | 7,222 | 10,353 | 1,000 | 4.4 | 4.0 | 3.9 | 6.8 | 2.25 | 46.3 | 14.1 | 3.6 / 7.2 |
+| unprotected | `22b9d837` | 1 | 10,000 | **484** | 4,768 | 9,084 | 7,240 | 3.5 | 1.4 | 4.0 | 5.6 | 2.96 | 51.7 | 14.2 | |
+| unprotected | before this week | 100 | 1,000 | 1,003 | 200 | 668 | 1,000 | 52.5 | 7.8 | 40.8 | 29.7 | 1.25 | 24.9 | 13.4 | 14.6 (waited 70 s) / 85.5 |
+| unprotected | before this week | 100 | 10,000 | 974 | 197 | 588 | 9,975 | 46.7 | 3.2 | 34.5 | 28.0 | 1.88 | 29.9 | 14.2 | |
+| unprotected | `22b9d837` | 100 | 1,000 | **924** | 205 | 1,289 | 1,000 | 57.3 | 12.5 | 47.8 | 35.6 | 1.41 | 36.8 | 14.3 | 2.1 / 49.5 |
+| unprotected | `22b9d837` | 100 | 10,000 | **958** | 310 | 751 | 9,975 | 57.3 | 2.6 | 45.8 | 35.5 | 1.45 | 40.6 | 14.4 | |
+| protected | before this week | 1 | 1,000 | 509 | 6,296 | 9,306 | 1,000 | 3.6 | 2.9 | 3.8 | 4.9 | 2.05 | 36.4 | 13.6 | 13.8 (waited 10 s) / 20.7 |
+| protected | before this week | 1 | 10,000 | 414 | 5,883 | 10,145 | 6,174 | 2.8 | 1.0 | 3.7 | 5.5 | 4.41 | 49.5 | 14.2 | |
+| protected | `22b9d837` | 1 | 1,000 | **441** | 6,934 | 10,089 | 1,000 | 7.5 | 9.0 | 5.4 | 13.1 | 2.10 | 50.4 | 13.9 | 14.9 / 17.7 |
+| protected | `22b9d837` | 1 | 10,000 | **464** | 5,958 | 9,627 | 6,942 | 6.4 | 6.1 | 5.3 | 10.4 | 3.19 | 55.4 | 14.2 | |
+| protected | before this week | 100 | 1,000 | 1,006 | 157 | 591 | 1,000 | 32.9 | 8.0 | 21.5 | 20.5 | 1.34 | 30.2 | 13.8 | 13.7 (waited 140 s) / 43.7 |
+| protected | before this week | 100 | 10,000 | 1,009 | 270 | 699 | 9,981 | 58.3 | 3.1 | 43.8 | 34.6 | 1.73 | 32.5 | 13.8 | |
+| protected | `22b9d837` | 100 | 1,000 | **721** | 2,743 | 4,666 | 1,000 | 64.0 | 43.5 | 42.9 | 64.3 | 1.58 | 46.2 | 14.3 | 14.1 (waited 110 s) / 135.3 |
+| protected | `22b9d837` | 100 | 10,000 | **721** | 2,901 | 4,581 | 9,976 | 64.0 | 31.5 | 47.3 | 64.7 | 2.54 | 62.5 | 16.8 | |
+| protected, `--mix` | `22b9d837` | 100 | 1,000 | **573** | 3,217 | 7,022 | 981 (212 landings failed: a file read at the tip answered `503 warming`, BUG-1949) | 20.3 | 14.7 | 14.5 | 21.7 | 1.84 | 45.2 | 13.4 | 13.9 (waited 70 s) / 16.2 |
+| protected, `--mix` | `22b9d837` | 100 | 10,000 | **443** | 3,502 | 8,721 | 6,625 | 59.3 | 33.0 | 43.2 | 63.9 | 3.91 | 94.8 | 23.4 | |
+
+Flags: `--people 100`, `--protected`, `--protected --mix --people 100`;
+"before this week" adds `SERVER_BIN=<a build of 404ca2c1>`. The last
+measurement of the same benchmark, one person and unprotected, was 993/s
+(p99 327 ms) and 943/s (p99 1.01 s) on `6fa552c` (2026-11-08).
+
+**Against the gates, on `22b9d837`:**
+
+| What | Result | Target | |
+|---|---|---|---|
+| Landed/s, one person's agents, unprotected (the benchmark as it was) | 464 (1,000 agents), 484 (10,000) | 1,000 | **miss** (BUG-1940) |
+| Landed/s, 100 people's agents, unprotected | 924, 958 | 1,000 | **miss by 4 to 8 %** (1,003 and 974 before this week) |
+| Landed/s, 100 people's agents, protected (0 approvals) | 721, 721 | 1,000 | **miss** (BUG-1942; 1,006 and 1,009 before this week) |
+| Landed/s, protected, 95 / 3 / 2 % mix, 10,000 agents of 100 people, 15 s | 443 | 1,000 | **miss** |
+| The same for 10 minutes (the gate as designed) | 125 over the run, from about 190 down to about 40 | 1,000 sustained | **miss: the service does not hold** (BUG-1941; below) |
+| 1,000/s offered for three minutes, 100 people, unprotected / protected | 220 / 106 an agent saw land (309 / 314 before this week) | 1,000 sustained | **miss** (BUG-1941); 500/s holds, 750/s does not |
+| p50, the best case (100 people, unprotected) | 205 ms, 310 ms | under 150 ms | **miss** (200 and 197 ms before this week) |
+| p99, the best case | 1,289 ms (1,000 agents), 751 ms (10,000) | under 1 s | **miss / pass** |
+| Database commits per landing, the best case | 1.41, 1.45 | at most 1.5 | **pass**; 2.3 to 3.2 with one person (small batches) |
+| Every agent served | 1,000 of 1,000; 9,975 of 10,000 in 15 s with 100 people; about 7,000 of 10,000 with one person | every agent | **pass** only with 100 people |
+
+**Where the time goes, and what each of this week's changes costs.**
+
+1. **One person's agents wait on each other** (BUG-1940; S24 part B,
+   2026-11-10, not this week). Each submit locks its person's row
+   (`SELECT id FROM people … FOR UPDATE`) for its whole transaction.
+   `pg_stat_statements`: with one person a submit waits 83.5 ms for that
+   lock before this week and 94.6 ms now; with 100 people 0.08 and
+   0.03 ms. The transaction under the lock went from 1.77 to 2.15 ms
+   (1/564 s, 1/464 s): this week's statements in it cost 0.4 ms, and 18 %
+   of the rate. Batches hold 4 landings, so commits per landing are 2 to 3.
+2. **This week's changes, on an unprotected `main`, 100 people** (per
+   landing, from `pg_stat_statements`; database time in brackets). The
+   rate went from 1,003 to 924/s (1,000 agents) and 974 to 958/s (10,000),
+   p99 from 668 to 1,289 ms and 588 to 751 ms; statements per landing from
+   24.9 to 36.8; a batch of about 55 from 7.8 to 12.5 ms of prepare and
+   29.7 to 35.6 ms of transaction (0.2 ms a landing together).
+
+   | Change | Statements added per landing | Where |
+   |---|---:|---|
+   | BUG-1881: the shared advisory lock and the row lock of the GC epoch, first in every root-writing transaction | 3.0 (0.07 ms): the guard 1.02, and 2.02 reads of the epoch it is compared with | every submit's transaction, and one per batch |
+   | BUG-1884 and BUG-1921: "reverted twice" | 2.0 (0.05 ms): the lookup 1.00, the queued reverts settled 1.02 | every submit; once more per batch |
+   | BUG-1880: the review rules | 1.0 (0.02 ms): the rules' state beside the branch | every submit (the rest only on a protected branch, below) |
+   | BUG-1524 and BUG-1922: landed records for held snapshots | 0: the "already landed" lookup and the batch's `landings` read became statements with `NOT EXISTS`, and the branch read carries `changes_recorded` (0.02 ms each, as before; the batch's read 0.08 ms a landing, as before) | submit and batch |
+   | BUG-1920: write access for every path a landed entry brings | 0: no statement; it runs in the batch's prepare on trees it already reads | part of prepare's 7.8 → 12.5 ms a batch (under 0.09 ms a landing, with the lookups above) |
+   | Not on the list: the embargo fixes (BUG-1851 and the others) | 2.0 (0.01 ms): the project's unreleased embargo lines | every submit |
+
+   None of these costs database time worth naming (0.15 ms a landing in
+   all); they cost round trips, about 0.2 ms each on one connection, and
+   those inside the submit's transaction are what item 1 multiplies.
+3. **BUG-1880 on a protected `main`** (BUG-1942). The review gate of each
+   entry is asked at the submit, again for every entry in the batch's
+   prepare, and again for every entry inside the batch's commit
+   transaction: the candidate PRs and the holds are read 2.94 times a
+   landing where they were read once, and the reverted-twice lookup 2.94
+   times (30.2 → 46.2 statements a landing in all). They run one entry after
+   another, so a batch of 64 spends 43.5 ms in prepare (8.0 before) and
+   64.3 ms in its transaction (20.5 before): **1,006 → 721/s, p99 0.59 →
+   4.7 s** with 1,000 agents, 1,009 → 721/s with 10,000. The batches are
+   full (64): this is the service's limit on a protected branch.
+4. **The object store is no longer the first limit**, but it is the largest
+   part of a batch: 41 to 48 ms to store a batch of about 55 (14 storage
+   writes a landing, each a synced file, as before).
+
+**Ten minutes: the gate as designed, as far as the tool can express it**
+(`OBJECTS=local LANDING_CLIENTS=10000 LANDING_RATES=1000 DURATION=600
+scripts/bench-server.sh landing -- --protected --mix --people 100`; load
+14.9 before after a 20 s wait, 24.6 after, 20 to 63 during). Not run: the
+1,000 thin pulls a second beside it (the tool's pulls are catch-up pulls
+of one project it creates itself), and the failover run (one server).
+
+| Measure | Result | Gate |
+|---|---|---|
+| Landed, by the server's records | 75,646 in 606 s: **125/s**; 172 to 285/s in the first minute, 26 to 91/s in the last three | 1,000/s sustained |
+| Landings an agent saw finish within its 60 s | 28/s; p50 22.0 s, p99 44.0 s | p50 150 ms, p99 1 s |
+| Requests that failed | 582,677: still queued after the server's 30 s wait, "you already have 1000 landings waiting in the queue" (`429`), and file reads at the tip answered `503 warming` | — |
+| Submits accepted / refused at the person's bound | 183,853 / about 203,000 | — |
+| Conflicts delivered per landing | 0.032 | 2 % of changes |
+| Database commits / statements / storage writes per landing | 21.8 / 759 / 195 (work for landings that never finished) | 1.5 commits |
+| Server memory | 1.0 GB after the first 40 s, 2.1 GB at the end | — |
+
+It collapses because **each batch reads the whole queue** (BUG-1941): the
+batch picker's statement returned 52 million rows in 2,601 calls: 1,257 a
+call in the first minute, 10,191 by the fifth, 76,600 a call over the last
+five (168 ms each in the database, before the server decodes them), to
+choose 64. On a protected `main` with the mix the service lands under
+600/s (the 15 s points), so at 1,000/s the queue grows from the first
+second, each batch slows down further, agents whose 30 s wait ran out
+submit again, and people reach their bound of 1,000 queued landings.
+Before this week's fixes a protected `main` landed 1,006/s (15 s, no mix):
+BUG-1880's cost is what puts the gate's rate above the service's capacity;
+the collapse past capacity is S24 part B's.
+
+**The database, before and after the 10 minutes** (sampled every 20 s:
+`pg_database_size`, and rows from the statistics, `n_live_tup`; "before" is
+the first sample of the measured window, 02:03:31, 7,605 landings in;
+"after" 02:13:37; per landing = growth / 75,646 landed):
+
+| | Before | After | Per landing |
+|---|---:|---:|---:|
+| Database size | 96.0 MB | 1,242.7 MB | 15.2 KB |
+| Disk used (database, WAL, objects in the local store) | — | +18.9 GB | 250 KB |
+| `projections` | 22,098 rows | 433,348 rows, 382 MB | 5.44 rows, 4.8 KB |
+| `landing_queue` | 7,877 | 183,887, 157 MB | 2.33 rows, 1.9 KB |
+| `view_graph` | 12,244 | 166,264, 141 MB | 2.04 rows, 1.7 KB |
+| `view_file_history` | 12,254 | 166,274, 101 MB | 2.04 rows, 1.2 KB |
+| `snapshots` | 15,713 | 270,795, 70 MB | 3.37 rows, 0.9 KB |
+| `view_changes` | 12,244 | 166,264, 69 MB | 2.04 rows, 0.8 KB |
+| `graph` | 7,642 | 83,250, 68 MB | 1.00 row, 0.8 KB |
+| `change_refs` | 7,877 | 183,919, 46 MB | 2.33 rows, 0.6 KB |
+| `landings` | 7,841 | 85,131, 45 MB | 1.02 rows, 0.5 KB |
+| `landed_from` | 7,652 | 83,275, 34 MB | 1.00 row, 0.4 KB |
+| `landed_changes` | 7,605 | 83,251, 34 MB | 1.00 row, 0.4 KB |
+| `file_history` | 7,648 | 83,256, 31 MB | 1.00 row, 0.4 KB |
+| `rule_history` | 7,643 | 83,251, 27 MB | 1.00 row, 0.3 KB |
+| `audit_log` | 8,175 | 186,004, 25 MB | 2.35 rows, 0.3 KB |
+
+This run's growth per landing is inflated by the 2.33 submits a landing
+(queue rows, change refs, snapshots and projections of changes that never
+landed) and by the mix's shared files (46 KB a version). The growth of
+runs that hold their rate follows the next table.
+
+**Three minutes at a time: what the service holds** (`OBJECTS=local
+LANDING_CLIENTS=10000 LANDING_RATES=<offered> DURATION=180
+scripts/bench-server.sh landing -- --people 100 [--protected] [--mix]`;
+10,000 agents of 100 people). "Agents saw land" counts landings answered
+within the agent's 60 s; the server's own rate is from its landed records,
+sampled every 15 s.
+
+| `main` | Server | Offered (/s) | Agents saw land (/s) | p50 | p99 | Failed requests | The server's landings/s, each 15 s | DB commits / statements per landing | Load before / after |
+|---|---|---:|---:|---:|---:|---:|---|---|---|
+| unprotected | before this week | 1,000 | 309 | 15.5 s | 70.6 s | 54,327 | 982, 524, 388, 354, 371, 341, 300, 345, 213 | 3.12 / 47.4 | 14.0 (waited 20 s) / 31.3 |
+| unprotected | `22b9d837` | 1,000 | **220** | 10.0 s | 38.5 s | 70,557 | 644, 529, 405, 375, 208, 17, 0, 0, 0, 362, 366, 358, 388 | 3.70 / 79.7 | 2.3 / 19.1 |
+| protected | before this week | 1,000 | 314 | 22.0 s | 64.7 s | 53,860 | 905, 605, 358, 392, 376, 401, 465, 324, 92 | 2.61 / 47.8 | 15.3 (waited 40 s) / 24.2 |
+| protected | `22b9d837` | 1,000 | **106** | 3.8 s | 21.9 s | 91,231 | 472, 358, 93, 0, 166, 280, 328, 294, 332, 224 | 8.65 / 174.3 | 15.3 (waited 30 s) / 29.4 |
+| protected, `--mix` | before this week | 1,000 | 111 | 20.4 s | 46.0 s | 90,305 | 319, 331, 297, 247, 258, 213, 169, 158, 0, 56, 144, 154, 195 | 7.49 / 114.9 | 16.0 (waited 20 s) / 27.1 |
+| protected, `--mix` | `22b9d837` | 1,000 | 28 (the 10-minute run) | 22.0 s | 44.0 s | 582,677 | 172 to 285, then down to 26 to 91 | 21.8 / 759 | above |
+| unprotected | `22b9d837` | 750 | 398 | 0.6 s | 42.8 s | 12,832 | 801, 760, 733, 612, 324, 351, 341, 316, 392 | 1.91 / 48.9 | 13.8 (waited 20 s) / 19.4 |
+| unprotected | `22b9d837` | 500 | **500** | **104 ms** | **925 ms** | 0 | 467 to 558 throughout | 1.68 / 40.2 | 16.0 / 27.6 |
+| protected, `--mix` | `22b9d837` | 300 | **300** | **41 ms** | **589 ms** | 4 (`warming`) | 284 to 312 throughout | 3.61 / 66.7 | 14.3 (waited 30 s) / 18.8 |
+| protected | `22b9d837` | 500 | 459 | 173 ms | 12.9 s | 0 | 463 to 598, then 414, 345, 251 | 1.93 / 53.7 | 10.2 / 45.8, **not alone** (see below) |
+
+* **No build holds 1,000/s for three minutes**, protected or not, this
+  week's or last week's: each starts near its 15 s rate (982, 905, 644,
+  472/s) and is at 200 to 400/s within a minute, with stretches of 15 to
+  45 s in which nothing lands. The 15 s points of the first table end
+  before the queue is long. The batch's read of the queue is what grows
+  (BUG-1941): 43 to 110 rows a call in the first 15 s, 5,300 to 11,900 on
+  average by the end of three minutes, on both builds.
+* **This week's fixes make the fall deeper**: 309 → 220/s unprotected,
+  314 → 106/s protected (BUG-1942), 111 → 28/s with the mix.
+* **Under its capacity the service is fast**: 500/s unprotected for three
+  minutes at p50 104 ms and p99 925 ms with nothing refused; 300/s on a
+  protected `main` with the 95 / 3 / 2 mix at p50 41 ms and p99 589 ms
+  (0.020 conflicts delivered per landing). 750/s did not hold, and a
+  protected `main` offered 500/s fell behind in its last 45 s (459/s, p99
+  12.9 s). That last run is the only one here that was not alone: another
+  session's benchmark (`scripts/bench-server.sh 1g` in another worktree)
+  held the benchmark lock from 03:30 to 03:42 UTC, this run started as it
+  ended, and that session was still at work. So what is
+  sustained today is between 500 and 750 landings a second on an
+  unprotected `main`: 43 to 65 million a day, where the phase's number is
+  86 million.
+
+**Growth per landing, from the two runs that held their rate** (the
+database sampled as above; before = the first sample of the run):
+
+| | Unprotected, 500/s | Protected, `--mix`, 300/s |
+|---|---:|---:|
+| Landings between the samples | 87,586 in 198 s | 50,298 in 168 s |
+| Database size | 61.4 → 907.8 MB: **9.7 KB a landing** (the deriver's rows were 14 % behind at the last sample) | 50.4 → 655.3 MB: **12.0 KB a landing** |
+| Disk used: database, WAL and the local object store | +7.9 GB: 90 KB a landing | +5.1 GB: 101 KB a landing |
+| Rows per landing: `projections` | 2.73 | 4.02 |
+| `view_graph`, `view_file_history`, `view_changes` (each) | 1.41 | 2.00 |
+| `snapshots` | 2.00 | 2.03 |
+| `landings` / `audit_log` | 1.10 / 1.09 | 1.31 / 1.32 |
+| `landing_queue`, `change_refs`, `landed_from`, `landed_changes` (each) | 1.00 | 1.00 to 1.02 |
+| `graph`, `file_history`, `rule_history` (each) | 0.86 | 1.00 |
+| Largest tables, bytes a landing | `projections` 2.6 KB, `view_graph` 1.2 KB, `landing_queue` 0.9 KB, `view_file_history` 0.8 KB | `projections` 3.3 KB, `view_graph` 1.7 KB, `view_file_history` 1.2 KB, `landing_queue` 1.1 KB |
+| Server memory, first → last sample | 0.60 → 1.55 GB (peak) | 0.53 → 1.74 GB |
+
+About 18 to 22 rows and 10 to 12 KB of database a landing with two view keys
+(the admin's and the agents' group's), so a million landings a day is
+about 10 to 12 GB of database a day; queue rows are kept (1 KB a landing)
+while the branch is busy. The local object store takes most of the disk:
+14 files a landing, a 4 KiB block each at least. The server's memory grew
+by about 1 GB in three minutes in both runs and by 1.1 GB over the 10
+minutes; whether it levels off was not measured.
+
+**With 256 database connections** (`… landing -- --people 100
+--db-connections 256`; the bench starts its server with 64, and S24 lets a
+project run three quarters of them at once; load 14.3 before after a 20 s
+wait, 40.6 after): 1,010/s, p50 132 ms, p99 666 ms, 1.33 commits per
+landing with 1,000 agents: **every gate met**; 935/s, p50 317 ms, p99
+1,135 ms, 1.82 commits with 10,000. So for 15 s an unprotected `main` and
+many people's agents still reach the gate at 1,000 agents, and the 924/s
+of the first table is within the spread between runs of one build; at
+10,000 agents the latency gates are missed either way. It was not run for
+three minutes.
+
+### The other gates of phase 4 §7
+
+| Gate | Measured | Target | | Load before / after |
+|---|---|---|---|---|
+| `veil-bench prs`: 100,000 PRs in 50 visibility classes, a viewer who may see 25 of them (50,000 PRs): list with its count | p50 6.3 ms, p99 20.3 ms | under 50 ms | **pass** | 0.95 / 1.26 |
+| search | p50 22.4 ms, p99 26.9 ms | under 50 ms | **pass** | |
+| open a PR | p50 8.7 ms; the slowest of 60, the first, 103 ms | under 100 ms | **pass** on the median | |
+| update (a new revision) | p50 9.4 ms, p99 51.6 ms | under 100 ms | **pass** | |
+| show | p50 5.8 ms, p99 9.1 ms | — | | |
+| `veil-bench bisect`: a culprit among 10,000 landings in at most 4 rounds of 8 parallel checks | **not run: there is no such benchmark** (no `veil-bench bisect`, no test at that size) | | | |
+| failover: the leaseholder killed every 30 s | **not run**: the bench starts one server | no ticket lost, at most 2 s of stall | | |
+| 1,000 thin pulls a second and phase 3 queries beside the landings | **not run** as designed (below); the mix's one query, a file read at the tip, answered `503 warming` 212 times in 15 s at about 600 landings a second (BUG-1949) | | | |
+
+There is no `veil-bench prs` either: the gate is `server_hub`
+`prs::pr_speed` (ignored), run as `.scratch/gate-tests.sh prs::pr_speed
+--ignored` (a release build of the test binary on a PostgreSQL 17 and
+MinIO of its own). It could not run as written: it inserted a `prs.risk`
+column that the schema keeps in `pr_revisions` (BUG-1950, fixed on this
+branch). On bisect, by the design's own bound (`HUB.md` §13: at most
+⌈log₉ N⌉ rounds with 8 parallel checks) 10,000 candidates need 5 rounds,
+not 4: 9⁴ is 6,561. Only narrowing by path can bring it to 4.
+
+### Many branches moving at once (the owner's extra shape)
+
+`.scratch/bench-custom.sh custom -- --mode branches --projects 1 --clients
+300,600 --rates max --duration 30 [--merge-every 5]` (a copy of
+`scripts/bench-server.sh` with one more profile that passes its flags to
+`veil-bench load`; objects in a local directory; the agents are one
+person's). Each agent pulls `main`, then pushes one new file to a branch
+of its own, in a closed loop. `--merge-every 5`, new on this branch: after
+every fifth push the agent lands its branch on `main` through the landing
+service (`POST …/land` with the branch's tip: the five changes that have
+not landed yet land as new snapshots on `main`).
+
+| Agents | Merges into `main` | Pushes (/s) | p50 (ms) | p99 (ms) | Branches landed on `main` (/s) | DB commits per push (the push's own) | DB statements per push | Storage writes per push | Server CPU (ms/push) | Errors | Load before / after |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 100 (the `load` profile, MinIO) | none | 1,131 | 80 | 216 | — | 3.19 (1.18) | 39.1 | 2.6 | 8.2 | 0 | 5.8 / 81.6 |
+| 300 | none | 739 | 392 | 751 | — | 3.50 (1.49) | 42.1 | 3.1 | 18.9 | 0 | 15.7 (waited 50 s) / 37.9 |
+| 600 | none | 490 | 1,236 | 1,686 | — | 4.36 (2.34) | 45.8 | 3.3 | 35.6 | 0 | |
+| 300 | every 5th push | 259 | 673 | 4,496 | 53 (1,589 in 30 s; 265 changes/s) | 4.75 (2.73) | 81.6 | 10.8 | 71.6 | 0 | 15.6 (waited 50 s) / 45.4 |
+| 600 | every 5th push | 306 | 1,456 | 6,308 | 55 (1,653 in 30 s) | 4.64 (2.59) | 69.2 | 10.3 | 62.5 | 148: "the branch did not land on main", still queued after the server's 30 s wait | |
+
+* **More agents push less**: 1,131 pushes a second with 100 agents, 739
+  with 300, 490 with 600, at 19 and 36 ms of server CPU a push (8 ms at
+  100): the server's cores are busy (14 to 17 of 32), and the
+  cost of a push grows with the number of branches moving.
+* **Branches merge into `main` at about 55 a second** whatever the number
+  of agents, five changes each; the pushes fall to 260 to 310 a second
+  beside them, and with 600 agents 148 merges were still queued after
+  30 s. The agents are one person's, so their landings are serialized
+  (BUG-1940).
+
+### G2: the server's numbers (phase 2 §7 and §8, `storage-and-cost.md` §9)
+
+`scripts/bench-server.sh load` (MinIO; load 5.8 before, 81.6 after), and
+again with the server of before this week (0.6 before, 101.5 after);
+`scripts/bench-server.sh cache` (15.7 before after a 100 s wait, 66.2
+after); `scripts/bench-server.sh daemon` (2.8 before, 22.2 after);
+`S8_BENCH_FILES` as given, `.scratch/gate-tests.sh
+workspaces::s8_bench_ready_to_read --ignored`; `scripts/bench-server.sh
+1g` twice (`OPENSCION.md`).
+
+| Gate | Measured on `22b9d837` | Before this week | Target | |
+|---|---|---|---|---|
+| Pulls/s, up to date (`main` quiet), 10 / 100 / 1,000 agents | 13,355 / 27,348 / 25,862 | 14,121 / 27,365 / 26,738 | — | |
+| Statements per up-to-date pull, warm caches | 3.0 | 3.0 | 5 or fewer | **pass** |
+| Pulls/s, `main` moving 20/s, 10 / 100 agents | 14,002 / 13,371 | 14,044 / 13,707 | 10,000 | **pass** |
+| Pulls/s, `main` moving 20/s, 1,000 agents | 1,467 (p50 664 ms; 59.8 statements a pull) | 1,527 (59.0) | 10,000 | **miss** (BUG-1947) |
+| Pulls/s while `main` moves 1,000/s | **not run as designed**: the tool's one background agent landed 41/s (`--background 1000`); beside it 100 agents pulled 3,789/s (20 statements a pull), 1,000 agents 1,465/s | — | 1,000+ | |
+| Object reads answered by the regional cache | 99.98 to 100 % (10, 100, 1,000 agents; `main` still and moving) | — | 99 % | **pass** |
+| The regional cache's memory | 196 MiB at most | — | 512 MiB | **pass** |
+| Fresh thin workspaces reading, through the cache / the server | 4,241 to 4,834/s / 4,266 to 4,569/s (100 and 1,000 agents) | — | — | |
+| Database commits per push, one agent | 1.00 (push), 1.01 (API) | 1.00, 1.01 | 1 | **pass** |
+| Database commits per push, pushes at once | 1.18 to 2.25 (10 and 100 agents on their own branches), 1.43 (100 projects), 2.40 (API, 100 projects) | 1.27 to 2.22, 1.48, 2.37 | 1 | **miss** (BUG-1946) |
+| Storage writes per push | 2.0 | 2.0 | 2 or fewer | **pass** (3.1 to 3.4 where pushes into one `main` lose races) |
+| Server peak memory, 1 GB profile | 965 MiB, 936 MiB | — | under 1 GB | **pass** |
+| Landings/s across 100 projects | 1,323 (push), 617 (API) | 1,249, 589 | 4,000 | **miss** (BUG-1948) |
+| Landings/s into one `main`, 50 agents, through the API | 20 at 20/s (p99 47 ms); 25 at 50/s (p99 11 s) | 20; 23 | 100, p99 under 500 ms | **miss** as on 2026-11-07 (35/s then); the landing service is what lands into one `main` now |
+| Fresh workspace ready (`bench-server.sh daemon`: the tips, their grant, the root and top-level trees), 1,000 / 10,000 files | cold daemon 16.7 / 8.9 ms; warm 3.4 / 2.9 ms; no daemon 7.0 / 4.2 ms | — | 2 s cold, 300 ms warm | **pass** |
+| Fresh mounted workspace to the first `ls` and `cat` (S8), 2,000 / 50,000 files | cold 255 / 242 ms; warm 117 / 160 ms; 1,000 files read cold in 307 / 297 ms | — | 2 s cold, 300 ms warm | **pass** (load 13.8 before after a 30 s wait, 11.7 after) |
+| The same at 200,000 files (`S8_BENCH_FILES=200000`) | cold 288 ms; warm 259 ms; 1,000 files read cold in 272 ms | — | 2 s cold, 300 ms warm | **pass**, the warm one by 41 ms (load 2.8 before, 2.7 after) |
+
+`veil-bench workspace --files 100k,1M --bytes 10G` of the design does not
+exist; the two rows above are the nearest measurements.
+
+**This week's fixes on the push and pull paths** (the two `load` runs):
+nothing in rates, commits or storage writes beyond the spread between
+runs. Statements per operation rose: a push 69.9 → 81.3 (one agent, its
+deriver's included), 48.2 → 55.3 (10 projects), 39.2 → 43.8 (100
+projects); an API commit 45.2 → 52.9, 31.1 → 37.0, 30.8 → 36.1; a push to
+an own branch 65.8 → 76.8, 43.7 → 49.6, 34.9 → 39.1. That is 4 to 11
+statements more per landing: BUG-1881's guard and epoch reads on every
+transaction that adds roots, and the lookups of the landing path where a
+push goes through it. Up-to-date pulls did not change (3.0 statements).
+The commits above 1 per push, the pulls at 1,000 agents and the rate
+across projects are the same before this week.
+
+### The blame speed gate (G3; BUG-1214, after BUG-1893, 1895, 1896)
+
+`server_hub` `blame::bug_1214_a_first_blame_costs_more_than_its_gate` and
+`blame::blame_speed` with `VEIL_BLAME_BENCH_VERSIONS=10000`, release build:
+`OBJECTS=local .scratch/gate-tests.sh blame::bug_1214…` (load 0.6 before,
+2.3 after), `MINIO=shared .scratch/gate-tests.sh blame::bug_1214…` (8.4,
+3.6), `MINIO=shared VEIL_BLAME_BENCH_VERSIONS=10000 .scratch/gate-tests.sh
+blame::blame_speed` (15.8 after a 60 s wait, 3.5).
+
+| Gate | Measured | Last time | Target | |
+|---|---|---|---|---|
+| The first blame of a 5,000-line file changed 10,000 times, objects in a local directory | **425 ms** (42.5 µs a version) | 430 ms (BUG-1214's row), 466 ms (the last run before this week's fix) | 1 s | **pass** |
+| The same, objects in S3 (MinIO) | **528 ms** (52.8 µs a version) | 527 ms (BUG-1214's row), 982 ms (the last run before this week's fix) | 1 s | **pass** |
+| `blame_speed` (20,000 snapshots, a hidden change between every two, MinIO): the first blame, admin / anyone on Earth | 544 ms / 545 ms, each in one request | — | 1 s | **pass** |
+| Blame, precomputed, p50 / p99 | 20.3 / 25.0 ms (admin), 21.8 / 23.4 ms (anyone on Earth) | 18.1 / 21.3 and 25.4 / 40.4 ms (S14 cycle 3) | 50 ms | **pass** |
+| `history --follow -n 50`, p50 / p99 | 1.0 / 1.8 ms, 1.3 / 1.9 ms | — | 50 ms | **pass** |
+
+The stricter line maps of this week's blame fix do not show: 425 and
+528 ms against 430 and 527 ms when S16 fixed BUG-1214, and under the 466 and 982 ms of the last run. With a MinIO container started for the run,
+the two S3 runs failed in their setup instead: the test's own writes (32
+at once, 165 KB each) got `S3 PUT: HTTP 499` twice out of tens of thousands,
+and the blame then missed an object (BUG-1953). They passed on the
+machine's long-lived MinIO (`veil-shared-minio`, a bucket of the run's),
+which is how the gate was measured before.
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |
