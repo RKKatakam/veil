@@ -138,6 +138,37 @@ fn status_reports_local_only_and_quarantined_files() {
     assert!(!st.contains("Xk29vLq8sPz") && !st.contains("AKIAIOSFODNN7EXAMPLE"), "no secret values: {st}");
 }
 
+// BUG-1985: `vl commit` records a binary file whose random bytes fit the
+// `url-password` pattern's classes (`://`, a `:`, eight bytes, `@` and a
+// letter), and still quarantines a real URL password next to it.
+#[test]
+fn commit_records_random_bytes_and_quarantines_a_url_password() {
+    let env = Env::new();
+    let r = env.repo("p");
+    let hex = "155a96f6c76843cd3a2f2f641a8342768e7eb7e79503483a8cd60489138f0eb0b130f3d453dc588a3d8494aaa6b32e51c4d1f3fedf934db59ef3043894d493dd40732df5";
+    let mut x = 0x1985u64;
+    let mut random = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    };
+    let mut blob = random(64 << 10);
+    blob.extend((0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()));
+    blob.extend(random(64 << 10));
+    r.write("assets/blob.bin", &blob);
+    r.write("config/app.yaml", "database:\r\n  url: postgres://app:Xk9mQ2vL7pR4@db.example.com/app\r\n");
+    let out = r.ok(&["commit", "-m", "assets"]);
+    assert!(out.contains("warning: config/app.yaml quarantined"), "{out}");
+    assert!(!out.contains("blob.bin"), "{out}");
+    assert_eq!(r.paths("@-"), vec!["assets/blob.bin"]);
+    assert_eq!(std::fs::read(r.path("assets/blob.bin")).unwrap(), blob);
+}
+
 // Scenario from git t7525-status-rename.sh: a rename shows as one.
 #[test]
 fn status_shows_a_rename() {
