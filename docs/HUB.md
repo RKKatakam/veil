@@ -5250,7 +5250,8 @@ vl embargo release ID
 Design: `docs/design/server/phase-4-agent-scale.md` §4.4, §4.11, the S24 row
 of §8, threat rows 20 and 21; §13.19 (S17) and §13.25 (S24, part A) here.
 Code: `crates/veil-server/src/limits/landing.rs` (outstanding-landing bounds
-and two-level fair batch ordering), `crates/veil-server/src/limits/mod.rs` and
+and two-level fair batch ordering), `crates/veil-server/src/limits/pressure.rs`
+(early back-pressure, item 6), `crates/veil-server/src/limits/mod.rs` and
 `bucket.rs` (per-agent-session and per-person rate buckets),
 `crates/veil-server/src/limits/health.rs` and `crates/vl/src/stats_cmd.rs`
 (landing counters in the admin-only health metrics), minimal wiring in
@@ -5350,6 +5351,63 @@ transaction per landing instead of 23.
    landing; 1 push + 23 background). **After:** **81** transactions committed
    for 40 landings (**2.02** per landing: 1 push commit + 1 background derive
    commit).
+
+6. **A submit past what the service lands in time is told to come back**
+   (`limits/pressure.rs`, BUG-1955). Until this, nothing answered a
+   submitter past the service's capacity: the request waited out the
+   server's 30 s, answered `queued`, the agent submitted again, and the
+   service went on landing changes nobody waited for. Now `POST …/land`
+   (both shapes) asks `limits::pressure::admit` before anything is done for
+   the submit: **how many landings would land before this one**, in the
+   service's own order (item 2: of the submitter's own, each session's up to
+   one more than this session has; of each other person's, up to one more
+   than that; `Waiting::ahead`). At `MAX_BRANCH_WAITING` (2,048: 32
+   batches) or more, or more than the service serves in `MAX_QUEUE_WAIT`
+   (10 s) at the rate it is serving now, the answer is **`503 queue_full`**
+   with `retry_after_ms` (the time the service needs for what is over the
+   bound, 1 to 5 s) and `Retry-After`; nothing is queued, stored or
+   recorded. Because the count follows the fair order, it is each
+   submitter's fair share of the queue: behind one person's 1,000 waiting
+   landings another person's first landing has one before it, and is
+   queued. One person alone meets only their own bound (item 1: 1,000 is
+   below 2,048), with its `429` as before. What waits is read from the
+   database at most every 100 ms a branch and server (one statement:
+   `landing_queue`'s waiting rows by person and session, and the service's
+   count of entries served); between two reads a server adds what it
+   admitted itself, so servers sharing a database may together admit a few
+   more than the bound: the exact bounds are item 1's. The rate is
+   `landing_leases.served` (migration 37), which the batch's transaction
+   adds its entries to in the statement that renews the lease; a service
+   that serves nothing (a lease held elsewhere) gives no rate, and then the
+   count alone decides. `vl land` waits as the answer asks and submits
+   again (as for every `retry_after_ms`), with a note (`waiting for the
+   server: the landing queue of 'main' is full …`). Not asked: landing a PR,
+   an embargo's release and the server's own reverts (bounded by item 1).
+7. **A merge and a conflict report read the branch's changes at the
+   change's own paths** (`landing/edits.rs` `touching`, BUG-1955). Whether a
+   change that overlaps the tip can be merged, the merge itself, and the
+   conflict report each asked for the branch's whole edit set since the
+   change's base (`edit_set(tip, base)`) and kept the edits at the change's
+   paths. On a busy branch that is every folder anyone landed in since: with
+   10,000 agents each in a folder of its own, a base ten seconds old was
+   10,000 folders, read for each such entry, in the batch's own thread.
+   `touching` gives the same edits in the same order (a property test
+   against the filtered edit set) from the folders on the way to the path
+   and under it. The conflict report's "landed since" list asks each of the
+   256 steps first whether it touched the edits, and reads the step's edit
+   set only then.
+8. **A batch's entries are read on several threads** (`landing/service.rs`
+   `read_ahead`, BUG-1955). What an entry's build reads that no other entry
+   changes (its stack's snapshots, each change's edit set and base tree:
+   objects, by id) is read for all entries of the batch on up to 8 threads;
+   then the entries are built on the tip one after another, as before. An
+   entry whose read failed is read again in its turn, and answered what it
+   always was. The batch is the one built on one thread, byte for byte.
+9. **Fewer round trips a batch and a submit** (BUG-1955): the authors a
+   batch's commit records are read in one statement (one a landing before,
+   in turn); a submit takes one of its person's slots at random without
+   reading which are free, and reads them only when that one is taken
+   (BUG-1940's fix read all of the person's waiting rows for every submit).
 
 **Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
 `concurrency.rs`, unit tests in `limits/landing.rs`):
