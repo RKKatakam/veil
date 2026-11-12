@@ -4,7 +4,7 @@
 //!
 //! When a change's edited paths changed on the branch since its base
 //! ([`super::edits::fast_path`] is `Some`), the landing batch merges it by
-//! content onto the running tip, in the queue's order ([`merge_onto`]):
+//! content onto the running tip, in the queue's order (`merge_onto`):
 //!
 //! * A change that merges cleanly onto what landed before it lands; one
 //!   that does not is answered `conflict`, never one that merges cleanly

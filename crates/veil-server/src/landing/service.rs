@@ -1397,12 +1397,12 @@ impl Service {
                     .collect();
                 let texts: Vec<String> = results.iter().map(|r| serde_json::to_string(r).unwrap_or_default()).collect();
                 let dones: Vec<i64> = vec![now_ms; results.len()];
-                let n = sqlx::query(&format!(
+                let n = sqlx::query(
                     "UPDATE landing_queue AS q \
                      SET state = v.state, result = v.result, done_at = v.done_at \
                      FROM unnest($3::BIGINT[], $4::TEXT[], $5::TEXT[], $6::BIGINT[]) AS v(seq, state, result, done_at) \
-                     WHERE q.project_id = $1 AND q.branch = $2 AND q.seq = v.seq AND q.state = 'queued'"
-                ))
+                     WHERE q.project_id = $1 AND q.branch = $2 AND q.seq = v.seq AND q.state = 'queued'",
+                )
                 .bind(pid)
                 .bind(&branch)
                 .bind(&seqs)

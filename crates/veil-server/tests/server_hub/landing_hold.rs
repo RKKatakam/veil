@@ -382,7 +382,7 @@ fn bug_1956_overlapping_landings_are_answered_as_landing_them_one_by_one_in_orde
             }
         }
         let landing = want.iter().filter(|w| w.is_some()).count();
-        assert!(landing >= 20 && landing < 80, "seed {seed}: the seed gives {landing} landings of 80, too few or no conflict");
+        assert!((20..80).contains(&landing), "seed {seed}: the seed gives {landing} landings of 80, too few or no conflict");
         release_branch(&hub, pid, "main");
         let mut seen = std::collections::HashSet::new();
         for ((f, _, ticket), want) in submitted.iter().zip(&want) {
