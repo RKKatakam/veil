@@ -465,3 +465,20 @@ fn scanner_false_positive_rate() {
     }
     println!("{files} files, {flagged} flagged ({:.3} %)", 100.0 * flagged as f64 / files.max(1) as f64);
 }
+
+/// BUG-1985: random binary data (compressed, encrypted or random files) is
+/// not a URL with a password. These 68 bytes come from a 12 MiB file of
+/// random bytes (`daemon::the_daemons_memory_stays_within_its_budget`'s
+/// kind, BUG-1980): `://`, then any bytes but the rule's few excluded ones,
+/// a `:`, eight or more bytes, `@` and a letter. About one such file in
+/// 1,400 matches (11 of 15,000 measured), and the file is quarantined:
+/// kept local, reported, never recorded.
+#[test]
+#[ignore = "BUG-1985: the url-password rule matches random binary data (about one 12 MiB file of random bytes in 1,400), and the file is quarantined"]
+fn bug_1985_random_bytes_are_not_a_url_password() {
+    let hex = "155a96f6c76843cd3a2f2f641a8342768e7eb7e79503483a8cd60489138f0eb0b130f3d453dc588a3d8494aaa6b32e51c4d1f3fedf934db59ef3043894d493dd40732df5";
+    let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+    assert_eq!(bytes.len(), 68);
+    let found = scan(&bytes);
+    assert!(found.is_empty(), "random bytes taken for a secret: {:?}", found.iter().map(|f| f.rule).collect::<Vec<_>>());
+}
