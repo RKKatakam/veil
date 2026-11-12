@@ -613,3 +613,74 @@ fn bug_1970_a_clean_stop_ends_its_batch_and_gives_the_lease_up_at_once() {
         assert_eq!(String::from_utf8_lossy(&r.body), text);
     }
 }
+
+/// BUG-2060: a change whose edit the tip already holds merges cleanly, as a
+/// three-way merge of it onto everything landed before it does: both sides
+/// made the same edit to a file (or the tip's edit includes the change's),
+/// added the same file, or deleted the same file. Until the fix the merge
+/// kept such a path as an edit that changes nothing, the landing check found
+/// the new snapshot's diff without it, and the change was refused as "a bug
+/// in the server".
+#[test]
+fn bug_2060_an_edit_the_tip_already_holds_merges_cleanly() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let land = |base: veil_core::ObjectId, edits: serde_json::Value| {
+        let r = api.post_json(
+            Some(&dev),
+            &format!("/v1/projects/{}/land", p.name),
+            &serde_json::json!({"onto": "main", "base": base.hex(), "edits": edits, "description": "bug 2060", "wait": true}),
+        );
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        r.json()
+    };
+    let tip = || api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let file = |path: &str| {
+        let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path={path}", p.name, tip().hex()));
+        (r.status, String::from_utf8_lossy(&r.body).to_string())
+    };
+    let lines: String = (0..30).map(|i| format!("line {i}\n")).collect();
+    let made = land(
+        tip(),
+        serde_json::json!([{"path": "src/same/f.txt", "put": {"text": lines}}, {"path": "src/same/gone.txt", "put": {"text": "to delete\n"}}]),
+    );
+    assert_eq!(made["state"], "landed", "{made}");
+    let base = tip();
+    // The tip: line 3 and line 20 edited, a file added, a file deleted.
+    let both = lines.replace("line 3\n", "line 3 edited\n").replace("line 20\n", "line 20 edited\n");
+    let first = land(
+        base,
+        serde_json::json!([
+            {"path": "src/same/f.txt", "put": {"text": both}},
+            {"path": "src/same/new.txt", "put": {"text": "the same new file\n"}},
+            {"path": "src/same/gone.txt", "delete": true},
+        ]),
+    );
+    assert_eq!(first["state"], "landed", "{first}");
+    // The change, on the old base: line 3 edited the same way, the same file
+    // added, the same file deleted, and one edit of its own.
+    let second = land(
+        base,
+        serde_json::json!([
+            {"path": "src/same/f.txt", "put": {"text": lines.replace("line 3\n", "line 3 edited\n")}},
+            {"path": "src/same/new.txt", "put": {"text": "the same new file\n"}},
+            {"path": "src/same/gone.txt", "delete": true},
+            {"path": "src/same/own.txt", "put": {"text": "its own edit\n"}},
+        ]),
+    );
+    assert_eq!(second["state"], "landed", "a clean three-way merge lands: {second}");
+    assert_eq!(second["merges"], 1, "{second}");
+    assert_eq!(file("src/same/f.txt"), (200, both));
+    assert_eq!(file("src/same/new.txt"), (200, "the same new file\n".to_string()));
+    assert_eq!(file("src/same/own.txt"), (200, "its own edit\n".to_string()));
+    assert_ne!(file("src/same/gone.txt").0, 200, "the deleted file stays deleted");
+    // A change whose every edit the tip holds: the merge is clean, and empty.
+    let before = tip();
+    let third = land(base, serde_json::json!([{"path": "src/same/new.txt", "put": {"text": "the same new file\n"}}]));
+    assert_eq!(third["state"], "landed", "a clean three-way merge lands: {third}");
+    assert_ne!(tip(), before, "{third}");
+    assert_eq!(file("src/same/new.txt"), (200, "the same new file\n".to_string()));
+    assert_eq!(file("src/same/own.txt"), (200, "its own edit\n".to_string()));
+}

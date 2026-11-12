@@ -374,11 +374,22 @@ pub(super) fn merge_onto(
         {
             return Ok(None);
         }
+        let oe = sync::entry_at(src, &chain_tree, &c.path)?;
+        // Deleted on the tip too: nothing to merge (BUG-2060).
+        if c.new.is_none() && oe.is_none() {
+            continue;
+        }
         let Some(te) = &c.new else { return Ok(None) };
-        let Some(oe) = sync::entry_at(src, &chain_tree, &c.path)? else { return Ok(None) };
+        let Some(oe) = oe else { return Ok(None) };
         let be = sync::entry_at(src, &parent_tree, &c.path)?;
         out.read += (oe.size + te.size + be.as_ref().map_or(0, |b| b.size)) as usize;
         let Some((merged, blob)) = merge_entry_bytes(src, &attrs, &c.path, be.as_ref(), &oe, te)? else { return Ok(None) };
+        // The tip holds this edit already (the same edit on both sides, or
+        // the tip's includes it): no edit, as the landing check finds
+        // (BUG-2060).
+        if merged.id == oe.id && merged.executable == oe.executable {
+            continue;
+        }
         out.blobs.extend(blob);
         out.set.push(Change { path: c.path.clone(), old: Some(oe), new: Some(merged) });
     }
