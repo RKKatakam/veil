@@ -322,5 +322,8 @@ fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
         "landing_rechecked": hub.landing.stats.rechecked.load(Relaxed),
         "landing_store_us": hub.landing.stats.store_us.load(Relaxed),
         "landing_commit_us": hub.landing.stats.commit_us.load(Relaxed),
+        "landing_pick_statements": hub.landing.stats.pick_statements.load(Relaxed),
+        "landing_pick_rows": hub.landing.stats.pick_rows.load(Relaxed),
+        "landing_review_asks": hub.landing.stats.review_asks.load(Relaxed),
     })
 }

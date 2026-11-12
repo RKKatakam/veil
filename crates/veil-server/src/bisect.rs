@@ -177,6 +177,21 @@ pub async fn any_reverted_twice_conn(c: &mut sqlx::PgConnection, project_id: i64
     Ok(hit.is_some())
 }
 
+/// Which of `ids` name a change the server has reverted at least twice
+/// ([`any_reverted_twice_conn`], for all the entries of a landing batch in
+/// one statement: BUG-1942).
+pub async fn reverted_twice_among(c: &mut sqlx::PgConnection, project_id: i64, ids: &[String]) -> Result<std::collections::HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let hit: Vec<String> = sqlx::query_scalar(&format!("SELECT k FROM ({REVERTED_KEYS}) r WHERE k = ANY($2) GROUP BY k HAVING COUNT(*) >= 2"))
+        .bind(project_id)
+        .bind(ids)
+        .fetch_all(&mut *c)
+        .await?;
+    Ok(hit.into_iter().collect())
+}
+
 /// Record the outcome of every revert of `project_id` whose landing ended,
 /// before reverts are counted on a connection ([`any_reverted_twice_conn`]).
 pub async fn settle_queued_reverts(hub: &Hub, project_id: i64) -> Result<()> {

@@ -363,6 +363,14 @@ pub struct Stats {
     pub rechecked: AtomicU64,
     /// Statements the branches' pollers made (`poll`).
     pub polls: AtomicU64,
+    /// Statements the services made to choose their batches, and the queue
+    /// rows those returned (`limits::landing::pick_batch`, BUG-1941).
+    pub pick_statements: AtomicU64,
+    pub pick_rows: AtomicU64,
+    /// Times a batch asked the database whether its entries meet the review
+    /// rules (`prs::verify_landing_reviews`, BUG-1942): one statement for
+    /// all of a batch's entries, or one entry asked alone.
+    pub review_asks: AtomicU64,
     /// Submits whose stack asked the derived graph, or walked, whether a
     /// change is on the branch: neither its tip nor a landing (BUG-1275).
     pub walks: AtomicU64,

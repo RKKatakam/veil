@@ -198,22 +198,6 @@ struct RowMeta {
     pr: Option<(String, i32)>,
 }
 
-impl crate::limits::landing::QueuedEntry for Row {
-    fn seq(&self) -> i64 {
-        self.seq
-    }
-    fn person_id(&self) -> i64 {
-        self.person.id
-    }
-    fn session_key(&self) -> &str {
-        if self.session.is_empty() {
-            &self.person.device_key
-        } else {
-            &self.session
-        }
-    }
-}
-
 /// Someone a projection is made for, now.
 #[derive(Clone)]
 struct As {
@@ -632,38 +616,33 @@ impl Service {
 
     /// The ready rows, leaving out those being committed: reverts first
     /// (S20, `priority > 0`, in their order), then the rest in fair-share
-    /// order (`limits::landing::fair_batch`, S24 part B).
+    /// order (`limits::landing::fair_batch`, S24 part B), from a bounded
+    /// read of the queue (`limits::landing::pick_batch`, BUG-1941).
     async fn ready(&self, exclude: &HashSet<i64>) -> Result<Vec<Row>> {
-        type R = (i64, String, i64, String, String, String, String, i64, i64, i64, i64, Option<String>, bool);
-        let rows: Vec<R> = sqlx::query_as(
-            "SELECT seq, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, project_epoch, merges, agent_session, priority > 0 FROM landing_queue \
-             WHERE project_id = $1 AND branch = $2 AND state = 'queued' ORDER BY priority DESC, created_at, seq",
-        )
-        .bind(self.project)
-        .bind(&self.branch)
-        .fetch_all(&self.hub.db)
-        .await?;
-        let (mut reverts, mut all) = (Vec::new(), Vec::with_capacity(rows.len()));
-        for (seq, ticket, id, name, device_key, session, stack, lineage, pe, je, merges, agent_session, revert) in rows {
-            let into = if revert { &mut reverts } else { &mut all };
-            into.push(Row {
-                seq,
-                ticket,
-                person: Person { id, name, device_key, agent: None },
-                session,
-                stack: super::decode_stack(&stack)?,
-                lineage,
-                epochs: (pe, je),
-                merges: merges.max(0) as u32,
-                agent_session,
-            });
-        }
-        // Reverts are never held back by fair sharing (S20).
-        reverts.retain(|r| !exclude.contains(&r.seq));
-        reverts.truncate(MAX_BATCH);
-        let rest = MAX_BATCH - reverts.len();
-        reverts.extend(crate::limits::landing::fair_batch(all, exclude, rest));
-        Ok(reverts)
+        let picked = {
+            let mut c = self.hub.db.acquire().await?;
+            crate::limits::landing::pick_batch(&mut c, self.project, &self.branch, exclude, MAX_BATCH).await?
+        };
+        let stats = &self.hub.landing.stats;
+        stats.pick_statements.fetch_add(picked.statements as u64, Ordering::Relaxed);
+        stats.pick_rows.fetch_add(picked.read as u64, Ordering::Relaxed);
+        picked
+            .rows
+            .into_iter()
+            .map(|r| {
+                Ok(Row {
+                    seq: r.seq,
+                    ticket: r.ticket,
+                    person: Person { id: r.person_id, name: r.person_name, device_key: r.device_key, agent: None },
+                    session: r.session,
+                    stack: super::decode_stack(&r.stack)?,
+                    lineage: r.lineage,
+                    epochs: (r.person_epoch, r.project_epoch),
+                    merges: r.merges.max(0) as u32,
+                    agent_session: r.agent_session,
+                })
+            })
+            .collect()
     }
 
     /// The project's view keys (what `derive::memo_tips` keeps warm): each
@@ -849,29 +828,45 @@ impl Service {
                     .await?
                 };
                 if !diffs.is_empty() {
-                    let mut c = hub.db.acquire().await?;
-                    for (idx, diff) in diffs {
-                        let e = &mut entries[idx];
-                        let Ok(a) = &e.who else { continue };
-                        let claim = e.row.stack.first().and_then(|x| x.review.clone());
-                        match crate::prs::verify_landing_review(
+                    // All of them in a few statements (BUG-1942).
+                    let items: Vec<crate::prs::LandingReview<'_>> = diffs
+                        .iter()
+                        .filter_map(|(idx, diff)| {
+                            let e = &entries[*idx];
+                            let a = e.who.as_ref().ok()?;
+                            Some(crate::prs::LandingReview {
+                                project: &a.project,
+                                viewer: &a.viewer,
+                                diff,
+                                claim: e.row.stack.first().and_then(|x| x.review.as_ref()),
+                            })
+                        })
+                        .collect();
+                    let answers = {
+                        let mut c = hub.db.acquire().await?;
+                        crate::prs::verify_landing_reviews(
                             &mut c,
-                            &a.project,
-                            &a.viewer,
+                            self.project,
                             &self.branch,
-                            &diff,
                             &ctx.rules,
-                            claim.as_ref(),
+                            &items,
                             is_protected,
+                            reverted_twice,
+                            &hub.landing.stats.review_asks,
                         )
                         .await?
-                        {
+                    };
+                    drop(items);
+                    for ((idx, diff), answer) in diffs.into_iter().zip(answers) {
+                        let e = &mut entries[idx];
+                        let Ok(a) = &e.who else { continue };
+                        match answer {
                             Ok(_) => {
                                 e.review_check = Some(EntryReviewCheck {
                                     project: a.project.clone(),
                                     viewer: a.viewer.clone(),
                                     diff,
-                                    claim,
+                                    claim: e.row.stack.first().and_then(|x| x.review.clone()),
                                 });
                             }
                             Err(why) => {
@@ -1148,6 +1143,7 @@ impl Service {
         let review_guard = b.review_guard.clone();
         let old_tip_id = b.old_tip;
         let tx_results = results.clone();
+        let tx_hub = hub.clone();
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
             let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing, active_review_checks, review_guard, claim_tokens) = (
                 ls.clone(),
@@ -1178,6 +1174,7 @@ impl Service {
                 tx_results.clone(),
             );
             let landed_prs = tx_landed_prs.clone();
+            let tx_hub = tx_hub.clone();
             Box::pin(async move {
                 crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 // Fencing: only the lease's current holder moves the branch.
@@ -1268,22 +1265,31 @@ impl Service {
                             return Err(Error::conflict(MOVED));
                         }
                         if guard.protected || guard.reverted_twice {
-                            for rc in &active_review_checks {
-                                if crate::prs::verify_landing_review(
-                                    &mut *c,
-                                    &rc.project,
-                                    &rc.viewer,
-                                    &branch,
-                                    &rc.diff,
-                                    &guard.ctx.rules,
-                                    rc.claim.as_ref(),
-                                    guard.protected,
-                                )
-                                .await?
-                                .is_err()
-                                {
-                                    return Err(Error::conflict(MOVED));
-                                }
+                            // In a few statements for the whole batch
+                            // (BUG-1942): this transaction holds the
+                            // branch's row.
+                            let items: Vec<crate::prs::LandingReview<'_>> = active_review_checks
+                                .iter()
+                                .map(|rc| crate::prs::LandingReview {
+                                    project: &rc.project,
+                                    viewer: &rc.viewer,
+                                    diff: &rc.diff,
+                                    claim: rc.claim.as_ref(),
+                                })
+                                .collect();
+                            let answers = crate::prs::verify_landing_reviews(
+                                &mut *c,
+                                pid,
+                                &branch,
+                                &guard.ctx.rules,
+                                &items,
+                                guard.protected,
+                                guard.reverted_twice,
+                                &tx_hub.landing.stats.review_asks,
+                            )
+                            .await?;
+                            if answers.iter().any(|a| a.is_err()) {
+                                return Err(Error::conflict(MOVED));
                             }
                         }
                     }
