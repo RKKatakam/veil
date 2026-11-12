@@ -27,4 +27,5 @@ mod rename_merge;
 mod rc_client;
 mod review_core;
 mod sandbox;
+mod watched;
 mod split_squash;
