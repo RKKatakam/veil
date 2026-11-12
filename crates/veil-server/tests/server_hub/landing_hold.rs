@@ -267,3 +267,52 @@ fn bug_1955_a_batch_lands_only_once_its_objects_are_stored() {
         assert_eq!(String::from_utf8_lossy(&r.body), format!("stored {i}\n"));
     }
 }
+
+/// BUG-1956: changes that each merge cleanly with all the others (twelve
+/// edits of twelve different lines of one file, all on one base) all land.
+/// Today a batch lands only the first of them and sends the rest to a
+/// merge each; after `MAX_MERGES` (3) rounds the ones left are answered
+/// `conflict`, though nothing conflicts.
+#[test]
+#[ignore = "BUG-1956: more than about four clean overlaps of one file in flight at once are answered conflict after three merges"]
+fn bug_1956_clean_overlaps_of_one_file_all_land() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let shared: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let made = land_edit(&api, &dev, &p.name, api.tips(Some(&dev), &p.name).unwrap().branches["main"], "src/over/shared.txt", &shared, true);
+    assert_eq!(made.status, 200, "{}", String::from_utf8_lossy(&made.body));
+    assert_eq!(made.json()["state"], "landed", "{}", made.json());
+    let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    hold_branch(&hub, pid, "main");
+    let mut tickets = Vec::new();
+    for i in 0..12 {
+        let text = shared.replace(&format!("line {}\n", 3 * i), &format!("line {} edited\n", 3 * i));
+        let r = land_edit(&api, &dev, &p.name, base, "src/over/shared.txt", &text, false);
+        assert_eq!(r.status, 200, "submit {i}: {}", String::from_utf8_lossy(&r.body));
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    release_branch(&hub, pid, "main");
+    let mut states = Vec::new();
+    for t in &tickets {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let state = loop {
+            let r = api.get(Some(&dev), &format!("/v1/projects/{}/land/{t}", p.name));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let s = r.json()["state"].as_str().unwrap_or_default().to_string();
+            if (s != "queued" && s != "merging") || std::time::Instant::now() > deadline {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        states.push(state);
+    }
+    assert_eq!(states, vec!["landed"; 12], "clean overlaps answered otherwise");
+    let tip = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path=src/over/shared.txt", p.name, tip.hex()));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let want: String = (0..40).map(|i| if i % 3 == 0 && i < 36 { format!("line {i} edited\n") } else { format!("line {i}\n") }).collect();
+    assert_eq!(String::from_utf8_lossy(&r.body), want);
+}
