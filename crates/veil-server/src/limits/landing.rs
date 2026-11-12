@@ -381,29 +381,57 @@ pub struct Picked {
 }
 
 const READY_COLUMNS: &str = "seq, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, project_epoch, merges, \
-     agent_session, priority > 0 AS revert, created_at";
+     agent_session, priority, created_at";
 
-type ReadyRow = (i64, String, i64, String, String, String, String, i64, i64, i64, i64, Option<String>, bool, i64);
+/// The queue's rows that are not reverts, in its order from after the row
+/// (`$5`, `$6`: its `created_at` and `seq`), at most `$4`, leaving out the
+/// rows `$3`, the people `$7` and the sessions `$8` ([`session_id`]).
+///
+/// The statement asks by the expression that leads the queue's index
+/// (`landing_queue_pick`: the project of a queued row, then branch,
+/// priority, `created_at`, `seq`) and names neither `project_id` nor
+/// `state`, so no other index answers it: the database reads the queue in
+/// its order from that row on and stops at the limit, whatever its
+/// statistics say of the queue's length (migration 36). (`created_at >= $5`
+/// is the index's range; the rest of the row comparison only drops the rows
+/// of that microsecond already read.)
+const READY_SQL: &str = "SELECT seq, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, project_epoch, merges, \
+     agent_session, priority, created_at FROM landing_queue \
+     WHERE (CASE WHEN state = 'queued' THEN project_id END) = $1 AND branch = $2 AND priority = 0 \
+     AND created_at >= $5 AND (created_at > $5 OR seq > $6) AND seq <> ALL($3) AND person_id <> ALL($7) \
+     AND person_id::TEXT || '/' || CASE WHEN session <> '' THEN session ELSE device_key END <> ALL($8) \
+     ORDER BY created_at, seq LIMIT $4";
 
+type ReadyRow = (i64, String, i64, String, String, String, String, i64, i64, i64, i64, Option<String>, i32, i64);
+
+/// The rows as read, in the queue's order: the reverts (by priority) first.
 fn ready_rows(rows: Vec<ReadyRow>) -> Vec<Ready> {
-    rows.into_iter()
-        .map(|(seq, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, project_epoch, merges, agent_session, revert, created_at)| Ready {
-            seq,
-            ticket,
-            person_id,
-            person_name,
-            device_key,
-            session,
-            stack,
-            lineage,
-            person_epoch,
-            project_epoch,
-            merges,
-            agent_session,
-            revert,
-            created_at,
+    let mut rows: Vec<(i32, Ready)> = rows
+        .into_iter()
+        .map(|(seq, ticket, person_id, person_name, device_key, session, stack, lineage, person_epoch, project_epoch, merges, agent_session, priority, created_at)| {
+            (
+                priority,
+                Ready {
+                    seq,
+                    ticket,
+                    person_id,
+                    person_name,
+                    device_key,
+                    session,
+                    stack,
+                    lineage,
+                    person_epoch,
+                    project_epoch,
+                    merges,
+                    agent_session,
+                    revert: priority > 0,
+                    created_at,
+                },
+            )
         })
-        .collect()
+        .collect();
+    rows.sort_by_key(|(priority, r)| (std::cmp::Reverse(*priority), r.created_at, r.seq));
+    rows.into_iter().map(|(_, r)| r).collect()
 }
 
 /// The next batch of `branch`'s queue, at most `limit` rows, leaving out
@@ -413,54 +441,51 @@ fn ready_rows(rows: Vec<ReadyRow>) -> Vec<Ready> {
 ///
 /// What it reads does not grow with the queue (BUG-1941): each statement
 /// reads [`PICK_CHUNK`] rows in the queue's order through its index
-/// (`landing_queue_ready`), and [`FairPick`] ends the reading as soon as no
+/// (`landing_queue_pick`), and [`FairPick`] ends the reading as soon as no
 /// later row can be in the batch. With `limit` people or more at the head
 /// of the queue that is one statement. Behind fewer it reads on past the
 /// rows of those it has seen, of which each person has at most their bound
 /// ([`admit_queue`]).
 pub async fn pick_batch(c: &mut PgConnection, project: i64, branch: &str, exclude: &HashSet<i64>, limit: usize) -> Result<Picked> {
     let exclude: Vec<i64> = exclude.iter().copied().collect();
+    // The first statement: the reverts (at most a batch of them), and the
+    // first chunk of the rest.
     let first = ready_rows(
         sqlx::query_as(&format!(
-            "SELECT {READY_COLUMNS} FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state = 'queued' AND seq <> ALL($3) \
-             ORDER BY priority DESC, created_at, seq LIMIT $4"
+            "(SELECT {READY_COLUMNS} FROM landing_queue WHERE (CASE WHEN state = 'queued' THEN project_id END) = $1 AND branch = $2 AND priority > 0 \
+             AND seq <> ALL($3) ORDER BY priority DESC, created_at, seq LIMIT $9) UNION ALL ({READY_SQL})"
         ))
         .bind(project)
         .bind(branch)
         .bind(&exclude)
         .bind(PICK_CHUNK as i64)
+        .bind(i64::MIN)
+        .bind(i64::MIN)
+        .bind(Vec::<i64>::new())
+        .bind(Vec::<String>::new())
+        .bind(limit as i64)
         .fetch_all(&mut *c)
         .await?,
     );
     let (mut statements, mut read) = (1, first.len());
-    let mut more = first.len() == PICK_CHUNK;
-    // The rows that are not reverts are read on from the last one read (from
-    // their first, if the chunk was all reverts).
-    let mut after = first.last().map(|r| if r.revert { (i64::MIN, i64::MIN) } else { (r.created_at, r.seq) });
     let (mut rows, rest): (Vec<Ready>, Vec<Ready>) = first.into_iter().partition(|r| r.revert);
-    rows.truncate(limit);
+    let mut more = rest.len() == PICK_CHUNK;
+    let mut after = rest.last().map(|r| (r.created_at, r.seq));
     let mut pick = FairPick::new(limit - rows.len());
     let mut skip = pick.add(rest);
     while let (true, Some(s), Some((at, seq))) = (more, &skip, after) {
-        // `created_at >= $5` is the index's range; the rest of the row
-        // comparison only drops the rows of that microsecond already read.
         let next = ready_rows(
-            sqlx::query_as(&format!(
-                "SELECT {READY_COLUMNS} FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state = 'queued' AND priority = 0 \
-                 AND created_at >= $5 AND (created_at > $5 OR seq > $6) AND seq <> ALL($3) AND person_id <> ALL($7) \
-                 AND person_id::TEXT || '/' || CASE WHEN session <> '' THEN session ELSE device_key END <> ALL($8) \
-                 ORDER BY created_at, seq LIMIT $4"
-            ))
-            .bind(project)
-            .bind(branch)
-            .bind(&exclude)
-            .bind(PICK_CHUNK as i64)
-            .bind(at)
-            .bind(seq)
-            .bind(&s.people)
-            .bind(&s.sessions)
-            .fetch_all(&mut *c)
-            .await?,
+            sqlx::query_as(READY_SQL)
+                .bind(project)
+                .bind(branch)
+                .bind(&exclude)
+                .bind(PICK_CHUNK as i64)
+                .bind(at)
+                .bind(seq)
+                .bind(&s.people)
+                .bind(&s.sessions)
+                .fetch_all(&mut *c)
+                .await?,
         );
         statements += 1;
         read += next.len();

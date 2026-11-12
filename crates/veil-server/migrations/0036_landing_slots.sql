@@ -19,3 +19,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS landing_queue_session_slot
 -- What the count of a person's waiting landings read: the two above have
 -- the same leading columns.
 DROP INDEX IF EXISTS landing_queue_queued_who;
+
+-- BUG-1941: the index a landing service chooses its batch through: a
+-- branch's queued rows in the queue's order (reverts first, then by age). A
+-- batch reads its first rows and stops (`limits::landing::pick_batch`).
+--
+-- Its first column is an expression (the project, of a queued row only), and
+-- the batch's statement asks by that expression and names neither
+-- `project_id` nor `state`. So no other index of the table answers the
+-- statement, and the database reads the queue in its order through this one
+-- whatever its statistics say. With plain columns (`landing_queue_ready`,
+-- dropped here) it chose by its estimate of the queue's length: while its
+-- statistics were behind a queue that had grown in seconds, it read every
+-- waiting row through a smaller index and sorted them, for each batch. What
+-- else read `landing_queue_ready` (a branch's `merging` rows) has
+-- `landing_queue_state`.
+CREATE INDEX IF NOT EXISTS landing_queue_pick
+    ON landing_queue ((CASE WHEN state = 'queued' THEN project_id END), branch, priority DESC, created_at, seq);
+DROP INDEX IF EXISTS landing_queue_ready;
