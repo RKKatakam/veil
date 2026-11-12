@@ -374,6 +374,11 @@ pub struct Stats {
     /// Submits whose stack asked the derived graph, or walked, whether a
     /// change is on the branch: neither its tip nor a landing (BUG-1275).
     pub walks: AtomicU64,
+    /// Submits told to come back because the branch's queue was full
+    /// (`limits::pressure`, BUG-1955), and queue entries handed to merge
+    /// workers.
+    pub queue_full: AtomicU64,
+    pub merging: AtomicU64,
 }
 
 /// A waiting ticket's answer channels, and the branch it waits on.
@@ -403,6 +408,9 @@ pub struct Services {
     next_claim: AtomicU64,
     /// Content merge workers running on this server (S18).
     pub merges: merge::Workers,
+    /// What this server knows of each branch's queue, for early
+    /// back-pressure (`limits::pressure`, BUG-1955).
+    pub pressure: crate::limits::pressure::Gauges,
     pub stats: Stats,
 }
 
@@ -420,6 +428,7 @@ impl Default for Services {
             pollers: Mutex::new(Default::default()),
             next_claim: AtomicU64::new(1),
             merges: merge::Workers::default(),
+            pressure: Default::default(),
             stats: Stats::default(),
         }
     }
@@ -839,7 +848,9 @@ pub fn abandon(hub: &Hub, w: Waiter) {
 /// `POST …/land`: build and check the change as a push (an uploaded
 /// `snapshot`) or an API commit (`edits` on `base`) is, queue it in the
 /// same commit, and answer with its ticket: at once with `wait: false`,
-/// else once it is decided (up to [`WAIT`]).
+/// else once it is decided (up to [`WAIT`]). `Err`: the branch's queue is
+/// full for this submitter, who is told when to come back
+/// (`limits::pressure`).
 pub async fn submit(
     hub: &Arc<Hub>,
     project: &crate::perm::Project,
@@ -847,7 +858,7 @@ pub async fn submit(
     caller: &crate::auth::Caller,
     who: Submitter,
     req: veil_core::hub::land::LandRequest,
-) -> Result<LandResult> {
+) -> Result<std::result::Result<LandResult, crate::limits::pressure::Refused>> {
     use veil_core::hub::{
         changes::ChangeRequest,
         wire::{BranchUpdate, PushRequest},
@@ -855,6 +866,11 @@ pub async fn submit(
     veil_core::commands::validate_tag_name(&req.onto).map_err(|_| Error::bad_request(format!("invalid branch name {:?}", req.onto)))?;
     if !project.participant(viewer) {
         return Err(Error::forbidden("you are not in this project"));
+    }
+    // Past what the branch's service lands in time, the submitter is told
+    // to come back, before anything is done for the submit (BUG-1955).
+    if let Some(refused) = crate::limits::pressure::admit(hub, project.id, &req.onto, &who).await? {
+        return Ok(Err(refused));
     }
     match (req.snapshot, req.base) {
         (Some(snapshot), None) if req.edits.is_empty() && req.change_id.is_none() && req.description.is_empty() => {
@@ -880,7 +896,7 @@ pub async fn submit(
             };
             match landings.pop() {
                 // Projected for the pusher by `push_with`.
-                Some(l) => Ok(l),
+                Some(l) => Ok(Ok(l)),
                 // Refused before it was queued (nothing new, no branch, …).
                 None => Err(Error::bad_request(
                     pushed.results.into_iter().find_map(|r| r.message).unwrap_or_else(|| "nothing to land".into()),
@@ -929,7 +945,7 @@ pub async fn submit(
             r.change_id = Some(made.change_id);
             let skipped = q.skipped.lock().unwrap().clone();
             r.warnings.extend(skipped_warnings(hub, project.id, &q.branch, &skipped).await?);
-            seen(hub, project, viewer, r).await
+            Ok(Ok(seen(hub, project, viewer, r).await?))
         }
         _ => Err(Error::bad_request("a landing names either an uploaded `snapshot`, or `edits` on a `base`")),
     }

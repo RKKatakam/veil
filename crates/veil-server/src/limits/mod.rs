@@ -40,6 +40,7 @@ pub mod bucket;
 pub mod gate;
 pub mod health;
 pub mod landing;
+pub mod pressure;
 
 use std::{
     collections::HashMap,
@@ -81,6 +82,9 @@ pub struct Settings {
     pub max_session_outstanding: usize,
     /// Most queued landings waiting at once for one person.
     pub max_person_outstanding: usize,
+    /// Most landings that may be due to land before a new one on a branch
+    /// (`pressure`): past it the submit is told to come back.
+    pub max_branch_waiting: usize,
 }
 
 impl Default for Settings {
@@ -94,6 +98,7 @@ impl Default for Settings {
             request_memory: 512 << 20,
             max_session_outstanding: landing::MAX_SESSION_OUTSTANDING,
             max_person_outstanding: landing::MAX_PERSON_OUTSTANDING,
+            max_branch_waiting: pressure::MAX_BRANCH_WAITING,
         }
     }
 }

@@ -1192,14 +1192,18 @@ impl Service {
             Box::pin(async move {
                 crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 // Fencing: only the lease's current holder moves the branch.
+                // (And the entries it has served: what a submit reads the
+                // service's rate from, `limits::pressure`.)
                 let held = sqlx::query(&format!(
-                    "UPDATE landing_leases SET expires_at = {DB_NOW} + $5 WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4"
+                    "UPDATE landing_leases SET expires_at = {DB_NOW} + $5, served = served + $6 \
+                     WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4"
                 ))
                 .bind(pid)
                 .bind(&branch)
                 .bind(&holder)
                 .bind(epoch)
                 .bind(LEASE_MS)
+                .bind(seqs.len() as i64)
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
@@ -1507,6 +1511,7 @@ impl Service {
         );
         for outcome in &b.outcomes {
             if let Outcome::Merging(job) = outcome {
+                st.merging.fetch_add(1, Ordering::Relaxed);
                 super::merge::spawn(hub, job.clone());
             }
         }

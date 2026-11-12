@@ -73,6 +73,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (34, "branch_changes_recorded", include_str!("../migrations/0034_branch_changes_recorded.sql")),
     (35, "bisect_revert_patch", include_str!("../migrations/0035_bisect_revert_patch.sql")),
     (36, "landing_slots", include_str!("../migrations/0036_landing_slots.sql")),
+    (37, "landing_served", include_str!("../migrations/0037_landing_served.sql")),
 ];
 
 pub async fn connect(url: &str, max: u32) -> anyhow::Result<PgPool> {

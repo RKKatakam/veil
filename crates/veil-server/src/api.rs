@@ -837,11 +837,14 @@ async fn land(
     caller: Caller,
     Path(p): Path<String>,
     Json(req): Json<veil_core::hub::land::LandRequest>,
-) -> Result<Json<veil_core::hub::land::LandResult>> {
+) -> Result<Response> {
     let person = caller.not_runner()?.clone();
     let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
     let who = crate::landing::Submitter { person, epochs };
-    Ok(Json(crate::landing::submit(&hub, &project, &viewer, &caller, who, req).await?))
+    Ok(match crate::landing::submit(&hub, &project, &viewer, &caller, who, req).await? {
+        Ok(r) => Json(r).into_response(),
+        Err(refused) => refused.response(),
+    })
 }
 
 #[derive(Deserialize)]
