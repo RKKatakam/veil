@@ -162,7 +162,7 @@ rehearsal: `deploy/compose/results/<stamp>/<gate>/`):
 | `commands.txt` | every `veil-bench` command line, and the machine it ran on |
 | `<label>.json` | the tool's raw results: one object per curve point under `runs`, with `ops_per_s`, `p50_ms`, `p99_ms`, `errors`, `db_commits_per_op`, `gates_missed`, … |
 | `<label>.md` | the same as a table; `<label>.log` the tool's output (`GATE MISSED:` lines name each missed target) |
-| `hub<N>-stats.json`, `hub<N>-docker-stats.log` | each server's request-path counters at the end, and its CPU and memory every 5 s |
+| `hub<N>-stats.json`, `hub<N>-docker-stats.log` | each server's request-path counters at the end (the landing service's batches, landings and timings among them: the tool fills its own `landing_*` fields only for a server it starts), and its CPU and memory every 5 s |
 | `scaling.md` | the scaling table: each curve's throughput with 1, 2 and 3 servers (summed over the drivers), and its ratio to one server's |
 | `failover-verdict.md`, `failover-check.txt`, `failover-run.txt`, `failover-after.txt`, `failover.json` | the failover verdict, the database's checks behind it, what the gate did and when |
 
@@ -190,13 +190,13 @@ and the file it comes from. Empty: not run yet.
 
 | Number | Gate | From | Value |
 |---|---|---|---|
-| headline: pushes/s and landings on `main`/s, 300 agents on branches, merging every 5th push | `branches` | `branches-merge.json`, run `clients=300`: `ops_per_s`, `p50_ms`, `p99_ms` | |
+| headline: pushes/s and merges into `main`/s, 300 agents on branches, merging every 5th push | `branches` | `branches-merge.json`, run `clients=300`: `ops_per_s`, `p50_ms`, `p99_ms`; merges/s = `branch_merges` / `seconds` | |
 | the same, 1,000 agents | `branches` | `branches-merge.json`, `clients=1000` | |
 | the same, 3,000 agents | `branches` | `branches-merge.json`, `clients=3000` | |
 | landings/s into one `main`, 10,000 agents of 100 people, plain, 3 min / 10 min | `landing` | `landing-plain-180s.json`, `landing-plain-600s.json`: `ops_per_s`, `p50_ms`, `p99_ms` | |
 | the same, protected `main` | `landing` | `landing-protected-180s.json`, `landing-protected-600s.json` | |
 | the same, protected, with the mix | `landing` | `landing-mix-180s.json`, `landing-mix-600s.json` | |
-| database commits per landing | `landing` | `landing-*.json`: `db_commits_per_op` | |
+| database commits per landing (PostgreSQL only: the tool counts PostgreSQL transaction ids, and reports 0 on YugabyteDB) | `landing` | `landing-*.json`: `db_commits_per_op` | |
 | pulls/s with 1, 2, 3 servers | `scaling` | `scaling.md` (from `scaling-<N>servers-pull@<driver>.json`) | |
 | pushes to one's own branch/s with 1, 2, 3 servers | `scaling` | `scaling.md` (`scaling-<N>servers-branches@<driver>.json`) | |
 | landings across 100 projects/s with 1, 2, 3 servers | `scaling` | `scaling.md` (`scaling-<N>servers-landing@<driver>.json`) | |
