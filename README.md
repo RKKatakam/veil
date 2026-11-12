@@ -69,12 +69,15 @@ second, held):
 |---|---|---|
 | Held for three minutes | **500 a second** (p50 104 ms, p99 925 ms) | Half the target. For comparison: 20 to 30 a second with pull, rebase, push and retry. |
 | Held for three minutes, protected `main`, 3 % overlapping and 2 % conflicting changes | 300 a second (p99 589 ms) | |
-| 15-second bursts | 924 to 958 a second | 464 to 484 when every agent belongs to one person (BUG-1940) |
-| Offered more than it can land | slows down instead of holding its rate | BUG-1941: a 10-minute run offered 1,000 a second landed 125 |
+| 15-second bursts | 956 to 1,022 a second (972 to 980 on a protected `main`) | One person's agents: 1,002 with 1,000 agents, 845 with 10,000 |
+| Offered more than it can land, with overlapping changes | lands about 230 a second, and agents see about 96 finish in time | BUG-1955, open: a 10-minute run offered 1,000 a second landed 125 |
 
 An earlier version of this page gave 993 landings a second. That came from
 a 15-second run, which ends before the queue grows; it is not a rate Veil
-holds. The fixes for BUG-1940, BUG-1941 and BUG-1942 are in progress.
+holds. BUG-1940, BUG-1941 and BUG-1942 are fixed, which brought the
+15-second runs to the numbers above; the held rates in the first two rows
+were measured before those fixes and have not been measured again. Holding
+the rate under sustained load is BUG-1955, in progress.
 
 **Beside Git**, on the same files (medians of 5):
 
@@ -87,7 +90,7 @@ holds. The fixes for BUG-1940, BUG-1941 and BUG-1942 are in progress.
 | Commit one changed file among 10,000 | 12.5 ms | **8.5 ms** |
 | `status` in the 1 GB project | 102 ms | **32 ms** |
 | Clone one folder of the 1 GB project | 4 to 5 s | **0.4 s** |
-| Default clone of the 1 GB project | fails after 64 s (BUG-1943, being fixed) | 29 s |
+| Default clone of the 1 GB project | **9.4 s** | 29 s |
 
 **Other gates:** blame over 10,000 versions answers in 425 to 528 ms the
 first time and 25 ms (p99) after; listing, searching, opening and updating
@@ -106,7 +109,7 @@ and a run across several machines.
 | History, blame and search answered by the server | Built, speed gate passed |
 | Landing at agent scale, CI, pull requests, embargoes, web client | Built; the landing rate is at half its target |
 | Review of the whole code base (eight passes) | Done: about 75 bugs found, all but a handful fixed |
-| Benchmarks on the final code | Run on 2026-11-12: 10 misses filed (BUG-1940 to BUG-1949), fixes in progress |
+| Benchmarks on the final code | Run on 2026-11-12: 10 misses filed (BUG-1940 to BUG-1949); 5 fixed so far, the rest in progress |
 | A run across several machines | Next |
 
 The correctness suite is green: about 800 server tests, each run on
