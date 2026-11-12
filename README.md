@@ -75,7 +75,7 @@ included, are in [LOAD.md](docs/design/scale/LOAD.md) (landings) and
 The p99 is just over the target, and the runs with overlapping changes
 miss it. These runs were made before two later changes: the early "come
 back later" answer, and BUG-1956's fix (changes that merged cleanly were
-refused as conflicts when several touched one file), which is in review.
+refused as conflicts when several touched one file), merged since and not yet measured again.
 An earlier version of this page gave 993 landings a second from a
 15-second run, which ends before the queue grows.
 
