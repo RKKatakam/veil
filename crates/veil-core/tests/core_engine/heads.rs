@@ -390,3 +390,217 @@ fn bug_1960_a_head_that_arrived_history_puts_under_another_is_dropped_after_an_o
     let (heads, expected) = heads_after_withheld_history_arrives(true);
     assert_eq!(heads, expected, "the old head is an ancestor of the upper head, and still a head");
 }
+
+fn xorshift(seed: u64) -> impl FnMut(usize) -> usize {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    move |n: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n as u64) as usize
+    }
+}
+
+/// The review of `clifast` (guarantee 3): `reachable_among_tips` answers
+/// as `reachable_among` (the walk before the branch) for any history, any
+/// roots and any candidates, whenever the tips it is told are apart (none
+/// descends from another) and `under` holds their parents: random
+/// histories with merges, fixed seeds.
+#[test]
+fn reachable_among_tips_answers_as_the_full_walk_for_tips_that_are_apart() {
+    let mut compared = 0;
+    for seed in 1..=60u64 {
+        let mut next = xorshift(seed);
+        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let repo = Repo::init(backend, None, "t").unwrap();
+        let mut all = vec![repo.root_id()];
+        let n = 8 + next(40);
+        for i in 0..n {
+            let mut parents = vec![all[next(all.len())]];
+            // Mostly near the newest (long lines), sometimes anywhere, sometimes a merge.
+            if next(3) > 0 {
+                parents = vec![all[all.len() - 1 - next(all.len().min(3))]];
+            }
+            if next(5) == 0 {
+                let other = all[next(all.len())];
+                if !parents.contains(&other) {
+                    parents.push(other);
+                }
+            }
+            all.push(repo.store().put_snapshot(&foreign(&repo, parents, i as i64 + 1)).unwrap());
+        }
+        let ancestors: Vec<HashSet<ObjectId>> = all.iter().map(|id| repo.held().ancestors(id).unwrap()).collect();
+        let at = |id: &ObjectId| all.iter().position(|a| a == id).unwrap();
+        for round in 0..30 {
+            // Tips that are apart.
+            let mut tips: Vec<ObjectId> = Vec::new();
+            for _ in 0..next(6) {
+                let c = all[next(all.len())];
+                if tips.iter().all(|t| !ancestors[at(t)].contains(&c) && !ancestors[at(&c)].contains(t)) {
+                    tips.push(c);
+                }
+            }
+            let tips: HashSet<ObjectId> = tips.into_iter().collect();
+            let under: HashSet<ObjectId> = tips.iter().flat_map(|t| repo.snapshot(t).unwrap().parents.clone()).collect();
+            // Candidates: some of the tips, and anything else.
+            let mut candidates: HashSet<ObjectId> = tips.iter().copied().filter(|_| next(3) > 0).collect();
+            for _ in 0..next(5) {
+                candidates.insert(all[next(all.len())]);
+            }
+            // Roots: the candidates' parents (as `drop_ancestor_heads` asks), or anything.
+            let roots: Vec<ObjectId> = match next(2) {
+                0 => candidates.iter().flat_map(|c| repo.snapshot(c).unwrap().parents.clone()).collect(),
+                _ => (0..1 + next(4)).map(|_| all[next(all.len())]).collect(),
+            };
+            let full = repo.held().reachable_among(roots.clone(), &candidates).unwrap();
+            let short = repo.held().reachable_among_tips(roots.clone(), &candidates, &tips, &under).unwrap();
+            assert_eq!(short, full, "seed {seed}, round {round}: {} snapshots, {} tips, {} candidates", all.len(), tips.len(), candidates.len());
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 60 * 30);
+}
+
+/// The review of `clifast` (guarantee 3): a random walk over every kind of
+/// operation that moves heads (new changes, merges, descriptions, rebases,
+/// squashes, abandons, undo, a restore to any earlier operation, history
+/// that arrives above what is held, with and without a rewrite in the same
+/// operation, a new process, two processes writing at once and their
+/// merge): after every operation that rewrote something and builds on one
+/// operation, no head is an ancestor of another, which is what the walk
+/// before the branch left (it read every head's whole range at each such
+/// operation).
+#[test]
+fn no_head_descends_from_another_after_a_rewrite_whatever_came_before() {
+    let (mut rewrites_checked, mut merges_seen) = (0, 0);
+    for seed in 1..=50u64 {
+        let mut next = xorshift(seed);
+        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let mut repo = Repo::init(backend.clone(), None, "t").unwrap();
+        let root = repo.root_id();
+        let mut stamp = 0i64;
+        for step in 0..60 {
+            let wc = repo.workspace_wc("default").unwrap();
+            let mut free: Vec<ObjectId> = repo.held().visible().unwrap().into_iter().filter(|id| *id != root && *id != wc).collect();
+            free.sort();
+            let what = if free.len() < 2 { 0 } else { next(12) };
+            let pick = |next: &mut dyn FnMut(usize) -> usize| free[next(free.len())];
+            match what {
+                0 | 1 => {
+                    let base = if free.is_empty() || next(6) == 0 { root } else { pick(&mut next) };
+                    change_on(&mut repo, base, &format!("s{seed}-{step}.txt"));
+                }
+                2 => {
+                    repo.describe(pick(&mut next), &format!("described at {step}")).unwrap();
+                }
+                3 => {
+                    let source = pick(&mut next);
+                    let dests: Vec<ObjectId> = std::iter::once(root)
+                        .chain(free.iter().copied())
+                        .filter(|d| !repo.held().ancestors(d).unwrap().contains(&source))
+                        .collect();
+                    repo.rebase(source, vec![dests[next(dests.len())]]).unwrap();
+                }
+                4 => {
+                    repo.abandon(pick(&mut next)).unwrap();
+                }
+                5 => {
+                    // A change with one parent that is neither the root nor the working copy's.
+                    let foldable: Vec<ObjectId> = free
+                        .iter()
+                        .copied()
+                        .filter(|id| matches!(repo.snapshot(id).unwrap().parents[..], [p] if p != root && p != wc))
+                        .collect();
+                    if let Some(id) = foldable.get(next(foldable.len().max(1))) {
+                        repo.squash(*id).unwrap();
+                    }
+                }
+                6 => {
+                    if repo.ops().get(&repo.op_id()).unwrap().parents.len() == 1 {
+                        repo.undo().unwrap();
+                    }
+                }
+                7 => {
+                    let log = repo.op_log(1000).unwrap();
+                    let (op, _) = &log[next(log.len())];
+                    repo.restore_operation(*op).unwrap();
+                }
+                8 | 9 => {
+                    // History that arrives: one or two snapshots on something
+                    // held, the upper one a head; with a rewrite in the same
+                    // operation (9) or without (8).
+                    let mut tx = repo.transaction("arrive").unwrap();
+                    let mut parent = if next(4) == 0 { root } else { pick(&mut next) };
+                    for _ in 0..1 + next(2) {
+                        stamp += 1;
+                        parent = tx.repo().store().put_snapshot(&foreign(tx.repo(), vec![parent], 1_000 + stamp)).unwrap();
+                    }
+                    tx.add_head(parent).unwrap();
+                    if what == 9 {
+                        let target = pick(&mut next);
+                        let mut described = (*tx.repo().snapshot(&target).unwrap()).clone();
+                        described.description = veil_core::object::Text::Plain(format!("rewritten at {step}"));
+                        tx.rewrite(target, described).unwrap();
+                    }
+                    tx.commit().unwrap();
+                }
+                10 => {
+                    // A merge of two changes neither of which descends from the other.
+                    let a = pick(&mut next);
+                    let others: Vec<ObjectId> = free
+                        .iter()
+                        .copied()
+                        .filter(|b| !repo.held().ancestors(b).unwrap().contains(&a) && !repo.held().ancestors(&a).unwrap().contains(b))
+                        .collect();
+                    if let Some(b) = others.get(next(others.len().max(1))) {
+                        let mut tx = repo.transaction("merge").unwrap();
+                        tx.new_change(vec![a, *b], "a merge").unwrap();
+                        tx.commit().unwrap();
+                    }
+                }
+                _ => {
+                    // Two processes at once: each describes a change from
+                    // the same state (the second in a copy of the
+                    // repository, published afterwards); then a new
+                    // process, which merges their operations.
+                    let (a, b) = (pick(&mut next), pick(&mut next));
+                    let fork: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+                    let files = |fs: &dyn StorageBackend| veil_core::vfs::walk_files(fs, &VPath::root(), &|p: &VPath| p.as_str().starts_with(".veil/local")).unwrap();
+                    for f in files(&*backend) {
+                        fork.write(&f, &backend.read(&f).unwrap()).unwrap();
+                    }
+                    repo.describe(a, &format!("first at {step}")).unwrap();
+                    if a != b {
+                        let mut second = Repo::open(fork.clone(), None, "t").unwrap();
+                        second.describe(b, &format!("second at {step}")).unwrap();
+                        drop(second);
+                        for f in files(&*fork) {
+                            let s = f.as_str();
+                            let new = backend.metadata(&f).unwrap().is_none();
+                            if new && (s.starts_with(".veil/objects/") || s.starts_with(".veil/ops/") || s.starts_with(".veil/op_heads/")) {
+                                backend.write(&f, &fork.read(&f).unwrap()).unwrap();
+                            }
+                        }
+                    }
+                    repo = Repo::open(backend.clone(), None, "t").unwrap();
+                }
+            }
+            if next(7) == 0 {
+                repo = Repo::open(backend.clone(), None, "t").unwrap();
+            }
+            let op = repo.ops().get(&repo.op_id()).unwrap();
+            merges_seen += usize::from(op.parents.len() > 1);
+            if op.parents.len() == 1 && !op.rewritten.is_empty() {
+                rewrites_checked += 1;
+                assert_eq!(
+                    redundant_heads(&repo),
+                    Vec::<ObjectId>::new(),
+                    "seed {seed}, step {step} (operation {what}, '{}'): a head under another head after a rewrite",
+                    op.description
+                );
+            }
+        }
+    }
+    assert!(rewrites_checked > 500, "the walk checked {rewrites_checked} rewrites");
+    assert!(merges_seen > 20, "the walk merged concurrent operations {merges_seen} times");
+}
