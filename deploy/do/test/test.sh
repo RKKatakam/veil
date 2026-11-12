@@ -26,7 +26,7 @@
 #      or in the results;
 #   7. the failover verdict on made-up results: a clean run passes, a change
 #      told landed and lost, one doubled on `main`, one landed and never
-#      told beyond the failed submits, one told as another snapshot, and a
+#      told beyond the failed submits, one told under another ticket, and a
 #      run without the per-change log each fail.
 # Everything runs under a temporary state directory inside the worktree's .scratch/.
 set -euo pipefail
@@ -288,19 +288,21 @@ fake_failover() { # DIR CASE: clean | lost | doubled | untold | moved
         setup_snapshots\|2 main_without_ticket\|0 landings_before_stop\|3 landings_after_stop\|4 first_landing_after_stop_ms\|100 \
         longest_gap_after_stop_ms\|900 longest_gap_before_stop_ms\|300 > "$1/failover-check.txt"
     echo '{"runs":[{"ops":4,"errors":2}]}' > "$1/failover.json"
-    local i n=0
+    # Change ids: hex on main's line (as the graph keeps them), the API's
+    # letters in the log (z = 0, y = 1, ...: "zy" is 01).
+    local i n=0 rl=zyxwvutsrq
     : > "$1/failover-line.txt"; : > "$1/failover.landings.jsonl"
     for i in 7 6 5 4 3 2 1; do
-        echo "$n|s$i|c$i|t$i" >> "$1/failover-line.txt"; n=$((n + 1))
-        [ "$2" = doubled ] && [ $i = 3 ] && { echo "$n|s3b|c3|t3b" >> "$1/failover-line.txt"; n=$((n + 1)); }
+        echo "$n|s$i|0$i|t$i" >> "$1/failover-line.txt"; n=$((n + 1))
+        [ "$2" = doubled ] && [ $i = 3 ] && { echo "$n|s3b|03|t3b" >> "$1/failover-line.txt"; n=$((n + 1)); }
     done
     printf '%s\n' "$n|setup1|cs1|" "$((n + 1))|setup0|cs0|" >> "$1/failover-line.txt"
     for i in 1 2 3 4 5; do
         [ "$2" = untold ] && [ $i = 5 ] && continue
-        echo "{\"ticket\":\"t$i\",\"change\":\"c$i\",\"landed\":[\"s$i\"],\"project\":\"p\",\"at_ms\":$i}" >> "$1/failover.landings.jsonl"
+        echo "{\"ticket\":\"t$i\",\"change\":\"z${rl:$i:1}\",\"landed\":[\"s$i\"],\"project\":\"p\",\"at_ms\":$i}" >> "$1/failover.landings.jsonl"
     done
-    [ "$2" = lost ] && echo '{"ticket":"t8","change":"c8","landed":["s8"],"project":"p","at_ms":8}' >> "$1/failover.landings.jsonl"
-    [ "$2" = moved ] && echo '{"ticket":"t9","change":"c2","landed":["s9"],"project":"p","at_ms":9}' >> "$1/failover.landings.jsonl"
+    [ "$2" = lost ] && echo '{"ticket":"t8","change":"zr","landed":["s8"],"project":"p","at_ms":8}' >> "$1/failover.landings.jsonl"
+    [ "$2" = moved ] && echo '{"ticket":"t9","change":"zx","landed":["s9"],"project":"p","at_ms":9}' >> "$1/failover.landings.jsonl"
     echo '{"failed":"land: connection reset","project":"p","at_ms":6}' >> "$1/failover.landings.jsonl"
     echo '{"failed":"still queued after the server'"'"'s wait","ticket":"t7","project":"p","at_ms":7}' >> "$1/failover.landings.jsonl"
 }
@@ -311,10 +313,10 @@ for c in clean lost doubled untold moved; do
     vrc[$c]=0; vout[$c]=$(python3 "$V" "$T/failover-$c" 2>&1) || vrc[$c]=$?
 done
 check "a clean run passes: 5 told, t7 explained by its ticket, t6 by the one failed submit without a ticket" '[ "${vrc[clean]}" = 0 ] && [[ "${vout[clean]}" == *"failover: every check passed"* ]] && [[ "${vout[clean]}" == *"| 2: 1 / 1 ≤ 1 | pass |"* ]] && [[ "${vout[clean]}" == *"| told landed, not on \`main\` | 0 | pass |"* ]]'
-check "a change told landed and missing from main fails as lost" '[ "${vrc[lost]}" = 1 ] && [[ "${vout[lost]}" == *"| told landed, not on \`main\` | 1 | **FAIL** |"*"\`c8\`"* ]]'
-check "a change told landed and twice on main fails as doubled" '[ "${vrc[doubled]}" = 1 ] && [[ "${vout[doubled]}" == *"| told landed, on \`main\` more than once | 1 | **FAIL** |"*"\`c3\`"* ]]'
+check "a change told landed and missing from main fails as lost" '[ "${vrc[lost]}" = 1 ] && [[ "${vout[lost]}" == *"| told landed, not on \`main\` | 1 | **FAIL** |"*"\`08\`"* ]]'
+check "a change told landed and twice on main fails as doubled" '[ "${vrc[doubled]}" = 1 ] && [[ "${vout[doubled]}" == *"| told landed, on \`main\` more than once | 1 | **FAIL** |"*"\`03\`"* ]]'
 check "a landing no agent was told about, beyond the failed submits, fails" '[ "${vrc[untold]}" = 1 ] && [[ "${vout[untold]}" == *"| 3: 1 / 2 ≤ 1 | **FAIL** |"* ]]'
-check "a change answered twice, once as another snapshot, fails" '[ "${vrc[moved]}" = 1 ] && [[ "${vout[moved]}" == *"| changes answered \`landed\` twice | 1 | **FAIL** |"* ]] && [[ "${vout[moved]}" == *"| told landed as another snapshot or ticket | 1 | **FAIL** |"* ]]'
+check "a change answered twice, once under another ticket, fails" '[ "${vrc[moved]}" = 1 ] && [[ "${vout[moved]}" == *"| changes answered \`landed\` twice | 1 | **FAIL** |"* ]] && [[ "${vout[moved]}" == *"| told landed under another ticket | 1 | **FAIL** |"* ]]'
 rm "$T/failover-clean/failover.landings.jsonl"
 rc=0; out=$(python3 "$V" "$T/failover-clean" 2>&1) || rc=$?
 check "a run without the per-change log fails" '[ $rc = 1 ] && [[ "$out" == *"| missing | **FAIL** |"* ]]'

@@ -16,7 +16,8 @@ The agents: the benchmark's per-change log (failover.landings.jsonl), one
 line for each `landed` answer (ticket, change, the landed snapshots) and
 one for each submit that failed (the error, and the ticket when the server
 gave one). Every change an agent was told landed must be on `main`'s line
-exactly once, as the snapshot and under the ticket it was told; every
+exactly once, under the ticket it was told (the `landed` snapshot ids are
+the caller's projection, not `main`'s ids, so they are not compared); every
 change on the line that a ticket landed and no agent was told about must
 be explained by a failed submit: by its ticket when the failure carried
 one, otherwise by counting (one submit that got no answer, a broken
@@ -42,8 +43,18 @@ def kv(path):
     return out
 
 
+# A change id as the API writes it (veil-core `ChangeId`: 32 letters k-z,
+# z = 0 ... k = f) and as the derived graph stores it (hex): both to hex.
+REVERSE_HEX = str.maketrans("zyxwvutsrqponmlk", "0123456789abcdef")
+
+
+def change_hex(c):
+    c = str(c).strip().lower()
+    return c.translate(REVERSE_HEX) if c and all("k" <= ch <= "z" for ch in c) else c
+
+
 def answers(d):
-    """The agents' side: {change: [(ticket, last landed snapshot)]}, the
+    """The agents' side: {change: [ticket]}, the
     tickets of failed submits, and the number of failed submits without
     one; None when the log is missing."""
     path = d / "failover.landings.jsonl"
@@ -62,8 +73,9 @@ def answers(d):
             else:
                 failed_blind += 1
         elif v.get("change"):
-            landed = v.get("landed") or [""]
-            told.setdefault(str(v["change"]), []).append((str(v.get("ticket") or ""), str(landed[-1])))
+            # `landed` holds snapshot ids as the caller sees them (its
+            # projection), not the ids on `main`: the ticket is compared.
+            told.setdefault(change_hex(v["change"]), []).append(str(v.get("ticket") or ""))
         else:
             bad += 1
     return told, failed_tickets, failed_blind, bad
@@ -79,7 +91,7 @@ def main_line(d):
     for line in path.read_text().splitlines():
         f = line.split("|")
         if len(f) == 4 and f[0].isdigit():
-            out.append((f[1], f[2], [t for t in f[3].split(",") if t]))
+            out.append((f[1], change_hex(f[2]), [t for t in f[3].split(",") if t]))
     return out
 
 
@@ -165,10 +177,9 @@ def main():
         doubled = [c for c in told if len(on_main.get(c, [])) > 1]
         row("told landed, on `main` more than once", len(doubled), not doubled,
             "landed twice" + (f" (e.g. `{doubled[0]}`)" if doubled else ""))
-        elsewhere = [c for c, v in told.items() if len(on_main.get(c, [])) == 1 and not all(
-            s == on_main[c][0][0] and (not t or t in on_main[c][0][1]) for t, s in v)]
-        row("told landed as another snapshot or ticket", len(elsewhere), not elsewhere,
-            "the snapshot (and ticket) the agent was told is the one on `main`" + (f" (e.g. `{elsewhere[0]}`)" if elsewhere else ""))
+        elsewhere = [c for c, v in told.items() if len(on_main.get(c, [])) == 1 and not all(t and t in on_main[c][0][1] for t in v)]
+        row("told landed under another ticket", len(elsewhere), not elsewhere,
+            "the ticket the agent was answered is the one that landed the change on `main`" + (f" (e.g. `{elsewhere[0]}`)" if elsewhere else ""))
         untold = [(c, tickets) for _, c, tickets in line if tickets and c not in told]
         by_ticket = sum(1 for _, tickets in untold if failed_tickets & set(tickets))
         blind = len(untold) - by_ticket
