@@ -970,6 +970,219 @@ and the blame then missed an object (BUG-1953). They passed on the
 machine's long-lived MinIO (`veil-shared-minio`, a bucket of the run's),
 which is how the gate was measured before.
 
+## Holding the rate past capacity (BUG-1955, 2026-11-12, `landhold2`)
+
+The same benchmark as G4 above, for three and ten minutes: `OBJECTS=local
+LANDING_CLIENTS=10000 LANDING_RATES=1000 DURATION=180
+scripts/bench-server.sh landing -- [--protected] [--mix] [--people 100]
+[--steps RATE:SECONDS,…]`, 10,000 agents, open loop. Each run went
+through `bench-quiet.sh` (load before under 16). `veil-bench load` now
+prints a time series every 10 s (offered, landed by the service,
+finished for an agent, the queue, p50/p99 from the scheduled time, the
+accepted request's wait, answers that told the agent to wait, failures,
+entries sent to a merge, landings per batch, commits per landing, and
+the server's `landing_pick_statements`, `landing_pick_rows` and
+`landing_review_asks`); `--steps` changes the offered rate during the
+run. The profile is timing spans in a build kept off the branch
+(`perf` is not allowed on this machine), the database's active backends
+sampled every 0.2 s (`pg_stat_activity` wait events), `vmstat` and `top`.
+
+**Two of the benchmark's own costs, removed.** (1) PostgreSQL ran with
+its default 128 MB of shared buffers against a database of 1.5 GB after
+three minutes: a third of the backends' active time was `DataFileWrite`
+(writing out pages themselves), and the batch's statements took 70 to
+120 µs a row. The deployment gives the database 4 GB
+(`deploy/do/configure.sh`); the benchmark does too now. (2) The server
+reached the database through Docker's published port: `docker-proxy`
+took 3 of the 32 threads, every statement two more copies. It goes to the
+container's address now, as to a database on its own host. Durability is
+unchanged (`synchronous_commit = on`, every object `fsync`ed).
+
+**What the profile showed** (protected, `--mix`, 1,000/s offered, 10,000
+agents of 100 people; ms per batch of the service unless named):
+
+| Build and harness | Finished (/s) | p50 / p99 (ms) | Batch cycle | Transaction | Store objects | Build | Prepare | Waiting for the batch before | A submit's work (`create_with`) | Its wait for the project's gate |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `af997c49`, default database | 703 | 10,191 / 57,001 | 70.0 | 48.7 | 26.4 | 24.9 | 21.7 | 18.7 | 45.9 | – |
+| the same, 4 GB of shared buffers | 902 | 3,656 / 26,351 | 56.9 | 35.4 | 27.1 | 23.8 | 13.7 | 15.6 | 41.5 | – |
+| + the objects stored during the transaction | 904 | 5,424 / 21,467 | 45.3 | 34.0 | 22.7 | 28.5 | 8.4 | 5.3 | 43.8 | – |
+| + the database at its own address (120 s) | 970 | 235 / 3,571 | 40.7 | 30.4 | 20.7 | 23.7 | 9.4 | 4.6 | 35.2 | 354 |
+
+- **The 80 ms of an overlapping build** (BUG-1955's row) was reading
+  the branch's whole edit set since the change's base (every folder
+  anyone landed in since, 10,000 of them for a base ten seconds old), on
+  the batch's own thread: spans on the build before `touching`
+  (`a1c4f691`'s profile) gave an entry sent to a merge 24.3 ms of the
+  batch (23.2 ms of it that read), a conflict 61.2 ms (27.8 ms for the
+  report's "landed since", 22.2 ms for the edit set), and the merge
+  worker 66.5 ms more. `touching` reads only the change's own paths: an
+  entry sent to a merge costs the batch 0.03 ms now, a conflict 2.8 ms,
+  a merge run 28 ms on its worker.
+- **The half-full batches** (36 of 64) were the service's own pace
+  before BUG-1941's fix, and now the entries a batch sends to a merge:
+  41 to 53 of 64 land, the others go to a merge worker or are answered
+  conflict, and each overlapping change comes back up to three times
+  (BUG-1956, below).
+- **The 9.68 commits a landing** were commits for submits nobody waited
+  for: 93,363 requests timed out and were sent again, each a commit, and
+  the agents saw 96 landings a second of the 229 landed. With the
+  answers below, nothing is done for a refused submit; what remains above
+  1.0 is the batch (1/50), the deriver's pass (about 0.2) and the merge
+  workers' commits (0.2 to 0.6 with the mix, more past capacity).
+- **The batch's longest step** was storing its objects (2 × `fsync` per
+  object, some 500 a batch) and then running its transaction, one after
+  the other; the transaction now runs while they are written and waits
+  for them only before `COMMIT` (HUB §13.32 item 10).
+- **A submit's 35 to 45 ms** are mostly waiting: of a submit's build,
+  1 ms is CPU (thread CPU time) and 12 ms wall; storing its 5 objects
+  11 ms (`fsync`); reading its stack 8 to 12 ms; its transaction 6 to
+  7 ms. During a run the machine is at 55 to 60 % CPU (25 % system) and
+  25 to 30 % I/O wait (`vmstat`): the load tool's 10,000 agents, the
+  server, the database and about 30,000 `fsync`s a second share 32
+  threads. A submit holds one of its project's 48 gate places (¾ of 64
+  database connections) for that time, so a project takes about 1,100
+  submits a second here; past that, requests wait in the gate.
+
+**Three-minute runs, before and after** (10,000 agents; finished: the
+landings the agents saw land, per second; commits: database commits per
+landing):
+
+| Run | Build, harness | Finished (/s) | p50 (ms) | p99 (ms) | Commits | Failed requests |
+|---|---|---:|---:|---:|---:|---:|
+| unprotected, 100 people | `a2fff143`, old | 668 | 29,274 | 58,519 | 1.46 | 0 |
+| | `af997c49`, old | 942 | 1,922 | 20,422 | 1.16 | 0 |
+| | **`landhold2`, new** | **996** | **280** | **1,187** | **1.22** | 0 |
+| protected, 100 people | `a2fff143`, old | 652 | 27,625 | 61,810 | 1.67 | 0 |
+| | `af997c49`, old | 871 | 2,820 | 40,712 | 1.18 | 216 |
+| | **`landhold2`, new** | **998** | **329** | **1,216** | **1.21** | 0 |
+| protected, `--mix`, 100 people | `a2fff143`, old | 96 (229 landed) | 15,000 | 36,000 | 9.68 | 93,363 |
+| | `a2fff143`, new | 133 (269 landed) | 12,980 | 36,628 | 7.58 | 86,726 |
+| | `af997c49`, old | 734 | 10,287 | 54,032 | 1.40 | 4,328 |
+| | **`landhold2`, new** | **935** | **1,224** | **10,781** | **1.82** | 1,365 |
+| unprotected, one person | `a2fff143`, old | 643 | 22,111 | 63,647 | 1.20 | 5,624 |
+| | `af997c49`, old | 985 | 1,545 | 7,747 | 1.16 | 0 |
+| | **`landhold2`, new** | **995** | **293** | **1,156** | **1.19** | 0 |
+
+"Old": the benchmark as it was (128 MB of shared buffers, `docker-proxy`);
+"new": as now. `a2fff143` is the start of this work (BUG-1940 to 1942
+fixed); `af997c49` the branch's first part (`touching`, read-ahead,
+back-pressure, a random slot first). The `--mix` row of `a2fff143`, old,
+is BUG-1955's own run. Per 10 s, the plain runs on `landhold2` hold 922
+to 1,069/s for the whole three minutes, p99 400 to 1,270 ms; the mix
+holds 980 to 1,076/s for 90 s, then 810 to 950/s with the queue at its
+bound.
+
+**Ten minutes, the mix** (`landhold2`; a row a minute of the series):
+
+| t (s) | offered/s | landed/s | finished/s | queue | p50 ms | p99 ms | wait p50 | wait p99 | told to wait | failed | to merges | per batch | commits/landing | pick stmts | pick rows | review asks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 60 | 1,000 | 1,013 | 1,013 | 747 | 769 | 4,154 | 760 | 1,666 | 0 | 0 | 2,322 | 50.1 | 1.67 | 326 | 54,097 | 808 |
+| 120 | 1,000 | 1,026 | 1,026 | 2,038 | 2,655 | 6,268 | 2,219 | 2,846 | 7,558 | 197 | 1,421 | 53.4 | 1.21 | 234 | 59,904 | 768 |
+| 180 | 1,000 | 822 | 822 | 1,714 | 7,827 | 15,324 | 7,820 | 8,771 | 0 | 13 | 3,192 | 46.0 | 3.16 | 307 | 60,360 | 716 |
+| 240 | 1,000 | 779 | 779 | 2,414 | 17,527 | 18,268 | 10,009 | 10,748 | 629 | 209 | 1,350 | 52.3 | 5.01 | 150 | 38,400 | 600 |
+| 300 | 1,000 | 752 | 751 | 2,008 | 33,107 | 33,837 | 9,859 | 11,822 | 624 | 507 | 1,775 | 48.8 | 3.63 | 154 | 39,424 | 616 |
+| 360 | 1,000 | 607 | 607 | 1,945 | 46,963 | 53,322 | 10,664 | 12,127 | 31 | 472 | 1,720 | 47.8 | 6.15 | 127 | 32,026 | 508 |
+| 420 | 1,000 | 629 | 629 | 868 | 60,398 | 62,422 | 10,948 | 12,080 | 0 | 1,042 | 1,695 | 47.8 | 2.23 | 257 | 63,227 | 526 |
+| 480 | 1,000 | 802 | 802 | 138 | 70,817 | 72,841 | 11,967 | 12,807 | 0 | 2,009 | 1,041 | 53.9 | 1.35 | 148 | 22,115 | 592 |
+| 540 | 1,000 | 773 | 773 | 116 | 71,934 | 74,490 | 11,972 | 12,543 | 0 | 2,257 | 931 | 52.8 | 1.30 | 146 | 12,956 | 584 |
+| 600 | 997 | 814 | 814 | 154 | 72,016 | 74,556 | 12,123 | 12,826 | 0 | 1,833 | 853 | 56.5 | 1.30 | 145 | 22,283 | 580 |
+
+Over the ten minutes: 808 finished a second, p50 27.7 s, p99 73 s from the scheduled time, 2.37 commits a landing, 45,222 landings the agents gave up on (each agent's own deadline), 128,450 answers that told an agent to wait.
+
+**Past capacity: 1,500/s offered for 120 s, then 600/s** (`--protected --mix
+--people 100 --steps 1500:120,600:60`, on the build before the gate's
+early answer; every row of the series):
+
+| t (s) | offered/s | landed/s | finished/s | queue | p50 ms | p99 ms | wait p50 | wait p99 | told to wait | failed | to merges | per batch | commits/landing | pick stmts | pick rows | review asks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 1,500 | 1,185 | 1,185 | 152 | 192 | 2,005 | 189 | 1,979 | 0 | 0 | 1,106 | 51.6 | 1.45 | 230 | 21,046 | 920 |
+| 20 | 1,500 | 770 | 770 | 89 | 4,028 | 6,758 | 3,994 | 6,637 | 0 | 0 | 986 | 51.7 | 1.24 | 149 | 23,646 | 596 |
+| 30 | 1,500 | 1,017 | 1,017 | 1,574 | 9,561 | 10,019 | 9,540 | 10,002 | 36 | 0 | 663 | 48.9 | 1.38 | 207 | 38,887 | 828 |
+| 40 | 1,500 | 1,170 | 1,170 | 1,232 | 11,163 | 11,957 | 7,675 | 8,051 | 0 | 0 | 1,091 | 57.6 | 1.28 | 408 | 104,448 | 816 |
+| 50 | 1,500 | 1,190 | 1,190 | 2,124 | 13,393 | 14,647 | 8,143 | 8,457 | 15,481 | 0 | 1,199 | 56.6 | 1.44 | 290 | 74,240 | 836 |
+| 60 | 1,500 | 1,107 | 1,107 | 2,120 | 13,589 | 22,017 | 1,893 | 4,323 | 43,604 | 0 | 1,187 | 56.2 | 1.36 | 198 | 50,688 | 792 |
+| 70 | 1,500 | 1,103 | 1,103 | 1,813 | 17,532 | 32,042 | 2,243 | 4,460 | 15,741 | 74 | 1,111 | 56.0 | 1.30 | 196 | 50,176 | 784 |
+| 80 | 1,500 | 1,072 | 1,072 | 2,535 | 20,904 | 35,096 | 8,013 | 8,331 | 15,180 | 145 | 1,606 | 55.2 | 1.45 | 320 | 81,920 | 778 |
+| 90 | 1,500 | 829 | 829 | 2,022 | 21,180 | 29,943 | 2,120 | 2,609 | 61,316 | 290 | 1,283 | 52.5 | 1.46 | 314 | 80,384 | 630 |
+| 100 | 1,500 | 1,050 | 1,050 | 394 | 29,830 | 40,708 | 2,831 | 7,385 | 16,129 | 214 | 845 | 56.3 | 1.20 | 193 | 49,408 | 746 |
+| 110 | 1,500 | 1,065 | 1,065 | 2,189 | 30,992 | 41,606 | 8,002 | 8,781 | 45 | 50 | 2,755 | 41.5 | 2.36 | 262 | 35,977 | 1,026 |
+| 120 | 1,498 | 866 | 866 | 1,960 | 33,170 | 37,401 | 8,481 | 8,881 | 24,671 | 335 | 1,347 | 50.5 | 1.97 | 202 | 51,712 | 686 |
+| 130 | 600 | 1,049 | 1,049 | 1,985 | 35,385 | 45,685 | 3,590 | 5,433 | 31,064 | 458 | 1,701 | 53.3 | 1.40 | 200 | 51,200 | 790 |
+| 140 | 600 | 897 | 892 | 2,092 | 40,360 | 52,491 | 2,910 | 6,871 | 26,993 | 351 | 1,317 | 53.0 | 1.40 | 168 | 43,008 | 672 |
+| 150 | 600 | 971 | 976 | 2,097 | 41,430 | 58,438 | 2,011 | 2,998 | 33,147 | 631 | 1,901 | 51.4 | 1.32 | 199 | 50,944 | 760 |
+| 160 | 600 | 875 | 875 | 1,923 | 47,781 | 61,761 | 3,649 | 6,443 | 25,970 | 1,013 | 1,993 | 49.4 | 1.80 | 215 | 55,040 | 708 |
+| 170 | 600 | 908 | 908 | 1,513 | 51,472 | 63,842 | 5,197 | 8,230 | 760 | 280 | 624 | 57.8 | 1.12 | 168 | 43,008 | 628 |
+| 180 | 598 | 809 | 805 | 2,105 | 53,358 | 61,885 | 9,019 | 10,407 | 41 | 108 | 3,127 | 46.0 | 2.69 | 350 | 89,600 | 702 |
+
+The service landed 770 to 1,190/s (1,040 on average) throughout, and
+every landing it made was one an agent saw finish (landed = finished);
+the accepted request's wait stayed within the queue's 10 s bound (p50 2
+to 9 s); commits per landing stayed 1.2 to 1.5 but for two rows of merge
+storms (BUG-1956). The queue did not drain in the 60 s at 600/s: the
+agents still held some 55,000 landings they had been told to bring back,
+which drain at what the service lands beyond 600/s.
+
+**Past capacity and back: 1,500/s for 90 s, then 300/s for 150 s**, with the gate's early answer (HUB §13.32 item 11; `--steps 1500:90,300:150`):
+
+| t (s) | offered/s | landed/s | finished/s | queue | p50 ms | p99 ms | wait p50 | wait p99 | told to wait | failed | to merges | per batch | commits/landing | pick stmts | pick rows | review asks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 1,500 | 1,070 | 1,070 | 146 | 367 | 2,707 | 331 | 2,692 | 1,870 | 0 | 727 | 38.5 | 1.44 | 279 | 17,357 | 1,114 |
+| 20 | 1,500 | 686 | 686 | 73 | 3,425 | 10,191 | 3,142 | 6,955 | 31,210 | 0 | 506 | 23.8 | 1.19 | 329 | 16,154 | 1,152 |
+| 30 | 1,500 | 964 | 964 | 139 | 10,471 | 15,085 | 3,262 | 10,954 | 43,257 | 0 | 598 | 36.1 | 1.29 | 288 | 18,050 | 1,070 |
+| 40 | 1,500 | 1,016 | 1,016 | 244 | 13,636 | 20,722 | 5,158 | 9,521 | 46,813 | 0 | 901 | 50.2 | 1.37 | 202 | 16,678 | 808 |
+| 50 | 1,500 | 1,187 | 1,187 | 302 | 16,116 | 22,821 | 4,781 | 7,880 | 37,616 | 0 | 1,033 | 56.5 | 1.35 | 210 | 30,830 | 840 |
+| 60 | 1,500 | 1,000 | 1,000 | 182 | 18,778 | 26,555 | 5,482 | 9,055 | 45,366 | 0 | 1,180 | 43.1 | 1.43 | 233 | 16,246 | 928 |
+| 70 | 1,500 | 952 | 952 | 245 | 22,087 | 33,271 | 5,671 | 9,680 | 49,599 | 85 | 1,109 | 48.7 | 1.40 | 195 | 12,508 | 780 |
+| 80 | 1,500 | 1,112 | 1,112 | 351 | 24,795 | 32,755 | 4,052 | 9,725 | 38,404 | 86 | 1,594 | 50.3 | 1.43 | 221 | 23,189 | 884 |
+| 90 | 1,497 | 1,000 | 1,000 | 328 | 27,358 | 35,360 | 4,630 | 8,363 | 34,672 | 111 | 1,218 | 54.4 | 1.43 | 184 | 21,342 | 736 |
+| 100 | 300 | 1,056 | 1,056 | 338 | 29,976 | 37,336 | 4,377 | 8,805 | 32,981 | 103 | 1,556 | 54.1 | 1.40 | 213 | 46,792 | 780 |
+| 110 | 300 | 942 | 942 | 375 | 33,650 | 40,321 | 4,081 | 9,911 | 37,506 | 184 | 1,857 | 50.2 | 1.54 | 187 | 36,157 | 750 |
+| 120 | 300 | 880 | 880 | 794 | 38,216 | 45,214 | 6,064 | 10,280 | 43,005 | 298 | 1,791 | 50.6 | 1.62 | 175 | 30,573 | 698 |
+| 130 | 300 | 993 | 993 | 531 | 40,911 | 46,864 | 5,009 | 7,891 | 37,275 | 260 | 1,764 | 52.7 | 1.47 | 196 | 47,257 | 752 |
+| 140 | 300 | 932 | 932 | 503 | 42,492 | 51,252 | 6,248 | 9,235 | 38,965 | 307 | 2,019 | 50.5 | 1.61 | 200 | 38,997 | 736 |
+| 150 | 300 | 906 | 906 | 461 | 22,978 | 46,185 | 6,149 | 9,652 | 22,308 | 636 | 1,907 | 50.3 | 1.64 | 202 | 44,329 | 724 |
+| 160 | 300 | 624 | 624 | 507 | 3,689 | 56,077 | 1,370 | 6,265 | 1,786 | 220 | 3,697 | 19.4 | 3.28 | 323 | 19,074 | 1,292 |
+| 170 | 300 | 354 | 354 | 6 | 73 | 55,767 | 72 | 3,860 | 0 | 32 | 3,569 | 6.7 | 3.71 | 527 | 8,287 | 2,096 |
+| 180 | 300 | 300 | 300 | 1 | 25 | 365 | 25 | 352 | 0 | 0 | 81 | 1.7 | 1.73 | 2,203 | 3,084 | 6,922 |
+| 190 | 300 | 300 | 300 | 2 | 26 | 86 | 24 | 79 | 0 | 0 | 316 | 1.5 | 2.10 | 2,436 | 3,310 | 7,740 |
+| 200 | 300 | 299 | 299 | 5 | 29 | 424 | 26 | 353 | 0 | 0 | 393 | 1.9 | 3.48 | 1,989 | 3,394 | 6,390 |
+| 210 | 300 | 300 | 300 | 2 | 57 | 311 | 54 | 302 | 0 | 0 | 226 | 2.8 | 2.60 | 1,218 | 3,228 | 4,228 |
+| 220 | 300 | 300 | 300 | 3 | 37 | 137 | 35 | 123 | 0 | 0 | 137 | 2.2 | 2.89 | 1,646 | 3,142 | 5,576 |
+| 230 | 300 | 299 | 299 | 4 | 35 | 483 | 29 | 469 | 0 | 0 | 425 | 2.0 | 3.30 | 1,831 | 3,418 | 6,042 |
+| 240 | 300 | 300 | 300 | 1 | 34 | 170 | 29 | 166 | 0 | 0 | 338 | 1.9 | 3.30 | 1,982 | 3,338 | 6,346 |
+
+While 1,500/s were offered the service landed 690 to 1,190/s (1,000 on average) and the agents saw every one of them finish; 31,000 to 50,000 answers per 10 s told an agent to come back (`503 busy` from the gate, `503 queue_full` from the queue); an accepted request waited 3 to 6 s at the median (8 to 9 s before the gate's answer: the same run on the build without it, `N-recover-mix`, had no answer telling anyone to wait until the queue filled at 90 s), at most about 11 s. When the offer fell to 300/s the service went on at capacity until the agents' backlog was landed (at 160 s); from 170 s on p50 was 25 to 73 ms, and from 180 s p99 was under 0.5 s. Commits per landing at 300/s are 1.7 to 3.7: batches of 2 landings, each with its own commit and the deriver's.
+
+The same build at 1,000/s with the mix for three minutes: 951/s finished, p50 1,364 ms, p99 10.8 s, 1.64 commits a landing (935/s, 1,224 ms, 10.8 s and 1.82 without the gate's answer).
+
+**What still misses, and what sets it.**
+
+- **p99 under 1 s at 1,000/s**: 1,156 to 1,216 ms for the plain runs
+  (p99 per 10 s under 1 s in most rows), 10.8 s with the mix. The
+  service lands about 1,000 to 1,100 a second here, so 1,000 offered is
+  at its capacity, and the queue swings. What sets it, per landing on
+  this machine: a submit's 35 ms in its project's gate (48 places: about
+  1,100/s), mostly waiting for CPU and `fsync` on a machine the load tool
+  shares; and the service's 41 ms batch cycle, whose largest steps are
+  its build (24 ms, 17 ms of it CPU on one thread: each entry is built on
+  the tip the last one made) and its transaction (30 ms). What would move
+  it: the load tool on another machine (its 10,000 agents and their TLS
+  are most of the system time); objects in S3 rather than `fsync`ed
+  files (14 to 15 object writes a landing, 2 `fsync`s each); preparing
+  the next batch while this one builds (its reads, 9 ms, and the pick,
+  2 ms: not done, since it reads review rules and memos at a tip not yet
+  final, which the byte-for-byte check would have to cover); more
+  database connections (the gate is ¾ of them).
+- **Commits per landing with the mix**: 1.82 over three minutes (gate
+  1.5), 2.37 over ten; 1.2 without the mix. The rest is merge workers
+  re-merging overlapping changes, more the longer the queue (BUG-1956).
+- **Ten minutes**: the rate falls from 1,000 to 650 to 800/s after three
+  minutes: the server's CPU per landing rises (9.7 to 12.3 ms), the
+  deriver falls 300 s behind and works through what it missed, and the
+  merge storms of BUG-1956 take a third of the batches' places. At the
+  end the landing queue is short (150) and requests wait 11 to 12 s in
+  the project's gate: the submit path, not the service, sets the rate.
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |
