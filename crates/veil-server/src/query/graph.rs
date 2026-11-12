@@ -21,10 +21,20 @@
 //! come from). Admins have one too (view key `admin`, `real` = itself), so
 //! every viewer runs the same code.
 //!
-//! **Filled** from the projection memo ([`extend`]): eagerly when a landing
-//! memoises its tips for every view key (`derive::memo_tips`), and when a
-//! query names a tip not in it yet: either way by one background fill per
-//! view key ([`ensure`]), which a query waits for until its deadline only. Rows are written parents
+//! **Filled** from the projection memo, in two parts (BUG-1943, BUG-1949):
+//!
+//! * **the rows** ([`extend_rows`]): one read of each new snapshot and a
+//!   few statements, so their cost is what is new and nothing else. Every
+//!   query but the two that read file history needs only these, and waits
+//!   for them ([`ensure`]) until its deadline;
+//! * **the file history** of those rows ([`extend`], S14: a diff of every
+//!   new snapshot's trees), which marks each row `files` once its file
+//!   history and that of everything below it is written. Blame and the
+//!   history of a path wait for it ([`ensure_files`]); nothing else does.
+//!
+//! Both run eagerly when a push or a landing moves a branch
+//! (`derive::memo_tips`), and when a query names a tip not filled yet: by
+//! one background fill of each part per view key. Rows are written parents
 //! first, each insert `ON CONFLICT DO NOTHING`: a row's presence means its
 //! ancestors' are present, and two servers extending at once write the same
 //! rows (`real` may name either of two real snapshots with one projection;
@@ -227,7 +237,7 @@ impl<'a> G<'a> {
         let row: Option<Row> = self.cx.db(|| {
             sqlx::query_as(
                 "SELECT generation, depth, parents, flags, skip, down_id, real_id FROM view_graph \
-                 WHERE project_id = $1 AND view_key = $2 AND snapshot = $3 AND files IS TRUE",
+                 WHERE project_id = $1 AND view_key = $2 AND snapshot = $3",
             )
             .bind(self.cx.project())
             .bind(self.vk)
@@ -286,39 +296,56 @@ impl<'a> G<'a> {
         Ok(self.cx.src.snapshot(id)?)
     }
 
-    /// Which of `ids` have rows (one statement).
-    fn present(&self, ids: &[ObjectId]) -> Result<HashSet<ObjectId>> {
-        let mut out: HashSet<ObjectId> = ids.iter().copied().filter(|i| *i == root() || self.local.borrow().contains_key(i)).collect();
+    /// Which of `ids` have rows (one statement, and none for the rows
+    /// this server holds); with `files`, which have rows marked as having
+    /// their file history.
+    fn present(&self, ids: &[ObjectId], files: bool) -> Result<HashSet<ObjectId>> {
+        let hub = self.cx.hub();
+        let (project, gce) = (self.cx.project(), hub.caches.gc_epoch(self.cx.project()));
+        let held = |i: &ObjectId| *i == root() || (!files && hub.query.rows.get(&cache_key(project, gce, self.vk, i)).is_some());
+        let mut out: HashSet<ObjectId> = ids.iter().copied().filter(held).collect();
         let ask: Vec<String> = ids.iter().filter(|i| !out.contains(i)).map(|i| i.hex()).collect();
         if ask.is_empty() {
             return Ok(out);
         }
-        let hub = self.cx.hub();
         let found: Vec<String> = self.cx.db(|| {
-            sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = ANY($3) AND files IS TRUE")
-                .bind(self.cx.project())
-                .bind(self.vk)
-                .bind(&ask)
-                .fetch_all(&hub.db)
+            sqlx::query_scalar(
+                "SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = ANY($3) AND (files IS TRUE OR NOT $4)",
+            )
+            .bind(project)
+            .bind(self.vk)
+            .bind(&ask)
+            .bind(files)
+            .fetch_all(&hub.db)
         })?;
         out.extend(found.iter().filter_map(|s| ObjectId::from_hex(s).ok()));
         Ok(out)
     }
 
+    /// Is the file history of each of `ids` and of everything below them
+    /// written (the `files` mark of their rows)? What blame and the history
+    /// of a path read; every other query reads rows and trees only.
+    pub fn have_files(&self, ids: &[ObjectId]) -> Result<bool> {
+        Ok(self.present(ids, true)?.len() == ids.iter().collect::<HashSet<_>>().len())
+    }
+
     /// Write `rows` (parents before children, each with its projected
-    /// snapshot's change id) and keep them, marked as having their file
-    /// history (`files`, S14: written before them). Their change ids go
-    /// first, to `view_changes` (`q/resolve`'s change id prefixes from the
-    /// viewer's own rows, BUG-1317): a row of `view_graph` is never there
-    /// without its change id; one written only to `view_changes` is
-    /// written again by the next fill. A row without the `files` mark (an
-    /// S13 server's, which writes graph rows only: BUG-1210) is not read as
-    /// present; filling it again marks it.
+    /// snapshot's change id). With `files`, they are marked as having
+    /// their file history (S14: written before them, in the same
+    /// transaction), whether they were there before or not; without, rows
+    /// already there are left as they are. Their change ids go first, to
+    /// `view_changes` (`q/resolve`'s change id prefixes from the viewer's
+    /// own rows, BUG-1317): a row of `view_graph` is never there without
+    /// its change id; one written only to `view_changes` is written again
+    /// by the next fill. A row without the `files` mark (the rows' own
+    /// fill's, or an S13 server's: BUG-1210) answers every query but blame
+    /// and the history of a path; the file history's fill marks it.
     pub(crate) async fn write_rows_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         project: i64,
         vk: &str,
         rows: &[(ObjectId, Arc<VRow>, ChangeId)],
+        files: bool,
     ) -> std::result::Result<(), sqlx::Error> {
         for chunk in rows.chunks(ROWS_PER_STATEMENT) {
             let ids: Vec<String> = chunk.iter().map(|(i, _, _)| i.hex()).collect();
@@ -342,11 +369,18 @@ impl<'a> G<'a> {
             .bind(&flags)
             .execute(&mut **tx)
             .await?;
-            sqlx::query(
-                "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id, files) \
-                 SELECT $1, $2, *, TRUE FROM UNNEST($3::text[], $4::bigint[], $5::bigint[], $6::text[], $7::int[], $8::text[], $9::text[], $10::text[]) \
-                 ON CONFLICT (project_id, view_key, snapshot) DO UPDATE SET files = TRUE WHERE view_graph.files IS NOT TRUE",
-            )
+            sqlx::query(match files {
+                true => {
+                    "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id, files) \
+                     SELECT $1, $2, *, TRUE FROM UNNEST($3::text[], $4::bigint[], $5::bigint[], $6::text[], $7::int[], $8::text[], $9::text[], $10::text[]) \
+                     ON CONFLICT (project_id, view_key, snapshot) DO UPDATE SET files = TRUE WHERE view_graph.files IS NOT TRUE"
+                }
+                false => {
+                    "INSERT INTO view_graph (project_id, view_key, snapshot, generation, depth, parents, flags, skip, down_id, real_id, files) \
+                     SELECT $1, $2, *, FALSE FROM UNNEST($3::text[], $4::bigint[], $5::bigint[], $6::text[], $7::int[], $8::text[], $9::text[], $10::text[]) \
+                     ON CONFLICT (project_id, view_key, snapshot) DO NOTHING"
+                }
+            })
             .bind(project)
             .bind(vk)
             .bind(&ids)
@@ -591,36 +625,76 @@ pub async fn blocking<T: Send + 'static>(hub: &Arc<Hub>, project: i64, f: impl F
 }
 
 /// Make `viewer`'s graph hold `tips` (real snapshots of committed history)
-/// and everything below them; answer each tip's id in the viewer's
-/// history. The projections come from the memo (`sync::projected`, which
-/// fills it first); hidden snapshots are walked here once per view key,
-/// never by a query that finds their rows. Queries and landings call it
-/// through [`ensure`], which runs it once per view key, in the background.
+/// and everything below them, **with their file history** (S14); answer
+/// each tip's id in the viewer's history. The projections come from the
+/// memo (`sync::projected`, which fills it first); hidden snapshots are
+/// walked here once per view key, never by a query that finds their rows.
+/// Blame and the history of a path call it through [`ensure_files`], a
+/// landing through [`prefill`]: once per view key, in the background.
 pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<Vec<ObjectId>> {
+    walk_tips(hub, project, viewer, tips, true, &Progress::default(), None).await
+}
+
+/// [`extend`] without the file history (BUG-1943): the rows of `tips` and
+/// of everything below them that has none, which is all that every query
+/// but blame and the history of a path reads. One read of each new
+/// snapshot (two for a viewer who is not an admin: the real one and its
+/// projection) and a few statements for all of them, so a fill costs what
+/// is new: a push of 10,000 snapshots is read at once, and a tip the
+/// server named a moment ago is a few rows away. The rows are the same
+/// ones [`extend`] writes, from the same projections: only their `files`
+/// mark is left for it.
+pub async fn extend_rows(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<Vec<ObjectId>> {
+    walk_tips(hub, project, viewer, tips, false, &Progress::default(), None).await
+}
+
+/// How far a fill is: the projections it memoised and the rows it wrote
+/// (a number of the viewer's own snapshots, nothing else). A query that
+/// gives up waiting for the fill answers it ([`warming`]): a client waits
+/// on while it grows.
+pub type Progress = Arc<std::sync::atomic::AtomicU64>;
+
+tokio::task_local! {
+    /// The fill this task projects for (`sync::projected` counts each
+    /// projection it memoises here: a viewer's first fill of a long
+    /// history spends most of its time there).
+    pub(crate) static FILLING: Progress;
+}
+
+/// One projection memoised by the fill this task runs, if it runs one.
+pub(crate) fn projected_one() {
+    let _ = FILLING.try_with(|p| p.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// [`extend`] (`files`) or [`extend_rows`]; the walk runs in one of
+/// `slots` (the projections before it hold none).
+async fn walk_tips(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    tips: &[ObjectId],
+    files: bool,
+    progress: &Progress,
+    slots: Option<&Arc<tokio::sync::Semaphore>>,
+) -> Result<Vec<ObjectId>> {
     let mut ps = Vec::with_capacity(tips.len());
     for t in tips {
-        ps.push(sync::projected(hub, project, viewer, *t).await?);
+        ps.push(FILLING.scope(progress.clone(), sync::projected(hub, project, viewer, *t)).await?);
     }
+    let _slot = match slots {
+        Some(s) => Some(s.clone().acquire_owned().await.map_err(|e| Error::Other(e.into()))?),
+        None => None,
+    };
     let vk = project.view(viewer).key();
     let admin = viewer.admin;
     let pairs: Vec<(ObjectId, ObjectId)> = tips.iter().copied().zip(ps.iter().copied()).collect();
-    let (project, viewer) = (project.clone(), viewer.clone());
+    let (project, viewer, progress) = (project.clone(), viewer.clone(), progress.clone());
     blocking(hub, project.id, move |cx| {
         let g = G::new(cx, &vk, None);
         let view = project.view(&viewer);
         let t = Trees::new(&g, &view);
-        let mut w = Walk {
-            g: &g,
-            t: &t,
-            fill: FileFill::default(),
-            admin,
-            pmap: HashMap::from([(root(), root())]),
-            present: HashSet::new(),
-            absent: HashSet::new(),
-            rows: HashMap::new(),
-            pending: Vec::new(),
-            inline_cap: false,
-        };
+        let mut w = Walk::new(&g, &t, admin, files, HashMap::from([(root(), root())]));
+        w.progress = Some(progress);
         let r = (|| {
             for (t, p) in &pairs {
                 w.pmap.insert(*t, *p);
@@ -637,14 +711,20 @@ pub async fn extend(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
     Ok(ps)
 }
 
-/// One extension of a viewer's graph, with its file history (S14:
-/// `files::Fill`, the rows of each snapshot's changed paths, written
-/// before the graph rows).
+/// Most snapshots one [`Walk::learn`] asks about at once.
+const AHEAD: usize = 512;
+
+/// One extension of a viewer's graph: its rows, and with `files` its file
+/// history (S14: `files::Fill`, the rows of each snapshot's changed paths,
+/// written before the graph rows, which are then marked `files`).
 struct Walk<'w, 'g, 'a> {
     g: &'g G<'a>,
     t: &'w Trees<'g, 'a>,
     fill: FileFill,
     admin: bool,
+    /// The file history too: then only a row marked `files` is present
+    /// (one without the mark is computed again, and marked).
+    files: bool,
     /// Real snapshot → its projection (the memo's).
     pmap: HashMap<ObjectId, ObjectId>,
     /// Projected ids known to have rows, and known not to have them yet.
@@ -655,9 +735,36 @@ struct Walk<'w, 'g, 'a> {
     /// Rows not written yet, parents first, with their change ids.
     pending: Vec<(ObjectId, Arc<VRow>, ChangeId)>,
     inline_cap: bool,
+    /// How many snapshots the next [`Walk::learn`] asks about: one, then
+    /// four times as many each time, up to [`AHEAD`]. A landing's one new
+    /// snapshot costs one statement (none when this server holds its
+    /// parent's row), a push of thousands one per [`AHEAD`].
+    ahead: usize,
+    /// Snapshots [`Walk::learn`] read ahead, for the walk to take.
+    read: HashMap<ObjectId, Arc<Snapshot>>,
+    progress: Option<Progress>,
 }
 
-impl Walk<'_, '_, '_> {
+impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
+    fn new(g: &'g G<'a>, t: &'w Trees<'g, 'a>, admin: bool, files: bool, pmap: HashMap<ObjectId, ObjectId>) -> Self {
+        Walk {
+            g,
+            t,
+            fill: FileFill::default(),
+            admin,
+            files,
+            pmap,
+            present: HashSet::new(),
+            absent: HashSet::new(),
+            rows: HashMap::new(),
+            pending: Vec::new(),
+            inline_cap: false,
+            ahead: 1,
+            read: HashMap::new(),
+            progress: None,
+        }
+    }
+
     fn has(&mut self, p: &ObjectId) -> Result<bool> {
         if self.rows.contains_key(p) || self.present.contains(p) {
             return Ok(true);
@@ -669,17 +776,56 @@ impl Walk<'_, '_, '_> {
         Ok(self.present.contains(p))
     }
 
+    /// Is it known whether projected snapshot `p` has a row?
+    fn known(&self, p: &ObjectId) -> bool {
+        self.rows.contains_key(p) || self.present.contains(p) || self.absent.contains(p)
+    }
+
+    /// Real snapshot `x`, read ahead or now.
+    fn snapshot(&mut self, x: &ObjectId) -> Result<Arc<Snapshot>> {
+        match self.read.remove(x) {
+            Some(s) => Ok(s),
+            None => self.g.snapshot(x),
+        }
+    }
+
     /// The projections of `ids` (real), from the memo, and which of those
-    /// have rows: one statement each for all of them.
+    /// have rows: one statement each for all of them, **and for the
+    /// snapshots below them** that the walk will come to next, up to
+    /// [`Walk::ahead`] in all (BUG-1943: a statement per snapshot made a
+    /// fill of 10,000 take 10,000 round trips).
     fn learn(&mut self, ids: &[ObjectId]) -> Result<()> {
-        let ask: Vec<ObjectId> = ids.iter().copied().filter(|i| !self.pmap.contains_key(i)).collect();
-        if !ask.is_empty() {
+        let unknown = |w: &Self, i: &ObjectId| w.pmap.get(i).is_none_or(|p| !w.known(p));
+        let mut queue: std::collections::VecDeque<ObjectId> = ids.iter().copied().filter(|i| unknown(self, i)).collect();
+        if queue.is_empty() {
+            return Ok(());
+        }
+        let mut seen: HashSet<ObjectId> = queue.iter().copied().collect();
+        let mut ask: Vec<ObjectId> = Vec::new();
+        while let Some(x) = queue.pop_front() {
+            ask.push(x);
+            if ask.len() + queue.len() >= self.ahead {
+                continue;
+            }
+            // Below what was asked for: whatever cannot be read ahead is
+            // left for the walk to ask about, if it gets there.
+            let Ok(s) = self.g.snapshot(&x) else { continue };
+            for p in &s.parents {
+                if *p != root() && unknown(self, p) && seen.insert(*p) {
+                    queue.push_back(*p);
+                }
+            }
+            self.read.insert(x, s);
+        }
+        self.ahead = (self.ahead * 4).min(AHEAD);
+        let lack: Vec<ObjectId> = ask.iter().copied().filter(|i| !self.pmap.contains_key(i)).collect();
+        if !lack.is_empty() {
             if self.admin {
-                self.pmap.extend(ask.iter().map(|i| (*i, *i)));
+                self.pmap.extend(lack.iter().map(|i| (*i, *i)));
             } else {
                 let cx = self.g.cx;
                 let hub = cx.hub();
-                let hex: Vec<String> = ask.iter().map(|i| i.hex()).collect();
+                let hex: Vec<String> = lack.iter().map(|i| i.hex()).collect();
                 let rows: Vec<(String, String)> = cx.db(|| {
                     sqlx::query_as("SELECT real_id, projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3)")
                         .bind(cx.project())
@@ -690,16 +836,14 @@ impl Walk<'_, '_, '_> {
                 for (r, p) in rows {
                     self.pmap.insert(ObjectId::from_hex(&r).map_err(bad)?, ObjectId::from_hex(&p).map_err(bad)?);
                 }
-                if let Some(m) = ask.iter().find(|i| !self.pmap.contains_key(i)) {
+                if let Some(m) = ids.iter().find(|i| !self.pmap.contains_key(i)) {
                     return Err(bad(format!("{} has no memoised projection", m.short())));
                 }
             }
         }
-        let ps: Vec<ObjectId> = ids
-            .iter()
-            .map(|i| self.pmap[i])
-            .filter(|p| !self.rows.contains_key(p) && !self.present.contains(p) && !self.absent.contains(p))
-            .collect();
+        let mut ps: Vec<ObjectId> = ask.iter().filter_map(|i| self.pmap.get(i).copied()).filter(|p| !self.known(p)).collect();
+        ps.sort();
+        ps.dedup();
         self.mark(&ps)
     }
 
@@ -708,7 +852,7 @@ impl Walk<'_, '_, '_> {
         if ps.is_empty() {
             return Ok(());
         }
-        let found = self.g.present(ps)?;
+        let found = self.g.present(ps, self.files)?;
         for p in ps {
             if found.contains(p) {
                 self.present.insert(*p);
@@ -726,7 +870,7 @@ impl Walk<'_, '_, '_> {
             if self.has(&px)? {
                 continue;
             }
-            let s = self.g.snapshot(&x)?;
+            let s = self.snapshot(&x)?;
             self.learn(&s.parents)?;
             let pps: Vec<ObjectId> = s.parents.iter().map(|p| self.pmap[p]).collect();
             if !expanded {
@@ -766,7 +910,9 @@ impl Walk<'_, '_, '_> {
             let row = Arc::new(VRow::compute(&ps, &parents, x));
             self.g.keep(px, row.clone());
             self.rows.insert(px, row.clone());
-            self.fill.add(self.g, self.t, px, &row)?;
+            if self.files {
+                self.fill.add(self.g, self.t, px, &row)?;
+            }
             self.pending.push((px, row, ps.change_id));
             if self.inline_cap && (self.pending.len() >= 16 || self.fill.pending.len() >= 64) {
                 return Err(bad("inline fill exceeded cap"));
@@ -790,17 +936,23 @@ impl Walk<'_, '_, '_> {
         let graph = std::mem::take(&mut self.pending);
         self.fill.forget_if_large();
         let gce = hub.caches.gc_epoch(project);
-        // File history first: a graph row's presence means its file
+        // File history first: a graph row's `files` mark means its file
         // history is there.
+        let marked = self.files;
         cx.db(|| async {
             let mut tx = hub.db.begin().await?;
-            FileFill::write_rows_tx(&mut tx, project, vk, &files).await?;
-            G::write_rows_tx(&mut tx, project, vk, &graph).await?;
+            if marked {
+                FileFill::write_rows_tx(&mut tx, project, vk, &files).await?;
+            }
+            G::write_rows_tx(&mut tx, project, vk, &graph, marked).await?;
             tx.commit().await?;
             Ok(())
         })?;
         for (i, r, _) in &graph {
             hub.query.rows.insert(cache_key(project, gce, vk, i), r.clone(), 320);
+        }
+        if let Some(p) = &self.progress {
+            p.fetch_add(graph.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
@@ -850,12 +1002,12 @@ pub(crate) async fn prepare_memo(
         if !seen_keys.insert(vk.clone()) {
             continue;
         }
-        let running = hub.query.fills.lock().unwrap().contains_key(&(project.id, vk.clone()));
+        let running = hub.query.fills.lock().unwrap().contains_key(&(project.id, vk.clone(), true));
         if running || leased.contains(&vk) {
             out.fallback.push(viewer);
             continue;
         }
-        if warm(hub, project.id, &vk, viewer.admin, tips).await?.is_some() {
+        if warm(hub, project.id, &vk, viewer.admin, tips, true).await?.is_some() {
             continue;
         }
         let mut deferred = sync::Deferred::default();
@@ -890,18 +1042,8 @@ pub(crate) async fn prepare_memo(
             let g = G::new(cx, &vk2, None);
             let view = project2.view(&viewer2);
             let t = Trees::new(&g, &view);
-            let mut w = Walk {
-                g: &g,
-                t: &t,
-                fill: FileFill::default(),
-                admin,
-                pmap,
-                present: HashSet::new(),
-                absent: HashSet::new(),
-                rows: HashMap::new(),
-                pending: Vec::new(),
-                inline_cap: true,
-            };
+            let mut w = Walk::new(&g, &t, admin, true, pmap);
+            w.inline_cap = true;
             for tip in &tips2 {
                 w.walk(*tip)?;
             }
@@ -973,7 +1115,7 @@ pub(crate) async fn write_prepared_memo(
             FileFill::write_rows_tx(tx, project_id, &k.vk, &k.files).await?;
         }
         if !k.graph.is_empty() {
-            G::write_rows_tx(tx, project_id, &k.vk, &k.graph).await?;
+            G::write_rows_tx(tx, project_id, &k.vk, &k.graph, true).await?;
         }
     }
     Ok((fallback, skip_vks))
@@ -1001,12 +1143,20 @@ pub(crate) fn cache_prepared_memo(hub: &Hub, project_id: i64, memo: &PreparedMem
 pub struct State {
     /// Rows of viewers' graphs, by project, view key and snapshot.
     pub rows: LruCache<Arc<VRow>>,
-    /// Fills running here, by project and view key: their outcome once done.
-    fills: Mutex<HashMap<(i64, String), Fill>>,
-    /// Fills started here, per project (the tests count them).
-    started: Mutex<HashMap<i64, u64>>,
-    /// One per fill running here: at most [`MAX_FILLS`] at once.
+    /// Fills running here, by project, view key and part (`true`: the file
+    /// history; `false`: the rows): their outcome once done, and how far
+    /// they are.
+    fills: Mutex<HashMap<(i64, String, bool), (Fill, Progress)>>,
+    /// Fills of rows, and of file history, started here, per project (the
+    /// tests count them).
+    started: Mutex<HashMap<i64, (u64, u64)>>,
+    /// One per fill of file history running here: at most [`MAX_FILLS`] at
+    /// once.
     slots: Arc<tokio::sync::Semaphore>,
+    /// One per fill of rows walking here: at most [`MAX_FILLS`] at once,
+    /// apart from the file history's (which take minutes on a long
+    /// history: no query's rows wait behind them).
+    row_slots: Arc<tokio::sync::Semaphore>,
     /// The blame jobs of this server (S14 cycle 3).
     pub jobs: super::files::Jobs,
     /// Versions blamed (computed, not read kept) here: the tests count
@@ -1023,6 +1173,7 @@ impl Default for State {
             fills: Mutex::new(HashMap::new()),
             started: Mutex::new(HashMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_FILLS)),
+            row_slots: Arc::new(tokio::sync::Semaphore::new(MAX_FILLS)),
             jobs: super::files::Jobs::default(),
             blame_steps: std::sync::atomic::AtomicU64::new(0),
         }
@@ -1030,9 +1181,15 @@ impl Default for State {
 }
 
 impl State {
-    /// How many fills this process started for `project`.
+    /// How many fills of rows (the ones queries wait for) this process
+    /// started for `project`.
     pub fn fills_started(&self, project: i64) -> u64 {
-        self.started.lock().unwrap().get(&project).copied().unwrap_or(0)
+        self.started.lock().unwrap().get(&project).map_or(0, |s| s.0)
+    }
+
+    /// How many fills of file history this process started for `project`.
+    pub fn file_fills_started(&self, project: i64) -> u64 {
+        self.started.lock().unwrap().get(&project).map_or(0, |s| s.1)
     }
 }
 
@@ -1046,25 +1203,38 @@ pub fn warming() -> Error {
     )
 }
 
+/// [`warming`], from a query that waited for a fill that has come as far
+/// as `progress` (a count of the viewer's own snapshots: [`Progress`]).
+/// The number is in the message, so a client that asks again sees whether
+/// the server is getting on (`vl` waits on while it changes, BUG-1943).
+fn warming_at(progress: u64) -> Error {
+    Error::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "warming",
+        format!("this history is being prepared for you ({progress} snapshots so far); try again in a few seconds"),
+    )
+}
+
 /// How long a fill waits for another server's fill of the same view key
 /// before it goes ahead itself (it then finds that one's rows).
 const FILL_LOCK_WAIT: Duration = Duration::from_secs(600);
-/// Most fills running at once on one server (BUG-1073). A fill runs its
-/// statements one at a time, so fills hold at most this many of the
-/// pool's connections, and only while a statement runs. Past it, a fill
-/// waits for a slot in its own task: a query waits for the fill until its
-/// deadline (then `warming`, and the fill stays queued), a landing until
-/// it is done.
+/// Most fills of one part running at once on one server (BUG-1073). A fill
+/// runs its statements one at a time, so fills hold at most twice this
+/// many of the pool's connections, and only while a statement runs. Past
+/// it, a fill waits for a slot in its own task: a query waits for the fill
+/// until its deadline (then `warming`, and the fill stays queued), a
+/// landing until it is done.
 pub const MAX_FILLS: usize = 4;
 /// How long a fill's lease lasts unless renewed, and how often it is.
 const LEASE: Duration = Duration::from_secs(120);
 const LEASE_RENEW: Duration = Duration::from_secs(30);
 
 /// The viewer's ids of real snapshots `tips`, once the viewer's graph holds
-/// them. A graph that does not hold them yet is filled by **one** task per
-/// project and view key on this server (and one server at a time, by a
-/// lease row in `view_fills`), at most [`MAX_FILLS`] at once on a server:
-/// every caller that needs it joins that task.
+/// their rows. A graph that does not hold them yet is filled by **one**
+/// task per project and view key on this server ([`extend_rows`]), at most
+/// [`MAX_FILLS`] walking at once on a server: every caller that needs it
+/// joins that task. It costs what is new (BUG-1943, BUG-1949): a tip the
+/// server named a moment ago is filled within the query that reads it.
 /// The task runs in the background to the end, whoever stops waiting;
 /// a caller with a `deadline` gets [`warming`] when it passes (a query's
 /// deadline never bounds, nor pays for, a first fill).
@@ -1075,12 +1245,25 @@ const LEASE_RENEW: Duration = Duration::from_secs(30);
 /// the project's people read it, plus anyone on Earth's and the admins';
 /// `derive::memo_tips` keeps each of those warm at every landing.
 pub async fn ensure(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], deadline: Option<Instant>) -> Result<Vec<ObjectId>> {
+    filled(hub, project, viewer, tips, deadline, false).await
+}
+
+/// [`ensure`], and the file history of `tips` and of everything below them
+/// (S14), which only blame and the history of a path read: filled by one
+/// task per project and view key too ([`extend`]: one server at a time, by
+/// a lease row in `view_fills`), which [`ensure`]'s fill and every landing
+/// queue, and which a query waits for until its deadline.
+pub async fn ensure_files(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], deadline: Option<Instant>) -> Result<Vec<ObjectId>> {
+    filled(hub, project, viewer, tips, deadline, true).await
+}
+
+async fn filled(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], deadline: Option<Instant>, files: bool) -> Result<Vec<ObjectId>> {
     let vk = project.view(viewer).key();
     // A fill this call started and saw finish: if its rows are still not
     // there, something is wrong; never loop on it.
     let mut ours_done = false;
     loop {
-        if let Some(ps) = warm(hub, project.id, &vk, viewer.admin, tips).await? {
+        if let Some(ps) = warm(hub, project.id, &vk, viewer.admin, tips, files).await? {
             return Ok(ps);
         }
         if ours_done {
@@ -1088,10 +1271,12 @@ pub async fn ensure(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
         }
         // Another caller's fill may be for other tips: wait for it, then
         // look again (and start ours).
-        let (mut rx, started) = start_or_join(hub, project, viewer, &vk, tips);
+        let (mut rx, progress, started) = start_or_join(hub, project, viewer, &vk, tips, files);
         let done = async { rx.wait_for(|d| d.is_some()).await.ok().and_then(|d| d.clone()) };
         let outcome = match deadline {
-            Some(d) => tokio::time::timeout_at(d.into(), done).await.map_err(|_| warming())?,
+            Some(d) => tokio::time::timeout_at(d.into(), done)
+                .await
+                .map_err(|_| warming_at(progress.load(std::sync::atomic::Ordering::Relaxed)))?,
             None => done.await,
         };
         if let Some(Err((full, e))) = outcome {
@@ -1104,21 +1289,26 @@ pub async fn ensure(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[
     }
 }
 
-/// Queue the fill of `viewer`'s graph up to `tips` unless it holds them
-/// already, and return at once: what a landing does for each view key
-/// (`derive::memo_tips`). The deriver never waits for a fill, so a long
-/// first fill cannot hold up deriving this or any project, and waiting it
-/// holds no connection, lock or slot (the fill's own task waits for those).
+/// Queue the fill of `viewer`'s graph up to `tips` (its rows, then its
+/// file history) unless it holds them already, and return at once: what a
+/// push and a landing do for each view key (`derive::memo_tips`). The
+/// deriver never waits for a fill, so a long first fill cannot hold up
+/// deriving this or any project, and waiting it holds no connection, lock
+/// or slot (the fill's own task waits for those).
 pub async fn prefill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<()> {
     let vk = project.view(viewer).key();
-    if warm(hub, project.id, &vk, viewer.admin, tips).await?.is_none() {
-        start_or_join(hub, project, viewer, &vk, tips);
+    if warm(hub, project.id, &vk, viewer.admin, tips, false).await?.is_none() {
+        // Its rows: their fill queues the file history's when it is done.
+        start_or_join(hub, project, viewer, &vk, tips, false);
+    } else if warm(hub, project.id, &vk, viewer.admin, tips, true).await?.is_none() {
+        start_or_join(hub, project, viewer, &vk, tips, true);
     }
     Ok(())
 }
 
-/// The viewer's ids of `tips` if their graph holds them all.
-async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[ObjectId]) -> Result<Option<Vec<ObjectId>>> {
+/// The viewer's ids of `tips` if their graph holds them all: their rows,
+/// and with `files` their file history too.
+async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[ObjectId], files: bool) -> Result<Option<Vec<ObjectId>>> {
     let mut out = Vec::with_capacity(tips.len());
     for t in tips {
         let p = if admin || *t == root() {
@@ -1135,14 +1325,19 @@ async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[Objec
                 None => return Ok(None),
             }
         };
-        let cached = p == root() || hub.query.rows.get(&cache_key(project, hub.caches.gc_epoch(project), vk, &p)).is_some();
+        // A row this server holds is there; whether its file history is
+        // too, only the row's mark says.
+        let cached = p == root() || (!files && hub.query.rows.get(&cache_key(project, hub.caches.gc_epoch(project), vk, &p)).is_some());
         if !cached {
-            let found: Option<String> = sqlx::query_scalar("SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3 AND files IS TRUE")
-                .bind(project)
-                .bind(vk)
-                .bind(p.hex())
-                .fetch_optional(&hub.db)
-                .await?;
+            let found: Option<String> = sqlx::query_scalar(
+                "SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3 AND (files IS TRUE OR NOT $4)",
+            )
+            .bind(project)
+            .bind(vk)
+            .bind(p.hex())
+            .bind(files)
+            .fetch_optional(&hub.db)
+            .await?;
             if found.is_none() {
                 return Ok(None);
             }
@@ -1152,45 +1347,70 @@ async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[Objec
     Ok(Some(out))
 }
 
-/// Join the fill running for (`project`, `vk`), or register one for
-/// `tips` and start its task at once (BUG-1074: a fill is queued the moment
-/// anyone needs it, whoever stops waiting); whether this call started it.
-/// The task waits for the view key's lease, then for one of the server's
-/// [`MAX_FILLS`] slots ([`leased_fill`]).
-fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId]) -> (Fill, bool) {
-    let key = (project.id, vk.to_string());
+/// Join the fill (of rows, or with `files` of file history) running for
+/// (`project`, `vk`), or register one for `tips` and start its task at
+/// once (BUG-1074: a fill is queued the moment anyone needs it, whoever
+/// stops waiting); how far it is, and whether this call started it. The
+/// task of a file history's fill waits for the view key's lease, then for
+/// one of the server's [`MAX_FILLS`] slots ([`leased_fill`]); the task of
+/// the rows' fill projects, then walks in a slot of its own kind, and
+/// queues the file history's fill when it is done.
+fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId], files: bool) -> (Fill, Progress, bool) {
+    let key = (project.id, vk.to_string(), files);
     let mut fills = hub.query.fills.lock().unwrap();
-    if let Some(rx) = fills.get(&key) {
-        return (rx.clone(), false);
+    if let Some((rx, progress)) = fills.get(&key) {
+        return (rx.clone(), progress.clone(), false);
     }
     let (tx, rx) = watch::channel(None);
-    fills.insert(key.clone(), rx.clone());
-    *hub.query.started.lock().unwrap().entry(project.id).or_default() += 1;
+    let progress = Progress::default();
+    fills.insert(key.clone(), (rx.clone(), progress.clone()));
+    {
+        let mut started = hub.query.started.lock().unwrap();
+        let n = started.entry(project.id).or_default();
+        match files {
+            true => n.1 += 1,
+            false => n.0 += 1,
+        }
+    }
     drop(fills);
-    let (hub, project, viewer, tips) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec());
+    let (hub, project, viewer, tips, at) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec(), progress.clone());
     tokio::spawn(async move {
-        let r = leased_fill(&hub, &project, &viewer, &key.1, &tips).await;
+        let r = match files {
+            true => leased_fill(&hub, &project, &viewer, &key.1, &tips, &at).await,
+            false => walk_tips(&hub, &project, &viewer, &tips, false, &at, Some(&hub.query.row_slots)).await.map(|_| ()),
+        };
         if let Err(e) = &r {
             eprintln!("veil-server: filling a viewer graph of project {}: {e:?}", project.id);
         }
         hub.query.fills.lock().unwrap().remove(&key);
-        let _ = tx.send(Some(r.map(|_| ()).map_err(|e| {
+        let rows_done = !files && r.is_ok();
+        let _ = tx.send(Some(r.map_err(|e| {
             let full = matches!(&e, Error::Other(a) if crate::pack::indexes_full(a));
             (full, format!("{e:?}"))
         })));
+        // The rows are there: their file history next, in the background
+        // (nobody waits for it but blame and the history of a path).
+        if rows_done {
+            match warm(&hub, project.id, &key.1, viewer.admin, &tips, true).await {
+                Ok(None) => drop(start_or_join(&hub, &project, &viewer, &key.1, &tips, true)),
+                Ok(Some(_)) => {}
+                Err(e) => eprintln!("veil-server: queueing the file history of project {}: {e:?}", project.id),
+            }
+        }
     });
-    (rx, true)
+    (rx, progress, true)
 }
 
 /// [`extend`] under the lease of (`project`, `vk`) in `view_fills`, so that
-/// two servers do not fill one view key at once, and in one of this
-/// server's [`MAX_FILLS`] slots. The lease comes first (BUG-1075): a fill
-/// that waits for another server's lease holds no slot meanwhile. Taking,
-/// renewing and giving back the lease are single statements: no connection
-/// is held while the fill runs (BUG-1073). A lease another server holds is
-/// waited for (one statement every 250 ms) up to [`FILL_LOCK_WAIT`]; a
-/// lease left by a server that stopped expires after [`LEASE`].
-async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId]) -> Result<()> {
+/// two servers do not fill one view key's file history at once, and in one
+/// of this server's [`MAX_FILLS`] slots. The lease comes first (BUG-1075):
+/// a fill that waits for another server's lease holds no slot meanwhile.
+/// Taking, renewing and giving back the lease are single statements: no
+/// connection is held while the fill runs (BUG-1073). A lease another
+/// server holds is waited for (one statement every 250 ms) up to
+/// [`FILL_LOCK_WAIT`]; a lease left by a server that stopped expires after
+/// [`LEASE`].
+async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId], progress: &Progress) -> Result<()> {
     let holder = hex::encode(veil_core::crypto::random_bytes::<16>());
     let take = || async {
         let now = veil_core::now_millis();
@@ -1230,7 +1450,7 @@ async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &st
         })
     });
     let r = match hub.query.slots.clone().acquire_owned().await {
-        Ok(_slot) => extend(hub, project, viewer, tips).await.map(|_| ()),
+        Ok(_slot) => walk_tips(hub, project, viewer, tips, true, progress, None).await.map(|_| ()),
         Err(e) => Err(Error::Other(e.into())),
     };
     if let Some(renew) = renew {

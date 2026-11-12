@@ -611,6 +611,8 @@ pub(crate) async fn projected_inner(
                     ObjectId::from_hex(&p).map_err(|e| Error::Other(e.into()))?
                 };
                 hub.caches.put_memo(project.id, &view_key, &x, &stored);
+                // A fill's progress, when a fill asked (BUG-1943).
+                crate::query::graph::projected_one();
                 stored
             }
         };
@@ -3145,6 +3147,7 @@ async fn push_staged(
         .iter()
         .map(|c| (c.real.hex(), real_parents_of.get(&c.real).map_or(0, |(_, a)| *a)))
         .collect();
+    let pushed_snapshots = new_reals.len();
     let origins: Vec<(String, String)> = completed.iter().filter_map(|c| c.origin.map(|o| (c.real.hex(), o.hex()))).collect();
     let memos: Vec<(String, String, String, bool)> =
         deferred.rows.iter().map(|(k, r, p)| (k.clone(), r.hex(), p.hex(), deferred.collapsed.contains(r))).collect();
@@ -3527,6 +3530,20 @@ async fn push_staged(
         .filter(|b| veil_core::embargo::embargo_id_of_branch(b).is_none())
         .collect();
     if !public_moved.is_empty() {
+        // A push of many snapshots: every view key's graph is filled from
+        // now on, beside the derived data and not after it (BUG-1943: the
+        // diffs of 10,000 snapshots take minutes, and a clone a second
+        // after the push asks for the tip's row). A small push's rows are
+        // written with its derived data (`derive::finish_landing_run`), or
+        // by the first query that names its tip.
+        if pushed_snapshots > 16 {
+            let (hub, id, moved) = (hub.clone(), project.id, public_moved.clone());
+            tokio::spawn(async move {
+                if let Err(e) = crate::derive::memo_tips(&hub, id, &moved).await {
+                    eprintln!("veil-server: filling the graphs of project {id} after a push: {e:?}");
+                }
+            });
+        }
         crate::derive::landed(hub, project.id, public_moved);
     }
     // Early embargo releases pushed via `vl embargo release <id>` + `vl push`.

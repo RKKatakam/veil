@@ -287,6 +287,20 @@ pub async fn resolve_real(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instan
     }
 }
 
+/// Wait (until `deadline`, then `warming`) for the file history of the
+/// viewer's snapshot `id`, which projects `real`, and of everything below
+/// it: what blame and the history of a path read (`graph::ensure_files`).
+/// Every other route reads rows and trees only, and never waits for it
+/// (BUG-1943: a push of 10,000 snapshots is read at once; the history of
+/// its files is ready a little later).
+async fn file_history_of(hub: &Arc<Hub>, ask: &Ask, id: ObjectId, real: ObjectId, deadline: Instant) -> Result<()> {
+    let vk = ask.key();
+    if blocking(hub, ask.project.id, move |cx| G::new(cx, &vk, None).have_files(&[id])).await? {
+        return Ok(());
+    }
+    graph::ensure_files(hub, &ask.project, &ask.viewer, &[real], Some(deadline)).await.map(|_| ())
+}
+
 /// Run `f` on the viewer's graph on a blocking thread, with the deadline;
 /// adds `policy_version` and `work` to the answer.
 async fn on_graph(
@@ -1219,7 +1233,8 @@ pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) ->
     if path.is_empty() {
         return Err(no_path());
     }
-    let id = resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
+    let (id, real) = resolve_real(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
+    file_history_of(hub, ask, id, real, deadline).await?;
     // A narrowed session never follows a rename: the path it came from may
     // be outside its paths (BUG-1690).
     let follow = q.follow.unwrap_or(false) && ask.viewer.only.is_none();
@@ -1298,7 +1313,9 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
             if path.is_empty() {
                 return Err(no_path());
             }
-            Ok((resolve(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?, path))
+            let (id, real) = resolve_real(hub, ask, q.rev.as_deref().unwrap_or(&ask.project.default_branch), deadline).await?;
+            file_history_of(hub, ask, id, real, deadline).await?;
+            Ok((id, path))
         }
     };
     let viewer = ask.viewer.clone();
@@ -1327,6 +1344,14 @@ pub async fn history(hub: &Arc<Hub>, ask: &Ask, q: HistoryParams, limits: Limits
                         _ => return Err(no_revision()),
                     };
                     out.push(files::Version { id, depth: r.depth, path: Arc::from(path) });
+                }
+                // An earlier page's cursor names versions whose file
+                // history was written then. One that names anything else
+                // is never answered from half a history (BUG-1943: a row
+                // is there before its file history).
+                let ids: Vec<ObjectId> = out.iter().map(|v| v.id).collect();
+                if !g.have_files(&ids)? {
+                    return Err(graph::warming());
                 }
                 out
             }
