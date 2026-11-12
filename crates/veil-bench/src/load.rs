@@ -340,6 +340,10 @@ struct Counters {
     /// Landings that were up to date (pull mode: nothing to fetch).
     noop: AtomicU64,
     latencies: Mutex<Vec<f64>>,
+    /// `landing`: how long each landing's last request took, the one the
+    /// server accepted and answered `landed` (ms): the wait in the server's
+    /// queue, without the time the agent was told to stay away.
+    waits: Mutex<Vec<f64>>,
     /// Agents that finished an operation while measuring (fairness: a hot
     /// row lets one agent win every race).
     finished_agents: Mutex<HashSet<usize>>,
@@ -791,6 +795,7 @@ impl Agent<'_> {
             self.c.requests.fetch_add(1, Ordering::Relaxed);
             let req = json!({"onto": "main", "base": base.hex(), "description": format!("land {}", self.files),
                 "edits": [{"path": path, "put": {"text": text}}]});
+            let asked = Instant::now();
             let r = self.api.post_json(Some(self.token), &self.path("/land"), &req)?;
             // Told to come back later: waited out as `vl land` does, within
             // the landing's deadline (its latency counts the waits).
@@ -811,6 +816,9 @@ impl Agent<'_> {
                 Some("landed") => {
                     let mine: ObjectId = serde_json::from_value(v["landed"].as_array().and_then(|l| l.last()).cloned().unwrap_or_default())?;
                     self.clone.tip = Some((mine, mine));
+                    if self.c.measuring.load(Ordering::Relaxed) {
+                        self.c.waits.lock().unwrap().push(asked.elapsed().as_secs_f64() * 1000.0);
+                    }
                     return Ok(collisions);
                 }
                 Some("queued") => bail!("still queued after the server's wait: {v}"),
@@ -1617,8 +1625,9 @@ struct SeriesPoint {
     errors: u64,
     slowed: u64,
     collisions: u64,
-    /// How many latencies were recorded so far.
+    /// How many latencies and waits were recorded so far.
     latencies: usize,
+    waits: usize,
     server: Option<serde_json::Value>,
     /// Landings waiting in the server's queue (`queued` or `merging`).
     queue: Option<i64>,
@@ -1641,6 +1650,7 @@ impl SeriesPoint {
             slowed: c.slowed.load(Ordering::Relaxed),
             collisions: c.collisions.load(Ordering::Relaxed),
             latencies: c.latencies.lock().unwrap().len(),
+            waits: c.waits.lock().unwrap().len(),
             server: cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f)),
             queue,
             xid: cx.stats.and_then(|(rt, url)| next_xid(rt, url)),
@@ -1651,12 +1661,15 @@ impl SeriesPoint {
 /// One row of a landing run's time series: what happened between two
 /// points. Rates are per second of the interval; `landed` is the server's
 /// own count, `finished` the landings the agents saw answered; the
-/// latencies are of the landings answered in the interval.
+/// latencies (from the scheduled time) and waits (the accepted request
+/// alone) are of the landings answered in the interval.
 fn series_row(cx: &Ctx<'_>, c: &Counters, a: &SeriesPoint, b: &SeriesPoint) -> serde_json::Value {
     let dt = (b.at - a.at).max(1e-9);
     let stat = |k: &str| Some(b.server.as_ref()?[k].as_f64()? - a.server.as_ref()?[k].as_f64()?);
     let mut lat: Vec<f64> = c.latencies.lock().unwrap().get(a.latencies..b.latencies).map(<[f64]>::to_vec).unwrap_or_default();
     lat.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let mut waits: Vec<f64> = c.waits.lock().unwrap().get(a.waits..b.waits).map(<[f64]>::to_vec).unwrap_or_default();
+    waits.sort_by(|x, y| x.partial_cmp(y).unwrap());
     let landed = stat("landing_landed");
     let commits = cx.stats.zip(a.xid.zip(b.xid)).and_then(|((rt, url), (from, to))| db_commits(rt, url, from, to));
     let per = |x: Option<f64>, n: Option<f64>| x.zip(n).filter(|(_, n)| *n > 0.0).map(|(x, n)| x / n);
@@ -1668,6 +1681,11 @@ fn series_row(cx: &Ctx<'_>, c: &Counters, a: &SeriesPoint, b: &SeriesPoint) -> s
         "queue": b.queue,
         "p50_ms": percentile(&lat, 0.5),
         "p99_ms": percentile(&lat, 0.99),
+        "wait_p50_ms": percentile(&waits, 0.5),
+        "wait_p99_ms": percentile(&waits, 0.99),
+        "queue_full": stat("landing_queue_full"),
+        "merging": stat("landing_merging"),
+        "conflicts": stat("landing_conflicts"),
         "errors": b.errors - a.errors,
         "slowed": b.slowed - a.slowed,
         "collisions": b.collisions - a.collisions,
@@ -1684,7 +1702,7 @@ fn series_row(cx: &Ctx<'_>, c: &Counters, a: &SeriesPoint, b: &SeriesPoint) -> s
 fn series_text(r: &serde_json::Value, markdown: bool) -> String {
     let Some(rows) = r["series"].as_array().filter(|s| !s.is_empty()) else { return String::new() };
     let f = |x: &serde_json::Value, d: usize| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{v:.d$}")).unwrap_or_else(|| "–".into());
-    let cols: [(&str, &str, usize); 15] = [
+    let cols: [(&str, &str, usize); 19] = [
         ("t (s)", "t_s", 0),
         ("offered/s", "offered_per_s", 0),
         ("landed/s", "landed_per_s", 0),
@@ -1692,9 +1710,13 @@ fn series_text(r: &serde_json::Value, markdown: bool) -> String {
         ("queue", "queue", 0),
         ("p50 ms", "p50_ms", 0),
         ("p99 ms", "p99_ms", 0),
+        ("wait p50", "wait_p50_ms", 0),
+        ("wait p99", "wait_p99_ms", 0),
         ("told to wait", "slowed", 0),
         ("errors", "errors", 0),
         ("collisions", "collisions", 0),
+        ("to merges", "merging", 0),
+        ("conflicts", "conflicts", 0),
         ("per batch", "landings_per_batch", 1),
         ("commits/landing", "commits_per_landing", 2),
         ("pick stmts", "pick_statements", 0),
