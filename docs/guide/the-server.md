@@ -42,8 +42,9 @@ postgres://veil:PASSWORD@db.example.com:5432/veil?sslmode=verify-full&sslrootcer
 A managed PostgreSQL accepts only TLS: use `verify-full` with the CA
 certificate its provider gives you. Without `sslrootcert` the public
 certificate authorities are accepted. Without `sslmode` the server does not
-try TLS, and a database that requires it refuses the connection. For now
-`verify-ca` checks the name too, as `verify-full` does (BUG-1909).
+try TLS, and a database that requires it refuses the connection.
+`verify-ca` checks the CA and not the name, for a database reached by an
+address or a name its certificate does not carry.
 
 Its limits have defaults (`docs/HUB.md` §13.25): `--device-rate 200/50000`
 (a burst a second, the most an hour), `--anonymous-rate 20/1000` per address,

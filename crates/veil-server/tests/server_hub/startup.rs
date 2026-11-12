@@ -438,7 +438,7 @@ fn bug_1928_a_database_url_that_asks_for_tls_in_words_the_server_does_not_know_i
 /// upgrade is not supported" before the handshake. Now `sslmode=require`
 /// encrypts, `verify-ca` and `verify-full` also check the certificate
 /// against `sslrootcert` and its name, and a URL without `sslmode` asks for
-/// no TLS, as before. (`verify-ca` should not check the name: BUG-1909.)
+/// no TLS, as before. (`verify-ca` does not check the name: BUG-1909.)
 #[test]
 fn bug_1590_the_server_connects_to_a_database_that_requires_tls() {
     let rt = runtime();
@@ -483,21 +483,28 @@ fn bug_1590_the_server_connects_to_a_database_that_requires_tls() {
     drop_database(&rt, &name);
 }
 
-/// BUG-1909: `sslmode=verify-ca` is to check that the database's
-/// certificate is the CA's and nothing about its name (a database reached
-/// by an address or a private name its certificate does not carry). sqlx
-/// 0.8.6 forgives only the name error older rustls versions gave, so with
-/// the rustls in the tree (0.23.46) `verify-ca` refuses what `verify-full`
-/// refuses. It fails closed: nothing is accepted that should not be.
+/// BUG-1909: `sslmode=verify-ca` checks that the database's certificate is
+/// the CA's and nothing about its name (a database reached by an address or
+/// a private name its certificate does not carry). sqlx 0.8.6 forgave only
+/// the name error older rustls versions gave, so with the rustls in the tree
+/// (0.23.46) `verify-ca` refused what `verify-full` refuses; the workspace
+/// patches `sqlx-core` (`vendor/sqlx-core`) to forgive both forms. A
+/// certificate of another CA is still refused, whatever its name.
 #[test]
-#[ignore = "BUG-1909: sslmode=verify-ca also checks the certificate's name (sqlx 0.8.6 with rustls 0.23.46), so it refuses a database reached by a name its certificate lacks"]
 fn bug_1909_verify_ca_does_not_check_the_certificates_name() {
     let rt = runtime();
     let (url, name) = fresh_database(&rt);
     let tls = TlsDatabase::start(&rt, &url);
-    let ca = tls.ca.display();
+    let (ca, another_ca) = (tls.ca.display().to_string(), tls.another_ca.display().to_string());
     // The certificate is for `localhost`; the CA is the one given.
     assert_eq!(select_one(&rt, &tls.url("127.0.0.1", &format!("sslmode=verify-ca&sslrootcert={ca}"))), Ok(1));
     assert_eq!(tls.seen(), (1, 0));
+    // Not the CA given, and not the name either: refused for the CA.
+    let refused = select_one(&rt, &tls.url("127.0.0.1", &format!("sslmode=verify-ca&sslrootcert={another_ca}"))).unwrap_err();
+    assert!(refused.contains("invalid peer certificate: UnknownIssuer"), "{refused}");
+    // `verify-full` still checks the name.
+    let refused = select_one(&rt, &tls.url("127.0.0.1", &format!("sslmode=verify-full&sslrootcert={ca}"))).unwrap_err();
+    assert!(refused.contains("invalid peer certificate: certificate not valid for name \"127.0.0.1\""), "{refused}");
+    assert_eq!(tls.seen(), (1, 0), "no refused certificate carried a connection");
     drop_database(&rt, &name);
 }

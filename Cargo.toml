@@ -5,6 +5,8 @@ members = ["crates/veil-core", "crates/vl", "crates/veil-bench", "crates/veil-se
 # build only when asked for (`-p …` or `--workspace`): `cargo test
 # --all-targets` skips them.
 default-members = ["crates/veil-core", "crates/vl"]
+# A copy of sqlx-core 0.8.6 with one change (BUG-1909), patched in below.
+exclude = ["vendor/sqlx-core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -57,3 +59,11 @@ codegen-units = 1
 # The profile `dist` builds release archives with (see dist-workspace.toml).
 [profile.dist]
 inherits = "release"
+
+# BUG-1909: sqlx-core 0.8.6 (the newest 0.8) forgives, for `sslmode=verify-ca`,
+# only the name error older rustls versions gave, so `verify-ca` also checked the
+# certificate's name. `vendor/sqlx-core` is 0.8.6 unchanged but for that match
+# (`src/net/tls/tls_rustls.rs`, `NoHostnameTlsVerifier`) and its lints
+# silenced; sqlx 0.9 has the same fix. Remove this when moving to sqlx 0.9.
+[patch.crates-io]
+sqlx-core = { path = "vendor/sqlx-core" }
