@@ -5408,6 +5408,15 @@ transaction per landing instead of 23.
    in turn); a submit takes one of its person's slots at random without
    reading which are free, and reads them only when that one is taken
    (BUG-1940's fix read all of the person's waiting rows for every submit).
+10. **A batch's objects are stored while its transaction runs**
+   (`landing/service.rs` `Storing`, BUG-1955). They were stored first and
+   the transaction began after: two steps of 27 and 37 ms one after the
+   other, the longest part of a batch (the next batch's build waited for
+   both). Now the transaction runs its statements while the objects are
+   written and waits for them just before it commits: the branch still
+   names nothing that is not stored (a batch whose objects cannot be
+   stored rolls back and is built again; a transaction run again finds the
+   store's outcome). Measured: 57 to 45 ms a batch with the gate's mix.
 
 **Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
 `concurrency.rs`, unit tests in `limits/landing.rs`):
@@ -5423,6 +5432,10 @@ transaction per landing instead of 23.
 | 7 | S14: file history and blame memos written in the consolidated transaction equal what they were before | `derive::landing` writes `projections`, `view_file_history`, and `view_graph` in one transaction; `q/blame` and `q/history` match the independent projected-files model and the projection-equivalence copy. | `blame::consolidated_landing_pass_file_history_and_blame_memos_match_projected_files`, `blame::blame_and_history_match_the_projected_files`, `query::query_projection_equivalence` |
 | 8 | S18 and S19: a re-queued merge counts once against the outstanding-landing bounds; a CI runner session never queues a landing; fair-share batching keeps S18's merge-worker ordering correct (BUG-1667) | `limits::landing::admit_queue` counts `state IN ('queued', 'merging')` and stores `agent_session`; CI runner sessions are refused `403 agent_session`; fair-share batches interleave fast-path landings and content merges cleanly. | `limits::s18_and_s19_requeued_merge_counts_once_runner_never_queues_and_fair_batch_keeps_merge_ordering` |
 | 9 | YugabyteDB: the single background transaction stays within YugabyteDB's limits on a large 500-file landing | `derive::landing` caps inline search/memo preparation on large batches (`writes.history.len() > 64`), commits derived rows in `ROWS_PER_STATEMENT` chunks with retry on retryable conflict (`STATEMENT_DEADLINE`), and finishes memoization and search indexing in the background. | `limits::a_500_file_landing_and_its_background_derive_pass_stay_bounded_and_succeed` |
+| 10 | Past what the service lands in time a submit is told to come back at once (`503 queue_full`, `retry_after_ms` 1 to 5 s) with nothing done for it, and another person's landing is still queued (BUG-1955) | Six held landings of one person fill a bound of 6: the seventh is refused in under 5 s with no queue row, snapshot or change ref; another person's is queued; once the six land, the seventh goes in | `landing_hold::bug_1955_a_full_queue_tells_the_submitter_to_come_back_and_holds_nobody_else_up` |
+| 11 | `vl land` waits out a full queue as the answer asks, with a note, and lands | the note `waiting for the server: the landing queue of 'main' is full …`, then landed | `landing_hold::bug_1955_vl_land_waits_for_a_full_queue_and_says_so`; `vl` unit test `bug_1955_a_full_landing_queue_is_waited_out_with_a_note` |
+| 12 | A batch read on several threads is the batch built on one, byte for byte (BUG-1955) | Three seeded batches of 90 submits by two people (new files, overlapping edits of one shared file, two changes adding one path): the same objects, snapshots, landings, memos, tip and answers, with at least one merge and one conflict each; the service then lands what the one-thread build said | `landing_hold::bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one` |
+| 13 | A batch commits only once its objects are stored (BUG-1955) | With the store's folders unwritable, three held landings stay queued and the branch keeps its tip for 3 s; once writable, all three land and their files read back at the new tip | `landing_hold::bug_1955_a_batch_lands_only_once_its_objects_are_stored` |
 
 ### 13.36 S20: automatic bisect and revert (built)
 

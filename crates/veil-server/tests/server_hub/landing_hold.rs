@@ -197,3 +197,73 @@ fn bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one() {
         }
     }
 }
+
+/// Every folder under `root` writable or not (the objects of a server
+/// whose objects are in a folder).
+fn writable(root: &std::path::Path, yes: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(if yes { 0o755 } else { 0o555 })).unwrap();
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            if e.file_type().unwrap().is_dir() {
+                dirs.push(e.path());
+            }
+        }
+    }
+}
+
+/// BUG-1955: a batch's objects are stored while its transaction runs, and
+/// it commits only once they are: when they cannot be stored, nothing of
+/// the batch lands (the branch keeps its tip, the tickets stay queued);
+/// once they can, it lands, and what the branch names can be read.
+#[test]
+fn bug_1955_a_batch_lands_only_once_its_objects_are_stored() {
+    let url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL");
+    // Objects in a folder, which can be made unwritable.
+    let hub = TestHub::start_with_s3(&url, Duration::from_secs(3600), None);
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    hold_branch(&hub, pid, "main");
+    let mut tickets = Vec::new();
+    for i in 0..3 {
+        let r = land_edit(&api, &dev, &p.name, base, &format!("src/stored/f{i}.rs"), &format!("stored {i}\n"), false);
+        assert_eq!(r.status, 200, "submit {i}: {}", String::from_utf8_lossy(&r.body));
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    let objects = hub._dir.path().join("objects");
+    writable(&objects, false);
+    release_branch(&hub, pid, "main");
+    let states = |hub: &TestHub| -> Vec<String> {
+        hub.rt
+            .block_on(
+                sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = ANY($2) ORDER BY ticket")
+                    .bind(pid)
+                    .bind(&tickets)
+                    .fetch_all(&hub.hub().db),
+            )
+            .unwrap()
+    };
+    // The service tries the batch again and again meanwhile.
+    std::thread::sleep(Duration::from_secs(3));
+    let failed = hub.hub().landing.stats.batches.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(states(&hub), vec!["queued"; 3], "a batch whose objects could not be stored changed its tickets");
+    assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], base, "a batch whose objects could not be stored moved the branch");
+
+    writable(&objects, true);
+    for t in &tickets {
+        let v = wait_ticket(&api, &dev, &p.name, t);
+        assert_eq!(v["state"], "landed", "{v}");
+    }
+    assert!(hub.hub().landing.stats.batches.load(std::sync::atomic::Ordering::Relaxed) > failed, "the batch committed once stored");
+    let tip = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    assert_ne!(tip, base);
+    for i in 0..3 {
+        let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path=src/stored/f{i}.rs", p.name, tip.hex()));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(String::from_utf8_lossy(&r.body), format!("stored {i}\n"));
+    }
+}
