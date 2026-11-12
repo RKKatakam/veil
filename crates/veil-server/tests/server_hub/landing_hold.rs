@@ -83,3 +83,40 @@ fn bug_1955_a_full_queue_tells_the_submitter_to_come_back_and_holds_nobody_else_
     assert_eq!(again.json()["state"], "landed", "{}", again.json());
     assert_eq!(served(&hub), 8);
 }
+
+/// BUG-1955: `vl land` told to come back waits as the answer asks, says
+/// what it waits for, and lands once the queue has room.
+#[test]
+fn bug_1955_vl_land_waits_for_a_full_queue_and_says_so() {
+    let mut settings = TestHub::limits();
+    settings.max_branch_waiting = 2;
+    let hub = TestHub::start_with_limits(settings);
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let admin = p.admin.token();
+    let base = api.tips(Some(&admin), &p.name).unwrap().branches["main"];
+    write_files(&p.dir, &[("src/held.txt", "held\n")]);
+    p.admin.ok(&p.dir, &["commit", "-m", "lands once the queue has room"]);
+
+    hold_branch(&hub, pid, "main");
+    let mut tickets = Vec::new();
+    for i in 0..2 {
+        let r = land_edit(&api, &admin, &p.name, base, &format!("src/full/f{i}.rs"), "x\n", false);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    let out = std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(2_500));
+            release_branch(&hub, pid, "main");
+        });
+        p.admin.ok(&p.dir, &["land"])
+    });
+    assert!(out.contains("landed main"), "{out}");
+    assert!(out.contains("waiting for the server: the landing queue of 'main' is full"), "{out}");
+    for t in &tickets {
+        let v = wait_ticket(&api, &admin, &p.name, t);
+        assert_eq!(v["state"], "landed", "{v}");
+    }
+}
