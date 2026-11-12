@@ -253,8 +253,10 @@ pushes work as in a full clone, and a large project clones in seconds.
 - `vl partial status` shows the cache and what is pinned; `vl partial full`
   fetches everything and makes the clone a full one (format 8).
 - A thin clone is repository format 9: a `vl` older than this one refuses
-  it rather than misreading it. `--only` clones are not thin (they keep
-  every snapshot, and only their directory's files).
+  it rather than misreading it. `--only DIR` clones are thin too: they
+  hold that directory's files of the branch they check out, and never
+  write, fetch or record anything outside it; `--only DIR --full` keeps
+  every snapshot and every version of that directory's files.
 
 ### The Veil daemon: one cache for the whole machine
 
