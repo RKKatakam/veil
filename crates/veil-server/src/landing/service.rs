@@ -350,6 +350,33 @@ impl Built {
     }
 }
 
+/// A batch's objects being stored (`sync::put_all`): its transaction runs
+/// meanwhile and waits for them only before it commits (BUG-1955: the
+/// store and then the transaction, one after the other, were the service's
+/// longest step). Waited once; a transaction run again finds the outcome.
+enum Storing {
+    Running(tokio::task::JoinHandle<Result<()>>),
+    Stored,
+    Failed(String),
+}
+
+impl Storing {
+    async fn wait(this: &tokio::sync::Mutex<Storing>) -> Result<()> {
+        let mut s = this.lock().await;
+        if let Storing::Running(task) = &mut *s {
+            *s = match task.await {
+                Ok(Ok(())) => Storing::Stored,
+                Ok(Err(e)) => Storing::Failed(format!("{e:?}")),
+                Err(e) => Storing::Failed(e.to_string()),
+            };
+        }
+        match &*s {
+            Storing::Failed(e) => Err(Error::Other(anyhow::anyhow!("storing the batch's objects: {e}"))),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// How a batch's commit ended.
 enum Committed {
     Ok,
@@ -497,10 +524,7 @@ impl Service {
             let seqs = built.rows.iter().map(|r| r.seq).collect();
             let (alone, after) = (built.alone, built.after.clone());
             let s = Arc::new(self.clone_handle());
-            let task = tokio::spawn(async move {
-                store.await.map_err(|e| Error::Other(e.into()))??;
-                s.commit(built, gc_epoch).await
-            });
+            let task = tokio::spawn(async move { s.commit(built, gc_epoch, Arc::new(tokio::sync::Mutex::new(Storing::Running(store)))).await });
             inflight = Some(InFlight { task, seqs, alone, after });
         }
     }
@@ -1003,7 +1027,7 @@ impl Service {
 
     /// Commit the batch (its objects stored already) in one transaction;
     /// then tell the waiters here, spawn merge workers, and emit events.
-    async fn commit(&self, mut b: Built, gc_epoch: i64) -> Result<Committed> {
+    async fn commit(&self, mut b: Built, gc_epoch: i64, stored: Arc<tokio::sync::Mutex<Storing>>) -> Result<Committed> {
         let t = Instant::now();
         let hub = &self.hub;
         for o in &mut b.outcomes {
@@ -1193,6 +1217,7 @@ impl Service {
             );
             let landed_prs = tx_landed_prs.clone();
             let tx_hub = tx_hub.clone();
+            let stored = stored.clone();
             Box::pin(async move {
                 crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 // Fencing: only the lease's current holder moves the branch.
@@ -1462,6 +1487,8 @@ impl Service {
                         .execute(&mut *c)
                         .await?;
                 }
+                // What the batch made is stored before the branch names it.
+                Storing::wait(&stored).await?;
                 Ok((results, marked))
             })
         })
