@@ -826,6 +826,11 @@ pub async fn finish_release(
                         "embargo {eid}'s line moved while it was being released; the release is tried again"
                     )));
                 }
+                // The holds and PRs this moves are review rules' rows: a
+                // batch that read them before waits for nothing else, so it
+                // commits first, or reads them after (BUG-2061). The review
+                // gate, exclusively, after the line's row.
+                super::close_review_gate(&mut *c, pid).await?;
 
                 let pr_rows: Vec<(String, String)> = sqlx::query_as(
                     "SELECT id, state FROM prs WHERE project_id = $1 AND embargo = $2 ORDER BY id",

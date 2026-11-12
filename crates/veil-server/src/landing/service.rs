@@ -1321,6 +1321,21 @@ impl Service {
                 if n != 1 {
                     return Err(Error::conflict(MOVED));
                 }
+                // The review gate, before anything the review rules come
+                // from is read again (BUG-1886, BUG-2061): exclusively by a
+                // batch that changes them (the default branch's
+                // `.veilrules`), shared by every other batch with a
+                // person's entry. Whatever changes the rules or the holds
+                // commits before this reads, or waits for this commit.
+                let rules_change = match &rules_landing {
+                    Some(l) => crate::prs::state::changes_rules(&mut *c, pid, l).await?,
+                    None => false,
+                };
+                if rules_change {
+                    crate::prs::close_review_gate(&mut *c, pid).await?;
+                } else if has_active_user_entries && review_guard.is_some() {
+                    crate::prs::share_review_gate(&mut *c, pid).await?;
+                }
                 // Re-verify the review rules and PR gates inside the batch's
                 // commit transaction before recording new rules or updating
                 // queue rows (`BUG-1880`): a protected branch's, an embargo
@@ -1345,10 +1360,9 @@ impl Service {
                             return Err(Error::conflict(MOVED));
                         }
                         if guard.protected || guard.reverted_twice {
-                            // Read under the review gate, shared: a
+                            // Read under the review gate (taken above): a
                             // verdict, hold or new revision written meanwhile
                             // is read here or waits for this commit (BUG-1886).
-                            crate::prs::share_review_gate(&mut *c, pid).await?;
                             // In a few statements for the whole batch
                             // (BUG-1942): this transaction holds the
                             // branch's row.

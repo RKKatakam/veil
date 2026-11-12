@@ -709,7 +709,11 @@ async fn commit(
                     }
                 }
                 if let (1, Some(l)) = (rows, &rules_landing) {
-                    crate::prs::state::record_landing(&mut *c, pid, l).await?;
+                    // New review rules: the review gate, exclusively, after
+                    // the branch row (BUG-2061).
+                    if crate::prs::state::record_landing(&mut *c, pid, l).await? {
+                        crate::prs::close_review_gate(&mut *c, pid).await?;
+                    }
                 }
             }
             let mut memos = Vec::new();

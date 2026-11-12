@@ -1495,6 +1495,10 @@ async fn record_revert_landed(
             let (branch, culprit_hex, landed_hex, culprit_cid) = (branch.clone(), culprit_hex.clone(), landed_hex.clone(), culprit_cid.clone());
             Box::pin(async move {
                 crate::pack_gc::guard_root_write(&mut *c, project_id, gc_epoch).await?;
+                // A change reverted twice needs a person's approval from
+                // now on: a batch that read the reverts before commits
+                // first (BUG-2061).
+                crate::prs::close_review_gate(&mut *c, project_id).await?;
                 Ok(sqlx::query(
                     "UPDATE bisect_reverts \
                      SET state = 'reverted', revert_snapshot = $5, \

@@ -3299,6 +3299,7 @@ async fn push_staged(
             }
             let mut moved = Vec::new();
             let mut lineages: Vec<(String, i64)> = Vec::new();
+            let mut rules_changed = false;
             for (branch, cur, new, accept, policy_text_update) in plans {
                 let (recorded, read_under) = plan_recorded.get(&branch).copied().unwrap_or((false, None));
                 let rows = match (cur, new) {
@@ -3369,9 +3370,15 @@ async fn push_staged(
                         .await?;
                 }
                 if let (true, Some(l)) = (branch == default_branch, &rules_landing) {
-                    crate::prs::state::record_landing(&mut *c, pid, l).await?;
+                    rules_changed = crate::prs::state::record_landing(&mut *c, pid, l).await?;
                 }
                 moved.push(branch);
+            }
+            // New review rules wait for every batch already re-reading them
+            // and are read by every batch after (BUG-2061): the review
+            // gate, exclusively, once every branch row of the push is held.
+            if rules_changed {
+                crate::prs::close_review_gate(&mut *c, pid).await?;
             }
             for (branch, lineage) in &lineages {
                 // Only record `landed_changes` on non-embargo branches so that
