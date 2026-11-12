@@ -163,7 +163,7 @@ impl QueuedEntry for Whole {
 
 /// The batch the whole queue gives, as the service chose it before
 /// BUG-1941: every queued row read, the reverts first, then fair shares.
-async fn whole_queue_batch(c: &mut sqlx::PgConnection, project: i64, branch: &str, exclude: &HashSet<i64>, limit: usize) -> Vec<i64> {
+async fn whole_queue_batch(c: &mut sqlx::PgConnection, project: i64, branch: &str, exclude: &HashSet<i64>, limit: usize) -> veil_server::error::Result<Vec<i64>> {
     let rows: Vec<(i64, i64, String, String, bool)> = sqlx::query_as(
         "SELECT seq, person_id, session, device_key, priority > 0 FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state = 'queued' \
          ORDER BY priority DESC, created_at, seq",
@@ -171,8 +171,7 @@ async fn whole_queue_batch(c: &mut sqlx::PgConnection, project: i64, branch: &st
     .bind(project)
     .bind(branch)
     .fetch_all(&mut *c)
-    .await
-    .unwrap();
+    .await?;
     let (reverts, rest): (Vec<Whole>, Vec<Whole>) = rows
         .into_iter()
         .map(|(seq, person, session, device, revert)| Whole { seq, person, key: if session.is_empty() { device } else { session }, revert })
@@ -180,7 +179,7 @@ async fn whole_queue_batch(c: &mut sqlx::PgConnection, project: i64, branch: &st
     let mut batch: Vec<i64> = reverts.iter().map(|r| r.seq).filter(|s| !exclude.contains(s)).take(limit).collect();
     let rest_limit = limit - batch.len();
     batch.extend(fair_batch(rest, exclude, rest_limit).iter().map(|r| r.seq));
-    batch
+    Ok(batch)
 }
 
 /// Rows of `landing_queue` the transaction has read so far (PostgreSQL's
@@ -206,7 +205,15 @@ fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
     let db = hub.hub().db.clone();
     let run = run_id();
     let branch = format!("speed-{run}");
+    // YugabyteDB may ask a transaction that read after other transactions'
+    // writes to start again ("Restart read required"); the server's own
+    // picks are single statements, which the database then runs again by
+    // itself. Here the whole transaction is run again.
     hub.rt.block_on(async {
+      let mut attempts = 0;
+      loop {
+        attempts += 1;
+        let done: veil_server::error::Result<()> = async {
         // Everything in one transaction that is rolled back: no landing
         // service sees these rows.
         let mut tx = db.begin().await.unwrap();
@@ -252,9 +259,9 @@ fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
         insert(&mut tx, pid, &branch, &run, &many(0, 20_000)).await;
         let none = HashSet::new();
         let before = rows_fetched(&mut tx).await;
-        let picked = pick_batch(&mut tx, pid, &branch, &none, 64).await.expect("a batch is chosen");
+        let picked = pick_batch(&mut tx, pid, &branch, &none, 64).await?;
         let fetched = rows_fetched(&mut tx).await - before;
-        let whole = whole_queue_batch(&mut tx, pid, &branch, &none, 64).await;
+        let whole = whole_queue_batch(&mut tx, pid, &branch, &none, 64).await?;
         assert_eq!(picked.rows.iter().map(|r| r.seq).collect::<Vec<_>>(), whole);
         assert_eq!(whole.len(), 64);
         assert_eq!((picked.statements, picked.read), (1, PICK_CHUNK), "20,000 queued landings of 300 people");
@@ -271,9 +278,9 @@ fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
         flood_order.sort();
         let exclude: HashSet<i64> = flood_order[..5].iter().copied().chain([*revert_seqs.iter().min().unwrap()]).collect();
         let before = rows_fetched(&mut tx).await;
-        let behind_flood = pick_batch(&mut tx, pid, &branch, &exclude, 64).await.expect("a batch is chosen");
+        let behind_flood = pick_batch(&mut tx, pid, &branch, &exclude, 64).await?;
         let fetched = rows_fetched(&mut tx).await - before;
-        let whole = whole_queue_batch(&mut tx, pid, &branch, &exclude, 64).await;
+        let whole = whole_queue_batch(&mut tx, pid, &branch, &exclude, 64).await?;
         let picked_seqs: Vec<i64> = behind_flood.rows.iter().map(|r| r.seq).collect();
         assert_eq!(picked_seqs, whole);
         assert_eq!(whole.len(), 64);
@@ -294,12 +301,21 @@ fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
         // Twice the queue: the same batch from the same reading.
         insert(&mut tx, pid, &branch, &run, &many(20_000, 20_000)).await;
         let before = rows_fetched(&mut tx).await;
-        let twice = pick_batch(&mut tx, pid, &branch, &exclude, 64).await.expect("a batch is chosen");
+        let twice = pick_batch(&mut tx, pid, &branch, &exclude, 64).await?;
         let fetched_twice = rows_fetched(&mut tx).await - before;
         assert_eq!(twice.rows.iter().map(|r| r.seq).collect::<Vec<_>>(), picked_seqs);
         assert_eq!((twice.statements, twice.read), (behind_flood.statements, behind_flood.read));
         assert!(fetched_twice <= 3_000, "the database fetched {fetched_twice} rows of the queue to choose 64 of 41,000");
         tx.rollback().await.unwrap();
+        Ok(())
+        }
+        .await;
+        match done {
+            Ok(()) => break,
+            Err(e) if e.is_retryable() && attempts < 8 => continue,
+            Err(e) => panic!("choosing a batch failed (attempt {attempts}): {e:?}"),
+        }
+      }
     });
 }
 
