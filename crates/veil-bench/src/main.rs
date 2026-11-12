@@ -214,6 +214,9 @@ enum Cmd {
         /// `branches`: land the agent's branch on `main` after every N pushes.
         #[arg(long, default_value_t = 0)]
         merge_every: u64,
+        /// `landing`: the agents belong to this many people, in turn.
+        #[arg(long, default_value_t = 1)]
+        people: usize,
     },
     /// Generate a repository (and keep it).
     Gen(GenArgs),
@@ -367,6 +370,7 @@ fn main() -> Result<()> {
             protected,
             mix,
             merge_every,
+            people,
         } => {
             let mode = match mode.as_str() {
                 "pull" => load::Mode::Pull,
@@ -409,6 +413,7 @@ fn main() -> Result<()> {
                 protected,
                 mix,
                 merge_every,
+                people,
             })?;
             std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
             let md = load::markdown(&v)?;

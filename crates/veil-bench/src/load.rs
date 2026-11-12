@@ -195,6 +195,9 @@ pub struct Args {
     /// `branches`: after every this many pushes, the agent lands its branch
     /// on `main` through the landing service (0: never).
     pub merge_every: u64,
+    /// `landing`: the agents are this many people's, in turn (1: one
+    /// person's, as before; the server bounds and orders landings by person).
+    pub people: usize,
 }
 
 /// `--mix`: the shared files (`w/shared/sN`) and each one's slots (a line
@@ -1009,11 +1012,15 @@ fn unique(prefix: &str) -> String {
 /// Create a project as `admin`: group `agents` (with `agent`), the policy
 /// `w/  agents`, and a first snapshot, with `seed` files of 4 KiB in
 /// `w/seed/`.
-fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, seed: usize, protected: bool, mix: bool) -> Result<String> {
+fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, more: &[(String, String)], seed: usize, protected: bool, mix: bool) -> Result<String> {
     let name = unique("load-");
     ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}"), &json!({}))?, "create project")?;
     ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}/groups/agents"), &json!({}))?, "create group")?;
     ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}/groups/agents/members"), &json!({"people": [agent]}))?, "add agent")?;
+    for chunk in more.chunks(50) {
+        let names: Vec<&str> = chunk.iter().map(|(n, _)| n.as_str()).collect();
+        ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}/groups/agents/members"), &json!({"people": names}))?, "add agents")?;
+    }
     let mut objects = Vec::new();
     let mut put = |o: Object| {
         let raw = o.encode_with(TreeEncoding::Binary);
@@ -1126,6 +1133,8 @@ struct Ctx<'a> {
     agent: &'a Identity,
     agent_name: &'a str,
     agent_token: &'a str,
+    /// `--people`: the other people's names and tokens.
+    more: &'a [(String, String)],
     server_pid: Option<u32>,
     stats: Option<(&'a tokio::runtime::Runtime, &'a str)>,
     /// The server this tool started, and the file its `SIGUSR1` writes.
@@ -1139,7 +1148,7 @@ type Schedule = Arc<Mutex<mpsc::Receiver<Instant>>>;
 fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, cache: Option<&crate::server::CacheProc>) -> Result<serde_json::Value> {
     let setup = Api::new(cx.base, cx.ca)?;
     let seed = if a.mode == Mode::Objects { SEED_FILES } else { 0 };
-    let names: Vec<String> = (0..projects).map(|_| create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, seed, a.protected, a.mix)).collect::<Result<_>>()?;
+    let names: Vec<String> = (0..projects).map(|_| create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, cx.more, seed, a.protected, a.mix)).collect::<Result<_>>()?;
     let cache_ca = cache.map(|c| std::fs::read_to_string(&c.cert)).transpose()?;
     let c = Counters::default();
     let bg = Counters::default();
@@ -1148,7 +1157,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
     let landers = if matches!(a.mode, Mode::Pull | Mode::Objects) && a.background > 0.0 { projects } else { 0 };
     // The flooded project beside the measured ones (S24).
     let flood = if a.mode == Mode::Pull { a.flood } else { 0 };
-    let flooded = if flood > 0 { Some(create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, seed, false, false)?) } else { None };
+    let flooded = if flood > 0 { Some(create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, &[], seed, false, false)?) } else { None };
     let fl = Counters::default();
     let ready = Barrier::new(clients + landers + flood + 1);
     // Open loop: scheduled landings, one queue per project.
@@ -1167,7 +1176,10 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                 let mut agent = match Api::new(cx.base, cx.ca) {
                     Ok(api) => Agent {
                         api,
-                        token: cx.agent_token,
+                        token: match i % (cx.more.len() + 1) {
+                            k if k > 0 && a.mode == Mode::Landing => &cx.more[k - 1].1,
+                            _ => cx.agent_token,
+                        },
                         identity: cx.agent,
                         project: name.clone(),
                         dir: vec!["w".into(), format!("g{:02}", (i / projects) / 32), format!("a{:04}", i / projects)],
@@ -1218,10 +1230,18 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                 ready.wait();
                 while !stop.load(Ordering::Relaxed) {
                     let scheduled = match (a.mode, rate) {
-                        (Mode::Land | Mode::Branches | Mode::Api | Mode::Landing, Rate::PerSecond(_)) => match rx.lock().unwrap().recv_timeout(Duration::from_millis(100)) {
-                            Ok(t) => t,
-                            Err(_) => continue,
-                        },
+                        (Mode::Land | Mode::Branches | Mode::Api | Mode::Landing, Rate::PerSecond(_)) => {
+                            // At the end every idle agent takes this lock in turn:
+                            // none of them waits out the timeout under it.
+                            let rx = rx.lock().unwrap();
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            match rx.recv_timeout(Duration::from_millis(100)) {
+                                Ok(t) => t,
+                                Err(_) => continue,
+                            }
+                        }
                         _ => Instant::now(),
                     };
                     let r = match a.mode {
@@ -1454,6 +1474,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         });
         result["protected"] = json!(a.protected);
         result["mix"] = json!(a.mix);
+        result["people"] = json!(a.people.max(1));
         result["branch_merges"] = json!(c.merges.load(Ordering::Relaxed));
         // The landing service's own counters (the server this tool started).
         let ratio = |a: Option<f64>, b: Option<f64>, k: f64| a.zip(b).map(|(a, b)| if b > 0.0 { a / b / k } else { f64::NAN });
@@ -1537,6 +1558,12 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
     let agent_name = unique("agent-");
     let admin_token = api.login(&admin, &unique("admin-"))?;
     let agent_token = api.login(&agent, &agent_name)?;
+    let more: Vec<(String, String)> = (1..a.people.max(1))
+        .map(|_| {
+            let name = unique("agent-");
+            Ok((name.clone(), api.login(&Identity::generate("load-agent"), &name)?))
+        })
+        .collect::<Result<_>>()?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let db_url = a.server.db_url();
     let cx = Ctx {
@@ -1547,6 +1574,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         agent: &agent,
         agent_name: &agent_name,
         agent_token: &agent_token,
+        more: &more,
         server_pid,
         stats: db_url.as_deref().map(|u| (&rt, u)),
         server_stats: _server.as_ref().map(|s: &crate::server::Server| (s.pid(), a.dir.join("server").join("stats.json"))),
