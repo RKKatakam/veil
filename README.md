@@ -62,24 +62,24 @@ generator, PostgreSQL and the object store. The full tables, misses
 included, are in [LOAD.md](docs/design/scale/LOAD.md) (landings) and
 [OPENSCION.md](docs/design/scale/OPENSCION.md) (beside Git).
 
-**Landing changes on one `main`** (10,000 agents; the target is 1,000 a
-second, held):
+**Landing changes on one `main`** (10,000 agents of 100 people offering
+1,000 a second; the target is 1,000 a second held, p99 under 1 s):
 
 | | Veil | Note |
 |---|---|---|
-| Held for three minutes | **500 a second** (p50 104 ms, p99 925 ms) | Half the target. For comparison: 20 to 30 a second with pull, rebase, push and retry. |
-| Held for three minutes, protected `main`, 3 % overlapping and 2 % conflicting changes | 300 a second (p99 589 ms) | |
-| 15-second bursts | 956 to 1,022 a second (972 to 980 on a protected `main`) | One person's agents: 1,002 with 1,000 agents, 845 with 10,000 |
-| Offered more than it can land, with overlapping changes | lands about 230 a second, and agents see about 96 finish in time | BUG-1955, open: a 10-minute run offered 1,000 a second landed 125 |
+| Held for three minutes | **996 a second** (p50 280 ms, p99 1.19 s) | Protected `main`: 998 (p99 1.22 s). All agents one person's: 995 (p99 1.16 s). For comparison: 20 to 30 a second with pull, rebase, push and retry. |
+| Three minutes, protected `main`, 3 % overlapping and 2 % conflicting changes | 951 a second (p50 1.36 s, p99 10.8 s) | |
+| Ten minutes, with those overlapping changes | 808 a second | Holds about 1,000 for two minutes, then 650 to 800: BUG-1955, open |
+| Offered 1.5 times what it can land | lands about 1,000 a second | Agents past capacity are told at once to come back; the backlog clears within about 20 s after the load drops |
 
-An earlier version of this page gave 993 landings a second. That came from
-a 15-second run, which ends before the queue grows; it is not a rate Veil
-holds. BUG-1940, BUG-1941 and BUG-1942 are fixed, which brought the
-15-second runs to the numbers above; the held rates in the first two rows
-were measured before those fixes and have not been measured again. Holding
-the rate under sustained load is BUG-1955, in progress.
+The p99 is just over the target, and the runs with overlapping changes
+miss it. These runs were made before two later changes: the early "come
+back later" answer, and BUG-1956's fix (changes that merged cleanly were
+refused as conflicts when several touched one file), which is in review.
+An earlier version of this page gave 993 landings a second from a
+15-second run, which ends before the queue grows.
 
-**Beside Git**, on the same files (medians of 5):
+**Beside Git**, on the same files (medians of 5 to 9):
 
 | | Veil | Git |
 |---|---|---|
@@ -87,9 +87,11 @@ the rate under sustained load is BUG-1955, in progress.
 | Import a 1 GB project (35,000 files) | **4.2 s** | 10.9 s |
 | Clone 1,000 files through the server | **159 to 163 ms** | 206 to 233 ms |
 | Clone 10,000 files through the server | 566 to 621 ms | 569 to 573 ms |
-| Commit one changed file among 10,000 | 12.5 ms | **8.5 ms** |
-| `status` in the 1 GB project | 102 ms | **32 ms** |
-| Clone one folder of the 1 GB project | 4 to 5 s | **0.4 s** |
+| Commit one changed file among 10,000 | 9.2 to 10.0 ms | **8.1 to 8.6 ms** |
+| Commit one changed file in the 1 GB project | **22 to 26 ms** | 26 to 28 ms (33 to 35 with `core.fsync=all`) |
+| `status` in the 1 GB project | **8.6 to 11 ms** | 29 to 31 ms |
+| `log -n 20` in the 1 GB project | 10 to 13 ms | **1 to 2 ms** |
+| Clone one folder of the 1 GB project | 1.0 s | **0.4 s** |
 | Default clone of the 1 GB project | **9.4 s** | 29 s |
 
 **Other gates:** blame over 10,000 versions answers in 425 to 528 ms the
@@ -107,7 +109,7 @@ and a run across several machines.
 | Client engine, workspaces, sandboxes | Built |
 | Thin clones, caches, storage on S3 with PostgreSQL or YugabyteDB | Built |
 | History, blame and search answered by the server | Built, speed gate passed |
-| Landing at agent scale, CI, pull requests, embargoes, web client | Built; the landing rate is at half its target |
+| Landing at agent scale, CI, pull requests, embargoes, web client | Built; landing holds about 1,000 a second for three minutes, not yet ten with overlapping changes |
 | Review of the whole code base (eight passes) | Done: about 75 bugs found, all but a handful fixed |
 | Benchmarks on the final code | Run on 2026-11-12: 10 misses filed (BUG-1940 to BUG-1949); 5 fixed so far, the rest in progress |
 | A run across several machines | Next |
