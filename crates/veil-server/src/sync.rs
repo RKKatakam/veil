@@ -3374,12 +3374,6 @@ async fn push_staged(
                 }
                 moved.push(branch);
             }
-            // New review rules wait for every batch already re-reading them
-            // and are read by every batch after (BUG-2061): the review
-            // gate, exclusively, once every branch row of the push is held.
-            if rules_changed {
-                crate::prs::close_review_gate(&mut *c, pid).await?;
-            }
             for (branch, lineage) in &lineages {
                 // Only record `landed_changes` on non-embargo branches so that
                 // landing at release onto `main` does not skip them!
@@ -3468,6 +3462,12 @@ async fn push_staged(
                     .bind(pid.to_string())
                     .execute(&mut *c)
                     .await?;
+            }
+            // New review rules wait for every batch already re-reading them
+            // and are read by every batch after (BUG-2061): the review
+            // gate, exclusively, last, holding every row the push writes.
+            if rules_changed {
+                crate::prs::close_review_gate(&mut *c, pid).await?;
             }
             Ok((moved, memo_stored))
         })

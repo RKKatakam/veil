@@ -5469,8 +5469,8 @@ transaction per landing instead of 23.
    it **exclusively**: a verdict and the holds it places, and a PR's new
    revision (first, after the GC guard); a landing of the default branch
    whose rules record changes (`prs::state::record_landing` answers
-   whether it does: the push takes the gate once it holds every branch row
-   it moves, a commit through the API after its branch row, the default
+   whether it does: the push takes the gate last, once it has written
+   everything, a commit through the API after its branch row, the default
    branch's own batch instead of taking it shared); an embargo's release
    moving its holds into `pr_holds` and retargeting its PRs
    (`finish_release`, after the line's row); and a revert recorded as
@@ -5480,7 +5480,10 @@ transaction per landing instead of 23.
    its locks in this order: the GC guard (`pack_gc::guard_root_write`),
    the landing lease's row, branch rows, the review gate, then the rows it
    writes (queue rows, PRs, snapshots); nothing that holds the gate waits
-   for a lease or a branch row, so no cycle is possible. (`Storing` is
+   for a lease or a branch row, so no cycle is possible through them. (A
+   release locks its line's record, `embargo_lines`, before the line's
+   branch row, as it did before the gate; the push therefore takes the
+   gate after its own writes, an embargo's record among them. `Storing` is
    waited for last, holding these, for at most half a lease, and the store
    takes none of them; item 11's places are in memory, taken before any
    transaction.) Batches do not wait for one another; a writer waits at
