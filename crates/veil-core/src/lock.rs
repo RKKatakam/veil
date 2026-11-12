@@ -770,7 +770,8 @@ impl RepoLock {
             let attempt = clock.now();
             // Only the longest waiter of this process creates a free lock
             // (BUG-1986); the others still judge the holder below.
-            if turn.mine() && backend.create_new(&path, &encode(&info, &extra))? {
+            let mine = turn.mine();
+            if mine && backend.create_new(&path, &encode(&info, &extra))? {
                 return Ok(Self::held(backend, path, info, extra, token, opts, ctx, attempt));
             }
             let Some(raw) = backend.read_opt(&path)? else {
@@ -780,7 +781,11 @@ impl RepoLock {
                 if let Some(what) = backend.special_at(&path)? {
                     return Err(not_a_lock_file(LOCK_PATH, what));
                 }
-                reason = format!("{LOCK_PATH} exists but cannot be read");
+                reason = if mine {
+                    format!("{LOCK_PATH} exists but cannot be read")
+                } else {
+                    String::from("other threads of this process were waiting for the lock first")
+                };
                 continue;
             };
             let unchanged_for = observed.see(&raw, clock.now());

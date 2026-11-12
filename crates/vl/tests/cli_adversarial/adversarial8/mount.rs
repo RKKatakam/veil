@@ -413,7 +413,8 @@ fn deleting_while_listing_skips_nothing() {
     let (mnt, _g) = mount(&env, U, &proj, "agent");
     std::fs::create_dir(mnt.join("many")).unwrap();
     for i in 0..3000 {
-        std::fs::write(mnt.join(format!("many/file-{i:05}.txt")), "x").unwrap();
+        let f = format!("many/file-{i:05}.txt");
+        std::fs::write(mnt.join(&f), "x").unwrap_or_else(|e| panic!("writing {f} through the mount: {e}"));
     }
     let r = std::fs::remove_dir_all(mnt.join("many"));
     // What is left, by name (BUG-1983: a failure on a loaded machine kept
