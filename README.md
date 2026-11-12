@@ -57,41 +57,69 @@ blame and search answered by the server in milliseconds.
 
 ## Measured
 
-On one 32-core machine that was also running other work, with PostgreSQL
-and S3-compatible storage beside it ([landings](docs/design/scale/LOAD.md),
-[Git comparison](docs/design/scale/OPENSCION.md)):
+Measured on 2026-11-12, on one 32-core machine that also ran the load
+generator, PostgreSQL and the object store. The full tables, misses
+included, are in [LOAD.md](docs/design/scale/LOAD.md) (landings) and
+[OPENSCION.md](docs/design/scale/OPENSCION.md) (beside Git).
 
-| | Veil | For comparison |
+**Landing changes on one `main`** (10,000 agents; the target is 1,000 a
+second, held):
+
+| | Veil | Note |
 |---|---|---|
-| Landings a second into one `main`, 1,000 agents | **993** (p99 327 ms) | 20 to 30 with pull, rebase, push and retry (Veil's own push model before the landing service) |
-| The same, 10,000 agents | **943** (p99 about 1 s) | |
-| Import a 10,000-file folder | **300 to 386 ms** | Git: 928 to 1,132 ms |
-| Clone 10,000 files through the server | **443 to 533 ms** | Git: 595 to 788 ms |
-| Commit one changed file among 10,000 | 22 to 37 ms | **Git: 9 to 10 ms.** Git doesn't force the commit to disk here; Veil does. |
+| Held for three minutes | **500 a second** (p50 104 ms, p99 925 ms) | Half the target. For comparison: 20 to 30 a second with pull, rebase, push and retry. |
+| Held for three minutes, protected `main`, 3 % overlapping and 2 % conflicting changes | 300 a second (p99 589 ms) | |
+| 15-second bursts | 924 to 958 a second | 464 to 484 when every agent belongs to one person (BUG-1940) |
+| Offered more than it can land | slows down instead of holding its rate | BUG-1941: a 10-minute run offered 1,000 a second landed 125 |
+
+An earlier version of this page gave 993 landings a second. That came from
+a 15-second run, which ends before the queue grows; it is not a rate Veil
+holds. The fixes for BUG-1940, BUG-1941 and BUG-1942 are in progress.
+
+**Beside Git**, on the same files (medians of 5):
+
+| | Veil | Git |
+|---|---|---|
+| Import a 10,000-file folder | **282 to 326 ms** | 811 ms |
+| Import a 1 GB project (35,000 files) | **4.2 s** | 10.9 s |
+| Clone 1,000 files through the server | **159 to 163 ms** | 206 to 233 ms |
+| Clone 10,000 files through the server | 566 to 621 ms | 569 to 573 ms |
+| Commit one changed file among 10,000 | 12.5 ms | **8.5 ms** |
+| `status` in the 1 GB project | 102 ms | **32 ms** |
+| Clone one folder of the 1 GB project | 4 to 5 s | **0.4 s** |
+| Default clone of the 1 GB project | fails after 64 s (BUG-1943, being fixed) | 29 s |
+
+**Other gates:** blame over 10,000 versions answers in 425 to 528 ms the
+first time and 25 ms (p99) after; listing, searching, opening and updating
+among 100,000 pull requests take 6 to 22 ms (median); a workspace of
+200,000 files starts in under 300 ms.
 
 ## Where it stands
 
-Veil is pre-release, and close to done:
+Veil is pre-release. Every planned feature is built; the work left is speed
+and a run across several machines.
 
 | Part | State |
 |---|---|
 | Client engine, workspaces, sandboxes | Built |
 | Thin clones, caches, storage on S3 with PostgreSQL or YugabyteDB | Built |
 | History, blame and search answered by the server | Built, speed gate passed |
-| Landing at agent scale, CI, pull requests, embargoes, web client | Built |
-| Review of the whole code base (eight passes this week) | Done: about 75 bugs found, all but a handful fixed |
-| Benchmarks on the final code | Next |
+| Landing at agent scale, CI, pull requests, embargoes, web client | Built; the landing rate is at half its target |
+| Review of the whole code base (eight passes) | Done: about 75 bugs found, all but a handful fixed |
+| Benchmarks on the final code | Run on 2026-11-12: 10 misses filed (BUG-1940 to BUG-1949), fixes in progress |
 | A run across several machines | Next |
 
-The whole suite is green: about 800 server tests, each run on PostgreSQL and
-on YugabyteDB, and about 2,300 client and engine tests. Every bug found is
-in [docs/BUGS.md](docs/BUGS.md) with the test that reproduces it, the open
-ones included.
+The correctness suite is green: about 800 server tests, each run on
+PostgreSQL and on YugabyteDB, and about 2,300 client and engine tests. Every
+bug found is in [docs/BUGS.md](docs/BUGS.md) with the test that reproduces
+it, the open ones included.
 
 Not proven yet: scale across several machines (the numbers above are from
-one), and the sandbox on macOS, where commands run unconfined for now. By
-design there is no offline mode: `vl` commits, splits, squashes and undoes
-locally, and everything shared goes through the server.
+one), the gates that have no benchmark yet (bisect over 10,000 candidates,
+server failover, workspaces of a million files), and the sandbox on macOS,
+where commands run unconfined for now. By design there is no offline mode:
+`vl` commits, splits, squashes and undoes locally, and everything shared
+goes through the server.
 
 ## Who can see what
 
