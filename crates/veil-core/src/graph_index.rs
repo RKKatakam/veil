@@ -98,6 +98,9 @@ pub const FLAG_EMBARGO: u8 = 1;
 /// Flag: the snapshot or one of its ancestors in the store has [`FLAG_EMBARGO`].
 pub const FLAG_EMBARGO_LINE: u8 = 2;
 
+/// The most missing parents [`GraphIndex::missing_below`] lists.
+pub const MAX_MISSING: usize = 4096;
+
 /// A generation (see the module docs).
 pub type Gen = u64;
 
@@ -597,6 +600,46 @@ impl GraphIndex {
             let (files, _) = self.list();
             self.remove_older(&files, st.epoch);
         }
+    }
+
+    /// Does this index persist its entries?
+    pub(crate) fn persists(&self) -> bool {
+        self.persist
+    }
+
+    /// Drop every entry, in memory and on disk, to be computed again.
+    pub fn discard(&self) {
+        let mut st = self.lock();
+        self.void(&mut st);
+    }
+
+    /// Every parent this index took as missing, after computing the entries
+    /// of `heads` and all below them, when none of them is in the store:
+    /// what could later join two of `heads` (a snapshot's parents never
+    /// change, so a head's held history grows only when one of these
+    /// arrives; `crate::settled`). `None` when one has arrived (the index
+    /// is then dropped), when a head is not held, when an entry is a thin
+    /// clone's lower bound, or when there are more than [`MAX_MISSING`].
+    pub fn missing_below(&self, repo: &Repo, heads: &[ObjectId]) -> Result<Option<Vec<ObjectId>>> {
+        let mut st = self.lock();
+        self.ensure_loaded(repo, &mut st);
+        if any_arrived(repo, &st.missing) {
+            self.void(&mut st);
+            return Ok(None);
+        }
+        let mut w = Walker { repo, st: &mut st, exact: false };
+        for h in heads {
+            if w.entry(h)?.is_none() {
+                return Ok(None);
+            }
+        }
+        // Those just computed were found missing just now.
+        if !st.partial.is_empty() || st.missing.len() > MAX_MISSING {
+            return Ok(None);
+        }
+        let mut out: Vec<ObjectId> = st.missing.iter().copied().collect();
+        out.sort();
+        Ok(Some(out))
     }
 
     // ---- queries --------------------------------------------------------

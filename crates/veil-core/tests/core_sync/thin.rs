@@ -1283,3 +1283,46 @@ fn s8kr_slow_answers_and_another_refusal_never_rewrite_a_server_change() {
         assert!(!repo.snapshot(&h).unwrap().predecessors.contains(&c2), "{} rewrites the server's c2", h.short());
     }
 }
+
+/// BUG-1960, a thin clone made full (as `vl partial full` does: every
+/// snapshot into the main store, the marker removed, the history index
+/// computed again): a local head that the server's history took in as it
+/// was (a branch a pull request landed from) is under the working copy's
+/// head through history the thin clone did not hold. Rewrites while it was
+/// thin settle nothing; once it is full, the next rewrite drops that head.
+#[test]
+fn bug_1960_a_thin_clone_made_full_drops_the_head_the_history_it_took_in_puts_under_another() {
+    let pr = project();
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    checkout(&mut repo, &fs, pr.tip);
+    let landed = pr.commits[1];
+    let mut tx = repo.transaction("a branch the server took in").unwrap();
+    tx.repo().store().put_raw(&landed, &pr.server.store.get_raw(&landed).unwrap()).unwrap();
+    tx.add_head(landed).unwrap();
+    tx.commit().unwrap();
+    let wc = repo.workspace_wc("default").unwrap();
+    let wc = repo.describe(wc, "one").unwrap();
+    let wc = repo.describe(wc, "two").unwrap();
+    assert!(repo.view().heads.contains(&landed), "while thin, the history between is not held");
+    assert!(repo.view().heads.contains(&wc));
+
+    for c in &pr.commits {
+        repo.store().put_raw(c, &pr.server.store.get_raw(c).unwrap()).unwrap();
+    }
+    repo.update_config(|c| {
+        c.partial = None;
+        c.format = veil_core::repo::REPO_FORMAT;
+        c.min_vl = Some(veil_core::repo::min_vl_for_format(c.format).into());
+        Ok(())
+    })
+    .unwrap();
+    repo.discard_history_index();
+    drop(repo);
+    let mut repo = Repo::open(fs.clone(), Some(pr.id.clone()), "alice").unwrap();
+    assert!(!repo.config().is_partial());
+    assert!(repo.held().ancestors(&wc).unwrap().contains(&landed), "the landed branch is under the working copy now");
+
+    let wc = repo.describe(wc, "three").unwrap();
+    let heads: HashSet<ObjectId> = repo.view().heads.iter().copied().collect();
+    assert_eq!(heads, HashSet::from([wc]), "the landed branch's head is under the working copy's");
+}

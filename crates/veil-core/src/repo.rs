@@ -2082,4 +2082,21 @@ impl Repo {
     pub(crate) fn persist_index(&self) {
         self.graph.persist(self);
     }
+
+    /// Does the history index persist (not over a network)?
+    pub(crate) fn graph_persists(&self) -> bool {
+        self.graph.persists()
+    }
+
+    /// [`GraphIndex::missing_below`].
+    pub(crate) fn graph_missing_below(&self, heads: &[ObjectId]) -> Result<Option<Vec<ObjectId>>> {
+        self.graph.missing_below(self, heads)
+    }
+
+    /// Drop the history index, to be computed again: after a thin clone is
+    /// made full, whose entries at its boundary list no missing parents
+    /// (BUG-1960).
+    pub fn discard_history_index(&self) {
+        self.graph.discard();
+    }
 }

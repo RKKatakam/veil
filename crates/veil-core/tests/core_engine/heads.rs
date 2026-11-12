@@ -385,10 +385,85 @@ fn a_head_that_arrived_history_puts_under_another_is_dropped_by_the_next_rewrite
 }
 
 #[test]
-#[ignore = "BUG-1960: a head that history arriving later (a withheld parent, released) puts under another head stays a head at every later rewrite, when the operation before rewrote something"]
 fn bug_1960_a_head_that_arrived_history_puts_under_another_is_dropped_after_an_operation_that_rewrote() {
     let (heads, expected) = heads_after_withheld_history_arrives(true);
     assert_eq!(heads, expected, "the old head is an ancestor of the upper head, and still a head");
+}
+
+/// The heads `old`, `other` and `upper` of [`heads_after_withheld_history_arrives`],
+/// settled by a rewrite while the snapshot between `upper` and `old` is
+/// withheld: the repository, the three heads, and the withheld snapshot.
+fn settled_beside_withheld_history() -> (Repo, [ObjectId; 3], veil_core::Snapshot) {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let mut repo = Repo::init(backend, None, "t").unwrap();
+    let root = repo.root_id();
+    let old = change_on(&mut repo, root, "old.txt");
+    let mut other = root;
+    for i in 0..6 {
+        other = change_on(&mut repo, other, &format!("line{i}.txt"));
+    }
+    let between = foreign(&repo, vec![old], 1);
+    let elsewhere = Repo::init(Arc::new(MemoryBackend::new()), None, "t").unwrap();
+    let between_id = elsewhere.store().put_snapshot(&between).unwrap();
+    let mut tx = repo.transaction("a pull: the upper snapshot, its parent withheld").unwrap();
+    let upper = tx.repo().store().put_snapshot(&foreign(tx.repo(), vec![between_id], 2)).unwrap();
+    tx.add_head(upper).unwrap();
+    tx.commit().unwrap();
+    let other = repo.describe(other, "described while the parent is withheld").unwrap();
+    assert_eq!(heads(&repo), HashSet::from([old, other, upper]), "nothing held joins the heads yet");
+    (repo, [old, other, upper], between)
+}
+
+/// BUG-1960, a pull that brings the joining history and rewrites in the
+/// same transaction (as `supersede_landed` does): the transaction's own
+/// writes are history that arrived since the heads were settled.
+#[test]
+fn bug_1960_history_that_arrives_in_the_rewriting_transaction_drops_the_head_it_puts_under_another() {
+    let (mut repo, [old, other, upper], between) = settled_beside_withheld_history();
+    let mut tx = repo.transaction("a pull: the withheld snapshot, and a rewrite").unwrap();
+    let between_id = tx.repo().store().put_snapshot(&between).unwrap();
+    let mut described = (*tx.repo().snapshot(&other).unwrap()).clone();
+    described.description = veil_core::object::Text::Plain("described in the pull".into());
+    let other = tx.rewrite(other, described).unwrap();
+    tx.commit().unwrap();
+    assert!(repo.held().snapshot(&between_id).unwrap().is_some(), "the withheld snapshot arrived");
+    assert!(repo.held().ancestors(&upper).unwrap().contains(&old));
+    assert_eq!(heads(&repo), HashSet::from([other, upper]), "the old head is under the upper one");
+    assert_eq!(redundant_heads(&repo), Vec::<ObjectId>::new());
+}
+
+/// BUG-1960, an operation log written before the settled-heads record (an
+/// operation that rewrote something, by an older `vl`, or one whose record
+/// was lost, torn, or replaced by another operation's): the next rewrite
+/// reads the range, and drops a head that arrived history put under
+/// another.
+#[test]
+fn bug_1960_an_operation_without_its_settled_record_is_no_proof_the_heads_are_apart() {
+    let record = veil_core::VPath::new(".veil/index/settled-heads").unwrap();
+    for how in ["removed", "torn", "another operation's"] {
+        let (mut repo, [old, other, upper], between) = settled_beside_withheld_history();
+        let backend = repo.backend().clone();
+        let written = backend.read_opt(&record).unwrap().expect("the rewrite recorded its heads");
+        match how {
+            "removed" => backend.remove_file(&record).unwrap(),
+            "torn" => backend.write(&record, &written[..written.len() - 1]).unwrap(),
+            _ => {
+                // A record for an operation since (one that rewrote
+                // nothing), whose heads it did not settle.
+                let root = repo.root_id();
+                let a = change_on(&mut repo, root, "beside.txt");
+                assert!(heads(&repo).contains(&a));
+            }
+        }
+        // The record lists the withheld snapshot as missing; with it gone,
+        // what joins the heads is not known to have been absent.
+        repo.store().put_snapshot(&between).unwrap();
+        assert!(repo.held().ancestors(&upper).unwrap().contains(&old), "{how}");
+        let other = repo.describe(other, "described after it arrived").unwrap();
+        assert!(!heads(&repo).contains(&old), "{how}: the old head is under the upper one, and still a head");
+        assert!(heads(&repo).contains(&other) && heads(&repo).contains(&upper), "{how}");
+        assert_eq!(redundant_heads(&repo), Vec::<ObjectId>::new(), "{how}");
+    }
 }
 
 fn xorshift(seed: u64) -> impl FnMut(usize) -> usize {
@@ -465,7 +540,8 @@ fn reachable_among_tips_answers_as_the_full_walk_for_tips_that_are_apart() {
 /// operation that moves heads (new changes, merges, descriptions, rebases,
 /// squashes, abandons, undo, a restore to any earlier operation, history
 /// that arrives above what is held, with and without a rewrite in the same
-/// operation, a new process, two processes writing at once and their
+/// operation, history that arrives below a head (a withheld snapshot
+/// released, with no operation or in a rewriting one: BUG-1960), a new process, two processes writing at once and their
 /// merge): after every operation that rewrote something and builds on one
 /// operation, no head is an ancestor of another, which is what the walk
 /// before the branch left (it read every head's whole range at each such
@@ -479,11 +555,16 @@ fn no_head_descends_from_another_after_a_rewrite_whatever_came_before() {
         let mut repo = Repo::init(backend.clone(), None, "t").unwrap();
         let root = repo.root_id();
         let mut stamp = 0i64;
+        // Snapshots withheld (known by id only), released later.
+        let elsewhere = Repo::init(Arc::new(MemoryBackend::new()), None, "t").unwrap();
+        let mut withheld: Vec<veil_core::Snapshot> = Vec::new();
         for step in 0..60 {
             let wc = repo.workspace_wc("default").unwrap();
             let mut free: Vec<ObjectId> = repo.held().visible().unwrap().into_iter().filter(|id| *id != root && *id != wc).collect();
+            // Not one standing on a withheld snapshot (a rewrite of it reads its parent).
+            free.retain(|id| repo.snapshot(id).unwrap().parents.iter().all(|p| repo.held().snapshot(p).unwrap().is_some()));
             free.sort();
-            let what = if free.len() < 2 { 0 } else { next(14) };
+            let what = if free.len() < 2 { 0 } else { next(16) };
             let pick = |next: &mut dyn FnMut(usize) -> usize| free[next(free.len())];
             match what {
                 0 | 1 => {
@@ -570,6 +651,38 @@ fn no_head_descends_from_another_after_a_rewrite_whatever_came_before() {
                         Err(e) => {
                             let e = e.to_string();
                             assert!(e.contains("nothing to") || e.contains("cannot undo") || e.contains("cannot redo") || e.contains("merges concurrent"), "seed {seed}, step {step}: {e}");
+                        }
+                    }
+                }
+                13 => {
+                    // A snapshot on something held, withheld, and one on
+                    // it that arrives: a head whose parent is not held.
+                    stamp += 1;
+                    let between = foreign(&repo, vec![pick(&mut next)], 1_000 + stamp);
+                    let between_id = elsewhere.store().put_snapshot(&between).unwrap();
+                    let mut tx = repo.transaction("arrive above a withheld snapshot").unwrap();
+                    stamp += 1;
+                    let upper = tx.repo().store().put_snapshot(&foreign(tx.repo(), vec![between_id], 1_000 + stamp)).unwrap();
+                    tx.add_head(upper).unwrap();
+                    tx.commit().unwrap();
+                    withheld.push(between);
+                }
+                14 => {
+                    // A withheld snapshot released: put in the store with
+                    // no operation (a pull that moves no reference), or by
+                    // an operation that also rewrites.
+                    if !withheld.is_empty() {
+                        let between = withheld.remove(next(withheld.len()));
+                        if next(2) == 0 {
+                            repo.store().put_snapshot(&between).unwrap();
+                        } else {
+                            let mut tx = repo.transaction("release and rewrite").unwrap();
+                            tx.repo().store().put_snapshot(&between).unwrap();
+                            let target = pick(&mut next);
+                            let mut described = (*tx.repo().snapshot(&target).unwrap()).clone();
+                            described.description = veil_core::object::Text::Plain(format!("rewritten at {step}"));
+                            tx.rewrite(target, described).unwrap();
+                            tx.commit().unwrap();
                         }
                     }
                 }

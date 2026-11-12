@@ -117,6 +117,9 @@ pub struct Transaction<'r> {
     /// Paths whose sealed entries a command (`vl restore`) carried into the
     /// directory it records (BUG-492).
     carried_sealed: HashSet<VPath>,
+    /// [`Transaction::drop_ancestor_heads`] ran: the heads it leaves are
+    /// apart (none descends from another), for the snapshots held now.
+    settles: bool,
 }
 
 /// Names of the operation's bytes and of its (empty) head file in a
@@ -186,6 +189,7 @@ impl<'r> Transaction<'r> {
             kept_dir: None,
             keep_attribution: false,
             carried_sealed: HashSet::new(),
+            settles: false,
         })
     }
 
@@ -690,6 +694,7 @@ impl<'r> Transaction<'r> {
     /// Drop any head in `self.view.heads` that another head already descends
     /// from, keeping `heads` the maximal tips of the visible DAG.
     fn drop_ancestor_heads(&mut self) -> Result<()> {
+        self.settles = true;
         if self.view.heads.len() <= 1 {
             return Ok(());
         }
@@ -717,23 +722,28 @@ impl<'r> Transaction<'r> {
     /// instead of reading the history between the newest head and the
     /// oldest (every snapshot since a branch left long ago, at each commit).
     ///
-    /// Known when the operation this transaction builds on rewrote
-    /// something: its commit ended with [`Transaction::drop_ancestor_heads`],
-    /// and left the heads this transaction starts from. Not for a merge of
-    /// concurrent operations (it moves heads after that step), and not in a
-    /// thin clone (history it fetches later can join two of its heads).
-    /// An operation written before heads were dropped this way, or history
-    /// that arrives later (a withheld parent), can leave a head that
-    /// another descends from: it stays, as it did before, until a
-    /// transaction that does not start from such an operation reads the
-    /// whole range again.
+    /// Known (BUG-1960) only from the settled-heads record
+    /// ([`crate::settled`]): the commit of the operation this transaction
+    /// builds on ended with [`Transaction::drop_ancestor_heads`], which left
+    /// its heads apart for the snapshots held then, and the record lists
+    /// every parent the history index took as missing at that moment. A
+    /// snapshot's parents never change, so a head's history grows only when
+    /// one of those arrives: while none is in the store (this transaction's
+    /// own writes included: a pull that brings the joining history), the
+    /// heads are apart now. Otherwise, without a record for that operation
+    /// (one written before records existed, a merge of concurrent
+    /// operations, an operation that rewrote nothing), and in a thin clone
+    /// (its history grows below its boundary), the walk reads the range.
     fn settled_heads(&self) -> Result<(HashSet<ObjectId>, HashSet<ObjectId>)> {
         let unknown = || Ok((HashSet::new(), HashSet::new()));
         if self.merge.is_some() || self.base.len() != 1 || self.repo.store.is_partial() {
             return unknown();
         }
         let Some(op) = self.repo.ops.try_get(&self.base[0]).ok().flatten() else { return unknown() };
-        if op.parents.len() > 1 || op.rewritten.is_empty() || op.view.heads != self.start_view.heads {
+        if op.parents.len() > 1 || op.view.heads != self.start_view.heads {
+            return unknown();
+        }
+        if !crate::settled::still_apart(self.repo, &self.base[0]) {
             return unknown();
         }
         let tips: HashSet<ObjectId> = self.start_view.heads.iter().copied().collect();
@@ -2063,6 +2073,11 @@ impl<'r> Transaction<'r> {
         self.repo.pin_working_copies();
         // Best effort: the index is a cache.
         self.repo.persist_index();
+        // Best effort too: without the record the next rewrite reads the
+        // range between its heads (a merge moves heads after the step).
+        if self.settles && self.merge.is_none() {
+            crate::settled::record(self.repo, &id);
+        }
         let warnings = self.take_merge_warnings();
         self.repo.warnings.extend(warnings);
         // Concurrent operations are merged by the next open or

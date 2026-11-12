@@ -477,6 +477,10 @@ fn full(ctx: &mut Ctx, remote: &str) -> Result<()> {
         c.min_vl = Some(veil_core::repo::min_vl_for_format(c.format).to_string());
         Ok(())
     })?;
+    // The history index's entries at the thin boundary took their
+    // generation from the server and list no missing parents: computed
+    // again, so that history arriving below a head is noticed (BUG-1960).
+    ctx.repo.discard_history_index();
     // The cache is no longer read: removed (best effort; `.veil/cache/`
     // is nothing but fetched copies).
     let cache = ctx.root.join(veil_core::promisor::CACHE_DIR);
