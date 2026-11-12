@@ -3404,6 +3404,7 @@ mod tests {
     }
 
     /// Unit tests only: this thread's builds walk on one thread.
+    #[cfg_attr(not(feature = "os"), allow(dead_code))]
     pub(super) fn serial() -> bool {
         #[cfg(test)]
         return SERIAL.with(|s| s.get());
