@@ -8,10 +8,15 @@
 # agents reconnect to the servers that are left.
 #
 #   deploy/lb/haproxy-cfg.sh HOST:PORT...  > haproxy.cfg
+#   HAPROXY_DNS=127.0.0.11:53 deploy/lb/haproxy-cfg.sh hub1:8443 hub2:8443
+#       (the rehearsal: names re-resolved through Docker's DNS, since a
+#       restarted container may come back on another address)
 #
 # The DigitalOcean run and the Compose rehearsal use this one file.
 set -euo pipefail
 [ $# -gt 0 ] && [[ "$1" != -* ]] || { echo "haproxy-cfg: usage: haproxy-cfg.sh HOST:PORT..." >&2; exit 2; }
+DNS=${HAPROXY_DNS:-}
+[ -z "$DNS" ] || [[ "$DNS" =~ ^[0-9.]+:[0-9]+$ ]] || { echo "haproxy-cfg: invalid HAPROXY_DNS '$DNS' (IP:PORT)" >&2; exit 2; }
 cat <<CFG
 global
     maxconn 400000
@@ -23,13 +28,21 @@ defaults
     timeout client 15m
     timeout server 15m
     timeout check 2s
+CFG
+[ -z "$DNS" ] || cat <<CFG
+resolvers dns
+    nameserver dns $DNS
+    hold valid 1s
+    hold obsolete 1s
+CFG
+cat <<CFG
 frontend veil
     bind :8443
     maxconn 400000
     default_backend hubs
 backend hubs
     balance leastconn
-    default-server check inter 1s fall 2 rise 2 on-marked-down shutdown-sessions maxconn 200000
+    default-server check inter 1s fall 2 rise 2 on-marked-down shutdown-sessions maxconn 200000${DNS:+ resolvers dns init-addr last,libc,none}
 CFG
 i=0
 for s in "$@"; do

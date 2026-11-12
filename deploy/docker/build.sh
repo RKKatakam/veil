@@ -8,6 +8,7 @@
 #   deploy/docker/build.sh            # both images
 #   deploy/docker/build.sh server     # one of them
 #   TAG=mytag deploy/docker/build.sh
+#   CARGO_BUILD_JOBS=8 deploy/docker/build.sh   # fewer compile jobs on a small or shared machine
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 TAG=${TAG:-$(git describe --always --dirty --abbrev=8 2>/dev/null || echo dev)}
@@ -21,7 +22,7 @@ for target in ${*:-server bench}; do
     esac
     echo "== building veil-$target:$TAG"
     D build -f deploy/docker/Dockerfile --target "$target" \
-        --build-arg "VEIL_COMMIT=$COMMIT" -t "veil-$target:$TAG" .
+        --build-arg "VEIL_COMMIT=$COMMIT" --build-arg "VEIL_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -t "veil-$target:$TAG" .
 done
 D images --format '{{.Repository}}:{{.Tag}}  {{.Size}}' | grep -E "^veil-(server|bench):$TAG " || true
 echo "TAG=$TAG"
