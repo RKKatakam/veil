@@ -975,7 +975,7 @@ fn a_push_of_one_file_larger_than_the_signed_in_pool_lands() {
 
 // ---- S24 part B: limits on the landing service -------------------------------------
 
-fn agent_session_token(api: &Api, token: &str, project: &str, run: &str) -> String {
+pub(crate) fn agent_session_token(api: &Api, token: &str, project: &str, run: &str) -> String {
     let r = api.post_json(
         Some(token),
         "/v1/sessions/agent",
@@ -985,7 +985,7 @@ fn agent_session_token(api: &Api, token: &str, project: &str, run: &str) -> Stri
     r.json()["token"].as_str().unwrap().to_string()
 }
 
-fn land_edit(api: &Api, token: &str, project: &str, base: veil_core::ObjectId, path: &str, text: &str, wait: bool) -> Reply {
+pub(crate) fn land_edit(api: &Api, token: &str, project: &str, base: veil_core::ObjectId, path: &str, text: &str, wait: bool) -> Reply {
     api.post_json(
         Some(token),
         &format!("/v1/projects/{project}/land"),
@@ -993,7 +993,7 @@ fn land_edit(api: &Api, token: &str, project: &str, base: veil_core::ObjectId, p
     )
 }
 
-fn wait_ticket(api: &Api, token: &str, project: &str, ticket: &str) -> serde_json::Value {
+pub(crate) fn wait_ticket(api: &Api, token: &str, project: &str, ticket: &str) -> serde_json::Value {
     for _ in 0..40 {
         let r = api.get(Some(token), &format!("/v1/projects/{project}/land/{ticket}"));
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
@@ -1006,14 +1006,14 @@ fn wait_ticket(api: &Api, token: &str, project: &str, ticket: &str) -> serde_jso
     panic!("ticket {ticket} still queued/merging");
 }
 
-fn project_id_of(hub: &TestHub, name: &str) -> i64 {
+pub(crate) fn project_id_of(hub: &TestHub, name: &str) -> i64 {
     let h = hub.hub();
     hub.rt
         .block_on(sqlx::query_scalar::<_, i64>("SELECT id FROM projects WHERE name = $1").bind(name).fetch_one(&h.db))
         .unwrap()
 }
 
-fn hold_branch(hub: &TestHub, project: i64, branch: &str) {
+pub(crate) fn hold_branch(hub: &TestHub, project: i64, branch: &str) {
     let h = hub.hub();
     hub.rt
         .block_on(
@@ -1029,7 +1029,7 @@ fn hold_branch(hub: &TestHub, project: i64, branch: &str) {
         .unwrap();
 }
 
-fn release_branch(hub: &TestHub, project: i64, branch: &str) {
+pub(crate) fn release_branch(hub: &TestHub, project: i64, branch: &str) {
     let h = hub.hub();
     hub.rt
         .block_on(

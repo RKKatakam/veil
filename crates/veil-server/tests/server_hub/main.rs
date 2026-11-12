@@ -59,3 +59,4 @@ mod browser;
 mod rc_server;
 mod rc_client;
 mod warm;
+mod landing_speed;

@@ -5268,10 +5268,18 @@ transaction per landing instead of 23.
    `landing_queue` records `person_id` and `session` (`session_hash(token)`
    for an agent session, `""` for a device session; migration 24). Inside the
    submit transaction — after all branch, base, stack, policy, and agent
-   checks succeed — `admit_queue` locks `SELECT id FROM people WHERE id = $1
-   FOR UPDATE`, serialising concurrent submits from the same person across
-   every server sharing the database. It then counts rows in `landing_queue`
-   with `state = 'queued'` across all projects: an agent session is bounded at
+   checks succeed — `admit_queue` takes one of the person's slots for the row
+   and, from an agent session, one of the session's (`person_slot`,
+   `session_slot`; migration 36, BUG-1940). A unique index on each, over the
+   waiting rows, is the bound, exact across every server sharing the
+   database: two submits that take the same slot at the same instant are
+   decided by the index, and the one that lost takes another. No lock is
+   held that another submit of the same person needs, so one person's agents
+   do not wait for one another. (Until BUG-1940 the person's row was locked
+   `FOR UPDATE` to the submit's commit, and one person's submits went one at
+   a time: 464 landings a second where 100 people's went at 924.) It counts
+   the person's rows in `landing_queue` with `state` `queued` or `merging` in
+   the project: an agent session is bounded at
    **100** (`MAX_SESSION_OUTSTANDING`, design §4.4 / §4.11) and a person
     across all their sessions and devices at **1,000** (`MAX_PERSON_OUTSTANDING`,
    ten times the session bound). Past either bound, the transaction rolls back
@@ -5283,10 +5291,20 @@ transaction per landing instead of 23.
    for queued landings to finish`). Nothing half-lands, and nothing hidden is
    named.
 2. **Each submitter's fair share of a batch** (`limits::landing::fair_batch`,
-   BUG-1662). When the branch's landing worker loads all `queued` tickets in
-   arrival order (`created_at, ticket`), `fair_batch` reorders them by a
-   two-level round-robin before `take_batch` caps the batch at `MAX_BATCH`
-   (64): first across distinct `person_id` (ordered by each person's earliest
+   BUG-1662). The branch's landing worker takes its batch of `MAX_BATCH`
+   (64) from the `queued` tickets in arrival order (`created_at, seq`) by a
+   two-level round-robin. It does not read the whole queue for that
+   (`limits::landing::pick_batch`, BUG-1941: it did, and past its capacity
+   each batch was slower than the last): it reads the queue in its order
+   through its index, 256 rows a statement, and after each statement
+   `FairPick` names the people and sessions no further row of which can be
+   in the batch; the next statement leaves those out, and the reading ends
+   when no row not yet read can be in the batch. With 64 people or more at
+   the head of the queue that is one statement; behind fewer, it reads past
+   the rows of those it has seen, of which each person has at most their
+   bound. The batch is exactly the one the whole queue gives (a row comes no
+   earlier in round-robin order when rows are added behind it). The order:
+   first across distinct `person_id` (ordered by each person's earliest
    queued ticket), and within each person across their distinct sessions
    (`session`, with device sessions grouped under `""`, ordered by each
    session's earliest queued ticket). In a batch of $B$ landings with $P$

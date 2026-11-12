@@ -44,7 +44,7 @@ pub mod state;
 pub mod threads;
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -2052,6 +2052,122 @@ pub async fn verify_landing_review(
         reasons.push(format!("{h} asked for changes"));
     }
     Ok(Err(format!("{NOT_READY} {}", reasons.join("; "))))
+}
+
+/// One entry of a landing batch, for [`verify_landing_reviews`]: what
+/// [`verify_landing_review`] is asked of it.
+pub struct LandingReview<'a> {
+    pub project: &'a crate::perm::Project,
+    pub viewer: &'a Viewer,
+    pub diff: &'a StackReviewDiff,
+    pub claim: Option<&'a crate::landing::ReviewClaim>,
+}
+
+/// [`verify_landing_review`] for every entry of a landing batch onto
+/// `branch` of `project`, with the same answers, in a number of statements
+/// that does not grow with the batch (BUG-1942: the batch asked for each
+/// entry in turn, three statements each, in its commit transaction too).
+///
+/// Three statements read, for all the entries at once, what could make an
+/// entry's answer anything but "nothing to meet": a change of it the server
+/// reverted twice, an open PR on `branch` whose current revision is its
+/// patch, a reviewer's hold on a path it touches. An entry none of them
+/// names, with no PR or embargo of its own (`ReviewClaim`) and a risk that
+/// needs no approval, is ready, as [`verify_landing_review`] would find from
+/// the same rows. Any other entry is asked alone, there.
+///
+/// `reverted_twice`: whether the project has a change the server reverted
+/// twice at all (`bisect::has_reverted_twice`, which the batch's
+/// transaction checks again). `asks` counts the statements for the whole
+/// batch and the entries asked alone (`landing::Stats::review_asks`).
+#[allow(clippy::too_many_arguments)]
+pub async fn verify_landing_reviews(
+    c: &mut sqlx::PgConnection,
+    project: i64,
+    branch: &str,
+    rules: &Review,
+    items: &[LandingReview<'_>],
+    branch_protected: bool,
+    reverted_twice: bool,
+    asks: &std::sync::atomic::AtomicU64,
+) -> Result<Vec<std::result::Result<Option<String>, String>>> {
+    let count = |n: u64| asks.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    if items.is_empty() || (!branch_protected && !reverted_twice) {
+        return Ok(items.iter().map(|_| Ok(None)).collect());
+    }
+    // Asked alone: an entry with a change reverted twice,
+    let mut alone: Vec<bool> = vec![false; items.len()];
+    if reverted_twice {
+        let ids: Vec<String> = items.iter().flat_map(|i| i.diff.changes.iter().cloned()).collect();
+        count(1);
+        let twice = crate::bisect::reverted_twice_among(&mut *c, project, &ids).await?;
+        for (i, item) in items.iter().enumerate() {
+            alone[i] = item.diff.changes.iter().any(|k| twice.contains(k));
+        }
+    }
+    if branch_protected {
+        // one that lands a PR or releases an embargo,
+        for (i, item) in items.iter().enumerate() {
+            alone[i] |= matches!(item.claim, Some(crate::landing::ReviewClaim::Pr { .. } | crate::landing::ReviewClaim::Embargo { .. }));
+        }
+        let patch_of = |item: &LandingReview<'_>| match item.claim {
+            Some(crate::landing::ReviewClaim::Patch { patch }) => patch.clone(),
+            _ => item.diff.patch.clone(),
+        };
+        // one whose patch is an open PR's current revision,
+        let patches: Vec<String> = items.iter().zip(&alone).filter(|(_, a)| !**a).map(|(i, _)| patch_of(i)).collect();
+        if !patches.is_empty() {
+            count(1);
+            let with_pr: HashSet<String> = sqlx::query_scalar(
+                "SELECT DISTINCT r.patch FROM prs p JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = p.revision \
+                 WHERE p.project_id = $1 AND p.target = $2 AND p.state = 'open' AND r.patch = ANY($3)",
+            )
+            .bind(project)
+            .bind(branch)
+            .bind(&patches)
+            .fetch_all(&mut *c)
+            .await?
+            .into_iter()
+            .collect();
+            for (i, item) in items.iter().enumerate() {
+                alone[i] |= with_pr.contains(&patch_of(item));
+            }
+        }
+        // one that touches a path a reviewer holds,
+        let paths: Vec<String> = {
+            let all: BTreeSet<&String> = items.iter().zip(&alone).filter(|(_, a)| !**a).flat_map(|(i, _)| i.diff.touched.iter()).collect();
+            all.into_iter().cloned().collect()
+        };
+        if !paths.is_empty() {
+            count(1);
+            let held: HashSet<String> = sqlx::query_scalar("SELECT DISTINCT path FROM pr_holds WHERE project_id = $1 AND path = ANY($2)")
+                .bind(project)
+                .bind(&paths)
+                .fetch_all(&mut *c)
+                .await?
+                .into_iter()
+                .collect();
+            if !held.is_empty() {
+                for (i, item) in items.iter().enumerate() {
+                    alone[i] |= item.diff.touched.iter().any(|p| held.contains(p));
+                }
+            }
+        }
+        // and one whose risk needs an approval (it has none: no PR).
+        for (i, item) in items.iter().enumerate() {
+            alone[i] = alone[i] || rules.need(classify(&item.diff.files, rules).0).approvals > 0;
+        }
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (item, alone) in items.iter().zip(alone) {
+        out.push(if alone {
+            count(1);
+            verify_landing_review(&mut *c, item.project, item.viewer, branch, item.diff, rules, item.claim, branch_protected).await?
+        } else {
+            Ok(None)
+        });
+    }
+    Ok(out)
 }
 
 /// Check the review rules in force for a landing `stack` onto `branch`
