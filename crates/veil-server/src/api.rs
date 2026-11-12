@@ -49,6 +49,7 @@ pub fn router(hub: HubState) -> Router {
         .route("/v1/projects/{p}/tips", get(tips))
         .route("/v1/projects/{p}/history", post(history))
         .route("/v1/projects/{p}/fetch", post(fetch))
+        .route("/v1/projects/{p}/subtree", get(crate::subtree::subtree))
         .route("/v1/projects/{p}/objects", post(objects).layer(DefaultBodyLimit::max(crate::db::body_limit("/objects"))))
         .route("/v1/projects/{p}/push", post(push))
         .route("/v1/projects/{p}/changes", post(changes))
@@ -751,7 +752,7 @@ async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
 
 /// Does the caller read encoded frames (compressed objects, S27)? A `vl`
 /// from before says nothing and gets plain frames.
-fn reads_encoded(headers: &HeaderMap) -> bool {
+pub(crate) fn reads_encoded(headers: &HeaderMap) -> bool {
     headers
         .get_all(header::ACCEPT)
         .iter()
@@ -771,7 +772,7 @@ fn reads_format(headers: &HeaderMap) -> u32 {
 }
 
 /// The content type of an answer of frames.
-fn frames_type(encoded: bool) -> &'static str {
+pub(crate) fn frames_type(encoded: bool) -> &'static str {
     if encoded {
         encoding::FRAMES
     } else {
