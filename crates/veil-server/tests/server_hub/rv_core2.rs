@@ -1956,6 +1956,8 @@ fn bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them() {
     let api = th.api();
     let pid = project_id(&th, &p.name);
     let (dev_tok, admin_tok, sec_tok) = (p.dev.token(), p.admin.token(), p.sec.token());
+    // Only people who may write every file of a PR review it.
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
 
     // The embargo, of `src/docs/held.md`, for the security group, and its PR.
     let dir = p.admin.dir("emb-2061");

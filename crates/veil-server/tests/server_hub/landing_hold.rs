@@ -687,8 +687,9 @@ fn bug_2060_an_edit_the_tip_already_holds_merges_cleanly() {
 
 /// A change made with `vl` in `dir` (the person's clone of the project) on
 /// `base`, by applying `edits` (in the form of `/land`'s) to its files, and
-/// given the tag `name`, for `vl push`: its snapshot id. (`/land`'s edits
-/// cannot replace a file by a folder, or a folder by a file, in one change.)
+/// given the tag `name` (for [`vl_land`]): its snapshot id. (`/land`'s
+/// edits cannot replace a file by a folder, or a folder by a file, in one
+/// change.)
 fn vl_change(who: &Person, dir: &std::path::Path, base: veil_core::ObjectId, edits: &[serde_json::Value], name: &str) -> veil_core::ObjectId {
     use std::os::unix::fs::PermissionsExt;
     who.ok(dir, &["new", &base.hex()]);
@@ -715,6 +716,18 @@ fn vl_change(who: &Person, dir: &std::path::Path, base: veil_core::ObjectId, edi
     snap
 }
 
+/// Submit the change tagged `tag` in `dir` to land on `onto` with `vl land`,
+/// not waiting: its ticket.
+fn vl_land(who: &Person, dir: &std::path::Path, tag: &str, onto: &str) -> String {
+    let out = who.ok(dir, &["land", tag, "--onto", onto, "--no-wait"]);
+    out.split("--status ")
+        .nth(1)
+        .and_then(|r| r.split('`').next())
+        .unwrap_or_else(|| panic!("no ticket in: {out}"))
+        .trim()
+        .to_string()
+}
+
 /// Whether `edits` replace a file by a folder or a folder by a file
 /// (which only [`vl_change`] makes).
 fn swaps_a_folder(edits: &[serde_json::Value]) -> bool {
@@ -735,15 +748,6 @@ fn bug_2070_an_edit_the_tip_already_holds_merges_cleanly_whatever_the_file() {
     let p = setup_project(&hub);
     let api = hub.api();
     let admin = p.admin.token();
-    let land = |snapshot: veil_core::ObjectId| {
-        let r = api.post_json(
-            Some(&admin),
-            &format!("/v1/projects/{}/land", p.name),
-            &serde_json::json!({"onto": "main", "snapshot": snapshot.hex(), "wait": true}),
-        );
-        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-        r.json()
-    };
     let tip = || api.tips(Some(&admin), &p.name).unwrap().branches["main"];
     let big: String = (0..30_000).map(|i| format!("big line {i:06} of a file over the merge cap\n")).collect();
     assert!(big.len() as u64 > veil_server::landing::merge::MAX_MERGE_FILE_BYTES);
@@ -775,14 +779,14 @@ fn bug_2070_an_edit_the_tip_already_holds_merges_cleanly_whatever_the_file() {
     ];
     let mut own = edits.clone();
     own.push(serde_json::json!({"path": "src/held/own.txt", "put": {"text": "its own edit\n"}}));
-    let first = vl_change(&p.admin, &dir, base, &edits, "held-first");
-    let second = vl_change(&p.admin, &dir, base, &own, "held-second");
-    let third = vl_change(&p.admin, &dir, base, &edits, "held-third");
-    p.admin.ok(&dir, &["push"]);
-    let landed = land(first);
+    vl_change(&p.admin, &dir, base, &edits, "held-first");
+    vl_change(&p.admin, &dir, base, &own, "held-second");
+    vl_change(&p.admin, &dir, base, &edits, "held-third");
+    let land = |tag: &str| settled(&api, &admin, &p.name, &vl_land(&p.admin, &dir, tag, "main"));
+    let landed = land("held-first");
     assert_eq!(landed["state"], "landed", "{landed}");
     let after_first = tip();
-    let landed = land(second);
+    let landed = land("held-second");
     assert_eq!(landed["state"], "landed", "a clean three-way merge lands: {landed}");
     assert_eq!(landed["merges"], 1, "{landed}");
     let file = |rev: veil_core::ObjectId, path: &str| {
@@ -797,7 +801,7 @@ fn bug_2070_an_edit_the_tip_already_holds_merges_cleanly_whatever_the_file() {
     }
     assert_eq!(file(now, "src/held/own.txt"), (200, b"its own edit\n".to_vec()));
     // Every edit held by the tip: the change lands, empty.
-    let landed = land(third);
+    let landed = land("held-third");
     assert_eq!(landed["state"], "landed", "a clean three-way merge lands: {landed}");
     assert_eq!(
         api.get(Some(&admin), &format!("/v1/projects/{}/q/tree?rev={}", p.name, tip().hex())).json()["id"],
@@ -816,9 +820,9 @@ struct Planned {
     /// The index of the earlier change it repeats exactly (an edit the tip
     /// may already hold, BUG-2060).
     repeats: Option<usize>,
-    /// Made with `vl` (it replaces a file by a folder or back): its two
-    /// copies, for the batch and for the one-by-one run.
-    made: Option<(veil_core::ObjectId, veil_core::ObjectId)>,
+    /// Made with `vl` (it replaces a file by a folder or back): the tags of
+    /// its two copies, for the batch and for the one-by-one run.
+    made: Option<(String, String)>,
 }
 
 fn kinds_put(path: &str, text: &str, executable: bool) -> serde_json::Value {
@@ -921,17 +925,16 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
     assert_eq!(r.json()["state"], "landed", "{}", r.json());
     let x = tip(&api);
     // The later base: `node1` is a folder there, and `t0`'s first line is another.
-    let r = api.post_json(
-        Some(&admin),
-        &format!("/v1/projects/{}/land", p.name),
-        &serde_json::json!({"onto": "main", "base": x.hex(), "edits": [
-            kinds_delete(&format!("{K}/node1")),
-            kinds_put(&format!("{K}/node1/inner.txt"), "made a folder\n", false),
-            kinds_put(&format!("{K}/t0.txt"), &text30("t0").replacen("t0 line 0\n", "t0 line 0 on y\n", 1), false),
-        ], "description": "node1 a folder", "wait": true}),
-    );
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    let dir = p.admin.dir(&format!("kinds-{seed}"));
+    p.admin.ok(p.admin.home.path(), &["clone", &hub.url(&p.name), dir.to_str().unwrap()]);
+    let to_y = [
+        kinds_delete(&format!("{K}/node1")),
+        kinds_put(&format!("{K}/node1/inner.txt"), "made a folder\n", false),
+        kinds_put(&format!("{K}/t0.txt"), &text30("t0").replacen("t0 line 0\n", "t0 line 0 on y\n", 1), false),
+    ];
+    vl_change(&p.admin, &dir, x, &to_y, &format!("y{seed}"));
+    let made_y = settled(&api, &admin, &p.name, &vl_land(&p.admin, &dir, &format!("y{seed}"), "main"));
+    assert_eq!(made_y["state"], "landed", "{made_y}");
     let y = tip(&api);
 
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x2070;
@@ -1019,27 +1022,26 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
     }
     // The changes that replace a file by a folder or back, made with `vl` by
     // the admin, twice each.
-    let dir = p.admin.dir(&format!("kinds-{seed}"));
-    p.admin.ok(p.admin.home.path(), &["clone", &hub.url(&p.name), dir.to_str().unwrap()]);
     for (i, c) in plan.iter_mut().enumerate() {
         if swaps_a_folder(&c.edits) {
             c.person = 1;
-            let one = vl_change(&p.admin, &dir, c.base, &c.edits, &format!("c{seed}b{i}"));
-            let two = vl_change(&p.admin, &dir, c.base, &c.edits, &format!("c{seed}s{i}"));
+            let (one, two) = (format!("c{seed}b{i}"), format!("c{seed}s{i}"));
+            vl_change(&p.admin, &dir, c.base, &c.edits, &one);
+            vl_change(&p.admin, &dir, c.base, &c.edits, &two);
             c.made = Some((one, two));
         }
     }
     assert!(plan.iter().filter(|c| c.made.is_some()).count() >= 3, "seed {seed}: too few folder changes");
-    p.admin.ok(&dir, &["push"]);
 
     // Queued while the branch is held: one batch.
     hold_branch(hub, pid, "main");
     let mut tickets = Vec::new();
     for (i, c) in plan.iter().enumerate() {
-        let ask = match c.made {
-            Some((one, _)) => serde_json::json!({"onto": "main", "snapshot": one.hex(), "wait": false}),
-            None => serde_json::json!({"onto": "main", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": false}),
-        };
+        if let Some((one, _)) = &c.made {
+            tickets.push(vl_land(&p.admin, &dir, one, "main"));
+            continue;
+        }
+        let ask = serde_json::json!({"onto": "main", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": false});
         let r = api.post_json(Some(&tokens[c.person]), &format!("/v1/projects/{}/land", p.name), &ask);
         assert_eq!(r.status, 200, "seed {seed}, submit {i}: {}", String::from_utf8_lossy(&r.body));
         assert_eq!(r.json()["state"], "queued", "seed {seed}, submit {i}: {}", r.json());
@@ -1085,10 +1087,11 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
     let mut serial: Vec<Option<serde_json::Value>> = vec![None; plan.len()];
     for &i in &order {
         let c = &plan[i];
-        let ask = match c.made {
-            Some((_, two)) => serde_json::json!({"onto": "serial", "snapshot": two.hex(), "wait": true}),
-            None => serde_json::json!({"onto": "serial", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": true}),
-        };
+        if let Some((_, two)) = &c.made {
+            serial[i] = Some(settled(&api, &admin, &p.name, &vl_land(&p.admin, &dir, two, "serial")));
+            continue;
+        }
+        let ask = serde_json::json!({"onto": "serial", "base": c.base.hex(), "edits": c.edits, "description": format!("change {i}"), "wait": true});
         let r = api.post_json(Some(&tokens[c.person]), &format!("/v1/projects/{}/land", p.name), &ask);
         assert_eq!(r.status, 200, "seed {seed}, serial {i}: {}", String::from_utf8_lossy(&r.body));
         serial[i] = Some(r.json());
