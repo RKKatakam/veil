@@ -534,6 +534,12 @@ impl Materialised {
                     Err(err) if refused_tree(store, &err) => {}
                     Err(err) => return Err(err),
                 },
+                // Any other folder left out (a one-directory clone's) stays
+                // left out, readable or not: never fetched, written or
+                // recorded (BUG-1566). A thin clone can read every folder,
+                // and dropping it here made the next snapshot take its files
+                // for deletions (BUG-1945).
+                Lookup::Entry(e) if e.kind == EntryKind::Dir => {}
                 Lookup::Entry(e) if e.kind.holds_blob() || e.kind == EntryKind::Conflict => {
                     if store.entry_readable(&e) && (e.kind != EntryKind::Conflict || Form::of(store, &e).entry().is_some_and(|f| f.kind != EntryKind::File && store.entry_readable(f))) {
                         changes.push(TreeChange {
