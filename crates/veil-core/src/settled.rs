@@ -14,11 +14,13 @@
 //! computed the heads' entries (none present then). A snapshot's parents
 //! never change, so a head's held history grows only when one of those
 //! arrives; while none is in the store, the operation's heads are still
-//! apart. The record is a cache: written without a barrier, checked by its
-//! checksum, and a missing, torn or other operation's record means the
-//! walk reads the whole range, as before.
+//! apart. The record is a cache: never synced (created exclusively, as the
+//! history index's layers are, so no barrier ever waits for it), checked
+//! by its checksum, and a missing, torn or other operation's record means
+//! the walk reads the whole range, as before.
 //!
-//! File `.veil/index/settled-heads` (integers little-endian):
+//! Files `.veil/index/settled/<operation id>`, the newest kept (integers
+//! little-endian):
 //!
 //! ```text
 //! "VEILSH01" | operation id [32] | missing u32 | missing parents [missing × 32]
@@ -28,10 +30,14 @@
 use crate::{id::ObjectId, repo::Repo, vpath::VPath};
 
 const MAGIC: &[u8; 8] = b"VEILSH01";
-const PATH: &str = ".veil/index/settled-heads";
+const DIR: &str = ".veil/index/settled";
 
-fn path() -> VPath {
-    VPath::new(PATH).expect("a valid path")
+fn dir() -> VPath {
+    VPath::new(DIR).expect("a valid path")
+}
+
+fn path(op: &ObjectId) -> VPath {
+    dir().join(&op.hex())
 }
 
 fn encode(op: &ObjectId, missing: &[ObjectId]) -> Vec<u8> {
@@ -73,13 +79,24 @@ pub(crate) fn record(repo: &Repo, op: &ObjectId) {
     }
     let heads: Vec<ObjectId> = repo.view.heads.iter().copied().collect();
     let Ok(Some(missing)) = repo.graph_missing_below(&heads) else { return };
-    let _ = repo.backend.write_unsynced(&path(), &encode(op, &missing));
+    let backend = &repo.backend;
+    if !matches!(backend.create_new_unsynced(&path(op), &encode(op, &missing)), Ok(true)) {
+        return;
+    }
+    // The others are older operations' (best effort).
+    let name = op.hex();
+    for e in backend.list_dir(&dir()).unwrap_or_default() {
+        // Records only (another process's file being created is left).
+        if e.name != name && e.name.len() == 64 && e.name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let _ = backend.remove_file(&dir().join(&e.name));
+        }
+    }
 }
 
 /// Are the heads of operation `op` known apart still: a record for `op`,
 /// and none of the parents it lists in the store?
 pub(crate) fn still_apart(repo: &Repo, op: &ObjectId) -> bool {
-    let Ok(Some(data)) = repo.backend.read_opt(&path()) else { return false };
+    let Ok(Some(data)) = repo.backend.read_opt(&path(op)) else { return false };
     let Some((recorded, missing)) = decode(&data) else { return false };
     recorded == *op && !missing.iter().any(|m| repo.store.has(m))
 }

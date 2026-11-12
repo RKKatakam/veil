@@ -23,9 +23,9 @@ mod overlay;
 mod sandbox;
 mod sparse;
 
-#[cfg(feature = "os")]
-#[cfg(debug_assertions)]
+#[cfg(all(feature = "os", debug_assertions))]
 pub use disk::lose_deferred_for_test;
+#[cfg(feature = "os")]
 pub use disk::{defer_durability, flush_deferred, parse_folding, probe_folding, DiskBackend, FOLDING_ENV};
 pub use memory::MemoryBackend;
 pub use overlay::{OverlayBackend, OverlayChanges};

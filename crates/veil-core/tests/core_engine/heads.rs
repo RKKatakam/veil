@@ -439,10 +439,10 @@ fn bug_1960_history_that_arrives_in_the_rewriting_transaction_drops_the_head_it_
 /// another.
 #[test]
 fn bug_1960_an_operation_without_its_settled_record_is_no_proof_the_heads_are_apart() {
-    let record = veil_core::VPath::new(".veil/index/settled-heads").unwrap();
     for how in ["removed", "torn", "another operation's"] {
         let (mut repo, [old, other, upper], between) = settled_beside_withheld_history();
         let backend = repo.backend().clone();
+        let record = veil_core::VPath::new(&format!(".veil/index/settled/{}", repo.op_id().hex())).unwrap();
         let written = backend.read_opt(&record).unwrap().expect("the rewrite recorded its heads");
         match how {
             "removed" => backend.remove_file(&record).unwrap(),
