@@ -87,7 +87,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use veil_core::{
     hub::grant::{sign_request, BatchRequest, ChainWant, Grant},
@@ -202,6 +202,11 @@ pub struct Args {
     /// `(landings a second, seconds)` steps; empty: the run's rate
     /// throughout, for `duration`.
     pub steps: Vec<(f64, f64)>,
+    /// `landing`: a file to append a line to (JSON) for each landing an
+    /// agent is answered `landed` (its ticket, change id and landed
+    /// snapshot) and each submit that failed (the error; the ticket when
+    /// one was given), from the start of the run, warm-up included.
+    pub log: Option<PathBuf>,
 }
 
 /// How often a landing run's time series takes a row ([`series_row`]).
@@ -348,12 +353,23 @@ struct Counters {
     /// row lets one agent win every race).
     finished_agents: Mutex<HashSet<usize>>,
     first_error: Mutex<Option<String>>,
+    /// `Args::log`, open.
+    log: Option<Mutex<std::fs::File>>,
 }
 
 impl Counters {
     fn count(&self, what: &AtomicU64, n: u64) {
         if self.measuring.load(Ordering::Relaxed) {
             what.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// A line of `Args::log` (written whether measuring or not).
+    fn log(&self, project: &str, mut line: serde_json::Value) {
+        if let Some(f) = &self.log {
+            line["project"] = json!(project);
+            line["at_ms"] = json!(veil_core::now_millis());
+            let _ = std::io::Write::write_all(&mut *f.lock().unwrap(), format!("{line}\n").as_bytes());
         }
     }
 
@@ -796,7 +812,13 @@ impl Agent<'_> {
             let req = json!({"onto": "main", "base": base.hex(), "description": format!("land {}", self.files),
                 "edits": [{"path": path, "put": {"text": text}}]});
             let asked = Instant::now();
-            let r = self.api.post_json(Some(self.token), &self.path("/land"), &req)?;
+            let r = match self.api.post_json(Some(self.token), &self.path("/land"), &req) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.c.log(&self.project, json!({"failed": format!("{e:#}")}));
+                    return Err(e);
+                }
+            };
             // Told to come back later: waited out as `vl land` does, within
             // the landing's deadline (its latency counts the waits).
             if let Some(ms) = wait_asked(&r) {
@@ -810,10 +832,14 @@ impl Agent<'_> {
                 backoff(attempt);
                 continue;
             }
-            ok(&r, "land")?;
+            if let Err(e) = ok(&r, "land") {
+                self.c.log(&self.project, json!({"failed": format!("{e:#}")}));
+                return Err(e);
+            }
             let v: serde_json::Value = serde_json::from_slice(&r.body)?;
             match v["state"].as_str() {
                 Some("landed") => {
+                    self.c.log(&self.project, json!({"ticket": v["ticket"], "change": v["change_id"], "landed": v["landed"]}));
                     let mine: ObjectId = serde_json::from_value(v["landed"].as_array().and_then(|l| l.last()).cloned().unwrap_or_default())?;
                     self.clone.tip = Some((mine, mine));
                     if self.c.measuring.load(Ordering::Relaxed) {
@@ -821,7 +847,10 @@ impl Agent<'_> {
                     }
                     return Ok(collisions);
                 }
-                Some("queued") => bail!("still queued after the server's wait: {v}"),
+                Some("queued") => {
+                    self.c.log(&self.project, json!({"failed": "still queued after the server's wait", "ticket": v["ticket"]}));
+                    bail!("still queued after the server's wait: {v}")
+                }
                 _ => {
                     collisions += 1;
                     self.c.count(&self.c.collisions, 1);
@@ -1188,7 +1217,13 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
     let seed = if a.mode == Mode::Objects { SEED_FILES } else { 0 };
     let names: Vec<String> = (0..projects).map(|_| create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, cx.more, seed, a.protected, a.mix)).collect::<Result<_>>()?;
     let cache_ca = cache.map(|c| std::fs::read_to_string(&c.cert)).transpose()?;
-    let c = Counters::default();
+    let log = match (&a.log, a.mode) {
+        (Some(p), Mode::Landing) => Some(Mutex::new(
+            std::fs::OpenOptions::new().create(true).append(true).open(p).with_context(|| p.display().to_string())?,
+        )),
+        _ => None,
+    };
+    let c = Counters { log, ..Default::default() };
     let bg = Counters::default();
     let stop = AtomicBool::new(false);
     // Agents, the background landers (pull mode) and this thread.

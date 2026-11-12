@@ -429,6 +429,9 @@ fn main() -> Result<()> {
                 merge_every,
                 people,
                 steps,
+                // `landing`: each landing told, and each submit that failed,
+                // beside the results (`docs/DEPLOY.md` §6.1).
+                log: Some(out.with_extension("landings.jsonl")),
             })?;
             std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
             let md = load::markdown(&v)?;
