@@ -867,8 +867,8 @@ fn pr_speed() {
             let titles: Vec<String> = (0..1000).map(|i| format!("change number {} in the speed run", chunk * 1000 + i)).collect();
             let at: Vec<i64> = (0..1000).map(|i| (chunk * 1000 + i) as i64).collect();
             sqlx::query(
-                "INSERT INTO prs (project_id, id, class_id, policy_key, target, author, title, body, state, revision, risk, created_at, updated_at) \
-                 SELECT $1, id, c, $2, 'main', $3, t, 'a body that says what the change is for', 'open', 1, 'normal', a, a \
+                "INSERT INTO prs (project_id, id, class_id, policy_key, target, author, title, body, state, revision, created_at, updated_at) \
+                 SELECT $1, id, c, $2, 'main', $3, t, 'a body that says what the change is for', 'open', 1, a, a \
                  FROM UNNEST($4::text[], $5::text[], $6::text[], $7::bigint[]) AS x(id, c, t, a)",
             )
             .bind(h.id).bind(&key).bind(author).bind(&ids).bind(&cls).bind(&titles).bind(&at)
