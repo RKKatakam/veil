@@ -1252,6 +1252,9 @@ pub(crate) fn cache_prepared_memo(hub: &Hub, project_id: i64, memo: &PreparedMem
 
 // ---- filling once ----------------------------------------------------------------
 
+/// The fills running in one server process, by project, view key and part.
+type Fills = HashMap<(i64, String, bool), (Fill, Progress)>;
+
 /// The query API's state in one server process.
 pub struct State {
     /// Rows of viewers' graphs, by project, view key and snapshot.
@@ -1259,7 +1262,7 @@ pub struct State {
     /// Fills running here, by project, view key and part (`true`: the file
     /// history; `false`: the rows): their outcome once done, and how far
     /// they are.
-    fills: Mutex<HashMap<(i64, String, bool), (Fill, Progress)>>,
+    fills: Mutex<Fills>,
     /// Fills of rows, and of file history, started here, per project (the
     /// tests count them).
     started: Mutex<HashMap<i64, (u64, u64)>>,
