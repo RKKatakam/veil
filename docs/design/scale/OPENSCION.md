@@ -825,6 +825,129 @@ MinIO run / the local-directory run, with Git's numbers of those runs.
 * **Clone one directory:** the rounds per level, and its S1 form (all
   history of the directory) against a thin clone's.
 
+## Performance round 5: clone one directory, a fresh clone's flushes (2026-11-12)
+
+Branch `clifast2b` (on `9713717b`, `stage2`), for BUG-1945 and BUG-1944,
+after BUG-1960's fix and BUG-1980's explanation. The owner's rule of
+2026-11-12 holds throughout: no durability or security is traded to beat
+Git. A commit's six barriers, the undoable op log and the rule that drops
+the watcher's plan while a policy change is pending are as they were.
+**The one-file commit at 1,000 and 10,000 files is an accepted residual by
+the owner's decision of 2026-11-12**: its gap to Git is the commit's
+durable chain, which Git skips by default (with `core.fsync=all` Git's
+one-file commit on the 1 GB profile goes from 26 to 28 ms up to 33 to 35
+ms; see round 4). It was not worked on.
+
+### What changed
+
+* **A clone of one directory stays in its S1 form.** Making it thin (the
+  tip's trees and the folder's files, older versions on demand) was built
+  and withdrawn: a `--only` clone's hidden paths are the files it left
+  out, and in the S1 form a folder outside `--only` is simply not in the
+  store, so the builder carries it whole; a thin clone can read every
+  folder's tree, and the builder then took the files of folders it never
+  wrote for deletions (`D src/lib.rs` in `sync::clone_one_directory_fetches_only_that_subtree`,
+  and objects outside the folder fetched). Combining them needs the
+  builder to carry everything outside the folder: a change to what a
+  snapshot records, to be reviewed as one. Not done.
+* **The trees of a folder in one request** (`GET
+  /v1/projects/{p}/subtree?snapshot=ID&path=DIR`, protocol revision 7,
+  `crates/veil-server/src/subtree.rs`): the root, the folders down to
+  `DIR`, and every tree below it (at most 20,000), in one answer, where
+  a clone asked one request per level. A thin clone's first fetch uses it
+  for the tip it checks out (`vl clone`, the whole tree); any answer but
+  the trees (an older server, an error) makes the walk ask level by level
+  as before. The route lists the trees by
+  walking the caller's projected tree, keeping what a narrowed agent
+  session may read, and answers through `sync::fetch` with one want per
+  tree, so every level is checked exactly as a fetch checks it (the
+  snapshot as the caller sees it, an embargo withholding it, each tree at
+  its path in the caller's projection, the narrowing); its path comes
+  through `Ask::file_path`. The client takes each tree only where its walk
+  from the snapshot's tree reaches it (each checked against its id) and
+  asks for anything else as before. The files then come in one fetch, in
+  parts on several threads, and the checkout writes them on 8 threads (as
+  it already did). Tests: `server_hub` `subtree::` (every level as the
+  caller's projection has it; a folder or snapshot the caller may not see
+  refused as `fetch` refuses it, nothing named; a narrowed agent session
+  refused outside its paths and given only its paths inside), and the
+  route classified in `agents::every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed`.
+* **A fresh clone's set-up flushes at once.** `vl clone` into a directory
+  it makes defers every flush of `init`, of the pull's and the new
+  change's transactions and of the key and remote set-up (about 60, one
+  after another) and makes them all at once, on several threads, before
+  the checkout's journal is written (`vfs::defer_durability`,
+  `vfs::flush_deferred`). Safe only because nothing exists before the
+  clone: its marker (`.veil/local/clone-incomplete`) is durable before the
+  deferral starts; every command refuses a directory holding it unless the
+  checkout's journal exists (and now finds the directory by the marker
+  alone, so a lost `repo.json` never makes it a folder of a repository
+  above); the journal is written only after the flush; a failed clone
+  removes its directory; and the marker's removal at the end is now made
+  durable too. A clone into a directory that was there flushes as before.
+  Tests: `server_hub` `clone_fast::a_fresh_clone_cut_before_its_one_flush_is_refused_never_usable`
+  (a power cut simulated where the most is deferred: every file written
+  since the marker cut to 0 or 9 bytes, or kept; every command refuses the
+  directory with the clone's refusal, also inside a repository of its own
+  with `repo.json` lost) and
+  `clone_fast::a_clone_into_a_directory_that_was_there_defers_nothing`;
+  the existing `warm::a_failed_clone_leaves_no_directory_that_looks_usable`,
+  `sync::a_clone_killed_at_any_point_is_refused_or_finished` and
+  `sync::a_one_directory_clone_killed_during_its_checkout_is_finished`.
+
+### Not done this round
+
+* **`log -n 20` and start-up (item 2).** Traced on the 1 GB profile, the
+  command opens the 4.6 MB stat cache (read and checksummed whole), all
+  24 pack indexes (and two ranged reads of each pack's data to check it),
+  the five layers of the history index, about 94 loose objects, and makes
+  an empty transaction (the gc fence's registration) before the build,
+  because a lock-free repository builds the working copy inside a
+  transaction. With the watcher vouching that nothing changed, nothing of
+  that is needed but the view; skipping it safely needs a build that is
+  known to write nothing before it runs (the watcher's plan can still be
+  dropped inside the build, by a policy or key change, and the build then
+  scans and writes objects, which must happen inside the transaction), and
+  checking the stat cache's key needs its checksum, which covers the
+  whole file. Not changed: measured as before (no difference between the
+  binaries, interleaved).
+* **A full scan on several threads (item 3).** The listing, the `stat`s
+  and the classification already run on worker threads (`prefetch.rs`,
+  an earlier round); what is serial is the walk itself (stat-cache
+  lookups, the trees, the report in walk order). Splitting the builder by
+  subtree with a report identical byte for byte is a change of its own;
+  not attempted.
+* **The one-file commit at 1,000 and 10,000 files**: the accepted
+  residual above.
+
+### Results
+
+Under load (the machine ran other agents' suites and builds: load 15 to
+47 during the runs, so single numbers moved by a third between runs; Git
+on the same tree in the same run is the comparison that holds). Medians;
+"before" is `560b7210` (this branch after BUG-1960 and BUG-1980), "after"
+`06e5e52f`.
+
+| Case | Before | After | Git | Result |
+|---|---:|---:|---:|---|
+| 1,000 files: clone one directory (server, MinIO) | 74.5 ms (Git 53.2) | 62.5 ms (Git 69.0) | 53 to 69 ms | 1.40× Git before, 0.91× after |
+| 10,000 files: clone one directory | 58.5 ms (Git 80.2) | 40.0 ms (Git 64.5) | 64 to 80 ms | **ahead**: 0.73× → 0.62× Git |
+| 1 GB profile: `clone --only docs` (1,317 files, local server, 9 runs) | 1,005 ms | 953 ms | 389 ms | **miss**: 2.6× → 2.4× Git (Git has one commit; Veil's S1 form 10,054 snapshots) |
+| 1 GB profile: `clone` (thin, default; 3 runs) | 5,362 ms | 5,124 ms | — | within the noise |
+| 1 GB profile: `log -n 20` (watcher; interleaved, 3 × 9) | 12.0 / 14.1 / 13.8 ms | 12.4 / 11.6 / 10.3 ms | 4.3 ms | unchanged (item 2 not done) |
+| 1 GB profile: `status`, clean (watcher; interleaved) | 7.2 / 10.0 / 8.7 ms | 7.0 / 8.8 / 11.3 ms | 27 ms | unchanged, ahead of Git |
+| 1 GB profile: `status`, daemon stopped (a scan) | 66 ms | 67 ms | 27 ms | unchanged (item 3 not done) |
+| 1,000 files: `log -n 20` | 10.4 ms (Git 3.2) | 14.2 ms (Git 3.6) | 3.2 to 3.6 | unchanged, noisy |
+| 1,000 files: commit one changed file (watcher) | 8.3 ms (Git 4.6) | 8.7 ms (Git 4.0) | 4.0 to 4.6 | accepted residual |
+| 10,000 files: commit one changed file (watcher) | 9.1 ms (Git 7.2) | 9.2 ms (Git 8.0) | 7.2 to 8.0 | accepted residual |
+
+The commit of one changed file on the 1 GB profile, interleaved (BUG-1960's
+record is one small unsynced file per rewrite): before 27 and 29 ms,
+after 28 and 32 ms, medians of 9 at load 15 to 18; at load 41 the two
+overlapped completely (after 22 to 67 ms, before 28 to 68).
+`heads::a_rewrite_beside_an_old_head_does_not_read_the_history_between`
+still passes: the shortcut is kept.
+
 ## Next
 
 1. **Clone one directory** (Git's level, not below): the ~60 sequential
