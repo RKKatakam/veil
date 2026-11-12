@@ -38,6 +38,106 @@ pub fn edit_set(src: &dyn TreeSource, new: ObjectId, old: ObjectId) -> Result<Ve
     Ok(g.changes)
 }
 
+/// Do paths `a` and `b` overlap: the same path, or one under the other?
+pub fn paths_overlap(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    long.starts_with(short) && long.as_bytes().get(short.len()) == Some(&b'/')
+}
+
+/// The edits of [`edit_set`]`(src, new, old)` whose path overlaps `path`
+/// ([`paths_overlap`]), in the same order, reading only the folders on the
+/// way to `path` and under it: what a branch changed where one change
+/// edits, whatever else landed on it meanwhile. (A content merge and a
+/// conflict report ask this for each overlapping path; the whole edit set
+/// of a busy branch since a change's base is every folder that anyone
+/// touched, BUG-1955.)
+pub fn touching(src: &dyn TreeSource, new: ObjectId, old: ObjectId, path: &str) -> Result<Vec<Change>> {
+    let mut out = Vec::new();
+    if new != old {
+        let parts: Vec<&str> = path.split('/').collect();
+        diff_name(src, "", folder(src, &old)?.as_ref(), folder(src, &new)?.as_ref(), parts[0], Some(&parts[1..]), 0, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// The folder listing `id`, if it is one (a sealed folder is a leaf).
+fn folder(src: &dyn TreeSource, id: &ObjectId) -> Result<Option<Arc<Tree>>> {
+    Ok(match src.node(id)? {
+        Node::Tree(t, _) => Some(t),
+        Node::Leaf => None,
+    })
+}
+
+/// What the diff of folders `ot` and `nt` (at `dir`) reports for the entry
+/// `name`, as `Graft`'s diff does: all of it (`rest` is `None`), or only
+/// what overlaps the path `rest` below it.
+#[allow(clippy::too_many_arguments)]
+fn diff_name(
+    src: &dyn TreeSource,
+    dir: &str,
+    ot: Option<&Arc<Tree>>,
+    nt: Option<&Arc<Tree>>,
+    name: &str,
+    rest: Option<&[&str]>,
+    depth: usize,
+    out: &mut Vec<Change>,
+) -> Result<()> {
+    if depth > veil_core::tree::MAX_TREE_DEPTH {
+        return Err(veil_core::VeilError::Corrupt("tree".into(), "nested too deep".into()));
+    }
+    let oe = ot.and_then(|t| t.get(name)).cloned();
+    let ne = nt.and_then(|t| t.get(name)).cloned();
+    if oe == ne {
+        return Ok(());
+    }
+    let child = if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") };
+    let sub = |e: &Option<TreeEntry>| -> Result<Option<Arc<Tree>>> {
+        match e {
+            Some(e) if e.kind == EntryKind::Dir => folder(src, &e.id),
+            _ => Ok(None),
+        }
+    };
+    let (o, n) = (sub(&oe)?, sub(&ne)?);
+    // Below `child`: the next part of the path, or every name of either side.
+    let below = |o: Option<&Arc<Tree>>, n: Option<&Arc<Tree>>, out: &mut Vec<Change>| -> Result<()> {
+        match rest {
+            Some([next, more @ ..]) => diff_name(src, &child, o, n, next, Some(more), depth + 1, out),
+            _ => {
+                let mut names: Vec<&str> = o.iter().chain(n.iter()).flat_map(|t| t.entries.iter().map(|e| e.name.as_str())).collect();
+                names.sort_unstable();
+                names.dedup();
+                names.into_iter().try_for_each(|name| diff_name(src, &child, o, n, name, None, depth + 1, out))
+            }
+        }
+    };
+    let leaf = |old: Option<TreeEntry>, new: Option<TreeEntry>, out: &mut Vec<Change>| {
+        let same = match (&old, &new) {
+            (Some(a), Some(b)) => a.kind == b.kind && a.same_content(b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            out.push(Change { path: child.clone(), old, new });
+        }
+    };
+    match (&o, &n) {
+        (Some(_), Some(_)) => below(o.as_ref(), n.as_ref(), out)?,
+        (Some(_), None) => {
+            below(o.as_ref(), None, out)?;
+            leaf(None, ne, out);
+        }
+        (None, Some(_)) => {
+            leaf(oe, None, out);
+            below(None, n.as_ref(), out)?;
+        }
+        (None, None) => leaf(oe, ne, out),
+    }
+    Ok(())
+}
+
 /// The same entry, as the push's checks compare them: kind, content, mode
 /// and label (the name is the path's).
 fn same(a: Option<&TreeEntry>, b: Option<&TreeEntry>) -> bool {
@@ -356,6 +456,53 @@ mod tests {
         // Deleting everything leaves the empty tree.
         let all = edit_set(&m, m.build(&BTreeMap::new()), base_t).unwrap();
         assert_eq!(m.land(&all, base_t).unwrap(), m.build(&BTreeMap::new()));
+    }
+
+    #[test]
+    fn touching_reads_only_the_path_and_reports_what_overlaps_it() {
+        let m = Mem::default();
+        let old = m.build(&files(&[("a/x", "1"), ("a/y", "2"), ("b/z/q", "3"), ("b/z/r", "3"), ("c", "4"), ("d/e", "5")]));
+        // a/x edited, a/y deleted, b/z became a file, c became a folder, d untouched.
+        let new = m.build(&files(&[("a/x", "9"), ("b/z", "7"), ("c/in", "8"), ("d/e", "5")]));
+        let paths = |cs: Vec<Change>| cs.into_iter().map(|c| c.path).collect::<Vec<_>>();
+        assert_eq!(paths(touching(&m, new, old, "a/x").unwrap()), ["a/x"]);
+        assert_eq!(paths(touching(&m, new, old, "a").unwrap()), ["a/x", "a/y"]);
+        // Under a folder that became a file, and above a file that became a folder.
+        assert_eq!(paths(touching(&m, new, old, "b/z/q").unwrap()), ["b/z/q", "b/z"]);
+        assert_eq!(paths(touching(&m, new, old, "b/z").unwrap()), ["b/z/q", "b/z/r", "b/z"]);
+        assert_eq!(paths(touching(&m, new, old, "c/in/deeper").unwrap()), ["c", "c/in"]);
+        assert_eq!(paths(touching(&m, new, old, "c/other").unwrap()), ["c"]);
+        assert_eq!(paths(touching(&m, new, old, "c").unwrap()), ["c", "c/in"]);
+        assert!(touching(&m, new, old, "d/e").unwrap().is_empty());
+        assert!(touching(&m, new, old, "nowhere/at/all").unwrap().is_empty());
+        assert!(touching(&m, old, old, "a/x").unwrap().is_empty());
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig { cases: 256, ..Default::default() })]
+        /// [`touching`] is the whole edit set, filtered: the same edits in
+        /// the same order, for any two trees and any path (files that became
+        /// folders and folders that became files among them).
+        #[test]
+        fn touching_is_the_edit_set_filtered(
+            old in proptest::collection::btree_map("[a-c]/[a-c]/[a-b]|[a-c]/[a-c]|[a-d]", "[xy]", 0..10),
+            new in proptest::collection::btree_map("[a-c]/[a-c]/[a-b]|[a-c]/[a-c]|[a-d]", "[xy]", 0..10),
+            path in "[a-c]/[a-c]/[a-b]/[a-b]|[a-c]/[a-c]/[a-b]|[a-c]/[a-c]|[a-d]",
+        ) {
+            let m = Mem::default();
+            let clean = |f: &BTreeMap<String, String>| -> BTreeMap<String, String> {
+                f.iter().filter(|(p, _)| !f.keys().any(|q| q.starts_with(&format!("{p}/")))).map(|(a, b)| (a.clone(), b.clone())).collect()
+            };
+            let (old_t, new_t) = (m.build(&clean(&old)), m.build(&clean(&new)));
+            let want: Vec<Change> = edit_set(&m, new_t, old_t).unwrap().into_iter().filter(|c| paths_overlap(&path, &c.path)).collect();
+            let got = touching(&m, new_t, old_t, &path).unwrap();
+            proptest::prop_assert_eq!(got.len(), want.len(), "{:?} against {:?}", got.iter().map(|c| &c.path).collect::<Vec<_>>(), want.iter().map(|c| &c.path).collect::<Vec<_>>());
+            for (g, w) in got.iter().zip(&want) {
+                proptest::prop_assert_eq!(&g.path, &w.path);
+                proptest::prop_assert_eq!(&g.old, &w.old);
+                proptest::prop_assert_eq!(&g.new, &w.new);
+            }
+        }
     }
 
     proptest::proptest! {

@@ -190,14 +190,6 @@ impl AttrSource for ServerAttrSource<'_> {
 }
 
 /// Do paths `a` and `b` overlap (the same path, or one inside the other)?
-fn paths_overlap(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
-    long.starts_with(short) && long.as_bytes().get(short.len()) == Some(&b'/')
-}
-
 /// Build a visibility-safe [`ConflictReport`] for an entry whose `set` (made
 /// on `base_snap` with tree `parent_tree`) conflicts with `tip_snap` (tree
 /// `chain_tree`).
@@ -213,7 +205,10 @@ pub fn build_conflict(
     merges: u32,
     change_id: Option<ChangeId>,
 ) -> Result<ConflictReport> {
-    let main_edits = edits::edit_set(src, chain_tree, parent_tree)?;
+    // What the branch changed since the base, where the change edits: read
+    // per path (`edits::touching`), never the branch's whole edit set
+    // (every folder anyone landed in since, BUG-1955).
+    let main_touching = |path: &str| edits::touching(src, chain_tree, parent_tree, path);
     let mut paths = Vec::new();
     let mut conflicts = Vec::new();
     let mut overlapping_edits = Vec::new();
@@ -230,8 +225,7 @@ pub fn build_conflict(
             hidden = true;
             continue;
         }
-        let main_touching: Vec<&Change> = main_edits.iter().filter(|m| paths_overlap(&c.path, &m.path)).collect();
-        if main_touching.iter().any(|m| !can_see(&m.path)) {
+        if main_touching(&c.path)?.iter().any(|m| !can_see(&m.path)) {
             hidden = true;
             continue;
         }
@@ -269,7 +263,7 @@ pub fn build_conflict(
     if paths.is_empty() && !hidden {
         // Blocked by a folder/file collision detected during `edits::apply`.
         for c in set {
-            if !can_see(&c.path) || main_edits.iter().any(|m| paths_overlap(&c.path, &m.path) && !can_see(&m.path)) {
+            if !can_see(&c.path) || main_touching(&c.path)?.iter().any(|m| !can_see(&m.path)) {
                 hidden = true;
             } else {
                 paths.push(c.path.clone());
@@ -329,11 +323,14 @@ fn collect_landed_since(
         let Ok(ps) = src.snapshot(&parent) else {
             continue;
         };
-        let step_edits = edits::edit_set(src, tree, ps.tree)?;
-        if !step_edits.iter().any(|c| view.read(&c.path) && view.within_narrowing(&c.path)) {
+        // Did the step touch an overlapping edit? Asked first: it reads the
+        // edits' own folders, and few steps did; the step's whole edit set
+        // only then (BUG-1955: 256 edit sets for every conflict).
+        if !overlapping.is_empty() && edits::fast_path(src, ps.tree, tree, overlapping)?.is_none() {
             continue;
         }
-        if overlapping.is_empty() || edits::fast_path(src, ps.tree, tree, overlapping)?.is_some() {
+        let step_edits = edits::edit_set(src, tree, ps.tree)?;
+        if step_edits.iter().any(|c| view.read(&c.path) && view.within_narrowing(&c.path)) {
             out.push(id);
         }
     }
@@ -377,7 +374,6 @@ pub fn can_merge(
         if edits::fast_path(src, *parent_tree, chain_tree, set)?.is_none() {
             continue;
         }
-        let main_edits = edits::edit_set(src, chain_tree, *parent_tree)?;
         let attrs = Attrs::with_source(
             Box::new(ServerAttrSource {
                 src,
@@ -390,9 +386,9 @@ pub fn can_merge(
             if edits::fast_path(src, *parent_tree, chain_tree, std::slice::from_ref(c))?.is_none() {
                 continue;
             }
-            if main_edits
+            if edits::touching(src, chain_tree, *parent_tree, &c.path)?
                 .iter()
-                .any(|m| paths_overlap(&c.path, &m.path) && (!view.read(&m.path) || !view.within_narrowing(&m.path)))
+                .any(|m| !view.read(&m.path) || !view.within_narrowing(&m.path))
             {
                 return Ok(false);
             }
@@ -932,7 +928,6 @@ fn merge_stack(
         if edits::fast_path(&src, parent_tree, chain_tree, &set)?.is_none() {
             merged_set = set.clone();
         } else {
-            let main_edits = edits::edit_set(&src, chain_tree, parent_tree)?;
             let mut new_blobs = Vec::new();
             {
                 let attrs = Attrs::with_source(
@@ -948,12 +943,11 @@ fn merge_stack(
                         merged_set.push(c.clone());
                         continue;
                     }
-                    if main_edits.iter().any(|m| {
-                        paths_overlap(&c.path, &m.path)
-                            && (!view.read(&m.path)
-                                || !tip_view.read(&m.path)
-                                || !view.within_narrowing(&m.path)
-                                || !tip_view.within_narrowing(&m.path))
+                    if edits::touching(&src, chain_tree, parent_tree, &c.path)?.iter().any(|m| {
+                        !view.read(&m.path)
+                            || !tip_view.read(&m.path)
+                            || !view.within_narrowing(&m.path)
+                            || !tip_view.within_narrowing(&m.path)
                     }) {
                         let report = build_conflict(&src, &view, against, parent_tree, chain, chain_tree, &set, job.merges, last_cid)?;
                         return Ok(WorkerOutcome::Conflict(report));
