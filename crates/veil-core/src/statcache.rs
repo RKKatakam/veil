@@ -610,19 +610,15 @@ impl CacheRun {
     #[cfg_attr(not(feature = "os"), allow(dead_code))]
     pub(crate) fn split_below(&mut self, depth: usize, subtrees: &HashMap<VPath, usize>, count: usize) -> Vec<CacheRun> {
         let mut runs: Vec<CacheRun> = (0..count).map(|_| self.empty_like()).collect();
-        let old = std::mem::take(&mut self.old);
-        for (path, rec) in old {
+        let by_name: HashMap<&str, usize> = subtrees.iter().map(|(p, &i)| (p.as_str(), i)).collect();
+        let task_of = |path: &VPath| {
             let s = path.as_str();
-            let cut = s.match_indices('/').nth(depth - 1).map(|(i, _)| i);
-            let task = cut.and_then(|i| VPath::new(&s[..i]).ok()).and_then(|p| subtrees.get(&p).copied());
-            match task {
-                Some(t) => {
-                    runs[t].old.insert(path, rec);
-                }
-                None => {
-                    self.old.insert(path, rec);
-                }
-            }
+            let cut = s.match_indices('/').nth(depth - 1).map(|(i, _)| i)?;
+            by_name.get(&s[..cut]).copied()
+        };
+        for (path, rec) in self.old.extract_if(|path, _| task_of(path).is_some()) {
+            let t = task_of(&path).expect("taken for its subtree");
+            runs[t].old.insert(path, rec);
         }
         for r in &mut runs {
             r.old_len = r.old.len();
