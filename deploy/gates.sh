@@ -200,6 +200,6 @@ gate_meta() {
 gate_report() { # GATE, results directory
     case $1 in
         scaling) python3 "$GATES_DIR/scaling-table.py" "$2" > "$2/scaling.md" && cat "$2/scaling.md" ;;
-        failover) python3 "$GATES_DIR/checks/failover-verdict.py" "$2" | tee "$2/failover.md"; return "${PIPESTATUS[0]}" ;;
+        failover) python3 "$GATES_DIR/checks/failover-verdict.py" "$2" | tee "$2/failover-verdict.md"; return "${PIPESTATUS[0]}" ;;
     esac
 }

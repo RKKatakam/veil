@@ -2,7 +2,8 @@
 """The failover gate's verdict (deploy/gates.sh `gate_failover`), from a
 results directory: failover-run.txt and failover-after.txt (what the gate
 did), failover-check.txt (deploy/checks/failover.sql) and failover.json
-(the benchmark's own numbers). Prints a Markdown table; exits 1 when a
+(the benchmark's own numbers). Prints a Markdown table (the gates keep
+it as failover-verdict.md); exits 1 when a
 check fails, 0 when every one passes.
 
     python3 deploy/checks/failover-verdict.py RESULTS_DIR
@@ -78,9 +79,9 @@ def main():
         ("landed_without_record", "landed tickets whose change has no landing record"),
         ("recorded_not_on_main", "recorded landings that are not on `main`'s first-parent line: lost"),
         ("change_twice_on_main", "extra copies of a change id on `main`'s line: landed twice"),
-        ("landed_twice", "one landed snapshot recorded for two changes"),
+        ("landed_twice", "one landed snapshot recorded as made from two changes"),
         ("main_without_ticket", "snapshots on `main`, after its first landing, that no ticket landed"),
-        ("main_not_derived", "snapshots on `main`'s line missing from the graph"),
+        ("main_not_derived", "snapshots on `main`'s line, above its root, missing from the graph"),
     ]:
         v = num(chk, k)
         row(k, "–" if v is None else v, v == 0, why)

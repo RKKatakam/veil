@@ -8,7 +8,7 @@
 #   commands.txt   every veil-bench command line, and on which machine
 #   *.json, *.md   the tool's raw results and its tables; LABEL.log its output
 #   hub<N>-stats.json, hub<N>-docker-stats.log   each server's counters and samples
-#   scaling.md, failover.md, failover-*.txt      the gates' own tables and checks
+#   scaling.md, failover-verdict.md, failover-*.txt     the gates' own tables and checks
 #
 #   bench.sh [--approve] GATE [veil-bench flags...]
 #

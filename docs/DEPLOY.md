@@ -412,7 +412,7 @@ records the moment on the database's clock (`failover-run.txt`). When the
 load ends it waits until no ticket of the run is still queued and the
 tip of `main` is in the derived graph, then runs `deploy/checks/failover.sql`
 (`failover-check.txt`); `deploy/checks/failover-verdict.py` judges it
-(`failover.md`, non-zero exit on a failed check):
+(`failover-verdict.md`, non-zero exit on a failed check):
 
 - **another server took over**: the lease's holder after differs from the
   one before;
@@ -452,7 +452,7 @@ made them; `docs/REPRODUCE.md` §6 says how to read each file:
 | `commands.txt` | every `veil-bench` command line and the machine it ran on |
 | `<label>.json`, `<label>.md`, `<label>.log` | the tool's raw results, its tables, its output; `@<n>` in a label is driver *n* |
 | `hub<N>-stats.json`, `hub<N>-docker-stats.log` | each server's request-path counters at the end of the gate, and its `docker stats` every 5 s |
-| `scaling.md`; `failover.md`, `failover-*.txt` | the scaling table; the failover verdict and the records behind it |
+| `scaling.md`; `failover-verdict.md`, `failover-*.txt` | the scaling table; the failover verdict and the records behind it |
 
 ## 7. Logs and metrics
 
