@@ -1359,14 +1359,15 @@ pub fn pull_moving(
         chain.reverse();
         chain
     };
-    // A thin clone's tip (BUG-1945): its trees, every level down to and
-    // below `only` (the whole tree without it), in one request where the
-    // server answers `subtree`. The walk below takes each where it reaches
-    // it (checked against its id) and asks for the rest, the files of
-    // every level at once, as before; any other answer (an older server, a
-    // refusal) leaves the walk to ask level by level.
+    // A thin clone's first fetch (BUG-1945): the tip's trees, every level
+    // down to and below `only` (the whole tree without it), in one request
+    // where the server answers `subtree`. The walk below takes each where
+    // it reaches it (checked against its id) and asks for the rest, the
+    // files of every level at once, as before; any other answer (an older
+    // server, a refusal) leaves the walk to ask level by level. A later
+    // pull holds most trees already: it asks for the new ones only.
     let mut prefetched: HashMap<ObjectId, Vec<u8>> = HashMap::new();
-    if thin && tips.revision >= veil_core::hub::wire::SUBTREE_REVISION {
+    if thin && fresh && tips.revision >= veil_core::hub::wire::SUBTREE_REVISION {
         if let Some((snap, _)) = new_snaps.iter().find(|(s, t)| Some(*s) == checked_out && !have(t)) {
             prefetched = client.subtree(*snap, only.unwrap_or("")).unwrap_or_default();
         }
