@@ -51,6 +51,9 @@ pub struct DiskBackend {
     barrier: Arc<Mutex<()>>,
     /// Probed lazily; only a definite answer is cached.
     folding: Arc<Mutex<Option<NameFolding>>>,
+    /// Durable writes made as unsynced ones until the next barrier after
+    /// [`DiskBackend::end_deferral`] ([`DiskBackend::defer_durability`]).
+    deferring: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Writes made durable by the next barrier.
@@ -188,6 +191,97 @@ impl DiskBackend {
             failures: Arc::default(),
             barrier: Arc::default(),
             folding: Arc::default(),
+            deferring: Arc::default(),
+        }
+    }
+
+    /// From now until [`DiskBackend::end_deferral`], every write this
+    /// backend would make durable on its own (`write`, `create_new`, a
+    /// durable stream, their new directories) is made as an unsynced one
+    /// is, its file and directories left to one barrier at the end, and
+    /// every barrier asked for meanwhile waits for that one (BUG-1945).
+    /// **Only for `vl clone` into a directory it creates, before its
+    /// checkout**: there nothing existed before, the clone's marker is
+    /// durable before this starts, every command refuses a directory
+    /// holding the marker without the checkout's journal, that journal is
+    /// written only after [`DiskBackend::end_deferral`], and a clone that
+    /// fails removes its directory. Writes through any other backend (the
+    /// person's home, another repository) are not deferred.
+    pub fn defer_durability(&self) {
+        self.deferring.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Stop deferring, and make everything deferred since
+    /// [`DiskBackend::defer_durability`] durable, on several threads, as a
+    /// barrier does. An error: nothing written since may be taken as
+    /// durable.
+    pub fn end_deferral(&self) -> Result<()> {
+        self.deferring.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.sync_barrier()
+    }
+
+    /// Debug builds only, for interruption tests: a power cut while
+    /// durability is deferred. Each file deferred since
+    /// [`DiskBackend::defer_durability`] is kept, emptied, cut to 9 bytes
+    /// or gone, as `seed` picks (0: every one emptied, 1: every one gone);
+    /// nothing is flushed, and deferring stops.
+    #[cfg(debug_assertions)]
+    pub fn lose_deferred_for_test(&self, seed: u64) {
+        self.deferring.store(false, std::sync::atomic::Ordering::SeqCst);
+        let batch = std::mem::take(&mut *self.unsynced.lock().unwrap_or_else(|e| e.into_inner()));
+        for (i, f) in batch.files.iter().enumerate() {
+            let pick = match seed {
+                0 => 1,
+                1 => 3,
+                _ => ((seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)) >> 61) & 3,
+            };
+            let _ = match pick {
+                0 => Ok(()),
+                1 => fs::OpenOptions::new().write(true).open(f).and_then(|h| h.set_len(0)),
+                2 => fs::OpenOptions::new().write(true).open(f).and_then(|h| h.set_len(h.metadata()?.len().min(9))),
+                _ => fs::remove_file(f),
+            };
+        }
+    }
+
+    fn deferring(&self) -> bool {
+        self.deferring.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record `created` directories (shallowest first) for the next
+    /// barrier: their parents' entries changed.
+    fn record_created(&self, created: &[PathBuf]) {
+        if !created.is_empty() {
+            let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+            u.dirs.extend(created.iter().filter_map(|d| d.parent().map(Path::to_path_buf)));
+        }
+    }
+
+    /// [`DiskBackend::create_new_file_at`] below `.veil/` while durability
+    /// is deferred: the file and its directory entry left to the barrier.
+    fn create_new_deferred(&self, path: &VPath, data: &[u8], secret: Option<bool>) -> Result<Option<bool>> {
+        let full = self.full_path(path);
+        let parent = full.parent().expect("non-root path has a parent");
+        let mut created = Vec::new();
+        create_dir_all_tracked(parent, &mut created).map_err(|e| io_err(parent, e))?;
+        self.record_created(&created);
+        let tmp = temp_path(parent, path);
+        if let Err(e) = create_new_file(&tmp, secret).and_then(|mut f| f.write_all(data)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(io_err(&full, e));
+        }
+        let linked = fs::hard_link(&tmp, &full);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => {
+                let mut u = self.unsynced.lock().unwrap_or_else(|e| e.into_inner());
+                u.dirs.insert(parent.to_path_buf());
+                u.files.push(full);
+                Ok(Some(true))
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(Some(false)),
+            // No hard links here: the durable route.
+            Err(_) => Ok(None),
         }
     }
 
@@ -294,6 +388,9 @@ impl DiskBackend {
         if path.is_root() {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));
         }
+        if self.deferring() {
+            return self.write_file_unsynced(path, data, secret);
+        }
         #[cfg(unix)]
         if !Self::own_path(path) {
             return self.write_beneath(path, data, secret, true).map(drop);
@@ -367,6 +464,12 @@ impl DiskBackend {
     fn create_new_file_at(&self, path: &VPath, data: &[u8], secret: Option<bool>) -> Result<bool> {
         if path.is_root() {
             return Err(VeilError::InvalidPath("cannot write to the root".into()));
+        }
+        if self.deferring() && Self::own_path(path) {
+            self.refuse_symlinked_parent(path)?;
+            if let Some(done) = self.create_new_deferred(path, data, secret)? {
+                return Ok(done);
+            }
         }
         #[cfg(unix)]
         if !Self::own_path(path) {
@@ -466,6 +569,9 @@ struct DiskStream {
     dir: PathBuf,
     len: u64,
     durable: bool,
+    /// Durability deferred ([`DiskBackend::defer_durability`]): the file
+    /// and its name are recorded here for the barrier.
+    deferred_to: Option<Arc<Mutex<Unsynced>>>,
     done: bool,
 }
 
@@ -498,6 +604,11 @@ impl super::StreamWriter for DiskStream {
             fs::rename(&self.tmp, &to)?;
             if self.durable {
                 sync_dir(&self.dir)?;
+            }
+            if let Some(u) = &self.deferred_to {
+                let mut u = u.lock().unwrap_or_else(|e| e.into_inner());
+                u.files.push(to.clone());
+                u.dirs.insert(self.dir.clone());
             }
             Ok(())
         })();
@@ -1089,6 +1200,11 @@ impl StorageBackend for DiskBackend {
     }
 
     fn sync_barrier(&self) -> Result<()> {
+        // Durability deferred: the one barrier of `end_deferral` makes all
+        // of it durable.
+        if self.deferring() {
+            return Ok(());
+        }
         // Held until our batch is durable: a concurrent barrier waits for
         // it rather than returning early with nothing left to sync.
         let _serial = self.barrier.lock().unwrap_or_else(|e| e.into_inner());
@@ -1152,9 +1268,15 @@ impl StorageBackend for DiskBackend {
             }));
         }
         let full = self.full_path(dir);
-        match durable {
-            true => create_dir_all_durable(&full),
-            false => fs::create_dir_all(&full),
+        // Deferred: the stream's file and name are left to the barrier.
+        let deferred = durable && self.deferring();
+        match (durable, deferred) {
+            (true, false) => create_dir_all_durable(&full),
+            (true, true) => {
+                let mut created = Vec::new();
+                create_dir_all_tracked(&full, &mut created).map(|()| self.record_created(&created))
+            }
+            (false, _) => fs::create_dir_all(&full),
         }
         .map_err(|e| io_err(&full, e))?;
         let tmp = full.join(super::stream_temp_name());
@@ -1164,7 +1286,8 @@ impl StorageBackend for DiskBackend {
             tmp,
             dir: full,
             len: 0,
-            durable,
+            durable: durable && !deferred,
+            deferred_to: deferred.then(|| self.unsynced.clone()),
             done: false,
         }))
     }
@@ -1214,7 +1337,13 @@ impl StorageBackend for DiskBackend {
         self.refuse_symlinked_parent(path)?;
         let full = self.full_path(path);
         let parent = full.parent().expect("non-root path has a parent");
-        create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
+        if self.deferring() {
+            let mut created = Vec::new();
+            create_dir_all_tracked(parent, &mut created).map_err(|e| io_err(parent, e))?;
+            self.record_created(&created);
+        } else {
+            create_dir_all_durable(parent).map_err(|e| io_err(parent, e))?;
+        }
         let tmp = temp_path(parent, path);
         let written = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).and_then(|mut f| f.write_all(data));
         if let Err(e) = written {

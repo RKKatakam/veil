@@ -61,3 +61,4 @@ mod rc_client;
 mod warm;
 mod landing_speed;
 mod landing_hold;
+mod clone_one;

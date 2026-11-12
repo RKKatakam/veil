@@ -1955,7 +1955,7 @@ impl<'r> Transaction<'r> {
             Err(e) => return Err(e),
         };
         let to = store.snapshot(&new.wc)?.tree;
-        store.prefetch_diff(from.as_ref(), &to)
+        store.prefetch_move(from.as_ref(), &to, &st.materialised)
     }
 
     pub fn commit(mut self) -> Result<Option<ObjectId>> {

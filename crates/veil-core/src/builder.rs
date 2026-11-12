@@ -1262,6 +1262,10 @@ impl<'a> Builder<'a> {
             for e in &tree.entries {
                 let p = dir.join(&e.name);
                 if e.kind == EntryKind::Dir {
+                    // Never written, never read (BUG-1945).
+                    if self.opts.materialised.is_some_and(|m| m.hidden(&p)) {
+                        continue;
+                    }
                     if depth + 1 < MAX_TREE_DEPTH {
                         stack.push((p, e.id, depth + 1));
                     }
@@ -1591,6 +1595,18 @@ impl<'a> Builder<'a> {
                         if let Some(pe) = pdir {
                             f.out.insert(pe.clone());
                         }
+                        continue;
+                    }
+                    // A folder the checkout never wrote (one a `--only`
+                    // clone leaves out), with something in the working
+                    // copy: never read (a thin clone would fetch it, and
+                    // take what is there for its edit), carried by id,
+                    // and what is there listed, never recorded (BUG-1945).
+                    if let Some(e) = pdir.filter(|_| self.opts.materialised.is_some_and(|m| m.hidden(&path))) {
+                        let files: Vec<VPath> = crate::vfs::walk_leaves(self.fs, &path, &|_| false)?.into_iter().map(|(p, _)| p).collect();
+                        self.report.not_recorded.extend(files);
+                        self.report.carried.push(path.clone());
+                        f.out.insert(e.clone());
                         continue;
                     }
                     let sub = match pdir {
@@ -1966,6 +1982,13 @@ impl<'a> Builder<'a> {
                         b.report.carried.push(path.clone());
                         Ok(Err(Some(e.clone())))
                     }
+                }
+                // A folder the checkout never wrote (a `--only` clone's):
+                // carried whole, never read (a thin clone would fetch it,
+                // and take its files for deletions; BUG-1945).
+                EntryKind::Dir if b.opts.materialised.is_some_and(|m| m.hidden(path)) => {
+                    b.report.carried.push(path.clone());
+                    Ok(Err(Some(e.clone())))
                 }
                 EntryKind::Dir => match b.store.tree(&e.id) {
                     Ok(tree) if depth < MAX_TREE_DEPTH => Ok(Ok(Frame {
