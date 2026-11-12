@@ -18,10 +18,10 @@
 //! bound is each submitter's fair share of the queue and one person's flood
 //! never has another person's landing refused: a person with nothing
 //! waiting has at most one landing of each other person before theirs
-//! ([`ahead`]).
+//! (`Waiting::ahead`).
 //!
 //! What waits is read from the database (every server's submits are in it),
-//! at most once every [`REFRESH`] for a branch, in one statement; between
+//! at most once every `REFRESH` for a branch, in one statement; between
 //! two reads a server adds its own admitted submits. The service's rate is
 //! the count of entries it served, which it keeps in its lease row
 //! (`landing_leases.served`, migration 37) in the batch's own transaction.
