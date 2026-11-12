@@ -711,6 +711,15 @@ impl ObjectStore {
     /// stream-O threat 5), so only [`ObjectStore::publish_staged`], under
     /// the lock, decides. Beyond [`STAGING_BUDGET`] bytes, puts fail
     /// ([`Staged::overflowed`]).
+    /// Does this thread stage this store's new objects in memory
+    /// ([`ObjectStore::begin_staging`])? Work done on another thread would
+    /// not be staged.
+    #[cfg_attr(not(feature = "os"), allow(dead_code))]
+    pub(crate) fn staging_here(&self) -> bool {
+        let me = self as *const ObjectStore as usize;
+        STAGING.with(|s| s.borrow().as_ref().is_some_and(|st| st.store == me))
+    }
+
     pub(crate) fn begin_staging(&self) -> StagingScope<'_> {
         let me = self as *const ObjectStore as usize;
         STAGING.with(|s| {

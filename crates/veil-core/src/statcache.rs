@@ -603,6 +603,63 @@ impl CacheRun {
         }
     }
 
+    /// For a subtree built on another thread (a full scan's, see
+    /// `builder::Ahead`): runs of their own, one per subtree whose `n`th
+    /// path component (`n` from 1) is the key of `subtrees`, holding the
+    /// last run's records below it, moved out of this one.
+    #[cfg_attr(not(feature = "os"), allow(dead_code))]
+    pub(crate) fn split_below(&mut self, depth: usize, subtrees: &HashMap<VPath, usize>, count: usize) -> Vec<CacheRun> {
+        let mut runs: Vec<CacheRun> = (0..count).map(|_| self.empty_like()).collect();
+        let old = std::mem::take(&mut self.old);
+        for (path, rec) in old {
+            let s = path.as_str();
+            let cut = s.match_indices('/').nth(depth - 1).map(|(i, _)| i);
+            let task = cut.and_then(|i| VPath::new(&s[..i]).ok()).and_then(|p| subtrees.get(&p).copied());
+            match task {
+                Some(t) => {
+                    runs[t].old.insert(path, rec);
+                }
+                None => {
+                    self.old.insert(path, rec);
+                }
+            }
+        }
+        for r in &mut runs {
+            r.old_len = r.old.len();
+        }
+        runs
+    }
+
+    #[cfg_attr(not(feature = "os"), allow(dead_code))]
+    fn empty_like(&self) -> CacheRun {
+        CacheRun {
+            old: HashMap::new(),
+            old_len: 0,
+            new: HashMap::new(),
+            verified_at: self.verified_at,
+            exact: self.exact,
+            changed: false,
+            visited_dirs: None,
+            encoded: None,
+        }
+    }
+
+    /// What a subtree's run (`split_below`) learnt, as this run would have
+    /// learnt it building the subtree itself: what it carries to the next
+    /// run, and whether that changed. The last run's records it did not
+    /// use are dropped, as this run drops those of paths it never saw.
+    pub(crate) fn absorb(&mut self, sub: CacheRun) {
+        self.new.extend(sub.new);
+        self.changed |= sub.changed;
+    }
+
+    /// A subtree's run (`split_below`) whose build is not used: its records
+    /// back, for this run to build the subtree itself.
+    pub(crate) fn give_back_run(&mut self, sub: CacheRun) {
+        self.old.extend(sub.old);
+        self.old.extend(sub.new);
+    }
+
     /// [`CacheRun::trusted`], moved out of the last run's records: carried
     /// into the next run with [`CacheRun::keep_taken`] once used, or given
     /// back with [`CacheRun::give_back`] (no copy of the path or the record).

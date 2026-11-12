@@ -51,7 +51,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -794,6 +794,69 @@ pub struct BuildReport {
 /// `dirs` has its own entries inspected, while any tracked subdirectory
 /// inside it that is neither in `dirs`/`subtrees` nor an ancestor of one
 /// keeps its entry from `parent_tree` without being opened.
+impl BuildReport {
+    /// Add what `o`, the report of a subtree built on its own, holds, as
+    /// if this build had built the subtree here: each list continued in
+    /// order, each count added. (Every field is named: a new one must be
+    /// merged here.)
+    fn append(&mut self, o: BuildReport) {
+        let BuildReport {
+            isolated,
+            quarantined,
+            quarantine_kept,
+            blocked_exposures,
+            policy_held_back,
+            policy_edit_pending,
+            policy_edit_held,
+            cloak_failures,
+            relabelled,
+            carried,
+            not_recorded,
+            ignored,
+            ignored_paths,
+            files,
+            hashed,
+            cache_hits,
+            policy_warnings,
+            unreadable,
+            unrepresentable,
+            shadowed,
+            link_warnings,
+            name_collisions,
+            nested,
+            line_endings,
+            renormalizable,
+        } = o;
+        self.isolated.extend(isolated);
+        self.quarantined.extend(quarantined);
+        self.quarantine_kept.extend(quarantine_kept);
+        self.blocked_exposures.extend(blocked_exposures);
+        self.policy_held_back.extend(policy_held_back);
+        self.policy_edit_pending |= policy_edit_pending;
+        if policy_edit_held.is_some() {
+            self.policy_edit_held = policy_edit_held;
+        }
+        self.cloak_failures.extend(cloak_failures);
+        self.relabelled.extend(relabelled);
+        self.carried.extend(carried);
+        self.not_recorded.extend(not_recorded);
+        self.ignored += ignored;
+        self.ignored_paths.extend(ignored_paths);
+        self.files += files;
+        self.hashed += hashed;
+        self.cache_hits += cache_hits;
+        self.policy_warnings.extend(policy_warnings);
+        self.unreadable.extend(unreadable);
+        self.unrepresentable.extend(unrepresentable);
+        self.shadowed.extend(shadowed);
+        self.link_warnings.extend(link_warnings);
+        self.name_collisions.extend(name_collisions);
+        self.nested.extend(nested);
+        self.line_endings.extend(line_endings);
+        self.renormalizable.extend(renormalizable);
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WatchPlan {
     dirs: HashSet<VPath>,
@@ -1034,6 +1097,11 @@ struct Builder<'a> {
     /// keyed by `(kind, plain_blob_id)`, computed lazily before storing any
     /// newly added public file (BUG-1832).
     deleted_secrets: Option<HashMap<(EntryKind, ObjectId), Visibility>>,
+    /// Subtrees of a full scan built on other threads (`Ahead`).
+    ahead: Option<(&'a Ahead, &'a AheadEnv<'a>)>,
+    /// The depth of the walk's root (a subtree built ahead starts below
+    /// the working copy's root).
+    depth_base: usize,
 }
 
 /// Build a tree from `fs`, returning its id and a report.
@@ -1129,7 +1197,8 @@ pub(crate) fn build_tree_planned(
     }
     // With the plan, only the directories it inspects are looked up (and
     // decoded, in a cache as loaded).
-    let run = match (cache.as_deref_mut(), key) {
+    #[cfg_attr(not(feature = "os"), allow(unused_mut))]
+    let mut run = match (cache.as_deref_mut(), key) {
         (Some(c), Some((key, clock))) => Some(match watch {
             Some(w) => c.begin_watched_run(key, clock, &w.lookups()),
             None => c.begin_run(key, clock),
@@ -1158,6 +1227,35 @@ pub(crate) fn build_tree_planned(
         None if policy_changed => Some(Policy::builtin()),
         _ => None,
     };
+    // A full scan of a large working copy on a disk: subtrees built ahead
+    // on other threads (`Ahead`), never while this thread stages in memory
+    // (another thread's objects would not be staged).
+    #[cfg(feature = "os")]
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(AHEAD_THREADS + 1);
+    #[cfg(feature = "os")]
+    let ahead = match (&prefetch, &parent) {
+        (Some(_), Some(p)) if threads > 1 && matches!(opts.line_endings, LineEndings::Convert) && !store.staging_here() && !tests::serial() => {
+            Ahead::plan(store, opts, p, &mut run, threads)
+        }
+        _ => None,
+    };
+    #[cfg(feature = "os")]
+    let env = AheadEnv {
+        store,
+        fs,
+        policy: opts.policy,
+        parent_tree: opts.parent_tree,
+        base_tree: opts.base_tree,
+        injected: opts.injected,
+        rescan: opts.rescan,
+        materialised: opts.materialised,
+        use_hints,
+        policy_changed,
+        parent_policy: parent_policy.clone(),
+        folding: fs.name_folding(),
+        links: store.format() >= crate::object::GIT_PARITY_REPO_FORMAT,
+        prefetch: prefetch.as_ref().map(|(p, _)| p),
+    };
     let mut b = Builder {
         store,
         fs,
@@ -1182,7 +1280,13 @@ pub(crate) fn build_tree_planned(
         #[cfg(feature = "os")]
         prefetch: prefetch.as_ref().map(|(p, _)| p),
         deleted_secrets: None,
+        ahead: None,
+        depth_base: 0,
     };
+    #[cfg(feature = "os")]
+    {
+        b.ahead = ahead.as_ref().map(|a| (a, &env));
+    }
     let root_parent = parent.clone().zip(opts.parent_tree);
     #[cfg(feature = "os")]
     let built = match &prefetch {
@@ -1192,9 +1296,17 @@ pub(crate) fn build_tree_planned(
                 // (and the walk).
                 let _ = std::thread::Builder::new().stack_size(256 << 10).spawn_scoped(s, || p.work());
             }
+            if let Some(a) = &ahead {
+                for _ in 1..threads {
+                    // A thread that cannot start leaves its tasks to the
+                    // others (the walk builds any not started).
+                    let _ = std::thread::Builder::new().stack_size(8 << 20).spawn_scoped(s, || a.work(&env));
+                }
+            }
             // The workers stop when the walk ends, however it ends (a panic
             // too: the scope waits for them before passing it on).
             let _stop = p.stopper();
+            let _stop_ahead = AheadStop(ahead.as_ref());
             b.build_dir(&VPath::root(), root_parent)
         }),
         None => b.build_dir(&VPath::root(), root_parent),
@@ -1498,7 +1610,7 @@ impl<'a> Builder<'a> {
         };
         let mut done: Option<Option<ObjectId>> = None;
         loop {
-            let depth = stack.len();
+            let depth = stack.len() + self.depth_base;
             let f = stack.last_mut().expect("never empty here");
             if let Some(name) = f.waiting.take() {
                 if let Some(id) = done.take().expect("a finished subdirectory") {
@@ -1638,6 +1750,13 @@ impl<'a> Builder<'a> {
                         None => None,
                     };
                     let name = name.to_string();
+                    // Built ahead on another thread, as here (`Ahead`).
+                    if let Some(built) = self.take_ahead(&path, sub.as_ref().map(|(_, id)| *id), depth) {
+                        if let Some(id) = built? {
+                            f.out.insert(TreeEntry::dir(&name, id));
+                        }
+                        continue;
+                    }
                     match self.open_dir(path, sub)? {
                         Opened::Done(Some(id)) => f.out.insert(TreeEntry::dir(&name, id)),
                         Opened::Done(None) => {}
@@ -3007,4 +3126,451 @@ impl<'a> Builder<'a> {
 /// not)?
 fn matches_quietly(store: &ObjectStore, id: &ObjectId, raw: &[u8]) -> bool {
     store.matches_encoding(id, raw).unwrap_or(false)
+}
+
+// ---- a full scan on several threads (BUG-1944) ------------------------------
+//
+// When the file watcher cannot vouch (it is stopped, or its plan does not
+// apply), a snapshot walks the whole working copy. The listings are made
+// ahead on other threads (`prefetch`); the walk itself (the stat cache's
+// records, the classification, the files read and hashed, the trees) was
+// one thread's. `Ahead` builds subtrees of the walk on other threads,
+// before the walk reaches them, each by a builder of its own exactly as the
+// walk would (the same options, a run of the stat cache holding the
+// records below it, a report of its own), and the walk takes each one's
+// result **where it would have built the subtree itself, only if it would
+// have built it from the same parent entry at the same depth**: its tree,
+// its report continued in order, what its cache run learnt. Anything else
+// (a directory the walk does not open, or opens otherwise) the walk builds
+// itself, as before, with the records back. So the tree, the report and
+// its order, and the first error in walk order are the serial walk's: an
+// error in a subtree is returned when the walk reaches it, as the walk
+// would have met it there, and nothing a subtree built ahead is used
+// otherwise. (Objects a subtree stored that the walk does not use are
+// garbage, as any unreferenced object.)
+
+/// Subtrees of a full scan built on other threads: the tasks (in walk
+/// order), their state, and the results the walk takes.
+#[cfg_attr(not(feature = "os"), allow(dead_code))]
+pub(crate) struct Ahead {
+    tasks: Vec<AheadTask>,
+    by_path: HashMap<VPath, usize>,
+    state: Mutex<Vec<TaskState>>,
+    ready: std::sync::Condvar,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+struct AheadTask {
+    path: VPath,
+    sub: Option<(Arc<Tree>, ObjectId)>,
+    /// The walk's depth (its stack's length) while it builds `path`'s entries.
+    depth: usize,
+}
+
+#[cfg_attr(not(feature = "os"), allow(dead_code))]
+enum TaskState {
+    Queued(Option<CacheRun>),
+    Running,
+    Done(Box<AheadResult>),
+    Taken,
+}
+
+struct AheadResult {
+    built: Result<Option<ObjectId>>,
+    report: BuildReport,
+    cache: Option<CacheRun>,
+}
+
+/// What a builder of a subtree is made of, shared by the threads.
+struct AheadEnv<'a> {
+    store: &'a ObjectStore,
+    fs: &'a dyn StorageBackend,
+    policy: &'a Policy,
+    parent_tree: Option<ObjectId>,
+    base_tree: Option<ObjectId>,
+    injected: Option<&'a InjectedSecrets>,
+    rescan: bool,
+    materialised: Option<&'a Materialised>,
+    use_hints: bool,
+    policy_changed: bool,
+    parent_policy: Option<Policy>,
+    folding: NameFolding,
+    links: bool,
+    #[cfg(feature = "os")]
+    prefetch: Option<&'a crate::prefetch::Prefetch<'a>>,
+}
+
+/// Stops the threads of an `Ahead` when the walk ends, however it ends.
+#[cfg_attr(not(feature = "os"), allow(dead_code))]
+struct AheadStop<'a>(Option<&'a Ahead>);
+
+impl Drop for AheadStop<'_> {
+    fn drop(&mut self) {
+        if let Some(a) = self.0 {
+            a.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Subtrees per thread worth spreading a scan over.
+#[cfg_attr(not(feature = "os"), allow(dead_code))]
+const AHEAD_PER_THREAD: usize = 4;
+/// Most levels below the root a task's subtree starts at.
+#[cfg_attr(not(feature = "os"), allow(dead_code))]
+const AHEAD_MAX_DEPTH: usize = 3;
+/// Most threads that build subtrees (besides the walk).
+#[cfg_attr(not(feature = "os"), allow(dead_code))]
+const AHEAD_THREADS: usize = 7;
+
+impl Ahead {
+    /// The subtrees of `parent` (the tree the working copy was recorded
+    /// as) to build ahead, and their stat cache runs (split off `run`):
+    /// the folders of the first level below the root that has enough of
+    /// them, among those the walk would open (not ignored, never left out
+    /// by the checkout, readable, not reserved). `None`: not worth it.
+    #[cfg_attr(not(feature = "os"), allow(dead_code))]
+    fn plan(store: &ObjectStore, opts: &BuildOptions, parent: &Arc<Tree>, run: &mut Option<CacheRun>, threads: usize) -> Option<Ahead> {
+        let skip = |path: &VPath| {
+            opts.materialised.is_some_and(|m| m.hidden(path) || m.lost(path))
+                || opts.policy.classify(path, true).tier == Tier::Ignored
+        };
+        let mut level: Vec<(VPath, Option<(Arc<Tree>, ObjectId)>)> = vec![(VPath::root(), Some((parent.clone(), ObjectId([0; 32]))))];
+        for depth in 1..=AHEAD_MAX_DEPTH {
+            let mut next = Vec::new();
+            for (dir, sub) in &level {
+                let Some((t, _)) = sub else { continue };
+                for e in t.entries.iter().filter(|e| e.kind == EntryKind::Dir && !crate::object::is_reserved_name(&e.name)) {
+                    let path = dir.join(&e.name);
+                    if skip(&path) {
+                        continue;
+                    }
+                    let Ok(tree) = store.tree(&e.id) else { continue };
+                    next.push((path, Some((tree, e.id))));
+                }
+            }
+            if next.is_empty() {
+                return None;
+            }
+            level = next;
+            if level.len() >= threads * AHEAD_PER_THREAD || depth == AHEAD_MAX_DEPTH {
+                if level.len() < 2 || depth >= MAX_TREE_DEPTH {
+                    return None;
+                }
+                // The walk's order: depth first, by name at each level.
+                level.sort_by(|a, b| a.0.components().cmp(b.0.components()));
+                let by_path: HashMap<VPath, usize> = level.iter().enumerate().map(|(i, (p, _))| (p.clone(), i)).collect();
+                let mut runs: Vec<Option<CacheRun>> = match run.as_mut() {
+                    Some(r) => r.split_below(depth, &by_path, level.len()).into_iter().map(Some).collect(),
+                    None => (0..level.len()).map(|_| None).collect(),
+                };
+                let state = runs.iter_mut().map(|r| TaskState::Queued(r.take())).collect();
+                let tasks = level.into_iter().map(|(path, sub)| AheadTask { path, sub, depth }).collect();
+                return Some(Ahead {
+                    tasks,
+                    by_path,
+                    state: Mutex::new(state),
+                    ready: std::sync::Condvar::new(),
+                    stop: Default::default(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Claim the next queued task (in walk order) and build it; until none
+    /// is left or the walk ended.
+    #[cfg_attr(not(feature = "os"), allow(dead_code))]
+    fn work(&self, env: &AheadEnv<'_>) {
+        while !self.stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let claimed = {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.iter_mut().enumerate().find_map(|(i, s)| match s {
+                    TaskState::Queued(run) => {
+                        let run = run.take();
+                        *s = TaskState::Running;
+                        Some((i, run))
+                    }
+                    _ => None,
+                })
+            };
+            let Some((i, run)) = claimed else { return };
+            self.build(env, i, run);
+        }
+    }
+
+    fn build(&self, env: &AheadEnv<'_>, i: usize, run: Option<CacheRun>) {
+        let task = &self.tasks[i];
+        let opts = BuildOptions {
+            policy: env.policy,
+            parent_tree: env.parent_tree,
+            base_tree: env.base_tree,
+            injected: env.injected,
+            rescan: env.rescan,
+            materialised: env.materialised,
+            line_endings: LineEndings::Convert,
+        };
+        let mut b = Builder {
+            store: env.store,
+            fs: env.fs,
+            opts: &opts,
+            use_hints: env.use_hints,
+            policy_changed: env.policy_changed,
+            parent_policy: env.parent_policy.clone(),
+            rescan: env.rescan,
+            cache: run,
+            report: BuildReport::default(),
+            folding: env.folding,
+            links: env.links,
+            attrs: None,
+            eol_now: None,
+            listed: None,
+            conflict_copy: None,
+            watch: None,
+            #[cfg(feature = "os")]
+            prefetch: env.prefetch,
+            deleted_secrets: None,
+            ahead: None,
+            depth_base: task.depth - 1,
+        };
+        let built = b.build_dir(&task.path, task.sub.clone());
+        let result = AheadResult {
+            built,
+            report: std::mem::take(&mut b.report),
+            cache: b.cache.take(),
+        };
+        self.state.lock().unwrap_or_else(|e| e.into_inner())[i] = TaskState::Done(Box::new(result));
+        self.ready.notify_all();
+    }
+
+    /// The result of task `i` for the walk: built by the walk's thread now
+    /// if no other thread started it, else waited for.
+    fn take(&self, env: &AheadEnv<'_>, i: usize) -> AheadResult {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match std::mem::replace(&mut st[i], TaskState::Taken) {
+                TaskState::Done(r) => return *r,
+                TaskState::Queued(run) => {
+                    st[i] = TaskState::Running;
+                    drop(st);
+                    self.build(env, i, run);
+                    st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                }
+                TaskState::Running => {
+                    st[i] = TaskState::Running;
+                    st = self.ready.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                TaskState::Taken => unreachable!("a task's result is taken once"),
+            }
+        }
+    }
+}
+
+impl<'a> Builder<'a> {
+    /// The subtree at `path` built ahead (`Ahead`), if it was built as the
+    /// walk would build it here (from parent entry `sub`, at `depth`): its
+    /// tree, with its report and stat cache records taken into this
+    /// build's. `None`: the walk builds it itself (with the records back).
+    fn take_ahead(&mut self, path: &VPath, sub: Option<ObjectId>, depth: usize) -> Option<Result<Option<ObjectId>>> {
+        let (ahead, env) = self.ahead?;
+        let &i = ahead.by_path.get(path)?;
+        let task = &ahead.tasks[i];
+        let r = ahead.take(env, i);
+        let same = task.sub.as_ref().map(|(_, id)| *id) == sub && task.depth == depth;
+        if !same {
+            if let (Some(main), Some(run)) = (self.cache.as_mut(), r.cache) {
+                main.give_back_run(run);
+            }
+            return None;
+        }
+        self.report.append(r.report);
+        if let (Some(main), Some(run)) = (self.cache.as_mut(), r.cache) {
+            main.absorb(run);
+        }
+        tests::used_ahead();
+        Some(r.built)
+    }
+}
+
+/// Test hooks of `Ahead` (no-ops outside the crate's unit tests).
+mod tests {
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static SERIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static USED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Unit tests only: this thread's builds walk on one thread.
+    pub(super) fn serial() -> bool {
+        #[cfg(test)]
+        return SERIAL.with(|s| s.get());
+        #[cfg(not(test))]
+        false
+    }
+
+    /// Unit tests only: count subtrees taken from other threads.
+    pub(super) fn used_ahead() {
+        #[cfg(test)]
+        USED.with(|u| u.set(u.get() + 1));
+    }
+
+    /// A full scan on several threads records byte for byte what the
+    /// serial walk records (BUG-1944): the same tree, the same report in
+    /// the same order (unreadable files and folders, links, nested
+    /// repositories, ignored folders, secrets), the same stat cache, after
+    /// seeded changes of every kind.
+    #[cfg(all(test, unix, feature = "os"))]
+    #[test]
+    fn a_full_scan_on_several_threads_records_what_the_serial_walk_records() {
+        use std::{os::unix::fs::PermissionsExt, sync::Arc};
+
+        use crate::{statcache::StatCache, DiskBackend, Identity, Repo, StorageBackend, VPath};
+
+        if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
+            return;
+        }
+        let mut seen = Vec::new();
+        for seed in 1..=6u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = |n: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % n
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let fs: Arc<DiskBackend> = Arc::new(DiskBackend::new(root));
+            let mut repo = Repo::init(fs.clone(), Some(Identity::generate("t")), "t").unwrap();
+            let write = |p: &str, data: &[u8]| {
+                let full = root.join(p);
+                std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+                std::fs::write(full, data).unwrap();
+            };
+            write(".veilpolicy", b"skip/ ignore\n");
+            // 6 folders of 6 folders, files at every level, deeper below.
+            for a in 0..6 {
+                write(&format!("top{a}.txt"), format!("top {a}").as_bytes());
+                for b in 0..6 {
+                    for f in 0..8 {
+                        write(&format!("d{a}/e{b}/f{f}.txt"), format!("{seed} {a} {b} {f}").as_bytes());
+                    }
+                    if next(3) == 0 {
+                        write(&format!("d{a}/e{b}/g/h/deep.txt"), b"deep");
+                    }
+                }
+                write(&format!("d{a}/skip/x.txt"), b"never");
+            }
+            let wc = repo.workspace_wc("default").unwrap();
+            let mut cache = StatCache::new();
+            repo.snapshot_workspace_cached("default", &*fs, Some(&mut cache)).unwrap();
+            assert!(cache.len() >= 250, "the cache counts enough files for the scan's threads");
+            // Changes of every kind, seeded.
+            for _ in 0..40 {
+                let (a, b, f) = (next(6), next(6), next(10));
+                let p = format!("d{a}/e{b}/f{f}.txt");
+                match next(12) {
+                    0..=3 => write(&p, format!("edited {seed} {}", next(1000)).as_bytes()),
+                    4 => {
+                        let _ = std::fs::remove_file(root.join(&p));
+                    }
+                    5 => write(&format!("d{a}/e{b}/new{f}/n.txt"), b"new"),
+                    6 => {
+                        let _ = std::fs::remove_file(root.join(&p));
+                        let _ = std::os::unix::fs::symlink(format!("f{}.txt", next(8)), root.join(&p));
+                    }
+                    7 => {
+                        let _ = std::os::unix::fs::symlink("../../nowhere", root.join(format!("d{a}/e{b}/dangling{f}")));
+                    }
+                    8 => {
+                        if let Ok(m) = std::fs::metadata(root.join(&p)) {
+                            let mut perm = m.permissions();
+                            perm.set_mode(0o000);
+                            let _ = std::fs::set_permissions(root.join(&p), perm);
+                        }
+                    }
+                    9 => write(&format!("d{a}/e{b}/.env"), format!("API_KEY=sk_live_{seed}{a}{b}aaaaaaaaaaaaaaaaaaaaaaaa\n").as_bytes()),
+                    10 => {
+                        // A nested repository, a folder become a file.
+                        let _ = std::fs::create_dir_all(root.join(format!("d{a}/e{b}/nested/.veil")));
+                        if next(2) == 0 {
+                            let _ = std::fs::remove_dir_all(root.join(format!("d{a}/e{b}/g")));
+                            write(&format!("d{a}/e{b}/g"), b"a file now");
+                        }
+                    }
+                    _ => {
+                        let d = root.join(format!("d{a}/e{b}/locked"));
+                        write(&format!("d{a}/e{b}/locked/l.txt"), b"locked");
+                        let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000));
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let build = |serial: bool| {
+                let mut c = cache.clone();
+                SERIAL.with(|s| s.set(serial));
+                USED.with(|u| u.set(0));
+                let r = repo.build_amending(&*fs, &wc_of(&repo), Some(&mut c), None);
+                SERIAL.with(|s| s.set(false));
+                let used = USED.with(|u| u.get());
+                // Each build's own clock reading aside.
+                let mut records: Vec<_> = c
+                    .records()
+                    .map(|(p, r)| {
+                        let mut r = r.clone();
+                        r.verified_at = 0;
+                        format!("{p} {r:?}")
+                    })
+                    .collect();
+                records.sort();
+                (format!("{r:?}"), records, c.is_dirty(), used)
+            };
+            let threaded = build(false);
+            let serial = build(true);
+            assert!(threaded.3 > 0, "seed {seed}: no subtree was built on another thread");
+            assert_eq!(serial.3, 0);
+            assert!(serial.0.starts_with("Ok"), "seed {seed}: the build failed: {}", serial.0);
+            assert_eq!(threaded.0, serial.0, "seed {seed}: another tree or report");
+            assert_eq!(threaded.1, serial.1, "seed {seed}: another stat cache");
+            assert_eq!(threaded.2, serial.2, "seed {seed}: the cache dirty or not");
+            seen.push(serial.0.clone());
+            let _ = wc;
+            // Everything readable again, for the directory's removal.
+            for e in walk(root) {
+                let _ = std::fs::set_permissions(&e, std::fs::Permissions::from_mode(0o755));
+            }
+            let _ = VPath::root();
+            let _: &dyn StorageBackend = &*fs;
+        }
+
+        // The seeds met what they were meant to: unreadable files and
+        // folders, nested repositories, secrets (links are in the tree).
+        let all = seen.join("\n");
+        for what in ["Permission denied", "nested: [VPath(\"d", "isolated: [VPath"] {
+            assert!(all.contains(what), "no seed met {what}: {all}");
+        }
+
+        fn wc_of(repo: &Repo) -> crate::ObjectId {
+            repo.workspace_wc("default").unwrap()
+        }
+
+        fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut out = vec![root.to_path_buf()];
+            let mut i = 0;
+            while i < out.len() {
+                let d = out[i].clone();
+                i += 1;
+                let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755));
+                if let Ok(r) = std::fs::read_dir(&d) {
+                    for e in r.flatten() {
+                        if e.file_type().is_ok_and(|t| t.is_dir()) {
+                            out.push(e.path());
+                        } else if e.file_type().is_ok_and(|t| t.is_file()) {
+                            let _ = std::fs::set_permissions(e.path(), std::fs::Permissions::from_mode(0o644));
+                        }
+                    }
+                }
+            }
+            out
+        }
+    }
 }
