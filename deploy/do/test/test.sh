@@ -23,7 +23,11 @@
 #      and docker: every droplet is reached (ssh inside a `while read` loop
 #      must not eat the list), the first server's keys travel as private
 #      files, and no secret is on an ssh or scp command line, in the output
-#      or in the results.
+#      or in the results;
+#   7. the failover verdict on made-up results: a clean run passes, a change
+#      told landed and lost, one doubled on `main`, one landed and never
+#      told beyond the failed submits, one told as another snapshot, and a
+#      run without the per-change log each fail.
 # Everything runs under a temporary state directory inside the worktree's .scratch/.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); DO=$(cd "$HERE/.." && pwd); ROOT=$(cd "$DO/../.." && pwd)
@@ -270,5 +274,49 @@ res=$(ls -d "$T"/results/veil-kit-full/*-pull 2>/dev/null | head -1)
 check "bench.sh --approve pull succeeds and records run.txt, topology.env, images.txt and commands.txt" '[ $rc = 0 ] && [ -n "$res" ] && [ -s "$res/run.txt" ] && [ -s "$res/topology.env" ] && [ -s "$res/images.txt" ] && [ -s "$res/commands.txt" ] && grep -q "^commit=" "$res/run.txt" && grep -q "revision=" "$res/images.txt"'
 leaks=$(cat "$FAKE_SSH_LOG" "$FAKE_DOCTL_LOG" "$FAKE_CURL_LOG"; echo "$out_ac $out_ab"; cat "$res"/* 2>/dev/null)
 check "no secret on an ssh or scp command line, in the output or in the results" '[[ "$leaks" != *"dop_v1_fake_secret_token"* && "$leaks" != *"secret-spaces-key"* && "$leaks" != *"secret-spaces-val"* && "$leaks" != *"secret-db-pass"* && "$leaks" != *"fake-server-key-material"* ]]'
+
+echo "== 7. the failover verdict on made-up results (deploy/checks/failover-verdict.py)"
+# A run of 6 tickets: 5 answered `landed`; t6's submit lost its connection
+# (no ticket in the log) and t7's was still queued when the tool gave up,
+# both landed anyway. Each case below changes one thing of the clean run.
+fake_failover() { # DIR CASE: clean | lost | doubled | untold | moved
+    mkdir -p "$1"
+    printf 't0_us=1\nholder_server=1\nhow=stop\nlease_before=1-aa epoch 1\nstop_us=2\n' > "$1/failover-run.txt"
+    printf 'lease_after=2-bb epoch 2\nunfinished_after_settling=0\ntip_derived=t\n' > "$1/failover-after.txt"
+    printf '%s\n' projects\|1 tickets\|7 tickets_landed\|7 tickets_conflict\|0 tickets_rejected\|0 unfinished\|0 landed_changes\|7 \
+        landed_without_record\|0 recorded_not_on_main\|0 landed_twice\|0 main_snapshots\|9 main_not_derived\|0 change_twice_on_main\|0 \
+        setup_snapshots\|2 main_without_ticket\|0 landings_before_stop\|3 landings_after_stop\|4 first_landing_after_stop_ms\|100 \
+        longest_gap_after_stop_ms\|900 longest_gap_before_stop_ms\|300 > "$1/failover-check.txt"
+    echo '{"runs":[{"ops":4,"errors":2}]}' > "$1/failover.json"
+    local i n=0
+    : > "$1/failover-line.txt"; : > "$1/failover.landings.jsonl"
+    for i in 7 6 5 4 3 2 1; do
+        echo "$n|s$i|c$i|t$i" >> "$1/failover-line.txt"; n=$((n + 1))
+        [ "$2" = doubled ] && [ $i = 3 ] && { echo "$n|s3b|c3|t3b" >> "$1/failover-line.txt"; n=$((n + 1)); }
+    done
+    printf '%s\n' "$n|setup1|cs1|" "$((n + 1))|setup0|cs0|" >> "$1/failover-line.txt"
+    for i in 1 2 3 4 5; do
+        [ "$2" = untold ] && [ $i = 5 ] && continue
+        echo "{\"ticket\":\"t$i\",\"change\":\"c$i\",\"landed\":[\"s$i\"],\"project\":\"p\",\"at_ms\":$i}" >> "$1/failover.landings.jsonl"
+    done
+    [ "$2" = lost ] && echo '{"ticket":"t8","change":"c8","landed":["s8"],"project":"p","at_ms":8}' >> "$1/failover.landings.jsonl"
+    [ "$2" = moved ] && echo '{"ticket":"t9","change":"c2","landed":["s9"],"project":"p","at_ms":9}' >> "$1/failover.landings.jsonl"
+    echo '{"failed":"land: connection reset","project":"p","at_ms":6}' >> "$1/failover.landings.jsonl"
+    echo '{"failed":"still queued after the server'"'"'s wait","ticket":"t7","project":"p","at_ms":7}' >> "$1/failover.landings.jsonl"
+}
+V=$ROOT/deploy/checks/failover-verdict.py
+declare -A vout vrc
+for c in clean lost doubled untold moved; do
+    fake_failover "$T/failover-$c" "$c"
+    vrc[$c]=0; vout[$c]=$(python3 "$V" "$T/failover-$c" 2>&1) || vrc[$c]=$?
+done
+check "a clean run passes: 5 told, t7 explained by its ticket, t6 by the one failed submit without a ticket" '[ "${vrc[clean]}" = 0 ] && [[ "${vout[clean]}" == *"failover: every check passed"* ]] && [[ "${vout[clean]}" == *"| 2: 1 / 1 ≤ 1 | pass |"* ]] && [[ "${vout[clean]}" == *"| told landed, not on \`main\` | 0 | pass |"* ]]'
+check "a change told landed and missing from main fails as lost" '[ "${vrc[lost]}" = 1 ] && [[ "${vout[lost]}" == *"| told landed, not on \`main\` | 1 | **FAIL** |"*"\`c8\`"* ]]'
+check "a change told landed and twice on main fails as doubled" '[ "${vrc[doubled]}" = 1 ] && [[ "${vout[doubled]}" == *"| told landed, on \`main\` more than once | 1 | **FAIL** |"*"\`c3\`"* ]]'
+check "a landing no agent was told about, beyond the failed submits, fails" '[ "${vrc[untold]}" = 1 ] && [[ "${vout[untold]}" == *"| 3: 1 / 2 ≤ 1 | **FAIL** |"* ]]'
+check "a change answered twice, once as another snapshot, fails" '[ "${vrc[moved]}" = 1 ] && [[ "${vout[moved]}" == *"| changes answered \`landed\` twice | 1 | **FAIL** |"* ]] && [[ "${vout[moved]}" == *"| told landed as another snapshot or ticket | 1 | **FAIL** |"* ]]'
+rm "$T/failover-clean/failover.landings.jsonl"
+rc=0; out=$(python3 "$V" "$T/failover-clean" 2>&1) || rc=$?
+check "a run without the per-change log fails" '[ $rc = 1 ] && [[ "$out" == *"| missing | **FAIL** |"* ]]'
 
 [ $fail = 0 ] && echo "deploy/do/test: all green" || { echo "deploy/do/test: FAILED"; exit 1; }

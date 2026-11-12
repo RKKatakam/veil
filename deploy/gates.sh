@@ -137,7 +137,8 @@ gate_scaling() {
 # SIGKILL). Shown from the database and the tool's results: another server
 # took the lease, how long no landing committed, and every change landed
 # exactly once (deploy/checks/failover.sql says what each row proves;
-# deploy/checks/failover-verdict.py judges them).
+# deploy/checks/failover-verdict.py judges them, and holds every answer the
+# agents got, failover.landings.jsonl, against `main`'s line, failover-line.txt).
 gate_failover() {
     local i rc=0 pid t0 stop holder=0 best=0 a b before after left=
     [ "$SERVERS" -ge 2 ] || { echo "gates: failover needs at least two servers behind one address (VEIL_DO_HUBS=2 or 3)" >&2; return 2; }
@@ -179,6 +180,9 @@ gate_failover() {
     done
     after=$(check_sql failover-lease.sql "$t0" | db_one)
     check_sql failover.sql "$t0" "$stop" | db_sql | record failover-check.txt
+    # `main`'s first-parent line, for the verdict to hold against the tool's
+    # per-change log (failover.landings.jsonl, beside failover.json).
+    check_sql failover-line.sql "$t0" | db_sql | record failover-line.txt
     { echo "lease_after=$after"; echo "unfinished_after_settling=${left:-}"; echo "tip_derived=${a:-}"; } | record failover-after.txt
     hub_ctl "$holder" start
     return $rc
