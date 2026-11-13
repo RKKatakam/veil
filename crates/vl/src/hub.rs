@@ -1366,8 +1366,11 @@ pub fn pull_moving(
     // files of every level at once, as before; any other answer (an older
     // server, a refusal) leaves the walk to ask level by level. A later
     // pull holds most trees already: it asks for the new ones only.
+    // Not with the daemon on (BUG-2210): the daemon serves an object from
+    // its store only along a chain of trees it holds, so trees taken
+    // around it leave it serving nothing; its walk is level by level.
     let mut prefetched: HashMap<ObjectId, Vec<u8>> = HashMap::new();
-    if thin && fresh && tips.revision >= veil_core::hub::wire::SUBTREE_REVISION {
+    if thin && fresh && !daemon && tips.revision >= veil_core::hub::wire::SUBTREE_REVISION {
         if let Some((snap, _)) = new_snaps.iter().find(|(s, t)| Some(*s) == checked_out && !have(t)) {
             prefetched = client.subtree(*snap, only.unwrap_or("")).unwrap_or_default();
         }

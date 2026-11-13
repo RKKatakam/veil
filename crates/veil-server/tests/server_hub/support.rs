@@ -25,8 +25,14 @@ pub fn test_db_prefix() -> String {
     std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_else(|_| format!("r{}x", std::process::id()))
 }
 
+/// `prefix` and a suffix no other call of this process returns (BUG-2211:
+/// every test of a run shares one database, and 4 random bytes alone gave
+/// two of a run's people one name). The count comes first; the random
+/// part, always 8 digits, keeps runs apart.
 pub fn unique(prefix: &str) -> String {
-    format!("{prefix}{}", hex::encode(veil_core::crypto::random_bytes::<4>()))
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{prefix}{n:x}{}", hex::encode(veil_core::crypto::random_bytes::<4>()))
 }
 
 pub struct TestHub {
