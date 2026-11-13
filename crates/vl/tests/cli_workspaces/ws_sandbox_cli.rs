@@ -492,3 +492,50 @@ fn ephemeral_ws_exec_whose_command_fails_keeps_its_status_and_the_file() {
     assert!(t.contains(LEFT_OUT), "{t}");
     assert!(std::fs::read_to_string(kept_file(&proj)).unwrap().contains("AKIAIOSFODNN7EXAMPLE"));
 }
+
+/// A throwaway directory on another filesystem than the project (`/tmp` is
+/// often a tmpfs): the file is copied out, at its path and with its mode,
+/// into private directories, before the throwaway directory goes.
+#[cfg(target_os = "linux")]
+#[test]
+fn ephemeral_ws_exec_keeps_a_quarantined_file_across_filesystems() {
+    let env = Env::new();
+    let proj = project(&env);
+    let tmp = tempfile::tempdir_in("/dev/shm").expect("a /dev/shm to put the throwaway directory on");
+    assert_ne!(std::fs::metadata(tmp.path()).unwrap().dev(), std::fs::metadata(&proj).unwrap().dev(), "not another filesystem");
+    let leak = "mkdir -p deep/er && echo \"const key = 'AKIAIOSFODNN7EXAMPLE';\" > deep/er/cfg.js && chmod 604 deep/er/cfg.js";
+    let out = env.cmd("alice", &proj, &["ws", "exec", "--ephemeral", "--", "sh", "-c", leak]).env("TMPDIR", tmp.path()).output().unwrap();
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(3), "{t}");
+    assert!(t.contains("  deep/er/cfg.js (aws-access-key-id at line 1; never recorded)"), "{t}");
+    assert!(!t.contains("lost with it"), "{t}");
+    let dirs: Vec<PathBuf> = std::fs::read_dir(proj.join(".veil/local/ephemeral-kept")).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let kept = dirs[0].join("deep/er/cfg.js");
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "const key = 'AKIAIOSFODNN7EXAMPLE';\n");
+    assert_eq!(std::fs::metadata(&kept).unwrap().mode() & 0o7777, 0o604);
+    for d in [dirs[0].clone(), dirs[0].join("deep"), dirs[0].join("deep/er")] {
+        assert_eq!(std::fs::metadata(&d).unwrap().mode() & 0o777, 0o700, "{}", d.display());
+    }
+    // The throwaway directory is gone.
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+/// A step after the recording that fails (here: listing what the command
+/// wrote outside `--only src`, in a directory it made unreadable) fails
+/// the run, but the file the recording left out is kept and named all the
+/// same, not deleted with the throwaway directory.
+#[test]
+fn ephemeral_ws_exec_that_fails_after_recording_still_keeps_the_file() {
+    let env = Env::new();
+    let proj = project(&env);
+    let leak = "echo \"const key = 'AKIAIOSFODNN7EXAMPLE';\" > src/cfg.js && mkdir shut && chmod 000 shut";
+    let out = env.vl("alice", &proj, &["ws", "exec", "--ephemeral", "--only", "src", "--", "sh", "-c", leak]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert!(t.contains("  src/cfg.js (aws-access-key-id at line 1; never recorded)"), "{t}");
+    let dirs: Vec<PathBuf> = std::fs::read_dir(proj.join(".veil/local/ephemeral-kept")).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    assert!(t.contains(&dirs[0].display().to_string()), "{t}");
+    assert_eq!(std::fs::read_to_string(dirs[0].join("src/cfg.js")).unwrap(), "const key = 'AKIAIOSFODNN7EXAMPLE';\n");
+}

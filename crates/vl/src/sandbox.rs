@@ -1381,7 +1381,10 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
     let sb = Sandbox::create("ephemeral")?;
     let dir = sb.path().to_path_buf();
     let sandbox = SandboxFs::new(&dir, None, false).with_forbidden_targets(std::iter::once(ctx.root.clone()).chain(crate::ctx::veil_private_dirs()));
-    let result = (|| -> Result<(i32, Vec<LeftOut>, String)> {
+    // What the recording left out as a secret, and where it was moved to:
+    // named even if a later step fails (BUG-2171).
+    let mut kept: (Vec<LeftOut>, String) = Default::default();
+    let result = (|| -> Result<i32> {
         let to = match &set {
             Some(s) => restrict_tree(ctx.repo.store(), &tree, s)?,
             None => tree,
@@ -1418,6 +1421,14 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
         let (id, report) = ctx
             .repo
             .commit_fs_as_child_with(base_snapshot, recorded_fs, a.message, injected.as_ref(), Some(&record), &[], true)?;
+        // What the recording left out as a secret goes with the throwaway
+        // directory unless it is moved out first, before any later step
+        // can fail (BUG-2171).
+        let left = left_out(&report, true);
+        if !left.is_empty() {
+            kept.1 = keep_left_out(&ctx.root, &dir, &left, &one_line(&ctx.repo, &id));
+        }
+        kept.0 = left;
         if let Some(why) = &pin.why {
             warn(&format!(
                 "{POLICY_FILE} {why} in the sandbox: the recorded policy is kept (in a sandbox, only a regular, readable \
@@ -1443,18 +1454,19 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
             warn(&msg);
         }
         eprintln!("Recorded {}", one_line(&ctx.repo, &id));
-        // What the recording left out as a secret goes with the throwaway
-        // directory unless it is moved out first (BUG-2171).
-        let left = left_out(&report, true);
-        let hint = match left.is_empty() {
-            true => String::new(),
-            false => keep_left_out(&ctx.root, &dir, &left, &one_line(&ctx.repo, &id)),
-        };
-        Ok((code, left, hint))
+        Ok(code)
     })();
     drop(sb);
-    let (code, left, hint) = result?;
-    Ok(exec_status(code, &left, &hint, false))
+    let (left, hint) = kept;
+    match result {
+        Ok(code) => Ok(exec_status(code, &left, &hint, false)),
+        Err(e) => {
+            if !left.is_empty() {
+                print_left_out(&left, "recorded", &hint, false);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// `.veil/local/ephemeral-kept`: the files `--ephemeral` runs left out as
