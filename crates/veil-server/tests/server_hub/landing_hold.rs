@@ -1191,3 +1191,52 @@ fn bug_2220_a_conflict_report_tells_the_tip_its_change_was_judged_on() {
     assert_ne!(answers[1]["conflicts"][0]["yours"], answers[3]["conflicts"][0]["yours"]);
     assert_eq!(answers[1]["conflicts"][0]["main"], answers[3]["conflicts"][0]["main"]);
 }
+
+/// BUG-2362: the trees a submit's checks graft (the full trees of a change
+/// made by someone who cannot see everything: here `src/` holds a folder
+/// only security sees) are held while the checks run and stored with the
+/// change's other objects, all at once, instead of one at a time as they
+/// were made. Every one of them is stored before the change is queued: the
+/// landed snapshot's whole tree is in the store, and the change reads back
+/// whole for an admin, hidden folder and all.
+#[test]
+fn bug_2362_a_submits_grafted_trees_are_stored_with_its_objects() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let (dev, admin) = (p.dev.token(), p.admin.token());
+    let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let r = land_edit(&api, &dev, &p.name, base, "src/grafted/deep/a.rs", "grafted\n", true);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["state"], "landed", "{v}");
+    let tip = api.tips(Some(&admin), &p.name).unwrap().branches["main"];
+    // The landed snapshot's every tree and blob, from the store itself.
+    let store = hub.hub().objects.blob_store().clone();
+    let mut todo = vec![hub.rt.block_on(hub.hub().objects.get(pid, &tip)).unwrap().map(|raw| match veil_core::object::Object::decode(&raw).unwrap() {
+        veil_core::object::Object::Snapshot(s) => s.tree,
+        _ => panic!("the tip is a snapshot"),
+    })
+    .expect("the landed snapshot is stored")];
+    let mut trees = 0;
+    while let Some(t) = todo.pop() {
+        let key = veil_server::store::object_key(pid, &t);
+        assert!(hub.rt.block_on(store.exists(&key)).unwrap(), "tree {} of the landed snapshot is stored", t.short());
+        let raw = hub.rt.block_on(hub.hub().objects.get(pid, &t)).unwrap().unwrap();
+        let veil_core::object::Object::Tree(tree) = veil_core::object::Object::decode(&raw).unwrap() else { panic!("a tree") };
+        trees += 1;
+        for e in tree.entries.values() {
+            if e.kind == veil_core::object::EntryKind::Tree {
+                todo.push(e.id);
+            } else {
+                assert!(hub.rt.block_on(store.exists(&veil_server::store::object_key(pid, &e.id))).unwrap(), "{} is stored", e.id.short());
+            }
+        }
+    }
+    assert!(trees >= 5, "the root, src/, the hidden folder and the two new ones: {trees}");
+    for (path, want) in [("src/grafted/deep/a.rs", "grafted\n".to_string()), (&format!("src/{NESTED_DIR}/key.txt") as &str, NESTED_MARK.to_string())] {
+        let r = api.get(Some(&admin), &format!("/v1/projects/{}/q/file?rev={}&path={path}", p.name, tip.hex()));
+        assert_eq!((r.status, String::from_utf8_lossy(&r.body).to_string()), (200, want), "{path} at the landed tip");
+    }
+}
