@@ -907,7 +907,9 @@ impl Packs {
         }
         {
             let mut m = p.map.write().unwrap();
-            if let Some(l) = m.packs.iter_mut().find(|l| &*l.name == name) {
+            // Newest first: a listing's new packs are at the end (names are
+            // unique in the map), so loading them does not walk every pack.
+            if let Some(l) = m.packs.iter_mut().rev().find(|l| &*l.name == name) {
                 if l.index.is_none() {
                     l.index = Some(index.clone());
                 }

@@ -229,11 +229,10 @@ fn bug_2221_is_below_answers_as_is_ancestor_whatever_was_remembered() {
 /// that misses the newest packs probes every pack's index
 /// (`pack::Packs::find_in`, 28 % of the server's CPU at 560 s) while each
 /// listing reads every row: S29's background merge
-/// (`pack_gc::maybe_schedule`, HUB §13.37) is never called. Once a
+/// (`pack_gc::maybe_schedule`, HUB §13.37) was never called. Once a
 /// project's small listed packs reach `MERGE_MIN_PACKS`, the server merges
 /// them in the background, without anyone running it.
 #[test]
-#[ignore = "BUG-2230: small packs are never merged in the background (pack_gc::maybe_schedule is never called)"]
 fn bug_2230_small_packs_are_merged_in_the_background_once_they_pile_up() {
     let hub = TestHub::start();
     let p = setup_project(&hub);

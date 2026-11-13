@@ -1611,6 +1611,68 @@ gained since the branch's last landing. `is_below` answers exactly as
 - Signing the read grant on every `tips` (`Grant::issue`, 15 to 28 %) is
   the largest steady cost per request.
 
+## Small packs merged in the background (BUG-2230, 2026-11-13, `packgc`)
+
+The many-branch headline at 300 agents for 10 minutes, before
+(`98aee270`, BUG-2221's fix: nothing calls S29's background merge) and
+after (`packgc`: every push that lists a pack calls
+`pack_gc::maybe_schedule`, HUB §13.37), on the same 32-core machine,
+objects in a local directory, one run at a time (`bench-quiet.sh`, load
+before 2.3 and 1.1; after 32 and 41, the runs' own). A copy of
+`bench-server.sh` with a `custom` profile passing its flags to
+`veil-bench load`, which also counts the `packs` rows every 30 s:
+
+```sh
+OBJECTS=local bash ~/.cache/veil-orch/bench-quiet.sh bash .scratch/bench-custom.sh custom -- --mode branches --projects 1 --rates max --merge-every 5 --clients 300 --duration 600
+# and --rates 110 (open loop, the before run's rate) with the after build
+```
+
+| Build | Rate | Pushes (/s) | p50 (ms) | p99 (ms) | Server CPU (ms/push) | Server cores | DB CPU (ms/push) | DB statements per push | Storage reads per push | KiB stored per push | Told to come back | Packs listed at the end (bytes) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| before | max | **109.3** | 1,587 | 16,379 | 137.7 | 15.0 | 23.5 | 156.2 | 29.8 | 14.4 | 60,394 | **136,667** (400 MB) |
+| after | max | **249.7** | 1,073 | 3,510 | 74.3 | 18.5 | 24.9 | 231.4 | 272.3 | 45.6 | 0 | **86** (1.64 GB) |
+| after | 110/s | 110.0 | **34.9** | **249** | **40.9** | 4.5 | 21.6 | 179.4 | 52.0 | 47.0 | 0 | 100 (379 MB) |
+
+The `packs` table every 30 s (listed packs; before, every push's stays):
+before 27,000 at 30 s, 94,000 at 3 min, 137,000 at 10 min. After, the
+merges fall behind the opening burst (about 1,000 pushes/s in the first
+minute: 10,695 listed at 90 s), are back under 1,000 by 3 minutes and
+stay between 66 and 520 after (both after runs); about 18,000 discarded rows wait out the
+60 s grace period at any time.
+
+- **2.3 times the pushes over 10 minutes**, half the server's CPU per
+  push, p99 4.7 times lower, and no answer told an agent to come back.
+  At the before run's own rate the after build answers in 35 ms (p50;
+  before 1.6 s) with 41 ms of server CPU a push (before 138).
+- **What merging costs:** every object is copied about once a size class
+  (`Options::size_tiers`: packs of one class, a factor of 16 in bytes,
+  merged 16 to 64 at a time), so the bytes stored per push go from 14.4
+  to 45.6 KiB, in few large writes (storage writes per push 12.7 and
+  11.0). A first version merged the smallest packs together whatever
+  their sizes, so a merged pack still under 8 MiB was copied again by
+  every later pass (about 40 times for a 1.7 KB push).
+- **A merge no longer fills the object cache:** `Objects::put_job_pack`
+  cached every object it wrote, under the pack's staged keys and again
+  under the project's when listed, up to 32 MiB a pass of objects nobody
+  asked for. It caches none now. That alone did not change the storage
+  reads (267 and 272 a push in the two after runs at full rate).
+- **Not closed: the storage reads per push grow** (**BUG-2271**, open):
+  29.8 before, 52.0 after at the same rate, 272 after at full rate.
+  Counted by read site in a 3-minute diagnostic build: almost all are
+  `Objects::get_blocking` misses (the landing's reads through the
+  repository), 3.1 of 3.5 million at 180 s; merges read 4 a push, index
+  loads under 1. The reads rise steeply over the run, as the branches
+  (never taking `main` back in this shape) get longer: each landing
+  reads the branch's own snapshots down to where it left `main`
+  (above). The after runs also land twice as many batches (12,023
+  against 6,872 at 110/s) where the before run told 60,394 requests to
+  come back. Local reads here; on S3 each is a request.
+- **`Packs::find_in` and `refresh_in`** were not changed: with at most a
+  few hundred packs listed they search and list a few hundred, not
+  136,000. `Packs::load` finds a pack newest first (a listing's new packs
+  are at the end), so a listing that adds `k` packs no longer walks every
+  pack `k` times.
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |

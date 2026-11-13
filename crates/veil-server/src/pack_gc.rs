@@ -91,6 +91,17 @@ pub const MAX_MERGED_BYTES: u64 = 32 << 20;
 /// Maximum number of source packs merged in one pass (bounds work per run).
 pub const MAX_PACKS_PER_RUN: usize = 64;
 
+/// A size class of small packs spans a factor of 2^`TIER_BITS` (16) in
+/// bytes ([`Options::size_tiers`]): merging [`TIER_MIN_PACKS`] to
+/// [`MAX_PACKS_PER_RUN`] packs of one class makes a pack one or two classes
+/// up, so an object is copied about once a class (4 or 5 times from a
+/// 1 KB push to [`SMALL_PACK_BYTES`]), and fewer than `TIER_MIN_PACKS`
+/// packs of each class are left listed.
+pub const TIER_BITS: u32 = 4;
+
+/// The fewest packs of one size class a background merge merges.
+pub const TIER_MIN_PACKS: usize = 16;
+
 /// Maximum bytes read in a single storage range request when copying entries
 /// from a source pack during merge/GC.
 const COPY_SPAN: u64 = 2 << 20;
@@ -142,6 +153,13 @@ pub struct Options {
     /// Optional hook invoked right before GC verifies `RefStamp` and switches
     /// packs / deletes loose objects (for deterministic race tests).
     pub before_switch: Option<SwitchHook>,
+    /// Merge small packs by size class ([`TIER_BITS`]): only packs of one
+    /// class, the smallest class with at least `min_packs_to_merge` packs
+    /// (the background merges, BUG-2230). Without it the smallest small
+    /// packs are merged together whatever their sizes, so a merged pack
+    /// that is still small is copied again by every later pass until it
+    /// passes `small_pack_bytes`.
+    pub size_tiers: bool,
 }
 
 /// Async callback invoked right before GC verifies `RefStamp` and commits a switch.
@@ -171,6 +189,7 @@ impl Default for Options {
             now_offset_ms: 0,
             crash: None,
             before_switch: None,
+            size_tiers: false,
         }
     }
 }
@@ -229,41 +248,94 @@ pub struct Report {
 /// Per-server background pack-GC state on [`Hub`].
 #[derive(Default)]
 pub struct State {
-    active: Mutex<HashSet<i64>>,
+    /// Projects with a background merge task on this server, each with
+    /// whether a push listed a pack since the task last counted (it counts
+    /// again before it stops).
+    active: Mutex<HashMap<i64, bool>>,
     pub runs: AtomicU64,
+    /// Background merge passes that merged packs (for tests).
+    pub background_merges: AtomicU64,
 }
 
-/// Trigger a background pack-merge check for `project` if its small listed
-/// pack count has reached [`MERGE_MIN_PACKS`]. Non-blocking; yields to
-/// landings and pushes via `limits.derive_turn()`.
+/// The least time between two counts of a project's small packs by one
+/// server's background task while nothing is to merge: a push that lists a
+/// pack meanwhile is counted when the gap ends, so the last pushes of a
+/// burst are never left uncounted, and under steady pushes the count runs
+/// at most once a gap, not once a push.
+pub const CHECK_GAP: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A push listed packs in `project` (BUG-2230): merge its small listed packs
+/// in the background once they reach [`MERGE_MIN_PACKS`]. Non-blocking. At
+/// most one task per project on this server: a push while it runs only
+/// marks the project to be counted again. The task runs merge-only passes
+/// ([`Options`] with `run_gc: false`: no object is dropped, so the switch
+/// takes neither the GC epoch row nor the root writers' gate and never
+/// waits for, or holds up, a push or a landing's transaction) by size
+/// class ([`Options::size_tiers`]: the smallest class with at least
+/// [`TIER_MIN_PACKS`] packs, at most [`MAX_PACKS_PER_RUN`] of them a pass),
+/// one after another while one merged, each under the project's advisory
+/// lock (one server at a time; another server's run makes this one's a
+/// skip), a derive worker permit and S24's shedding (`derive_turn` before
+/// each step). The old packs stay listed until the merged pack and its row
+/// are durable, and stay stored for [`DEFAULT_PACK_GRACE_MS`] after.
 pub fn maybe_schedule(hub: &Arc<Hub>, project: i64) {
     {
         let mut active = hub.pack_gc.active.lock().unwrap();
-        if !active.insert(project) {
+        if let Some(again) = active.get_mut(&project) {
+            *again = true;
             return;
         }
+        active.insert(project, false);
     }
     let hub = hub.clone();
     tokio::spawn(async move {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM packs WHERE project_id = $1 AND state = $2 AND size <= $3",
-        )
-        .bind(project)
-        .bind(LISTED)
-        .bind(SMALL_PACK_BYTES as i64)
-        .fetch_one(&hub.derive.db)
-        .await
-        .unwrap_or(0);
-        if count as usize >= MERGE_MIN_PACKS {
-            let opts = Options {
-                min_packs_to_merge: MERGE_MIN_PACKS,
-                run_gc: false,
-                ..Options::default()
-            };
-            let _ = run_project(&hub, project, &opts).await;
+        loop {
+            let merged = merge_small_packs(&hub, project).await;
+            if !merged {
+                tokio::time::sleep(CHECK_GAP).await;
+            }
+            let mut active = hub.pack_gc.active.lock().unwrap();
+            let again = active.entry(project).or_insert(false);
+            if !merged && !*again {
+                active.remove(&project);
+                return;
+            }
+            *again = false;
         }
-        hub.pack_gc.active.lock().unwrap().remove(&project);
     });
+}
+
+/// One background merge-only pass on `project` if its small listed packs
+/// reach [`MERGE_MIN_PACKS`]: whether it merged any (so another may follow).
+async fn merge_small_packs(hub: &Arc<Hub>, project: i64) -> bool {
+    let count: i64 = match sqlx::query_scalar(
+        "SELECT count(*) FROM packs WHERE project_id = $1 AND state = $2 AND size <= $3",
+    )
+    .bind(project)
+    .bind(LISTED)
+    .bind(SMALL_PACK_BYTES as i64)
+    .fetch_one(&hub.derive.db)
+    .await
+    {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    if (count as usize) < MERGE_MIN_PACKS {
+        return false;
+    }
+    let opts = Options {
+        min_packs_to_merge: TIER_MIN_PACKS,
+        run_gc: false,
+        size_tiers: true,
+        ..Options::default()
+    };
+    match run_project(hub, project, &opts).await {
+        Ok(r) if !r.skipped && r.packs_merged > 0 => {
+            hub.pack_gc.background_merges.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Run one bounded merge and/or garbage-collection pass on `project`.
@@ -690,6 +762,18 @@ async fn select_batch(
         (a.objects, a.size, a.created_at, &a.name).cmp(&(b.objects, b.size, b.created_at, &b.name))
     });
 
+    if opts.size_tiers {
+        // The smallest class with enough packs, alone (sorted by size within).
+        let class = |p: &PackRow| (u64::BITS - p.size.max(1).leading_zeros()) / TIER_BITS;
+        let mut counts: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+        for p in &small {
+            *counts.entry(class(p)).or_default() += 1;
+        }
+        let pick = counts.iter().find(|(_, n)| **n >= opts.min_packs_to_merge.max(2)).map(|(c, _)| *c);
+        small.retain(|p| Some(class(p)) == pick);
+        small.sort_by(|a, b| (a.size, a.created_at, &a.name).cmp(&(b.size, b.created_at, &b.name)));
+    }
+
     let Some(gc) = gc else {
         if small.len() < opts.min_packs_to_merge {
             return Ok((Vec::new(), HashSet::new(), None, false));
@@ -936,6 +1020,26 @@ async fn compact_batch(
                 if locked.len() != old_names.len() {
                     return Ok(None);
                 }
+                // The replacement packs must still be this run's, staged
+                // (BUG-2270): another server that took the project's lock
+                // after this one's lock session ended (its connection
+                // dropped while the run went on) discards a staged job
+                // pack as an interrupted run's and deletes its bytes;
+                // replacing the old packs by it would lose their objects
+                // once the grace period passed.
+                if !new_names.is_empty() {
+                    let staged: Vec<String> = sqlx::query_scalar(
+                        "SELECT name FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3 FOR UPDATE",
+                    )
+                    .bind(project)
+                    .bind(&new_names)
+                    .bind(STAGED)
+                    .fetch_all(&mut *c)
+                    .await?;
+                    if staged.len() != new_names.len() {
+                        return Ok(None);
+                    }
+                }
                 if !all_expired_hexes.is_empty() {
                     purge_expired_db_records(c, project, &all_expired_hexes).await?;
                 }
@@ -1007,8 +1111,12 @@ async fn compact_batch(
         .into_iter()
         .map(|(n, held, _, _)| (n, held.index.clone()))
         .collect();
+    // Into the lookup map only: a job pack's objects are not cached
+    // (`Objects::put_job_pack`), so there is nothing to move to the
+    // project's keys, and walking a merged index for it costs a hash an
+    // object.
     if !for_listed.is_empty() {
-        hub.objects.listed_here(project, for_listed);
+        hub.objects.packs().listed_here(project, for_listed);
     }
     let old_arcs: Vec<Arc<str>> = batch.iter().map(|p| p.name.clone()).collect();
     hub.objects.forget_packs(project, &old_arcs);

@@ -3527,7 +3527,14 @@ async fn push_staged(
             .into_iter()
             .map(|p| ((p.name.clone(), p.held.map(|h| h.index)), p.name))
             .unzip();
+        let listed_any = !for_cache.is_empty();
         hub.objects.listed(project.id, for_cache);
+        // Merge the project's small packs in the background once they pile
+        // up (BUG-2230): every push lists one, and each lookup and listing
+        // grows with them.
+        if listed_any {
+            crate::pack_gc::maybe_schedule(hub, project.id);
+        }
         if !moved.is_empty() || !embargo_upserts.is_empty() {
             hub.caches.tips_changed(project.id);
         }
