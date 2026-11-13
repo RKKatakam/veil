@@ -137,9 +137,10 @@ gate_scaling() {
 # SIGKILL). Shown from the database and the tool's results: another server
 # took the lease, how long no landing committed, and every change landed
 # exactly once (deploy/checks/failover.sql says what each row proves;
-# deploy/checks/failover-verdict.py judges them).
+# deploy/checks/failover-verdict.py judges them, and holds every answer the
+# agents got, failover.landings.jsonl, against `main`'s line, failover-line.txt).
 gate_failover() {
-    local i rc=0 pid t0 stop holder=0 best=0 a b before after left=
+    local i rc=0 pid t0 stop holder=0 best=0 a b st before after left=
     [ "$SERVERS" -ge 2 ] || { echo "gates: failover needs at least two servers behind one address (VEIL_DO_HUBS=2 or 3)" >&2; return 2; }
     t0=$(db_now_us)
     bench driver failover load --url "$URL" --ca /tls/ca.pem --warmup "$WARMUP" --duration "$FAILOVER_DURATION" --mode landing --projects 1 --clients "$FAILOVER_AGENTS" --people "$FAILOVER_PEOPLE" --rates "$FAILOVER_RATE" --dir /work/failover --out "$R/failover.json" "$@" &
@@ -150,7 +151,10 @@ gate_failover() {
     for i in $(seq "$SERVERS"); do first[$i]=$(hub_stats "$i" | stat_of landing_batches); done
     pause 3
     for i in $(seq "$SERVERS"); do
-        a=${first[$i]:-0}; b=$(hub_stats "$i" | stat_of landing_batches)
+        a=${first[$i]:-0}; st=$(hub_stats "$i"); b=$(stat_of landing_batches <<<"$st")
+        if [ -z "$st" ] && [ "$DRY" != 1 ]; then
+            echo "   server $i: gave no counters (its stats.json is missing or empty: can it write its data directory? see its log)" >&2
+        fi
         echo "   server $i: landing batches $a -> $b in about 3 s"
         if [ $((b - a)) -gt "$best" ]; then best=$((b - a)); holder=$i; fi
     done
@@ -179,6 +183,9 @@ gate_failover() {
     done
     after=$(check_sql failover-lease.sql "$t0" | db_one)
     check_sql failover.sql "$t0" "$stop" | db_sql | record failover-check.txt
+    # `main`'s first-parent line, for the verdict to hold against the tool's
+    # per-change log (failover.landings.jsonl, beside failover.json).
+    check_sql failover-line.sql "$t0" | db_sql | record failover-line.txt
     { echo "lease_after=$after"; echo "unfinished_after_settling=${left:-}"; echo "tip_derived=${a:-}"; } | record failover-after.txt
     hub_ctl "$holder" start
     return $rc

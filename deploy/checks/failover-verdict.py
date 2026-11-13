@@ -8,13 +8,21 @@ check fails, 0 when every one passes.
 
     python3 deploy/checks/failover-verdict.py RESULTS_DIR
 
-"Exactly once" rests on the database: the landing queue (every ticket the
-servers accepted), the landing records (each landed change and the
-snapshot it became) and `main`'s first-parent line in the derived graph.
-The benchmark counts its landings but does not log which change each was,
-so a landing whose answer was lost with the stopped server (the agent saw
-an error; the ticket landed anyway) is told apart from none: the tool's
-count may be lower than the database's, never higher.
+"Exactly once" is judged from both sides. The database: the landing
+queue (every ticket the servers accepted), the landing records (each
+landed change and the snapshot it became) and `main`'s first-parent line
+in the derived graph (failover-line.txt, deploy/checks/failover-line.sql).
+The agents: the benchmark's per-change log (failover.landings.jsonl), one
+line for each `landed` answer (ticket, change, the landed snapshots) and
+one for each submit that failed (the error, and the ticket when the server
+gave one). Every change an agent was told landed must be on `main`'s line
+exactly once, under the ticket it was told (the `landed` snapshot ids are
+the caller's projection, not `main`'s ids, so they are not compared); every
+change on the line that a ticket landed and no agent was told about must
+be explained by a failed submit: by its ticket when the failure carried
+one, otherwise by counting (one submit that got no answer, a broken
+connection or a timeout, can have landed at most one change, so such
+changes may not outnumber the failed submits without a ticket).
 """
 import json
 import pathlib
@@ -32,6 +40,58 @@ def kv(path):
                     k, v = line.split(sep, 1)
                     out[k.strip()] = v.strip()
                     break
+    return out
+
+
+# A change id as the API writes it (veil-core `ChangeId`: 32 letters k-z,
+# z = 0 ... k = f) and as the derived graph stores it (hex): both to hex.
+REVERSE_HEX = str.maketrans("zyxwvutsrqponmlk", "0123456789abcdef")
+
+
+def change_hex(c):
+    c = str(c).strip().lower()
+    return c.translate(REVERSE_HEX) if c and all("k" <= ch <= "z" for ch in c) else c
+
+
+def answers(d):
+    """The agents' side: {change: [ticket]}, the
+    tickets of failed submits, and the number of failed submits without
+    one; None when the log is missing."""
+    path = d / "failover.landings.jsonl"
+    if not path.exists():
+        return None
+    told, failed_tickets, failed_blind, bad = {}, set(), 0, 0
+    for line in path.read_text().splitlines():
+        try:
+            v = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if "failed" in v:
+            if v.get("ticket"):
+                failed_tickets.add(str(v["ticket"]))
+            else:
+                failed_blind += 1
+        elif v.get("change"):
+            # `landed` holds snapshot ids as the caller sees them (its
+            # projection), not the ids on `main`: the ticket is compared.
+            told.setdefault(change_hex(v["change"]), []).append(str(v.get("ticket") or ""))
+        else:
+            bad += 1
+    return told, failed_tickets, failed_blind, bad
+
+
+def main_line(d):
+    """The database's side: `main`'s first-parent line, [(snapshot,
+    change, [tickets])], tip first; None when the dump is missing."""
+    path = d / "failover-line.txt"
+    if not path.exists():
+        return None
+    out = []
+    for line in path.read_text().splitlines():
+        f = line.split("|")
+        if len(f) == 4 and f[0].isdigit():
+            out.append((f[1], change_hex(f[2]), [t for t in f[3].split(",") if t]))
     return out
 
 
@@ -94,6 +154,38 @@ def main():
             "every landed change once on `main`, nothing else")
     row("tickets conflict / rejected", f"{chk.get('tickets_conflict', '–')} / {chk.get('tickets_rejected', '–')}", None,
         "answered, not landed (an agent then submits again, as a new ticket)")
+    # The agents' answers against `main`'s line, change by change.
+    ans, line = answers(d), main_line(d)
+    row("the per-change log and `main`'s line", "present" if ans is not None and line else "missing",
+        ans is not None and bool(line), "failover.landings.jsonl (the tool) and failover-line.txt (the database)")
+    if ans is not None and line:
+        told, failed_tickets, failed_blind, bad = ans
+        on_main = {}
+        for snap, change, tickets in line:
+            on_main.setdefault(change, []).append((snap, tickets))
+        n_told = sum(len(v) for v in told.values())
+        row("answers `landed` / failed submits (with a ticket, without)",
+            f"{n_told} / {len(failed_tickets) + failed_blind} ({len(failed_tickets)}, {failed_blind})", None,
+            "from the start of the run, warm-up included")
+        row("unreadable lines in the log", bad, bad == 0, "every line is an answer or a failure")
+        twice_told = sum(len(v) - 1 for v in told.values())
+        row("changes answered `landed` twice", twice_told, twice_told == 0, "one answer per submit, one submit per change")
+        missing = [c for c in told if c not in on_main]
+        row("told landed, not on `main`", len(missing), not missing,
+            "a change an agent was told had landed and is not on `main`'s first-parent line: lost" +
+            (f" (e.g. `{missing[0]}`)" if missing else ""))
+        doubled = [c for c in told if len(on_main.get(c, [])) > 1]
+        row("told landed, on `main` more than once", len(doubled), not doubled,
+            "landed twice" + (f" (e.g. `{doubled[0]}`)" if doubled else ""))
+        elsewhere = [c for c, v in told.items() if len(on_main.get(c, [])) == 1 and not all(t and t in on_main[c][0][1] for t in v)]
+        row("told landed under another ticket", len(elsewhere), not elsewhere,
+            "the ticket the agent was answered is the one that landed the change on `main`" + (f" (e.g. `{elsewhere[0]}`)" if elsewhere else ""))
+        untold = [(c, tickets) for _, c, tickets in line if tickets and c not in told]
+        by_ticket = sum(1 for _, tickets in untold if failed_tickets & set(tickets))
+        blind = len(untold) - by_ticket
+        row("landed, no agent told: explained by a failed submit's ticket / left ≤ failed submits without a ticket",
+            f"{len(untold)}: {by_ticket} / {blind} ≤ {failed_blind}", blind <= failed_blind,
+            "a submit that got no answer (a broken connection, a timeout) may have landed one change; nothing else lands untold")
     t_ops, t_err = tool.get("ops"), tool.get("errors")
     if t_ops is not None and landed is not None:
         row("the tool's landings (measured window) ≤ the database's", f"{int(t_ops)} ≤ {landed}", int(t_ops) <= landed,

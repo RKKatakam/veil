@@ -99,11 +99,15 @@ services:
 
   # Servers behind one address are one server to a client: the second
   # gets the first's identity, receipt key, grant key and cache token
-  # (configure.sh does the same over SSH).
+  # (configure.sh does the same over SSH). This is the first container to
+  # mount hub2data, at a path the image does not have, so Docker makes the
+  # volume root's: it is given to the server's user, or hub2 cannot write
+  # its data directory (its stats.json: the failover gate then finds no
+  # lease holder when hub2 holds the lease).
   hub2-keys:
     image: veil-server:${TAG}
     user: "0"
-    entrypoint: ["sh", "-c", "cd /hub1 && cp hub-identity.json hub-receipt-key hub-grant-key hub-cache-token /hub2/ && chown 10001:10001 /hub2/hub-* && chmod 600 /hub2/hub-*"]
+    entrypoint: ["sh", "-c", "cd /hub1 && cp hub-identity.json hub-receipt-key hub-grant-key hub-cache-token /hub2/ && chown 10001:10001 /hub2 /hub2/hub-* && chmod 600 /hub2/hub-*"]
     mem_limit: 64m
     volumes:
       - hub1data:/hub1:ro

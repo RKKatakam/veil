@@ -413,8 +413,12 @@ apart (`SIGUSR1` → `stats.json`): the holder is the one whose
 records the moment on the database's clock (`failover-run.txt`). When the
 load ends it waits until no ticket of the run is still queued and the
 tip of `main` is in the derived graph, then runs `deploy/checks/failover.sql`
-(`failover-check.txt`); `deploy/checks/failover-verdict.py` judges it
-(`failover-verdict.md`, non-zero exit on a failed check):
+(`failover-check.txt`) and dumps `main`'s first-parent line
+(`deploy/checks/failover-line.sql`, `failover-line.txt`: each snapshot
+from the tip down, its change id and the tickets that landed it);
+`deploy/checks/failover-verdict.py` judges them against each other and
+against what the agents were told (`failover-verdict.md`, non-zero exit on
+a failed check):
 
 - **another server took over**: the lease's holder after differs from the
   one before;
@@ -426,6 +430,17 @@ tip of `main` is in the derived graph, then runs `deploy/checks/failover.sql`
   snapshot is recorded for two changes; no snapshot on the line after the
   first landing lacks a ticket; and the line's length is the set-up
   snapshots plus the landed changes, exactly;
+- **what the agents were told** (`failover.landings.jsonl`, below, against
+  `failover-line.txt`): every change an agent was answered `landed` is on
+  `main`'s first-parent line exactly once, as the snapshot and under the
+  ticket it was told, and no change was answered `landed` twice; every
+  change on the line that a ticket landed and no agent was told about is
+  explained by a failed submit: by its ticket, when the failure carried
+  one (`still queued after the server's wait`), and otherwise by count:
+  a submit that got no answer (a broken connection to the stopped server,
+  a timeout, an HTTP error from the balancer) can have landed at most one
+  change, so the rest may not outnumber the failed submits without a
+  ticket. A missing log fails the verdict;
 - **the pause**: the longest gap between landings (their `done_at`) after
   the stop, against the target of 2 s and the longest gap in the 30 s
   before. At least one landing must follow the stop: with none there is
@@ -438,21 +453,25 @@ wrongly refused changes after the failover would show only in those
 counts (each agent writes a file of its own, so a plain run expects no
 conflicts).
 
-The database is the authority here. The benchmark tool's count over the
-measured window must not exceed the database's (it is lower by the
-warm-up's landings and by **answers lost with the stopped server**: the
-ticket was accepted and landed, but the agent saw a broken connection).
-To tell those apart change by change, `veil-bench load --mode landing`
-also writes, beside its results (`--out X.json` gives
-`X.landings.jsonl`), one JSON line for each landing an agent was answered
-`landed` (`ticket`, `change`, the `landed` snapshot ids, `project`,
-`at_ms`) and one for each submit that failed (`failed`: the error, and the
-`ticket` when the server gave one), from the start of the run, warm-up
-included. With it "every change the tool was told landed is on `main`
-once" can be checked from both sides: each `change` of the file on
-`main`'s first-parent line exactly once, and a failed submit's `ticket`,
-when it has one, looked up in `landing_queue`. The gate does not read the
-file yet (`failover.sql` judges from the database alone).
+The per-change log: `veil-bench load --mode landing` writes, beside its
+results (`--out X.json` gives `X.landings.jsonl`), one JSON line for each
+landing an agent was answered `landed` (`ticket`, `change`, the `landed`
+snapshot ids, `project`, `at_ms`) and one for each submit that failed
+(`failed`: the error, and the `ticket` when the server gave one), from the
+start of the run, warm-up included. The tool's count over the measured
+window must also not exceed the database's (it is lower by the warm-up's
+landings and by the answers lost with the stopped server).
+
+What the verdict still can't see: which change a submit without an answer
+was. Those landings are accepted by count, not by name: any landed ticket
+no agent heard of passes while there are no more of them than failed
+submits without a ticket, whether or not they were those submits' own
+(a change an agent *was* told about is judged by name either way, so a
+lost or doubled one is always caught). Changes the server refused
+(`conflict`, `rejected`) are counted only, as above. A change of a stack
+other than its first is not matched to its ticket (the tool submits one
+change per ticket). A `landed` reply the tool could not read is not in
+the log; if it landed, the verdict fails (unexplained), never passes.
 
 ### 6.2 The results directory
 
@@ -538,6 +557,32 @@ server's landed-from-itself records as second landings. The tool's
 database-commit counter reads 0 on YugabyteDB (it counts PostgreSQL
 transaction ids): commits per landing are measured on PostgreSQL only.
 
+**Failover again, 2026-11-13** (`dokit3`; images `veil-server:93f14e54`
+and `veil-bench:93f14e54`, whose Rust is staging `169cd8f8`'s: BUG-1970's
+fix, the per-change landing log; the same topology and sizes, `GATES=failover`,
+once with `docker stop` and once with `FAILOVER_HOW=kill`). The verdict now
+also holds every answer the agents got against `main`'s first-parent line
+(§6.1). Again for the flow only: one machine.
+
+| Run | Lease | Exactly once (database) | Exactly once (the agents' answers) | Longest pause after the stop (30 s before) | Verdict |
+|---|---|---|---|---|---|
+| stop (`20261113T012547Z`) | server 2 → server 1, epoch 1 → 2 | `main` = 2 set-up + 1,622 landed, nothing queued | 1,621 answered `landed`, each on `main` once under its ticket; 1 landing no agent heard of, against 22 failed submits without a ticket (broken connections to the stopped server) | **481 ms** (311 ms) | pass |
+| kill (`20261113T012950Z`) | server 2 → server 1, epoch 1 → 2 | `main` = 2 + 1,621, nothing queued | 1,620 answered, each once; 1 unheard of, against 23 failed submits | **2,711 ms** (392 ms) | exactly once: pass; pause: **miss** |
+
+Before BUG-1970's fix both pauses were about 2.4 s. A clean stop now
+gives the lease up at once (two earlier stop runs of this round: 628 and
+307 ms); a crash still waits for the lease to expire (`LEASE_MS`, 2 s)
+and for the next server's retry, BUG-1970's cause (2), left open.
+
+Found by this round, both fixed in the kit: the agents' change ids are in
+Veil's letters (`k`–`z`) and the graph's in hex, and the `landed`
+snapshot ids an agent is answered are its own projection, not `main`'s
+(the verdict compares hex change ids and tickets); and in the rehearsal
+the second server could not write its data directory, so the gate found
+no lease holder when that server held it (**BUG-2080**: the first kill
+run, `20261112T231814Z`, failed so; both runs above had server 2 holding
+the lease).
+
 ### 9.2 The rehearsal of 2026-11-09 (one server, PostgreSQL)
 
 `deploy/compose/rehearsal.sh boat` on Boat machines (8 vCPU, 16 GB, Docker
@@ -609,7 +654,13 @@ succeeds, records its settings and runs where it belongs (the drivers'
 gates against the balancer's private address, `scaling` from both
 drivers, `failover` stopping the lease holder and reading its checks
 through stdin); and that no secret appears in any of it or in the
-topology recorded beside results. `configure.sh`, `bench.sh` and `logs.sh`
+topology recorded beside results. The failover verdict is tested on
+made-up results directories (§7 of the tests): a clean run passes (with
+one landing explained by a failed submit's ticket and one by a failed
+submit without one), and a change told landed but not on `main`, one told
+landed and twice on `main`, a landing no agent was told about beyond the
+failed submits, a change answered twice as two snapshots, and a run
+without the per-change log each fail. `configure.sh`, `bench.sh` and `logs.sh`
 over real SSH are exercised only by the rehearsal's equivalent Docker
 commands (§4) and by the DigitalOcean run.
 
