@@ -37,7 +37,7 @@
 
 pub mod class;
 pub mod embargo;
-pub mod gate;
+pub mod review_gate;
 pub mod review;
 pub mod revision;
 pub mod rules;
@@ -2066,7 +2066,7 @@ pub async fn verify_landing_review(
     Ok(Err(format!("{NOT_READY} {}", reasons.join("; "))))
 }
 
-pub(crate) use self::gate::close_review_gate;
+pub(crate) use self::review_gate::close_review_gate;
 
 /// One entry of a landing batch, for [`verify_landing_reviews`]: what
 /// [`verify_landing_review`] is asked of it.

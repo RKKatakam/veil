@@ -1334,7 +1334,7 @@ impl Service {
                 // shared by every other batch with a person's entry.
                 // Whatever changes the rules, the holds or that access
                 // commits before this reads, or waits for this commit. A
-                // writer announced first (`prs::gate`, BUG-2110): the batch
+                // writer announced first (`prs::review_gate`, BUG-2110): the batch
                 // waits for it outside the transaction and runs again.
                 let rules_change = match &rules_landing {
                     Some(l) => crate::prs::state::changes_rules(&mut *c, pid, l).await?,
@@ -1344,7 +1344,7 @@ impl Service {
                     crate::prs::close_review_gate(&mut *c, pid).await?;
                 } else if has_active_user_entries && review_guard.is_some() {
                     let look = !writers_seen.lock().unwrap().1;
-                    let writers = crate::prs::gate::share_review_gate(&mut *c, pid, look).await?;
+                    let writers = crate::prs::review_gate::share_review_gate(&mut *c, pid, look).await?;
                     if !writers.is_empty() {
                         writers_seen.lock().unwrap().0 = writers;
                         return Err(Error::conflict(REVIEW_WRITERS));
@@ -1555,7 +1555,7 @@ impl Service {
                 Err(Error::Api { code: "conflict", message, .. }) if message == STORE_SLOW => Storing::wait(&stored_outside).await?,
                 Err(Error::Api { code: "conflict", message, .. }) if message == REVIEW_WRITERS => {
                     let ids = std::mem::take(&mut writers_seen.lock().unwrap().0);
-                    crate::prs::gate::wait_review_writers(&hub.db, pid, &ids).await?;
+                    crate::prs::review_gate::wait_review_writers(&hub.db, pid, &ids).await?;
                     writers_seen.lock().unwrap().1 = true;
                 }
                 r => break r,

@@ -1,4 +1,4 @@
--- The review gate's writers (BUG-2110, `prs::gate`): a write that takes a
+-- The review gate's writers (BUG-2110, `prs::review_gate`): a write that takes a
 -- project's review gate exclusively first announces itself here, in a row
 -- committed on its own, and a landing batch takes the gate shared only
 -- when no writer of its project is announced; one that finds one waits

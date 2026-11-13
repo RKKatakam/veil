@@ -312,8 +312,8 @@ where
             }
         };
         // The review gate's writers this attempt announced are removed when
-        // it ends, committed or not (BUG-2110, `prs::gate`).
-        let r = match tokio::time::timeout_at(deadline, crate::prs::gate::scoped(pool, once)).await {
+        // it ends, committed or not (BUG-2110, `prs::review_gate`).
+        let r = match tokio::time::timeout_at(deadline, crate::prs::review_gate::scoped(pool, once)).await {
             Ok(r) => r,
             Err(_) => return Err(Error::busy()),
         };

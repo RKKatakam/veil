@@ -5458,7 +5458,7 @@ transaction per landing instead of 23.
    treated as before, and when the backlog is under 2 s landings wait for
    a place again. One person's flood holds another person's landing back
    no longer than the gate's order did: both come in as places free.
-12. **The review gate and the landing's lock order** (`prs/gate.rs`,
+12. **The review gate and the landing's lock order** (`prs/review_gate.rs`,
    BUG-1886, BUG-2061, BUG-2110, BUG-2111). Every landing meets the review
    rules, holds and approvals in force when it commits. The gate is a
    per-project transaction-scoped advisory lock: every batch with a

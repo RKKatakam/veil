@@ -2157,7 +2157,7 @@ fn review_gate_key(pid: i64) -> i64 {
 /// batch that comes after the writer must not get in before it, or a busy
 /// project's overlapping batches starve the writer: YugabyteDB (2025.2)
 /// grants a later shared request past a waiting exclusive one. The writer
-/// announces itself first (`prs::gate`), and a batch asks for the gate only
+/// announces itself first (`prs::review_gate`), and a batch asks for the gate only
 /// when no writer is announced. Here two transactions stand in for two
 /// batches on other branches: the first holds the gate while the verdict
 /// waits; the second runs a batch's ask after the verdict's and finds the
@@ -2195,7 +2195,7 @@ fn bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate() {
         // and leaves the gate to it.
         let mut second = th.rt.block_on(h.db.begin()).unwrap();
         th.rt.block_on(sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *second)).unwrap();
-        let writers = th.rt.block_on(veil_server::prs::gate::share_review_gate(&mut second, pid, true)).unwrap();
+        let writers = th.rt.block_on(veil_server::prs::review_gate::share_review_gate(&mut second, pid, true)).unwrap();
         let rows: Vec<(i64, i64, i64)> =
             th.rt.block_on(sqlx::query_as("SELECT id, project_id, since_ms FROM review_writers").fetch_all(&h.db)).unwrap();
         th.rt.block_on(first.rollback()).unwrap();
@@ -2283,7 +2283,7 @@ fn bug_2111_a_reviewer_removed_while_the_batch_commits_does_not_approve_it() {
 }
 
 /// BUG-2110: stand-ins for batches on other branches, run as a batch runs
-/// its ask for the review gate (`prs::gate`), overlap without end: three
+/// its ask for the review gate (`prs::review_gate`), overlap without end: three
 /// loops, each holding the gate shared 150 ms at a time, 50 ms apart, so
 /// that at every instant at least two hold it. Three verdicts in a row are
 /// each answered within a bound of the order of one batch's commit, on
@@ -2306,12 +2306,12 @@ fn bug_2110_writers_are_answered_in_bounded_time_while_batches_overlap_without_e
                 tokio::time::sleep(Duration::from_millis(50 * i)).await;
                 while !stop.load(Ordering::SeqCst) {
                     let mut tx = db.begin().await.unwrap();
-                    let writers = veil_server::prs::gate::share_review_gate(&mut tx, pid, true).await.unwrap();
+                    let writers = veil_server::prs::review_gate::share_review_gate(&mut tx, pid, true).await.unwrap();
                     if !writers.is_empty() {
                         tx.rollback().await.unwrap();
-                        veil_server::prs::gate::wait_review_writers(&db, pid, &writers).await.unwrap();
+                        veil_server::prs::review_gate::wait_review_writers(&db, pid, &writers).await.unwrap();
                         tx = db.begin().await.unwrap();
-                        let again = veil_server::prs::gate::share_review_gate(&mut tx, pid, false).await.unwrap();
+                        let again = veil_server::prs::review_gate::share_review_gate(&mut tx, pid, false).await.unwrap();
                         assert!(again.is_empty(), "{again:?}");
                     }
                     tokio::time::sleep(Duration::from_millis(150)).await;
