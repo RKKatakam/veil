@@ -825,6 +825,155 @@ MinIO run / the local-directory run, with Git's numbers of those runs.
 * **Clone one directory:** the rounds per level, and its S1 form (all
   history of the directory) against a thin clone's.
 
+## Performance round 5: start-up, clone one directory, a fresh clone's flushes (2026-11-13)
+
+Branch `clifast3` (on `6f2f2ec0`), for BUG-1944 and BUG-1945. The owner's
+rule of 2026-11-12 holds throughout: a commit's six barriers, the undoable
+op log, the rule that drops the watcher's plan while a policy change is
+pending, the heads record (BUG-1960, BUG-2010) and a returned commit's
+durability are as they were. No repository format change, no new flag.
+
+### What changed
+
+* **Start-up with the watcher vouching (item 1).** A lock-free repository
+  built the working copy inside a transaction at every command; when the
+  watcher's plan is clean (nothing changed, nothing to recheck) the
+  watched build is now looked at first, outside any transaction, staged in
+  memory, and builds nothing if the plan does not apply (a policy or key
+  change, a rescan: `builder::build_tree_planned`, `watched_only`); a
+  working copy found as recorded makes no transaction, anything else is
+  built in the transaction as before. **The stat cache's checksum** (it
+  covers the 4.6 MB file) is verified before the first record is decoded,
+  never skipped (`statcache::Loaded::intact`): a command that decodes none
+  never hashes it. **Pack indexes** are listed at first need and each one
+  opened (read and checked against its data file, as before) when a lookup
+  reaches it (`PackSet::pending`): `log -n 20` on the 1 GB profile opens 8
+  of 24. Tests: `statcache::the_checksum_is_verified_before_the_first_record_is_read`,
+  `core_sync` `storage::pack_indexes_are_read_when_a_lookup_reaches_them`
+  (a loose read opens none, a packed one opens packs until one holds it,
+  an absent object or the list opens all, a damaged index is found broken
+  when reached, a miss is `Corrupt`), `core_engine`
+  `watched::a_clean_plan_that_does_not_apply_records_what_a_full_scan_does`
+  (and the seeded `watched::` walks: a clean plan records what a scan does).
+* **Clone one directory (item 2) is thin**, as every clone is by default:
+  the tip's trees on the way to the folder and below it, the folder's
+  files, older history on demand. Before, `--only` forced the S1 form
+  (10,054 snapshots, 30,527 objects); `--only DIR --full` keeps it. The
+  earlier attempt (round 5 of `clifast2b`) recorded folders it never wrote
+  as deleted; the whole class is closed: a folder the clone left out is
+  never read, fetched, written or recorded, readable or not:
+  `Materialised::fill_in` dropped it from the record once its tree was
+  readable (in S1 its tree was absent, which hid that), the builder now
+  carries it by id without reading it (a file of the person's own there is
+  listed as not recorded), a move's prefetch skips it
+  (`ObjectStore::prefetch_move`) and a move's changes are computed with it
+  as the working copy shows it (`Materialised::with_left_out_as`), so
+  nothing below it is diffed or written. **Its trees in one request:**
+  `GET /v1/projects/{p}/subtree?snapshot=ID&path=DIR` (protocol revision 7,
+  `crates/veil-server/src/subtree.rs`) lists the root, the folders down to
+  `DIR` and every tree below (at most 20,000) from the caller's projected
+  tree and narrowing, and answers through `sync::fetch`, so every level is
+  checked exactly as a fetch checks it; its path comes through
+  `Ask::file_path`; it is classified in
+  `agents::every_route_that_takes_a_path_or_a_revision_is_classified_and_narrowed`.
+  A thin clone's first fetch takes each tree where its walk reaches it
+  (checked against its id), then asks for the files of every level at
+  once; any other answer leaves the walk to ask level by level. The files
+  are written by checkout's 8 threads, as before. Tests (`server_hub`
+  `clone_one::`): the route answers every level as the caller sees it; a
+  folder or snapshot the caller may not see is refused with fetch's exact
+  status and body, naming nothing; someone with no session gets the public
+  folder only; a narrowed agent session is refused outside its paths and
+  gets only its paths inside; `a_one_folder_clone_records_only_what_it_wrote`
+  (thin and `--full`: after the clone, after a pull with changes inside
+  and outside and a move, with a file of the person's own in a folder never
+  written, and after an edit pushed, the project outside the folder is as
+  others left it and nothing outside it was fetched). `sync::bug_832`'s
+  admin clone, thin now, reads the project's recorded policy and seals the
+  edit of the folder's `.env` under its rule, as a whole clone does (the
+  test now expects that; fin's views still keep it local).
+* **A fresh clone's set-up flushes (item 4)**, about 60 one after another,
+  are deferred to one barrier before the checkout's journal, for a clone
+  into a directory it makes only, and only on the backend of that
+  directory (`DiskBackend::defer_durability`, `end_deferral`; the person's
+  home and anything else keep their own flushes). Safe because nothing
+  existed before: the clone's marker is durable before the deferral, every
+  command refuses a directory holding it without the journal (and now
+  finds such a directory by the marker alone, so a `repo.json` lost in a
+  power cut never makes it a folder of a repository above), the journal is
+  written only after the barrier, and a failed clone removes its
+  directory. Tests (`clone_one::`, a power cut simulated in debug builds,
+  `VEIL_TEST_CLONE_POWER_CUT`): `a_fresh_clone_cut_before_its_one_barrier_is_refused_never_usable`
+  (6 seeds of every deferred file kept, emptied, cut short or gone, whole
+  and `--only` clones, alone and inside another repository: every command
+  refuses with the clone's refusal, in the directory and below it, the
+  repository around it records nothing of it, and a new clone works) and
+  `a_clone_into_a_directory_that_was_there_defers_nothing`; the existing
+  `warm::a_failed_clone_leaves_no_directory_that_looks_usable`,
+  `sync::a_clone_killed_at_any_point_is_refused_or_finished` and
+  `sync::a_one_directory_clone_killed_during_its_checkout_is_finished`
+  pass. `strace -c` of the 1 GB `--only docs` clone: 24 `fsync` calls
+  before, 4 after.
+* **A full scan on several threads (item 3): built, measured, reverted.**
+  Subtrees of the walk were built ahead on 7 threads, each by a builder of
+  its own, and taken where the walk would build them (the same parent
+  entry and depth), with its report continued in order and its stat cache
+  records; a seeded test against the serial walk (unreadable files and
+  folders, links, nested repositories, ignored folders, secrets, the
+  nesting limit) passed, and two mutations of it failed it. On the 1 GB
+  profile it saved nothing (interleaved, 4 × 9 runs: base 64 to 70 ms,
+  threaded 68 to 74, serial 62 to 75): the listing, the `stat`s and the
+  classification already run on 7 threads (`prefetch`), and what bounds
+  the scan is serial around the walk: decoding the 35,000 stat cache
+  records (9 to 15 ms) and 10 to 20 ms between the cache run and the walk
+  (timing marks in an instrumented build; not explained this round). The
+  change was reverted as it saved nothing (`e46102ee`).
+
+### Results
+
+Medians; Git on the same tree. 1 GB profile: 4 rounds of 9 processes,
+before/after interleaved, through `bench-quiet.sh` (load 2 to 6; the
+daemon restarted before each batch); a second, quieter run with the
+daemon left running is in brackets. Clone: a local server (objects in a
+directory), 3 rounds of 5, interleaved; Git `clone --filter=blob:none
+--sparse` and `sparse-checkout set docs`, 9 runs.
+
+| Case (1 GB profile) | Before | After | Git | Result |
+|---|---:|---:|---:|---|
+| `clone --only docs` (1,317 files) | 1,016 to 1,044 ms | **354 to 386 ms** | 401 to 414 ms | **Veil ahead** (was 2.5×) |
+| `.veil` of that clone | 23 MB | 11 MB | | |
+| `log -n 20` (watcher) | 11.8 to 22.1 (8.4 to 9.4) ms | 12.7 to 18.6 (8.0 to 8.2) ms | 1.5 to 2.4 ms | **miss**: fixed costs, below |
+| status, clean (watcher) | 8.0 to 19.8 (7.1 to 7.6) ms | 9.5 to 14.7 (5.7 to 5.8) ms | 30 to 33 ms | ahead of Git |
+| status, clean (daemon stopped) | 63.6 to 70.1 ms | 62.5 to 68.1 ms | 30 to 33 ms | **miss**: item 3, above |
+| `log -n 20` (daemon stopped) | 64.4 to 69.6 ms | 63.0 to 68.0 ms | | a scan |
+
+`scripts/bench-server.sh openscion` (MinIO), twice each, alternated
+(before a, after a, before b, after b). Its `status` and `log` rows moved
+by a factor of 3 between runs, Git's own with them (Git's `log -n 20` at
+10,000 files: 1.3 to 4.2 ms), so only the clone rows are given.
+
+| Files | Case | Before | After | Git | Result |
+|---:|---|---:|---:|---:|---|
+| 1,000 | clone one directory | 73.8 / 75.3 | 72.3 / 51.3 | 63 to 69 | level to ahead |
+| 10,000 | clone one directory | 53.5 / 45.8 | 44.9 / 47.6 | 55 to 74 | **Veil ahead** |
+| 1,000 | clone everything | 173 / 171 | 140 / 128 | 213 to 247 | ahead |
+
+### What remains, and why
+
+* **`log -n 20` (8 ms quiet, against Git's 1.5)**: what is left is spread
+  thin over about 1,700 system calls (Git: about 100): the process and its
+  threads, five reads of the op log's heads (four of them registering
+  for gc's fence: `mkdir`, a fence check, `rmdir`), the daemon's answer, the pack listing
+  (48 `stat`s of names), and the reads of the 20 snapshots, each opening
+  its pack file. Each is under a millisecond; none is a safety step that
+  could go.
+* **A full scan** (status with the daemon stopped, 65 ms against Git's
+  31): item 3 above; the next lever is the stat cache's decode (a layout
+  that can be read by directory, a change of the cache file only) and the
+  unexplained 10 to 20 ms before the walk.
+* **The one-file commit at 1,000 and 10,000 files**: the accepted residual
+  (owner, 2026-11-12).
+
 ## Next
 
 1. **Clone one directory** (Git's level, not below): the ~60 sequential
