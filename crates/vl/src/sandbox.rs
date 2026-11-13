@@ -1501,6 +1501,11 @@ fn keep_one(dir: &Path, to: &Path, path: &VPath) -> std::io::Result<()> {
     if !std::fs::symlink_metadata(&from)?.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
+    // Only a file inside the sandbox: never one a link in its path leads to.
+    let parent = from.parent().map(std::fs::canonicalize).transpose()?;
+    if !parent.is_some_and(|p| std::fs::canonicalize(dir).is_ok_and(|d| p.starts_with(d))) {
+        return Err(std::io::Error::other("its path leads out of the sandbox"));
+    }
     let mut made = Vec::new();
     for d in dest.ancestors().skip(1) {
         if d.exists() {
