@@ -722,7 +722,14 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
             });
         }
         Cmd::Land { rev, onto, remote, no_wait, status } => {
-            return hub_cmd::land(ctx, remote, rev.as_deref(), onto.as_deref(), !*no_wait, status.as_deref());
+            let code = hub_cmd::land(ctx, remote, rev.as_deref(), onto.as_deref(), !*no_wait, status.as_deref())?;
+            // Sent, as `vl push` sends (BUG-2170): the change landed (or
+            // queued) without a quarantined file is not a plain success
+            // either. `--status` sends nothing.
+            return Ok(match status.is_none() && code == ExitCode::SUCCESS {
+                true => render::quarantine_status(&ctx.report, "sent to land"),
+                false => code,
+            });
         }
         #[cfg(debug_assertions)]
         Cmd::Pull { remote } if test_remotes::is_path_remote(ctx, remote) => test_remotes::pull(ctx, remote)?,

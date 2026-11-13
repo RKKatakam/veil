@@ -42,7 +42,7 @@ static STDOUT_ERROR: OnceLock<String> = OnceLock::new();
 /// Exit status for output cut short by a closed pipe: 128 + SIGPIPE.
 pub const BROKEN_PIPE_STATUS: u8 = 141;
 
-/// Exit status of `vl commit`, `vl new` and `vl push` when the working copy
+/// Exit status of `vl commit`, `vl new`, `vl push` and `vl land` when the working copy
 /// holds quarantined files (BUG-2140): the work is done, without them.
 pub const QUARANTINE_STATUS: u8 = 3;
 
@@ -278,7 +278,7 @@ pub fn one_line(repo: &Repo, id: &ObjectId) -> String {
 }
 
 /// The exit status of a command that recorded, finalised or pushed work
-/// (`vl commit`, `vl new`, `vl push`): [`QUARANTINE_STATUS`], with every
+/// (`vl commit`, `vl new`, `vl push`, `vl land`): [`QUARANTINE_STATUS`], with every
 /// file named on standard error, while the working copy holds files the
 /// scanner quarantined, which no snapshot has; success otherwise
 /// (BUG-2140: a script that commits and pushes must notice).

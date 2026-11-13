@@ -362,10 +362,10 @@ $ cat cfg.js
 k = process.env.AWS_KEY
 ```
 
-A quarantine never passes as a plain success: **`vl commit`, `vl new` and
-`vl push` exit 3** while the working copy holds a quarantined file. The
-work is done all the same (the change is recorded, or pushed, without the
-file), and each file left out is named on standard error, so a script that
+A quarantine never passes as a plain success: **`vl commit`, `vl new`,
+`vl push` and `vl land` exit 3** while the working copy holds a quarantined
+file. The work is done all the same (the change is recorded, or pushed or
+landed, without the file), and each file left out is named on standard error, so a script that
 commits and pushes stops instead of shipping a change with a file silently
 missing:
 
@@ -383,7 +383,7 @@ $ echo $?
 
 Once each file is resolved (fixed, `vl isolate`d or `vl expose --force`d),
 the same commands exit 0; a file you isolated on purpose never makes them
-fail. Read-only commands (`vl status`, `vl log`, `vl diff`) exit 0 and list
+fail. With `--no-snapshot` they look at no file, so they do not check. Read-only commands (`vl status`, `vl log`, `vl diff`) exit 0 and list
 the files; `vl status --json` has them in `quarantined`, and the `commit`
 result of `vl serve --local` carries the same list.
 

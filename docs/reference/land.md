@@ -7,6 +7,8 @@ Land a change on a branch through the server's landing service: the server puts 
 
 REV and the changes under it that the server does not hold yet land in order, all or none, each as its own snapshot. A protected branch (`.veilrules`: `[branches.main] protected = true`) moves only this way, and `vl push` to one lands instead. Waits for the outcome: landed (your tag follows the change), conflict (the paths that changed meanwhile: pull, redo the change on the new tip, land again) or rejected.
 
+Exits 3 (the work done all the same) while the working copy holds files the secret scanner quarantined, naming each: `vl isolate FILE` keeps one on this machine on purpose, `vl expose --force FILE` records one that is not a secret.
+
 ```text
 vl land [OPTIONS] [REV]
 ```

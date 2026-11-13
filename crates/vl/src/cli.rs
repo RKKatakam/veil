@@ -754,6 +754,11 @@ pub enum Cmd {
     /// landed (your tag follows the change), conflict (the paths that
     /// changed meanwhile: pull, redo the change on the new tip, land again)
     /// or rejected.
+    ///
+    /// Exits 3 (the work done all the same) while the working copy holds
+    /// files the secret scanner quarantined, naming each: `vl isolate
+    /// FILE` keeps one on this machine on purpose, `vl expose --force FILE`
+    /// records one that is not a secret.
     Land {
         /// The change to land (default: `@-`, the change you last committed).
         rev: Option<String>,

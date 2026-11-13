@@ -382,3 +382,23 @@ fn ws_exec_of_dot_named_workspaces_stays_inside_the_sandboxes_directory() {
     assert!(!proj.join(".veil/local/files").exists());
     assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "..", "x.txt"]), "x\n");
 }
+
+// BUG-2171: a `vl ws exec` whose command succeeded but whose recording left
+// a file out as a secret looks like a plain success (exit 0), as `vl commit`
+// did before BUG-2140; with --ephemeral the file goes with the throwaway
+// directory. The command's own failure keeps its status.
+#[test]
+#[ignore = "BUG-2171: vl ws exec exits 0 when its recording quarantined a file the command wrote"]
+fn bug_2171_ws_exec_that_quarantines_an_output_file_exits_3() {
+    let env = Env::new();
+    let proj = project(&env);
+    let leak = "echo \"const key = 'AKIAIOSFODNN7EXAMPLE';\" > cfg.js";
+    for args in [vec!["ws", "exec", "agent", "--", "sh", "-c", leak], vec!["ws", "exec", "--ephemeral", "--", "sh", "-c", leak]] {
+        let out = env.vl("alice", &proj, &args);
+        assert_eq!(out.status.code(), Some(3), "vl {args:?}:\n{}", text(&out));
+        assert!(text(&out).contains("  cfg.js (aws-access-key-id at line 1; never recorded)"), "{}", text(&out));
+    }
+    // A failing command keeps its own status.
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", "exit 7"]);
+    assert_eq!(out.status.code(), Some(7), "{}", text(&out));
+}
