@@ -338,8 +338,11 @@ struct Counters {
     /// Answers that told a landing agent to come back later (`429` or `503`
     /// with `retry_after_ms`), each waited out before the next submit.
     slowed: AtomicU64,
-    /// Branches landed on `main` (`--merge-every`).
+    /// Branches landed on `main` (`--merge-every`), and the answers that
+    /// told a branch's landing to come back later (each waited out and
+    /// asked again, BUG-2222).
     merges: AtomicU64,
+    merge_waits: AtomicU64,
     errors: AtomicU64,
     requests: AtomicU64,
     /// Landings that were up to date (pull mode: nothing to fetch).
@@ -628,8 +631,21 @@ impl Agent<'_> {
                     // `--merge-every`: the branch lands on `main` (what of it
                     // has not landed yet), through the landing service.
                     if self.merge_every > 0 && self.branch != "main" && self.files.is_multiple_of(self.merge_every) {
-                        self.c.requests.fetch_add(1, Ordering::Relaxed);
-                        let r = self.api.post_json(Some(self.token), &self.path("/land"), &json!({"onto": "main", "snapshot": snap.hex()}))?;
+                        // Told to come back later (`503 busy` with
+                        // `retry_after_ms`, HUB §13.32 item 11): waited out
+                        // and asked again as `vl land` does, within the
+                        // deadline (BUG-2222).
+                        let (c, api, token, path) = (self.c, &self.api, self.token, self.path("/land"));
+                        let body = json!({"onto": "main", "snapshot": snap.hex()});
+                        let r = asked_until_answered(
+                            deadline,
+                            || {
+                                c.requests.fetch_add(1, Ordering::Relaxed);
+                                api.post_json(Some(token), &path, &body)
+                            },
+                            || c.count(&c.merge_waits, 1),
+                        )
+                        .context("land the branch")?;
                         ok(&r, "land the branch")?;
                         let v: serde_json::Value = serde_json::from_slice(&r.body)?;
                         if v["state"].as_str() != Some("landed") {
@@ -870,6 +886,23 @@ fn wait_asked(r: &Reply) -> Option<u64> {
     }
     let ms = serde_json::from_slice::<serde_json::Value>(&r.body).ok()?["retry_after_ms"].as_u64()?;
     Some(ms + u64::from(veil_core::crypto::random_bytes::<1>()[0]) % (ms / 8).max(1))
+}
+
+/// Send a request until it is answered other than "come back later": each
+/// answer asking so (`retry_after_ms`, [`wait_asked`]) is counted by
+/// `waited` and waited out within `deadline`, then the request is sent
+/// again; the first other answer is returned (BUG-2222).
+fn asked_until_answered(deadline: Instant, mut send: impl FnMut() -> Result<Reply>, mut waited: impl FnMut()) -> Result<Reply> {
+    loop {
+        let r = send()?;
+        let Some(ms) = wait_asked(&r) else { return Ok(r) };
+        waited();
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("told to come back each time until the deadline: HTTP {} {}", r.status, String::from_utf8_lossy(&r.body));
+        }
+        std::thread::sleep(Duration::from_millis(ms).min(left));
+    }
 }
 
 /// Capped, jittered backoff after a busy server.
@@ -1606,6 +1639,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         result["mix"] = json!(a.mix);
         result["people"] = json!(a.people.max(1));
         result["branch_merges"] = json!(c.merges.load(Ordering::Relaxed));
+        result["branch_merge_waits"] = json!(c.merge_waits.load(Ordering::Relaxed));
         // The landing service's own counters (the server this tool started).
         let ratio = |a: Option<f64>, b: Option<f64>, k: f64| a.zip(b).map(|(a, b)| if b > 0.0 { a / b / k } else { f64::NAN });
         result["landing_batches"] = json!(stat("landing_batches"));
@@ -1873,13 +1907,16 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
 fn line(r: &serde_json::Value) -> String {
     let f = |k: &str| r[k].as_f64().map(|v| format!("{v:.2}")).unwrap_or_else(|| "–".into());
     format!(
-        "{} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, server ms/op {}, db ms/op {}, db/op {}, commits/op {}, writes/op {}, derived {} s later ({} branches behind)",
+        "{} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, told to come back {} (busy {}, branch landings {}), server ms/op {}, db ms/op {}, db/op {}, commits/op {}, writes/op {}, derived {} s later ({} branches behind)",
         f("ops_per_s"),
         r["agents_finishing"],
         f("p50_ms"),
         f("p99_ms"),
         f("collisions_per_op"),
         r["errors"],
+        r["busy"].as_u64().unwrap_or(0) + r["slowed"].as_u64().unwrap_or(0) + r["branch_merge_waits"].as_u64().unwrap_or(0),
+        r["busy"],
+        r["branch_merge_waits"],
         f("server_cpu_ms_per_op"),
         f("db_cpu_ms_per_op"),
         f("db_per_op"),
@@ -2051,5 +2088,50 @@ mod tests {
         let raced = |w: f64| json!({"mode": "land", "ops": 1000.0, "collisions_per_op": 4.0, "storage_push_writes_per_op": w});
         assert!(missed_gates(&raced(9.0), 0.0).is_empty());
         assert_eq!(missed_gates(&raced(12.0), 0.0).len(), 1);
+    }
+
+    fn reply(status: u16, body: serde_json::Value) -> Reply {
+        Reply { status, body: body.to_string().into_bytes() }
+    }
+
+    /// BUG-2222: a branch's landing told to come back later (`503 busy`
+    /// with `retry_after_ms`, as the landing service answers past what it
+    /// lands in time) is waited out and asked again until it is answered,
+    /// each such answer counted apart from errors; an answer without
+    /// `retry_after_ms` is the caller's to judge (an error), and asking
+    /// stops at the deadline.
+    #[test]
+    fn bug_2222_a_branch_landing_told_to_come_back_is_asked_again() {
+        let busy = || reply(503, json!({"code": "busy", "message": "come back later", "retry_after_ms": 2}));
+        let mut answers = vec![busy(), busy(), reply(200, json!({"state": "landed"}))].into_iter();
+        let (mut sent, mut waited) = (0, 0);
+        let r = asked_until_answered(
+            Instant::now() + Duration::from_secs(10),
+            || {
+                sent += 1;
+                Ok(answers.next().expect("no more asks than answers"))
+            },
+            || waited += 1,
+        )
+        .expect("answered once the server takes it");
+        assert_eq!(r.status, 200);
+        assert_eq!((sent, waited), (3, 2));
+
+        // A 503 that does not say when to come back is handed back as it is.
+        let mut waited = 0;
+        let r = asked_until_answered(Instant::now() + Duration::from_secs(10), || Ok(reply(503, json!({"code": "unavailable"}))), || waited += 1)
+            .expect("handed back");
+        assert_eq!((r.status, waited), (503, 0));
+        assert!(ok(&r, "land the branch").is_err(), "the caller counts it as an error");
+
+        // Told to come back each time: it stops at the deadline.
+        let start = Instant::now();
+        let mut waited = 0;
+        let Err(e) = asked_until_answered(start + Duration::from_millis(50), || Ok(busy()), || waited += 1) else {
+            panic!("asking went on past the deadline")
+        };
+        assert!(format!("{e:#}").contains("told to come back each time"), "{e:#}");
+        assert!(waited >= 2, "{waited} waits before the deadline");
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }
