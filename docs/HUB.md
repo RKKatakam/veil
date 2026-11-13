@@ -2583,12 +2583,26 @@ can never make a change count as landed.
 cheapest first: the tip itself; `landings` of the current lineage (an
 agent's base is its own last landing, or a tip it read; batches record the
 tip they move from); the derived commit graph when it holds the tip (its
-jump table, bounded by generation), never waiting for the deriver; else a
+jump table, bounded by generation), never waiting for the deriver; when it
+does not hold the tip yet, the part of the line it does not hold is read
+from the store, once per submit (at most 4,096 snapshots), down to the
+first snapshots it holds, and the graph answers below them; else a
 walk down from the tip shared by the whole stack: while the line is read,
 at most 256 snapshots (a base a few landings below a tip the deriver has
 not reached yet: BUG-1405), and once it is read, for what was left
 undecided, at most 4,096, whose frontier the derived graph then answers
-for. Past that, `warming` (503: try again).
+for. Past that, `warming` (503: try again). **The graph's answers
+(BUG-2221)**: first parents through the jump table; else one walk down in
+generation order, shared by every question of the submit with the same
+starting points. A snapshot found not below a tip is remembered so (per
+server, at most 262,144 such facts, the oldest forgotten first; history
+never changes, so the fact never goes stale), and the next walk for it
+stops at that tip: a branch landed on `main` again and again reads what
+`main` gained since its last landing, not `main`'s history since the
+branch left it (before, every snapshot of the branch, none of them on
+`main` since each landed as a rebased copy, walked every snapshot of
+`main` newer than it, at every landing: 78 % of the server's CPU three
+minutes into the many-branch headline).
 
 **What a submit costs at most, whatever the hidden history**: one
 statement for the branch, and for each change the submitter sees on the
