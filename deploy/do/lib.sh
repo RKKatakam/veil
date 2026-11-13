@@ -37,6 +37,19 @@ HUBS=${VEIL_DO_HUBS:-1}
 SIZE_LB=${VEIL_DO_SIZE_LB:-c-4}
 DB_CONNECTIONS=${VEIL_DO_DB_CONNECTIONS:-64}
 HOURS=${VEIL_DO_HOURS:-8}
+# Where the servers keep objects (owner, 2026-11-13; docs/DEPLOY.md §2.3):
+# `minio`, an S3-compatible MinIO on a storage droplet of the run (the
+# speed runs: one Spaces bucket allows about 800 requests a second, the
+# headline needs about 4,900, BUG-2290), or `spaces`, a DigitalOcean Spaces
+# bucket. Either way the `spaces` gate runs a short, slow run on Spaces.
+OBJECTS=${VEIL_DO_OBJECTS:-minio}
+# The storage droplet: 16 dedicated vCPUs and a 400 GB local disk (the
+# gates write at most about 200 GiB, docs/DEPLOY.md §2.3). A smaller size
+# needs a block-storage volume of OBJECTS_VOLUME_GB (0: the droplet's disk).
+SIZE_OBJECTS=${VEIL_DO_SIZE_OBJECTS:-c2-16vcpu-32gb}
+OBJECTS_VOLUME_GB=${VEIL_DO_OBJECTS_VOLUME_GB:-0}
+# The free space configure.sh requires where MinIO keeps its data.
+OBJECTS_NEED_GB=250
 [[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]] || { echo "do: invalid VEIL_DO_NAME '$NAME' (use letters, digits and hyphens)" >&2; exit 2; }
 [[ "$REGION" =~ ^[a-z0-9-]+$ ]] || { echo "do: invalid VEIL_DO_REGION '$REGION'" >&2; exit 2; }
 [[ "$DRIVERS" =~ ^[1-9][0-9]*$ ]] || { echo "do: invalid VEIL_DO_DRIVERS '$DRIVERS'" >&2; exit 2; }
@@ -44,6 +57,13 @@ HOURS=${VEIL_DO_HOURS:-8}
 [[ "$HUBS" =~ ^[123]$ ]] || { echo "do: invalid VEIL_DO_HUBS '$HUBS' (1, 2 or 3 servers)" >&2; exit 2; }
 [[ "$DB_CONNECTIONS" =~ ^[1-9][0-9]*$ ]] || { echo "do: invalid VEIL_DO_DB_CONNECTIONS '$DB_CONNECTIONS'" >&2; exit 2; }
 [[ "$WITH_CACHE" =~ ^[01]$ ]] || { echo "do: invalid VEIL_DO_WITH_CACHE '$WITH_CACHE' (0 or 1)" >&2; exit 2; }
+[[ "$OBJECTS" =~ ^(minio|spaces)$ ]] || { echo "do: invalid VEIL_DO_OBJECTS '$OBJECTS' (minio: MinIO on a storage droplet; spaces: a Spaces bucket)" >&2; exit 2; }
+[[ "$OBJECTS_VOLUME_GB" =~ ^(0|[1-9][0-9]*)$ ]] && [ "$OBJECTS_VOLUME_GB" -le 16000 ] || { echo "do: invalid VEIL_DO_OBJECTS_VOLUME_GB '$OBJECTS_VOLUME_GB' (0, or 1 to 16000)" >&2; exit 2; }
+if [ "$OBJECTS_VOLUME_GB" -gt 0 ]; then
+    [ "$OBJECTS" = minio ] || { echo "do: VEIL_DO_OBJECTS_VOLUME_GB is for the MinIO storage droplet (VEIL_DO_OBJECTS=minio)" >&2; exit 2; }
+    [ "$OBJECTS_VOLUME_GB" -ge "$OBJECTS_NEED_GB" ] || { echo "do: a volume of $OBJECTS_VOLUME_GB GB is under the $OBJECTS_NEED_GB GB the gates need" >&2; exit 2; }
+    [[ "$NAME" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "do: a volume's name must be lowercase and start with a letter: VEIL_DO_NAME '$NAME'" >&2; exit 2; }
+fi
 [[ "$HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ "$(echo "$HOURS > 0" | bc -l)" = 1 ] || { echo "do: invalid VEIL_DO_HOURS '$HOURS' (must be > 0)" >&2; exit 2; }
 IMAGE=ubuntu-24-04-x64
 # Third-party images, pinned (deploy/versions.env: the rehearsal runs the same).
@@ -137,6 +157,7 @@ droplets() {
         for i in $(seq "$YB_NODES"); do echo "yb $NAME-yb$i $SIZE_DB"; done
     else echo "db $NAME-db $SIZE_DB"; fi
     for i in $(seq "$DRIVERS"); do echo "driver $NAME-driver$i $SIZE_DRIVER"; done
+    [ "$OBJECTS" = minio ] && echo "minio $NAME-minio $SIZE_OBJECTS"
     [ "$WITH_CACHE" = 1 ] && echo "cache $NAME-cache $SIZE_CACHE"
     return 0
 }
@@ -153,6 +174,16 @@ database_url() { # [server number, default 1]
         echo "postgres://yugabyte@${n:-YB${i}_PRIVATE_IP}:5433/yugabyte"
     else echo "postgres://veil:${VEIL_DO_DB_PASSWORD:-}@$(priv_of "$NAME-db"):5432/veil"; fi
 }
+# The object store the servers use: MinIO on the storage droplet's private
+# address (TLS with the run's certificate), or the Spaces endpoint.
+objects_endpoint() {
+    if [ "$OBJECTS" = minio ]; then
+        local v; v=$(priv_of "$NAME-minio"); echo "https://${v:-$NAME-minio_PRIVATE_IP}:9000"
+    else echo "$SPACES_ENDPOINT"; fi
+}
+# The storage droplet's volume (when OBJECTS_VOLUME_GB > 0) and the device
+# it appears as on the droplet.
+VOLUME_NAME=$NAME-minio-data
 # The one address agents and `vl` use: the balancer's with several
 # servers, else the server's. `front_host public|private`.
 front_host() {
@@ -163,7 +194,7 @@ front_host() {
 # secrets (a fixed list of names, so a new secret can never leak into it).
 topology() {
     local v
-    for v in NAME REGION SIZE_HUB HUBS SIZE_LB SIZE_DB YB_NODES SIZE_DRIVER DRIVERS WITH_CACHE SIZE_CACHE DB_CONNECTIONS HOURS IMAGE PG_IMAGE YB_IMAGE HAPROXY_IMAGE; do
+    for v in NAME REGION SIZE_HUB HUBS SIZE_LB SIZE_DB YB_NODES SIZE_DRIVER DRIVERS WITH_CACHE SIZE_CACHE DB_CONNECTIONS OBJECTS SIZE_OBJECTS OBJECTS_VOLUME_GB HOURS IMAGE PG_IMAGE YB_IMAGE HAPROXY_IMAGE MINIO_IMAGE; do
         printf '%s=%s\n' "$v" "${!v}"
     done
 }
@@ -182,5 +213,6 @@ price_of() {
         *) echo "" ;;
     esac
 }
+VOLUME_GB_MONTHLY=0.10   # block storage: $0.10 per GiB a month, billed hourly (672 hours)
 SPACES_MONTHLY=5.00   # the Spaces subscription: $5 a month flat (250 GiB, 1 TiB out) while any bucket exists
 BUDGET_MAX=100.00     # owner's rule: the budget is under $100

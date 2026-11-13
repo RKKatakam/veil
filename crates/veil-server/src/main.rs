@@ -43,7 +43,8 @@ struct Args {
     #[arg(long, conflicts_with = "s3_endpoint")]
     storage: Option<PathBuf>,
     /// Keep objects in S3 at this endpoint (credentials in
-    /// VEIL_S3_ACCESS_KEY and VEIL_S3_SECRET_KEY).
+    /// VEIL_S3_ACCESS_KEY and VEIL_S3_SECRET_KEY; a CA of its own, in
+    /// PEM, in the file VEIL_S3_CA names).
     #[arg(long, requires = "s3_bucket")]
     s3_endpoint: Option<String>,
     #[arg(long)]
@@ -310,6 +311,8 @@ fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
         "object_cache_misses": hub.objects.cache_misses.load(Relaxed),
         "storage_own_writes": hub.objects.own_writes.load(Relaxed),
         "pack_row_commits": hub.objects.pack_rows.load(Relaxed),
+        "s3_slow_down": veil_server::store::S3_SLOW_DOWN.load(Relaxed),
+        "s3_gave_up": veil_server::store::S3_GAVE_UP.load(Relaxed),
         "session_hits": c.session_hits.load(Relaxed),
         "session_misses": c.session_misses.load(Relaxed),
         "permission_hits": c.permission_hits.load(Relaxed),

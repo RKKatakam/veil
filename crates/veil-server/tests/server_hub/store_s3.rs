@@ -87,3 +87,30 @@ fn bug_1953_a_store_that_keeps_answering_499_is_refused_within_a_bound_and_nothi
     assert!(f.stored.lock().unwrap().is_empty());
     assert!(rt.block_on(objects.get(1, &id)).unwrap().is_none(), "the object a refused PUT did not store is not served");
 }
+
+/// Every `503 Slow Down` (and `429`) a store answers is counted, as is a
+/// request that still fails when the retries run out: `stats.json`'s
+/// `s3_slow_down` and `s3_gave_up`, which the `spaces` gate of the
+/// deployment kit records against DigitalOcean Spaces' rate limit
+/// (BUG-2290). The counters are the process's, so other tests can only
+/// add to them: each is held to at least what this test caused.
+#[test]
+fn bug_2290_slow_down_answers_and_requests_given_up_are_counted() {
+    use veil_server::store::{S3_GAVE_UP, S3_SLOW_DOWN};
+    let rt = runtime();
+    let (f, store) = fake(&rt, 4, 503);
+    let slow_before = S3_SLOW_DOWN.load(Ordering::SeqCst);
+    let put = rt.block_on(store.put("p/1/o/cd", Bytes::from_static(b"slowed")));
+    assert!(put.is_ok(), "a PUT answered 503 four times, then 200: {put:?}");
+    assert_eq!(f.puts.load(Ordering::SeqCst), 5, "four refused tries and the one that stored");
+    assert!(S3_SLOW_DOWN.load(Ordering::SeqCst) - slow_before >= 4, "the four 503 answers are counted");
+
+    let (f, store) = fake(&rt, usize::MAX, 429);
+    let (slow_before, gave_up_before) = (S3_SLOW_DOWN.load(Ordering::SeqCst), S3_GAVE_UP.load(Ordering::SeqCst));
+    let put = rt.block_on(store.put("p/1/o/ef", Bytes::from_static(b"never stored")));
+    assert_eq!(format!("{:#}", put.unwrap_err()), "S3 PUT: HTTP 429", "a store that keeps answering 429 is refused");
+    let tries = f.puts.load(Ordering::SeqCst) as u64;
+    assert!(tries > 3, "tried again: {tries} tries");
+    assert!(S3_SLOW_DOWN.load(Ordering::SeqCst) - slow_before >= tries, "every 429 is counted ({tries} tries)");
+    assert!(S3_GAVE_UP.load(Ordering::SeqCst) - gave_up_before >= 1, "the request given up is counted");
+}

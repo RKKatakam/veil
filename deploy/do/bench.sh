@@ -8,13 +8,16 @@
 #   commands.txt   every veil-bench command line, and on which machine
 #   *.json, *.md   the tool's raw results and its tables; LABEL.log its output
 #   hub<N>-stats.json, hub<N>-docker-stats.log   each server's counters and samples
+#   minio-docker-stats.log   the MinIO storage droplet's samples (VEIL_DO_OBJECTS=minio)
 #   scaling.md, failover-verdict.md, failover-*.txt     the gates' own tables and checks
 #
 #   bench.sh [--approve] GATE [veil-bench flags...]
 #
 # GATE (deploy/gates.sh): pull land branches api landing scaling failover   (drivers,
 #   against the one address)   objects openscion scale   (the first server's machine,
-#   with a server the tool starts itself). Sizes come from the environment
+#   with a server the tool starts itself)   spaces   (the same, its server on a
+#   Spaces bucket, BUCKET-spaces, with /etc/veil/spaces.env's keys, at a rate
+#   under the bucket's limit). Sizes come from the environment
 #   (DURATION=20, LANDING_AGENTS=10000, ...: docs/REPRODUCE.md); DRIVER=n picks
 #   the driver of a one-driver gate; STEP_LIMIT (default 3600 s) bounds each command.
 set -euo pipefail
@@ -37,16 +40,20 @@ DRY=$((1 - APPROVED))
 R=/work/results/$STAMP-$GATE
 URL=https://$(front_host private):8443
 SERVERS=$HUBS
-OWN=(--server /usr/local/bin/veil-server --s3-endpoint "$SPACES_ENDPOINT")
+OWN=(--server /usr/local/bin/veil-server --s3-endpoint "$(objects_endpoint)")
 OWN_BUCKET=$BUCKET
+SPACES_OWN=(--server /usr/local/bin/veil-server --s3-endpoint "$SPACES_ENDPOINT")
+SPACES_BUCKET=$BUCKET-spaces
 addr() { local v; v=$(ip_of "$1"); echo "${v:-${1}_IP}"; }            # public (a placeholder in a dry run)
 paddr() { local v; v=$(priv_of "$1"); echo "${v:-${1}_PRIVATE_IP}"; }  # private
 HUB1=$(addr "$NAME-hub")
 
-# VEIL_DATABASE_URL, VEIL_S3_ACCESS_KEY and VEIL_S3_SECRET_KEY come from
-# /etc/veil/hub.env (--env-file), never the command line.
+# VEIL_DATABASE_URL, VEIL_S3_ACCESS_KEY, VEIL_S3_SECRET_KEY and VEIL_S3_CA
+# come from /etc/veil/hub.env (the `spaces` gate: /etc/veil/spaces.env)
+# through --env-file, never the command line.
+BENCH_ENV=/etc/veil/hub.env
 bench_cmd() { # veil-bench arguments...
-    echo "mkdir -p /srv/bench/results; chown -R 10002:10002 /srv/bench; timeout --kill-after=60 $STEP_LIMIT docker run --rm --network host --env-file /etc/veil/hub.env -v /srv/bench:/work -v /etc/veil/tls:/tls:ro --ulimit nofile=1048576:1048576 veil-bench:$TAG $(printf '%q ' "$@")"
+    echo "mkdir -p /srv/bench/results; chown -R 10002:10002 /srv/bench; timeout --kill-after=60 $STEP_LIMIT docker run --rm --network host --env-file $BENCH_ENV -v /srv/bench:/work -v /etc/veil/tls:/tls:ro --ulimit nofile=1048576:1048576 veil-bench:$TAG $(printf '%q ' "$@")"
 }
 record() { # FILE: stdin kept in this gate's results directory
     if [ $APPROVED = 1 ]; then cat > "$OUT/$1"; else cat >/dev/null; echo "would record $1" >&2; fi
@@ -59,11 +66,12 @@ bench_on() { # host, label, veil-bench arguments...
     else remote "$host" "$(bench_cmd "$@")"; fi
 }
 record_append() { if [ $APPROVED = 1 ]; then cat >> "$OUT/commands.txt"; else cat >/dev/null; fi; }
-bench() { # driver|drivers|hub, label, veil-bench arguments...
+bench() { # driver|drivers|hub|spaces, label, veil-bench arguments...
     local where=$1 label=$2; shift 2
     local n a args pids=() rc=0
     case $where in
         hub) bench_on "$HUB1" "$label" "$@" ;;
+        spaces) BENCH_ENV=/etc/veil/spaces.env bench_on "$HUB1" "$label" "$@" ;;
         driver)
             n=${DRIVER:-1}
             bench_on "$(addr "$NAME-driver$n")" "$label" "$@" ;;
@@ -111,7 +119,7 @@ topology | record topology.env
         echo "local $img:$TAG $(docker image inspect -f '{{.Id}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}' "$img:$TAG" 2>/dev/null || echo missing)"
     done
     echo "# pinned third-party images (deploy/versions.env)"
-    echo "PG_IMAGE=$PG_IMAGE"; echo "YB_IMAGE=$YB_IMAGE"; echo "HAPROXY_IMAGE=$HAPROXY_IMAGE"
+    echo "PG_IMAGE=$PG_IMAGE"; echo "YB_IMAGE=$YB_IMAGE"; echo "HAPROXY_IMAGE=$HAPROXY_IMAGE"; echo "MINIO_IMAGE=$MINIO_IMAGE"
 } | record images.txt
 for h in "${HUB_IPS[@]}" "${DRIVER_IPS[@]}"; do
     if [ $APPROVED = 1 ]; then
@@ -119,24 +127,26 @@ for h in "${HUB_IPS[@]}" "${DRIVER_IPS[@]}"; do
     else remote "$h" "docker image inspect veil-server:$TAG veil-bench:$TAG; docker ps"; fi
 done
 
-# Metrics on every server while the gate runs: docker stats every 5 s.
-for i in $(seq "$HUBS"); do
-    remote "${HUB_IPS[$((i - 1))]}" "mkdir -p /srv/metrics; rm -f /srv/metrics/$STAMP-$GATE.stats; nohup sh -c 'while true; do echo \"\$(date -u +%FT%TZ) \$(docker stats --no-stream --format \"{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} net={{.NetIO}} blk={{.BlockIO}}\" | tr \"\\n\" \";\")\"; sleep 5; done' > /srv/metrics/$STAMP-$GATE.stats 2>/dev/null & echo \$! > /srv/metrics/$STAMP-$GATE.pid"
+# Metrics on every server (and the MinIO droplet) while the gate runs:
+# docker stats every 5 s.
+SAMPLED=("${HUB_IPS[@]}"); [ "$OBJECTS" = minio ] && SAMPLED+=("$(addr "$NAME-minio")")
+for h in "${SAMPLED[@]}"; do
+    remote "$h" "mkdir -p /srv/metrics; rm -f /srv/metrics/$STAMP-$GATE.stats; nohup sh -c 'while true; do echo \"\$(date -u +%FT%TZ) \$(docker stats --no-stream --format \"{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} net={{.NetIO}} blk={{.BlockIO}}\" | tr \"\\n\" \";\")\"; sleep 5; done' > /srv/metrics/$STAMP-$GATE.stats 2>/dev/null & echo \$! > /srv/metrics/$STAMP-$GATE.pid"
 done
 
 echo "== $GATE against $URL ($HUBS server(s), $DRIVERS driver(s)), limit ${STEP_LIMIT}s per command"
 rc=0
 run_gate "$GATE" "$@" || rc=$?
 
-for i in $(seq "$HUBS"); do
-    h=${HUB_IPS[$((i - 1))]}
+for i in $(seq "${#SAMPLED[@]}"); do
+    h=${SAMPLED[$((i - 1))]}; label=hub$i; [ "$i" -gt "$HUBS" ] && label=minio
     if [ $APPROVED = 1 ]; then
-        hub_stats "$i" > "$OUT/hub$i-stats.json" || true
+        [ "$label" = minio ] || hub_stats "$i" > "$OUT/hub$i-stats.json" || true
         remote "$h" "kill \$(cat /srv/metrics/$STAMP-$GATE.pid) 2>/dev/null" || true
-    else hub_stats "$i"; remote "$h" "kill \$(cat /srv/metrics/$STAMP-$GATE.pid)"; fi
-    copy_from "$h" "/srv/metrics/$STAMP-$GATE.stats" "$OUT/hub$i-docker-stats.log" || true
+    else [ "$label" = minio ] || hub_stats "$i"; remote "$h" "kill \$(cat /srv/metrics/$STAMP-$GATE.pid)"; fi
+    copy_from "$h" "/srv/metrics/$STAMP-$GATE.stats" "$OUT/$label-docker-stats.log" || true
 done
-case $GATE in objects|openscion|scale) SRC=("$HUB1") ;; *) SRC=("${DRIVER_IPS[@]}") ;; esac
+case $GATE in objects|openscion|scale|spaces) SRC=("$HUB1") ;; *) SRC=("${DRIVER_IPS[@]}") ;; esac
 for h in "${SRC[@]}"; do
     if [ $APPROVED = 1 ]; then
         remote "$h" "test -d /srv/bench/results/$STAMP-$GATE" 2>/dev/null && copy_from "$h" "/srv/bench/results/$STAMP-$GATE/." "$OUT/" || true

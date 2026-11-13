@@ -1721,9 +1721,10 @@ VEIL_DIAG_READS=500 OBJECTS=local bash ~/.cache/veil-orch/bench-quiet.sh bash .s
   push are about 4,900 requests a second; one Spaces bucket allows 800
   operations a second (DigitalOcean, "Spaces Limits"), answers more with
   `503 Slow Down`, and asks for a support ticket above 150 a second
-  sustained. Within 800 the headline holds about 40 pushes/s. The paid
-  run needs the bucket's limit raised, or `HEADLINE_RATE=40`
-  (`docs/DEPLOY.md` §11).
+  sustained. Within 800 the headline holds about 40 pushes/s. Decided by
+  the owner (2026-11-13): the paid run's speed runs keep objects in MinIO
+  on a storage droplet, and a 5-minute `spaces` gate runs on Spaces at 20
+  pushes/s (`docs/DEPLOY.md` §2.3).
 
 ## What would raise each ceiling (not built)
 

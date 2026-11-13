@@ -8,6 +8,9 @@
 #   R            this gate's results directory as the benchmark's container sees it
 #   OWN          (array) how the tool starts a server of its own: --server … --s3-endpoint …
 #   OWN_BUCKET   the prefix of those servers' buckets
+#   SPACES_OWN   (array) the same for the `spaces` gate's server: its object store is
+#                a DigitalOcean Spaces endpoint (the rehearsal: its MinIO)
+#   SPACES_BUCKET  that server's bucket
 #   SERVERS      how many servers run behind URL
 #   DRY          1 in a dry run: every step is printed, nothing is waited for
 # and defines
@@ -15,7 +18,8 @@
 #                             command line to commands.txt; returns its exit status.
 #                             WHERE: driver (one driver), drivers (every driver at
 #                             once; `@D` in ARGS becomes the driver's number), hub
-#                             (the first server's machine)
+#                             (the first server's machine), spaces (the same, with
+#                             the Spaces keys)
 #   hub_ctl N stop|kill|start   stop server N (SIGINT, graceful), kill it (SIGKILL),
 #                               or start it and wait until it is healthy
 #   hub_stats N               server N's counters (its stats.json) on stdout
@@ -47,13 +51,22 @@ GATES_DIR=${GATES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 : "${FAILOVER_AGENTS:=1000}" "${FAILOVER_PEOPLE:=100}" "${FAILOVER_RATE:=300}"
 : "${FAILOVER_DURATION:=120}" "${FAILOVER_AFTER:=45}" "${FAILOVER_HOW:=stop}" "${FAILOVER_SETTLE:=120}"
 
-GATES_ALL="pull land branches api landing scaling failover objects openscion scale"
+# spaces: the many-branch shape on a real Spaces bucket, for correctness
+# and flow, not speed (owner, 2026-11-13; BUG-2290). A push makes about
+# 8.6 storage reads and 11.0 writes (docs/design/scale/LOAD.md), 19.6
+# requests; one bucket allows 800 a second, so 40 pushes/s is the limit
+# itself: 20/s (about 390 requests a second) leaves half of it for the
+# setup's bursts, the merges and the deriver. 100 agents, 5 minutes.
+: "${SPACES_AGENTS:=100}" "${SPACES_RATE:=20}" "${SPACES_DURATION:=300}"
+
+GATES_ALL="pull land branches api landing scaling failover objects openscion scale spaces"
 # The settings recorded beside every result (run.txt).
 GATE_SETTINGS="DURATION WARMUP PULL_CLIENTS PULL_BACKGROUND LAND_PROJECTS LAND_CLIENTS BRANCH_CLIENTS OBJECT_CLIENTS
  OPENSCION_FILES OPENSCION_RUNS SCALE_PROFILE SCALE_RUNS LANDING_AGENTS LANDING_PEOPLE LANDING_RATE LANDING_DURATIONS
  LANDING_VARIANTS HEADLINE_AGENTS MERGE_EVERY HEADLINE_RATE HEADLINE_DURATION SCALING_SERVERS SCALING_DURATION
  SCALING_PULL_CLIENTS SCALING_BRANCH_CLIENTS SCALING_LANDING_PROJECTS SCALING_LANDING_CLIENTS FAILOVER_AGENTS
- FAILOVER_PEOPLE FAILOVER_RATE FAILOVER_DURATION FAILOVER_AFTER FAILOVER_HOW FAILOVER_SETTLE"
+ FAILOVER_PEOPLE FAILOVER_RATE FAILOVER_DURATION FAILOVER_AFTER FAILOVER_HOW FAILOVER_SETTLE SPACES_AGENTS SPACES_RATE
+ SPACES_DURATION"
 
 db_one() { db_sql | head -1; }
 db_now_us() { echo "select (extract(epoch from clock_timestamp()) * 1000000)::bigint" | db_one; }
@@ -106,6 +119,11 @@ run_gate() {
             bench hub openscion openscion --vl /usr/local/bin/vl "${OWN[@]}" --s3-bucket "$OWN_BUCKET-openscion" --files "$OPENSCION_FILES" --runs "$OPENSCION_RUNS" --dir /work/openscion --out "$R/openscion.json" "$@" || rc=1 ;;
         scale)
             bench hub scale run --profile "$SCALE_PROFILE" --runs "$SCALE_RUNS" --vl /usr/local/bin/vl "${OWN[@]}" --s3-bucket "$OWN_BUCKET-scale" --dir /work/scale --out "$R/scale-$SCALE_PROFILE.json" --skip-phase import,local,remote-path,packed,sftp,agents "$@" || rc=1 ;;
+        # Its own server on the first server's machine, objects on Spaces;
+        # the tool records the store's `503 Slow Down` answers (s3_slow_down)
+        # and requests given up (s3_gave_up) from that server's counters.
+        spaces)
+            bench spaces spaces load "${SPACES_OWN[@]}" --s3-bucket "$SPACES_BUCKET" --mode branches --projects 1 --clients "$SPACES_AGENTS" --rates "$SPACES_RATE" --merge-every "$MERGE_EVERY" --duration "$SPACES_DURATION" --warmup "$WARMUP" --dir /work/spaces --out "$R/spaces.json" "$@" || rc=1 ;;
         *) echo "gates: unknown gate '$gate' (one of: $GATES_ALL)" >&2; return 2 ;;
     esac
     return $rc
@@ -208,5 +226,6 @@ gate_report() { # GATE, results directory
     case $1 in
         scaling) python3 "$GATES_DIR/scaling-table.py" "$2" > "$2/scaling.md" && cat "$2/scaling.md" ;;
         failover) python3 "$GATES_DIR/checks/failover-verdict.py" "$2" | tee "$2/failover-verdict.md"; return "${PIPESTATUS[0]}" ;;
+        spaces) python3 "$GATES_DIR/checks/spaces-verdict.py" "$2" | tee "$2/spaces-verdict.md"; return "${PIPESTATUS[0]}" ;;
     esac
 }

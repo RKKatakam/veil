@@ -2,8 +2,10 @@
 # Destroy everything the test created (docs/DEPLOY.md, "Teardown"), then
 # check that nothing tagged NAME is left and that the Spaces bucket is gone.
 #   destroy.sh            dry run: what would be deleted
-#   destroy.sh --approve  delete: droplets, firewall, SSH key, tag; empty and
-#                         delete the Spaces bucket (needs the Spaces keys)
+#   destroy.sh --approve  delete: droplets, the storage droplet's volume,
+#                         firewall, SSH key, tag; empty and delete the Spaces
+#                         buckets (needs the Spaces keys). MinIO's objects go
+#                         with its droplet (or its volume).
 #   destroy.sh --check    only the "nothing left" check (--approve to really query)
 # Deleting by tag, not by remembered id, so droplets created by a run that
 # died before saving its state are removed too.
@@ -26,13 +28,14 @@ spaces() { # METHOD, path, extra curl args...: a signed request to Spaces
 spaces_code() { # METHOD, path -> HTTP status code (or 000 on network error)
     spaces "$1" "$2" -o /dev/null -w '%{http_code}' || echo 000
 }
-# Every Spaces bucket this deployment can make: the server's own ($BUCKET)
-# and the three same-machine benchmark buckets ($BUCKET-{objects,openscion,scale}),
+# Every Spaces bucket this deployment can make: the server's own ($BUCKET,
+# with VEIL_DO_OBJECTS=spaces), the three same-machine benchmark buckets
+# ($BUCKET-{objects,openscion,scale}) and the `spaces` gate's ($BUCKET-spaces),
 # plus any bucket in the region starting with $NAME- found by listing '/'.
 spaces_buckets() {
     local b list=()
     if [ -n "$BUCKET" ]; then
-        list+=("$BUCKET" "$BUCKET-objects" "$BUCKET-openscion" "$BUCKET-scale")
+        list+=("$BUCKET" "$BUCKET-objects" "$BUCKET-openscion" "$BUCKET-scale" "$BUCKET-spaces")
     fi
     if [ $APPROVED = 1 ] && [ -n "${VEIL_DO_SPACES_KEY:-}" ] && [ -n "${VEIL_DO_SPACES_SECRET:-}" ]; then
         local xml
@@ -47,6 +50,24 @@ spaces_buckets() {
 if [ $CHECK_ONLY = 0 ]; then
     echo "== destroying everything tagged '$NAME' in the account"
     run_do compute droplet delete --tag-name "$NAME" --force || true
+    # The storage droplet's volume (VEIL_DO_OBJECTS_VOLUME_GB): by the id
+    # create.sh saved and by its exact name (a run that died before saving
+    # it). It detaches when its droplet is deleted, which takes a moment.
+    if [ $APPROVED = 1 ]; then
+        vol_out=$(run_do compute volume list --format ID,Name --no-header)
+        for id in $( { [ -n "${VOL_ID:-}" ] && echo "$VOL_ID"; awk -v n="$VOLUME_NAME" '$2==n{print $1}' <<<"$vol_out"; } | awk 'NF && !seen[$0]++'); do
+            gone=0
+            for i in $(seq 24); do
+                if run_do compute volume delete "$id" --force; then gone=1; break; fi
+                sleep 5
+            done
+            [ $gone = 1 ] || echo "destroy: could not delete the volume $id (still attached?); the check below counts it" >&2
+        done
+    else
+        if [ -n "${VOL_ID:-}" ]; then run_do compute volume delete "$VOL_ID" --force || true; fi
+        run_do compute volume list --format ID,Name --no-header
+        echo "would delete every volume named $VOLUME_NAME (retrying while it detaches)" >&2
+    fi
     if [ -n "${FW_ID:-}" ]; then run_do compute firewall delete "$FW_ID" --force || true; fi
     if [ $APPROVED = 1 ]; then
         fw_out=$(run_do compute firewall list --format ID,Name --no-header)
