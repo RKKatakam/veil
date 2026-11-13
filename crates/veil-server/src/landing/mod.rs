@@ -378,6 +378,9 @@ pub struct Stats {
     /// Submits whose stack asked the derived graph, or walked, whether a
     /// change is on the branch: neither its tip nor a landing (BUG-1275).
     pub walks: AtomicU64,
+    /// Snapshots of the derived graph those walks read
+    /// (`derive::graph::Graph::is_below`, BUG-2221).
+    pub graph_reads: AtomicU64,
     /// Submits told to come back because the branch's queue was full
     /// (`limits::pressure`, BUG-1955), and entries landed merged by
     /// content (BUG-1956).

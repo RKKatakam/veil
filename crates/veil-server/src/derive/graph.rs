@@ -223,7 +223,9 @@ impl<'a> Graph<'a> {
             }
         };
         let w = &mut walks[i];
+        let read = w.read;
         w.down_to(self, rx.generation)?;
+        self.cx.hub().landing.stats.graph_reads.fetch_add(w.read - read, std::sync::atomic::Ordering::Relaxed);
         let below = w.seen.contains(&x);
         if !below {
             if let [s] = starts {
@@ -281,6 +283,8 @@ pub struct Descent {
     stop: Option<ObjectId>,
     heap: BinaryHeap<(i64, ObjectId)>,
     seen: HashSet<ObjectId>,
+    /// Snapshots read so far.
+    read: u64,
 }
 
 impl Descent {
@@ -290,6 +294,7 @@ impl Descent {
             stop,
             heap: BinaryHeap::new(),
             seen: HashSet::new(),
+            read: 0,
         };
         for s in starts {
             if w.seen.insert(*s) {
@@ -307,6 +312,7 @@ impl Descent {
                 break;
             }
             self.heap.pop();
+            self.read += 1;
             if Some(y) == self.stop {
                 continue;
             }
