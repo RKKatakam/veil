@@ -174,7 +174,7 @@ impl Staged {
     /// What the checks made and hold (never stored by them).
     pub(crate) fn made(&self) -> Vec<(ObjectId, Bytes)> {
         let mut v: Vec<(ObjectId, Bytes)> = self.made.lock().unwrap().iter().map(|(k, v)| (*k, v.clone())).collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v.sort_by_key(|a| a.0);
         v
     }
 

@@ -774,7 +774,7 @@ pub struct Batch<'a> {
     /// each changed against its first parent, and the deepest
     /// [`HISTORY_AHEAD`] stored `file_history` rows of each path they
     /// change, as the database held them when read (forgotten at a flush).
-    ahead_trees: HashMap<ObjectId, (Vec<Change>, Vec<String>)>,
+    ahead_trees: HashMap<ObjectId, TreeChanges>,
     ahead_history: HashMap<String, Vec<(i64, ObjectId)>>,
 }
 
@@ -946,7 +946,7 @@ impl<'a> Batch<'a> {
     /// What snapshot `id` (with `parents`) changed against its first parent:
     /// the leaves, and the folders that changed with no leaf below them
     /// ([`changes::diff`]).
-    fn tree_changes(&mut self, id: ObjectId, parents: &[ObjectId]) -> Result<(Vec<Change>, Vec<String>)> {
+    fn tree_changes(&mut self, id: ObjectId, parents: &[ObjectId]) -> Result<TreeChanges> {
         match self.ahead_trees.remove(&id) {
             Some(c) => Ok(c),
             None => tree_changes(&self.cx.src, id, parents),
@@ -1047,7 +1047,7 @@ impl<'a> Batch<'a> {
     fn read_ahead(&mut self, chunk: &[ObjectId]) -> Result<()> {
         let src = &self.cx.src;
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let read: Vec<Result<Vec<(ObjectId, (Vec<Change>, Vec<String>))>>> = std::thread::scope(|sc| {
+        let read: Vec<Result<Vec<(ObjectId, TreeChanges)>>> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..AHEAD_THREADS.min(chunk.len()))
                 .map(|_| {
                     sc.spawn(|| {
@@ -1332,10 +1332,13 @@ impl<'a> Batch<'a> {
     }
 }
 
-/// What snapshot `id` (with `parents`) changed against its first parent:
-/// the leaves, and the folders that changed with no leaf below them
+/// The leaves a snapshot changed, and the folders that changed with no leaf
+/// below them.
+type TreeChanges = (Vec<Change>, Vec<String>);
+
+/// What snapshot `id` (with `parents`) changed against its first parent
 /// ([`changes::diff`]).
-fn tree_changes(src: &Source, id: ObjectId, parents: &[ObjectId]) -> Result<(Vec<Change>, Vec<String>)> {
+fn tree_changes(src: &Source, id: ObjectId, parents: &[ObjectId]) -> Result<TreeChanges> {
     let tree = src.snapshot(&id)?.tree;
     let base = match parents.first() {
         Some(p) => src.snapshot(p)?.tree,

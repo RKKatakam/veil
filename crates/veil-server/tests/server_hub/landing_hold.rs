@@ -1226,8 +1226,8 @@ fn bug_2362_a_submits_grafted_trees_are_stored_with_its_objects() {
         let raw = hub.rt.block_on(hub.hub().objects.get(pid, &t)).unwrap().unwrap();
         let veil_core::object::Object::Tree(tree) = veil_core::object::Object::decode(&raw).unwrap() else { panic!("a tree") };
         trees += 1;
-        for e in tree.entries.values() {
-            if e.kind == veil_core::object::EntryKind::Tree {
+        for e in &tree.entries {
+            if e.kind == veil_core::object::EntryKind::Dir {
                 todo.push(e.id);
             } else {
                 assert!(hub.rt.block_on(store.exists(&veil_server::store::object_key(pid, &e.id))).unwrap(), "{} is stored", e.id.short());
