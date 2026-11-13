@@ -1527,6 +1527,89 @@ a landing; parts are ms a batch):
 | 140 | 1,000 | 1,072 | 1,072 | 165 | 500 | 3,047 | 492 | 992 | 0 | 0 | 368 | 746 | 58.8 | 1.26 |
 | 160 | 1,000 | 893 | 893 | 65 | 2,483 | 6,394 | 2,083 | 3,014 | 9,372 | 0 | 222 | 497 | 44.0 | 1.26 |
 | 180 | 998 | 913 | 910 | 74 | 3,444 | 8,683 | 2,673 | 4,051 | 14,276 | 0 | 277 | 686 | 41.7 | 1.27 |
+## Many branches over minutes (BUG-2221, 2026-11-13, `branchperf2`)
+
+The headline shape (above) at 300 and 1,000 agents for 3 minutes and at
+300 agents for 10, before (`487e9c0b` with the bench's BUG-2222 retry of a
+branch's landing) and after (`branchperf2`'s server, with the bench's
+whole BUG-2222 fix), on the same 32-core machine, objects in a local
+directory, one run at a time (`bench-quiet.sh`, load before 13.6 to 15.1):
+
+```sh
+OBJECTS=local scripts/bench-server.sh custom -- --mode branches --projects 1 --rates max --merge-every 5 --clients 300 --duration 180
+# (a copy of bench-server.sh with one more profile passing its flags to veil-bench load; also --clients 1000, and --duration 600)
+```
+
+**The profile** (the server's CPU sampled at 199 Hz for 25 s, by a
+profiling-only build that is not committed; share of all samples,
+inclusive):
+
+| Run | At | `Graph::is_ancestor` / `is_below` | `api::tips` (of it, signing the grant) | `Packs::find_in` | `edits::edit_set` | `Packs::refresh_in` |
+|---|---:|---:|---:|---:|---:|---:|
+| before, 300 agents, 10 min | 150 s | **81.2 %** | 6.9 % (3.9 %) | 0.0 % | 0.0 % | 2.6 % |
+| before, 300 agents, 10 min | 560 s | **86.3 %** | 3.8 % (1.9 %) | 0.0 % | 0.0 % | 1.8 % |
+| after, 300 agents, 10 min | 150 s | 7.2 % | 43.3 % (27.7 %) | 0.9 % | 3.4 % | 8.5 % |
+| after, 300 agents, 10 min | 560 s | 3.4 % | 32.2 % (14.9 %) | **28.2 %** | 23.8 % | 14.1 % |
+
+Before, almost all of `is_ancestor`'s samples came through
+`landing::Ancestry::near`: a landing of a branch asks, for every snapshot
+of the branch down to where it left `main`, whether it is below `main`'s
+tip. None is (each of its changes landed as a rebased copy), and each
+answer walked every snapshot of `main` whose generation (which follows the
+timestamp) is at least the snapshot's: the branch's oldest snapshots
+walked all of `main` since the branch began, at every landing. The cost of
+a landing grew with the branch's length times what `main` gained since it
+began.
+
+**The fix** (`derive::graph::Graph::is_below`; HUB §13.19): first parents
+through the jump table, as before; else one walk down in generation order,
+shared by every question of the submit with the same starting points; a
+snapshot found not below a tip is remembered so (per server, at most
+262,144 such facts; history never changes, so a fact never goes stale) and
+the next walk for it stops at that tip; while the deriver does not hold
+`main`'s tip, the part it does not hold (at most 256 snapshots; further
+behind, the older walks) is read from the store once per submit and the
+graph answers below it. A landing now reads what `main`
+gained since the branch's last landing. `is_below` answers exactly as
+`is_ancestor` (tests `branch_landing::bug_2221_*`).
+
+| Agents | Run | Build | Pushes (/s) | p50 (ms) | p99 (ms) | Branches landed on `main` (/s) | Server CPU (ms/push) | Server cores | DB CPU (ms/push) | DB cores | DB statements per push | Errors | Told to come back |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 300 | 180 s | before | **67.4** | 2,065 | 24,428 | 13.8 (2,481) | 417.9 | 28.2 | 17.3 | 1.2 | 102.3 | 0 | 34,354 |
+| 300 | 180 s | after | **226.7** | 1,250 | 3,866 | 45.4 (8,177) | 41.5 | 9.4 | 33.8 | 7.7 | 130.9 | 0 | 1 |
+| 300 | 180 s | after, final (`840ed33d`: at most 256 read with the deriver behind) | **248.5** | 1,002 | 4,133 | 49.8 (8,971) | 42.4 | 10.5 | 15.5 | 3.8 | 134.2 | 0 | 125 |
+| 1,000 | 180 s | before | **110.5** | 6,018 | 38,707 | 19.7 (3,547) | 233.8 | 25.8 | 13.7 | 1.5 | 77.8 | 195 | 154,821 |
+| 1,000 | 180 s | after | **212.8** | 4,355 | 9,925 | 42.9 (7,717) | 71.9 | 15.3 | 14.5 | 3.1 | 107.3 | 0 | 69,439 |
+| 300 | 600 s | before | **30.7** | 5,605 | 52,414 | 6.1 (3,646) | 938.1 | 28.8 | 22.0 | 0.7 | 117.2 | 219 | 179,403 |
+| 300 | 600 s | after | **109.2** | 1,510 | 17,515 | 21.4 (12,818) | 136.8 | 14.9 | 23.4 | 2.6 | 155.8 | 0 | 77,144 |
+
+- **3.4 times the pushes over 3 minutes at 300 agents (3.7 with the
+  final build), 1.9 times at 1,000, 3.6 times over 10 minutes**; the server's CPU per push at
+  300 agents for 3 minutes is 41.5 ms where it was 417.9 (103.9 in a
+  30 s run before). The before runs' errors are the bench's own
+  (`tips: 503 busy` not waited out, the rest of BUG-2222); the after
+  runs had the whole fix and none.
+- **Still not flat over 10 minutes** (109 pushes/s against 227 over
+  3): the server is at 15 of 32 threads and the database at 2.6 cores,
+  yet 75,803 answers told agents to come back. At 560 s, 28 % of the
+  server's CPU is `Packs::find_in` and 14 % `Packs::refresh_in`: **every
+  push's pack stays listed** (the packs listing returned 78,000 rows on
+  average in the 10-minute run, 2,977 listings at 43.5 ms each), because
+  S29's background merge is never scheduled (**BUG-2230**): each object
+  lookup that misses the newest packs probes every pack's index, so a
+  request's cost grows with the number of pushes the project has had.
+  The landing's edit set (`edits::edit_set`, 23.8 %) is mostly those
+  lookups.
+- **The branch's own length** is still read at every landing: the stack
+  reads each snapshot of the branch down to where it left `main` (each a
+  `landings` lookup and a projection lookup: 1.49 million of each in the
+  10-minute run, 23 per push, 0.08 to 0.09 ms each). Branches in this
+  shape never take `main` back, so they only grow; past 4,096 snapshots
+  since leaving `main` a branch's landing is answered `warming`
+  (`WALK_BUDGET`). Agents that start a new branch from `main` now and
+  then, as real ones do, stay far below both.
+- Signing the read grant on every `tips` (`Grant::issue`, 15 to 28 %) is
+  the largest steady cost per request.
 
 ## What would raise each ceiling (not built)
 

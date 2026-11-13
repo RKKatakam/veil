@@ -378,6 +378,9 @@ pub struct Stats {
     /// Submits whose stack asked the derived graph, or walked, whether a
     /// change is on the branch: neither its tip nor a landing (BUG-1275).
     pub walks: AtomicU64,
+    /// Snapshots of the derived graph those walks read
+    /// (`derive::graph::Graph::is_below`, BUG-2221).
+    pub graph_reads: AtomicU64,
     /// Submits told to come back because the branch's queue was full
     /// (`limits::pressure`, BUG-1955), and entries landed merged by
     /// content (BUG-1956).
@@ -1568,6 +1571,13 @@ pub(crate) struct Ancestry {
     /// `landed_changes` row (BUG-1524); else [`Ancestry::landed`] also asks
     /// the derived graph.
     recorded: bool,
+    /// The derived graph's walks down from the tip (or the frontier),
+    /// shared by every question of the submit (BUG-2221).
+    walks: Vec<crate::derive::graph::Descent>,
+    /// While the derived graph does not hold the tip: the snapshots below
+    /// it that it does not hold yet, and the ones it holds where they end
+    /// (`Ancestry::top`; `Some(None)`: more than `NEAR_WALK`).
+    top: Option<Option<(std::collections::HashSet<ObjectId>, Vec<ObjectId>)>>,
 }
 
 /// More than [`MAX_REVISIONS`] revisions of a change to look through.
@@ -1603,6 +1613,8 @@ impl Ancestry {
             walk: None,
             staged,
             recorded: true,
+            walks: Vec::new(),
+            top: None,
         }
     }
 
@@ -1646,7 +1658,30 @@ impl Ancestry {
         self.hub.landing.stats.walks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tip = self.tip;
         if self.graph().await? {
-            let v = crate::derive::read(&self.hub, self.project, move |g| Ok(g.row(&x)?.is_some() && g.is_ancestor(x, tip)?)).await?;
+            let mut walks = std::mem::take(&mut self.walks);
+            let (v, walks) = crate::derive::read(&self.hub, self.project, move |g| {
+                let v = g.row(&x)?.is_some() && g.is_below(&mut walks, x, &[tip])?;
+                Ok((v, walks))
+            })
+            .await?;
+            self.walks = walks;
+            self.known.insert(x, v);
+            return Ok(Some(v));
+        }
+        // The deriver a few landings behind (BUG-2221): below the part of
+        // the line it does not hold yet, the graph answers.
+        if let Some((above, base)) = self.top().await? {
+            let v = above.contains(&x) || {
+                let base = base.clone();
+                let mut walks = std::mem::take(&mut self.walks);
+                let (v, walks) = crate::derive::read(&self.hub, self.project, move |g| {
+                    let v = g.row(&x)?.is_some() && g.is_below(&mut walks, x, &base)?;
+                    Ok((v, walks))
+                })
+                .await?;
+                self.walks = walks;
+                v
+            };
             self.known.insert(x, v);
             return Ok(Some(v));
         }
@@ -1656,6 +1691,43 @@ impl Ancestry {
             return Ok(Some(found));
         }
         Ok(None)
+    }
+
+    /// The snapshots below the tip (and it) that the derived graph does not
+    /// hold, read down to the first ones it holds on every line, which are
+    /// returned too: everything below the tip is one of the first or below
+    /// one of the second (a derived snapshot's parents are derived). Read
+    /// once per submit; `None` past `NEAR_WALK` snapshots (the deriver far
+    /// behind): the older walks then, as before, after at most `NEAR_WALK`
+    /// reads here (not `WALK_BUDGET`: the walks would read it all again).
+    async fn top(&mut self) -> Result<Option<&(std::collections::HashSet<ObjectId>, Vec<ObjectId>)>> {
+        if self.top.is_none() {
+            let tip = self.tip;
+            let top = crate::derive::read(&self.hub, self.project, move |g| {
+                let (mut above, mut base) = (std::collections::HashSet::new(), Vec::new());
+                let mut seen = std::collections::HashSet::from([tip]);
+                let mut todo = vec![tip];
+                while let Some(y) = todo.pop() {
+                    if g.row(&y)?.is_some() {
+                        base.push(y);
+                        continue;
+                    }
+                    if above.len() == NEAR_WALK {
+                        return Ok(None);
+                    }
+                    above.insert(y);
+                    for p in g.cx.src.snapshot(&y)?.parents.iter() {
+                        if seen.insert(*p) {
+                            todo.push(*p);
+                        }
+                    }
+                }
+                Ok(Some((above, base)))
+            })
+            .await?;
+            self.top = Some(top);
+        }
+        Ok(self.top.as_ref().and_then(|t| t.as_ref()))
     }
 
     /// Is `x` the tip or below it?
@@ -1940,23 +2012,21 @@ impl Ancestry {
         if frontier.len() > FRONTIER_LIMIT {
             return Err(crate::query::graph::warming());
         }
-        let answer = crate::derive::read(&self.hub, self.project, move |g| {
+        let mut walks = std::mem::take(&mut self.walks);
+        let (answer, walks) = crate::derive::read(&self.hub, self.project, move |g| {
             for f in &frontier {
                 if g.row(f)?.is_none() {
-                    return Ok(None);
+                    return Ok((None, walks));
                 }
             }
             if g.row(&x)?.is_none() {
-                return Ok(Some(false));
+                return Ok((Some(false), walks));
             }
-            for f in &frontier {
-                if g.is_ancestor(x, *f)? {
-                    return Ok(Some(true));
-                }
-            }
-            Ok(Some(false))
+            let v = g.is_below(&mut walks, x, &frontier)?;
+            Ok((Some(v), walks))
         })
         .await?;
+        self.walks = walks;
         answer.ok_or_else(crate::query::graph::warming)
     }
 }

@@ -108,6 +108,12 @@ pub struct Workers {
     active: Mutex<HashMap<i64, BTreeSet<String>>>,
     /// Graph rows by `(project, snapshot)` (rows never change).
     rows: LruCache<Arc<GraphRow>>,
+    /// By `(project, x)`: a snapshot `x` was found not to be below
+    /// (`graph::Graph::is_below`, BUG-2221). History never changes, so
+    /// this stays true (even when the graph rows are dropped, or the
+    /// project's graph made again); a later walk from a newer tip stops
+    /// there.
+    not_below: LruCache<ObjectId>,
 }
 
 impl Workers {
@@ -118,7 +124,19 @@ impl Workers {
             permits: tokio::sync::Semaphore::new(DERIVERS),
             active: Mutex::new(HashMap::new()),
             rows: LruCache::new(64 << 20),
+            not_below: LruCache::new(NOT_BELOW_ENTRIES),
         }
+    }
+
+    /// A snapshot `x` of `project` is not below, if one is known.
+    pub(crate) fn not_below(&self, project: i64, x: &ObjectId) -> Option<ObjectId> {
+        self.not_below.get(&not_below_key(project, x))
+    }
+
+    /// `x` of `project` is not below `y` (never forgotten wrongly: only
+    /// forgotten, the oldest first).
+    pub(crate) fn set_not_below(&self, project: i64, x: &ObjectId, y: ObjectId) {
+        self.not_below.insert(not_below_key(project, x), y, 1);
     }
 
     pub(crate) async fn permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
@@ -130,6 +148,18 @@ impl Workers {
     pub fn clear_cache(&self) {
         self.rows.clear();
     }
+}
+
+/// How many "not below" facts one server remembers (`Workers::not_below`):
+/// about 30 MB at most.
+const NOT_BELOW_ENTRIES: usize = 1 << 18;
+
+fn not_below_key(project: i64, id: &ObjectId) -> ObjectId {
+    let mut h = blake3::Hasher::new();
+    h.update(b"not-below");
+    h.update(&project.to_le_bytes());
+    h.update(&id.0);
+    ObjectId(*h.finalize().as_bytes())
 }
 
 fn row_key(project: i64, id: &ObjectId) -> ObjectId {

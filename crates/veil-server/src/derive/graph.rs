@@ -190,6 +190,51 @@ impl<'a> Graph<'a> {
         Ok(false)
     }
 
+    /// Is `x` (derived) one of `starts` or below one (as [`Graph::is_ancestor`]
+    /// for each), with the walks of one submit's questions shared in
+    /// `walks` (BUG-2221)? A landing asks this of every snapshot of a
+    /// branch down to where it left `main`, each not below the tip when its
+    /// change landed as a rebased copy: one walk each, down to the
+    /// snapshot's generation, read every snapshot of `main` newer than it,
+    /// for every one of them, at every landing. Now first parents are
+    /// tried first through the jump table, as before; then a snapshot found
+    /// not below a tip once is remembered so (`Workers::not_below`), and
+    /// the walk for it stops there, since nothing below that tip is it: only
+    /// what `main` gained since is read. One walk serves every question with
+    /// the same starts and stop, read further down only as far as each
+    /// question's generation needs.
+    pub fn is_below(&self, walks: &mut Vec<Descent>, x: ObjectId, starts: &[ObjectId]) -> Result<bool> {
+        if starts.contains(&x) {
+            return Ok(true);
+        }
+        let rx = self.get(&x)?;
+        for s in starts {
+            if self.at_depth(*s, rx.depth)? == Some(x) {
+                return Ok(true);
+            }
+        }
+        let project = self.cx.project();
+        let stop = self.cx.hub().derive.not_below(project, &x);
+        let i = match walks.iter().position(|w| w.stop == stop && w.starts == starts) {
+            Some(i) => i,
+            None => {
+                walks.push(Descent::new(self, starts, stop)?);
+                walks.len() - 1
+            }
+        };
+        let w = &mut walks[i];
+        let read = w.read;
+        w.down_to(self, rx.generation)?;
+        self.cx.hub().landing.stats.graph_reads.fetch_add(w.read - read, std::sync::atomic::Ordering::Relaxed);
+        let below = w.seen.contains(&x);
+        if !below {
+            if let [s] = starts {
+                self.cx.hub().derive.set_not_below(project, &x, *s);
+            }
+        }
+        Ok(below)
+    }
+
     /// The best common ancestors of `a` and `b` (none an ancestor of
     /// another), sorted by id: paint-down by generation, as the client's
     /// `GraphIndex::merge_bases`.
@@ -225,6 +270,59 @@ impl<'a> Graph<'a> {
             }
         }
         reduce(self, found)
+    }
+}
+
+/// A walk down from `starts` in generation order ([`Graph::is_below`]):
+/// `seen` holds every snapshot reached, which once it has read down to a
+/// generation is every snapshot of at least that generation below a start
+/// by a path that does not pass through `stop`, a snapshot the questions it
+/// serves are known not to be below.
+pub struct Descent {
+    starts: Vec<ObjectId>,
+    stop: Option<ObjectId>,
+    heap: BinaryHeap<(i64, ObjectId)>,
+    seen: HashSet<ObjectId>,
+    /// Snapshots read so far.
+    read: u64,
+}
+
+impl Descent {
+    fn new(g: &Graph, starts: &[ObjectId], stop: Option<ObjectId>) -> Result<Descent> {
+        let mut w = Descent {
+            starts: starts.to_vec(),
+            stop,
+            heap: BinaryHeap::new(),
+            seen: HashSet::new(),
+            read: 0,
+        };
+        for s in starts {
+            if w.seen.insert(*s) {
+                w.heap.push((g.get(s)?.generation, *s));
+            }
+        }
+        Ok(w)
+    }
+
+    /// Read on until every snapshot left to read is below generation `floor`
+    /// (parents' generations are strictly lower).
+    fn down_to(&mut self, g: &Graph, floor: i64) -> Result<()> {
+        while let Some(&(generation, y)) = self.heap.peek() {
+            if generation < floor {
+                break;
+            }
+            self.heap.pop();
+            self.read += 1;
+            if Some(y) == self.stop {
+                continue;
+            }
+            for p in &g.get(&y)?.parents {
+                if self.seen.insert(*p) {
+                    self.heap.push((g.get(p)?.generation, *p));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
