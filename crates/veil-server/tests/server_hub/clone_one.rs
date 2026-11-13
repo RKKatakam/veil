@@ -381,3 +381,36 @@ fn a_clone_into_a_directory_that_was_there_defers_nothing() {
     clone_cut(&p.fin, &hub.url(&p.name), &fresh, 1, None);
     assert!(!fresh.join(".veil/repo.json").exists(), "control: the new directory's repo.json was not deferred");
 }
+
+/// What is at the top of a clone's directory, `.veil` aside.
+fn top_level(d: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n != ".veil").collect();
+    names.sort();
+    names
+}
+
+/// A one-folder clone by someone who can read the files beside the folder
+/// (the admin: the root's own files, `.veilpolicy`): thin, it could fetch
+/// and write every one of them, and it never does, at the clone or at a
+/// move (a file left out by `--only` is left out as a folder is, BUG-1945;
+/// `fill_in` wrote every readable hidden file).
+#[test]
+fn a_one_folder_clone_never_writes_a_file_beside_its_folder() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let url = hub.url(&p.name);
+    let d = p.admin.dir("only-admin");
+    let out = p.admin.ok(p.admin.home.path(), &["clone", &url, d.to_str().unwrap(), "--only", BILL_DIR]);
+    assert!(out.contains("Cloned") && out.contains("thin"), "{out}");
+    assert_eq!(top_level(&d), vec![BILL_DIR.to_string()], "written beside the folder at the clone");
+    assert!(!has_marker(&everything_in(&d), ROOT_MARK), "a file beside the folder was fetched");
+    assert_clean(&p.admin.ok(&d, &["status"]), "after the clone");
+    write_files(&p.dir, &[(ROOT_FILE, &format!("{ROOT_MARK} v2")), ("src/lib.rs", &format!("{PUBLIC_MARK} v2"))]);
+    p.admin.commit_main(&p.dir, "beside the folder");
+    p.admin.ok(&p.dir, &["push"]);
+    p.admin.ok(&d, &["pull"]);
+    p.admin.ok(&d, &["new", "main"]);
+    assert_eq!(top_level(&d), vec![BILL_DIR.to_string()], "written beside the folder at the move");
+    assert!(!has_marker(&everything_in(&d), ROOT_MARK), "a file beside the folder was fetched by the move");
+    assert_clean(&p.admin.ok(&d, &["status"]), "after the move");
+}

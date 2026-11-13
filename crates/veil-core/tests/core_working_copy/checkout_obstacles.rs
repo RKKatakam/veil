@@ -203,3 +203,33 @@ fn a_name_near_the_filesystem_limit_is_written() {
     fs.write(&p(&name), b"x\n").unwrap();
     assert_eq!(fs.read(&p(&name)).unwrap(), b"x\n");
 }
+
+/// A file the checkout could not write is hidden (`report.failed`), and a
+/// later version of the tree that makes its path a folder writes that
+/// folder: only a folder a one-directory clone left out stays left out
+/// (BUG-1945's fix kept every hidden path as left out by choice, so the
+/// folder was never written and the builder carried it silently).
+#[cfg(unix)]
+#[test]
+fn a_file_left_unwritten_that_becomes_a_folder_is_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = mem_repo();
+    let store = repo.store();
+    let t0 = tree(&repo, &[("ro/x.txt", "x\n")]);
+    let t1 = tree(&repo, &[("ro/x.txt", "x\n"), ("ro/cfg", "a file\n")]);
+    let t2 = tree(&repo, &[("ro/x.txt", "x\n"), ("ro/cfg/a.json", "{}\n")]);
+    let dir = tempfile::tempdir().unwrap();
+    let fs = DiskBackend::new(dir.path());
+    let mut record = veil_core::checkout::Materialised::default();
+    veil_core::checkout::checkout_recorded(store, &fs, None, &t0, &mut record, None).expect("first checkout");
+    let ro = dir.path().join("ro");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let r = veil_core::checkout::checkout_recorded(store, &fs, Some(&t0), &t1, &mut record, None).expect("second checkout");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(r.failed.len(), 1, "the file could not be written: {r:?}");
+    assert!(record.hidden(&p("ro/cfg")));
+    veil_core::checkout::checkout_recorded(store, &fs, Some(&t1), &t2, &mut record, None).expect("third checkout");
+    assert_eq!(fs.read(&p("ro/cfg/a.json")).unwrap(), b"{}\n", "the folder was never written");
+    let (built, _) = repo.build_from_recorded(&fs, Some(t2), None, Some(&record)).unwrap();
+    assert_eq!(built, t2);
+}

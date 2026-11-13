@@ -1263,7 +1263,7 @@ impl<'a> Builder<'a> {
                 let p = dir.join(&e.name);
                 if e.kind == EntryKind::Dir {
                     // Never written, never read (BUG-1945).
-                    if self.opts.materialised.is_some_and(|m| m.hidden(&p)) {
+                    if self.opts.materialised.is_some_and(|m| m.left_out(&p)) {
                         continue;
                     }
                     if depth + 1 < MAX_TREE_DEPTH {
@@ -1602,7 +1602,7 @@ impl<'a> Builder<'a> {
                     // copy: never read (a thin clone would fetch it, and
                     // take what is there for its edit), carried by id,
                     // and what is there listed, never recorded (BUG-1945).
-                    if let Some(e) = pdir.filter(|_| self.opts.materialised.is_some_and(|m| m.hidden(&path))) {
+                    if let Some(e) = pdir.filter(|_| self.opts.materialised.is_some_and(|m| m.left_out(&path))) {
                         let files: Vec<VPath> = crate::vfs::walk_leaves(self.fs, &path, &|_| false)?.into_iter().map(|(p, _)| p).collect();
                         self.report.not_recorded.extend(files);
                         f.out.insert(e.clone());
@@ -1986,7 +1986,7 @@ impl<'a> Builder<'a> {
                 // carried whole, never read (a thin clone would fetch it,
                 // and take its files for deletions; BUG-1945).
                 // Not a redaction: nothing to report.
-                EntryKind::Dir if b.opts.materialised.is_some_and(|m| m.hidden(path)) => Ok(Err(Some(e.clone()))),
+                EntryKind::Dir if b.opts.materialised.is_some_and(|m| m.left_out(path)) => Ok(Err(Some(e.clone()))),
                 EntryKind::Dir => match b.store.tree(&e.id) {
                     Ok(tree) if depth < MAX_TREE_DEPTH => Ok(Ok(Frame {
                         entry: e.clone(),

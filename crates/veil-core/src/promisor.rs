@@ -974,16 +974,16 @@ impl ObjectStore {
     }
 
     /// [`ObjectStore::prefetch_diff`] for a move of a working copy that
-    /// `materialised` describes: the folders it never wrote (a `--only`
-    /// clone's, [`crate::checkout::Materialised::hidden`]) are never
-    /// fetched, as the checkout never writes them (BUG-1945).
+    /// `materialised` describes: what it never wrote (a `--only` clone's,
+    /// [`crate::checkout::Materialised::left_out`]) is never fetched, as
+    /// the checkout never writes it (BUG-1945).
     pub fn prefetch_move(&self, from: Option<&ObjectId>, to: &ObjectId, materialised: &crate::checkout::Materialised) -> Result<()> {
         let Some(p) = self.partial.get() else { return Ok(()) };
         if !self.fetching(p) {
             return Ok(());
         }
         let at = self.locate(p, to)?.map(|(snapshot, path, _)| (snapshot, path));
-        let hidden = |path: &str| VPath::new(path).is_ok_and(|v| materialised.hidden(&v));
+        let hidden = |path: &str| VPath::new(path).is_ok_and(|v| materialised.left_out(&v));
         self.prefetch_diff_from(p, from, to, at, &hidden)
     }
 
