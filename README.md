@@ -89,9 +89,9 @@ An earlier version of this page gave 993 landings a second from a
 | Clone 10,000 files through the server | 566 to 621 ms | 569 to 573 ms |
 | Commit one changed file among 10,000 | 9.2 to 10.0 ms | **8.1 to 8.6 ms** |
 | Commit one changed file in the 1 GB project | **22 to 26 ms** | 26 to 28 ms (33 to 35 with `core.fsync=all`) |
-| `status` in the 1 GB project | **8.6 to 11 ms** | 29 to 31 ms |
-| `log -n 20` in the 1 GB project | 10 to 13 ms | **1 to 2 ms** |
-| Clone one folder of the 1 GB project | 1.0 s | **0.4 s** |
+| `status` in the 1 GB project | **5.7 to 5.8 ms** | 30 to 33 ms |
+| `log -n 20` in the 1 GB project | 8.0 to 8.2 ms | **1.5 to 2.4 ms** |
+| Clone one folder of the 1 GB project (1,317 files) | **354 to 386 ms** | 401 to 414 ms |
 | Default clone of the 1 GB project | **9.4 s** | 29 s |
 
 **Other gates:** blame over 10,000 versions answers in 425 to 528 ms the
