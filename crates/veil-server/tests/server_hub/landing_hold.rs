@@ -1124,3 +1124,70 @@ fn every_kind_of_edit_run(hub: &TestHub, seed: u64) {
 fn next_kind(kind: u64) -> u64 {
     (kind + 3) % 10
 }
+
+/// BUG-2220: a batch's conflict reports are built once the batch is, on its
+/// threads, and each still tells what its change was judged on: the tip as
+/// everything before it in the queue's order left it, not the tip the
+/// batch ends on. In one batch, on one base: an edit of a file lands, a
+/// second edit of it conflicts, a new file lands, and a third edit of the
+/// file conflicts. The second's report is onto the first's landed
+/// snapshot, the third's onto the new file's; both name the first as what
+/// landed on the file since their base, and the path with its three
+/// versions.
+#[test]
+fn bug_2220_a_conflict_report_tells_the_tip_its_change_was_judged_on() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let made = land_edit(&api, &dev, &p.name, api.tips(Some(&dev), &p.name).unwrap().branches["main"], "src/rep/hot.txt", "v0\n", true);
+    assert_eq!(made.status, 200, "{}", String::from_utf8_lossy(&made.body));
+    assert_eq!(made.json()["state"], "landed", "{}", made.json());
+    let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    hold_branch(&hub, pid, "main");
+    let mut tickets = Vec::new();
+    for (path, text) in [("src/rep/hot.txt", "a\n"), ("src/rep/hot.txt", "b\n"), ("src/rep/later.txt", "later\n"), ("src/rep/hot.txt", "c\n")] {
+        let r = land_edit(&api, &dev, &p.name, base, path, text, false);
+        assert_eq!(r.status, 200, "{path}: {}", String::from_utf8_lossy(&r.body));
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    release_branch(&hub, pid, "main");
+    let answers: Vec<serde_json::Value> = tickets
+        .iter()
+        .map(|t| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let r = api.get(Some(&dev), &format!("/v1/projects/{}/land/{t}", p.name));
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                let v = r.json();
+                if (v["state"] != "queued" && v["state"] != "merging") || std::time::Instant::now() > deadline {
+                    break v;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .collect();
+    let states: Vec<&str> = answers.iter().map(|v| v["state"].as_str().unwrap_or_default()).collect();
+    assert_eq!(states, ["landed", "conflict", "landed", "conflict"], "{answers:?}");
+    let landed = |v: &serde_json::Value| v["landed"].as_array().and_then(|l| l.last()).and_then(|x| x.as_str()).unwrap().to_string();
+    let (first, later) = (landed(&answers[0]), landed(&answers[2]));
+    assert_ne!(first, later);
+    // The two landed one after the other: the conflict between them moved nothing.
+    let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={later}&path=src/rep/hot.txt", p.name));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(String::from_utf8_lossy(&r.body), "a\n");
+    for (v, onto) in [(&answers[1], &first), (&answers[3], &later)] {
+        assert_eq!(v["onto"].as_str(), Some(onto.as_str()), "{v}");
+        assert_eq!(v["base"].as_str(), Some(base.hex().as_str()), "{v}");
+        assert_eq!(v["landed_since"], serde_json::json!([first]), "{v}");
+        assert_eq!(v["paths"], serde_json::json!(["src/rep/hot.txt"]), "{v}");
+        let c = &v["conflicts"][0];
+        assert_eq!(c["path"], "src/rep/hot.txt", "{v}");
+        assert!(c["base"].is_string() && c["main"].is_string() && c["yours"].is_string(), "{v}");
+        assert_ne!(c["main"], c["yours"], "{v}");
+        assert_ne!(c["base"], c["main"], "{v}");
+    }
+    assert_ne!(answers[1]["conflicts"][0]["yours"], answers[3]["conflicts"][0]["yours"]);
+    assert_eq!(answers[1]["conflicts"][0]["main"], answers[3]["conflicts"][0]["main"]);
+}

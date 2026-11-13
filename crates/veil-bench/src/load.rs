@@ -1617,6 +1617,12 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         result["landing_prepare_ms_per_batch"] = json!(ratio(stat("landing_prepare_us"), stat("landing_batches"), 1000.0));
         result["landing_store_ms_per_batch"] = json!(ratio(stat("landing_store_us"), stat("landing_batches"), 1000.0));
         result["landing_commit_ms_per_batch"] = json!(ratio(stat("landing_commit_us"), stat("landing_batches"), 1000.0));
+        // The build by part, in ms a batch (BUG-2220).
+        for k in ["read", "write_rule", "merge", "conflict", "apply", "recheck", "project"] {
+            result[format!("landing_{k}_ms_per_batch")] = json!(ratio(stat(&format!("landing_{k}_us")), stat("landing_batches"), 1000.0));
+        }
+        result["landing_merging"] = json!(stat("landing_merging"));
+        result["landing_conflicts"] = json!(stat("landing_conflicts"));
         result["flood"] = json!(flood);
         result["flood_ops_per_s"] = json!((fl.ops.load(Ordering::Relaxed) - flood_ops0) as f64 / elapsed);
         result["flood_errors"] = json!(fl.errors.load(Ordering::Relaxed) - flood_errors0);

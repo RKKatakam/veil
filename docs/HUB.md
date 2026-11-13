@@ -5598,6 +5598,26 @@ transaction per landing instead of 23.
    poller here reads the outcomes once more after this server takes a
    lease (BUG-2150: only every 5 s while a service runs here, before). (The kit's rehearsal has not been run
    again since.)
+14. **A batch's conflict reports are built once the batch is, and a merged
+   change's push checks again make nothing they discard** (`landing/service.rs`
+   `build`, `recheck`, BUG-2220). BUG-1956's fix put the merge workers'
+   work on the batch's one thread: with the mix, conflict reports (each
+   walks up to 256 snapshots for its "landed since" list) and the push's
+   checks again for each merged change took 19 ms of a 42 ms build. An
+   entry is still answered `conflict` in its turn, exactly when its merge
+   onto everything before it is not clean, and nothing of it stays; its
+   report is built after the batch's last entry, up to 8 at once, from
+   what it was judged on (its tip and that tip's tree, its base, its edits,
+   its submitter): the report built in its turn, objects being read by id.
+   The checks again (`sync::complete`) hold the trees their graft makes
+   instead of storing them (`sync::Staged::held`: a re-check that passes
+   made only trees of the batch's own new tree, which the batch stores)
+   and make no graph row for the snapshot they check (`PushRows::unkept`:
+   the row of a parent the batch made a moment before was asked of the
+   database, for a row thrown away). Content merges stay in order on the
+   batch's thread. The batch's build is timed by part in the server's
+   counters (`landing_*_us`). Measured: `docs/design/scale/LOAD.md`, "The
+   mix's regression found and fixed".
 
 **Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
 `concurrency.rs`, unit tests in `limits/landing.rs`):
@@ -5625,6 +5645,7 @@ transaction per landing instead of 23.
 | 19 | A lease whose holder was killed is taken over well inside `LEASE_MS`, at the next epoch, and every change lands once (BUG-1970) | the holder killed (every connection closed) while its batch's transaction waits at the entry's row: the other server holds the lease at epoch + 1 (its own lock taken) 57–168 ms on PostgreSQL / 211–623 ms on YugabyteDB after the kill (asserted under 1 s); the killed holder's batch and the next landing each land once (`main`'s line from the base: the two changes, once each) | `failover::bug_1970_a_killed_holder_is_taken_over_before_its_lease_expires_and_its_batch_lands_once` |
 | 20 | A live holder with its lock is never taken over; one whose lock session ends is taken over at once and fenced (BUG-1970) | a landing sent to the other server is landed by the holder, the lease unchanged; the holder's lock session terminated: the next landing lands in under `LEASE_MS` and the other server holds the lease at epoch + 1 in under `LEASE_MS` (the holder, alive, may land it first), and one sent to the old holder lands once, by the new one, which keeps the lease (`main`'s line from the base: the four changes, once each) | `failover::bug_1970_a_holder_whose_lock_session_ends_is_taken_over_at_once_and_fenced` |
 | 21 | The lock's key is the same in every release (a changed one would take every live holder's lease over) | the branch key pinned; the epoch's 31 bits as SQL computes them | `landing::lease_lock::tests::keys_are_stable_and_per_branch_and_epoch` |
+| 22 | A batch's conflict reports, built once the batch is on its threads, each tell the tip its change was judged on; a merged change's push checks again store nothing and ask the database nothing for a row they discard (BUG-2220) | in one batch on one base, an edit lands, a second conflicts, a new file lands, a third conflicts: the second's report is onto the first's landed snapshot, the third's onto the new file's, both name the first as landed since; the mix at 1,000/s for 3 min lands 975 and 987/s (794 to 860 before) | `landing_hold::bug_2220_a_conflict_report_tells_the_tip_its_change_was_judged_on`, `landing_hold::bug_1956_*`, `landing_hold::bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one` |
 
 ### 13.36 S20: automatic bisect and revert (built)
 

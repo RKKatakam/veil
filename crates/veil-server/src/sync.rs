@@ -158,6 +158,19 @@ impl Staged {
         }
     }
 
+    /// Nothing uploaded: what a check makes is held here and never stored.
+    /// For the landing's re-check of a change it built (BUG-2220): the trees
+    /// a re-check that passes makes are the batch's own, which the batch
+    /// stores, and one that fails makes nothing anything names.
+    pub(crate) fn held() -> Arc<Staged> {
+        Arc::new(Staged {
+            at: Arc::new(HashMap::new()),
+            packs: Arc::new(Vec::new()),
+            made: Arc::new(Mutex::new(HashMap::new())),
+            touched: Mutex::new(HashSet::new()),
+        })
+    }
+
     /// The same uploads and made objects, with reads counted apart (one
     /// snapshot's completion).
     fn child(&self) -> Arc<Staged> {
@@ -1883,15 +1896,25 @@ pub struct PushRows {
     /// concurrent check reads earlier windows' rows without cloning the map.
     frozen: Option<Arc<HashMap<ObjectId, Arc<crate::derive::graph::GraphRow>>>>,
     read: usize,
+    /// No row is kept for an accepted snapshot ([`PushRows::unkept`]).
+    unkept: bool,
 }
 
 impl PushRows {
+    /// Rows for checks whose accepted snapshot is not kept (the landing's
+    /// re-check, BUG-2220): `complete` makes no row for it, so it never asks
+    /// the database for the row of a parent the batch made a moment ago.
+    pub(crate) fn unkept() -> PushRows {
+        PushRows { unkept: true, ..PushRows::default() }
+    }
+
     /// A cheap snapshot of the rows so far for a parallel guess window.
     fn freeze(&self) -> PushRows {
         PushRows {
             rows: HashMap::new(),
             frozen: Some(Arc::new(self.rows.clone())),
             read: self.read,
+            unkept: self.unkept,
         }
     }
 
@@ -1913,6 +1936,9 @@ impl PushRows {
     /// `parents`, when every parent has a row (otherwise a walk that needs
     /// it makes it).
     fn add(&mut self, src: &Source, id: ObjectId, s: &Snapshot, parents: &[ObjectId]) -> Result<()> {
+        if self.unkept {
+            return Ok(());
+        }
         let mut rows = Vec::with_capacity(parents.len());
         for p in parents {
             match self.row(src, p)? {

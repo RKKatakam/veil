@@ -383,6 +383,17 @@ pub struct Stats {
     /// content (BUG-1956).
     pub queue_full: AtomicU64,
     pub merging: AtomicU64,
+    /// Microseconds of a batch's build by part (BUG-2220): its entries'
+    /// reads ahead, the write rule's checks, content merges, conflict
+    /// reports, applying and the landing check, the push's checks again,
+    /// and the view keys' projections.
+    pub read_us: AtomicU64,
+    pub write_rule_us: AtomicU64,
+    pub merge_us: AtomicU64,
+    pub conflict_us: AtomicU64,
+    pub apply_us: AtomicU64,
+    pub recheck_us: AtomicU64,
+    pub project_us: AtomicU64,
 }
 
 /// A waiting ticket's answer channels, and the branch it waits on.

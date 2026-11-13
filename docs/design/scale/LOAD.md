@@ -1386,11 +1386,147 @@ person's (`--people` applies to `landing` only). The deployment's
 | 1,000 landings/s held, 3 min, plain / protected / one person | 995.5 / 995.6 / 998.3 | **pass** |
 | p99 at 1,000/s, plain runs | 1,197 to 1,598 ms | 1 s: **miss** |
 | p50 at 1,000/s, plain runs | 220 to 348 ms | 150 ms: **miss** |
-| 1,000/s with the mix, 3 min | 860, 794 (p99 41 to 55 s) | **miss** (BUG-2220; 951 before) |
+| 1,000/s with the mix, 3 min | 860, 794 (p99 41 to 55 s) | **miss** (BUG-2220; 951 before; fixed on `mixperf`: 975 and 987/s, below) |
 | 1,000/s with the mix, 10 min | 799 (p99 68 s) | **miss** (BUG-1955) |
 | commits per landing | 1.15 to 1.24 plain, 1.24 to 1.39 with the mix | 1.5: **pass** |
 | past capacity: lands at capacity, tells the rest to come back, recovers | lands 963/s on average, nothing lost; p99 under 0.3 s 10 s after the backlog is gone | **pass** |
 | the many-branch headline over 3 min | 72 pushes/s, 13.4 merges/s at 300 agents | no fixed target; **falls** (BUG-2221) |
+
+## The mix's regression found and fixed (BUG-2220, 2026-11-13, `mixperf`)
+
+The mix had slowed from 951/s (`landhold2`) to 794 to 860/s, its batch
+build from 0.60 to 0.80 to 0.84 ms of CPU a landing. With no `perf` on the
+machine (`perf_event_paranoid` 4), the batch's build was timed by part
+(counters `landing_{read,write_rule,merge,conflict,apply,recheck,project}_us`
+in the server's `stats.json`, `landing_*_ms_per_batch` in the tool's
+result). Same benchmark and harness as above: `OBJECTS=local
+LANDING_CLIENTS=10000 LANDING_RATES=1000 DURATION=180
+scripts/bench-server.sh landing -- --protected --mix --people 100`.
+
+**The profile before** (B0, `dc4e3f82` plus the counters; ms a batch of 51
+landings; build 42.5 ms a batch, 0.83 ms a landing):
+
+| Part | ms a batch | Count | ms each | In the batch on `landhold2`? |
+|---|---:|---:|---:|---|
+| the push's checks again, for each merged change (`recheck`) | **11.9** | 4,650 | 7.3 | yes, for a merged change come back from a worker (`merges > 0`) |
+| conflict reports (`merge::build_conflict`) | **7.0** | 7,224 | 2.8 | **no**: a merge worker's |
+| the view keys' projections | 7.0 | 146,445 | 0.05 | yes |
+| apply and the landing check | 4.5 | | | yes |
+| content merges (`merge::merge_onto`) | **4.4** | 4,646 | 2.7 | **no**: a merge worker's |
+| reads ahead (8 threads) | 0.8 | | | yes |
+
+**The cause.** BUG-1956's fix moved the merge workers' work onto the
+batch's one thread: content merges (2.7 ms each: three versions of a 46 KB
+file) and conflict reports (2.8 ms each: the report's "landed since" walks
+up to 256 snapshots of the branch). Together 11.4 ms a batch, 0.22 ms a
+landing: the whole regression. And the push's checks again (`recheck`),
+which a merged change had always had, cost 7.3 ms each, most of it two
+things it threw away: `sync::complete` stored the trees its graft made, one
+synchronous store write (an `fsync`ed file here) for a tree the batch
+stores anyway; and it made the new snapshot's graph row, asking the
+database for the row of a parent the batch had made a moment before (no
+row: a round trip for nothing), a row the re-check then discarded.
+
+**Why p99 grew so much more than the rate fell.** Past capacity the service
+lands at capacity, and an accepted submit waited 2 to 4 s (the queue at its
+bound, about 2,000, over the rate) all through B0. But the agents keep
+offering 1,000/s: what is not landed is told to come back (6,000 to 6,400
+`queue_full` answers a second from 70 s on), the agents' backlog grows by
+the shortfall every second, and a landing's latency counts every wait. So
+p50 and p99 grow with the run's length (B0: p99 7 s at 40 s, 19 s at 70 s,
+41 s at 100 s, 54 s at 160 s): p99 measures shortfall × time, not the cost
+of a landing. And it fed itself: as waits lengthen, bases age, more
+changes overlap and conflict (conflicts 315 → 498 per 10 s), each costing
+the batch a merge or a report, and the rate fell from 972 to 692/s over
+B0's three minutes.
+
+**The fix** (`landing/service.rs`, `sync.rs`), every answer the same:
+
+1. **The re-check stores nothing and keeps no row.** `recheck` runs
+   `sync::complete` with what it makes held (`Staged::held`: nothing
+   uploaded, nothing stored) and with `PushRows::unkept` (no graph row for
+   the re-checked snapshot, so no parent's row is asked for). A re-check
+   that passes made only trees of the batch's own new tree, which the
+   batch stores; one that fails made nothing anything names. The checks
+   themselves (the graft, closure, checks 2, 8 and 9 with the secret scan,
+   access lines, rules) are unchanged.
+2. **Conflict reports are built once the batch is, on its threads.** An
+   entry is still answered `conflict` in its turn, exactly when its merge
+   onto everything before it is not clean, and nothing of it stays; what
+   the report needs (its tip and tree there, its base, its edits, the
+   submitter) is kept, and the reports are built after the batch's last
+   entry, up to 8 at once. Each is the report built in its turn: the same
+   function of the same objects, by id. A report that fails to build
+   answers what an entry whose build failed always did.
+
+Content merges stay in the batch's order on its one thread: after the fix
+they are 2.2 to 3.4 ms a batch, and the batch is no longer the limit.
+
+**Before and after** (3 min unless said; "build" is ms of the batch's build
+a landing; parts are ms a batch):
+
+| Run | Code | Landed (/s) | p50 (ms) | p99 (ms) | Commits per landing | Landings per batch | Build | recheck | conflict | merge | Prepare / store / transaction (ms a batch) | Told to come back | Failed | Load before / after |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---|
+| mix | before (`finalbench`) | 859.8 | 4,923 | 41,074 | 1.34 | 52.8 | 0.80 | | | | 10.2 / 27.4 / 42.1 | 565,760 | 1,259 | 11.11 / 40.12 |
+| mix | before (`finalbench`) | 793.8 | 11,633 | 55,196 | 1.31 | 52.7 | 0.84 | | | | 13.1 / 28.1 / 42.6 | 780,375 | 2,314 | 15.08 / 84.94 |
+| mix | before (B0, counters) | 812.6 | 6,489 | 49,978 | 1.41 | 51.0 | 0.83 | 11.9 | 7.0 | 4.4 | 12.9 / 26.2 / 39.9 | 746,976 | 2,130 | 11.36 / 72.06 |
+| mix | before (B0b, counters) | 838.0 | 7,879 | 47,866 | 1.34 | 54.0 | 0.81 | 11.2 | 7.3 | 4.2 | 11.8 / 28.1 / 43.1 | 683,620 | 1,718 | 13.77 / 50.97 |
+| mix | **after** (B1) | **987.0** | 284 | 2,925 | 1.32 | 33.3 | 0.57 | 0.53 | 2.6 | 2.2 | 3.8 / 20.6 / 30.0 | 1,084 | 0 | 2.71 / 25.16 |
+| mix | **after** (B2) | **975.2** | 338 | 5,624 | 1.31 | 35.4 | 0.56 | 0.60 | 2.5 | 2.4 | 5.1 / 21.3 / 31.5 | 30,861 | 0 | 10.03 / 20.47 |
+| mix, 10 min | before (`finalbench`) | 799.1 | 45,041 | 67,972 | 1.24 | 59.1 | 0.78 | | | | 10.6 / 37.1 / 57.3 | 2,379,234 | 61,024 | 15.46 / 2.55 |
+| mix, 10 min | **after** (B10) | **850.5** | 14,661 | 68,675 | 1.25 | 40.7 | 0.60 | 0.75 | 3.5 | 3.4 | 4.9 / 29.3 / 43.7 | 1,593,352 | 29,646 | 13.83 / 2.12 |
+| plain protected | before (`finalbench`) | 995.6 | 284 | 1,197 | 1.15 | 34.1 | 0.47 | | | | 5.5 / 20.1 / 31.6 | 0 | 0 | 15.75 / 11.11 |
+| plain protected | before (P0, counters, the same hour) | 992.0 | 250 | 1,537 | 1.20 | 30.3 | 0.45 | 0.10 | 0 | 0 | 5.4 / 18.5 / 28.0 | 0 | 0 | 13.95 / 22.73 |
+| plain protected | **after** (P1) | **990.3** | 336 | 2,175 | 1.22 | 33.2 | 0.47 | 0.11 | 0 | 0 | 5.4 / 19.7 / 31.0 | 1,300 | 0 | 14.82 / 16.34 |
+| plain protected | **after** (P1b, again) | **996.8** | 284 | 1,099 | 1.17 | 32.0 | 0.45 | 0.10 | 0 | 0 | 5.3 / 19.9 / 29.6 | 0 | 0 | 3.93 / 15.38 |
+
+- **The mix holds about 1,000/s for three minutes again** (975 and 987/s,
+  above `landhold2`'s 951/s): the queue stays short (11 to 680), batches
+  are 19 to 59 of 64, nothing fails, and the build is 0.56 to 0.57 ms a
+  landing (0.60 on `landhold2`, 0.83 before). The re-check is 0.6 ms
+  where it was 7.3; the conflict reports 2.5 to 2.6 ms a batch where they
+  were 7.0, with more of them (10,178 and 12,205 in three minutes: the
+  agents, served sooner, try their conflicting changes again sooner).
+- **The plain run is unchanged**: 990.3 and 996.8/s after against 992.0/s
+  before in the same hour (p99 2.2 and 1.1 s against 1.5 s: the runs'
+  spread), build 0.45 to 0.47 ms a landing either way. It has no merges or
+  conflicts, so neither change runs in it.
+- **What still misses:** p99 (2.9 and 5.6 s with the mix), and **ten
+  minutes**: 850/s (799 before), p99 68.7 s. Its limit is no longer the
+  batch: from about 150 s on (in the 3-minute runs too, plain or mixed)
+  an accepted submit waits longer while the queue stays short (ten
+  minutes: 59 to 134 queued from 240 s on, batches 44 to 56 of 64, yet a
+  submit waits 4 to 10 s at the median), and the deriver ends 300 s
+  behind (BUG-1955's open ten-minute item; see its row).
+
+**Ten minutes, the mix, after** (a row a minute):
+
+| t (s) | offered/s | landed/s | finished/s | queue | p50 ms | p99 ms | wait p50 | wait p99 | told to wait | failed | to merges | conflicts | per batch | commits/landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 60 | 1,000 | 1,022 | 1,022 | 228 | 272 | 2,490 | 265 | 748 | 0 | 0 | 271 | 469 | 31.7 | 1.34 |
+| 120 | 1,000 | 982 | 982 | 187 | 543 | 2,655 | 533 | 784 | 0 | 0 | 293 | 695 | 50.2 | 1.12 |
+| 180 | 1,000 | 989 | 993 | 91 | 1,906 | 4,076 | 1,897 | 2,063 | 0 | 0 | 304 | 1,262 | 40.9 | 1.19 |
+| 240 | 1,000 | 757 | 757 | 101 | 7,173 | 16,144 | 5,086 | 8,205 | 32,228 | 54 | 207 | 625 | 43.6 | 1.28 |
+| 300 | 1,000 | 827 | 827 | 134 | 19,071 | 30,934 | 4,780 | 11,182 | 39,911 | 174 | 333 | 730 | 46.5 | 1.29 |
+| 360 | 1,000 | 810 | 810 | 107 | 31,999 | 41,608 | 6,383 | 10,750 | 43,848 | 125 | 204 | 530 | 48.5 | 1.25 |
+| 420 | 1,000 | 778 | 778 | 84 | 44,350 | 56,703 | 7,764 | 11,844 | 46,009 | 260 | 320 | 587 | 49.3 | 1.26 |
+| 480 | 1,000 | 736 | 736 | 59 | 53,893 | 62,692 | 4,387 | 12,310 | 25,620 | 188 | 186 | 261 | 44.1 | 1.19 |
+| 540 | 1,000 | 776 | 776 | 124 | 62,713 | 71,300 | 8,364 | 12,718 | 55,135 | 2,573 | 92 | 193 | 54.3 | 1.20 |
+| 600 | 997 | 752 | 752 | 594 | 63,071 | 71,734 | 9,529 | 12,927 | 53,808 | 3,182 | 194 | 184 | 56.1 | 1.26 |
+
+**Three minutes, the mix, after (B2)** (every other row):
+
+| t (s) | offered/s | landed/s | finished/s | queue | p50 ms | p99 ms | wait p50 | wait p99 | told to wait | failed | to merges | conflicts | per batch | commits/landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 20 | 1,000 | 923 | 923 | 677 | 446 | 3,462 | 419 | 1,295 | 0 | 0 | 209 | 230 | 40.4 | 1.39 |
+| 40 | 1,000 | 1,060 | 1,060 | 25 | 313 | 2,575 | 302 | 555 | 0 | 0 | 325 | 572 | 27.8 | 1.39 |
+| 60 | 1,000 | 1,036 | 1,036 | 233 | 227 | 2,075 | 194 | 805 | 0 | 0 | 248 | 609 | 33.8 | 1.37 |
+| 80 | 1,000 | 1,057 | 1,062 | 11 | 191 | 2,362 | 184 | 509 | 0 | 0 | 324 | 717 | 42.0 | 1.30 |
+| 100 | 1,000 | 1,021 | 1,021 | 107 | 217 | 2,444 | 208 | 631 | 0 | 0 | 280 | 601 | 32.9 | 1.31 |
+| 120 | 1,000 | 1,040 | 1,040 | 229 | 276 | 4,304 | 253 | 571 | 0 | 0 | 302 | 741 | 52.2 | 1.26 |
+| 140 | 1,000 | 1,072 | 1,072 | 165 | 500 | 3,047 | 492 | 992 | 0 | 0 | 368 | 746 | 58.8 | 1.26 |
+| 160 | 1,000 | 893 | 893 | 65 | 2,483 | 6,394 | 2,083 | 3,014 | 9,372 | 0 | 222 | 497 | 44.0 | 1.26 |
+| 180 | 998 | 913 | 910 | 74 | 3,444 | 8,683 | 2,673 | 4,051 | 14,276 | 0 | 277 | 686 | 41.7 | 1.27 |
 
 ## What would raise each ceiling (not built)
 
