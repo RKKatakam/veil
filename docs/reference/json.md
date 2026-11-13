@@ -122,7 +122,10 @@ new`, `vl push` and `vl land` exit 3 when they did their work while the
 working copy holds quarantined files, which no snapshot has: each is named
 on standard error, and `vl status --json` lists them (`quarantined`) until
 they are isolated, exposed or fixed. With `--no-snapshot`, which looks at
-no file, they do not check.
+no file, they do not check. `vl ws exec` exits with its command's status,
+but 3 when the command exited 0 and the recording left out files as
+secrets (named the same way); they are a workspace's own, so the main
+working copy's commands do not count them.
 
 When a command fails, `error: …` goes to standard error as always and, with
 `--json`, a [`veil.error/1`](#veilerror1) document goes to standard output,

@@ -387,6 +387,18 @@ fail. With `--no-snapshot` they look at no file, so they do not check. Read-only
 the files; `vl status --json` has them in `quarantined`, and the `commit`
 result of `vl serve --local` carries the same list.
 
+**`vl ws exec`** passes on its command's exit status, but **exits 3** when
+the command exited 0 and the recording left out a file it wrote as a
+secret, with the same lines (`error: recorded, but without 1 quarantined
+file …`); a failing command keeps its own status, and the files are named
+all the same. The files are never deleted: a workspace's sandbox keeps
+them (resolve them in that workspace: `vl ws switch NAME`, then `vl
+isolate` or `vl expose --force`), and an `--ephemeral` run moves them,
+with their permissions, to `.veil/local/ephemeral-kept/` before its
+throwaway directory goes ([details](workspaces-and-agents.md#one-shot-runs---ephemeral)).
+A workspace's quarantined files are its own: `vl commit`, `vl push` and
+`vl land` in your project directory count only its working copy's.
+
 ## `vl scan` in CI
 
 `vl scan` scans the working copy and **exits 1** if a public file holds a

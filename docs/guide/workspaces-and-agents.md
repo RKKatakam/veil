@@ -347,6 +347,27 @@ points at. Take it from there with its change id: `vl merge zsspmtrn`,
 `vl tag set codegen -r zsspmtrn`, `vl edit zsspmtrn`, or
 `vl abandon zsspmtrn`.
 
+A file the command wrote that the scanner quarantines (it looks like a
+secret) is not recorded, and is **not deleted with the throwaway
+directory**: it is moved first, with its permissions, to a new directory
+of `.veil/local/ephemeral-kept/` (on this machine only, never recorded or
+pushed), and the run exits 3 when its command exited 0:
+
+```text
+$ vl ws exec --ephemeral -- sh -c "echo \"const key = 'AKIAIOSFODNN7EXAMPLE';\" > cfg.js"
+warning: cfg.js quarantined: looks like a secret (aws-access-key-id at line 1: AKIA…(20 chars)); not snapshotted. …
+Recorded vkqlwzmt 41c09d2e (empty) (no description set)
+error: recorded, but without 1 quarantined file (it looks like a secret):
+  cfg.js (aws-access-key-id at line 1; never recorded)
+hint: moved out of the throwaway sandbox, with the same permissions, to /home/me/proj/.veil/local/ephemeral-kept/1794571234567-3fa1: …
+$ echo $?
+3
+```
+
+To record one, put it in a working copy of that change (`vl edit
+vkqlwzmt`) and fix it, `vl isolate` it or `vl expose --force` it; `vl
+doctor` lists the directory until you delete it.
+
 <a id="attribution"></a>
 ## Who made a change: agent attribution
 
@@ -540,6 +561,14 @@ with the sandbox.
 Other quarantined files (the scanner found what looks like a secret in
 something the command wrote) stay in the sandbox, as they would in your
 project directory, and are quarantined again on every run until fixed.
+While the sandbox holds one, `vl ws exec` exits 3 when its command
+exited 0 (a failing command keeps its own status), naming each file
+(`error: recorded, but without 1 quarantined file …`), as `vl commit`
+does: fix the file in the sandbox, or in that workspace (`vl ws switch
+NAME`) `vl isolate` it to keep it local on purpose, or `vl expose
+--force` it if it is not a secret. They are the workspace's own: `vl
+push` and `vl land` in your project directory count only its working
+copy's quarantined files.
 Use the vault for secrets an agent needs (`vl run`), not files it writes.
 
 ## Sandboxes
@@ -592,7 +621,8 @@ Use the vault for secrets an agent needs (`vl run`), not files it writes.
 * `--ephemeral` runs use a throwaway directory in `$TMPDIR` (`/tmp` on
   Linux, a per-user directory under `/var/folders` on macOS), named
   `veil-ws-ephemeral-<pid>-<random>`, private to you and removed when `vl`
-  exits, including after `kill -9`.
+  exits, including after `kill -9` (a run that records first moves the
+  files its recording quarantined to `.veil/local/ephemeral-kept/`).
 * `vl doctor` reports leftover throwaway sandboxes, sandboxes of removed
   workspaces, interrupted and unrecorded runs, and files a rebuild kept.
 * A sandbox never hands its command a **symlink that could lead out of
