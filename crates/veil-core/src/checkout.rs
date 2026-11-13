@@ -312,6 +312,23 @@ impl Materialised {
         false
     }
 
+    /// `to` with every path left out by choice
+    /// ([`Materialised::left_out_by_choice`]) as in `shown` (absent where
+    /// `shown` has none): only the folders on the way to them are read.
+    fn with_left_out_as(&self, store: &ObjectStore, to: &ObjectId, shown: Option<&ObjectId>) -> Result<ObjectId> {
+        let mut tree = *to;
+        for p in self.hidden.iter().filter(|p| !self.refused.contains(*p) && !p.is_root()) {
+            let was = match shown {
+                Some(s) => lookup(store, s, p)?,
+                None => None,
+            };
+            if lookup(store, &tree, p)? != was {
+                tree = crate::conflict::set_entry(store, &tree, p, was)?;
+            }
+        }
+        Ok(tree)
+    }
+
     /// Every hidden path, in order.
     pub fn hidden_paths(&self) -> impl Iterator<Item = &VPath> {
         self.hidden.iter()
@@ -631,10 +648,12 @@ pub fn checkout_recorded(
     mut cache: Option<&mut StatCache>,
 ) -> Result<CheckoutReport> {
     let shown = record.view.or(from.copied());
-    let (changes, left_out) = checkout_changes(store, shown.as_ref(), to)?;
-    // Nothing at or below a path a one-directory clone left out is
-    // written, readable or not (BUG-1566; a thin clone can read every
-    // folder, BUG-1945).
+    // Nothing at or below a path a one-directory clone left out is read or
+    // written, readable or not (BUG-1566): the changes are those to `to`
+    // with each such path as the working copy shows it (a thin clone can
+    // read every folder, and has not fetched those, BUG-1945).
+    let target = record.with_left_out_as(store, to, shown.as_ref())?;
+    let (changes, left_out) = checkout_changes(store, shown.as_ref(), &target)?;
     let changes: Vec<TreeChange> = changes.into_iter().filter(|c| !record.left_out_by_choice(&c.path)).collect();
     let changes = record.refill_lost(store, fs, changes, cache.as_deref())?;
     let mut report = apply_changes(store, fs, shown.as_ref(), to, &changes, cache.as_deref_mut(), Some(&record.crlf))?;
