@@ -358,3 +358,152 @@ fn bug_2221_is_below_matches_is_ancestor_over_random_histories_in_two_projects()
     assert_eq!(checked, 60 * 40);
     assert!(below > checked / 10 && below < checked * 9 / 10, "{below} of {checked} below: the histories have both answers");
 }
+
+/// Push one new file `path` as `who` to `branch` (made from `main` when
+/// new): the branch's tip as `who` sees it.
+fn push_as(api: &Api, p: &Project, who: &Person, branch: &str, path: &str) -> ObjectId {
+    let tok = who.token();
+    let had = tip_of(api, &tok, &p.name, branch);
+    let mut c = Craft::new(api, who, &p.name, if had.is_some() { branch } else { "main" });
+    c.file(path, &format!("{path}\n"));
+    let (_, r) = c.push_edited(branch, had, |_| {});
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    tip_of(api, &tok, &p.name, branch).expect("the branch has a tip")
+}
+
+/// Land `snapshot` (as `who` sees it) on `main` as `who`: the answer, which
+/// must be `landed`.
+fn land_as(api: &Api, p: &Project, who: &Person, snapshot: ObjectId) -> serde_json::Value {
+    let r = api.post_json(Some(&who.token()), &format!("/v1/projects/{}/land", p.name), &json!({"onto": "main", "snapshot": snapshot.hex()}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["state"], "landed", "{v}");
+    v
+}
+
+/// BUG-2271: someone who is not an admin pushes to a branch of their own and
+/// lands it on `main` again and again (the many-branch headline's agents).
+/// Each landing reads the branch down to where it left `main`, and asks of
+/// each change whether its submitter sees it whole; that answer read the
+/// change's edits (its trees and its parent's) every time, so the reads
+/// grew with the branch, and past the object cache each was a storage read
+/// (on S3 a request): 272 a push over 10 minutes. Now each change is
+/// classified once per view: each landing classifies exactly its own new
+/// changes (before: every change of the branch, 2, 4, 6, … 12).
+#[test]
+fn bug_2271_a_branch_landed_again_and_again_classifies_only_its_new_changes() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let (h, tok) = (hub.hub(), p.admin.token());
+    let classified = || h.landing.stats.classified.load(Ordering::Relaxed);
+    let mut counts = Vec::new();
+    for round in 0..6 {
+        let mut tip = ObjectId([0; 32]);
+        for k in 0..2 {
+            tip = push_as(&api, &p, &p.dev, "dev-2271", &format!("src/dev/f{round}-{k}.rs"));
+        }
+        let before = classified();
+        let v = land_as(&api, &p, &p.dev, tip);
+        counts.push(classified() - before);
+        // Exactly this round's two changes land; the earlier ones are on
+        // `main` already.
+        assert_eq!(v["landed"].as_array().map(Vec::len), Some(2), "round {round}: {v}");
+        // `main` moves on between the branch's landings.
+        let base = tip_of(&api, &tok, &p.name, "main").unwrap();
+        let r = crate::limits::land_edit(&api, &tok, &p.name, base, &format!("src/main/r{round}.rs"), "x\n", true);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+    }
+    assert_eq!(counts, vec![2; 6], "changes classified at each landing");
+}
+
+/// BUG-2271: what is remembered of a change is its submitter's view's own.
+/// A change editing `src/` and the billing folder is seen in part by a dev,
+/// who lands the branch: only their own change on it lands, that one is
+/// left out (remembered so for the dev's view). Someone in both groups sees
+/// it whole and lands it: it is classified again for their view, and lands.
+#[test]
+fn bug_2271_a_remembered_class_is_the_viewers_own() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let h = hub.hub();
+    let classified = || h.landing.stats.classified.load(Ordering::Relaxed);
+    // The admin's change of both folders, on a new branch.
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/mixed-2271.rs", "m\n");
+    c.file(&format!("{BILL_DIR}/mixed-2271.txt"), "m\n");
+    let (_, r) = c.push_edited("mix-2271", None, |_| {});
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // A dev's change on it, landed by the dev: theirs lands, the mixed one
+    // (seen in part) does not.
+    let tip = push_as(&api, &p, &p.dev, "mix-2271", "src/dev-2271.rs");
+    let before = classified();
+    let v = land_as(&api, &p, &p.dev, tip);
+    assert_eq!(v["landed"].as_array().map(Vec::len), Some(1), "{v}");
+    assert_eq!(classified() - before, 2, "the dev's change and the mixed one");
+    let main = |who: &Person| {
+        let t = tip_of(&api, &who.token(), &p.name, "main").unwrap();
+        let r = api.get(Some(&who.token()), &format!("/v1/projects/{}/q/file?rev={}&path={BILL_DIR}/mixed-2271.txt", p.name, t.hex()));
+        r.status
+    };
+    assert_eq!(main(&p.admin), 404, "the mixed change is not on main");
+    // Finance in devs too: they see it whole, and land it.
+    let fp = p.fin.fingerprint();
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name, "--confirm", &fp]);
+    let tip = tip_of(&api, &p.fin.token(), &p.name, "mix-2271").unwrap();
+    let before = classified();
+    let v = land_as(&api, &p, &p.fin, tip);
+    assert_eq!(v["landed"].as_array().map(Vec::len), Some(1), "{v}");
+    assert!(classified() - before >= 1, "classified again for their view");
+    assert_eq!(main(&p.admin), 200, "the mixed change is on main");
+}
+
+/// BUG-2271 review: a remembered answer never outlives the access it was
+/// decided on. A dev added to finance sees the admin's change of `src/` and
+/// the billing folder whole, and lands their branch on another branch (the
+/// change is remembered as theirs to land, for that view). Removed from
+/// finance, they land the same branch on `main`: the change is classified
+/// again for their new view, seen in part, and left out, so nothing at a
+/// path they can no longer read lands under their name.
+#[test]
+fn bug_2271_a_remembered_class_is_not_kept_past_a_revocation() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let h = hub.hub();
+    let classified = || h.landing.stats.classified.load(Ordering::Relaxed);
+    // Another target, made from `main`.
+    let rel = push_as(&api, &p, &p.admin, "rel-2271", "src/rel-2271.rs");
+    assert_ne!(rel, ObjectId([0; 32]));
+    // The admin's change of both folders, on a new branch.
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/mixed-2271r.rs", "m\n");
+    c.file(&format!("{BILL_DIR}/mixed-2271r.txt"), "m\n");
+    let (_, r) = c.push_edited("mix-2271r", None, |_| {});
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // The dev, in finance too, sees it whole and lands the branch on `rel`.
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.dev.name, "--confirm", &p.dev.fingerprint()]);
+    let tip = push_as(&api, &p, &p.dev, "mix-2271r", "src/dev-2271r.rs");
+    let before = classified();
+    let r = api.post_json(Some(&p.dev.token()), &format!("/v1/projects/{}/land", p.name), &json!({"onto": "rel-2271", "snapshot": tip.hex()}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(v["landed"].as_array().map(Vec::len), Some(2), "the mixed change and the dev's: {v}");
+    assert!(classified() - before >= 1, "the mixed change was classified");
+    // Out of finance: the same branch, one more change, landed on `main`.
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.dev.name]);
+    let tip = push_as(&api, &p, &p.dev, "mix-2271r", "src/dev-2271r2.rs");
+    let before = classified();
+    let v = land_as(&api, &p, &p.dev, tip);
+    assert_eq!(v["landed"].as_array().map(Vec::len), Some(2), "only the dev's two changes: {v}");
+    assert!(classified() - before >= 1, "the mixed change was classified again for their new view");
+    let t = tip_of(&api, &p.admin.token(), &p.name, "main").unwrap();
+    let r = api.get(Some(&p.admin.token()), &format!("/v1/projects/{}/q/file?rev={}&path={BILL_DIR}/mixed-2271r.txt", p.name, t.hex()));
+    assert_eq!(r.status, 404, "the mixed change is not on main");
+}

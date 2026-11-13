@@ -744,6 +744,22 @@ commands (§4) and by the DigitalOcean run.
   G2's commits per push (BUG-1946) and landings across projects
   (BUG-1948). The paid run measures them across machines; it is not
   expected to pass them. BUG-1593 (commits per landing) is fixed.
+- **Spaces' request rate (BUG-2290).** One Spaces bucket allows 800
+  operations a second, all kinds together (500, of which 300 writes and
+  lists, for buckets made before DigitalOcean's upgrade), answers more
+  with `503 Slow Down`, and asks for a support ticket above 150 a second
+  sustained ([Spaces Limits](https://docs.digitalocean.com/products/spaces/details/limits/),
+  [Performance Best Practices](https://docs.digitalocean.com/products/spaces/concepts/best-practices/)).
+  The many-branch headline makes about 8.6 reads and 11.0 writes a push
+  (local, 300 agents for 10 minutes, after BUG-2271's fix; 272 reads
+  before it): at 250 pushes/s about 4,900 requests a second. The server
+  retries a `503` for at most 10 s, then the request fails, so at that
+  rate the run measures Spaces' throttling. **Before the run, ask
+  DigitalOcean support to raise the bucket's limit to at least 6,000
+  operations a second; without that, set `HEADLINE_RATE=40`** (about 800
+  requests a second) and read the headline as a correctness run, not a
+  speed one. The server's object cache (256 MiB) is not the limit: 99 %
+  of its lookups hit in that run.
 - **YugabyteDB restarts.** A node that restarts turns the tablet-replica
   limit on again (§2.2); nothing in the gates creates tables, but a
   migration would fail on it.

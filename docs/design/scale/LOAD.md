@@ -1673,6 +1673,58 @@ stay between 66 and 520 after (both after runs); about 18,000 discarded rows wai
   are at the end), so a listing that adds `k` packs no longer walks every
   pack `k` times.
 
+## Storage reads in the many-branch headline (BUG-2271, 2026-11-13, `readsperf`)
+
+The many-branch headline at 300 agents for 10 minutes, objects in a local
+directory, one run at a time (`bench-quiet.sh`), with a diagnostic build
+(not committed) that counts every storage read by a label set where it is
+made and samples one call stack in 500:
+
+```sh
+VEIL_DIAG_READS=500 OBJECTS=local bash ~/.cache/veil-orch/bench-quiet.sh bash .scratch/bench-custom.sh custom -- --mode branches --projects 1 --rates max --merge-every 5 --clients 300 --duration 600
+```
+
+| Build | Pushes (/s) | p50 (ms) | p99 (ms) | Server CPU (ms/push) | Storage reads per push | Object cache hits | Storage writes per push |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `98aee270` (before background merging) | 108.4 | 1,602 | 17,725 | 138.9 | 29.5 | 95 % | 12.7 |
+| `9d0ef46c` (background merging) | 243.4 | 1,111 | 3,367 | 70.7 | **261.3** | **71 %** | 11.0 |
+| `readsperf` (this fix) | 246.9 | 1,067 | 3,567 | 72.7 | **8.6** | **99 %** | 11.0 |
+
+- **Where the reads came from.** Neither the merges (4 a push) nor the
+  merged packs nor `Packs::load`: on `9d0ef46c` 27.1 million tree and
+  11.1 million snapshot misses in 10 minutes, nearly all from landings.
+  Labelled in a 4-minute run: `landing::classify` 6.15 of 7.15 million
+  reads (86 %), the viewer graph's fill 0.68 million, the rest 0.33
+  million. The agents are not admins: a landing of a branch reads it down
+  to where it left `main` and asks of each change whether its submitter
+  sees it whole, by its edit set (the change's trees and its parent's).
+  These branches never take `main` back, so every landing asked it of
+  every change of the branch again (2, 4, 6, … a landing), and once the
+  trees written between two landings of one branch outgrew the 256 MiB
+  object cache (each agent's folder gains a file a push, so its trees
+  grow), each was a storage read. The faster run (background merging)
+  got there sooner: more pushes, longer branches, bigger folders.
+- **The fix:** the answer is remembered per server, by project, view key,
+  change and base (at most 262,144). It depends only on the two snapshots
+  and on what the viewer reads, which the view key names exactly, so it
+  never goes stale. With it the cache holds what is read again (99 %
+  hits), and the fill's walks stop missing too (0.68 million to 27,000
+  in the 4-minute runs). Moving a pushed pack's cached objects and trees
+  to the project's keys, instead of copying them, changed nothing (265
+  reads a push) and was dropped.
+- **Speed is unchanged here**: local reads are cheap, and the pushes are
+  bound elsewhere (CPU 73 ms a push). On S3 each read is a request.
+- **What is left** (8.6 a push): the push's own projection
+  (`sync::project_one`), pack indexes loaded for `/tips` grants, and the
+  fill's walks.
+- **Spaces (BUG-2290):** at 250 pushes/s, 8.6 reads and 11.0 writes a
+  push are about 4,900 requests a second; one Spaces bucket allows 800
+  operations a second (DigitalOcean, "Spaces Limits"), answers more with
+  `503 Slow Down`, and asks for a support ticket above 150 a second
+  sustained. Within 800 the headline holds about 40 pushes/s. The paid
+  run needs the bucket's limit raised, or `HEADLINE_RATE=40`
+  (`docs/DEPLOY.md` §11).
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |

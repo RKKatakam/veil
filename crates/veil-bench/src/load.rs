@@ -1645,6 +1645,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "session_hit_share": stat("session_hits").zip(stat("session_misses")).map(|(h, m)| h / (h + m)),
             "permission_hit_share": stat("permission_hits").zip(stat("permission_misses")).map(|(h, m)| h / (h + m)),
             "tips_hit_share": stat("tips_hits").zip(stat("tips_misses")).map(|(h, m)| h / (h + m)),
+            "object_cache_hit_share": stat("object_cache_hits").zip(stat("object_cache_misses")).map(|(h, m)| h / (h + m)),
             "bytes_sent_per_op": per_op(sent as f64),
             "bytes_received_per_op": per_op(received as f64),
             "db_writes_per_op": dml.map(per_op),
@@ -1933,7 +1934,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
 fn line(r: &serde_json::Value) -> String {
     let f = |k: &str| r[k].as_f64().map(|v| format!("{v:.2}")).unwrap_or_else(|| "–".into());
     format!(
-        "{} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, told to come back {} (busy {}, branch landings {}), server ms/op {}, db ms/op {}, db/op {}, commits/op {}, writes/op {}, derived {} s later ({} branches behind)",
+        "{} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, told to come back {} (busy {}, branch landings {}), server ms/op {}, db ms/op {}, db/op {}, commits/op {}, writes/op {}, derived {} s later ({} branches behind), storage reads/op {}, object cache hits {}",
         f("ops_per_s"),
         r["agents_finishing"],
         f("p50_ms"),
@@ -1949,7 +1950,9 @@ fn line(r: &serde_json::Value) -> String {
         f("db_commits_per_op"),
         f("db_writes_per_op"),
         f("derive_lag_s"),
-        r["derive_behind"]
+        r["derive_behind"],
+        f("storage_reads_per_op"),
+        f("object_cache_hit_share")
     )
 }
 

@@ -497,6 +497,10 @@ pub struct Objects {
     pub writes: AtomicU64,
     pub written_bytes: AtomicU64,
     pub reads: AtomicU64,
+    /// Project object lookups answered from the object caches, and those
+    /// that were not (BUG-2271).
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
     pub own_writes: AtomicU64,
     /// Database commits that record a pack before it is written (an
     /// upload's, a push's own: S28), apart from a push's transaction.
@@ -605,6 +609,8 @@ impl Objects {
             writes: Default::default(),
             written_bytes: Default::default(),
             reads: Default::default(),
+            cache_hits: Default::default(),
+            cache_misses: Default::default(),
             own_writes: Default::default(),
             pack_rows: Default::default(),
         }
@@ -809,10 +815,12 @@ impl Objects {
     pub async fn get(&self, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
         let ck = self.cache_key(project, id);
         if let Some(raw) = self.raw_cache.get(&ck) {
+            bump(&self.cache_hits);
             return Ok(Some(raw));
         }
         match self.cache.get(&ck) {
             Some(enc) => {
+                bump(&self.cache_hits);
                 let raw = decoded_cached(id, &enc)?;
                 if raw.len() <= RAW_CACHE_MAX_OBJECT {
                     self.raw_cache.insert(ck, raw.clone(), raw.len());
@@ -820,6 +828,7 @@ impl Objects {
                 Ok(Some(raw))
             }
             None => {
+                bump(&self.cache_misses);
                 let enc = self.load_encoding(project, id).await?;
                 self.load(ck, id, enc)
             }
@@ -874,9 +883,11 @@ impl Objects {
     pub fn get_blocking(&self, rt: &tokio::runtime::Handle, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
         let ck = self.cache_key(project, id);
         if let Some(raw) = self.raw_cache.get(&ck) {
+            bump(&self.cache_hits);
             return Ok(Some(raw));
         }
         if let Some(enc) = self.cache.get(&ck) {
+            bump(&self.cache_hits);
             let raw = decoded_cached(id, &enc)?;
             if raw.len() <= RAW_CACHE_MAX_OBJECT {
                 self.raw_cache.insert(ck, raw.clone(), raw.len());
@@ -910,6 +921,7 @@ impl Objects {
         let Some(r) = direct else {
             return rt.block_on(self.get(project, id));
         };
+        bump(&self.cache_misses);
         bump(&self.reads);
         self.load(ck, id, r?)
     }
@@ -921,11 +933,14 @@ impl Objects {
     pub fn get_ephemeral_blocking(&self, rt: &tokio::runtime::Handle, project: i64, id: &ObjectId) -> Result<Option<Bytes>> {
         let ck = self.cache_key(project, id);
         if let Some(raw) = self.raw_cache.get(&ck) {
+            bump(&self.cache_hits);
             return Ok(Some(raw));
         }
         if let Some(enc) = self.cache.get(&ck) {
+            bump(&self.cache_hits);
             return Ok(Some(decoded_cached(id, &enc)?));
         }
+        bump(&self.cache_misses);
         let direct = match self.packs.find(project, id) {
             Found::At(n, s) => self.store.get_range_blocking(&crate::pack::key(project, &n), s.offset, s.last()).and_then(|r| {
                 match r {
