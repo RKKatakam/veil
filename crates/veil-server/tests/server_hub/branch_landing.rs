@@ -368,3 +368,49 @@ fn bug_2271_a_remembered_class_is_the_viewers_own() {
     assert!(classified() - before >= 1, "classified again for their view");
     assert_eq!(main(&p.admin), 200, "the mixed change is on main");
 }
+
+/// BUG-2271 review: a remembered answer never outlives the access it was
+/// decided on. A dev added to finance sees the admin's change of `src/` and
+/// the billing folder whole, and lands their branch on another branch (the
+/// change is remembered as theirs to land, for that view). Removed from
+/// finance, they land the same branch on `main`: the change is classified
+/// again for their new view, seen in part, and left out, so nothing at a
+/// path they can no longer read lands under their name.
+#[test]
+fn bug_2271_a_remembered_class_is_not_kept_past_a_revocation() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let h = hub.hub();
+    let classified = || h.landing.stats.classified.load(Ordering::Relaxed);
+    // Another target, made from `main`.
+    let rel = push_as(&api, &p, &p.admin, "rel-2271", "src/rel-2271.rs");
+    assert_ne!(rel, ObjectId([0; 32]));
+    // The admin's change of both folders, on a new branch.
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/mixed-2271r.rs", "m\n");
+    c.file(&format!("{BILL_DIR}/mixed-2271r.txt"), "m\n");
+    let (_, r) = c.push_edited("mix-2271r", None, |_| {});
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    // The dev, in finance too, sees it whole and lands the branch on `rel`.
+    p.admin.ok(&p.dir, &["group", "add", "finance", &p.dev.name, "--confirm", &p.dev.fingerprint()]);
+    let tip = push_as(&api, &p, &p.dev, "mix-2271r", "src/dev-2271r.rs");
+    let before = classified();
+    let r = api.post_json(Some(&p.dev.token()), &format!("/v1/projects/{}/land", p.name), &json!({"onto": "rel-2271", "snapshot": tip.hex()}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["state"], "landed", "{v}");
+    assert_eq!(v["landed"].as_array().map(Vec::len), Some(2), "the mixed change and the dev's: {v}");
+    assert!(classified() - before >= 1, "the mixed change was classified");
+    // Out of finance: the same branch, one more change, landed on `main`.
+    p.admin.ok(&p.dir, &["group", "remove", "finance", &p.dev.name]);
+    let tip = push_as(&api, &p, &p.dev, "mix-2271r", "src/dev-2271r2.rs");
+    let before = classified();
+    let v = land_as(&api, &p, &p.dev, tip);
+    assert_eq!(v["landed"].as_array().map(Vec::len), Some(2), "only the dev's two changes: {v}");
+    assert!(classified() - before >= 1, "the mixed change was classified again for their new view");
+    let t = tip_of(&api, &p.admin.token(), &p.name, "main").unwrap();
+    let r = api.get(Some(&p.admin.token()), &format!("/v1/projects/{}/q/file?rev={}&path={BILL_DIR}/mixed-2271r.txt", p.name, t.hex()));
+    assert_eq!(r.status, 404, "the mixed change is not on main");
+}
