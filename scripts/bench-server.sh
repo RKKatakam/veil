@@ -84,7 +84,7 @@ echo "== starting PostgreSQL and MinIO ($TAG)"
 # database (1.5 GB after three minutes) is written out by the backends
 # themselves, a third of their time (BUG-1955). Durability as deployed
 # (`synchronous_commit = on`). The deployment's checkpoint spacing too
-# (BUG-2364): with the default 1 GB of WAL between checkpoints a landing run
+# (BUG-2360): with the default 1 GB of WAL between checkpoints a landing run
 # checkpointed every 20 to 28 s, and full-page images made 6 of its 7.5 GB
 # of WAL.
 D run -d --name "$PG" -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 --shm-size=1g \
