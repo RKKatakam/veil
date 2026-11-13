@@ -747,6 +747,7 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
         Some(_) => None,
         None => Some(gate::Key::Server),
     };
+    let t_gate = std::time::Instant::now();
     let project_place = match gate_key {
         Some(k) => match limits.projects.place(k, class, deadline).await {
             Some(p) => Some(p),
@@ -757,6 +758,10 @@ pub async fn admit(State(hub): State<HubState>, req: Request, next: Next) -> Res
     let Some(server_place) = limits.server.place(class, deadline).await else {
         return finish(&hub, busy(false));
     };
+    if class == Class::Write {
+        hub.landing.stats.p_gate_waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::landing::prof(&hub.landing.stats.p_gate_wait_us, t_gate);
+    }
 
     // 5: the route, its cache hits counted for its project, its answer
     // under the answers' budget.

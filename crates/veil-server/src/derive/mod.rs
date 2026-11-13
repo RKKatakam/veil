@@ -360,20 +360,29 @@ pub async fn landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Res
     let stats = tokio::spawn(async move { locked_landing(&hub2, project, branches).await })
         .await
         .map_err(|e| Error::Other(e.into()))??;
+    let st = &hub.landing.stats;
+    st.p_derive_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    st.p_derive_snapshots.fetch_add(stats.snapshots as u64, std::sync::atomic::Ordering::Relaxed);
+    let t_prs = std::time::Instant::now();
     // The project's record of its last valid `.veilrules` (S21, BUG-1259),
     // kept current at each landing on the default branch; a failure here is
     // only a longer walk at the next PR request.
     if let Err(e) = crate::prs::landed(hub, project, &moved).await {
         eprintln!("veil-server: recording the review rules of project {project}: {e:?}");
     }
+    crate::landing::prof(&st.p_derive_prs_us, t_prs);
     Ok(stats)
 }
 
 async fn locked_landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Result<Stats> {
     let key = LOCK_BASE ^ project;
     let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+    let st = &hub.landing.stats;
+    let t_lock = std::time::Instant::now();
     let (permit, mut c) = loop {
+        let t_turn = std::time::Instant::now();
         hub.limits.derive_turn().await;
+        crate::landing::prof(&st.p_derive_turn_us, t_turn);
         let permit = hub.derive.permit().await?;
         let mut c = hub.derive.db.acquire().await?;
         let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(key).fetch_one(&mut *c).await?;
@@ -389,13 +398,17 @@ async fn locked_landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> 
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    crate::landing::prof(&st.p_derive_lock_us, t_lock);
     let cx = cx(hub, project);
     let scope = Scope::Branches(branches);
+    let t_prep = std::time::Instant::now();
     let prep = tokio::task::spawn_blocking(move || deriving(|| prepare_landing_run(&cx, scope)))
         .await
         .map_err(|e| Error::Other(e.into()));
+    crate::landing::prof(&st.p_derive_prep_us, t_prep);
+    let t_fin = std::time::Instant::now();
     let r = match prep {
-        Ok(Ok(p)) => finish_landing_run(hub, project, p).await,
+        Ok(Ok(p)) => finish_landing_run(hub, project, p).await.inspect(|_| crate::landing::prof(&st.p_derive_finish_us, t_fin)),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(e),
     };
@@ -483,6 +496,9 @@ fn prepare_landing_run(cx: &Cx, scope: Scope) -> Result<PreparedLanding> {
 async fn finish_landing_run(hub: &Arc<Hub>, project: i64, p: PreparedLanding) -> Result<Stats> {
     let view_info = viewers_of(hub, project).await?;
     let small = p.writes.history.len() <= 64 && p.writes.graph.len() <= 16;
+    if !small {
+        hub.landing.stats.p_derive_big.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let memo = match (&view_info, small) {
         (Some((proj, viewers)), true) => crate::query::graph::prepare_memo(hub, proj, viewers.clone(), &p.tip_oids).await?,
         (Some((_, viewers)), false) => crate::query::graph::PreparedMemo {

@@ -399,6 +399,22 @@ pub struct Stats {
     pub apply_us: AtomicU64,
     pub recheck_us: AtomicU64,
     pub project_us: AtomicU64,
+    /// PROFILE (lateslow): submits, their parts' microseconds.
+    pub p_submits: AtomicU64,
+    pub p_admit_us: AtomicU64,
+    pub p_create_us: AtomicU64,
+    pub p_wait_us: AtomicU64,
+    pub p_seen_us: AtomicU64,
+    pub p_gate_waits: AtomicU64,
+    pub p_gate_wait_us: AtomicU64,
+    pub p_derive_runs: AtomicU64,
+    pub p_derive_snapshots: AtomicU64,
+    pub p_derive_turn_us: AtomicU64,
+    pub p_derive_lock_us: AtomicU64,
+    pub p_derive_prep_us: AtomicU64,
+    pub p_derive_finish_us: AtomicU64,
+    pub p_derive_prs_us: AtomicU64,
+    pub p_derive_big: AtomicU64,
 }
 
 /// A waiting ticket's answer channels, and the branch it waits on.
@@ -953,9 +969,12 @@ pub async fn submit(
     }
     // Past what the branch's service lands in time, the submitter is told
     // to come back, before anything is done for the submit (BUG-1955).
+    hub.landing.stats.p_submits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let t_admit = std::time::Instant::now();
     if let Some(refused) = crate::limits::pressure::admit(hub, project.id, &req.onto, &who).await? {
         return Ok(Err(refused));
     }
+    prof(&hub.landing.stats.p_admit_us, t_admit);
     match (req.snapshot, req.base) {
         (Some(snapshot), None) if req.edits.is_empty() && req.change_id.is_none() && req.description.is_empty() => {
             let onto = req.onto.clone();
@@ -1006,7 +1025,9 @@ pub async fn submit(
                 onto: None,
                 receipts: req.receipts,
             };
+            let t_create = std::time::Instant::now();
             let r = crate::changes::create_with(hub, project, viewer, caller, change, Some((who.clone(), q.clone()))).await;
+            prof(&hub.landing.stats.p_create_us, t_create);
             crate::sync::settle_uploads(hub, project.id, who.person.id, &receipts, &r).await;
             let made = match r {
                 Ok(m) => m,
@@ -1019,6 +1040,7 @@ pub async fn submit(
                 }
             };
             ensure(hub, project.id, &q.branch);
+            let t_wait = std::time::Instant::now();
             let mut r = match req.wait {
                 true => wait(hub, project.id, who.person.id, &q.branch, w, tokio::time::Instant::now() + WAIT).await?,
                 false => {
@@ -1026,13 +1048,22 @@ pub async fn submit(
                     queued(&q.ticket)
                 }
             };
+            prof(&hub.landing.stats.p_wait_us, t_wait);
+            let t_seen = std::time::Instant::now();
             r.change_id = Some(made.change_id);
             let skipped = q.skipped.lock().unwrap().clone();
             r.warnings.extend(skipped_warnings(hub, project.id, &q.branch, &skipped).await?);
-            Ok(Ok(seen(hub, project, viewer, r).await?))
+            let r = seen(hub, project, viewer, r).await?;
+            prof(&hub.landing.stats.p_seen_us, t_seen);
+            Ok(Ok(r))
         }
         _ => Err(Error::bad_request("a landing names either an uploaded `snapshot`, or `edits` on a `base`")),
     }
+}
+
+/// PROFILE (lateslow): add the microseconds since `t` to `c`.
+pub fn prof(c: &AtomicU64, t: std::time::Instant) {
+    c.fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The answer to a landing with nothing in it to land: every change is on
