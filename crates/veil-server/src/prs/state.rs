@@ -144,7 +144,7 @@ fn next_record(row: &Option<(String, String)>, l: &Landing) -> (RulesState, bool
 /// Whether recording `l` can change the review rules (see `next_record`),
 /// read before the landing's transaction takes the review gate: by the
 /// default branch's own batch, which must know which way to take it
-/// (`prs::close_review_gate` or `prs::share_review_gate`) before it reads
+/// (`prs::close_review_gate` or `prs::gate::share_review_gate`) before it reads
 /// the rules again. Its branch row's lock keeps the record where it is
 /// until it records.
 pub async fn changes_rules(c: &mut sqlx::PgConnection, project: i64, l: &Landing) -> Result<bool> {

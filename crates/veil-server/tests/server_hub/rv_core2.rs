@@ -113,6 +113,39 @@ async fn wait_for_sql_lock(db: &sqlx::PgPool, query_like: &str, msg: &str) {
     }
 }
 
+/// The backend pid of the connection `c` (for [`wait_blocked_by`]).
+async fn backend_pid(c: &mut sqlx::PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(c).await.unwrap()
+}
+
+/// Wait until a statement matching `query_like` waits on a lock that the
+/// backend `blocker` holds, and answer its backend pid: this test's
+/// statement, not another test's running at once (`wait_for_sql_lock` looks
+/// at the whole database). YugabyteDB does not report it: as
+/// `wait_for_sql_lock` there, answering 0.
+async fn wait_blocked_by(db: &sqlx::PgPool, blocker: i32, query_like: &str, msg: &str) -> i32 {
+    if is_yugabyte(db).await {
+        wait_for_sql_lock(db, query_like, msg).await;
+        return 0;
+    }
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: Option<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND query LIKE $1 AND $2 = ANY(pg_blocking_pids(pid)) LIMIT 1",
+        )
+        .bind(query_like)
+        .bind(blocker)
+        .fetch_optional(db)
+        .await
+        .unwrap();
+        if let Some(pid) = waiting {
+            return pid;
+        }
+        assert!(Instant::now() < until, "{msg}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 struct TxGuard<'a>(&'a tokio::runtime::Runtime, Option<sqlx::Transaction<'static, sqlx::Postgres>>);
 
 impl TxGuard<'_> {
@@ -440,8 +473,9 @@ fn bug_1886_an_approval_withdrawn_while_the_batch_commits_waits_for_the_batch() 
     th.rt
         .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
         .unwrap();
+    let held_pid = th.rt.block_on(backend_pid(&mut held));
     release_lease(&th, pid, "main");
-    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
+    let batch_pid = th.rt.block_on(wait_blocked_by(&h.db, held_pid, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
 
     // Its reviewer takes the approval back: the verdict waits for the batch
     // that read the approval.
@@ -452,7 +486,7 @@ fn bug_1886_an_approval_withdrawn_while_the_batch_commits_waits_for_the_batch() 
             withdrawn.store(true, Ordering::SeqCst);
             r
         });
-        th.rt.block_on(wait_for_sql_lock(&h.db, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the batch"));
+        th.rt.block_on(wait_blocked_by(&h.db, batch_pid, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the batch"));
         std::thread::sleep(Duration::from_millis(300));
         assert!(!withdrawn.load(Ordering::SeqCst), "the verdict was written while the batch that read the approval was open");
 
@@ -1907,8 +1941,9 @@ fn bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits() {
     th.rt
         .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
         .unwrap();
+    let held_pid = th.rt.block_on(backend_pid(&mut held));
     release_lease(&th, pid, "dev");
-    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entry's row"));
+    th.rt.block_on(wait_blocked_by(&h.db, held_pid, "UPDATE landing_queue AS q%", "the batch never reached its entry's row"));
 
     let answered = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -2035,8 +2070,9 @@ fn bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them() {
     th.rt
         .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
         .unwrap();
+    let held_pid = th.rt.block_on(backend_pid(&mut held));
     release_lease(&th, pid, "dev");
-    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entry's row"));
+    th.rt.block_on(wait_blocked_by(&h.db, held_pid, "UPDATE landing_queue AS q%", "the batch never reached its entry's row"));
 
     let answered = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -2138,6 +2174,7 @@ fn bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate() {
     let key = review_gate_key(pid);
     let mut first = th.rt.block_on(h.db.begin()).unwrap();
     th.rt.block_on(sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(key).execute(&mut *first)).unwrap();
+    let first_pid = th.rt.block_on(backend_pid(&mut first));
     let written = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let reviewer = scope.spawn(|| {
@@ -2145,15 +2182,27 @@ fn bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate() {
             written.store(true, Ordering::SeqCst);
             r
         });
-        th.rt.block_on(wait_for_sql_lock(&h.db, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the gate"));
+        // Announced (other tests' writers may wait on the gate too)...
+        let until = Instant::now() + Duration::from_secs(30);
+        while th.rt.block_on(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM review_writers WHERE project_id = $1").bind(pid).fetch_one(&h.db)).unwrap() == 0 {
+            assert!(Instant::now() < until, "the verdict never announced itself");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // ...and waiting for the gate.
+        th.rt.block_on(wait_blocked_by(&h.db, first_pid, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the gate"));
         assert!(!written.load(Ordering::SeqCst), "the verdict did not wait for a batch holding the gate");
         // A batch arriving after the writer: it finds the writer announced
         // and leaves the gate to it.
         let mut second = th.rt.block_on(h.db.begin()).unwrap();
         th.rt.block_on(sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *second)).unwrap();
         let writers = th.rt.block_on(veil_server::prs::gate::share_review_gate(&mut second, pid, true)).unwrap();
-        assert_eq!(writers.len(), 1, "the batch after the verdict did not find it announced");
+        let rows: Vec<(i64, i64, i64)> =
+            th.rt.block_on(sqlx::query_as("SELECT id, project_id, since_ms FROM review_writers").fetch_all(&h.db)).unwrap();
         th.rt.block_on(first.rollback()).unwrap();
+        if writers.len() != 1 {
+            th.rt.block_on(second.rollback()).unwrap();
+            panic!("the batch after the verdict did not find it announced: {writers:?}, rows {rows:?}, project {pid}");
+        }
         let until = Instant::now() + Duration::from_secs(5);
         while !written.load(Ordering::SeqCst) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(50));
@@ -2201,8 +2250,9 @@ fn bug_2111_a_reviewer_removed_while_the_batch_commits_does_not_approve_it() {
     th.rt
         .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
         .unwrap();
+    let held_pid = th.rt.block_on(backend_pid(&mut held));
     release_lease(&th, pid, "main");
-    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
+    th.rt.block_on(wait_blocked_by(&h.db, held_pid, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
 
     let removed = AtomicBool::new(false);
     std::thread::scope(|scope| {
