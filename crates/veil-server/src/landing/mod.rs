@@ -1557,6 +1557,9 @@ pub(crate) struct Ancestry {
     /// `landed_changes` row (BUG-1524); else [`Ancestry::landed`] also asks
     /// the derived graph.
     recorded: bool,
+    /// The derived graph's walks down from the tip (or the frontier),
+    /// shared by every question of the submit (BUG-2221).
+    walks: Vec<crate::derive::graph::Descent>,
 }
 
 /// More than [`MAX_REVISIONS`] revisions of a change to look through.
@@ -1592,6 +1595,7 @@ impl Ancestry {
             walk: None,
             staged,
             recorded: true,
+            walks: Vec::new(),
         }
     }
 
@@ -1635,7 +1639,13 @@ impl Ancestry {
         self.hub.landing.stats.walks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tip = self.tip;
         if self.graph().await? {
-            let v = crate::derive::read(&self.hub, self.project, move |g| Ok(g.row(&x)?.is_some() && g.is_ancestor(x, tip)?)).await?;
+            let mut walks = std::mem::take(&mut self.walks);
+            let (v, walks) = crate::derive::read(&self.hub, self.project, move |g| {
+                let v = g.row(&x)?.is_some() && g.is_below(&mut walks, x, &[tip])?;
+                Ok((v, walks))
+            })
+            .await?;
+            self.walks = walks;
             self.known.insert(x, v);
             return Ok(Some(v));
         }
@@ -1929,23 +1939,21 @@ impl Ancestry {
         if frontier.len() > FRONTIER_LIMIT {
             return Err(crate::query::graph::warming());
         }
-        let answer = crate::derive::read(&self.hub, self.project, move |g| {
+        let mut walks = std::mem::take(&mut self.walks);
+        let (answer, walks) = crate::derive::read(&self.hub, self.project, move |g| {
             for f in &frontier {
                 if g.row(f)?.is_none() {
-                    return Ok(None);
+                    return Ok((None, walks));
                 }
             }
             if g.row(&x)?.is_none() {
-                return Ok(Some(false));
+                return Ok((Some(false), walks));
             }
-            for f in &frontier {
-                if g.is_ancestor(x, *f)? {
-                    return Ok(Some(true));
-                }
-            }
-            Ok(Some(false))
+            let v = g.is_below(&mut walks, x, &frontier)?;
+            Ok((Some(v), walks))
         })
         .await?;
+        self.walks = walks;
         answer.ok_or_else(crate::query::graph::warming)
     }
 }
