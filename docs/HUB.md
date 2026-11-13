@@ -5532,7 +5532,7 @@ transaction per landing instead of 23.
    writer's announcement takes no lock anyone holds.) Batches do not wait
    for one another.
 13. **A lease whose holder is gone is taken over at once** (`landing/lease_lock.rs`,
-   `landing/service.rs` `take_lease`, migration 40, BUG-1970 cause 2).
+   `landing/service.rs` `take_lease`, migration 39, BUG-1970 cause 2).
    A branch's lease row (`landing_leases`) lasts `LEASE_MS` (2 s, kept:
    a batch's transaction may wait half of it for its store, BUG-1982, and
    a shorter lease would leave a slow store or an ordinary pause too
