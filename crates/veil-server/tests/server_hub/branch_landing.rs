@@ -131,7 +131,8 @@ fn bug_2221_with_the_deriver_behind_a_branch_landing_reads_only_what_main_gained
 /// asked before and in whatever order, `is_below` answers as
 /// `is_ancestor` does, for every pair of snapshots of a history with
 /// merges, crossing lines and timestamps out of order; and a snapshot found
-/// not below `main` once is below it after `main` merges it.
+/// not below `main` once is below it after `main` merges it. Several
+/// starting points too (below any one of them).
 #[test]
 fn bug_2221_is_below_answers_as_is_ancestor_whatever_was_remembered() {
     let hub = TestHub::start();
@@ -183,6 +184,16 @@ fn bug_2221_is_below_answers_as_is_ancestor_whatever_was_remembered() {
                         checked += 1;
                         below += want as usize;
                     }
+                }
+            }
+            // Several starting points (the frontier the landing asks the
+            // graph about while the deriver is behind): below any of them.
+            for (i, t) in pairs.iter().enumerate() {
+                let u = pairs[(i * 7 + 3) % pairs.len()];
+                let mut walks = Vec::new();
+                for x in pairs.iter().rev() {
+                    let want = g.is_ancestor(*x, *t)? || g.is_ancestor(*x, u)?;
+                    assert_eq!(g.is_below(&mut walks, *x, &[*t, u])?, want, "is {} below {} or {}", x.short(), t.short(), u.short());
                 }
             }
             Ok((checked, below))
