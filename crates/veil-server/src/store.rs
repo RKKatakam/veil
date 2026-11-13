@@ -83,6 +83,29 @@ pub fn object_key(project: i64, id: &ObjectId) -> String {
     format!("p/{project}/{}/{}", &h[..2], &h[2..])
 }
 
+/// Writes to a local directory in flight at once, each on a thread of
+/// [`write_threads`]: what one landing batch stores, in one round.
+const WRITE_THREADS: usize = 1024;
+
+/// The threads a local directory's writes wait on, apart from the
+/// runtime's blocking pool (BUG-2363): each write waits for the journal
+/// twice (`fsync`), and as many in flight as [`WRITE_THREADS`] would hold
+/// that pool's 512 threads, every other blocking step of the server (a
+/// submit's build, an object read, the deriver) queued behind them.
+fn write_threads() -> &'static tokio::runtime::Handle {
+    static WRITES: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    WRITES
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(WRITE_THREADS)
+                .thread_name("veil-store-write")
+                .build()
+                .expect("the store's write threads")
+        })
+        .handle()
+}
+
 /// Objects in a local directory: `<root>/p/<project>/ab/cdef…`, written to
 /// a temporary file, synced, then renamed into place.
 pub struct FsStore {
@@ -116,22 +139,25 @@ impl BlobStore for FsStore {
     /// then its folder), and writes in flight together share its commits:
     /// what a landing batch stores (some 500 objects) took eight rounds of
     /// 64, 37 to 48 ms a batch, the largest part of a batch (BUG-1955).
+    /// A batch's some 600 objects took three rounds of 256 (33 to 46 ms,
+    /// most of a batch's commit: BUG-2363); all at once, one.
     fn writes_at_once(&self) -> usize {
-        256
+        WRITE_THREADS
     }
 
+    /// On threads of their own ([`write_threads`]).
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         let path = self.path(key)?;
-        if tokio::fs::try_exists(&path).await? {
-            return Ok(());
-        }
         let dir = path.parent().expect("keys have a directory").to_path_buf();
         let t_q = std::time::Instant::now();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        write_threads().spawn_blocking(move || -> Result<()> {
             PUT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             PUT_QUEUE_US.fetch_add(t_q.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             let _t = PutTimer(std::time::Instant::now());
             use std::io::Write;
+            if path.try_exists()? {
+                return Ok(());
+            }
             std::fs::create_dir_all(&dir)?;
             let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
             tmp.write_all(&data)?;
