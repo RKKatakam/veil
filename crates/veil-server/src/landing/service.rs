@@ -369,9 +369,63 @@ struct Built {
     /// The default branch's `.veilrules` at the new tip (S21).
     rules_file: Option<crate::prs::state::RulesFile>,
     review_guard: Option<BatchReviewGuard>,
+    /// The entries answered `conflict`, by their place in `outcomes`: each
+    /// one's report is built once the batch is ([`build`]).
+    conflicts: Vec<(usize, ConflictAsk)>,
+}
+
+/// What an entry answered `conflict` was judged on: its report is built
+/// from it once the batch is, on the batch's threads, with the batch's
+/// objects (BUG-2220: built in its turn, on the one thread, each report
+/// walked up to 256 snapshots of the branch). The same report as built in
+/// its turn: every input is here, and objects are content-addressed.
+struct ConflictAsk {
+    who: As,
+    against: ObjectId,
+    parent_tree: ObjectId,
+    chain: ObjectId,
+    chain_tree: ObjectId,
+    set: Vec<Change>,
+    merges: u32,
+    change_id: Option<veil_core::ChangeId>,
+}
+
+impl ConflictAsk {
+    fn report(&self, src: &Source) -> Result<super::merge::ConflictReport> {
+        let view = self.who.project.view(&self.who.viewer);
+        super::merge::build_conflict(
+            src,
+            &view,
+            self.against,
+            self.parent_tree,
+            self.chain,
+            self.chain_tree,
+            &self.set,
+            self.merges,
+            self.change_id,
+        )
+    }
 }
 
 impl Built {
+    /// The entry being built (the next of `outcomes`) is answered
+    /// `conflict`: its report is built with the batch's others.
+    fn conflict(&mut self, ask: ConflictAsk) -> Outcome {
+        let report = super::merge::ConflictReport {
+            paths: Vec::new(),
+            onto: ask.chain,
+            base: ask.against,
+            conflicts: Vec::new(),
+            landed_since: Vec::new(),
+            hidden: false,
+            too_large: false,
+            merges: ask.merges,
+            change_id: ask.change_id,
+        };
+        self.conflicts.push((self.outcomes.len(), ask));
+        Outcome::Conflict(report)
+    }
+
     fn object(&mut self, src: &mut Source, id: ObjectId, raw: Bytes) {
         self.bytes += raw.len();
         self.made += raw.len();
@@ -952,7 +1006,7 @@ impl Service {
                     // of a protected branch's batch, BUG-1955); the first
                     // that fails is the batch's error, as before.
                     sync::blocking(hub, self.project, move |src| {
-                        on_threads(&pending_stacks, build_threads(), |(i, st)| Ok((*i, crate::prs::stack_review_diff(src, st)?))).into_iter().collect()
+                        on_threads(&pending_stacks, build_threads(), 8, |(i, st)| Ok((*i, crate::prs::stack_review_diff(src, st)?))).into_iter().collect()
                     })
                     .await?
                 };
@@ -1865,6 +1919,11 @@ fn read_entry(src: &Source, stack: &[Entry]) -> veil_core::Result<Read> {
     Ok(Read { snaps, sets, base_trees })
 }
 
+/// Adds the microseconds since `t` to a build counter (BUG-2220).
+fn spent(counter: &std::sync::atomic::AtomicU64, t: Instant) {
+    counter.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
 /// The threads a batch's entries are read on: the machine's, at most 8
 /// (the build itself, on the tip, is one thread's).
 fn build_threads() -> usize {
@@ -1872,9 +1931,9 @@ fn build_threads() -> usize {
 }
 
 /// `f` of each of `items`, in their order, on up to `threads` threads (at
-/// least 8 items a thread; with one thread, or few items, here).
-fn on_threads<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let per = items.len().div_ceil(threads.max(1)).max(8);
+/// least `least` items a thread; with one thread, or few items, here).
+fn on_threads<T: Sync, R: Send>(items: &[T], threads: usize, least: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let per = items.len().div_ceil(threads.max(1)).max(least);
     if threads < 2 || items.len() <= per {
         return items.iter().map(f).collect();
     }
@@ -1892,7 +1951,7 @@ fn on_threads<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R
 fn read_ahead(src: &Source, entries: &[Prepared], threads: usize) -> Vec<Option<Read>> {
     match threads {
         0 | 1 => entries.iter().map(|_| None).collect(),
-        _ => on_threads(entries, threads, |p| read_entry(src, &p.row.stack).ok()),
+        _ => on_threads(entries, threads, 8, |p| read_entry(src, &p.row.stack).ok()),
     }
 }
 
@@ -1933,6 +1992,7 @@ fn build(
         accept: None,
         rules_file: None,
         review_guard,
+        conflicts: Vec::new(),
     };
     // Attached keys: projected from their memo over what came after it.
     for (k, who, at, m) in attach {
@@ -1974,7 +2034,9 @@ fn build(
         b.after.keys.insert(k, Kept { who, at: p });
         hub.landing.stats.attached.fetch_add(1, Ordering::Relaxed);
     }
+    let t = Instant::now();
     let read = read_ahead(&src, &entries, threads);
+    spent(&hub.landing.stats.read_us, t);
     for (p, read) in entries.into_iter().zip(read) {
         if b.alone {
             break;
@@ -2052,6 +2114,20 @@ fn build(
         b.rows.push(row);
         b.outcomes.push(outcome);
     }
+    // The conflicts' reports, each from what its entry was judged on.
+    let asks = std::mem::take(&mut b.conflicts);
+    let t = Instant::now();
+    let reports = on_threads(&asks, threads, 1, |(_, ask)| ask.report(&src));
+    spent(&hub.landing.stats.conflict_us, t);
+    for ((at, _), report) in asks.iter().zip(reports) {
+        b.outcomes[*at] = match report {
+            Ok(r) => Outcome::Conflict(r),
+            Err(e) => {
+                eprintln!("veil-server: landing ticket {} of project {project}: {e:?}", b.rows[*at].ticket);
+                Outcome::Rejected("the server could not land this change (an error it logged); submit it again".into())
+            }
+        };
+    }
     // Nothing landed: the tip is still the one `on.made` made.
     if !b.objects.is_empty() {
         b.after.made = Arc::new(b.objects.iter().cloned().collect());
@@ -2106,6 +2182,7 @@ fn entry(
     // changed or leaks a hidden path name (BUG-1104, S18 Guarantee 1).
     let view = who.project.view(&who.viewer);
     let default = branch == who.project.default_branch;
+    let t = Instant::now();
     if p.recheck || p.row.merges > 0 || view.is_agent() {
         for ((s, set), e) in snaps.iter().zip(&sets).zip(&p.row.stack) {
             let against = if s.parents.get(1..).is_some_and(|o| o.contains(&e.base)) { e.base } else { s.parents[0] };
@@ -2161,6 +2238,7 @@ fn entry(
             return Ok(Some(Outcome::Rejected(format!("you may not write '{}'", c.path))));
         }
     }
+    spent(&hub.landing.stats.write_rule_us, t);
     if let Some(why) = &p.review_refusal {
         return Ok(Some(Outcome::Rejected(why.clone())));
     }
@@ -2218,7 +2296,10 @@ fn entry(
         // batch was overtaken, at most three times, by the next).
         let mut merged_set = None;
         if edits::fast_path(src, parent_tree, chain_tree, set)?.is_some() {
-            match super::merge::merge_onto(src, &view, s.parents.len(), set, parent_tree, chain_tree)? {
+            let t = Instant::now();
+            let m = super::merge::merge_onto(src, &view, s.parents.len(), set, parent_tree, chain_tree)?;
+            spent(&hub.landing.stats.merge_us, t);
+            match m {
                 Some(m) => {
                     // A batch's merges are bounded in what they read: past
                     // it, the entry comes first in the next batch.
@@ -2233,39 +2314,36 @@ fn entry(
                     merged = true;
                 }
                 None => {
-                    let report = super::merge::build_conflict(
-                        src,
-                        &view,
+                    return Ok(Some(b.conflict(ConflictAsk {
+                        who,
                         against,
                         parent_tree,
                         chain,
                         chain_tree,
-                        set,
-                        p.row.merges,
-                        last_cid,
-                    )?;
-                    return Ok(Some(Outcome::Conflict(report)));
+                        set: set.clone(),
+                        merges: p.row.merges,
+                        change_id: last_cid,
+                    })));
                 }
             }
         }
         let merged_here = merged_set.is_some();
         let set: &[Change] = merged_set.as_deref().unwrap_or(set);
         let mut made = HashMap::new();
+        let t = Instant::now();
         let tree = match edits::apply(src, chain_tree, set, &mut made)? {
             Ok(t) => t,
             Err(edits::Blocked(_)) => {
-                let report = super::merge::build_conflict(
-                    src,
-                    &view,
+                return Ok(Some(b.conflict(ConflictAsk {
+                    who,
                     against,
                     parent_tree,
                     chain,
                     chain_tree,
-                    &sets[i],
-                    p.row.merges,
-                    last_cid,
-                )?;
-                return Ok(Some(Outcome::Conflict(report)));
+                    set: sets[i].clone(),
+                    merges: p.row.merges,
+                    change_id: last_cid,
+                })));
             }
         };
         for (id, (raw, _)) in made {
@@ -2285,6 +2363,7 @@ fn entry(
                 "the server could not land this change: its landing check failed (a bug in the server, logged there)".into(),
             )));
         }
+        spent(&hub.landing.stats.apply_us, t);
         let mut parents = vec![chain];
         if merge {
             parents.extend(s.parents[1..].iter().copied());
@@ -2338,6 +2417,7 @@ fn entry(
         // The push's checks again, on the new parents, when what they read
         // may have changed: access (epochs), or the policy file the
         // classification reads; and always for a merge (every parent).
+        let t = Instant::now();
         let policy_moved = sync::entry_at(src, &parent_tree, POLICY_FILE)? != sync::entry_at(src, &chain_tree, POLICY_FILE)?;
         if p.recheck || p.row.merges > 0 || policy_moved || merge || merged_here {
             if policy_moved && !who.viewer.admin {
@@ -2362,6 +2442,7 @@ fn entry(
                 return Ok(Some(Outcome::Rejected(why)));
             }
         }
+        spent(&hub.landing.stats.recheck_us, t);
         reals.push(id);
         landed.push((id, snap));
         chain = id;
@@ -2387,6 +2468,7 @@ fn entry(
     }
     // Projections of every new snapshot for every kept view key, onto its
     // last memo.
+    let t = Instant::now();
     let mut new_memos = Vec::new();
     let mut dropped = Vec::new();
     let mut keys = b.after.keys.clone();
@@ -2427,6 +2509,7 @@ fn entry(
     }
     b.flush(hub, src, before)?;
     b.after.keys = keys;
+    spent(&hub.landing.stats.project_us, t);
     for (x, _) in &landed {
         b.after.recent.push_back(*x);
         if b.after.recent.len() > RECENT {
@@ -2518,7 +2601,14 @@ fn recheck(
         signature: None,
         ..real.clone()
     };
-    let c = match sync::complete(src, &who.project, &who.viewer, &known, &n, parents, &real.attempts, identity, &mut sync::PushRows::default()) {
+    // What the checks make is held, never stored as they run (BUG-2220: a
+    // store write and a database read for each merged change, on the
+    // batch's one thread): the trees of a re-check that passes are the
+    // batch's own, and its new snapshot's graph row is not kept.
+    let staged = src.staged.replace(sync::Staged::held());
+    let c = sync::complete(src, &who.project, &who.viewer, &known, &n, parents, &real.attempts, identity, &mut sync::PushRows::unkept());
+    src.staged = staged;
+    let c = match c {
         Ok(c) => c,
         Err(Error::Api { message, code: "forbidden" | "bad_request" | crate::auth::AGENT_SESSION, .. }) => return Ok(Err(message)),
         Err(e) => return Err(e),
