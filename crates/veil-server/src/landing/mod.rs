@@ -381,6 +381,8 @@ pub struct Stats {
     /// Snapshots of the derived graph those walks read
     /// (`derive::graph::Graph::is_below`, BUG-2221).
     pub graph_reads: AtomicU64,
+    /// Changes `classify` read, not remembered (BUG-2271).
+    pub classified: AtomicU64,
     /// Submits told to come back because the branch's queue was full
     /// (`limits::pressure`, BUG-1955), and entries landed merged by
     /// content (BUG-1956).
@@ -423,7 +425,14 @@ pub struct Services {
     /// Leases this server has taken, ever: a poller reads the outcomes
     /// once more after each (BUG-2150).
     taken: AtomicU64,
+    /// What [`classify`] answered (`None`: a conflict the viewer sees), by
+    /// project, view key, change and base (BUG-2271).
+    classes: veil_core::cache::LruCache<Option<Class>>,
 }
+
+/// [`Services::classes`]: at most this many answers, the oldest forgotten
+/// first.
+const CLASSES: usize = 262_144;
 
 const RETRY_LEASE: Duration = Duration::from_millis(500);
 
@@ -443,6 +452,7 @@ impl Default for Services {
             stats: Stats::default(),
             stopping: AtomicBool::new(false),
             taken: AtomicU64::new(0),
+            classes: veil_core::cache::LruCache::new(CLASSES),
         }
     }
 }
@@ -1186,6 +1196,7 @@ struct Link {
 
 /// What a held change is to its submitter (its own edits, against its
 /// first parent or the base it lands on).
+#[derive(Clone, Copy)]
 enum Class {
     /// Every edit at a path they cannot read: not in their history.
     Hidden,
@@ -1500,7 +1511,43 @@ pub(crate) async fn agent_stack(
 /// What held change `x` is to `viewer`: its own edits against `against`
 /// (its first parent, or the base a merge lands on). `Err` to refuse it
 /// (conflicts they can see).
+///
+/// Each answer is remembered ([`Services::classes`], BUG-2271): it is a
+/// function of the two snapshots (history never changes) and of the paths
+/// the viewer reads, which their view key names exactly (`View::key`; a
+/// change of policy or of their groups is another key). A branch that never
+/// takes its target back is read down to where it left it at every landing,
+/// and the edit set of each of its changes read its trees again: in the
+/// many-branch headline, most of the server's storage reads.
 async fn classify(
+    hub: &Arc<Hub>,
+    project: &crate::perm::Project,
+    viewer: &crate::perm::Viewer,
+    x: ObjectId,
+    against: ObjectId,
+) -> Result<std::result::Result<Class, String>> {
+    let memo = {
+        let mut h = blake3::Hasher::new_derive_key("veil-server 2026-11-13 landing classify");
+        h.update(&project.id.to_le_bytes());
+        let vk = project.view(viewer).key();
+        h.update(&(vk.len() as u64).to_le_bytes());
+        h.update(vk.as_bytes());
+        h.update(&x.0);
+        h.update(&against.0);
+        ObjectId(*h.finalize().as_bytes())
+    };
+    if let Some(c) = hub.landing.classes.get(&memo) {
+        return Ok(c.ok_or_else(|| UNRESOLVED.to_string()));
+    }
+    hub.landing.stats.classified.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let r = classify_read(hub, project, viewer, x, against).await?;
+    hub.landing.classes.insert(memo, r.as_ref().ok().copied(), 1);
+    Ok(r)
+}
+
+const UNRESOLVED: &str = "a change with unresolved conflicts never lands: resolve them first";
+
+async fn classify_read(
     hub: &Arc<Hub>,
     project: &crate::perm::Project,
     viewer: &crate::perm::Viewer,
@@ -1520,7 +1567,7 @@ async fn classify(
         let view = p.view(&v);
         let s = src.snapshot(&x)?;
         if s.conflicts.iter().any(|c| view.read(c)) {
-            return Ok(Err("a change with unresolved conflicts never lands: resolve them first".to_string()));
+            return Ok(Err(UNRESOLVED.to_string()));
         }
         if v.admin {
             return Ok(Ok(Class::Whole));
