@@ -739,6 +739,25 @@ impl Client {
         )
     }
 
+    /// The trees of `snapshot` from its root down to folder `path`, and
+    /// every tree below it, in one request (`subtree`, revision 7, at most
+    /// the server's bound), by id. Each is taken only where a walk from
+    /// the snapshot's tree reaches it, and checked against its id there
+    /// (BUG-1945).
+    pub fn subtree(&self, snapshot: ObjectId, path: &str) -> Result<HashMap<ObjectId, Vec<u8>>> {
+        let route = format!("/subtree?snapshot={}&path={}", snapshot.hex(), percent(path));
+        let body = self.ok("GET", &self.url.project_path(&route), None)?;
+        let frames = encoding::split_frames(&body)?;
+        let mut out = HashMap::with_capacity(frames.len());
+        let mut ids = frames.iter().map(|(id, _)| *id);
+        for d in Decoded::parallel(&frames)? {
+            for range in d.objects {
+                out.insert(ids.next().expect("one id per frame"), d.bytes[range].to_vec());
+            }
+        }
+        Ok(out)
+    }
+
     /// A fetch of many objects, each handed to `f` with its want
     /// as its part arrives (BUG-859): `wants` split into parts of about
     /// [`FETCH_BYTES`] by the sizes tree entries carry (`sizes`, one per
@@ -1329,7 +1348,7 @@ pub fn pull_moving(
     // an id is in the frontier once), the chain walked up when asked for.
     let daemon = thin && crate::thin::daemon_on();
     let roots: HashMap<ObjectId, ObjectId> = new_snaps.iter().copied().collect();
-    let mut parents: HashMap<ObjectId, ObjectId> = HashMap::new();
+    let parents: std::cell::RefCell<HashMap<ObjectId, ObjectId>> = Default::default();
     let chain_of = |parents: &HashMap<ObjectId, ObjectId>, id: &ObjectId| -> Vec<ObjectId> {
         let mut chain = Vec::new();
         let mut cur = *id;
@@ -1340,12 +1359,21 @@ pub fn pull_moving(
         chain.reverse();
         chain
     };
+    // A thin clone's first fetch (BUG-1945): the tip's trees, every level
+    // down to and below `only` (the whole tree without it), in one request
+    // where the server answers `subtree`. The walk below takes each where
+    // it reaches it (checked against its id) and asks for the rest, the
+    // files of every level at once, as before; any other answer (an older
+    // server, a refusal) leaves the walk to ask level by level. A later
+    // pull holds most trees already: it asks for the new ones only.
+    let mut prefetched: HashMap<ObjectId, Vec<u8>> = HashMap::new();
+    if thin && fresh && tips.revision >= veil_core::hub::wire::SUBTREE_REVISION {
+        if let Some((snap, _)) = new_snaps.iter().find(|(s, t)| Some(*s) == checked_out && !have(t)) {
+            prefetched = client.subtree(*snap, only.unwrap_or("")).unwrap_or_default();
+        }
+    }
     while !frontier.is_empty() {
-        let asked: Vec<(ObjectId, Vec<ObjectId>, ObjectId)> = match daemon {
-            true => frontier.iter().filter_map(|(snap, _, id, _)| Some((*roots.get(snap)?, chain_of(&parents, id), *id))).collect(),
-            false => Vec::new(),
-        };
-        let mut next = Vec::new();
+        let next = std::cell::RefCell::new(Vec::new());
         let mut handle = |snap: ObjectId, w: &Want, raw: Vec<u8>| -> Result<()> {
             let obj = Object::decode(&raw)?;
             let mut children = Vec::new();
@@ -1371,9 +1399,9 @@ pub fn pull_moving(
             for (cid, p, size) in children {
                 if seen.insert(cid) && !have(&cid) {
                     if daemon {
-                        parents.insert(cid, w.id);
+                        parents.borrow_mut().insert(cid, w.id);
                     }
-                    next.push((snap, p, cid, size));
+                    next.borrow_mut().push((snap, p, cid, size));
                 }
             }
             content_bytes += raw.len() as u64;
@@ -1392,6 +1420,30 @@ pub fn pull_moving(
                 report.objects_copied += 1;
             }
             Ok(())
+        };
+        // The trees the `subtree` answer holds, level after level, as the
+        // walk reaches them: what is left (the files) is asked for at once.
+        while !prefetched.is_empty() {
+            let mut rest = Vec::new();
+            let mut took = false;
+            for (snap, path, id, size) in frontier.drain(..) {
+                match prefetched.remove(&id).filter(|raw| ObjectId::hash(raw) == id) {
+                    Some(raw) => {
+                        handle(snap, &Want { path, id, snapshot: Some(snap) }, raw)?;
+                        took = true;
+                    }
+                    None => rest.push((snap, path, id, size)),
+                }
+            }
+            frontier = rest;
+            if !took {
+                break;
+            }
+            frontier.append(&mut next.borrow_mut());
+        }
+        let asked: Vec<(ObjectId, Vec<ObjectId>, ObjectId)> = match daemon {
+            true => frontier.iter().filter_map(|(snap, _, id, _)| Some((*roots.get(snap)?, chain_of(&parents.borrow(), id), *id))).collect(),
+            false => Vec::new(),
         };
         if !asked.is_empty() {
             let mut got = crate::thin::via_daemon(&client.url, client.identity(), &asked);
@@ -1422,7 +1474,7 @@ pub fn pull_moving(
             client.fetch_each(snap, &wants, &sizes, |w, raw| handle(w.snapshot.unwrap_or(snap), w, raw))?;
         }
         drop(handle);
-        frontier = next;
+        frontier = next.into_inner();
     }
     report.packs_written = incoming.finish()?;
     if let Some(c) = content {

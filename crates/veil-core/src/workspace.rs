@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::{
-    builder::{build_tree_cached, build_tree_watched, BuildOptions, BuildReport, InjectedSecrets, LineEndings, WatchPlan},
+    builder::{build_tree_cached, build_tree_planned, BuildOptions, BuildReport, InjectedSecrets, LineEndings, WatchPlan},
     checkout::{checkout_cached, checkout_recorded, CheckoutReport, Materialised},
     error::{Result, VeilError},
     id::{ChangeId, ObjectId},
@@ -215,6 +215,7 @@ fn hold_command_edit(
 
 /// What [`Repo::snapshot_workspace_with`] builds a tree with, besides the
 /// working copy it amends.
+#[derive(Clone, Copy)]
 struct BuildParams<'a> {
     injected: Option<&'a InjectedSecrets>,
     materialised: Option<&'a Materialised>,
@@ -223,6 +224,8 @@ struct BuildParams<'a> {
     carried: &'a [(VPath, crate::object::TreeEntry)],
     line_endings: LineEndings<'a>,
     watch: Option<&'a WatchPlan>,
+    /// Build only if `watch` applies (`build_tree_planned`).
+    watched_only: bool,
 }
 
 /// A tree built from a working copy, with the policy that classified it.
@@ -264,7 +267,7 @@ fn build_wc_tree(
     p: &BuildParams<'_>,
     rescan: bool,
     cache: Option<&mut StatCache>,
-) -> Result<Built> {
+) -> Result<Option<Built>> {
     let store = repo.store.clone();
     // What `fs` was materialised from: the working copy, with the
     // entries a command put back in place of its own.
@@ -280,7 +283,7 @@ fn build_wc_tree(
     let (wp, command_edit) = recording_policy(repo, fs, &parent_tree, p.policy_from_command, || {
         repo.snapshot_policy(fs, (!p.policy_incoming).then_some(&wc.tree))
     })?;
-    let (tree, mut report) = build_tree_watched(
+    let Some((tree, mut report)) = build_tree_planned(
         &store,
         fs,
         &BuildOptions {
@@ -294,9 +297,13 @@ fn build_wc_tree(
         },
         cache,
         p.watch,
-    )?;
+        p.watched_only,
+    )?
+    else {
+        return Ok(None);
+    };
     let tree = hold_command_edit(&store, tree, &parent_tree, command_edit, &mut report)?;
-    Ok(Built { tree, report, wp })
+    Ok(Some(Built { tree, report, wp }))
 }
 
 pub fn validate_workspace_name(name: &str) -> Result<()> {
@@ -425,13 +432,27 @@ impl Repo {
             carried,
             line_endings,
             watch,
+            watched_only: false,
         };
         // 1. Scan without the lock. Lock-free repositories (format 6) take
         // no lock: they build inside the transaction, with the objects
-        // staged on disk, and compare-and-swap at commit.
+        // staged on disk, and compare-and-swap at commit; but when the file
+        // watcher vouches that nothing changed, the watched build is looked
+        // at first, outside any transaction (it stages in memory, and
+        // builds nothing if the plan does not apply): a command that finds
+        // the working copy as recorded makes no transaction (BUG-1944).
+        // What it does find changed is built again in the transaction.
         // A commit records under the lock in any case.
-        let probe = match self.backend.is_network() || self.lock_free() || commit.is_some() {
+        let clean_watch = self.lock_free() && watch.is_some_and(WatchPlan::is_clean);
+        let probe = match self.backend.is_network() || (self.lock_free() && !clean_watch) || commit.is_some() {
             true => None,
+            false if clean_watch => {
+                let only = BuildParams { watched_only: true, ..params };
+                match self.probe_snapshot(ws, fs, &only, expected_wc, cache.as_deref())? {
+                    Some(Probe::Changed(_)) | None => None,
+                    unchanged => unchanged,
+                }
+            }
             false => self.probe_snapshot(ws, fs, &params, expected_wc, cache.as_deref())?,
         };
         let probe = match probe {
@@ -480,7 +501,7 @@ impl Repo {
                 }
                 p.built
             }
-            None => build_wc_tree(tx.repo(), &wc, fs, &params, rescan, cache)?,
+            None => build_wc_tree(tx.repo(), &wc, fs, &params, rescan, cache)?.expect("built whether or not the plan applies"),
         };
         let Built { tree, report, wp } = built;
         tx.repo().record_accepted(&wp)?;
@@ -580,7 +601,7 @@ impl Repo {
         let built = build_wc_tree(self, &wc, fs, params, false, scanned.as_mut());
         let staged = scope.finish();
         let built = match built {
-            Ok(b) if !staged.overflowed() => b,
+            Ok(Some(b)) if !staged.overflowed() => b,
             _ => return Ok(None),
         };
         if built.tree == wc.tree && built.wp.accept.is_none() {

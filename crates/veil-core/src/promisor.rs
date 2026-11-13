@@ -970,7 +970,21 @@ impl ObjectStore {
             return Ok(());
         }
         let at = self.locate(p, to)?.map(|(snapshot, path, _)| (snapshot, path));
-        self.prefetch_diff_from(p, from, to, at)
+        self.prefetch_diff_from(p, from, to, at, &|_| false)
+    }
+
+    /// [`ObjectStore::prefetch_diff`] for a move of a working copy that
+    /// `materialised` describes: what it never wrote (a `--only` clone's,
+    /// [`crate::checkout::Materialised::left_out`]) is never fetched, as
+    /// the checkout never writes it (BUG-1945).
+    pub fn prefetch_move(&self, from: Option<&ObjectId>, to: &ObjectId, materialised: &crate::checkout::Materialised) -> Result<()> {
+        let Some(p) = self.partial.get() else { return Ok(()) };
+        if !self.fetching(p) {
+            return Ok(());
+        }
+        let at = self.locate(p, to)?.map(|(snapshot, path, _)| (snapshot, path));
+        let hidden = |path: &str| VPath::new(path).is_ok_and(|v| materialised.left_out(&v));
+        self.prefetch_diff_from(p, from, to, at, &hidden)
     }
 
     /// [`ObjectStore::prefetch_diff`] of `to`, the folder at `path` below
@@ -984,14 +998,22 @@ impl ObjectStore {
         let at = self
             .locate(p, root)?
             .map(|(snapshot, base, _)| (snapshot, if base.is_empty() { path.as_str().to_string() } else { format!("{base}/{path}") }));
-        self.prefetch_diff_from(p, from, to, at)
+        self.prefetch_diff_from(p, from, to, at, &|_| false)
     }
 
     /// The walk knows every entry's path below `to`'s place `at`: each
     /// object is asked for at its own paths, never at the place the locator
     /// met it first (BUG-1460, BUG-1462, BUG-1463). Without a place for
     /// `to`, by id, through the locator.
-    fn prefetch_diff_from(&self, p: &Partial, from: Option<&ObjectId>, to: &ObjectId, at: Option<(ObjectId, String)>) -> Result<()> {
+    /// Nothing at a path `skip` names is fetched.
+    fn prefetch_diff_from(
+        &self,
+        p: &Partial,
+        from: Option<&ObjectId>,
+        to: &ObjectId,
+        at: Option<(ObjectId, String)>,
+        skip: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
         let mut level: Vec<(Option<ObjectId>, ObjectId, String)> = vec![(from.copied(), *to, at.as_ref().map(|(_, b)| b.clone()).unwrap_or_default())];
         let ensure = |items: Vec<(ObjectId, u64, String)>| -> Result<()> {
             match &at {
@@ -1018,6 +1040,9 @@ impl ObjectStore {
                 for e in &tt.entries {
                     let old = ft.as_ref().and_then(|ft| ft.get(&e.name));
                     if old.is_some_and(|o| o.id == e.id) {
+                        continue;
+                    }
+                    if skip(&join(&path, &e.name)) {
                         continue;
                     }
                     match e.kind {

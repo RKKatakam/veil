@@ -167,7 +167,7 @@ impl Repo {
         let report = if from != to || !record.is_empty() {
             // A thin clone fetches what the move reads first: a server that
             // cannot be reached fails it before anything is written.
-            self.store().prefetch_diff(Some(&from), &to)?;
+            self.store().prefetch_move(Some(&from), &to, &record)?;
             // Intent first: from here on, a crash leaves the move to finish.
             state.pending = Some(PendingCheckout {
                 workspace: ws.to_string(),

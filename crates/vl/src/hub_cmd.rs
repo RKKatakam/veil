@@ -199,13 +199,10 @@ pub fn clone(url: &HubUrl, dest: Option<&Path>, only: Option<&str>, thin: Option
     if dest.exists() && std::fs::read_dir(&dest)?.next().is_some() {
         bail!("destination {} is not empty", dest.display());
     }
-    // A clone of one directory keeps its S1 form (every snapshot, that
-    // directory's files): S3 does not combine it with a thin clone.
-    let thin = if only.is_some() { None } else { thin };
     let created = !dest.exists();
     std::fs::create_dir_all(&dest)?;
     let dest = dest.canonicalize()?;
-    let r = clone_populate(url, &dest, only.as_deref(), thin);
+    let r = clone_populate(url, &dest, only.as_deref(), thin, created);
     if r.is_err() {
         let _ = if created {
             std::fs::remove_dir_all(&dest)
@@ -226,11 +223,21 @@ pub fn clone(url: &HubUrl, dest: Option<&Path>, only: Option<&str>, thin: Option
     r
 }
 
-fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>, mut thin: Option<u64>) -> Result<ExitCode> {
+fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>, mut thin: Option<u64>, created: bool) -> Result<ExitCode> {
     let identity = load_identity()?;
     let client = Client::new(url, identity.clone())?;
     let fs = Arc::new(DiskBackend::new(dest));
     crate::ctx::mark_clone_incomplete(&fs)?;
+    // Into a directory this clone made (BUG-1945): what it writes before
+    // its checkout (the repository, the pull, the new change; about 60
+    // flushes one after another) is made durable by one barrier before the
+    // checkout's journal. Until that journal exists every command refuses
+    // the directory (its marker, durable above, says the clone did not
+    // finish), and a clone that fails removes it: an interruption leaves
+    // no directory, or one `vl` refuses or finishes.
+    if created {
+        fs.defer_durability();
+    }
     let mut repo = Repo::init_for_clone_at(fs.clone(), Some(identity.clone()), &user_for(&identity), veil_core::repo::REPO_FORMAT)?;
     let mut config = repo.config().clone();
     config.remotes.insert(
@@ -278,6 +285,17 @@ fn clone_populate(url: &HubUrl, dest: &Path, only: Option<&str>, mut thin: Optio
         let (_, hidden) = hub::restrict_to(repo.store(), to, o)?;
         partial = Some((hub::without(repo.store(), to, o)?, hidden));
     }
+    // Debug builds only, for the interruption tests: a power cut before
+    // the barrier (what was deferred lost, cut short or kept, as `seed`
+    // picks), the process gone at once.
+    #[cfg(debug_assertions)]
+    if let Some(seed) = std::env::var("VEIL_TEST_CLONE_POWER_CUT").ok().and_then(|s| s.parse::<u64>().ok()) {
+        fs.lose_deferred_for_test(seed);
+        std::process::exit(86);
+    }
+    // Everything above durable before the journal that lets a command
+    // finish the clone.
+    fs.end_deferral().context("making the clone durable")?;
     // Journalled, so a clone killed here is finished by the next command
     // (BUG-830).
     let (_, co) = repo.check_out_new(&*fs, DEFAULT_WORKSPACE, wc, partial).context("checking out")?;

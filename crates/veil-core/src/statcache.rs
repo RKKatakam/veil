@@ -250,11 +250,16 @@ pub struct StatCache {
     dirty: bool,
 }
 
-/// The records of a cache file, encoded: the file's checksum was verified
-/// when it was read.
+/// The records of a cache file, encoded. Its header (the key) is read at
+/// load; its checksum, which covers the whole file, is verified before
+/// any record is decoded (`Loaded::intact`), so a command that decodes
+/// none (the file watcher vouching that nothing changed) never hashes it
+/// (BUG-1944). Records of a file that fails it are no records.
 #[derive(Clone, Debug)]
 struct Loaded {
     file: Arc<Vec<u8>>,
+    /// The checksum's verdict, once verified (shared by clones).
+    intact: Arc<OnceLock<bool>>,
     /// Where the first record starts in `file` (the last ends at its
     /// checksum).
     start: usize,
@@ -269,10 +274,23 @@ impl Loaded {
         &self.file[self.start..self.file.len() - 32]
     }
 
+    /// Does the file's checksum hold? Verified once, before the first
+    /// record is decoded.
+    fn intact(&self) -> bool {
+        *self.intact.get_or_init(|| {
+            let (body, sum) = self.file.split_at(self.file.len() - 32);
+            blake3::hash(body).as_bytes() == sum
+        })
+    }
+
     /// Every record, as the builds since the load left them. Records that
-    /// do not decode are no records: an empty cache.
+    /// do not decode, or of a file whose checksum fails, are no records:
+    /// an empty cache.
     fn decode(&self) -> HashMap<VPath, Record> {
-        let mut records = decode_records(self.encoded(), self.count, None).unwrap_or_default();
+        let mut records = match self.intact() {
+            true => decode_records(self.encoded(), self.count, None).unwrap_or_default(),
+            false => HashMap::new(),
+        };
         for p in &self.patches {
             p.apply(&mut records);
         }
@@ -479,6 +497,7 @@ impl StatCache {
         let narrowed = match &self.loaded {
             Some(l) if self.records.get().is_none() && l.patches.is_empty() && self.key.as_ref() == Some(&key) => match lookups.is_empty() {
                 true => Some((HashMap::new(), l.count as usize)),
+                false if !l.intact() => None,
                 false => decode_records(l.encoded(), l.count, Some(lookups)).map(|m| (m, l.count as usize)),
             },
             _ => None,
@@ -725,10 +744,8 @@ fn encode(c: &StatCache) -> Vec<u8> {
 /// The cache in file `raw`: its checksum, header and key are checked now,
 /// its records when they are decoded ([`Loaded::decode`]).
 fn decode(raw: Vec<u8>) -> Option<StatCache> {
-    let (body, sum) = raw.split_at(raw.len().checked_sub(32)?);
-    if blake3::hash(body).as_bytes() != sum {
-        return None;
-    }
+    // The checksum is verified before any record is read (`Loaded::intact`).
+    let (body, _) = raw.split_at(raw.len().checked_sub(32)?);
     let mut r = Reader(body);
     if r.take(MAGIC.len())? != MAGIC || r.u32()? != VERSION {
         return None;
@@ -749,6 +766,7 @@ fn decode(raw: Vec<u8>) -> Option<StatCache> {
         records: OnceLock::new(),
         loaded: Some(Loaded {
             file: Arc::new(raw),
+            intact: Arc::default(),
             start,
             count,
             patches: Vec::new(),
@@ -983,10 +1001,15 @@ mod tests {
         assert!(back.records.get().is_none());
         assert_eq!(back.all(), c.all());
         assert_eq!(back.len(), 4);
-        let mut bad = raw.clone();
-        bad[MAGIC.len() + 10] ^= 1;
-        assert!(decode(bad).is_none());
-        assert!(decode(raw[..raw.len() - 1].to_vec()).is_none());
+        // A flipped bit anywhere is no records: a cache refused at load
+        // (its header), or one whose checksum fails when its records are
+        // first needed.
+        for at in [MAGIC.len() + 10, raw.len() / 2, raw.len() - 40, raw.len() - 1] {
+            let mut bad = raw.clone();
+            bad[at] ^= 1;
+            assert!(decode(bad).is_none_or(|c| c.is_empty()), "byte {at}");
+        }
+        assert!(decode(raw[..raw.len() - 1].to_vec()).is_none_or(|c| c.is_empty()));
         assert!(decode(Vec::new()).is_none());
     }
 
@@ -1014,6 +1037,46 @@ mod tests {
         assert!(run.old.is_empty());
         back.end_run(run);
         assert!(back.is_empty());
+    }
+
+    /// The checksum covers the whole file and is verified before any
+    /// record is decoded, never skipped: a watched build that looks up
+    /// nothing never hashes the file, one that looks up a directory of a
+    /// file whose records were corrupted (the checksum fails) finds no
+    /// records, and so do a full build and a save (BUG-1944).
+    #[test]
+    fn the_checksum_is_verified_before_the_first_record_is_read() {
+        let c = sample();
+        let raw = encode(&c);
+        // Nothing looked up: nothing hashed, nothing decoded, nothing to save.
+        let mut back = decode(raw.clone()).unwrap();
+        let run = back.begin_watched_run(c.key.clone().unwrap(), CLOCK, &Lookups { dirs: HashSet::new(), subtrees: vec![] });
+        back.end_run(run);
+        assert!(back.loaded.as_ref().unwrap().intact.get().is_none(), "the file was hashed for a build that read no record");
+        assert!(!back.dirty);
+        // A record's byte flipped, the header intact: the key loads, the
+        // records do not.
+        let mut bad = raw.clone();
+        bad[raw.len() - 40] ^= 1;
+        let lookups = Lookups { dirs: HashSet::from(["a"]), subtrees: vec![] };
+        let mut back = decode(bad.clone()).unwrap();
+        assert_eq!(back.key, c.key);
+        let run = back.begin_watched_run(c.key.clone().unwrap(), CLOCK, &lookups);
+        assert!(run.old.is_empty(), "a watched run read records of a file whose checksum fails");
+        back.end_run(run);
+        assert!(back.is_empty());
+        assert!(decode(bad.clone()).unwrap().get(&vp("a/x")).is_none());
+        let mut back = decode(bad).unwrap();
+        let run = back.begin_run(c.key.clone().unwrap(), CLOCK);
+        assert!(run.old.is_empty(), "a full run read records of a file whose checksum fails");
+        back.end_run(run);
+        assert!(decode(encode(&back)).unwrap().is_empty());
+        // Intact: the same lookups find the records.
+        let mut back = decode(raw).unwrap();
+        let run = back.begin_watched_run(c.key.clone().unwrap(), CLOCK, &lookups);
+        assert_eq!(run.old.len(), 2);
+        back.end_run(run);
+        assert_eq!(back.loaded.as_ref().map(|l| l.intact.get().copied()), Some(Some(true)));
     }
 
     const CLOCK: StatClock = StatClock { now: 9, exact: false };

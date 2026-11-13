@@ -273,7 +273,11 @@ fn check_clone_finished(root: &Path) -> Result<()> {
 pub fn find_root(start: &Path) -> Option<PathBuf> {
     let mut cur = Some(start);
     while let Some(d) = cur {
-        if d.join(VEIL_DIR).join("repo.json").is_file() {
+        // A clone that did not finish is found by its marker alone (its
+        // `repo.json` may not be durable yet, BUG-1945): it is refused
+        // (`check_clone_finished`), never taken for a folder of a
+        // repository above.
+        if d.join(VEIL_DIR).join("repo.json").is_file() || d.join(CLONE_INCOMPLETE).is_file() {
             return Some(d.to_path_buf());
         }
         // Never from inside a `vl ws exec` sandbox
@@ -695,7 +699,7 @@ impl Ctx {
             // and nothing is recorded, so `status`, `undo`, `op restore`
             // and `partial limit` still run (BUG-1146); a command that
             // would record the directory as a commit stops instead.
-            if let Err(e) = self.repo.store().prefetch_diff(Some(&base_snap.tree), &target_tree) {
+            if let Err(e) = self.repo.store().prefetch_move(Some(&base_snap.tree), &target_tree, &self.checkout.materialised) {
                 if commit.is_some() {
                     return Err(anyhow::Error::from(e).context(
                         "the working copy is behind `@` and cannot be brought up to it; run `vl undo`, or raise the cache's bound with `vl partial limit SIZE`",
@@ -1082,7 +1086,7 @@ impl Ctx {
         // A thin clone: a move this command could not fetch for (left by an
         // earlier one; every move this command published was fetched ahead
         // before it was) leaves the directory as it is (BUG-1146).
-        if let Err(e) = self.repo.store().prefetch_diff(Some(&from), &to_snap.tree) {
+        if let Err(e) = self.repo.store().prefetch_move(Some(&from), &to_snap.tree, &self.checkout.materialised) {
             warn(&format!(
                 "the working copy stays as it is: moving it to `@` needs what this thin clone cannot fetch now ({e}). \
                  Run `vl undo` to go back, or `vl partial limit SIZE` and run any command"

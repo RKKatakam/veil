@@ -86,6 +86,12 @@ struct PackSet {
     packs: Vec<Arc<Pack>>,
     /// Packs whose index or data could not be opened: name → reason.
     broken: Vec<(String, String)>,
+    /// Packs listed and not opened yet: each is opened (its index read and
+    /// checked against its data file, as [`Pack::open`] does) when a
+    /// lookup has not found its object in those opened before, or when
+    /// every pack is asked for (BUG-1944: a command that reads a few
+    /// objects opened all 24 indexes of the 1 GB profile).
+    pending: Vec<String>,
 }
 
 /// How long a loaded copy of the gc pending list is trusted before re-reading.
@@ -865,36 +871,63 @@ impl ObjectStore {
         };
         let mut set = self.packs.write().unwrap();
         let unchanged = set.loaded
-            && names.len() == set.packs.len() + set.broken.len()
-            && names
-                .iter()
-                .all(|n| set.packs.iter().any(|p| p.name() == n) || set.broken.iter().any(|(b, _)| b == n));
+            && names.len() == set.packs.len() + set.broken.len() + set.pending.len()
+            && names.iter().all(|n| {
+                set.packs.iter().any(|p| p.name() == n) || set.broken.iter().any(|(b, _)| b == n) || set.pending.contains(n)
+            });
         if unchanged {
             return Ok(false);
         }
         let mut packs = Vec::new();
-        let mut broken = Vec::new();
+        let mut pending = Vec::new();
         for name in names {
-            if let Some(p) = set.packs.iter().find(|p| p.name() == name) {
-                packs.push(p.clone());
-                continue;
-            }
-            match Pack::open(&*self.backend, &dir, &name) {
-                Ok(p) => packs.push(Arc::new(p)),
-                // Removed by a concurrent gc between listing and opening.
-                Err(e) if e.is_not_found() => {}
-                // Its data file went after its index was read: removed
-                // meanwhile too (index first), if the index is gone now.
-                Err(_) if !self.backend.exists(&crate::pack::index_file(&dir, &name)).unwrap_or(true) => {}
-                Err(e) => broken.push((name, e.to_string())),
+            match set.packs.iter().find(|p| p.name() == name) {
+                Some(p) => packs.push(p.clone()),
+                // Opened when needed (a broken one again, as it was).
+                None => pending.push(name),
             }
         }
         *set = PackSet {
             loaded: true,
             packs,
-            broken,
+            broken: Vec::new(),
+            pending,
         };
         Ok(true)
+    }
+
+    /// Open the packs not opened yet, one after another, until one holds
+    /// `id` (every one, for `None`). Whether one opened now holds it.
+    fn open_pending(&self, id: Option<&ObjectId>) -> bool {
+        let dir = self.pack_dir();
+        let mut set = self.packs.write().unwrap();
+        while let Some(name) = set.pending.pop() {
+            match Pack::open(&*self.backend, &dir, &name) {
+                Ok(p) => {
+                    let holds = id.is_some_and(|id| p.contains(id));
+                    set.packs.push(Arc::new(p));
+                    if holds {
+                        return true;
+                    }
+                }
+                // Removed by a concurrent gc between listing and opening.
+                Err(e) if e.is_not_found() => {}
+                // Its data file went after its index was read: removed
+                // meanwhile too (index first), if the index is gone now.
+                Err(_) if !self.backend.exists(&crate::pack::index_file(&dir, &name)).unwrap_or(true) => {}
+                Err(e) => set.broken.push((name, e.to_string())),
+            }
+        }
+        false
+    }
+
+    /// Every pack listed, opened.
+    fn open_all_packs(&self) -> Result<()> {
+        self.ensure_packs()?;
+        if !self.packs.read().unwrap().pending.is_empty() {
+            self.open_pending(None);
+        }
+        Ok(())
     }
 
     /// Re-scan the pack directory if this store has listed it already (a
@@ -908,18 +941,21 @@ impl ObjectStore {
 
     /// Currently known packs (loading them if needed).
     pub fn packs(&self) -> Result<Vec<Arc<Pack>>> {
-        self.ensure_packs()?;
+        self.open_all_packs()?;
         Ok(self.packs.read().unwrap().packs.clone())
     }
 
     /// Packs that could not be opened, with the reason.
     pub fn broken_packs(&self) -> Result<Vec<(String, String)>> {
-        self.ensure_packs()?;
+        self.open_all_packs()?;
         Ok(self.packs.read().unwrap().broken.clone())
     }
 
+    /// Is `id` in a pack of the list as loaded (opening those not opened
+    /// yet until one holds it)?
     pub(crate) fn in_loaded_packs(&self, id: &ObjectId) -> bool {
-        self.packs.read().unwrap().packs.iter().any(|p| p.contains(id))
+        let opened = self.packs.read().unwrap().packs.iter().any(|p| p.contains(id));
+        opened || self.open_pending(Some(id))
     }
 
     /// Look `id` up in the packs. A pack that vanished (a concurrent gc
@@ -928,6 +964,10 @@ impl ObjectStore {
         self.ensure_packs()?;
         let mut corrupt = None;
         for attempt in 0..2 {
+            // Opened until one holds `id` (all, if none does).
+            if !self.packs.read().unwrap().packs.iter().any(|p| p.contains(id)) {
+                self.open_pending(Some(id));
+            }
             let packs = self.packs.read().unwrap().packs.clone();
             for p in packs.iter().filter(|p| p.contains(id)) {
                 match p.get(&*self.backend, id, &self.bases) {
@@ -944,6 +984,7 @@ impl ObjectStore {
         if let Some(e) = corrupt {
             return Err(e);
         }
+        // Not found: every pack listed was opened looking for it.
         if let Some((name, why)) = self.packs.read().unwrap().broken.first() {
             return Err(VeilError::Corrupt(
                 id.hex(),

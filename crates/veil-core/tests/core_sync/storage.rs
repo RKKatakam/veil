@@ -598,3 +598,158 @@ fn tree_and_snapshot_caches_are_bounded() {
     assert!(stats.delta_bases.weight <= 4096);
     assert_history_intact(&repo);
 }
+
+/// Counts the pack indexes read, over a shared memory backend.
+#[derive(Debug)]
+struct IndexReads {
+    inner: Arc<MemoryBackend>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl IndexReads {
+    fn count(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl StorageBackend for IndexReads {
+    fn kind(&self) -> &'static str {
+        "memory"
+    }
+    fn read(&self, path: &VPath) -> veil_core::Result<Vec<u8>> {
+        if path.as_str().ends_with(".idx") {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.read(path)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> veil_core::Result<()> {
+        self.inner.write(path, data)
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> veil_core::Result<bool> {
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> veil_core::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> veil_core::Result<Vec<veil_core::vfs::DirEntry>> {
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> veil_core::Result<Option<veil_core::vfs::Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, executable: bool) -> veil_core::Result<()> {
+        self.inner.set_executable(path, executable)
+    }
+}
+
+/// BUG-1944: a pack's index is read (and checked against its data file)
+/// when a lookup reaches it, not when the store is first used: a read of
+/// a loose object opens no pack, a read of a packed one opens packs until
+/// one holds it, and anything asked of every pack (an absent object, the
+/// list, the broken ones) opens them all, as before. A damaged index is
+/// found as it was: reported broken, and a miss is `Corrupt`.
+#[test]
+fn pack_indexes_are_read_when_a_lookup_reaches_them() {
+    let (mut repo, fs, id) = new_repo();
+    history(&mut repo, &fs, 8, 4);
+    // Every file's content in one of three packs (round robin), the rest
+    // loose: opening the repository reads no pack.
+    let dir = p(".veil/objects/pack");
+    let ids: Vec<ObjectId> = repo
+        .store()
+        .list_objects()
+        .unwrap()
+        .into_iter()
+        .filter(|o| matches!(Object::decode(&repo.store().get_raw(o).unwrap()), Ok(Object::Blob(_))))
+        .collect();
+    for part in 0..3 {
+        let mut pb = PackBuilder::new(3).unwrap();
+        for o in ids.iter().skip(part).step_by(3) {
+            pb.add(*o, &repo.store().get_raw(o).unwrap(), None).unwrap();
+        }
+        pb.finish(&*fs, &dir).unwrap().unwrap();
+    }
+    for o in &ids {
+        let h = o.hex();
+        fs.remove_file(&p(&format!(".veil/objects/{}/{}", &h[..2], &h[2..]))).unwrap();
+    }
+    let names: Vec<String> = fs
+        .list_dir(&dir)
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| e.name.strip_prefix("pack-")?.strip_suffix(".idx").map(str::to_string))
+        .collect();
+    assert_eq!(names.len(), 3, "three packs: {names:?}");
+    let packs: Vec<Pack> = names.iter().map(|n| Pack::open(&*fs, &dir, n).unwrap()).collect();
+    // One object of each pack, held by that pack alone.
+    let only_in = |i: usize| {
+        packs[i].index().ids().iter().copied().find(|id| packs.iter().enumerate().all(|(j, q)| j == i || !q.contains(id))).unwrap()
+    };
+    let objects: Vec<ObjectId> = (0..3).map(only_in).collect();
+    // A loose object, written after the last gc.
+    fs.write(&p("src/loose.txt"), b"loose\n").unwrap();
+    let wc = snap(&mut repo, &fs);
+    let loose = lookup(repo.store(), &repo.snapshot(&wc).unwrap().tree, &p("src/loose.txt")).unwrap().unwrap().id;
+    let all: HashMap<ObjectId, Vec<u8>> = objects.iter().chain([&loose]).map(|i| (*i, repo.store().get_raw(i).unwrap())).collect();
+
+    let open = || {
+        let counting = Arc::new(IndexReads { inner: fs.clone(), reads: Default::default() });
+        let repo = Repo::open(counting.clone(), Some(id.clone()), "alice").unwrap();
+        (repo, counting)
+    };
+    // Opening the repository reads no index; each object, in a store as
+    // opened, is verified (the bytes hash to the id) and opens packs, in
+    // the order listed from the last, until one holds it.
+    for (i, obj) in objects.iter().enumerate() {
+        let (r, counting) = open();
+        assert_eq!(counting.count(), 0, "opening the repository read a pack index");
+        assert_eq!(r.store().get_raw(obj).unwrap(), all[obj], "object {i}");
+        assert_eq!(counting.count(), 3 - i, "object {i}: indexes read");
+        for o in objects.iter().chain([&loose]) {
+            assert_eq!(&r.store().get_raw(o).unwrap(), &all[o]);
+        }
+        assert_eq!(counting.count(), 3, "each index is read once");
+    }
+    // A store that reads only the loose object opens no pack.
+    let (r, counting) = open();
+    assert_eq!(r.store().get_raw(&loose).unwrap(), all[&loose]);
+    assert!(r.store().has(&loose));
+    assert_eq!(counting.count(), 0, "a loose read opened a pack");
+    // An absent object: every pack is opened looking for it.
+    let absent = ObjectId::hash(b"absent");
+    assert!(!r.store().has(&absent));
+    assert_eq!(counting.count(), 3);
+    assert!(matches!(r.store().get_raw(&absent), Err(VeilError::Missing(_))));
+    // The list opens every pack.
+    let (r, counting) = open();
+    assert_eq!(r.store().packs().unwrap().len(), 3);
+    assert_eq!(counting.count(), 3);
+
+    // A damaged index is found when reached: reported broken, the other
+    // packs still read, and a miss is `Corrupt`, never `Missing`.
+    let idx = p(&format!(".veil/objects/pack/pack-{}.idx", names[0]));
+    let good = fs.read(&idx).unwrap();
+    let mut bad = good.clone();
+    bad[100] ^= 1;
+    fs.write(&idx, &bad).unwrap();
+    let (r, _) = open();
+    assert_eq!(r.store().get_raw(&objects[1]).unwrap(), all[&objects[1]]);
+    assert_eq!(r.store().get_raw(&objects[2]).unwrap(), all[&objects[2]]);
+    assert!(matches!(r.store().get_raw(&objects[0]), Err(VeilError::Corrupt(..))));
+    assert!(matches!(r.store().get_raw(&absent), Err(VeilError::Corrupt(..))));
+    let (r, _) = open();
+    assert_eq!(r.store().broken_packs().unwrap().len(), 1);
+    assert_eq!(r.store().packs().unwrap().len(), 2);
+    let (mut r, _) = open();
+    assert!(matches!(gc(&mut r, &now_gc()), Err(VeilError::Corrupt(..))));
+    fs.write(&idx, &good).unwrap();
+    let (r, _) = open();
+    assert!(r.store().broken_packs().unwrap().is_empty());
+    assert!(r.store().verify_packs().unwrap().is_empty());
+}

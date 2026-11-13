@@ -188,3 +188,28 @@ fn bug_1574_a_checkout_of_a_refused_root_fails_and_records_no_root() {
     assert_eq!(back, record);
     assert!(veil_core::StorageBackend::list_dir(&fs, &veil_core::VPath::root()).unwrap().is_empty(), "nothing was written");
 }
+
+/// A folder the server refuses, left out by a checkout, is carried by the
+/// next build and reported as carried (what `vl status` lists as "you no
+/// longer have access to this folder"), with or without files of the
+/// person's own in it: only what a one-directory clone left out is carried
+/// silently (BUG-1945's fix took every hidden folder for one).
+#[test]
+fn a_refused_folder_left_out_is_reported_as_carried() {
+    let Clone { repo, feature, feature_bill, .. } = clone_with_a_refused_folder();
+    let tree = repo.snapshot(&feature).unwrap().tree;
+    let fs = MemoryBackend::new();
+    let mut record = veil_core::checkout::Materialised::default();
+    let r = veil_core::checkout::checkout_recorded(repo.store(), &fs, None, &tree, &mut record, None).expect("the checkout");
+    assert!(r.redacted.contains(&p(BILL)), "{r:?}");
+    assert!(record.hidden(&p(BILL)) && !record.left_out(&p(BILL)));
+    let (built, report) = repo.build_from_recorded(&fs, Some(tree), None, Some(&record)).unwrap();
+    assert_eq!(built, tree);
+    assert_eq!(report.carried, vec![p(BILL)], "the refused folder is not reported");
+    veil_core::StorageBackend::write(&fs, &p(&format!("{BILL}/mine.txt")), b"mine\n").unwrap();
+    let (built, report) = repo.build_from_recorded(&fs, Some(tree), None, Some(&record)).unwrap();
+    assert_eq!(built, tree);
+    assert_eq!(lookup(repo.store(), &built, &p(BILL)).unwrap(), Some(feature_bill));
+    assert_eq!(report.carried, vec![p(BILL)], "the refused folder is not reported");
+    assert_eq!(report.not_recorded, vec![p(&format!("{BILL}/mine.txt"))]);
+}

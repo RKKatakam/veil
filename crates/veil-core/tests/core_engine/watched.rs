@@ -347,3 +347,37 @@ fn a_watched_build_on_a_loaded_cache_records_what_a_full_scan_does_disk() {
         walk(true, seed, 40);
     }
 }
+
+/// BUG-1944: when the watcher vouches that nothing changed, a lock-free
+/// repository looks at the watched build before any transaction; a plan
+/// that does not apply there (here the policy file changed, which drops
+/// it) is built in the transaction as before, and records exactly what a
+/// full scan records, on every later build too.
+#[test]
+fn a_clean_plan_that_does_not_apply_records_what_a_full_scan_does() {
+    for disk in [false, true] {
+        let mut copies = vec![Copy::new(Mode::Scan, disk), Copy::new(Mode::Loaded, disk)];
+        assert!(copies[1].repo.lock_free());
+        let none = BTreeSet::new();
+        for c in &copies {
+            c.fs.write(&vp("a/x.txt"), b"x\n").unwrap();
+            c.fs.write(&vp("b/y.txt"), b"y\n").unwrap();
+        }
+        let first: Vec<_> = copies.iter_mut().map(|c| c.record(None)).collect();
+        assert!(first[0].1 && first[0] == first[1]);
+        for (step, policy) in [b"b/ ignore\n".as_slice(), b"".as_slice(), b"a/x.txt ignore\n".as_slice()].into_iter().enumerate() {
+            for c in &copies {
+                c.fs.write(&vp(".veilpolicy"), policy).unwrap();
+            }
+            let reference = copies[0].record(None);
+            let got = copies[1].record(Some((&none, &none)));
+            assert_eq!(got, reference, "disk {disk}, step {step}: a clean plan with the policy changed");
+            assert!(reference.1, "step {step}: the policy edit is recorded");
+            // Nothing changed since: the plan applies, nothing is recorded.
+            let reference = copies[0].record(None);
+            let got = copies[1].record(Some((&none, &none)));
+            assert_eq!(got, reference, "disk {disk}, step {step}: nothing changed");
+            assert!(!got.1);
+        }
+    }
+}

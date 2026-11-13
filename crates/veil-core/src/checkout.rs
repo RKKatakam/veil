@@ -138,6 +138,8 @@ pub struct CheckoutReport {
 /// * [`hidden`](Materialised::hidden): file entries left out (unreadable),
 ///   and folders left out because the server refuses them (BUG-1508), which
 ///   the builder carries by id.
+/// * [`left_out`](Materialised::left_out): what a one-directory clone left
+///   out (BUG-1945), hidden whatever becomes readable.
 /// * [`from_fallback`](Materialised::from_fallback): conflicts written with
 ///   a version this reader could not read, with the rendering written.
 ///
@@ -182,6 +184,12 @@ pub struct Materialised {
     /// them without the old version's key, which its person may no longer
     /// hold, and keeps them if edited since (BUG-1509, BUG-1531).
     own: BTreeMap<VPath, ObjectId>,
+    /// The paths a one-directory clone left out (`vl clone --only`, beside
+    /// its folder and the folders on the way to it): never fetched,
+    /// written or recorded by checkout or the builder, readable or not
+    /// (BUG-1945). Only these: a file the checkout could not write, or a
+    /// folder the server refused, is written once it can be.
+    chosen: BTreeSet<VPath>,
 }
 
 /// On-disk form of [`Materialised`]: paths are plain strings, validated when
@@ -208,6 +216,8 @@ struct MaterialisedRaw {
     lost: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     own: BTreeMap<String, ObjectId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    chosen: Vec<String>,
 }
 
 impl TryFrom<MaterialisedRaw> for Materialised {
@@ -232,6 +242,7 @@ impl TryFrom<MaterialisedRaw> for Materialised {
             kept_versions: r.kept_versions.iter().map(|(s, id)| Ok((path(s)?, *id))).collect::<std::result::Result<_, String>>()?,
             lost: r.lost.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
             own: r.own.iter().map(|(s, id)| Ok((path(s)?, *id))).collect::<std::result::Result<_, String>>()?,
+            chosen: r.chosen.iter().map(|s| path(s)).collect::<std::result::Result<_, _>>()?,
         })
     }
 }
@@ -249,6 +260,7 @@ impl From<Materialised> for MaterialisedRaw {
             kept_versions: m.kept_versions.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
             lost: m.lost.into_iter().map(|p| p.as_str().to_string()).collect(),
             own: m.own.into_iter().map(|(p, id)| (p.as_str().to_string(), id)).collect(),
+            chosen: m.chosen.into_iter().map(|p| p.as_str().to_string()).collect(),
         }
     }
 }
@@ -270,15 +282,17 @@ impl Materialised {
     /// start of a partial clone's journalled checkout
     /// ([`Repo::check_out_new`](crate::repo::Repo::check_out_new)).
     pub(crate) fn shown_as(view: ObjectId, hidden: impl IntoIterator<Item = VPath>) -> Materialised {
+        let m = Materialised::hiding(hidden);
         Materialised {
             view: Some(view),
-            ..Materialised::hiding(hidden)
+            chosen: m.hidden.clone(),
+            ..m
         }
     }
 
     /// Nothing hidden, nothing from a fallback, nothing converted.
     pub fn is_empty(&self) -> bool {
-        self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty() && self.crlf.is_empty() && self.left.is_empty() && self.refused.is_empty() && self.kept_edits.is_empty() && self.lost.is_empty() && self.own.is_empty()
+        self.view.is_none() && self.hidden.is_empty() && self.fallback.is_empty() && self.crlf.is_empty() && self.left.is_empty() && self.refused.is_empty() && self.kept_edits.is_empty() && self.lost.is_empty() && self.own.is_empty() && self.chosen.is_empty()
     }
 
     /// Did checkout write the file at `path` with CRLF line endings for
@@ -297,6 +311,41 @@ impl Materialised {
     /// this reader could not read it?
     pub fn hidden(&self, path: &VPath) -> bool {
         self.hidden.contains(path)
+    }
+
+    /// Did a one-directory clone leave `path` out (`vl clone --only`)?
+    pub fn left_out(&self, path: &VPath) -> bool {
+        self.chosen.contains(path)
+    }
+
+    /// Is `path`, or a folder above it, left out by a one-directory clone
+    /// ([`Materialised::left_out`])?
+    pub fn left_out_by_choice(&self, path: &VPath) -> bool {
+        let mut at = Some(path.clone());
+        while let Some(p) = at.filter(|p| !p.is_root()) {
+            if self.chosen.contains(&p) {
+                return true;
+            }
+            at = p.parent();
+        }
+        false
+    }
+
+    /// `to` with every path left out by choice
+    /// ([`Materialised::left_out_by_choice`]) as in `shown` (absent where
+    /// `shown` has none): only the folders on the way to them are read.
+    fn with_left_out_as(&self, store: &ObjectStore, to: &ObjectId, shown: Option<&ObjectId>) -> Result<ObjectId> {
+        let mut tree = *to;
+        for p in self.chosen.iter() {
+            let was = match shown {
+                Some(s) => lookup(store, s, p)?,
+                None => None,
+            };
+            if lookup(store, &tree, p)? != was {
+                tree = crate::conflict::set_entry(store, &tree, p, was)?;
+            }
+        }
+        Ok(tree)
     }
 
     /// Every hidden path, in order.
@@ -479,7 +528,9 @@ impl Materialised {
             }
         }
         let mut changes = Vec::new();
-        for p in self.hidden.clone() {
+        // What a one-directory clone left out stays left out, readable or
+        // not: never fetched, written or recorded (BUG-1566, BUG-1945).
+        for p in self.hidden.iter().filter(|p| !self.chosen.contains(*p)).cloned().collect::<Vec<_>>() {
             match lookup_opt(store, tree, &p)? {
                 Lookup::Unreadable => {}
                 // A folder left out because the server refused it
@@ -612,7 +663,13 @@ pub fn checkout_recorded(
     mut cache: Option<&mut StatCache>,
 ) -> Result<CheckoutReport> {
     let shown = record.view.or(from.copied());
-    let (changes, left_out) = checkout_changes(store, shown.as_ref(), to)?;
+    // Nothing at or below a path a one-directory clone left out is read or
+    // written, readable or not (BUG-1566): the changes are those to `to`
+    // with each such path as the working copy shows it (a thin clone can
+    // read every folder, and has not fetched those, BUG-1945).
+    let target = record.with_left_out_as(store, to, shown.as_ref())?;
+    let (changes, left_out) = checkout_changes(store, shown.as_ref(), &target)?;
+    let changes: Vec<TreeChange> = changes.into_iter().filter(|c| !record.left_out_by_choice(&c.path)).collect();
     let changes = record.refill_lost(store, fs, changes, cache.as_deref())?;
     let mut report = apply_changes(store, fs, shown.as_ref(), to, &changes, cache.as_deref_mut(), Some(&record.crlf))?;
     // A version's file the checkout had to leave on disk though it held

@@ -48,6 +48,7 @@ pub mod search;
 pub mod shares;
 pub mod store;
 pub mod sync;
+pub mod subtree;
 pub mod tls;
 pub mod web;
 
