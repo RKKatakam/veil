@@ -63,6 +63,15 @@ paid run's (§6). **The rehearsal's numbers measure nothing**: one machine
 plays nine, with tens of agents for seconds. It shows that every step of
 the paid run works, end to end, before anything is rented.
 
+**The last rehearsal, 2026-11-13** (`integration` @ `dc4e3f82`, images
+built by the script; `docs/DEPLOY.md` §9.1): every gate **ok** (`pull`,
+`land`, `branches`, `api`, `landing`, `scaling`, `failover`, `objects`,
+`openscion`, `scale`), and the failover gate run twice: with the lease
+holder stopped (`docker stop`) the longest pause in landings was 642 ms,
+with it killed (`FAILOVER_HOW=kill`) 442 ms (target 2 s); both times every
+change landed on `main` exactly once (1,624), by the database and by the
+agents' answers. Teardown left nothing. For the flow only, as above.
+
 At the end the script says `nothing of veil-dokit-me remains (containers,
 volumes, networks)`; check with `docker ps -a --filter
 label=com.docker.compose.project=veil-dokit-me`.

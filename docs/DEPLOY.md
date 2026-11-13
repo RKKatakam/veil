@@ -139,10 +139,11 @@ What `configure.sh` sets up, and why:
   servers, three copies of every tablet.
 - `--tserver_flags=ysql_num_shards_per_tserver=1`: each hash-sharded table
   gets one tablet per node (three), led one by each node, so a hot table's
-  writes are spread over the cluster. Veil's schema (migrations 1 to 36) is
+  writes are spread over the cluster. Veil's schema (migrations 1 to 39) is
   many small tables and indexes: a node holds a replica of every tablet,
   about three times the number of tables and indexes in all. The
-  rehearsal's count is in §9.1 (122 per node at one tablet per table).
+  rehearsal's count is in §9.1 (124 on `yb1` at one tablet per table;
+  122 per node with migrations 1 to 36, §9.2).
 - **The tablet-replica limit lifted on every master**:
   `yugabyted` turns `enforce_tablet_replica_limits` on at each start,
   whatever `--master_flags` says (the same as `scripts/verify-server.sh`
@@ -302,8 +303,8 @@ log in `deploy/compose/results/<stamp>/`. On a machine others use, run
 it alone (it needs 11.5 GB), give it its own `NAME` and `LB_PORT`, and
 leave other Compose projects alone: its teardown removes only its own
 project's containers, network and volumes. **The rehearsal's
-numbers are for the flow only**: one machine plays nine. The rehearsal of
-2026-11-12 is in §9.
+numbers are for the flow only**: one machine plays nine. The rehearsals of
+2026-11-13 and 2026-11-12 are in §9.
 
 ## 5. The DigitalOcean run, in order
 
@@ -531,7 +532,48 @@ appears as hourly line items.
 
 ## 9. Rehearsal results
 
-### 9.1 The rehearsal of 2026-11-12 (the multi-machine topology)
+### 9.1 The rehearsal of 2026-11-13 (the final one before the paid run)
+
+`deploy/compose/rehearsal.sh finalbench` on the development machine (32
+cores, 30 GB, Docker 28; through `~/.cache/veil-orch/heavy.sh`, alone in
+the machine's heavy-job turn), images `veil-server:dc4e3f82` and
+`veil-bench:dc4e3f82` built from `integration` @ `dc4e3f82` (public
+`main`), its own Compose project `veil-dokit-finalbench`, `LB_PORT=28743`:
+three YugabyteDB nodes (one tablet per table, 2.25 GB each), two servers
+behind HAProxy, one driver, every gate at the rehearsal's sizes; then
+`GATES=failover FAILOVER_HOW=kill SKIP_BUILD=1 TAG=dc4e3f82` (the same
+images; the checkout's commit, recorded in that run's `run.txt`, was
+`b3bbc9dd`, records only). **These numbers are for the flow only:** one
+machine played nine.
+
+Results: `deploy/compose/results/20261113T081916Z/` (every gate, failover
+by `docker stop`) and `deploy/compose/results/20261113T082838Z/` (failover
+by SIGKILL); not committed.
+
+| Step | Outcome | What it showed |
+|---|---|---|
+| bring-up | **ok**, 61 s (60 s for the kill run) | three YugabyteDB nodes; 124 tablets on `yb1` after migrations 1 to 39; both servers healthy; HTTPS through the balancer with the run's CA (`/v1/epochs` → 401, as expected without a grant) |
+| `pull` | ok | 4,907 and 12,581 pulls/s (10 and 50 agents); 1.3 and 1.6 statements per pull |
+| `land`, `api` | ok | 14.8 and 267 landings/s (1 and 10 agents); API 48 and 323/s |
+| `branches` | ok | the cost curve 14 and 234 pushes/s; **the headline** with 10 and 30 agents merging every 5th push for 10 s: 83 and 147 pushes/s, 166 and 295 branch landings on `main`, no errors |
+| `landing` | ok | 40 agents of 4 people, 50/s offered, 10 s: plain 48.6/s, protected 50.2/s, with the mix 50.6/s (p99 418 to 557 ms), no errors |
+| `scaling` | ok (flow) | `scaling.md` from both server counts: pulls 10,258 → 11,201/s, pushes 301 → 290/s, landings across 4 projects 221 → 172/s with 1 → 2 servers |
+| `failover`, stop | **pass** | server 1 held the lease and was stopped; another server took it (epoch 1 → 2); nothing left queued; `main` = 2 set-up snapshots + 1,624 landed changes, exactly; 1,624 answered `landed`, each on `main` once under its ticket; 0 landings no agent heard of, against 20 failed submits without a ticket; first landing 14 ms after the stop; **longest pause after the stop 642 ms** (376 ms in the 30 s before) |
+| `failover`, kill | **pass** | server 1 held the lease and was killed; taken over at epoch 2; `main` = 2 + 1,624, exactly; 1,624 answered `landed`, each once; 0 unheard of, against 20 failed submits; first landing 318 ms after the kill; **longest pause after the kill 442 ms** (388 ms in the 30 s before) |
+| `objects` | ok | 792 reads/s through the server, 1,599 through the cache (10 workspaces) |
+| `openscion` | ok (1,000 files, 1 run) | import 67 ms (Git 104), clone 166 (170), commit one file 18 (21), clone one directory 40 (44) |
+| `scale` (`tiny`) | ok | initial push 1.7 s, server 20 → 84 MiB; thin clone 0.33 s |
+| teardown | **ok** | `nothing of veil-dokit-finalbench remains (containers, volumes, networks)`, after both runs |
+
+**The crash takeover is rehearsed** (BUG-1970 cause (2), fixed on
+`failover2`): a killed lease holder paused landings 442 ms here, where it
+paused 2,711 ms on 2026-11-13 before the fix (§9.2) and 2,358 ms on
+2026-11-12; a clean stop 642 ms (481 ms before). Both are within the 2 s
+target; on one machine, so for the flow only. A machine that vanishes
+(no closed connection) still waits for the lease's 2 s expiry. No new
+problem in the kit.
+
+### 9.2 The rehearsal of 2026-11-12 (the multi-machine topology)
 
 `deploy/compose/rehearsal.sh` on the development machine (32 cores, 30 GB,
 Docker 28; shared with other work), `dokit2`, images `veil-server:dokit2`
@@ -582,8 +624,8 @@ gives the lease up at once (two earlier stop runs of this round: 628 and
 and for the next server's retry, BUG-1970's cause (2), left open.
 Cause (2) is fixed since on `failover2` (`docs/HUB.md` §13.32 item 13:
 a server finds a dead holder's session lock free and takes the lease over
-at once, in 57 to 623 ms in the server tests on both databases); not yet
-rehearsed. A machine that vanishes still waits for the lease's expiry.
+at once, in 57 to 623 ms in the server tests on both databases);
+rehearsed since: §9.1. A machine that vanishes still waits for the lease's expiry.
 
 Found by this round, both fixed in the kit: the agents' change ids are in
 Veil's letters (`k`–`z`) and the graph's in hex, and the `landed`
@@ -594,7 +636,7 @@ no lease holder when that server held it (**BUG-2080**: the first kill
 run, `20261112T231814Z`, failed so; both runs above had server 2 holding
 the lease).
 
-### 9.2 The rehearsal of 2026-11-09 (one server, PostgreSQL)
+### 9.3 The rehearsal of 2026-11-09 (one server, PostgreSQL)
 
 `deploy/compose/rehearsal.sh boat` on Boat machines (8 vCPU, 16 GB, Docker
 28), `integration` `ae3d57ed`, 15 s per load point, 1,000 files and one
