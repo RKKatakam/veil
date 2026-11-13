@@ -299,6 +299,19 @@ impl Materialised {
         self.hidden.contains(path)
     }
 
+    /// Is `path`, or a folder above it, hidden by the checkout's choice (a
+    /// one-directory clone's: hidden and not refused by the server)?
+    pub fn left_out_by_choice(&self, path: &VPath) -> bool {
+        let mut at = Some(path.clone());
+        while let Some(p) = at.filter(|p| !p.is_root()) {
+            if self.hidden.contains(&p) && !self.refused.contains(&p) {
+                return true;
+            }
+            at = p.parent();
+        }
+        false
+    }
+
     /// Every hidden path, in order.
     pub fn hidden_paths(&self) -> impl Iterator<Item = &VPath> {
         self.hidden.iter()
@@ -619,6 +632,10 @@ pub fn checkout_recorded(
 ) -> Result<CheckoutReport> {
     let shown = record.view.or(from.copied());
     let (changes, left_out) = checkout_changes(store, shown.as_ref(), to)?;
+    // Nothing at or below a path a one-directory clone left out is
+    // written, readable or not (BUG-1566; a thin clone can read every
+    // folder, BUG-1945).
+    let changes: Vec<TreeChange> = changes.into_iter().filter(|c| !record.left_out_by_choice(&c.path)).collect();
     let changes = record.refill_lost(store, fs, changes, cache.as_deref())?;
     let mut report = apply_changes(store, fs, shown.as_ref(), to, &changes, cache.as_deref_mut(), Some(&record.crlf))?;
     // A version's file the checkout had to leave on disk though it held
