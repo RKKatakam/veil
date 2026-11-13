@@ -1563,7 +1563,7 @@ pub const NON_OBJECT_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
     ("key_requests", &["project_id", "person_id", "created_at"]),
     ("landed_changes", &["project_id", "branch", "lineage", "change_id", "author"]),
     ("landed_from", &["project_id"]),
-    ("landing_leases", &["project_id", "branch", "holder", "epoch", "expires_at", "served"]),
+    ("landing_leases", &["project_id", "branch", "holder", "epoch", "expires_at", "served", "lock_epoch"]),
     ("landing_queue", &["project_id", "branch", "seq", "ticket", "person_id", "person_name", "device_key", "lineage", "person_epoch", "project_epoch", "state", "created_at", "done_at", "merges", "agent_session", "session", "priority", "person_slot", "session_slot"]),
     ("landings", &["project_id", "branch", "lineage", "at"]),
     ("log_cursors", &["project_id", "view_key", "id", "created_at"]),

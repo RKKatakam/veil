@@ -556,27 +556,9 @@ fn bug_1970_a_clean_stop_ends_its_batch_and_gives_the_lease_up_at_once() {
     // `a`'s batch is held at the entry's row, which it writes in its commit.
     let mut held = b.rt.block_on(db.begin()).unwrap();
     b.rt.block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held)).unwrap();
+    let held_pid: i32 = b.rt.block_on(sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *held)).unwrap();
     release_branch(&a, pid, "main");
-    let yugabyte = b.rt.block_on(sqlx::query_scalar::<_, String>("SELECT version()").fetch_one(&db)).unwrap().contains("-YB-");
-    let until = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let waiting: i64 = b
-            .rt
-            .block_on(
-                sqlx::query_scalar(if yugabyte {
-                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND query LIKE 'UPDATE landing_queue AS q%'"
-                } else {
-                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'UPDATE landing_queue AS q%'"
-                })
-                .fetch_one(&db),
-            )
-            .unwrap();
-        if waiting > 0 {
-            break;
-        }
-        assert!(std::time::Instant::now() < until, "`a`'s batch never reached its entry's row");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    crate::failover::wait_for_batch_at_row(&b, pid, held_pid);
     let (holder_a, epoch_a, _) = lease();
     assert_ne!(holder_a, "test");
 

@@ -85,7 +85,7 @@ start_services() {
   # renewal comes late, and YugabyteDB then kills every connection and
   # restarts (seen on 8-vCPU Boat machines: 370 of 425 tests failed).
   running "$YB" || { D rm -f "$YB" >/dev/null 2>&1; D run -d --name "$YB" -p 127.0.0.1::5433 "$YB_IMAGE" bin/yugabyted start --background=false \
-    --tserver_flags=memory_limit_hard_bytes=3221225472,ysql_num_shards_per_tserver=1,enable_ysql_operation_lease=false \
+    --tserver_flags=yb_enable_read_committed_isolation=true,memory_limit_hard_bytes=3221225472,ysql_num_shards_per_tserver=1,enable_ysql_operation_lease=false \
     --master_flags=memory_limit_hard_bytes=1073741824,enforce_tablet_replica_limits=false,enable_ysql_operation_lease=false >/dev/null || return 1; }
   PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=$(port "$YB" 5433)
   # Over TCP: a new container first runs a set-up server on its socket only.

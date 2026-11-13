@@ -207,6 +207,7 @@ pub async fn start(config: Config) -> Result<Running> {
     let cache_token = cache::feed::load_token(&config.data_dir).context("reading hub-cache-token")?;
     let (tls, cert_pem, certificate) = tls::server_config(&config.tls, &config.data_dir)?;
     let db = db::connect(&config.database_url, config.db_connections).await.context("connecting to the database")?;
+    db::read_committed_is_read_committed(&db).await.context("checking the database's isolation")?;
     db::migrate(&db).await.context("migrating the database")?;
     // The background deriver's own connections (BUG-911), opened when a
     // run first needs one.

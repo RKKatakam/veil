@@ -63,5 +63,6 @@ mod landing_speed;
 mod hunt_access;
 mod landing_hold;
 mod clone_one;
+mod failover;
 mod quarantine_land;
 mod store_s3;

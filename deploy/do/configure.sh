@@ -70,7 +70,7 @@ if [ "$YB_NODES" -gt 0 ]; then
     for i in $(seq "$YB_NODES"); do
         n=$NAME-yb$i; ip=$(addr "$n"); priv=$(paddr "$n")
         join=""; [ "$i" -gt 1 ] && join="--join=$FIRST"
-        remote "$ip" "docker rm -f yb >/dev/null 2>&1; docker run -d --name yb --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v yb-data:/root/var $YB_IMAGE bin/yugabyted start --background=false --advertise_address=$priv $join --tserver_flags=ysql_num_shards_per_tserver=1 --master_flags=enforce_tablet_replica_limits=false"
+        remote "$ip" "docker rm -f yb >/dev/null 2>&1; docker run -d --name yb --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v yb-data:/root/var $YB_IMAGE bin/yugabyted start --background=false --advertise_address=$priv $join --tserver_flags=yb_enable_read_committed_isolation=true,ysql_num_shards_per_tserver=1 --master_flags=enforce_tablet_replica_limits=false"
         remote "$ip" 'for i in $(seq 120); do docker exec yb bin/ysqlsh -h '"$priv"' -tAc "select 1" >/dev/null 2>&1 && break; sleep 2; done; echo "   yb'"$i"' answers"'
     done
     remote "$YB1" 'for i in $(seq 60); do n=$(docker exec yb bin/ysqlsh -h '"$FIRST"' -tAc "select count(*) from yb_servers()" 2>/dev/null); [ "$n" = '"$YB_NODES"' ] && break; sleep 2; done; echo "   YugabyteDB nodes in the cluster: $n (expected '"$YB_NODES"')"; [ "$n" = '"$YB_NODES"' ]'

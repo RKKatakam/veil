@@ -558,3 +558,43 @@ fn bug_1909_verify_ca_still_refuses_an_expired_or_self_signed_certificate() {
     }
     drop_database(&rt, &name);
 }
+
+/// BUG-2135: on a YugabyteDB whose `READ COMMITTED` is snapshot isolation
+/// (tablet servers without `yb_enable_read_committed_isolation=true`) the
+/// server refuses to start, naming the flag; with read committed on, and on
+/// PostgreSQL (never asked), it starts.
+#[test]
+fn bug_2135_a_yugabytedb_without_read_committed_is_refused_at_start() {
+    use veil_server::db::{is_yugabyte, isolation_refusal, read_committed_is_read_committed};
+    assert_eq!(isolation_refusal("read committed"), None);
+    for level in ["repeatable read", "serializable"] {
+        let m = isolation_refusal(level).expect("refused");
+        assert!(m.contains("--yb_enable_read_committed_isolation=true") && m.contains(level), "{m}");
+    }
+    assert!(is_yugabyte("PostgreSQL 15.12-YB-2025.2.8.1-b0 on x86_64-pc-linux-gnu"));
+    assert!(!is_yugabyte("PostgreSQL 17.6 on x86_64-pc-linux-musl"));
+
+    // The test database: the check passes (the test YugabyteDB runs with
+    // read committed on), and on YugabyteDB it read what a READ COMMITTED
+    // transaction of the server's pool runs at.
+    let rt = runtime();
+    let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 1).await.unwrap();
+        read_committed_is_read_committed(&db).await.expect("the test database runs read committed");
+        let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
+        if is_yugabyte(&version) {
+            let mut tx = db.begin_with("BEGIN ISOLATION LEVEL READ COMMITTED").await.unwrap();
+            let level: String = sqlx::query_scalar("SELECT yb_get_effective_transaction_isolation_level()::text").fetch_one(&mut *tx).await.unwrap();
+            assert_eq!(level, "read committed");
+            // What a repeatable read transaction runs at is refused, as a
+            // cluster without read committed runs READ COMMITTED.
+            tx.rollback().await.unwrap();
+            let mut tx = db.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ").await.unwrap();
+            let level: String = sqlx::query_scalar("SELECT yb_get_effective_transaction_isolation_level()::text").fetch_one(&mut *tx).await.unwrap();
+            tx.rollback().await.unwrap();
+            assert!(isolation_refusal(&level).is_some(), "{level}");
+        }
+        db.close().await;
+    });
+}
