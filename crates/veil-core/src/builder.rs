@@ -1554,6 +1554,22 @@ impl<'a> Builder<'a> {
                 self.report.not_recorded.extend(files);
                 continue;
             }
+            // What a one-directory clone left out (a folder or a file beside
+            // its folder), with something in the working copy there: never
+            // read (a thin clone would fetch it, and take what is there for
+            // its edit), carried as recorded, and what is there listed,
+            // never recorded (BUG-1945).
+            if self.opts.materialised.is_some_and(|m| m.left_out(&path)) {
+                let files = match kind {
+                    NodeKind::Dir => crate::vfs::walk_leaves(self.fs, &path, &|_| false)?.into_iter().map(|(p, _)| p).collect(),
+                    _ => vec![path.clone()],
+                };
+                self.report.not_recorded.extend(files);
+                if let Some(pe) = parent_entry {
+                    f.out.insert(pe.clone());
+                }
+                continue;
+            }
             match kind {
                 NodeKind::Dir => {
                     let class = self.opts.policy.classify(&path, true);
@@ -1595,17 +1611,6 @@ impl<'a> Builder<'a> {
                         if let Some(pe) = pdir {
                             f.out.insert(pe.clone());
                         }
-                        continue;
-                    }
-                    // A folder the checkout never wrote (one a `--only`
-                    // clone leaves out), with something in the working
-                    // copy: never read (a thin clone would fetch it, and
-                    // take what is there for its edit), carried by id,
-                    // and what is there listed, never recorded (BUG-1945).
-                    if let Some(e) = pdir.filter(|_| self.opts.materialised.is_some_and(|m| m.left_out(&path))) {
-                        let files: Vec<VPath> = crate::vfs::walk_leaves(self.fs, &path, &|_| false)?.into_iter().map(|(p, _)| p).collect();
-                        self.report.not_recorded.extend(files);
-                        f.out.insert(e.clone());
                         continue;
                     }
                     let sub = match pdir {
@@ -1937,6 +1942,11 @@ impl<'a> Builder<'a> {
         }
         let open = |b: &mut Self, e: &TreeEntry, path: &VPath, depth: usize| -> Result<std::result::Result<Frame, Option<TreeEntry>>> {
             match e.kind {
+                // What a one-directory clone left out: carried whole, never
+                // read (a thin clone would fetch it, and take an absent
+                // file or folder for a deletion; BUG-1945). Not a
+                // redaction: nothing to report.
+                _ if b.opts.materialised.is_some_and(|m| m.left_out(path)) => Ok(Err(Some(e.clone()))),
                 EntryKind::File => {
                     // Readable and absent is a deletion, unless it was never
                     // materialised (it became readable since checkout).
@@ -1982,11 +1992,6 @@ impl<'a> Builder<'a> {
                         Ok(Err(Some(e.clone())))
                     }
                 }
-                // A folder the checkout never wrote (a `--only` clone's):
-                // carried whole, never read (a thin clone would fetch it,
-                // and take its files for deletions; BUG-1945).
-                // Not a redaction: nothing to report.
-                EntryKind::Dir if b.opts.materialised.is_some_and(|m| m.left_out(path)) => Ok(Err(Some(e.clone()))),
                 EntryKind::Dir => match b.store.tree(&e.id) {
                     Ok(tree) if depth < MAX_TREE_DEPTH => Ok(Ok(Frame {
                         entry: e.clone(),

@@ -413,4 +413,17 @@ fn a_one_folder_clone_never_writes_a_file_beside_its_folder() {
     assert_eq!(top_level(&d), vec![BILL_DIR.to_string()], "written beside the folder at the move");
     assert!(!has_marker(&everything_in(&d), ROOT_MARK), "a file beside the folder was fetched by the move");
     assert_clean(&p.admin.ok(&d, &["status"]), "after the move");
+    // A file of the person's own where the clone left one out: listed,
+    // never recorded, never pushed over the project's.
+    write_files(&d, &[(ROOT_FILE, "MARKER-MINE-BESIDE-not-recorded")]);
+    let status = p.admin.ok(&d, &["status"]);
+    assert_clean(&status, "with a file of the person's own beside the folder");
+    assert!(status.contains(ROOT_FILE), "the file is not listed:\n{status}");
+    write_files(&d, &[(&format!("{BILL_DIR}/acme/invoice.txt"), "edited beside")]);
+    p.admin.commit_main(&d, "edit inside");
+    p.admin.ok(&d, &["push"]);
+    p.admin.ok(&p.dir, &["pull"]);
+    p.admin.ok(&p.dir, &["new", "main"]);
+    assert_eq!(std::fs::read_to_string(p.dir.join(BILL_DIR).join("acme/invoice.txt")).unwrap(), "edited beside", "the edit landed");
+    assert_eq!(std::fs::read_to_string(p.dir.join(ROOT_FILE)).unwrap(), format!("{ROOT_MARK} v2"), "the person's file was recorded over the project's");
 }

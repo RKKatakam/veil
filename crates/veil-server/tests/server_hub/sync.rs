@@ -194,24 +194,13 @@ fn bug_832_a_one_directory_clone_keeps_the_folders_secrets() {
         write_files(&d, &[(&format!("{BILL_DIR}/.env") as &str, &format!("KEY={ENV_MARK}\nEDIT={n}\n"))]);
         write_files(&d, &[(&format!("{BILL_DIR}/acme/invoice.txt") as &str, &format!("from clone {n}"))]);
         let st = who.ok(&d, &["status"]);
-        // The admin's one-directory clone is thin (BUG-1945): it reads the
-        // project's recorded policy, and seals the edit under its rule, as
-        // a whole clone does; fin's views stay local.
-        let sealed = format!("M {BILL_DIR}/.env [cloaked");
-        match n {
-            2 => assert!(st.contains(&sealed) && !st.contains("D "), "clone {n}: {st}"),
-            _ => assert!(st.contains("kept as recorded") && !st.contains("D "), "clone {n}: {st}"),
-        }
+        assert!(st.contains("kept as recorded") && !st.contains("D "), "clone {n}: {st}");
         who.commit_main(&d, "partial edit");
         who.ok(&d, &["push"]);
         p.admin.ok(&p.dir, &["pull"]);
         p.admin.ok(&p.dir, &["new", "main"]);
         let env = std::fs::read_to_string(p.dir.join(BILL_DIR).join(".env")).unwrap_or_default();
-        match n {
-            // The admin's sealed edit, theirs to make.
-            2 => assert!(env.contains(ENV_MARK) && env.contains("EDIT=2"), "clone {n}: the admin's sealed edit did not land: {env:?}"),
-            _ => assert!(env.contains(ENV_MARK) && !env.contains("EDIT="), "clone {n}: the push deleted or changed the folder's secret: {env:?}"),
-        }
+        assert!(env.contains(ENV_MARK) && !env.contains("EDIT="), "clone {n}: the push deleted or changed the folder's secret: {env:?}");
         assert_eq!(std::fs::read_to_string(p.dir.join(BILL_DIR).join("acme/invoice.txt")).unwrap(), format!("from clone {n}"));
     }
 }
