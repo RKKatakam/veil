@@ -539,3 +539,15 @@ fn ephemeral_ws_exec_that_fails_after_recording_still_keeps_the_file() {
     assert!(t.contains(&dirs[0].display().to_string()), "{t}");
     assert_eq!(std::fs::read_to_string(dirs[0].join("src/cfg.js")).unwrap(), "const key = 'AKIAIOSFODNN7EXAMPLE';\n");
 }
+
+#[test]
+#[ignore = "BUG-2200: an --ephemeral --only run fails after recording when the command left an unreadable directory outside the set"]
+fn bug_2200_an_unreadable_directory_outside_the_set_does_not_fail_a_recorded_ephemeral_run() {
+    let env = Env::new();
+    let proj = project(&env);
+    let out = env.vl("alice", &proj, &["ws", "exec", "--ephemeral", "--only", "src", "--", "sh", "-c", "echo ok > src/ok.txt && mkdir shut && chmod 000 shut"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    let id = recorded_id(&t);
+    assert_eq!(env.stdout("alice", &proj, &["cat", "-r", &id, "src/ok.txt"]), "ok\n");
+}
