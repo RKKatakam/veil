@@ -162,6 +162,17 @@ impl TestHub {
         }
     }
 
+    /// This server gone as a killed process goes (BUG-1970): no clean
+    /// stop; its tasks dropped and every connection it had closed (a task
+    /// dropped as the runtime goes may print a panic: a killed process
+    /// runs none of that).
+    pub fn crash(mut self) {
+        let running = self.running.take();
+        let rt = std::mem::replace(&mut self.rt, tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
+        drop(running);
+        rt.shutdown_timeout(Duration::from_secs(5));
+    }
+
     pub fn authority(&self) -> String {
         format!("127.0.0.1:{}", self.port)
     }

@@ -75,6 +75,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (36, "landing_slots", include_str!("../migrations/0036_landing_slots.sql")),
     (37, "landing_served", include_str!("../migrations/0037_landing_served.sql")),
     (38, "review_writers", include_str!("../migrations/0038_review_writers.sql")),
+    (40, "lease_locks", include_str!("../migrations/0040_lease_locks.sql")),
 ];
 
 pub async fn connect(url: &str, max: u32) -> anyhow::Result<PgPool> {
@@ -132,6 +133,40 @@ fn options(url: &str, max: u32) -> anyhow::Result<(PgPoolOptions, sqlx::postgres
         ("lock_timeout", format!("{}", LOCK_TIMEOUT.as_millis())),
     ]);
     Ok((PgPoolOptions::new().max_connections(max).acquire_timeout(Duration::from_secs(30)), opts))
+}
+
+/// Refuse to serve on a YugabyteDB that runs `READ COMMITTED` as snapshot
+/// isolation (BUG-2135). YugabyteDB does unless its tablet servers run with
+/// `yb_enable_read_committed_isolation=true`, and then every reasoning of
+/// [`Isolation::ReadCommitted`] that a statement sees what committed before
+/// it (the review gate's reads after the gate, BUG-1886) is wrong without a
+/// word. Asked of a `READ COMMITTED` transaction of the server's own pool,
+/// as every one of its transactions begins; PostgreSQL is not asked.
+pub async fn read_committed_is_read_committed(pool: &PgPool) -> anyhow::Result<()> {
+    let version: String = sqlx::query_scalar("SELECT version()").fetch_one(pool).await?;
+    if !is_yugabyte(&version) {
+        return Ok(());
+    }
+    let mut tx = pool.begin_with("BEGIN ISOLATION LEVEL READ COMMITTED").await?;
+    let effective: String = sqlx::query_scalar("SELECT yb_get_effective_transaction_isolation_level()::text").fetch_one(&mut *tx).await?;
+    tx.rollback().await?;
+    isolation_refusal(&effective).map_or(Ok(()), |m| Err(anyhow::anyhow!(m)))
+}
+
+/// Whether `version()` names YugabyteDB.
+pub fn is_yugabyte(version: &str) -> bool {
+    version.contains("-YB-")
+}
+
+/// What the server says, refusing, when a YugabyteDB's `READ COMMITTED`
+/// transaction runs at `effective`; `None` when it is read committed.
+pub fn isolation_refusal(effective: &str) -> Option<String> {
+    (!effective.trim().eq_ignore_ascii_case("read committed")).then(|| {
+        format!(
+            "this YugabyteDB runs READ COMMITTED transactions as {effective}: start every tablet server with \
+             --yb_enable_read_committed_isolation=true (the server's landings rely on read committed)"
+        )
+    })
 }
 
 /// The advisory lock that one migrating process holds (any key; both

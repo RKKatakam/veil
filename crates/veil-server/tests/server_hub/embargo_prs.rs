@@ -839,6 +839,7 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     // ---- Case A: the line lands at release with its approved PR, armed or not (BUG-1875); a PR onto the
     //      line, not armed, becomes an ordinary open PR once across 2 servers ----
     let main_before_a = api1.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let pid: i64 = hub1.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub1.hub().db)).unwrap();
     let until_a = veil_core::now_millis() + 60_000;
     let (eid_a, _, _, _) = push_embargo(
         &hub1,
@@ -902,7 +903,7 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     );
     assert_eq!(th_a.status, 200);
 
-    // Expire `until_a` in PostgreSQL (`release_due` strictly uses `clock_timestamp()`) and race `release_due` across both servers!
+    // Expire `until_a` in PostgreSQL (`release_due` strictly uses `clock_timestamp()`) and race its release across both servers!
     hub1.rt.block_on(async {
         sqlx::query(
             "UPDATE embargo_lines SET until_ms = (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT - 10 WHERE embargo_id = $1",
@@ -913,9 +914,11 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
         .unwrap();
     });
     let (n1, n2) = std::thread::scope(|s| {
-        let t1 = s.spawn(|| hub1.rt.block_on(veil_server::embargo::release_due(&hub1.hub())).unwrap());
-        let t2 = s.spawn(|| hub2.rt.block_on(veil_server::embargo::release_due(&hub2.hub())).unwrap());
-        (t1.join().unwrap(), t2.join().unwrap())
+        // This embargo's release only (BUG-2134: `release_due` releases every due
+        // embargo of the database, other tests' too, and its count is theirs).
+        let t1 = s.spawn(|| hub1.rt.block_on(veil_server::embargo::release_one(&hub1.hub(), pid, &eid_a, None, None)).unwrap());
+        let t2 = s.spawn(|| hub2.rt.block_on(veil_server::embargo::release_one(&hub2.hub(), pid, &eid_a, None, None)).unwrap());
+        (u8::from(t1.join().unwrap()), u8::from(t2.join().unwrap()))
     });
     assert!(n1 + n2 <= 1, "at most one server may win the release transition (got {n1} and {n2})");
     let rel_a: Option<i64> = hub1
@@ -1037,7 +1040,7 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     assert_eq!(arm_b.json()["land_at_release"], true);
     assert_eq!(arm_b.json()["state"], "open");
 
-    // Race `release_due` across `hub1` and `hub2`!
+    // Race its release across `hub1` and `hub2`!
     hub1.rt.block_on(async {
         sqlx::query(
             "UPDATE embargo_lines SET until_ms = (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT - 10 WHERE embargo_id = $1",
@@ -1048,9 +1051,11 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
         .unwrap();
     });
     let (b1, b2) = std::thread::scope(|s| {
-        let t1 = s.spawn(|| hub1.rt.block_on(veil_server::embargo::release_due(&hub1.hub())).unwrap());
-        let t2 = s.spawn(|| hub2.rt.block_on(veil_server::embargo::release_due(&hub2.hub())).unwrap());
-        (t1.join().unwrap(), t2.join().unwrap())
+        // This embargo's release only (BUG-2134: `release_due` releases every due
+        // embargo of the database, other tests' too, and its count is theirs).
+        let t1 = s.spawn(|| hub1.rt.block_on(veil_server::embargo::release_one(&hub1.hub(), pid, &eid_b, None, None)).unwrap());
+        let t2 = s.spawn(|| hub2.rt.block_on(veil_server::embargo::release_one(&hub2.hub(), pid, &eid_b, None, None)).unwrap());
+        (u8::from(t1.join().unwrap()), u8::from(t2.join().unwrap()))
     });
     assert!(b1 + b2 <= 1, "at most one server may finalize land-at-release (got {b1} and {b2})");
     let rel_b: Option<i64> = hub1

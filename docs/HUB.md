@@ -5531,6 +5531,59 @@ transaction per landing instead of 23.
    them; item 11's places are in memory, taken before any transaction. A
    writer's announcement takes no lock anyone holds.) Batches do not wait
    for one another.
+13. **A lease whose holder is gone is taken over at once** (`landing/lease_lock.rs`,
+   `landing/service.rs` `take_lease`, migration 40, BUG-1970 cause 2).
+   A branch's lease row (`landing_leases`) lasts `LEASE_MS` (2 s, kept:
+   a batch's transaction may wait half of it for its store, BUG-1982, and
+   a shorter lease would leave a slow store or an ordinary pause too
+   little room) unless renewed; until now another server took it over
+   only on expiry, so a killed holder paused landings 2 s plus the next
+   server's retry (2,711 ms in the kit's rehearsal). Now the holder of
+   epoch `e` also holds a **session advisory lock** keyed by the branch
+   (a stable hash, in the two-integer key space no other lock of the
+   server uses) and `e`, on one connection per server of its own
+   (`application_name` `veil-landing-leases <holder>`), taken **before**
+   the lease, and the row records it (`lock_epoch = e`). A process that
+   dies closes its connections, and the database frees the lock at once:
+   by hand, a holder's client killed (`kill -9`) or its backend
+   terminated freed it in under 15 ms on PostgreSQL 17 and under 150 ms
+   on YugabyteDB 2025.2.8.1 (each including the waiter's client start;
+   the backend must be idle, as the lock session is: one inside a
+   statement notices only when the statement ends). A server whose take
+   finds the lease unexpired, another's, with `lock_epoch = epoch`, asks
+   for that lock and lets it go in the same statement (on any
+   connection: nothing is kept); if it got it, the holder is gone, and it
+   takes the lease at `e + 1` by a compare-and-swap on `e`, as it would an
+   expired one. A holder never locks its epoch's key again, so a key found
+   free stays free, and what is taken over is exactly that epoch.
+   Correctness rests, as before, on the fencing: the batch's transaction
+   renews the lease only `WHERE holder = me AND epoch = e`, so a holder
+   that lost its lease, however, lands nothing more, and every change
+   lands once. A live holder that keeps its lock session is never taken
+   over before expiry; one whose session the database ended (its
+   connection dropped, a partition the database noticed) is taken over as
+   a dead one, and fenced. What this does not speed up: a machine that
+   vanishes sends nothing, and the database keeps its session (and lock)
+   until TCP keepalive gives up (by hand, a client container cut from the
+   network: never within 20 s with the defaults; about 2 s with the
+   tightest settings, 1 s idle, 1 s interval, 1 probe, on both databases),
+   no sooner than the lease's own expiry, so that case is still the
+   lease's; and a holder killed while one of its statements waits (for a
+   row lock, say) keeps that transaction, with the lease row's lock, until
+   the statement ends. A lease taken without the lock (no lock session, its
+   key held by a server that crashed taking it, a server of an earlier
+   release, a row written by hand) has no `lock_epoch` equal to its epoch
+   and is taken over only on expiry. Measured in the tests (two servers
+   on one database): a holder killed while committing a batch was taken
+   over in 57 to 168 ms on PostgreSQL (14 runs) and 211 to 623 ms on YugabyteDB (9 runs), its
+   batch rolled back and landed once by the other server; a holder whose
+   lock session was terminated, alive, was taken over and the next landing
+   landed in 141 to 288 ms (PostgreSQL) and 321 to 806 ms (YugabyteDB)
+   after the session was gone. A landing sent to the server that takes
+   over and landed by the old holder's last batch is answered at once: a
+   poller here reads the outcomes once more after this server takes a
+   lease (BUG-2150: only every 5 s while a service runs here, before). (The kit's rehearsal has not been run
+   again since.)
 
 **Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
 `concurrency.rs`, unit tests in `limits/landing.rs`):
@@ -5555,6 +5608,9 @@ transaction per landing instead of 23.
 | 16 | Every landing meets the approvals that count when it commits: a reviewer's access taken away (here: out of the group that writes the PR's paths), answered while the batch that counted the approval commits, is never overtaken by it (BUG-2111) | the batch held after its review check, at its entry's row: the removal waits for it (the change lands, counted as it was read), then is answered | `rv_core2::bug_2111_a_reviewer_removed_while_the_batch_commits_does_not_approve_it` |
 | 17 | A writer of the review rules waits only for the batches already holding the gate, on PostgreSQL and YugabyteDB: a batch that asks after it leaves the gate to it, and a writer that went away holds no landing back (BUG-2110) | a batch's ask after the verdict's finds the verdict announced and takes nothing; once the batch before ends the verdict is written within 5 s, its row gone; three loops of stand-in batches overlapping without end (150 ms holds, 50 ms apart): three verdicts each answered in under 2 s, the batches going on meanwhile; a stale row whose lock is free is removed by the batch, which lands | `rv_core2::bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate`, `rv_core2::bug_2110_writers_are_answered_in_bounded_time_while_batches_overlap_without_end`, `rv_core2::bug_2110_a_writer_that_went_away_does_not_stop_landings` |
 | 18 | The review gate's writers neither deadlock nor leak (BUG-2130 to BUG-2133): one lock order with the project's row; no pool deadlock from the announcement's connection; an announcement goes with its dropped request; a writer's own lock is no other lock | a policy push and an admin's removal queued behind a stand-in batch never wait for each other, both answered; 16 removals filling the pool, freed at once, answered within 0.2 s (before: `503` after 30 s); a verdict whose client gave up leaves no row; no writer id up to 10^6 has another lock's key | `rv_core2::bug_2130_a_policy_push_and_an_admin_removal_take_the_gate_in_one_order`, `rv_core2::bug_2131_writers_filling_the_pool_are_answered`, `rv_core2::bug_2132_a_writer_whose_request_is_dropped_leaves_no_announcement`, `prs::review_gate::tests::a_writers_key_is_no_projects_review_gate` |
+| 19 | A lease whose holder was killed is taken over well inside `LEASE_MS`, at the next epoch, and every change lands once (BUG-1970) | the holder killed (every connection closed) while its batch's transaction waits at the entry's row: the other server holds the lease at epoch + 1 (its own lock taken) 57–168 ms on PostgreSQL / 211–623 ms on YugabyteDB after the kill (asserted under 1 s); the killed holder's batch and the next landing each land once (`main`'s line from the base: the two changes, once each) | `failover::bug_1970_a_killed_holder_is_taken_over_before_its_lease_expires_and_its_batch_lands_once` |
+| 20 | A live holder with its lock is never taken over; one whose lock session ends is taken over at once and fenced (BUG-1970) | a landing sent to the other server is landed by the holder, the lease unchanged; the holder's lock session terminated: the next landing lands in under `LEASE_MS` and the other server holds the lease at epoch + 1 in under `LEASE_MS` (the holder, alive, may land it first), and one sent to the old holder lands once, by the new one, which keeps the lease (`main`'s line from the base: the four changes, once each) | `failover::bug_1970_a_holder_whose_lock_session_ends_is_taken_over_at_once_and_fenced` |
+| 21 | The lock's key is the same in every release (a changed one would take every live holder's lease over) | the branch key pinned; the epoch's 31 bits as SQL computes them | `landing::lease_lock::tests::keys_are_stable_and_per_branch_and_epoch` |
 
 ### 13.36 S20: automatic bisect and revert (built)
 

@@ -20,6 +20,7 @@
 //! a push to one lands its new changes instead.
 
 pub mod edits;
+pub mod lease_lock;
 pub mod merge;
 pub mod rules;
 mod service;
@@ -414,14 +415,21 @@ pub struct Services {
     /// The server is stopping cleanly ([`stop`]): no service starts, and
     /// each running one ends after its batch being committed.
     stopping: AtomicBool,
+    /// The locks of the leases this server holds (`lease_lock`).
+    locks: lease_lock::Session,
+    /// Leases this server has taken, ever: a poller reads the outcomes
+    /// once more after each (BUG-2150).
+    taken: AtomicU64,
 }
 
 const RETRY_LEASE: Duration = Duration::from_millis(500);
 
 impl Default for Services {
     fn default() -> Self {
+        let holder = format!("{}-{}", std::process::id(), hex::encode(veil_core::crypto::random_bytes::<8>()));
         Services {
-            holder: format!("{}-{}", std::process::id(), hex::encode(veil_core::crypto::random_bytes::<8>())),
+            locks: lease_lock::Session::new(&holder),
+            holder,
             running: Mutex::new(HashMap::new()),
             held_elsewhere: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
@@ -431,6 +439,7 @@ impl Default for Services {
             pressure: Default::default(),
             stats: Stats::default(),
             stopping: AtomicBool::new(false),
+            taken: AtomicU64::new(0),
         }
     }
 }
@@ -833,14 +842,21 @@ fn poll(hub: &Arc<Hub>, project: i64, branch: &str) {
         // is read twice is answered once).
         let mut since = veil_core::now_millis() - 60_000;
         let mut read_at = Instant::now();
+        let mut taken = hub.landing.taken.load(std::sync::atomic::Ordering::SeqCst);
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
             // A service here answers its waiters itself: the row is read
-            // only as a fallback, every 5 s.
+            // only as a fallback, every 5 s, and once after this server
+            // takes a lease: a service answers only what it lands, and what
+            // the lease's last holder landed is committed by then (its
+            // batch's transaction holds the lease's row, which the take
+            // waits for), unanswered here (BUG-2150).
             let local = hub.landing.running.lock().unwrap().contains_key(&key);
-            if local && read_at.elapsed() < Duration::from_secs(5) {
+            let took = hub.landing.taken.load(std::sync::atomic::Ordering::SeqCst);
+            if local && read_at.elapsed() < Duration::from_secs(5) && took == taken {
                 continue;
             }
+            taken = took;
             read_at = Instant::now();
             let waiting: std::collections::HashSet<String> = {
                 let w = hub.landing.waiters.lock().unwrap();

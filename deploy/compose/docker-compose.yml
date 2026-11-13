@@ -31,17 +31,17 @@ services:
   yb1:
     <<: *yb
     hostname: yb1
-    command: ["bin/yugabyted", "start", "--background=false", "--advertise_address=yb1", "--tserver_flags=${YB_TSERVER_FLAGS}", "--master_flags=${YB_MASTER_FLAGS}"]
+    command: ["bin/yugabyted", "start", "--background=false", "--advertise_address=yb1", "--tserver_flags=yb_enable_read_committed_isolation=true${YB_TSERVER_FLAGS:+,$YB_TSERVER_FLAGS}", "--master_flags=${YB_MASTER_FLAGS}"]
     volumes: [yb1data:/root/var]
   yb2:
     <<: *yb
     hostname: yb2
-    command: ["bin/yugabyted", "start", "--background=false", "--advertise_address=yb2", "--join=yb1", "--tserver_flags=${YB_TSERVER_FLAGS}", "--master_flags=${YB_MASTER_FLAGS}"]
+    command: ["bin/yugabyted", "start", "--background=false", "--advertise_address=yb2", "--join=yb1", "--tserver_flags=yb_enable_read_committed_isolation=true${YB_TSERVER_FLAGS:+,$YB_TSERVER_FLAGS}", "--master_flags=${YB_MASTER_FLAGS}"]
     volumes: [yb2data:/root/var]
   yb3:
     <<: *yb
     hostname: yb3
-    command: ["bin/yugabyted", "start", "--background=false", "--advertise_address=yb3", "--join=yb1", "--tserver_flags=${YB_TSERVER_FLAGS}", "--master_flags=${YB_MASTER_FLAGS}"]
+    command: ["bin/yugabyted", "start", "--background=false", "--advertise_address=yb3", "--join=yb1", "--tserver_flags=yb_enable_read_committed_isolation=true${YB_TSERVER_FLAGS:+,$YB_TSERVER_FLAGS}", "--master_flags=${YB_MASTER_FLAGS}"]
     volumes: [yb3data:/root/var]
 
   postgres:

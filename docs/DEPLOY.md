@@ -573,6 +573,10 @@ Before BUG-1970's fix both pauses were about 2.4 s. A clean stop now
 gives the lease up at once (two earlier stop runs of this round: 628 and
 307 ms); a crash still waits for the lease to expire (`LEASE_MS`, 2 s)
 and for the next server's retry, BUG-1970's cause (2), left open.
+Cause (2) is fixed since on `failover2` (`docs/HUB.md` §13.32 item 13:
+a server finds a dead holder's session lock free and takes the lease over
+at once, in 57 to 623 ms in the server tests on both databases); not yet
+rehearsed. A machine that vanishes still waits for the lease's expiry.
 
 Found by this round, both fixed in the kit: the agents' change ids are in
 Veil's letters (`k`–`z`) and the graph's in hex, and the `landed`

@@ -105,20 +105,61 @@ const CLEAN_CHUNK: i64 = 20_000;
 const DB_NOW: &str = "(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT";
 
 /// Take the lease of `branch`: its fencing epoch, or `None` while another
-/// server holds it.
+/// server holds it. It is taken when it expired, is this server's, or its
+/// holder's lock is free (`lease_lock`: the holder is gone, BUG-1970), at
+/// the next epoch by a compare-and-swap on the one read; this server's
+/// lock of that epoch is taken first, and the row's `lock_epoch` says
+/// whether it was.
 async fn take_lease(hub: &Hub, project: i64, branch: &str) -> Result<Option<i64>> {
-    Ok(sqlx::query_scalar(&format!(
-        "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at) VALUES ($1, $2, $3, 1, {DB_NOW} + $4) \
-         ON CONFLICT (project_id, branch) DO UPDATE SET holder = EXCLUDED.holder, epoch = landing_leases.epoch + 1, \
-         expires_at = EXCLUDED.expires_at WHERE landing_leases.expires_at < {DB_NOW} OR landing_leases.holder = EXCLUDED.holder \
+    let me = &hub.landing.holder;
+    // The probe takes the holder's lock and lets it go in one statement
+    // (on any connection: nothing is kept), only for an unexpired lease of
+    // another holder that holds its lock.
+    let row: Option<(i64, bool, bool)> = sqlx::query_as(&format!(
+        "SELECT epoch, expires_at < {DB_NOW} OR holder = $3, \
+         CASE WHEN lock_epoch = epoch AND expires_at >= {DB_NOW} AND holder <> $3 THEN \
+           CASE WHEN pg_try_advisory_lock($4, (epoch & 2147483647)::int4) THEN pg_advisory_unlock($4, (epoch & 2147483647)::int4) ELSE false END \
+         ELSE false END \
+         FROM landing_leases WHERE project_id = $1 AND branch = $2"
+    ))
+    .bind(project)
+    .bind(branch)
+    .bind(me)
+    .bind(super::lease_lock::branch_key(project, branch))
+    .fetch_optional(&hub.db)
+    .await?;
+    let (current, gone) = match row {
+        None => (0, false),
+        Some((epoch, takeable, gone)) => {
+            if !takeable && !gone {
+                return Ok(None);
+            }
+            (epoch, gone)
+        }
+    };
+    let next = current + 1;
+    let locks = &hub.landing.locks;
+    let locked = locks.lock(&hub.db, project, branch, next).await;
+    let took: std::result::Result<Option<i64>, _> = sqlx::query_scalar(&format!(
+        "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at, lock_epoch) VALUES ($1, $2, $3, $5, {DB_NOW} + $4, CASE WHEN $6 THEN $5 END) \
+         ON CONFLICT (project_id, branch) DO UPDATE SET holder = EXCLUDED.holder, epoch = EXCLUDED.epoch, \
+         expires_at = EXCLUDED.expires_at, lock_epoch = EXCLUDED.lock_epoch WHERE landing_leases.epoch = $5 - 1 \
+         AND (landing_leases.expires_at < {DB_NOW} OR landing_leases.holder = EXCLUDED.holder OR $7) \
          RETURNING epoch"
     ))
     .bind(project)
     .bind(branch)
-    .bind(&hub.landing.holder)
+    .bind(me)
     .bind(LEASE_MS)
+    .bind(next)
+    .bind(locked)
+    .bind(gone)
     .fetch_optional(&hub.db)
-    .await?)
+    .await;
+    if locked && !matches!(took, Ok(Some(_))) {
+        locks.unlock(&hub.db, project, branch, next).await;
+    }
+    Ok(took?)
 }
 
 /// Renew the lease; `false` if it was lost.
@@ -412,6 +453,7 @@ pub(super) async fn run(hub: &Arc<Hub>, project: i64, branch: &str, wake: Arc<No
         return Ok(false);
     }
     let Some(epoch) = take_lease(hub, project, branch).await? else { return Ok(true) };
+    hub.landing.taken.fetch_add(1, Ordering::SeqCst);
     let name: Option<String> = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project).fetch_optional(&hub.db).await?;
     let Some(name) = name else { return Ok(false) };
     let s = Service {
@@ -430,6 +472,8 @@ pub(super) async fn run(hub: &Arc<Hub>, project: i64, branch: &str, wake: Arc<No
         .bind(epoch)
         .execute(&hub.db)
         .await;
+    // Given up (or lost): its lock goes too, so it is never taken over by it later.
+    hub.landing.locks.unlock(&hub.db, project, branch, epoch).await;
     r.map(|_| false)
 }
 
