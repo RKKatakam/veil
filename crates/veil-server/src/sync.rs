@@ -381,14 +381,7 @@ pub(crate) async fn blocking_in<T: Send + 'static>(
         pending,
         staged,
     };
-    let (h, t_q) = (hub.clone(), std::time::Instant::now());
-    tokio::task::spawn_blocking(move || {
-        h.landing.stats.p_blk_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::landing::prof(&h.landing.stats.p_blk_queue_us, t_q);
-        f(&src)
-    })
-    .await
-    .map_err(|e| Error::Other(e.into()))?
+    tokio::task::spawn_blocking(move || f(&src)).await.map_err(|e| Error::Other(e.into()))?
 }
 
 fn without_signature(s: &Snapshot) -> Snapshot {

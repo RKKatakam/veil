@@ -1521,13 +1521,10 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
     drop(fills);
     let (hub, project, viewer, tips, at) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec(), progress.clone());
     tokio::spawn(async move {
-        let t_f = std::time::Instant::now();
-        hub.landing.stats.p_fills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let r = match files {
             true => leased_fill(&hub, &project, &viewer, &key.1, &tips, &at).await,
             false => walk_tips(&hub, &project, &viewer, &tips, false, &at, Some(&hub.query.row_slots)).await.map(|_| ()),
         };
-        crate::landing::prof(&hub.landing.stats.p_fill_us, t_f);
         if let Err(e) = &r {
             eprintln!("veil-server: filling a viewer graph of project {}: {e:?}", project.id);
         }

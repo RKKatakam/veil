@@ -1796,10 +1796,6 @@ fn series_row(cx: &Ctx<'_>, c: &Counters, a: &SeriesPoint, b: &SeriesPoint) -> s
         "pick_statements": stat("landing_pick_statements"),
         "pick_rows": stat("landing_pick_rows"),
         "review_asks": stat("landing_review_asks"),
-        // PROFILE (lateslow): every server counter's change over the interval.
-        "server_delta": b.server.as_ref().and_then(|bs| bs.as_object()).map(|o| {
-            o.keys().filter_map(|k| Some((k.clone(), json!(stat(k)?)))).collect::<serde_json::Map<_, _>>()
-        }),
     })
 }
 

@@ -622,11 +622,7 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
     tokio::spawn(async move {
         let mut branches = branches;
         loop {
-            let t_u = std::time::Instant::now();
-            hub.landing.stats.p_search_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let r = update(&hub, project, Some(branches)).await;
-            crate::landing::prof(&hub.landing.stats.p_search_us, t_u);
-            if let Err(e) = r {
+            if let Err(e) = update(&hub, project, Some(branches)).await {
                 eprintln!("veil-server: indexing project {project} for search: {e:?}");
             }
             let next = {

@@ -384,7 +384,6 @@ struct Plan {
 async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectId, pparent: ObjectId) -> Result<Built> {
     // The caller's tree, as their `vl` would push it.
     let (p, w) = (plan.clone(), who.clone());
-    let t_sh = std::time::Instant::now();
     let shaped = sync::blocking_with(hub, w.project.id, plan.pending.clone(), move |src| {
         let view = w.project.view(&w.viewer);
         let mut pr = Projector::new(src, &view);
@@ -397,7 +396,6 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
         Ok(Shaped { tree, made, entries })
     })
     .await?;
-    crate::landing::prof(&hub.landing.stats.p_b_shape_us, t_sh);
     // The push's checks on it, then the caller's projection.
     let mut overlay = plan.pending.clone();
     overlay.extend(shaped.made.iter().map(|(k, v)| (*k, v.clone())));
@@ -426,13 +424,9 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
         };
         let mut known = p.uploaded.clone();
         known.extend(src.pending.keys().copied());
-        let t_cs = std::time::Instant::now();
         let (real_id, real, raw) = complete_signed(src, &w, &known, n, parent, &hub2.identity)?;
-        crate::landing::prof(&hub2.landing.stats.p_b_complete_us, t_cs);
-        let t_po = std::time::Instant::now();
         let view = w.project.view(&w.viewer);
         let (mine, mine_raw) = sync::project_one(src, &view, real_id, &real, vec![pparent], p.ppredecessors.clone(), vec![], None, &hub2.identity)?;
-        crate::landing::prof(&hub2.landing.stats.p_b_project_us, t_po);
         // What the full tree holds of what this change made: the blobs, and
         // the trees of the caller's that are the full tree's (all of them
         // for someone who sees everything there; the graft stored its own).
@@ -1100,8 +1094,6 @@ pub(crate) async fn create_with(
     if req.edits.iter().any(|e| !viewer.within_narrowing(&e.path)) {
         return Err(sync::agent_refusal(sync::NARROWED_WRITE));
     }
-    let st = &hub.landing.stats;
-    let t_c = std::time::Instant::now();
     let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     // Uploads are staged (S28): read into memory with what the change makes,
     // stored only once every check passed (BUG-930).
@@ -1135,7 +1127,6 @@ pub(crate) async fn create_with(
             return Err(bad(format!("cannot land work built on unreleased embargo {eid} onto '{}'", q.branch)));
         }
     }
-    crate::landing::prof(&st.p_c_base_us, t_c);
     let base_proj = if req.base == ObjectId([0; 32]) {
         sync::projected(hub, project, viewer, base_real).await?
     } else {
@@ -1240,9 +1231,7 @@ pub(crate) async fn create_with(
                 }
             }
         }
-        let t_b = std::time::Instant::now();
         let built = build(hub, &plan, &who, parent, pparent).await?;
-        crate::landing::prof(&st.p_c_build_us, t_b);
         // The one rule of every tip an agent session sets (`sync::agent_tip`):
         // for a narrowed one, anything outside its paths first (a stack of
         // its person's own changes may hold more); then the files that decide
@@ -1256,10 +1245,7 @@ pub(crate) async fn create_with(
             _ => None,
         };
         // Stored before anything reads them (a landing's stack may).
-        let t_p = std::time::Instant::now();
         sync::put_all(hub, project.id, built.store.clone()).await?;
-        crate::landing::prof(&st.p_c_put_us, t_p);
-        let t_s = std::time::Instant::now();
         // A landing of edits: the stack is the submitter's history from the
         // branch up to this one, as for a pushed snapshot (BUG-1112).
         if let Some((_, q)) = land.as_mut() {
@@ -1304,7 +1290,6 @@ pub(crate) async fn create_with(
                 first.review = Some(claim);
             }
         }
-        crate::landing::prof(&st.p_c_stack_us, t_s);
         // The branch rules: a move of the default branch changes them only
         // for an admin, judged against its tip (BUG-1102).
         let rules_moved = match cur {
@@ -1375,10 +1360,7 @@ pub(crate) async fn create_with(
             },
             _ => None,
         };
-        let t_m = std::time::Instant::now();
-        let committed = commit(hub, &plan, &who, &built, &restacked, person.id, gc_epoch, mv, land.as_ref(), base_embargo.as_deref()).await;
-        crate::landing::prof(&st.p_c_commit_us, t_m);
-        match committed {
+        match commit(hub, &plan, &who, &built, &restacked, person.id, gc_epoch, mv, land.as_ref(), base_embargo.as_deref()).await {
             Ok(m) => break (built, m),
             // The tip moved during the request: try again on the new one,
             // with the access as it is now (BUG-1051).

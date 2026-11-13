@@ -126,11 +126,7 @@ impl BlobStore for FsStore {
             return Ok(());
         }
         let dir = path.parent().expect("keys have a directory").to_path_buf();
-        let t_q = std::time::Instant::now();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            PUT_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            PUT_QUEUE_US.fetch_add(t_q.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            let _t = PutTimer(std::time::Instant::now());
             use std::io::Write;
             std::fs::create_dir_all(&dir)?;
             let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
@@ -2220,17 +2216,5 @@ mod tests {
         })
         .await
         .unwrap();
-    }
-}
-
-/// PROFILE (lateslow): local puts, their wait for a blocking thread, and
-/// their time on it.
-pub static PUT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static PUT_QUEUE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static PUT_RUN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-struct PutTimer(std::time::Instant);
-impl Drop for PutTimer {
-    fn drop(&mut self) {
-        PUT_RUN_US.fetch_add(self.0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }

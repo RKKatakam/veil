@@ -392,29 +392,20 @@ pub async fn landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Res
     let stats = tokio::spawn(async move { locked_landing(&hub2, project, branches).await })
         .await
         .map_err(|e| Error::Other(e.into()))??;
-    let st = &hub.landing.stats;
-    st.p_derive_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    st.p_derive_snapshots.fetch_add(stats.snapshots as u64, std::sync::atomic::Ordering::Relaxed);
-    let t_prs = std::time::Instant::now();
     // The project's record of its last valid `.veilrules` (S21, BUG-1259),
     // kept current at each landing on the default branch; a failure here is
     // only a longer walk at the next PR request.
     if let Err(e) = crate::prs::landed(hub, project, &moved).await {
         eprintln!("veil-server: recording the review rules of project {project}: {e:?}");
     }
-    crate::landing::prof(&st.p_derive_prs_us, t_prs);
     Ok(stats)
 }
 
 async fn locked_landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Result<Stats> {
     let key = LOCK_BASE ^ project;
     let deadline = tokio::time::Instant::now() + LOCK_WAIT;
-    let st = &hub.landing.stats;
-    let t_lock = std::time::Instant::now();
     let (permit, mut c) = loop {
-        let t_turn = std::time::Instant::now();
         hub.limits.derive_turn().await;
-        crate::landing::prof(&st.p_derive_turn_us, t_turn);
         let permit = hub.derive.permit().await?;
         let mut c = hub.derive.db.acquire().await?;
         let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(key).fetch_one(&mut *c).await?;
@@ -430,17 +421,13 @@ async fn locked_landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> 
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    crate::landing::prof(&st.p_derive_lock_us, t_lock);
     let cx = cx(hub, project);
     let scope = Scope::Branches(branches);
-    let t_prep = std::time::Instant::now();
     let prep = tokio::task::spawn_blocking(move || deriving(|| prepare_landing_run(&cx, scope)))
         .await
         .map_err(|e| Error::Other(e.into()));
-    crate::landing::prof(&st.p_derive_prep_us, t_prep);
-    let t_fin = std::time::Instant::now();
     let r = match prep {
-        Ok(Ok(p)) => finish_landing_run(hub, project, p).await.inspect(|_| crate::landing::prof(&st.p_derive_finish_us, t_fin)),
+        Ok(Ok(p)) => finish_landing_run(hub, project, p).await,
         Ok(Err(e)) => Err(e),
         Err(e) => Err(e),
     };
@@ -528,9 +515,6 @@ fn prepare_landing_run(cx: &Cx, scope: Scope) -> Result<PreparedLanding> {
 async fn finish_landing_run(hub: &Arc<Hub>, project: i64, p: PreparedLanding) -> Result<Stats> {
     let view_info = viewers_of(hub, project).await?;
     let small = p.writes.history.len() <= 64 && p.writes.graph.len() <= 16;
-    if !small {
-        hub.landing.stats.p_derive_big.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
     let memo = match (&view_info, small) {
         (Some((proj, viewers)), true) => crate::query::graph::prepare_memo(hub, proj, viewers.clone(), &p.tip_oids).await?,
         (Some((_, viewers)), false) => crate::query::graph::PreparedMemo {
@@ -1010,17 +994,14 @@ impl<'a> Batch<'a> {
             if expanded.contains(&x) {
                 continue;
             }
-            let t_w = std::time::Instant::now();
             if !absent.contains(&x) {
                 self.ask_rows(x, &mut absent)?;
             }
             if !absent.contains(&x) && self.graph.row(&x)?.is_some() {
                 done.insert(x);
-                crate::landing::prof(&self.cx.hub().landing.stats.p_d_walk_us, t_w);
                 continue;
             }
             let s = self.cx.src.snapshot(&x)?;
-            crate::landing::prof(&self.cx.hub().landing.stats.p_d_walk_us, t_w);
             expanded.insert(x);
             stack.push((x, true));
             for p in s.parents.iter().rev() {
@@ -1139,9 +1120,7 @@ impl<'a> Batch<'a> {
         if row.flags & FLAG_EMBARGO_LINE != 0 {
             row.changed = Some(WITHHELD.into());
         } else {
-            let t_tc = std::time::Instant::now();
             let (ch, dirs) = self.tree_changes(x, &s.parents)?;
-            crate::landing::prof(&self.cx.hub().landing.stats.p_d_tree_us, t_tc);
             for k in self.keys_of(&ch, &dirs) {
                 self.writes.rules.push((k, row.generation, hex.clone()));
             }
@@ -1162,14 +1141,10 @@ impl<'a> Batch<'a> {
                 if ch.len() + dirs.len() > changes::MAX_PATHS {
                     row.changed = Some(MANY.into());
                 } else {
-                    let t_so = std::time::Instant::now();
                     let (from, capped, similar) = changes::sources(src, &ch)?;
-                    crate::landing::prof(&self.cx.hub().landing.stats.p_d_sources_us, t_so);
-                    let t_lc = std::time::Instant::now();
                     let wants: Vec<(String, ObjectId)> =
                         ch.iter().flat_map(|c| s.parents.iter().map(move |p| (c.path.clone(), *p))).collect();
                     let mut prevs = self.last_changes(&wants)?.into_iter();
-                    crate::landing::prof(&self.cx.hub().landing.stats.p_d_last_us, t_lc);
                     let mut paths = Vec::with_capacity(ch.len());
                     for ((c, from), capped) in ch.into_iter().zip(from).zip(capped) {
                         paths.push(PathChange {
@@ -1330,8 +1305,6 @@ impl<'a> Batch<'a> {
 
     fn flush_with_progress(&mut self, progress: Option<(&[String], &[String])>) -> Result<()> {
         let cx = self.cx;
-        let t_fl = std::time::Instant::now();
-        let _t = Timer(&cx.hub().landing.stats.p_d_flush_us, t_fl);
         let mut w = std::mem::take(&mut self.writes);
         let objects = std::mem::take(&mut w.objects);
         upload_objects(&cx.src.rt, cx.hub(), cx.project(), objects)?;
@@ -1356,14 +1329,6 @@ impl<'a> Batch<'a> {
         self.history.clear();
         self.ahead_history.clear();
         Ok(())
-    }
-}
-
-/// PROFILE (lateslow): adds its time when dropped.
-struct Timer<'a>(&'a std::sync::atomic::AtomicU64, std::time::Instant);
-impl Drop for Timer<'_> {
-    fn drop(&mut self) {
-        crate::landing::prof(self.0, self.1);
     }
 }
 
