@@ -283,25 +283,63 @@ pub fn one_line(repo: &Repo, id: &ObjectId) -> String {
 /// scanner quarantined, which no snapshot has; success otherwise
 /// (BUG-2140: a script that commits and pushes must notice).
 pub fn quarantine_status(r: &BuildReport, done: &str) -> ExitCode {
-    if r.quarantined.is_empty() {
+    let files = left_out(r, false);
+    if files.is_empty() {
         return ExitCode::SUCCESS;
     }
-    let n = r.quarantined.len();
-    let (files, look) = if n == 1 { ("file", "it looks") } else { ("files", "they look") };
+    print_left_out(
+        &files,
+        done,
+        "to keep a file on this machine on purpose, `vl isolate <file>`; if it is not a secret, `vl expose --force <file>` records it",
+        true,
+    );
+    ExitCode::from(QUARANTINE_STATUS)
+}
+
+/// A file a recording left out because the scanner took it for a secret.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct LeftOut {
+    pub path: VPath,
+    rule: String,
+    line: usize,
+    held: bool,
+}
+
+/// The files `r`'s recording left out as secrets. `skip_injected`: not a
+/// copy of a secret injected into a sandbox, which the sandbox's cleanup
+/// takes out (`vl ws exec --with-isolated`): nothing of the command's own.
+pub fn left_out(r: &BuildReport, skip_injected: bool) -> Vec<LeftOut> {
+    r.quarantined
+        .iter()
+        .filter(|(_, f)| !(skip_injected && f.iter().any(|f| f.rule == veil_core::builder::INJECTED_RULE)))
+        .map(|(p, f)| LeftOut {
+            path: p.clone(),
+            rule: f.first().map_or_else(|| "secret".to_string(), |f| f.rule.to_string()),
+            line: f.first().map_or(0, |f| f.line),
+            held: r.quarantine_kept.contains(p),
+        })
+        .collect()
+}
+
+/// `error: DONE, but without N quarantined file(s) …`, a line per file and
+/// `hint: HINT` (with `until`, `. Exit status 3 until then`): the message of
+/// every command a quarantine makes exit [`QUARANTINE_STATUS`].
+pub fn print_left_out(files: &[LeftOut], done: &str, hint: &str, until: bool) {
+    let n = files.len();
+    let (noun, look) = if n == 1 { ("file", "it looks") } else { ("files", "they look") };
     err_line(format_args!(
-        "{} {done}, but without {n} quarantined {files} ({look} like a secret):",
+        "{} {done}, but without {n} quarantined {noun} ({look} like a secret):",
         red("error:")
     ));
-    for (p, findings) in &r.quarantined {
-        let f = &findings[0];
-        let state = if r.quarantine_kept.contains(p) { "edit held back" } else { "never recorded" };
-        err_line(format_args!("  {} ({} at line {}; {state})", safe(p.as_str()), f.rule, f.line));
+    for f in files {
+        let state = if f.held { "edit held back" } else { "never recorded" };
+        err_line(format_args!("  {} ({} at line {}; {state})", safe(f.path.as_str()), f.rule, f.line));
     }
-    err_line(format_args!(
-        "{} to keep a file on this machine on purpose, `vl isolate <file>`; if it is not a secret, `vl expose --force <file>` records it. Exit status {QUARANTINE_STATUS} until then",
-        yellow("hint:")
-    ));
-    ExitCode::from(QUARANTINE_STATUS)
+    let until = match until {
+        true => format!(". Exit status {QUARANTINE_STATUS} until then"),
+        false => String::new(),
+    };
+    err_line(format_args!("{} {hint}{until}", yellow("hint:")));
 }
 
 pub fn print_build_warnings(r: &BuildReport) {

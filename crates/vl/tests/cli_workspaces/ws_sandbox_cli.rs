@@ -384,21 +384,111 @@ fn ws_exec_of_dot_named_workspaces_stays_inside_the_sandboxes_directory() {
 }
 
 // BUG-2171: a `vl ws exec` whose command succeeded but whose recording left
-// a file out as a secret looks like a plain success (exit 0), as `vl commit`
-// did before BUG-2140; with --ephemeral the file goes with the throwaway
-// directory. The command's own failure keeps its status.
+// a file out as a secret exits 3, as `vl commit` does (BUG-2140), naming
+// the file; with --ephemeral the file is moved out of the throwaway
+// directory first, never deleted. The command's own failure keeps its
+// status, with the same message.
+const LEAK: &str = "echo \"const key = 'AKIAIOSFODNN7EXAMPLE';\" > cfg.js";
+const LEFT_OUT: &str = "  cfg.js (aws-access-key-id at line 1; never recorded)";
+
+fn recorded_id(out: &str) -> String {
+    out.lines()
+        .find_map(|l| l.strip_prefix("Recorded "))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no Recorded line:\n{out}"))
+        .to_string()
+}
+
+/// The one `cfg.js` an `--ephemeral` run kept, and its directory.
+fn kept_file(proj: &Path) -> PathBuf {
+    let dirs: Vec<PathBuf> = std::fs::read_dir(proj.join(".veil/local/ephemeral-kept")).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    dirs[0].join("cfg.js")
+}
+
 #[test]
-#[ignore = "BUG-2171: vl ws exec exits 0 when its recording quarantined a file the command wrote"]
 fn bug_2171_ws_exec_that_quarantines_an_output_file_exits_3() {
     let env = Env::new();
     let proj = project(&env);
-    let leak = "echo \"const key = 'AKIAIOSFODNN7EXAMPLE';\" > cfg.js";
-    for args in [vec!["ws", "exec", "agent", "--", "sh", "-c", leak], vec!["ws", "exec", "--ephemeral", "--", "sh", "-c", leak]] {
-        let out = env.vl("alice", &proj, &args);
-        assert_eq!(out.status.code(), Some(3), "vl {args:?}:\n{}", text(&out));
-        assert!(text(&out).contains("  cfg.js (aws-access-key-id at line 1; never recorded)"), "{}", text(&out));
-    }
-    // A failing command keeps its own status.
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", LEAK]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(3), "{t}");
+    assert!(t.contains("error: recorded, but without 1 quarantined file (it looks like a secret):"), "{t}");
+    assert!(t.contains(LEFT_OUT), "{t}");
+    assert!(t.contains("vl ws switch agent") && t.contains("Exit status 3 until then"), "{t}");
+    // The file stays in the sandbox, where the message says, and in no snapshot.
+    let files = files_dir(&proj, "agent");
+    assert!(t.contains(&files.display().to_string()), "{t}");
+    assert!(read(&files, "cfg.js").contains("AKIAIOSFODNN7EXAMPLE"));
+    let o = env.vl("alice", &proj, &["ws", "cat", "agent", "cfg.js"]);
+    assert!(!o.status.success(), "cfg.js was recorded:\n{}", text(&o));
+
+    // A failing command keeps its own status; the message is printed all the same.
     let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", "exit 7"]);
-    assert_eq!(out.status.code(), Some(7), "{}", text(&out));
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(7), "{t}");
+    assert!(t.contains(LEFT_OUT), "{t}");
+    assert!(!t.contains("Exit status 3"), "{t}");
+
+    // Isolated in that workspace, the file is kept on purpose: exit 0.
+    env.ok("alice", &proj, &["ws", "switch", "agent"]);
+    env.ok("alice", &proj, &["isolate", "cfg.js"]);
+    env.ok("alice", &proj, &["ws", "switch", "default"]);
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "true"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(!t.contains("quarantined file"), "{t}");
+    assert!(read(&files, "cfg.js").contains("AKIAIOSFODNN7EXAMPLE"));
+}
+
+#[test]
+fn ephemeral_ws_exec_keeps_a_quarantined_file_and_exits_3() {
+    let env = Env::new();
+    let proj = project(&env);
+    let leak = format!("{LEAK}; chmod 640 cfg.js; echo ok > ok.txt");
+    let out = env.vl("alice", &proj, &["ws", "exec", "--ephemeral", "-r", "@-", "--", "sh", "-c", &leak]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(3), "{t}");
+    assert!(t.contains("error: recorded, but without 1 quarantined file (it looks like a secret):"), "{t}");
+    assert!(t.contains(LEFT_OUT), "{t}");
+    assert!(!t.contains("Exit status 3"), "{t}");
+    // Kept where the message says, with its permissions.
+    let kept = kept_file(&proj);
+    assert!(t.contains(&kept.parent().unwrap().display().to_string()), "{t}");
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "const key = 'AKIAIOSFODNN7EXAMPLE';\n");
+    assert_eq!(std::fs::metadata(&kept).unwrap().mode() & 0o777, 0o640);
+    assert_eq!(std::fs::metadata(kept.parent().unwrap()).unwrap().mode() & 0o777, 0o700);
+
+    // The change has the rest, not the file; neither does a push of it.
+    let id = recorded_id(&t);
+    assert_eq!(env.stdout("alice", &proj, &["cat", "-r", &id, "ok.txt"]), "ok\n");
+    let o = env.vl("alice", &proj, &["cat", "-r", &id, "cfg.js"]);
+    assert!(!o.status.success(), "cfg.js was recorded:\n{}", text(&o));
+    // The main working copy holds no quarantined file: its own commands exit 0.
+    let st = env.ok("alice", &proj, &["status"]);
+    assert!(!st.contains("cfg.js"), "{st}");
+    env.ok("alice", &proj, &["tag", "set", "main", "-r", &id]);
+    let remote = env.dir("remote");
+    env.ok("alice", &proj, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    env.ok("alice", &proj, &["push", "origin"]);
+    env.ok("bob", &env.root, &["clone", "remote", "bob"]);
+    let bob = env.root.join("bob");
+    assert_eq!(read(&bob, "ok.txt"), "ok\n");
+    assert!(!bob.join("cfg.js").exists());
+    assert!(!env.ok("bob", &bob, &["files", "-r", "main"]).contains("cfg.js"));
+    // `vl doctor` lists the kept directory.
+    let d = env.vl("alice", &proj, &["doctor"]);
+    assert!(text(&d).contains(&kept.parent().unwrap().display().to_string()), "{}", text(&d));
+}
+
+#[test]
+fn ephemeral_ws_exec_whose_command_fails_keeps_its_status_and_the_file() {
+    let env = Env::new();
+    let proj = project(&env);
+    let leak = format!("{LEAK}; exit 7");
+    let out = env.vl("alice", &proj, &["ws", "exec", "--ephemeral", "--", "sh", "-c", &leak]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(7), "{t}");
+    assert!(t.contains(LEFT_OUT), "{t}");
+    assert!(std::fs::read_to_string(kept_file(&proj)).unwrap().contains("AKIAIOSFODNN7EXAMPLE"));
 }
