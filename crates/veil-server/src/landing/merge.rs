@@ -375,12 +375,19 @@ pub(super) fn merge_onto(
             return Ok(None);
         }
         let oe = sync::entry_at(src, &chain_tree, &c.path)?;
-        // Deleted on the tip too: nothing to merge (BUG-2060).
-        if c.new.is_none() && oe.is_none() {
+        // Deleted on the tip too, or replaced there by a folder: the file
+        // is gone on both sides, nothing to merge (BUG-2060, BUG-2070).
+        if c.new.is_none() && oe.as_ref().is_none_or(|e| e.kind == EntryKind::Dir) {
             continue;
         }
         let Some(te) = &c.new else { return Ok(None) };
         let Some(oe) = oe else { return Ok(None) };
+        // The tip has this version of the path already (the same edit on
+        // both sides): no edit, whatever the file, a binary, `-merge` or
+        // over-cap one among them (BUG-2070).
+        if oe.same_content(te) {
+            continue;
+        }
         let be = sync::entry_at(src, &parent_tree, &c.path)?;
         out.read += (oe.size + te.size + be.as_ref().map_or(0, |b| b.size)) as usize;
         let Some((merged, blob)) = merge_entry_bytes(src, &attrs, &c.path, be.as_ref(), &oe, te)? else { return Ok(None) };

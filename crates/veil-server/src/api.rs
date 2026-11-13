@@ -1031,8 +1031,14 @@ pub async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, 
             // names this group, never the person who signed up under its
             // name, nor a deleted group of that name.
             let gid = group_id(c, pid, &g).await?;
+            // A line naming a person of this name names the group now: that
+            // person loses what it gave them (BUG-2111). The review gate,
+            // before the project's row (lock order).
+            crate::prs::close_review_gate(&mut *c, pid).await?;
+            // NO KEY UPDATE: a transaction waiting for the gate may hold
+            // the row KEY SHARE (a foreign key's check: BUG-2130).
             let text: String =
-                sqlx::query_scalar("SELECT policy_bindings FROM projects WHERE id = $1 FOR UPDATE").bind(pid).fetch_one(&mut *c).await?;
+                sqlx::query_scalar("SELECT policy_bindings FROM projects WHERE id = $1 FOR NO KEY UPDATE").bind(pid).fetch_one(&mut *c).await?;
             let mut bindings: std::collections::BTreeMap<String, Binding> = serde_json::from_str(&text).unwrap_or_default();
             if let Some(b) = bindings.get_mut(&g) {
                 *b = Binding::Group(gid);
@@ -1061,6 +1067,8 @@ pub async fn delete_group(State(hub): State<HubState>, caller: Caller, Path((p, 
         Box::pin(async move {
             let info = group_info(c, pid, &g).await?;
             let id = group_id(c, pid, &g).await?;
+            // Its people lose what it gave them (BUG-2111).
+            crate::prs::close_review_gate(&mut *c, pid).await?;
             for t in [
                 "DELETE FROM group_members WHERE group_id = $1",
                 "DELETE FROM group_managers WHERE group_id = $1",
@@ -1143,6 +1151,11 @@ async fn change_group(hub: HubState, caller: Caller, p: String, g: String, op: O
                 }
                 _ => {}
             }
+            if op == Op::RemoveMember {
+                // An approval counts while its reviewer may write the PR's
+                // paths: ordered against every landing batch (BUG-2111).
+                crate::prs::close_review_gate(&mut *c, pid).await?;
+            }
             for (_, id) in &ids {
                 let q = match op {
                     Op::AddMember => "INSERT INTO group_members (group_id, person_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -1203,7 +1216,14 @@ async fn change_admins(hub: HubState, caller: Caller, p: String, add: bool, req:
     let info = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let people = people.clone();
         Box::pin(async move {
-            let _: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+            if !add {
+                // An admin's approval counts on every path (BUG-2111): the
+                // review gate, before the project's row (lock order).
+                crate::prs::close_review_gate(&mut *c, pid).await?;
+            }
+            // NO KEY UPDATE: a push waiting for the gate holds the row KEY
+            // SHARE (its rows' foreign keys: BUG-2130).
+            let _: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE id = $1 FOR NO KEY UPDATE")
                 .bind(pid)
                 .fetch_one(&mut *c)
                 .await?;

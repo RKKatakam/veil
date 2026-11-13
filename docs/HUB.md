@@ -5458,6 +5458,79 @@ transaction per landing instead of 23.
    treated as before, and when the backlog is under 2 s landings wait for
    a place again. One person's flood holds another person's landing back
    no longer than the gate's order did: both come in as places free.
+12. **The review gate and the landing's lock order** (`prs/review_gate.rs`,
+   BUG-1886, BUG-2061, BUG-2110, BUG-2111). Every landing meets the review
+   rules, holds and approvals in force when it commits. The gate is a
+   per-project transaction-scoped advisory lock: every batch with a
+   person's entry takes it **shared** right after its branch row's
+   compare-and-swap, before it reads again anything the review rules come
+   from (the default branch's tip and `pr_review_rules`, the reverts,
+   `prs`, `pr_reviews`, `pr_holds`, and what decides whether an approval
+   counts: the project's access policy and epoch, the reviewer's groups and
+   admin rights, the embargo's groups); everything that changes those takes
+   it **exclusively** (`close_review_gate`): a verdict and the holds it
+   places, and a PR's new revision (first, after the GC guard); closing a
+   PR; a group member removed, a group deleted or created (a line naming a
+   person of that name names the group from then on), an admin's rights
+   removed (first, before the project's row); a landing of the default
+   branch whose rules record changes or that accepts or changes the access
+   policy (`prs::state::record_landing` answers whether the rules record
+   does: the push takes the gate last, once it has written everything but
+   the project's row, which it writes after; a commit through the API
+   after its branch row, before the project's row; the default branch's
+   own batch instead of taking it shared); an embargo's release moving its
+   holds into `pr_holds` and retargeting its PRs (`finish_release`, after
+   the line's row); and a revert recorded as landed
+   (`bisect::record_revert_landed`). Such a write commits before a batch
+   reads (the batch refuses what no longer meets the rules and is built
+   again) or waits for the batch's commit: that is all correctness rests
+   on, on both databases.
+   **No writer is starved, on either database (BUG-2110).** YugabyteDB
+   (2025.2) grants a shared request past a waiting exclusive one, so with
+   batches on several branches overlapping, a writer waited as long as
+   they did (by hand: 6.7 s, the whole time three loops of overlapping
+   150 ms shared holds ran; PostgreSQL queues them: 0.65 s). Now a writer
+   first **announces** itself: a row in `review_writers` (migration 43)
+   committed on its own, on another connection of the
+   `db::transaction`'s pool, and its transaction then takes its own
+   advisory lock (key `-id`: below zero, so no other lock's, whose keys
+   are a positive base XOR a project; BUG-2133) and the gate. A batch takes the gate in one statement only
+   if no writer of its project is announced in that statement's snapshot;
+   if one is, it takes nothing, rolls back, waits outside any transaction
+   for the writers it found (polling, at most 1 s, then it goes in
+   anyway: the gate keeps it right), and runs its transaction again
+   without looking at writers announced since (they wait for it). Once a
+   writer's row is committed only the batches that looked before can still
+   ask for the gate, each once: a writer waits at most for the batches
+   already committing, and a batch at most for the writers announced
+   before it looked, so a stream of writers does not starve batches
+   either. (A batch that waited its 1 s asks too, ignoring the writer:
+   so the bound holds while batches hold the gate under 1 s, as they do
+   but for a slow store, waited for at most half a lease, 1 s, inside.) Neither relies on how the database queues lock requests (by
+   hand on YugabyteDB with the same three loops running the batches' ask:
+   the writer got the gate 0.63 s after it asked, when the batch already
+   in ended). `db::transaction` deletes a writer's row when its attempt
+   ends, committed or not, and a task deletes it when the attempt is
+   dropped (its client went away, the deadline, a panic: BUG-2132); a row left by a server that stopped is removed
+   by the batch waiting for it once it is 2 s old and its writer's lock is
+   free. Writers wait for one another on the gate as before (an exclusive
+   lock among writers only).
+   Every transaction takes its locks in this order: the GC guard
+   (`pack_gc::guard_root_write`), the landing lease's row, branch rows, the
+   review gate, then the rows it writes (queue rows, PRs, snapshots, the
+   project's row); nothing that holds the gate waits for a lease or a
+   branch row, so no cycle is possible through them. A transaction that
+   waits for the gate may hold the project's row `KEY SHARE` (its rows'
+   foreign keys), so one holding the gate locks that row `FOR NO KEY
+   UPDATE`, never `FOR UPDATE` (an admin's removal, a group's creation:
+   BUG-2130). (A release locks its
+   line's record, `embargo_lines`, before the line's branch row, as it did
+   before the gate; the push therefore takes the gate after its own
+   writes, an embargo's record among them. `Storing` is waited for last,
+   holding these, for at most half a lease, and the store takes none of
+   them; item 11's places are in memory, taken before any transaction. A
+   writer's announcement takes no lock anyone holds.) Batches do not wait
+   for one another.
 
 **Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
 `concurrency.rs`, unit tests in `limits/landing.rs`):
@@ -5478,6 +5551,10 @@ transaction per landing instead of 23.
 | 12 | A batch read on several threads is the batch built on one, byte for byte (BUG-1955) | Three seeded batches of 90 submits by two people (new files, overlapping edits of one shared file, two changes adding one path): the same objects, snapshots, landings, memos, tip and answers, with at least one merge and one conflict each; the service then lands what the one-thread build said | `landing_hold::bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one` |
 | 13 | A batch commits only once its objects are stored (BUG-1955) | With the store's folders unwritable, three held landings stay queued and the branch keeps its tip for 3 s; once writable, all three land and their files read back at the new tip | `landing_hold::bug_1955_a_batch_lands_only_once_its_objects_are_stored` |
 | 14 | Behind 2 s of landings waiting in a gate, a new landing is answered at once; those waiting keep their places and get in; pulls still wait; with no backlog landings wait again (BUG-1955) | a gate of one place held, two landings and a pull waiting: after 2 s a third landing is refused without waiting, the gate's load is (1 running, 3 waiting), and all three get in once the place is free | `limits::gate::tests::a_landing_behind_a_long_backlog_is_told_at_once` |
+| 15 | Every landing meets the review rules and holds in force when it commits: a tighter `.veilrules` on the default branch, or an embargo's release moving a hold into `pr_holds`, answered while a batch on another protected branch commits, is never overtaken by it (BUG-2061) | the batch held after its review check, at its entry's row: the rules push and the release wait for it (the change lands, under the rules it was read under), then are answered; the next such change is refused `not_ready` | `rv_core2::bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits`, `rv_core2::bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them` |
+| 16 | Every landing meets the approvals that count when it commits: a reviewer's access taken away (here: out of the group that writes the PR's paths), answered while the batch that counted the approval commits, is never overtaken by it (BUG-2111) | the batch held after its review check, at its entry's row: the removal waits for it (the change lands, counted as it was read), then is answered | `rv_core2::bug_2111_a_reviewer_removed_while_the_batch_commits_does_not_approve_it` |
+| 17 | A writer of the review rules waits only for the batches already holding the gate, on PostgreSQL and YugabyteDB: a batch that asks after it leaves the gate to it, and a writer that went away holds no landing back (BUG-2110) | a batch's ask after the verdict's finds the verdict announced and takes nothing; once the batch before ends the verdict is written within 5 s, its row gone; three loops of stand-in batches overlapping without end (150 ms holds, 50 ms apart): three verdicts each answered in under 2 s, the batches going on meanwhile; a stale row whose lock is free is removed by the batch, which lands | `rv_core2::bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate`, `rv_core2::bug_2110_writers_are_answered_in_bounded_time_while_batches_overlap_without_end`, `rv_core2::bug_2110_a_writer_that_went_away_does_not_stop_landings` |
+| 18 | The review gate's writers neither deadlock nor leak (BUG-2130 to BUG-2133): one lock order with the project's row; no pool deadlock from the announcement's connection; an announcement goes with its dropped request; a writer's own lock is no other lock | a policy push and an admin's removal queued behind a stand-in batch never wait for each other, both answered; 16 removals filling the pool, freed at once, answered within 0.2 s (before: `503` after 30 s); a verdict whose client gave up leaves no row; no writer id up to 10^6 has another lock's key | `rv_core2::bug_2130_a_policy_push_and_an_admin_removal_take_the_gate_in_one_order`, `rv_core2::bug_2131_writers_filling_the_pool_are_answered`, `rv_core2::bug_2132_a_writer_whose_request_is_dropped_leaves_no_announcement`, `prs::review_gate::tests::a_writers_key_is_no_projects_review_gate` |
 
 ### 13.36 S20: automatic bisect and revert (built)
 

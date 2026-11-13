@@ -697,7 +697,13 @@ async fn commit(
                     crate::landing::record_changes(&mut *c, pid, branch, lineage, &on_branch.0, &on_branch.1, &on_branch.2).await?;
                 }
                 moved = Some(rows == 1);
-                if rows == 1 {
+                let mut gate = false;
+                if rows == 1 && (accept.is_some() || policy_text_update.is_some()) {
+                    // A new access policy (an approval counts while its
+                    // reviewer may write the PR's paths: BUG-2111): the
+                    // review gate, exclusively, before the project's row
+                    // (lock order, BUG-2130).
+                    crate::prs::close_review_gate(&mut *c, pid).await?;
                     if let Some(text) = &accept {
                         crate::perm::accept_policy(&mut *c, pid, text).await?;
                     } else if let Some(text) = &policy_text_update {
@@ -709,7 +715,13 @@ async fn commit(
                     }
                 }
                 if let (1, Some(l)) = (rows, &rules_landing) {
-                    crate::prs::state::record_landing(&mut *c, pid, l).await?;
+                    gate = crate::prs::state::record_landing(&mut *c, pid, l).await?;
+                }
+                if gate {
+                    // New review rules (BUG-2061): the review gate,
+                    // exclusively, after the branch row (again, if the
+                    // policy took it).
+                    crate::prs::close_review_gate(&mut *c, pid).await?;
                 }
             }
             let mut memos = Vec::new();

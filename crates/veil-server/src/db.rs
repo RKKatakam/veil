@@ -74,6 +74,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (35, "bisect_revert_patch", include_str!("../migrations/0035_bisect_revert_patch.sql")),
     (36, "landing_slots", include_str!("../migrations/0036_landing_slots.sql")),
     (37, "landing_served", include_str!("../migrations/0037_landing_served.sql")),
+    (43, "review_writers", include_str!("../migrations/0043_review_writers.sql")),
 ];
 
 pub async fn connect(url: &str, max: u32) -> anyhow::Result<PgPool> {
@@ -310,7 +311,9 @@ where
                 }
             }
         };
-        let r = match tokio::time::timeout_at(deadline, once).await {
+        // The review gate's writers this attempt announced are removed when
+        // it ends, committed or not (BUG-2110, `prs::review_gate`).
+        let r = match tokio::time::timeout_at(deadline, crate::prs::review_gate::scoped(pool, once)).await {
             Ok(r) => r,
             Err(_) => return Err(Error::busy()),
         };

@@ -113,6 +113,39 @@ async fn wait_for_sql_lock(db: &sqlx::PgPool, query_like: &str, msg: &str) {
     }
 }
 
+/// The backend pid of the connection `c` (for [`wait_blocked_by`]).
+async fn backend_pid(c: &mut sqlx::PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(c).await.unwrap()
+}
+
+/// Wait until a statement matching `query_like` waits on a lock that the
+/// backend `blocker` holds, and answer its backend pid: this test's
+/// statement, not another test's running at once (`wait_for_sql_lock` looks
+/// at the whole database). YugabyteDB does not report it: as
+/// `wait_for_sql_lock` there, answering 0.
+async fn wait_blocked_by(db: &sqlx::PgPool, blocker: i32, query_like: &str, msg: &str) -> i32 {
+    if is_yugabyte(db).await {
+        wait_for_sql_lock(db, query_like, msg).await;
+        return 0;
+    }
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: Option<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND query LIKE $1 AND $2 = ANY(pg_blocking_pids(pid)) LIMIT 1",
+        )
+        .bind(query_like)
+        .bind(blocker)
+        .fetch_optional(db)
+        .await
+        .unwrap();
+        if let Some(pid) = waiting {
+            return pid;
+        }
+        assert!(Instant::now() < until, "{msg}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 struct TxGuard<'a>(&'a tokio::runtime::Runtime, Option<sqlx::Transaction<'static, sqlx::Postgres>>);
 
 impl TxGuard<'_> {
@@ -440,8 +473,9 @@ fn bug_1886_an_approval_withdrawn_while_the_batch_commits_waits_for_the_batch() 
     th.rt
         .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
         .unwrap();
+    let held_pid = th.rt.block_on(backend_pid(&mut held));
     release_lease(&th, pid, "main");
-    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
+    let batch_pid = th.rt.block_on(wait_blocked_by(&h.db, held_pid, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
 
     // Its reviewer takes the approval back: the verdict waits for the batch
     // that read the approval.
@@ -452,7 +486,7 @@ fn bug_1886_an_approval_withdrawn_while_the_batch_commits_waits_for_the_batch() 
             withdrawn.store(true, Ordering::SeqCst);
             r
         });
-        th.rt.block_on(wait_for_sql_lock(&h.db, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the batch"));
+        th.rt.block_on(wait_blocked_by(&h.db, batch_pid, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the batch"));
         std::thread::sleep(Duration::from_millis(300));
         assert!(!withdrawn.load(Ordering::SeqCst), "the verdict was written while the batch that read the approval was open");
 
@@ -1876,7 +1910,6 @@ fn bug_1885_deleted_branches_stop_counting_toward_max_branches_at_once() {
 /// and is answered. The change must not land unapproved after that answer:
 /// either the push waits for the batch, or the batch refuses the change.
 #[test]
-#[ignore = "BUG-2061: a rules change on the default branch does not wait for a batch on another protected branch"]
 fn bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits() {
     let th = TestHub::start();
     let p = setup_project(&th);
@@ -1908,8 +1941,9 @@ fn bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits() {
     th.rt
         .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
         .unwrap();
+    let held_pid = th.rt.block_on(backend_pid(&mut held));
     release_lease(&th, pid, "dev");
-    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entry's row"));
+    th.rt.block_on(wait_blocked_by(&h.db, held_pid, "UPDATE landing_queue AS q%", "the batch never reached its entry's row"));
 
     let answered = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -1930,4 +1964,625 @@ fn bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits() {
             assert_eq!(done["state"], "landed", "{done}");
         }
     });
+    // The tighter rules are in force from then on: the next such change waits for an approval.
+    let dev_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["dev"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "dev", "base": dev_tip.hex(), "edits": [put("src/docs/y.md", "y\n")], "description": "doc 2", "wait": true}),
+    );
+    assert_eq!((r.status, r.json()["code"].as_str()), (409, Some("not_ready")), "landed unapproved under the tighter rules: {}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("not ready to land"), "{}", String::from_utf8_lossy(&r.body));
+}
+
+/// BUG-2061, an embargo's release: `prs::embargo::finish_release` moves the
+/// embargo's holds into `pr_holds`. `dev` is protected and `src/docs/**`
+/// needs checks only; a security member has asked for changes on the
+/// embargo's PR of `src/docs/held.md` (a hold kept with the embargo until
+/// it is released); a change of that path is queued on `dev` and its batch
+/// is held after its review check, at its entry's row. The embargo is then
+/// released. The change must not land after the release is answered with
+/// the hold in force: either the release waits for the batch, or the batch
+/// refuses the change.
+#[test]
+fn bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (dev_tok, admin_tok, sec_tok) = (p.dev.token(), p.admin.token(), p.sec.token());
+    // Only people who may write every file of a PR review it.
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+
+    // The embargo, of `src/docs/held.md`, for the security group, and its PR.
+    let dir = p.admin.dir("emb-2061");
+    p.admin.ok(p.admin.home.path(), &["clone", &th.url(&p.name), dir.to_str().unwrap()]);
+    write_files(&dir, &[("src/docs/fix.md", "the embargoed fix\n")]);
+    p.admin.ok(&dir, &["commit", "--no-advance", "-m", "an embargoed fix"]);
+    let out = p.admin.ok(&dir, &["merge", "@-", "--into", "main", "--embargo-for", "security", "-m", "an embargoed fix"]);
+    let eid = out
+        .split_whitespace()
+        .map(|w| w.trim_end_matches(':'))
+        .find(|w| w.len() == 10 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| panic!("no embargo id in: {out}"))
+        .to_string();
+    p.admin.ok(&dir, &["push"]);
+    // A PR onto the line, of a change on top of it: it stays open at the
+    // release (retargeted), and its holds become `pr_holds`.
+    let line = format!("embargo/{eid}");
+    let line_tip = api.tips(Some(&admin_tok), &p.name).unwrap().branches[&line];
+    let top = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": line_tip.hex(), "description": "on top of the fix", "edits": [put("src/docs/held.md", "more of the fix\n")]}),
+    );
+    assert_eq!(top.status, 200, "{}", String::from_utf8_lossy(&top.body));
+    let top_snap = top.json()["snapshot"].as_str().unwrap().to_string();
+    let pr = api.post_json(Some(&admin_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": top_snap, "onto": line, "title": "more of the fix"}));
+    assert_eq!(pr.status, 200, "{}", String::from_utf8_lossy(&pr.body));
+    let (pr_id, patch) = (pr.json()["id"].as_str().unwrap().to_string(), pr.json()["patch"].as_str().unwrap().to_string());
+    let sig = p.sec.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, "request-changes"));
+    let r = api.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+        &json!({"patch": patch, "verdict": "request-changes", "signature": sig}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let h = th.hub();
+    let holds = |table: &str| -> i64 {
+        th.rt
+            .block_on(
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE project_id = $1 AND path = 'src/docs/held.md'"))
+                    .bind(pid)
+                    .fetch_one(&h.db),
+            )
+            .unwrap()
+    };
+    assert_eq!((holds("pr_embargo_holds"), holds("pr_holds")), (1, 0), "the hold is kept with the embargo");
+
+    // `dev` protected, `src/docs/**` checks only.
+    let r = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "main", "base": api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"].hex(), "wait": true, "description": "protect dev",
+                "edits": [put(".veilrules", "[branches.dev]\nprotected = true\n\n[review]\nchecks_only = [\"src/docs/**\"]\n")]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "landed", "{}", r.json());
+    let main = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "dev", "expected": null, "new": main.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+
+    hold_lease(&th, pid, "dev");
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "dev", "base": main.hex(), "edits": [put("src/docs/held.md", "dev's text\n")], "description": "doc", "wait": false}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "queued", "{}", r.json());
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    let mut held = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt
+        .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
+        .unwrap();
+    let held_pid = th.rt.block_on(backend_pid(&mut held));
+    release_lease(&th, pid, "dev");
+    th.rt.block_on(wait_blocked_by(&h.db, held_pid, "UPDATE landing_queue AS q%", "the batch never reached its entry's row"));
+
+    let answered = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let releasing = scope.spawn(|| {
+            let r = api.post_json(Some(&admin_tok), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
+            answered.store(true, Ordering::SeqCst);
+            r
+        });
+        std::thread::sleep(Duration::from_secs(3));
+        let answered_while_held = answered.load(Ordering::SeqCst);
+        th.rt.block_on(held.rollback()).unwrap();
+        let rel = releasing.join().unwrap();
+        assert_eq!(rel.status, 200, "{}", String::from_utf8_lossy(&rel.body));
+        let released: Option<i64> = th
+            .rt
+            .block_on(sqlx::query_scalar("SELECT released_at FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2").bind(pid).bind(&eid).fetch_one(&h.db))
+            .unwrap();
+        assert!(released.is_some(), "the embargo was released");
+        assert_eq!((holds("pr_embargo_holds"), holds("pr_holds")), (0, 1), "the release made the hold public");
+        let shown = api.get(Some(&admin_tok), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+        assert_eq!((shown.json()["state"].as_str(), shown.json()["target"].as_str()), (Some("open"), Some("main")), "{}", shown.json());
+        let done = outcome(&api, &dev_tok, &p.name, &ticket);
+        if answered_while_held {
+            assert_eq!(done["state"], "rejected", "landed on a held path after the release was answered: {done}");
+        } else {
+            assert_eq!(done["state"], "landed", "{done}");
+        }
+    });
+    // The hold is in force from then on.
+    let dev_tip = api.tips(Some(&dev_tok), &p.name).unwrap().branches["dev"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({"onto": "dev", "base": dev_tip.hex(), "edits": [put("src/docs/held.md", "again\n")], "description": "doc 2", "wait": true}),
+    );
+    assert_eq!((r.status, r.json()["code"].as_str()), (409, Some("not_ready")), "landed on a held path: {}", String::from_utf8_lossy(&r.body));
+    assert!(String::from_utf8_lossy(&r.body).contains("asked for changes"), "{}", String::from_utf8_lossy(&r.body));
+}
+
+/// `main` protected, and a PR of dev's adding `file` on its own branch:
+/// the PR's tip, id and patch. `review(who, verdict)` posts a signed verdict.
+fn protected_main_and_a_pr(api: &Api, p: &Project, file: &str) -> (ObjectId, String, String) {
+    let dev_tok = p.dev.token();
+    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect main with review rules");
+    p.admin.ok(&p.dir, &["push"]);
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": base.hex(), "edits": [put(file, "pub fn feat() {}\n")]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let feat: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "feat", "expected": null, "new": feat.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+    let pr = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "feat", "title": "add feat"})).json();
+    (feat, pr["id"].as_str().unwrap().to_string(), pr["patch"].as_str().unwrap().to_string())
+}
+
+fn post_verdict(api: &Api, p: &Project, who: &Person, pr_id: &str, patch: &str, verdict: &str) -> Reply {
+    let sig = who.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, pr_id, patch, verdict));
+    api.post_json(
+        Some(&who.token()),
+        &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+        &json!({"patch": patch, "verdict": verdict, "signature": sig}),
+    )
+}
+
+/// The review gate's advisory-lock key (`prs::REVIEW_GATE_BASE ^ project`).
+fn review_gate_key(pid: i64) -> i64 {
+    0x7665_696c_7276_6774_i64 ^ pid
+}
+
+/// BUG-2110: a verdict (or a rules push, a new revision, an embargo
+/// release, a revert recorded, a reviewer's access taken) takes the review
+/// gate exclusively and waits for the batches already holding it shared; a
+/// batch that comes after the writer must not get in before it, or a busy
+/// project's overlapping batches starve the writer: YugabyteDB (2025.2)
+/// grants a later shared request past a waiting exclusive one. The writer
+/// announces itself first (`prs::review_gate`), and a batch asks for the gate only
+/// when no writer is announced. Here two transactions stand in for two
+/// batches on other branches: the first holds the gate while the verdict
+/// waits; the second runs a batch's ask after the verdict's and finds the
+/// verdict announced, so does not take the gate; once the first ends the
+/// verdict is written, with the second still open.
+#[test]
+fn bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (_, pr_id, patch) = protected_main_and_a_pr(&api, &p, "src/feature-2110.rs");
+    let h = th.hub();
+    let key = review_gate_key(pid);
+    let mut first = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt.block_on(sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(key).execute(&mut *first)).unwrap();
+    let first_pid = th.rt.block_on(backend_pid(&mut first));
+    let written = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reviewer = scope.spawn(|| {
+            let r = post_verdict(&api, &p, &p.admin, &pr_id, &patch, "approve");
+            written.store(true, Ordering::SeqCst);
+            r
+        });
+        // Announced (other tests' writers may wait on the gate too)...
+        let until = Instant::now() + Duration::from_secs(30);
+        while th.rt.block_on(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM review_writers WHERE project_id = $1").bind(pid).fetch_one(&h.db)).unwrap() == 0 {
+            assert!(Instant::now() < until, "the verdict never announced itself");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // ...and waiting for the gate.
+        th.rt.block_on(wait_blocked_by(&h.db, first_pid, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the gate"));
+        assert!(!written.load(Ordering::SeqCst), "the verdict did not wait for a batch holding the gate");
+        // A batch arriving after the writer: it finds the writer announced
+        // and leaves the gate to it.
+        let mut second = th.rt.block_on(h.db.begin()).unwrap();
+        th.rt.block_on(sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *second)).unwrap();
+        let writers = th.rt.block_on(veil_server::prs::review_gate::share_review_gate(&mut second, pid, true)).unwrap();
+        let rows: Vec<(i64, i64, i64)> =
+            th.rt.block_on(sqlx::query_as("SELECT id, project_id, since_ms FROM review_writers").fetch_all(&h.db)).unwrap();
+        th.rt.block_on(first.rollback()).unwrap();
+        if writers.len() != 1 {
+            th.rt.block_on(second.rollback()).unwrap();
+            panic!("the batch after the verdict did not find it announced: {writers:?}, rows {rows:?}, project {pid}");
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !written.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let in_time = written.load(Ordering::SeqCst);
+        th.rt.block_on(second.rollback()).unwrap();
+        let r = reviewer.join().unwrap();
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(in_time, "the verdict still waited 5 s after the batch before it ended");
+        let left: i64 = th.rt.block_on(sqlx::query_scalar("SELECT count(*) FROM review_writers WHERE project_id = $1").bind(pid).fetch_one(&h.db)).unwrap();
+        assert_eq!(left, 0, "the verdict's announcement outlived it");
+    });
+}
+
+/// BUG-2111: an approval counts while its reviewer may write every path of
+/// the PR (`review::gate_conn`), read in the batch's transaction; taking the
+/// reviewer's access away (here: out of the group that writes `src/`) takes
+/// no lock the batch waits for. Answered while the batch that counted the
+/// approval is open, it does not stop that batch landing the change with
+/// an approval that no longer counts. Either the removal waits for the
+/// batch, or the batch refuses the change.
+#[test]
+fn bug_2111_a_reviewer_removed_while_the_batch_commits_does_not_approve_it() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let dev_tok = p.dev.token();
+    // sec writes `src/` as one of devs, and is the PR's one reviewer.
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let (feat, pr_id, patch) = protected_main_and_a_pr(&api, &p, "src/feature-2111.rs");
+    let r = post_verdict(&api, &p, &p.sec, &pr_id, &patch, "approve");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true, "{}", r.json());
+
+    hold_lease(&th, pid, "main");
+    let r = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/land", p.name), &json!({"onto": "main", "snapshot": feat.hex(), "wait": false}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "queued", "{}", r.json());
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    // The batch counts sec's approval in its transaction, then is held at
+    // the entry's row.
+    let h = th.hub();
+    let mut held = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt
+        .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
+        .unwrap();
+    let held_pid = th.rt.block_on(backend_pid(&mut held));
+    release_lease(&th, pid, "main");
+    th.rt.block_on(wait_blocked_by(&h.db, held_pid, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
+
+    let removed = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let admin = scope.spawn(|| {
+            let o = p.admin.run(&p.dir, &["group", "remove", "devs", &p.sec.name]);
+            removed.store(true, Ordering::SeqCst);
+            o
+        });
+        let until = Instant::now() + Duration::from_secs(3);
+        while !removed.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let removed_while_held = removed.load(Ordering::SeqCst);
+        th.rt.block_on(held.rollback()).unwrap();
+        let o = admin.join().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let done = outcome(&api, &dev_tok, &p.name, &ticket);
+        assert_ne!(done["state"], "queued", "{done}");
+        assert!(
+            !(removed_while_held && done["state"] == "landed"),
+            "sec was out of devs (answered) before the batch committed, and the change landed on sec's approval: {done}"
+        );
+        // The removal waited for the batch, which counted sec's approval
+        // and landed first.
+        assert!(!removed_while_held, "the removal did not wait for the batch that counted sec's approval");
+        assert_eq!(done["state"], "landed", "{done}");
+    });
+}
+
+/// BUG-2110: stand-ins for batches on other branches, run as a batch runs
+/// its ask for the review gate (`prs::review_gate`), overlap without end: three
+/// loops, each holding the gate shared 150 ms at a time, 50 ms apart, so
+/// that at every instant at least two hold it. Three verdicts in a row are
+/// each answered within a bound of the order of one batch's commit, on
+/// PostgreSQL and on YugabyteDB, and the batches go on meanwhile (each
+/// waits only for a writer announced before it asked).
+#[test]
+fn bug_2110_writers_are_answered_in_bounded_time_while_batches_overlap_without_end() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (_, pr_id, patch) = protected_main_and_a_pr(&api, &p, "src/feature-2110b.rs");
+    let h = th.hub();
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let loops: Vec<_> = (0..3u64)
+        .map(|i| {
+            let (db, stop, done) = (h.db.clone(), stop.clone(), done.clone());
+            th.rt.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50 * i)).await;
+                while !stop.load(Ordering::SeqCst) {
+                    let mut tx = db.begin().await.unwrap();
+                    let writers = veil_server::prs::review_gate::share_review_gate(&mut tx, pid, true).await.unwrap();
+                    if !writers.is_empty() {
+                        tx.rollback().await.unwrap();
+                        veil_server::prs::review_gate::wait_review_writers(&db, pid, &writers).await.unwrap();
+                        tx = db.begin().await.unwrap();
+                        let again = veil_server::prs::review_gate::share_review_gate(&mut tx, pid, false).await.unwrap();
+                        assert!(again.is_empty(), "{again:?}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    tx.commit().await.unwrap();
+                    done.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(600));
+    let mut took = Vec::new();
+    for verdict in ["approve", "request-changes", "approve"] {
+        let before = done.load(Ordering::SeqCst);
+        let t = Instant::now();
+        let r = post_verdict(&api, &p, &p.admin, &pr_id, &patch, verdict);
+        took.push(t.elapsed());
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        // The batches go on: more of them commit before the next verdict.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(done.load(Ordering::SeqCst) >= before + 3, "the batches stopped while the writers wrote");
+    }
+    stop.store(true, Ordering::SeqCst);
+    for l in loops {
+        th.rt.block_on(l).unwrap();
+    }
+    assert!(took.iter().all(|d| *d < Duration::from_secs(2)), "a verdict waited past the batches holding the gate when it asked: {took:?}");
+    let r = api.get(Some(&p.dev.token()), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true, "{}", r.json());
+}
+
+/// BUG-2110: a writer that went away announced (its server stopped before
+/// its transaction ended) does not hold landings back: a batch that finds
+/// its row, stale and its lock free, removes it and lands.
+#[test]
+fn bug_2110_a_writer_that_went_away_does_not_stop_landings() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let dev_tok = p.dev.token();
+    let (feat, pr_id, patch) = protected_main_and_a_pr(&api, &p, "src/feature-2110c.rs");
+    let r = post_verdict(&api, &p, &p.admin, &pr_id, &patch, "approve");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true, "{}", r.json());
+    let h = th.hub();
+    th.rt.block_on(sqlx::query("INSERT INTO review_writers (project_id, since_ms) VALUES ($1, 0)").bind(pid).execute(&h.db)).unwrap();
+    let r = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/land", p.name), &json!({"onto": "main", "snapshot": feat.hex(), "wait": false}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    let done = outcome(&api, &dev_tok, &p.name, &ticket);
+    assert_eq!(done["state"], "landed", "{done}");
+    let left: i64 = th.rt.block_on(sqlx::query_scalar("SELECT count(*) FROM review_writers WHERE project_id = $1").bind(pid).fetch_one(&h.db)).unwrap();
+    assert_eq!(left, 0, "the stale writer's row was not removed");
+}
+
+/// Whether two of this database's backends wait for each other (a
+/// deadlock PostgreSQL has not broken yet). YugabyteDB does not report
+/// `pg_blocking_pids`: answered false.
+async fn a_lock_cycle(db: &sqlx::PgPool) -> bool {
+    if is_yugabyte(db).await {
+        return false;
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity a, LATERAL unnest(pg_blocking_pids(a.pid)) AS b(pid) \
+         WHERE a.datname = current_database() AND a.pid = ANY(pg_blocking_pids(b.pid)))",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+/// BUG-2130: the review gate before the project's row, everywhere. An
+/// admin's removal takes the gate, then the project's row; a push that
+/// accepted a new access policy wrote the project's row
+/// (`perm::accept_policy`) and took the gate after, last. Granted the gate
+/// while such a push waited for it, the removal waited for the push's row
+/// and the push for the gate: a deadlock. Here a transaction standing in
+/// for a batch holds the gate shared; the removal asks for it, then the
+/// push; once the stand-in ends, neither may wait for the other, and both
+/// are answered.
+#[test]
+fn bug_2130_a_policy_push_and_an_admin_removal_take_the_gate_in_one_order() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let h = th.hub();
+    let admins = format!("/v1/projects/{}/admins", p.name);
+    let r = api.post_json(Some(&p.admin.token()), &admins, &json!({"people": [p.carol.name]}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    p.admin.ok(&p.dir, &["access", &format!("{BILL_DIR}/"), "finance", "security"]);
+    p.admin.commit_main(&p.dir, "billing for security too");
+    let yb = th.rt.block_on(is_yugabyte(&h.db));
+    let mut batch = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt.block_on(sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(review_gate_key(pid)).execute(&mut *batch)).unwrap();
+    let batch_pid = th.rt.block_on(backend_pid(&mut batch));
+    std::thread::scope(|scope| {
+        let removal = scope.spawn(|| api.post_json(Some(&p.admin.token()), &format!("{admins}/remove"), &json!({"people": [p.carol.name]})));
+        th.rt.block_on(wait_blocked_by(&h.db, batch_pid, "SELECT pg_advisory_xact_lock(%", "the removal never waited for the gate"));
+        let push = scope.spawn(|| p.admin.ok(&p.dir, &["push"]));
+        // The push waits for the gate too (after the removal).
+        if yb {
+            std::thread::sleep(Duration::from_secs(3));
+        } else {
+            let until = Instant::now() + Duration::from_secs(30);
+            loop {
+                let n: i64 = th
+                    .rt
+                    .block_on(
+                        sqlx::query_scalar(
+                            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+                             AND query LIKE 'SELECT pg_advisory_xact_lock(%' AND $1 = ANY(pg_blocking_pids(pid))",
+                        )
+                        .bind(batch_pid)
+                        .fetch_one(&h.db),
+                    )
+                    .unwrap();
+                if n >= 2 {
+                    break;
+                }
+                assert!(Instant::now() < until, "the push never waited for the gate");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        th.rt.block_on(batch.rollback()).unwrap();
+        // PostgreSQL breaks a deadlock after `deadlock_timeout` (1 s).
+        let until = Instant::now() + Duration::from_millis(1500);
+        let mut cycle = false;
+        while Instant::now() < until && !cycle {
+            cycle = th.rt.block_on(a_lock_cycle(&h.db));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let r = removal.join().unwrap();
+        let pushed = push.join().unwrap();
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(!r.json()["admins"].as_array().unwrap().iter().any(|a| a == &json!(p.carol.name)), "{}", r.json());
+        assert!(!pushed.is_empty());
+        assert!(!cycle, "the removal and the push waited for each other");
+    });
+}
+
+/// BUG-2131: a writer of the review gate announces itself on a second
+/// connection of the pool its transaction holds one of. Writers that fill
+/// the pool, each in its transaction before its announcement, wait for a
+/// connection none of them gives back: every one until the pool's
+/// `acquire_timeout` (30 s), then failed `503`. Now one that gets no
+/// connection within 100 ms takes the gate unannounced. Here 16 group-member removals (the test
+/// server's pool), 8 in each of two projects (a project runs at most 12
+/// requests at once), each cancelling an invite of its own, wait in their
+/// transactions at the invite rows this test holds; once they are freed,
+/// each takes the gate.
+#[test]
+fn bug_2131_writers_filling_the_pool_are_answered() {
+    use sqlx::Connection;
+    let th = TestHub::start();
+    let projects = [setup_project(&th), setup_project(&th)];
+    let api = th.api();
+    let h = th.hub();
+    let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    let now = veil_core::now_millis();
+    for p in &projects {
+        let pid = project_id(&th, &p.name);
+        let admin_id: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.admin.name).fetch_one(&h.db)).unwrap();
+        let gid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'devs'").bind(pid).fetch_one(&h.db)).unwrap();
+        for i in 0..8 {
+            th.rt
+                .block_on(
+                    sqlx::query("INSERT INTO invites (project_id, invite_key, person, group_id, expires_at, created_by, created_at) VALUES ($1, $2, $2, $3, $4, $5, $6)")
+                        .bind(pid)
+                        .bind(format!("nobody-2131-{i}"))
+                        .bind(gid)
+                        .bind(now + 3_600_000)
+                        .bind(admin_id)
+                        .bind(now)
+                        .execute(&h.db),
+                )
+                .unwrap();
+        }
+    }
+    // Outside the server's pool.
+    let mut outside = th.rt.block_on(sqlx::PgConnection::connect(&url)).unwrap();
+    let mut hold = th.rt.block_on(outside.begin()).unwrap();
+    let held = th.rt.block_on(sqlx::query("SELECT 1 FROM invites WHERE invite_key LIKE 'nobody-2131-%' FOR UPDATE").execute(&mut *hold)).unwrap();
+    assert_eq!(held.rows_affected(), 16);
+    let mut probe = th.rt.block_on(sqlx::PgConnection::connect(&url)).unwrap();
+    std::thread::scope(|scope| {
+        let (mut asks, api) = (Vec::new(), &api);
+        for p in &projects {
+            for i in 0..8 {
+                asks.push(scope.spawn(move || {
+                    let t = Instant::now();
+                    let r = api.post_json(
+                        Some(&p.admin.token()),
+                        &format!("/v1/projects/{}/groups/devs/members/remove", p.name),
+                        &json!({"people": [format!("nobody-2131-{i}")]}),
+                    );
+                    (r, t.elapsed())
+                }));
+            }
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let n: i64 = th
+                .rt
+                .block_on(
+                    sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                         AND query LIKE 'DELETE FROM invites%'",
+                    )
+                    .fetch_one(&mut probe),
+                )
+                .unwrap();
+            if n >= 16 || Instant::now() >= until {
+                eprintln!("bug_2131: {n} removals wait at their invite rows");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let freed = Instant::now();
+        th.rt.block_on(hold.rollback()).unwrap();
+        for a in asks {
+            let (r, took) = a.join().unwrap();
+            eprintln!("bug_2131: answered {} in {took:?}, {:?} after the rows were freed", r.status, freed.elapsed());
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            assert!(freed.elapsed() < Duration::from_secs(8), "the removals were answered {:?} after the rows were freed", freed.elapsed());
+        }
+    });
+}
+
+/// BUG-2132: a writer's announcement goes when its request does, also
+/// when the request is dropped mid-way (its client went away, or
+/// `db::transaction`'s deadline): `review_gate::scoped` deleted the rows
+/// only after its transaction's future ran to the end. Here a verdict
+/// waits for the gate held by a stand-in batch; its client gives up after
+/// a second; once the stand-in ends, no announcement of the project is
+/// left.
+#[test]
+fn bug_2132_a_writer_whose_request_is_dropped_leaves_no_announcement() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (_, pr_id, patch) = protected_main_and_a_pr(&api, &p, "src/feature-2132.rs");
+    let h = th.hub();
+    let count = || -> i64 { th.rt.block_on(sqlx::query_scalar("SELECT count(*) FROM review_writers WHERE project_id = $1").bind(pid).fetch_one(&h.db)).unwrap() };
+    let mut batch = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt.block_on(sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(review_gate_key(pid)).execute(&mut *batch)).unwrap();
+    std::thread::scope(|scope| {
+        let reviewer = scope.spawn(|| {
+            let sig = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, "approve"));
+            api.post_json_within(
+                &p.admin.token(),
+                &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+                &json!({"patch": patch, "verdict": "approve", "signature": sig}),
+                Duration::from_secs(2),
+            )
+        });
+        let until = Instant::now() + Duration::from_secs(30);
+        while count() == 0 {
+            assert!(Instant::now() < until, "the verdict never announced itself");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(reviewer.join().is_err(), "the verdict was answered while the gate was held");
+    });
+    // The server notices the client gone.
+    std::thread::sleep(Duration::from_millis(500));
+    th.rt.block_on(batch.rollback()).unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while count() != 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(count(), 0, "the dropped verdict's announcement was left");
 }

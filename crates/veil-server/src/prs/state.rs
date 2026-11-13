@@ -124,19 +124,50 @@ pub struct Landing {
     pub fast_forward: bool,
 }
 
+/// The state `l` records over the record `row` read, and whether that can
+/// change the rules a landing on another branch was judged under (BUG-2061):
+/// unless the record was at the tip the branch moves from and keeps its
+/// state, the rules may change. (With the same state, a file that turns
+/// valid or absent keeps what it requires and only loses a broken file's
+/// warnings.)
+fn next_record(row: &Option<(String, String)>, l: &Landing) -> (RulesState, bool) {
+    let recorded: Option<RulesState> = match (row, l.old) {
+        (Some((checked, state)), Some(old)) if *checked == old.hex() => serde_json::from_str(state).ok(),
+        _ => None,
+    };
+    let prev = if l.fast_forward { recorded.as_ref() } else { None };
+    let state = next_state(&l.file, prev);
+    let changes = recorded.as_ref() != Some(&state);
+    (state, changes)
+}
+
+/// Whether recording `l` can change the review rules (see `next_record`),
+/// read before the landing's transaction takes the review gate: by the
+/// default branch's own batch, which must know which way to take it
+/// (`prs::close_review_gate` or `prs::review_gate::share_review_gate`) before it reads
+/// the rules again. Its branch row's lock keeps the record where it is
+/// until it records.
+pub async fn changes_rules(c: &mut sqlx::PgConnection, project: i64, l: &Landing) -> Result<bool> {
+    let row: Option<(String, String)> = sqlx::query_as("SELECT checked, state FROM pr_review_rules WHERE project_id = $1")
+        .bind(project)
+        .fetch_optional(&mut *c)
+        .await?;
+    Ok(next_record(&row, l).1)
+}
+
 /// Record the state a landing brings, in the landing's transaction, after
 /// the branch's compare-and-swap (which holds the branch row's lock, so
-/// landings record in their order).
-pub async fn record_landing(c: &mut sqlx::PgConnection, project: i64, l: &Landing) -> Result<()> {
+/// landings record in their order). Answers whether the rules may have
+/// changed: the caller then takes the review gate exclusively
+/// (`prs::close_review_gate`) once it holds every branch row it moves, so
+/// that a batch on another branch either reads the new rules or commits
+/// before this landing does (BUG-2061).
+pub async fn record_landing(c: &mut sqlx::PgConnection, project: i64, l: &Landing) -> Result<bool> {
     let row: Option<(String, String)> = sqlx::query_as("SELECT checked, state FROM pr_review_rules WHERE project_id = $1 FOR UPDATE")
         .bind(project)
         .fetch_optional(&mut *c)
         .await?;
-    let prev: Option<RulesState> = match (&row, l.old, l.fast_forward) {
-        (Some((checked, state)), Some(old), true) if *checked == old.hex() => serde_json::from_str(state).ok(),
-        _ => None,
-    };
-    let state = next_state(&l.file, prev.as_ref());
+    let (state, changes) = next_record(&row, l);
     sqlx::query(
         "INSERT INTO pr_review_rules (project_id, checked, state) VALUES ($1, $2, $3) \
          ON CONFLICT (project_id) DO UPDATE SET checked = EXCLUDED.checked, state = EXCLUDED.state",
@@ -146,7 +177,7 @@ pub async fn record_landing(c: &mut sqlx::PgConnection, project: i64, l: &Landin
     .bind(state_json(&state))
     .execute(&mut *c)
     .await?;
-    Ok(())
+    Ok(changes)
 }
 
 /// The `[review]` rules in force at the tip of `branch` (the default
