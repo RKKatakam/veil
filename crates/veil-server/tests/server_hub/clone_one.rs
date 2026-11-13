@@ -427,3 +427,44 @@ fn a_one_folder_clone_never_writes_a_file_beside_its_folder() {
     assert_eq!(std::fs::read_to_string(p.dir.join(BILL_DIR).join("acme/invoice.txt")).unwrap(), "edited beside", "the edit landed");
     assert_eq!(std::fs::read_to_string(p.dir.join(ROOT_FILE)).unwrap(), format!("{ROOT_MARK} v2"), "the person's file was recorded over the project's");
 }
+
+/// Requests the server answered under a session (each request looks its
+/// session up once).
+fn requests(hub: &TestHub) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let h = hub.hub();
+    h.caches.stats.session_hits.load(Relaxed) + h.caches.stats.session_misses.load(Relaxed)
+}
+
+/// With the daemon off, a thin clone's first fetch takes every level of
+/// its trees in one `subtree` request: a file eight folders deep costs no
+/// request a level more than one at the top. (With the daemon on it reads
+/// through the daemon level by level, so that the daemon's store serves
+/// the next clone, BUG-2210: `daemon::a_thin_clone_answers_the_same_with_and_without_the_daemon`.)
+#[test]
+fn bug_2210_without_the_daemon_a_thin_clone_costs_no_request_a_level() {
+    let hub = TestHub::start();
+    let admin = hub.person("admin");
+    admin.ok(admin.home.path(), &["daemon", "stop"]);
+    let mut cost = Vec::new();
+    for depth in [1usize, 8] {
+        let name = unique("deep");
+        let dir = admin.dir(&format!("src{depth}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        admin.ok(&dir, &["init"]);
+        let path = (0..depth).map(|l| format!("d{l}")).collect::<Vec<_>>().join("/");
+        write_files(&dir, &[(&format!("{path}/f.txt"), "deep\n"), ("top.txt", "top\n")]);
+        admin.ok(&dir, &["remote", "add", "origin", &hub.url(&name)]);
+        admin.commit_main(&dir, "import");
+        let out = admin.ok(&dir, &["push"]);
+        assert!(out.contains("Created project"), "{out}");
+        let c = admin.dir(&format!("clone{depth}"));
+        let before = requests(&hub);
+        admin.ok(admin.home.path(), &["clone", &hub.url(&name), c.to_str().unwrap()]);
+        cost.push(requests(&hub) - before);
+        assert_eq!(std::fs::read_to_string(c.join(&path).join("f.txt")).unwrap(), "deep\n", "the clone checked out the deep file");
+        assert_eq!(std::fs::read_to_string(c.join("top.txt")).unwrap(), "top\n", "the clone checked out the top file");
+    }
+    eprintln!("bug_2210: a clone of depth 1 cost {} requests, of depth 8 {}", cost[0], cost[1]);
+    assert!(cost[1] <= cost[0] + 2, "a clone of a file 8 folders deep cost {} requests, of one at the top {}", cost[1], cost[0]);
+}
