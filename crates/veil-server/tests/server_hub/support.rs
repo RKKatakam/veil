@@ -662,7 +662,14 @@ pub fn everything_in(clone: &Path) -> Vec<(String, Vec<u8>)> {
     }
     let mut stack = vec![clone.to_path_buf()];
     while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).unwrap().flatten() {
+        // A directory removed between being listed and being read (a
+        // command's temporary directory, BUG-2343) holds nothing to obtain.
+        let entries = match std::fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("{}: {e}", d.display()),
+        };
+        for e in entries.flatten() {
             let p = e.path();
             if e.file_type().unwrap().is_dir() {
                 stack.push(p);
