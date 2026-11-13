@@ -62,4 +62,5 @@ mod warm;
 mod landing_speed;
 mod hunt_access;
 mod landing_hold;
+mod quarantine_land;
 mod store_s3;

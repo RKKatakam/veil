@@ -24,6 +24,7 @@ mod filesystem;
 mod ignores;
 mod init;
 mod restore;
+mod quarantine_exit;
 mod revisions;
 mod snapshot;
 mod stash;
@@ -181,6 +182,17 @@ impl<'a> R<'a> {
         let t = text(&out);
         assert!(out.status.success(), "vl {args:?} failed:\n{t}");
         assert!(!t.contains("panicked"), "vl {args:?} panicked:\n{t}");
+        t
+    }
+
+    /// stdout + stderr of a `vl commit`, `vl new` or `vl push` that did its
+    /// work while the working copy holds a quarantined file: exit status 3
+    /// exactly (BUG-2140).
+    pub fn quarantined<S: AsRef<OsStr> + std::fmt::Debug>(&self, args: &[S]) -> String {
+        let out = self.run(args);
+        let t = text(&out);
+        assert_eq!(out.status.code(), Some(3), "vl {args:?}: expected exit 3 (quarantined):\n{t}");
+        assert!(t.contains("quarantined file"), "vl {args:?}:\n{t}");
         t
     }
 

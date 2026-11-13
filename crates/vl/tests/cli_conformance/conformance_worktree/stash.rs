@@ -90,7 +90,7 @@ fn a_quarantined_edit_stays_on_disk() {
     let env = Env::new();
     let (r, _) = dirty(&env);
     r.write("cfg.js", LEAKY);
-    r.ok(&["new", "@-"]);
+    r.quarantined(&["new", "@-"]);
     assert_eq!(r.read("cfg.js"), LEAKY);
 }
 

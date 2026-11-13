@@ -3,7 +3,9 @@
 
 # `vl new`
 
-Start a new change on top of REVS (default: @). Several = merge
+Start a new change on top of REVS (default: @). Several = merge.
+
+Exits 3 (the work done all the same) while the working copy holds files the secret scanner quarantined, naming each: `vl isolate FILE` keeps one on this machine on purpose, `vl expose --force FILE` records one that is not a secret.
 
 ```text
 vl new [OPTIONS] [REVS]...

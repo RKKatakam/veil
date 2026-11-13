@@ -110,7 +110,10 @@ fn quarantined_edits_keep_history_and_survive_checkouts() {
     assert_eq!(env.stdout(&proj, &["cat", "cfg.js", "-r", "@"]), CLEAN);
 
     // Checking out a tree without the file must not delete the local edit...
-    let out = env.ok(&proj, &["new", "root"]);
+    // (Exit 3: `cfg.js` and `leak.js` stay quarantined, BUG-2140.)
+    let out = env.vl(&proj, &["new", "root"]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.contains("kept cfg.js"), "{out}");
     assert_eq!(read(&proj, "cfg.js"), LEAKY);
     assert!(!proj.join("main.rs").exists(), "everything else is checked out");
@@ -795,8 +798,12 @@ mod s7_watcher {
         let st = env.ok(&w, &["status"]);
         assert!(st.contains("Q src/app.rs [quarantined]"), "leaky edit quarantined:\n{st}");
 
-        env.ok(&w, &["commit", "-m", "rotate secrets"]);
-        env.ok(&s, &["commit", "-m", "rotate secrets"]);
+        // Committed without the leaky edit: exit 3 (BUG-2140).
+        for p in [&w, &s] {
+            let out = env.vl(p, &["commit", "-m", "rotate secrets"]);
+            assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(String::from_utf8_lossy(&out.stderr).contains("  src/app.rs (aws-access-key-id at line 1; edit held back)"));
+        }
         assert_same_as_scan(&env, &w, &s);
 
         // Verify that the committed `.env.prod` and `.env.staging` are sealed (`cloaked`)

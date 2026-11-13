@@ -117,7 +117,12 @@ does not show to the same reader:
 
 The exit status is the same with and without `--json`: 0 on success, 1 on
 failure, and 1 from `vl scan` when a public file contains a secret (its
-document is printed all the same, with `clean: false`).
+document is printed all the same, with `clean: false`). `vl commit`, `vl
+new`, `vl push` and `vl land` exit 3 when they did their work while the
+working copy holds quarantined files, which no snapshot has: each is named
+on standard error, and `vl status --json` lists them (`quarantined`) until
+they are isolated, exposed or fixed. With `--no-snapshot`, which looks at
+no file, they do not check.
 
 When a command fails, `error: …` goes to standard error as always and, with
 `--json`, a [`veil.error/1`](#veilerror1) document goes to standard output,
