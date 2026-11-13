@@ -266,3 +266,96 @@ fn bug_2230_small_packs_are_merged_in_the_background_once_they_pile_up() {
     assert!(discarded > 0, "no pack was merged within 30 s of {pushes} pushes ({small} small packs listed)");
     assert!(small < veil_server::pack_gc::MERGE_MIN_PACKS as i64, "{small} small packs still listed after the merges");
 }
+
+/// Push `n` snapshots to `p`, each on a branch of its own, with one or two
+/// parents among the earlier ones (and `main`'s tip), timestamps jittered
+/// by up to a minute either way; each derived. Every snapshot, `main`'s
+/// tip first.
+fn random_dag(hub: &TestHub, p: &Project, seed: u64, n: usize) -> Vec<ObjectId> {
+    let pid = project_id_of(hub, &p.name);
+    let api = hub.api();
+    let tok = p.admin.token();
+    let mut seed = seed;
+    let mut next = |m: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % m
+    };
+    let mut all = vec![tip_of(&api, &tok, &p.name, "main").unwrap()];
+    for i in 0..n {
+        let a = all[next(all.len() as u64) as usize];
+        let b = all[next(all.len() as u64) as usize];
+        // Mostly the newest few as first parent (long lines), merges often.
+        let a = if next(3) > 0 { all[all.len() - 1 - next(all.len().min(4) as u64) as usize] } else { a };
+        let parents = if next(5) < 2 && a != b { vec![a, b] } else { vec![a] };
+        let jitter = next(120_000) as i64 - 60_000;
+        let c = Craft::new(&api, &p.admin, &p.name, "main");
+        let (id, r) = c.push_edited(&format!("rdag-{i}"), None, |s| {
+            s.parents = parents;
+            s.timestamp += jitter;
+        });
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+        derive(hub, pid, id);
+        all.push(id);
+    }
+    all
+}
+
+/// BUG-2221 (review): over random histories in two projects sharing one
+/// server (and its remembered "not below" facts), random questions with
+/// one to three starting points, asked in "submits" that share one list of
+/// walks across different starting points (as `Ancestry::near` does for
+/// the tip, the frontier and the base below the part the deriver lacks),
+/// the projects' submits interleaved and tips asked in any order (a later
+/// tip, then an earlier one, as after a forced push): `is_below` answers
+/// exactly as `is_ancestor` of any start, every time.
+#[test]
+fn bug_2221_is_below_matches_is_ancestor_over_random_histories_in_two_projects() {
+    let hub = TestHub::start();
+    let projects: Vec<(i64, Vec<ObjectId>)> = [0x5eed1_u64, 0x5eed2]
+        .iter()
+        .map(|seed| {
+            let p = setup_project(&hub);
+            let pid = project_id_of(&hub, &p.name);
+            (pid, random_dag(&hub, &p, *seed, 48))
+        })
+        .collect();
+    let h = hub.hub();
+    let mut seed = 0x2221_beef_u64;
+    let mut next = move |m: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % m
+    };
+    let (mut checked, mut below) = (0usize, 0usize);
+    for submit in 0..60 {
+        let (pid, all) = projects[submit % 2].clone();
+        let pick = |k: u64| all[k as usize];
+        let n = all.len() as u64;
+        // Up to three start lists in this submit, of one to three starts.
+        let lists: Vec<Vec<ObjectId>> = (0..1 + next(3)).map(|_| (0..1 + next(3)).map(|_| pick(next(n))).collect()).collect();
+        let questions: Vec<(ObjectId, Vec<ObjectId>)> =
+            (0..40).map(|_| (pick(next(n)), lists[next(lists.len() as u64) as usize].clone())).collect();
+        let (c, b) = hub
+            .rt
+            .block_on(veil_server::derive::read(&h, pid, move |g| {
+                let mut walks = Vec::new();
+                let (mut c, mut b) = (0usize, 0usize);
+                for (x, starts) in &questions {
+                    let mut want = false;
+                    for s in starts {
+                        want |= g.is_ancestor(*x, *s)?;
+                    }
+                    let got = g.is_below(&mut walks, *x, starts)?;
+                    assert_eq!(got, want, "submit {submit}: is {} below {:?}", x.short(), starts.iter().map(|s| s.short()).collect::<Vec<_>>());
+                    c += 1;
+                    b += want as usize;
+                }
+                Ok((c, b))
+            }))
+            .expect("the graph answers");
+        checked += c;
+        below += b;
+    }
+    assert_eq!(checked, 60 * 40);
+    assert!(below > checked / 10 && below < checked * 9 / 10, "{below} of {checked} below: the histories have both answers");
+}
