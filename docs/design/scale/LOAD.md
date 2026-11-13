@@ -1726,6 +1726,163 @@ VEIL_DIAG_READS=500 OBJECTS=local bash ~/.cache/veil-orch/bench-quiet.sh bash .s
   on a storage droplet, and a 5-minute `spaces` gate runs on Spaces at 20
   pushes/s (`docs/DEPLOY.md` §2.3).
 
+## Final local measurements on `171a625a` (2026-11-13 evening, `finalbench2`)
+
+The last local runs before the multi-machine test, on `integration` @
+`171a625a` (public `main`), unchanged (the branch `finalbench2` adds
+records only). Since this morning's runs (`finalbench`, `dc4e3f82`, above)
+the code gained the fixes for the mix (BUG-2220), for many branches
+(BUG-2221, and the bench's BUG-2222), background pack merging (BUG-2230,
+BUG-2280), storage reads (BUG-2271) and the YugabyteDB retry (BUG-2340).
+**The machine and harness are this morning's**: one 32-thread box with
+30 GB of memory running the load tool, the server and the database
+together; release builds; PostgreSQL 17 in Docker with the deployment's
+settings (`shared_buffers=4GB`, `effective_cache_size=12GB`,
+`synchronous_commit=on`); objects in a local directory, every one
+`fsync`ed (`OBJECTS=local`). Every run went through
+`~/.cache/veil-orch/bench-quiet.sh`, one at a time, from 20:48 to 22:07
+UTC; "load" is the 1-minute load average it printed before and after.
+The paid run's speed gates will keep objects in MinIO on a storage
+droplet (BUG-2290's decision); these are one-machine numbers. Raw
+results: `.scratch/finalbench2/` on the branch (not committed).
+
+**Commands** (`.scratch/bench-custom.sh` is `scripts/bench-server.sh` with
+one more profile, `custom`, passing its flags to `veil-bench load` and
+counting the `packs` rows every 30 s, as on `packgc` and `readsperf`):
+
+```sh
+B="--mode branches --projects 1 --rates max --merge-every 5"
+OBJECTS=local bench-quiet.sh bash .scratch/bench-custom.sh custom -- $B --clients 300 --duration 180
+OBJECTS=local bench-quiet.sh bash .scratch/bench-custom.sh custom -- $B --clients 1000 --duration 180
+OBJECTS=local bench-quiet.sh bash .scratch/bench-custom.sh custom -- $B --clients 300 --duration 600
+L="OBJECTS=local LANDING_CLIENTS=10000 LANDING_RATES=1000"
+env $L DURATION=180 bench-quiet.sh scripts/bench-server.sh landing -- --people 100                      # unprotected
+env $L DURATION=180 bench-quiet.sh scripts/bench-server.sh landing -- --protected --people 100          # protected
+env $L DURATION=180 bench-quiet.sh scripts/bench-server.sh landing -- --protected --mix --people 100    # the mix (run twice)
+env $L DURATION=180 bench-quiet.sh scripts/bench-server.sh landing --                                   # one person's agents
+env $L DURATION=600 bench-quiet.sh scripts/bench-server.sh landing -- --protected --mix --people 100    # ten minutes
+```
+
+### Many branches moving at once (the headline shape)
+
+Each agent pulls `main`, pushes one new file to a branch of its own in a
+closed loop, and after every fifth push lands its branch on `main`
+through the landing service (`--merge-every 5`); the agents are one
+person's. Latency is a push's. "Told to come back": `503 busy` answers,
+each waited out and asked again (BUG-2222's fix). "Packs listed at the
+end": the `packs` table's listed rows after the run (state 1).
+
+| Agents | Run | Pushes (/s) | Branches landed on `main` (/s) | p50 (ms) | p99 (ms) | Server CPU (ms/push) | Server cores | DB CPU (ms/push) | DB cores | DB statements per push | DB commits per push (the push's own) | Storage reads per push | Storage writes per push (the push's own) | Object cache hits | Errors | Told to come back | Packs listed at the end (bytes) | Load before / after |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 300 | 180 s | **371.6** | **74.7** (13,443) | 789 | 1,612 | 39.9 | 14.8 | 20.0 | 7.4 | 149.8 | 4.45 (2.34) | 6.8 | 10.9 (2.0) | 99.7 % | 0 | 0 | 4,316 (411 MB) | 1.67 / 55.16 |
+| 1,000 | 180 s | **258.2** | **52.4** (9,433) | 4,021 | 6,183 | 77.6 | 20.0 | 13.8 | 3.6 | 102.1 | 5.31 (3.20) | 4.7 | 10.6 (2.0) | 100.0 % | 0 | 7,290 (7,262 pushes or pulls, 28 branch landings) | 3,209 (134 MB) | 14.76 (waited 80 s) / 43.26 |
+| 300 | 600 s | **245.8** | **49.2** (29,523) | 1,069 | 3,596 | 72.6 | 17.9 | 25.1 | 6.2 | 229.5 | 5.35 (3.23) | 8.5 | 11.0 (2.0) | 99.5 % | 0 | 0 | 94 (1.59 GB) | 13.93 (waited 70 s) / 46.86 |
+
+**This morning → now** (the morning's 3-minute runs are `finalbench` on
+`dc4e3f82`; no 10-minute run was made there, so its "before" is
+`branchperf2`'s on `487e9c0b`, the same day, same harness):
+
+| Run | This morning | Now |
+|---|---|---|
+| 300 agents, 3 min | 72 pushes/s, 13.4 landed/s, p50 2,145 ms, p99 20,939 ms, 395 ms CPU a push, 215 errors, 27,199 told to come back | **371.6, 74.7, 789 ms, 1,612 ms, 39.9 ms, 0, 0** |
+| 1,000 agents, 3 min | 116 pushes/s, 19.5 landed/s, p50 5,296 ms, p99 27,518 ms, 226 ms, 2,350 errors, 115,150 told | **258.2, 52.4, 4,021 ms, 6,183 ms, 77.6 ms, 0, 7,290** |
+| 300 agents, 10 min | 30.7 pushes/s, 6.1 landed/s, p50 5,605 ms, p99 52,414 ms, 938 ms, 219 errors, 179,403 told (`487e9c0b`) | **245.8, 49.2, 1,069 ms, 3,596 ms, 72.6 ms, 0, 0** |
+
+- **The headline holds over ten minutes**: 245.8 pushes and 49.2 branch
+  landings a second, p99 3.6 s, no errors and no answer telling an agent
+  to come back; as on `readsperf` (246.9/s, 8.6 reads a push). Over
+  three minutes the same 300 agents push 371.6 a second (248.5 on
+  `branchperf2`'s final build).
+- **The listed packs** (every 30 s): in the 10-minute run 220 at 30 s,
+  14,282 at 120 s (the opening burst outruns the background merge), 394
+  at 240 s and 98 to 483 from then on; 94 at the end. The 3-minute runs end before the
+  merges catch up (4,316 and 3,209 listed at the end; 9,952 at 90 s in
+  the 300-agent run).
+- **Storage reads per push** 4.7 to 8.5, object cache hits 99.5 to
+  100 % (261 a push on `9d0ef46c` before BUG-2271's fix).
+- **1,000 agents**: the server on 20 of 32 threads (77.6 ms a push), on
+  a machine that also runs the 1,000 agents; p99 6.2 s; 7,290 answers
+  told agents to come back, each waited out, and none failed.
+- **Every run of the shape misses the tool's cost gate** of one database
+  commit a push (`storage-and-cost.md` §9): 2.34 to 3.23 commits a push
+  of the push's own (the deriver's and the pack rows' aside), as this
+  morning (2.69 to 4.21; 1.23 without branch landings). Not counted by
+  kind; filed as **BUG-2350**. The storage-writes gate (2 a push) passes
+  now (2.00 to 2.03; 2.05 to 2.24 this morning).
+
+### Landing on one `main`: 10,000 agents, 1,000/s offered
+
+Columns as in this morning's table above. "Told to come back": answers
+with a `retry_after_ms`, each waited out; the server counted no `503
+queue_full` in any of these runs, so they are the early `503 busy`
+answer to a landing behind 2 s of waiting landings.
+
+| Run | Offered | Finished (/s) | Landed by the server (/s) | Per 10 s (/s) | p50 (ms) | p99 (ms) | Commits per landing | Statements per landing | Failed requests | Told to come back | Conflicts per landing | Landings per batch | Prepare / store / transaction (ms per batch) | Build CPU (ms per landing) | Server cores | Deriver behind at the end | Load before / after |
+|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
+| unprotected, 100 people | 1,000/s, 180 s | **987.6** | 988.0 | 864 to 1,023 | 344 | 1,760 | 1.18 | 30.8 | 0 | 231 | 0 | 30.0 | 3.0 / 19.5 / 28.4 | 0.48 | 10.1 | 88 s | 13.54 (waited 70 s) / 25.81 |
+| protected, 100 people | 1,000/s, 180 s | **997.9** | 998.2 | 897 to 1,126 | 315 | 1,780 | 1.23 | 32.9 | 0 | 0 | 0 | 30.8 | 5.1 / 19.1 / 28.4 | 0.46 | 9.9 | 56 s | 15.91 (waited 30 s) / 40.65 |
+| protected, `--mix`, 100 people | 1,000/s, 180 s | **973.1** | 973.3 | 806 to 1,121 | 545 | 8,011 | 1.27 | 36.3 | 26 | 55,397 | 0.072 | 34.3 | 5.1 / 20.8 / 30.7 | 0.57 | 9.7 | 116 s | 15.19 (waited 60 s) / 21.68 |
+| the same, run again | 1,000/s, 180 s | **959.4** | 959.4 | 800 to 1,058 | 316 | 10,590 | 1.25 | 35.8 | 7 | 74,343 | 0.054 | 30.1 | 4.7 / 19.5 / 27.3 | 0.55 | 9.5 | 100 s | 15.52 (waited 20 s) / 22.34 |
+| unprotected, one person | 1,000/s, 180 s | **976.5** | 976.7 | 842 to 1,023 | 552 | 6,992 | 1.22 | 30.3 | 0 | 69,288 | 0 | 31.1 | 3.2 / 20.4 / 29.9 | 0.45 | 9.8 | 106 s | 13.54 (waited 30 s) / 22.66 |
+| protected, `--mix`, 100 people | 1,000/s, 600 s | **833.8** | 833.9 | 628 to 1,043 | 11,621 | 69,306 | 1.23 | 35.7 | 39,329 | 1,649,065 | 0.067 | 41.2 | 5.2 / 30.8 / 44.9 | 0.60 | 9.5 | 300 s (1 branch) | 13.93 (waited 30 s) / 2.07 |
+
+**This morning → now** (the morning's runs on `dc4e3f82`, above):
+
+| Run | This morning (`dc4e3f82`) | Now (`171a625a`) |
+|---|---|---|
+| unprotected, 100 people, 3 min | 995.5/s, p50 348 ms, p99 1,436 ms, 1.20 commits, nothing told to come back | 987.6/s, 344 ms, 1,760 ms, 1.18, 231 told |
+| protected, 100 people, 3 min | 995.6/s, 284 ms, 1,197 ms, 1.15 | 997.9/s, 315 ms, 1,780 ms, 1.23 |
+| unprotected, one person, 3 min | 998.3/s, 220 ms, 1,598 ms, 1.24, nothing told | 976.5/s, 552 ms, 6,992 ms, 1.22, 69,288 told |
+| protected, mix, 3 min | 859.8/s, 4.9 s, 41.1 s, 1.34; again 793.8/s, 11.6 s, 55.2 s, 1.31 | **973.1/s, 545 ms, 8.0 s, 1.27; again 959.4/s, 316 ms, 10.6 s, 1.25** (975.2 and 987.0/s on `mixperf`) |
+| protected, mix, 10 min | 799.1/s, 45.0 s, 68.0 s, 1.24, 61,024 failed | 833.8/s, 11.6 s, 69.3 s, 1.23, 39,329 failed (850.5/s on `mixperf`) |
+
+- **The plain and protected runs hold 1,000/s for three minutes**
+  (987.6 and 997.9/s); p99 still misses 1 s (1.76 and 1.78 s; per 10 s
+  0.18 to 2.25 s).
+- **The mix is back near 1,000/s for three minutes** (973.1 and
+  959.4/s, against 859.8 and 793.8 this morning), close to `mixperf`'s
+  975.2 and 987.0/s; p99 8.0 and 10.6 s (2.9 and 5.6 on `mixperf`).
+- **From 130 to 150 s on, the mix runs and one person's agents slow the
+  same way** (BUG-1955's open item, seen on `mixperf`; the unprotected
+  run in its last 10 s, 231 answers): the queue stays short (at most 374
+  queued in any 10 s of the 3-minute runs) but an accepted submit waits
+  longer (wait p99 per 10 s from about 1 s to 3 to 7 s), landings behind 2 s of waiting are answered `503 busy`, and
+  p99 grows with the run (one person's agents: p99 per 10 s 1.5 s at
+  120 s, 5.2 s at 130 s, 8.2 s at 180 s; 4,823 to 15,986 `busy` answers
+  per 10 s from 130 s on). This morning the one-person run had none:
+  where it starts varies from run to run. The deriver ends 56 to 116 s
+  behind in the 3-minute runs and 300 s in the 10-minute one.
+- **Ten minutes with the mix** misses as before: 833.8/s (628 to
+  1,043/s per 10 s), p99 69.3 s, 39,329 landings the agents gave up on.
+
+**Ten minutes, the mix** (a row a minute):
+
+| t (s) | offered/s | landed/s | finished/s | queue | p50 ms | p99 ms | wait p50 | wait p99 | told to wait | failed | to merges | conflicts | per batch | commits/landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 60 | 1,000 | 997 | 997 | 156 | 253 | 2,704 | 241 | 928 | 0 | 0 | 277 | 750 | 34.1 | 1.37 |
+| 120 | 1,000 | 1,017 | 1,017 | 399 | 506 | 3,698 | 497 | 802 | 0 | 0 | 273 | 926 | 50.6 | 1.28 |
+| 180 | 1,000 | 846 | 846 | 93 | 2,562 | 8,422 | 2,113 | 3,313 | 10,785 | 2 | 288 | 828 | 40.6 | 1.14 |
+| 240 | 1,000 | 964 | 964 | 242 | 8,115 | 16,495 | 4,548 | 8,218 | 35,119 | 73 | 252 | 820 | 49.4 | 1.13 |
+| 300 | 1,000 | 691 | 691 | 92 | 19,057 | 28,369 | 8,478 | 12,361 | 47,562 | 156 | 198 | 617 | 35.9 | 1.29 |
+| 360 | 1,000 | 779 | 777 | 63 | 32,089 | 47,095 | 8,218 | 11,413 | 40,219 | 277 | 325 | 869 | 46.9 | 1.26 |
+| 420 | 1,000 | 820 | 820 | 50 | 47,233 | 59,894 | 5,007 | 12,674 | 38,450 | 346 | 318 | 570 | 53.2 | 1.21 |
+| 480 | 1,000 | 717 | 717 | 139 | 59,872 | 69,581 | 4,848 | 13,199 | 31,065 | 1,257 | 202 | 259 | 53.0 | 1.20 |
+| 540 | 1,000 | 725 | 725 | 213 | 61,797 | 72,298 | 4,786 | 13,461 | 43,619 | 4,178 | 224 | 163 | 44.5 | 1.21 |
+| 600 | 998 | 772 | 768 | 54 | 60,817 | 71,241 | 4,469 | 12,448 | 42,943 | 2,874 | 241 | 156 | 39.0 | 1.18 |
+
+### What still misses (2026-11-13 evening)
+
+| Gate | Result | Target |
+|---|---|---|
+| 1,000 landings/s held, 3 min, plain / protected / one person | 987.6 / 997.9 / 976.5 | protected **passes**; plain 1.2 % and one person 2.4 % short |
+| p99 at 1,000/s, plain runs | 1,760 / 1,780 / 6,992 ms | 1 s: **miss** (G4) |
+| p50 at 1,000/s, plain runs | 315 to 552 ms | 150 ms: **miss** |
+| 1,000/s with the mix, 3 min | 973.1, 959.4 (p99 8.0 and 10.6 s) | near; p99 **misses** |
+| 1,000/s with the mix, 10 min | 833.8 (p99 69.3 s) | **miss** (BUG-1955) |
+| commits per landing | 1.18 to 1.23 plain, 1.23 to 1.27 with the mix | 1.5: **pass** |
+| the many-branch headline over 10 min | 245.8 pushes/s, 49.2 branch landings/s, p99 3.6 s, nothing told to come back | no fixed target; **holds** (fell to 30.7/s this morning) |
+| the tool's cost gate in the many-branch shape | 2.34 to 3.23 commits a push of its own | 1: **miss** (BUG-2350) |
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |

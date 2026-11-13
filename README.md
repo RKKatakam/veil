@@ -57,11 +57,13 @@ blame and search answered by the server in milliseconds.
 
 ## Measured
 
-Landings measured on 2026-11-13 (the code as published, `dc4e3f82`), the
-comparison with Git on 2026-11-12, on one 32-core machine that also ran the
-load generator, PostgreSQL (with the deployment's settings) and the object
-store. The full tables, misses included, are in
-[LOAD.md](docs/design/scale/LOAD.md) (landings) and
+Landings measured on the evening of 2026-11-13 (the code as published,
+`171a625a`), the comparison with Git on 2026-11-12, on one 32-core machine
+that also ran the load generator, PostgreSQL (with the deployment's
+settings) and the object store (a local directory). These are one-machine
+numbers; the paid run across several machines will keep objects in MinIO
+for its speed gates (BUG-2290's decision). The full tables, misses
+included, are in [LOAD.md](docs/design/scale/LOAD.md) (landings) and
 [OPENSCION.md](docs/design/scale/OPENSCION.md) (beside Git).
 
 **Landing changes on one `main`** (10,000 agents offering 1,000 a second,
@@ -69,17 +71,30 @@ three minutes unless noted; the target is 1,000 a second held, p99 under 1 s):
 
 | | Landed a second | p50 / p99 | Note |
 |---|---|---|---|
-| Agents of 100 people | **996** | 348 ms / 1.44 s | 1.20 database commits a landing; nothing refused. For comparison: 20 to 30 a second with pull, rebase, push and retry. |
-| Protected `main` | **996** | 284 ms / 1.20 s | 1.15 commits a landing |
-| All agents one person's | **998** | 220 ms / 1.60 s | 1.24 commits a landing |
-| Protected `main`, 3 % overlapping and 2 % conflicting changes | 860 and 794 (two runs) | 4.9 s / 41 s and 11.6 s / 55 s | **Misses**: 951 a second on 2026-11-12. The batch now merges overlapping changes itself, which lowered commits a landing (1.64 then, 1.31 and 1.34 now) but slowed each batch (BUG-2220) |
-| The same, ten minutes | 799 | 45 s / 68 s | **Misses**: 604 to 992 a second per 10 s (BUG-1955); 808 on 2026-11-12 |
-| Offered 1.5 times what it can land for 90 s, then 300 a second | 963 on average while overloaded | p99 under 0.3 s once the backlog is gone (one 10 s stretch at 1.0 s) | Agents past capacity are told at once to come back; every landing made is one an agent sees; the backlog clears 90 s after the load drops |
-| Many agents, each on its own branch, landing it on `main` every 5th push | 72 pushes and 13.4 branch landings a second (300 agents), 116 and 19.5 (1,000) | 2.1 s / 21 s (300) | **Falls** from 218 pushes and 48 landings a second in a 30 s run: the server's CPU per push is 104 ms over 30 s, 395 ms over 180 s; without the landings on `main` the same agents push 633 a second for 180 s (BUG-2221) |
+| Agents of 100 people | **988** | 344 ms / 1.76 s | 1.18 database commits a landing; nothing failed. For comparison: 20 to 30 a second with pull, rebase, push and retry. |
+| Protected `main` | **998** | 315 ms / 1.78 s | 1.23 commits a landing |
+| All agents one person's | **977** | 552 ms / 6.99 s | 1.22 commits a landing; from 130 s on, 69,288 answers told agents to come back (BUG-1955) |
+| Protected `main`, 3 % overlapping and 2 % conflicting changes | **973 and 959** (two runs) | 545 ms / 8.0 s and 316 ms / 10.6 s | p99 **misses**; 860 and 794 a second this morning, before BUG-2220's fix |
+| The same, ten minutes | 834 | 11.6 s / 69 s | **Misses**: 628 to 1,043 a second per 10 s; 39,329 landings given up (BUG-1955); 799 this morning |
+| Offered 1.5 times what it can land for 90 s, then 300 a second (this morning, `dc4e3f82`; not run again) | 963 on average while overloaded | p99 under 0.3 s once the backlog is gone (one 10 s stretch at 1.0 s) | Agents past capacity are told at once to come back; every landing made is one an agent sees; the backlog clears 90 s after the load drops |
 
-What still misses: p99 under 1 s at 1,000 a second (1.2 to 1.6 s), p50
-under 150 ms (220 to 348 ms), the mix at 1,000 a second for three and for ten
-minutes, and the many-branch workload over minutes rather than seconds.
+**Many agents, each on its own branch**, pushing in a closed loop and
+landing the branch on `main` every 5th push (as many as they can; one
+person's agents):
+
+| Agents, run | Pushes a second | Branches landed on `main` a second | p50 / p99 (a push) | Note |
+|---|---|---|---|---|
+| 300, three minutes | **372** | **74.7** | 789 ms / 1.61 s | **p99 misses 1 s**; 40 ms of server CPU a push; 6.8 storage reads a push; nothing told to come back. This morning: 72 and 13.4, p99 21 s (BUG-2221) |
+| 1,000, three minutes | **258** | **52.4** | 4.0 s / 6.2 s | **p99 misses 1 s**; 7,290 requests told to come back, each waited out; this morning 116 and 19.5 |
+| 300, ten minutes | **246** | **49.2** | 1.07 s / 3.6 s | **p99 misses 1 s**; holds over ten minutes (30.7 pushes a second before BUG-2221's fix); 8.5 storage reads a push, 99.5 % object cache hits; 94 packs listed at the end |
+
+What still misses: p99 under 1 s at 1,000 landings a second (1.8 to 7.0 s;
+from about 130 s on, an accepted landing waits longer while the queue
+stays short, BUG-1955), p50 under 150 ms (315 to 552 ms), the mix's p99,
+the mix at 1,000 a second for ten minutes, and p99 under 1 s in the
+many-branch shape (1.6 to 6.2 s). Every many-branch run also misses the
+benchmark's cost gate of one database commit a push (2.3 to 3.2,
+BUG-2350).
 
 **Beside Git**, on the same files (medians of 5 to 9):
 
