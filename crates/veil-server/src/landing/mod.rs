@@ -415,6 +415,8 @@ pub struct Stats {
     pub p_derive_finish_us: AtomicU64,
     pub p_derive_prs_us: AtomicU64,
     pub p_derive_big: AtomicU64,
+    pub p_blk_n: AtomicU64,
+    pub p_blk_queue_us: AtomicU64,
     pub p_d_tree_us: AtomicU64,
     pub p_d_sources_us: AtomicU64,
     pub p_d_last_us: AtomicU64,

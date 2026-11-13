@@ -174,8 +174,12 @@ static MALLOC_CONF: &[u8; 70] = b"narenas:2,background_thread:true,dirty_decay_m
 
 fn main() -> anyhow::Result<()> {
     // Deep trees recurse on every server thread (BUG-1052).
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+    let mut b = tokio::runtime::Builder::new_multi_thread();
+    // PROFILE (lateslow): the blocking pool's size, for an experiment.
+    if let Some(n) = std::env::var("VEIL_PROF_BLOCKING").ok().and_then(|v| v.parse().ok()) {
+        b.max_blocking_threads(n);
+    }
+    b.enable_all()
         .thread_stack_size(veil_server::THREAD_STACK)
         .build()?
         .block_on(serve())
@@ -365,6 +369,11 @@ fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
         "landing_p_derive_finish_us": hub.landing.stats.p_derive_finish_us.load(Relaxed),
         "landing_p_derive_prs_us": hub.landing.stats.p_derive_prs_us.load(Relaxed),
         "landing_p_derive_big": hub.landing.stats.p_derive_big.load(Relaxed),
+        "landing_p_blk_n": hub.landing.stats.p_blk_n.load(Relaxed),
+        "landing_p_blk_queue_us": hub.landing.stats.p_blk_queue_us.load(Relaxed),
+        "landing_p_put_n": veil_server::store::PUT_N.load(Relaxed),
+        "landing_p_put_queue_us": veil_server::store::PUT_QUEUE_US.load(Relaxed),
+        "landing_p_put_run_us": veil_server::store::PUT_RUN_US.load(Relaxed),
         "landing_p_d_tree_us": hub.landing.stats.p_d_tree_us.load(Relaxed),
         "landing_p_d_sources_us": hub.landing.stats.p_d_sources_us.load(Relaxed),
         "landing_p_d_last_us": hub.landing.stats.p_d_last_us.load(Relaxed),
