@@ -3,7 +3,8 @@
 //! called by every push that lists a pack), so the packs a lookup searches
 //! stay bounded under continuous pushes; BUG-2270: a merge whose staged
 //! replacement another server discarded meanwhile gives way instead of
-//! replacing the old packs by nothing.
+//! replacing the old packs by nothing; BUG-2280: the packs a merge replaced,
+//! and a crashed merge's staged pack, are swept with no push since.
 
 use std::{
     sync::{
@@ -17,7 +18,7 @@ use bytes::Bytes;
 use veil_core::{object::Object, ObjectId};
 use veil_server::{
     pack::LISTED,
-    pack_gc::{self, Options, SwitchHook, MERGE_MIN_PACKS, SMALL_PACK_BYTES},
+    pack_gc::{self, CrashPoint, Options, SwitchHook, MERGE_MIN_PACKS, SMALL_PACK_BYTES},
 };
 
 use crate::{limits::project_id_of, support::*};
@@ -235,23 +236,41 @@ fn bug_2270_a_merge_whose_staged_pack_was_discarded_gives_way() {
     read_all(&fresh, pid, &ids, "after the merge, another server");
 }
 
-/// BUG-2280: the packs a background merge replaced are deleted only by a
-/// later pass on the project (`sweep_discarded`, once their grace period
-/// has passed), and a pass runs only when a push finds 64 small packs
-/// listed. A project that goes quiet after a burst keeps the packs its
-/// last minute of merges replaced stored for good (and a crashed merge's
-/// staged pack, swept only by a later pass's `sweep_staged`). Here the
-/// grace period is made to pass at once (the discarded rows aged): nothing
-/// deletes them.
+/// The names of `project`'s packs in `state`, and of its merges' staged
+/// packs when `state` is `STAGED` (`person_id IS NULL`).
+fn pack_names(hub: &TestHub, project: i64, state: i16) -> Vec<String> {
+    hub.rt
+        .block_on(
+            sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = $2 AND (state <> 0 OR person_id IS NULL) ORDER BY name")
+                .bind(project)
+                .bind(state)
+                .fetch_all(&hub.hub().db),
+        )
+        .unwrap()
+}
+
+/// Whether pack `name` of `project` is still in storage.
+fn stored(hub: &TestHub, project: i64, name: &str) -> bool {
+    let h = hub.hub();
+    hub.rt.block_on(h.objects.blob_store().exists(&veil_server::pack::key(project, name))).expect("storage answers")
+}
+
+/// BUG-2280: the packs a background merge replaced are deleted once their
+/// grace period has passed, with no push since: a merging pass starts a
+/// sweeper (`pack_gc::schedule_sweep`) that looks again at least every
+/// `SWEEP_RECHECK` and sweeps what is due. Here the grace period is made
+/// to pass at once (the discarded rows aged): their rows and storage
+/// objects go, and every snapshot pushed is still read, on this server and
+/// a fresh one.
 #[test]
-#[ignore = "BUG-2280: packs a background merge replaced stay stored once the project goes quiet"]
 fn bug_2280_packs_a_background_merge_replaced_are_deleted_after_the_grace_period() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let pid = project_id_of(&hub, &p.name);
     let api = hub.api();
+    let mut pushed = Vec::new();
     for i in 0..MERGE_MIN_PACKS + 8 {
-        push_file(&api, &p, "quiet", &format!("src/q{i}.txt"));
+        pushed.push(push_file(&api, &p, "quiet", &format!("src/q{i}.txt")));
     }
     let h = hub.hub();
     let until = Instant::now() + Duration::from_secs(30);
@@ -264,6 +283,8 @@ fn bug_2280_packs_a_background_merge_replaced_are_deleted_after_the_grace_period
     let (small, discarded) = small_and_discarded(&hub, pid);
     assert!(small < MERGE_MIN_PACKS as i64, "{small} small packs still listed");
     assert!(discarded >= pack_gc::TIER_MIN_PACKS as i64, "the merges replaced the pushes' packs: {discarded} discarded");
+    let replaced = pack_names(&hub, pid, 2);
+    assert!(replaced.iter().all(|n| stored(&hub, pid, n)), "the replaced packs are stored through their grace period");
     // The grace period passes (as it does a minute later).
     let aged = hub
         .rt
@@ -275,10 +296,96 @@ fn bug_2280_packs_a_background_merge_replaced_are_deleted_after_the_grace_period
         )
         .expect("the discarded rows are aged");
     assert_eq!(aged.rows_affected() as i64, discarded);
-    let until = Instant::now() + Duration::from_millis(pack_gc::DEFAULT_PACK_GRACE_MS as u64) + Duration::from_secs(15);
+    let until = Instant::now() + pack_gc::SWEEP_RECHECK + Duration::from_secs(20);
     while small_and_discarded(&hub, pid).1 > 0 && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(500));
     }
     let (_, left) = small_and_discarded(&hub, pid);
     assert_eq!(left, 0, "{left} replaced packs still stored after their grace period, with no push since");
+    assert!(h.pack_gc.sweeps.load(Ordering::Relaxed) >= 1, "the sweeper swept");
+    for n in &replaced {
+        assert!(!stored(&hub, pid, n), "replaced pack {n} still in storage");
+    }
+    read_all(&hub, pid, &pushed, "after the sweep");
+    let fresh = TestHub::beside(&hub);
+    read_all(&fresh, pid, &pushed, "after the sweep, another server");
+}
+
+/// BUG-2280: a merge interrupted after writing its staged pack, before its
+/// switch (a server stopped), leaves the pack staged; another server's
+/// look at start-up (`pack_gc::projects_to_sweep`, then `schedule_sweep`,
+/// as `sweep_scan` does) finds the project and sweeps it with no push
+/// since: the staged pack is discarded (its storage object deleted at
+/// once), its row deleted once the grace period has passed, and the packs
+/// listed are untouched (every object read on both servers).
+#[test]
+fn bug_2280_a_crashed_merges_staged_pack_is_swept_without_a_push() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let h = hub.hub();
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let raw = Bytes::from(Object::Blob(format!("BUG-2280 object {i}").into_bytes()).encode());
+        let id = ObjectId::hash(&raw);
+        ids.push(id);
+        let enc = veil_server::store::encode(raw);
+        hub.rt.block_on(async {
+            let (name, held) = h.objects.put_pack(pid, 1, vec![(id, enc)]).await.expect("the pack is stored");
+            let r = sqlx::query("UPDATE packs SET state = $3 WHERE project_id = $1 AND name = $2")
+                .bind(pid)
+                .bind(&*name)
+                .bind(LISTED)
+                .execute(&h.db)
+                .await
+                .expect("the pack is listed");
+            assert_eq!(r.rows_affected(), 1);
+            h.objects.listed_here(pid, vec![(name, held.index.clone())]);
+        });
+    }
+    let listed_before = pack_names(&hub, pid, LISTED);
+    assert_eq!(listed_before.len(), 4);
+    let crash = Options { crash: Some(CrashPoint::AfterWriteBeforeSwitch), ..Options::merge_only() };
+    let rep = hub.rt.block_on(pack_gc::run_project(&h, pid, &crash)).expect("the merge runs");
+    assert!(!rep.skipped, "{rep:?}");
+    assert_eq!(rep.packs_merged, 0, "the merge stopped before its switch: {rep:?}");
+    let staged = pack_names(&hub, pid, 0);
+    assert_eq!(staged.len(), 1, "the interrupted merge left its pack staged");
+    assert!(stored(&hub, pid, &staged[0]), "the staged pack was written");
+    // Another server starts.
+    let fresh = TestHub::beside(&hub);
+    let f = fresh.hub();
+    let due = fresh.rt.block_on(pack_gc::projects_to_sweep(&f)).expect("the look runs");
+    assert!(due.contains(&pid), "the start-up look finds the project");
+    fresh.rt.block_on(async { pack_gc::schedule_sweep(&f, pid) });
+    let until = Instant::now() + pack_gc::SWEEP_RECHECK + Duration::from_secs(20);
+    while (!pack_names(&hub, pid, 0).is_empty() || stored(&hub, pid, &staged[0])) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(pack_names(&hub, pid, 0).is_empty(), "the staged pack is no longer staged");
+    assert!(!stored(&hub, pid, &staged[0]), "the staged pack's storage object is deleted");
+    assert_eq!(pack_names(&hub, pid, 2), staged, "its row is discarded, kept for the grace period");
+    // The grace period passes: the row goes.
+    let aged = hub
+        .rt
+        .block_on(
+            sqlx::query("UPDATE packs SET discarded_at = discarded_at - $2 WHERE project_id = $1 AND state = 2")
+                .bind(pid)
+                .bind(2 * pack_gc::DEFAULT_PACK_GRACE_MS)
+                .execute(&h.db),
+        )
+        .expect("the discarded row is aged");
+    assert_eq!(aged.rows_affected(), 1);
+    let until = Instant::now() + pack_gc::SWEEP_RECHECK + Duration::from_secs(20);
+    while !pack_names(&hub, pid, 2).is_empty() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(pack_names(&hub, pid, 2).is_empty(), "the discarded row is deleted after its grace period");
+    assert!(f.pack_gc.sweeps.load(Ordering::Relaxed) >= 2, "the other server's sweeper swept twice");
+    assert_eq!(pack_names(&hub, pid, LISTED), listed_before, "the listed packs are untouched");
+    read_all(&hub, pid, &ids, "after the sweep");
+    read_all(&fresh, pid, &ids, "after the sweep, another server");
+    // Nothing is left to sweep: the sweeper stopped and the look finds nothing.
+    let due = fresh.rt.block_on(pack_gc::projects_to_sweep(&f)).expect("the look runs");
+    assert!(!due.contains(&pid), "nothing of the project is left to sweep");
 }
