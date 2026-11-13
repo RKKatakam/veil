@@ -144,8 +144,9 @@ pub struct Config {
     /// `derive::DERIVE_CONNECTIONS` more.
     pub db_connections: u32,
     /// Derive, in the background once serving, every branch a landing left
-    /// underived (`derive::resume`), and start the landing services of
-    /// every branch with queued landings (`landing::resume`). Servers do;
+    /// underived (`derive::resume`), start the landing services of every
+    /// branch with queued landings (`landing::resume`), and sweep the packs
+    /// left to sweep (`pack_gc::sweep_scan`). Servers do;
     /// tests that count their own derive runs, or share a database between
     /// servers with separate object stores, turn it off.
     pub catch_up_at_start: bool,
@@ -255,6 +256,7 @@ pub async fn start(config: Config) -> Result<Running> {
     tokio::spawn(embargo::run_loop(hub.clone(), rx.clone()));
     let pace = cache::deadline::Pace { stall: ANSWER_STALL, grace: ANSWER_STALL, min_rate: limits::body::MIN_RATE };
     let connections = ConnectionLimits { pace, max_connections: config.limits.max_connections, buffer: HTTP_BUFFER };
+    let sweep_stop = rx.clone();
     let task = tokio::spawn(serve(listener, tls, app, rx, Some(connections), Some(hub.limits.connections.clone())));
     if config.catch_up_at_start {
         tokio::spawn({
@@ -268,6 +270,9 @@ pub async fn start(config: Config) -> Result<Running> {
         // Landings queued when a server stopped are landed.
         tokio::spawn(landing::resume(hub.clone()));
         tokio::spawn(bisect::resume(hub.clone()));
+        // Packs a stopped server left to sweep, then a look every few
+        // minutes (BUG-2280).
+        tokio::spawn(pack_gc::sweep_scan(hub.clone(), sweep_stop));
     }
     Ok(Running {
         addr,

@@ -205,6 +205,16 @@ impl Options {
         }
     }
 
+    /// Options for a pass that only sweeps (BUG-2280, [`schedule_sweep`]):
+    /// it merges nothing and drops no object.
+    pub fn sweep_only() -> Self {
+        Options {
+            min_packs_to_merge: usize::MAX,
+            run_gc: false,
+            ..Options::default()
+        }
+    }
+
     fn now_ms(&self) -> i64 {
         veil_core::now_millis().saturating_add(self.now_offset_ms)
     }
@@ -255,6 +265,11 @@ pub struct State {
     pub runs: AtomicU64,
     /// Background merge passes that merged packs (for tests).
     pub background_merges: AtomicU64,
+    /// Projects with a sweeper task on this server ([`schedule_sweep`]),
+    /// each with whether it was asked again since it last looked.
+    sweeping: Mutex<HashMap<i64, bool>>,
+    /// Sweeper passes that deleted or discarded packs (for tests).
+    pub sweeps: AtomicU64,
 }
 
 /// The least time between two counts of a project's small packs by one
@@ -332,10 +347,153 @@ async fn merge_small_packs(hub: &Arc<Hub>, project: i64) -> bool {
     match run_project(hub, project, &opts).await {
         Ok(r) if !r.skipped && r.packs_merged > 0 => {
             hub.pack_gc.background_merges.fetch_add(1, Ordering::Relaxed);
+            // The packs it replaced are deleted once their grace period
+            // has passed, whether or not anything pushes again (BUG-2280).
+            schedule_sweep(hub, project);
             true
         }
         _ => false,
     }
+}
+
+/// The longest a sweeper ([`schedule_sweep`]) waits before it looks at its
+/// project again, and its wait after a pass that swept nothing (skipped:
+/// another server's pass holds the project's lock).
+pub const SWEEP_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a server looks for projects with packs to sweep
+/// ([`sweep_scan`]), the first time at start-up.
+pub const SWEEP_SCAN: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Sweep `project`'s packs as each becomes due, until none is left
+/// (BUG-2280): packs a merge replaced (`DISCARDED`, once
+/// [`DEFAULT_PACK_GRACE_MS`] has passed since), a merge's staged pack
+/// that no merge holds (an interrupted one's: at once) and an upload
+/// staged and never listed (after [`DEFAULT_STAGED_GRACE_MS`]).
+/// Non-blocking; at most one task per project on this server (a call
+/// while it runs makes it look again before it stops). Each pass is
+/// [`Options::sweep_only`] through [`run_project`]: the project's advisory
+/// lock (another server's pass, or a merge, makes it a skip, tried again
+/// after [`SWEEP_RECHECK`]), a derive worker permit and S24's shedding,
+/// and only `sweep_staged` and `sweep_discarded`, which delete nothing
+/// but rows they find `DISCARDED` past the grace period (a discarded row
+/// never turns listed) and discard only rows still `STAGED`. The task
+/// looks again at least every [`SWEEP_RECHECK`], so it never sleeps past
+/// what another server swept or discarded meanwhile; after each pass it
+/// ran it calls [`maybe_schedule`], so a background merge skipped while
+/// the pass held the lock is not left undone.
+pub fn schedule_sweep(hub: &Arc<Hub>, project: i64) {
+    {
+        let mut sweeping = hub.pack_gc.sweeping.lock().unwrap();
+        if let Some(again) = sweeping.get_mut(&project) {
+            *again = true;
+            return;
+        }
+        sweeping.insert(project, false);
+    }
+    let hub = hub.clone();
+    tokio::spawn(async move {
+        loop {
+            let wait = match sweep_due(&hub, project).await {
+                Ok(None) => {
+                    let mut sweeping = hub.pack_gc.sweeping.lock().unwrap();
+                    let again = sweeping.entry(project).or_insert(false);
+                    if !*again {
+                        sweeping.remove(&project);
+                        return;
+                    }
+                    *again = false;
+                    continue;
+                }
+                Ok(Some(due)) => {
+                    let now = veil_core::now_millis();
+                    if due > now {
+                        std::time::Duration::from_millis((due - now) as u64).min(SWEEP_RECHECK)
+                    } else {
+                        let r = run_project(&hub, project, &Options::sweep_only()).await;
+                        if matches!(&r, Ok(r) if !r.skipped) {
+                            // A background merge that found the lock held
+                            // by this pass counts again.
+                            maybe_schedule(&hub, project);
+                        }
+                        match r {
+                            Ok(r) if !r.skipped && r.discarded_packs_swept + r.staged_packs_swept > 0 => {
+                                hub.pack_gc.sweeps.fetch_add(1, Ordering::Relaxed);
+                                std::time::Duration::ZERO
+                            }
+                            _ => SWEEP_RECHECK,
+                        }
+                    }
+                }
+                Err(_) => SWEEP_RECHECK,
+            };
+            tokio::time::sleep(wait).await;
+        }
+    });
+}
+
+/// When `project` next has a pack to sweep ([`schedule_sweep`]), in
+/// milliseconds since the epoch; `None`: nothing to sweep. A discarded
+/// row with no `discarded_at` (none is written so) is never due, as in
+/// `sweep_discarded`.
+async fn sweep_due(hub: &Hub, project: i64) -> Result<Option<i64>> {
+    const _: () = assert!(LISTED == 1);
+    let (discarded, jobs, upload): (Option<i64>, i64, Option<i64>) = sqlx::query_as(
+        "SELECT min(discarded_at) FILTER (WHERE state = $2), count(*) FILTER (WHERE state = $3 AND person_id IS NULL), \
+         min(created_at) FILTER (WHERE state = $3 AND person_id IS NOT NULL) FROM packs WHERE project_id = $1 AND state <> 1",
+    )
+    // `state <> 1` (LISTED) is written literally so the partial index
+    // `packs_unlisted` (migration 40) serves it under a generic plan too.
+    .bind(project)
+    .bind(DISCARDED)
+    .bind(STAGED)
+    .fetch_one(&hub.db)
+    .await?;
+    let now = veil_core::now_millis();
+    Ok([
+        discarded.map(|t| t.saturating_add(DEFAULT_PACK_GRACE_MS)),
+        (jobs > 0).then_some(now),
+        upload.map(|t| t.saturating_add(DEFAULT_STAGED_GRACE_MS)),
+    ]
+    .into_iter()
+    .flatten()
+    .min())
+}
+
+/// Every [`SWEEP_SCAN`], the first time at start-up, start a sweeper
+/// ([`schedule_sweep`]) on every project with packs to sweep (BUG-2280):
+/// those a server stopped before sweeping (a merge interrupted, or the
+/// replaced packs of one whose server stopped within their grace period)
+/// are swept whether or not the project is pushed to again. Reads only
+/// the rows of packs not listed (`packs_unlisted`, migration 40).
+pub async fn sweep_scan(hub: Arc<Hub>, mut stop: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        for project in projects_to_sweep(&hub).await.unwrap_or_default() {
+            schedule_sweep(&hub, project);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(SWEEP_SCAN) => {}
+            _ = stop.changed() => return,
+        }
+    }
+}
+
+/// The projects [`sweep_scan`] starts a sweeper on: those with a pack
+/// discarded, a merge's pack staged, or an upload staged for longer than
+/// [`DEFAULT_STAGED_GRACE_MS`].
+pub async fn projects_to_sweep(hub: &Hub) -> Result<Vec<i64>> {
+    let cutoff = veil_core::now_millis().saturating_sub(DEFAULT_STAGED_GRACE_MS);
+    // `state <> 1` written out (`LISTED`), so the partial index serves it.
+    const _: () = assert!(LISTED == 1);
+    Ok(sqlx::query_scalar(
+        "SELECT DISTINCT project_id FROM packs WHERE state <> 1 \
+         AND (state = $1 OR (state = $2 AND (person_id IS NULL OR created_at <= $3)))",
+    )
+    .bind(DISCARDED)
+    .bind(STAGED)
+    .bind(cutoff)
+    .fetch_all(&hub.db)
+    .await?)
 }
 
 /// Run one bounded merge and/or garbage-collection pass on `project`.

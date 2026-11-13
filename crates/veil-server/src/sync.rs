@@ -3412,9 +3412,22 @@ async fn push_staged(
             // same person discarded first cannot be listed: nothing lands,
             // and `vl` uploads again.
             if !packs.0.is_empty() {
-                // A staged row turns listed (locked by the update: a racing
-                // discard waits, then finds it listed); the push's own pack
-                // gets its row here; a discarded one stays discarded.
+                // Every pack was recorded staged before it was written; a
+                // row gone was discarded and then deleted with its storage
+                // object (a sweep of an upload past its grace period, by a
+                // server without this push's index in hand: BUG-2310).
+                // Locked: a racing discard or delete waits, then finds it
+                // listed.
+                let have: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND name = ANY($2) FOR UPDATE")
+                    .bind(pid)
+                    .bind(&packs.0)
+                    .fetch_all(&mut *c)
+                    .await?;
+                if have.len() != packs.0.len() {
+                    return Err(Error::conflict("an upload this push names was discarded; push again"));
+                }
+                // A staged row turns listed; a discarded one stays
+                // discarded.
                 let states: Vec<i16> = sqlx::query_scalar(
                     "INSERT INTO packs (project_id, name, state, size, objects, created_at) \
                      SELECT $1, n, $6, s, o, $5 FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) AS t(n, s, o) \
