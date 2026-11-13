@@ -16,6 +16,18 @@ a command in this document, and every result directory records what made it.
 The runbook behind this page, with the reasons for each choice, is
 `docs/DEPLOY.md`; the kit is `deploy/` (`deploy/README.md`).
 
+**Where the objects are.** Veil's servers keep objects in an
+S3-compatible store. The speed runs use **MinIO on a storage droplet of
+the run**, not DigitalOcean Spaces: one Spaces bucket allows about 800
+requests a second, and the many-branch headline needs about 4,900 (8.6
+reads and 11.0 writes a push at 250 pushes a second; `docs/DEPLOY.md`
+§2.3, BUG-2290). On Spaces the run would measure Spaces' throttling. **One
+short gate, `spaces`, runs on a real Spaces bucket** at 20 pushes a second
+(about 390 requests a second, half the bucket's limit) for 5 minutes, to
+show Veil works there; it is a correctness run, not a speed one. So the
+speed numbers below are Veil on a self-hosted S3-compatible store, as
+someone running Veil on their own machines would have.
+
 ## 1. Prerequisites
 
 | | For | Check |
@@ -28,9 +40,10 @@ The runbook behind this page, with the reasons for each choice, is
 
 For the paid run, at DigitalOcean: an account with a payment method; a
 personal access token with read and write scope (API → Tokens); a Spaces
-key pair (API → Spaces Keys); a **droplet limit of at least 9** (the full
-topology has 9 droplets; new accounts often have 3 to 5: ask for more under
-Account); your public IPv4 address (`curl -4 -s https://ifconfig.me`).
+key pair (API → Spaces Keys; for the `spaces` gate and the teardown's
+check); a **droplet limit of at least 10** (the full topology has 10
+droplets with the storage droplet; new accounts often have 3 to 5: ask
+for more under Account); your public IPv4 address (`curl -4 -s https://ifconfig.me`).
 
 ## 2. Check out the commit
 
@@ -42,11 +55,13 @@ bash deploy/do/test/test.sh   # the kit's own tests; a fake doctl, nothing leave
 
 ## 3. The free rehearsal (about 10 minutes after the image build, no cost)
 
-The paid topology on one machine, small: three YugabyteDB nodes, MinIO in
-place of DigitalOcean Spaces, two Veil servers on the one database and
+The paid topology on one machine, small: three YugabyteDB nodes, MinIO
+over TLS (as on the paid run's storage droplet), two Veil servers on the one database and
 bucket, HAProxy in front of them as the one address, one load driver. Every
 gate runs briefly (seconds, tens of agents), the failover gate included,
-and everything is torn down at the end.
+and the `spaces` gate against the MinIO (there is no Spaces bucket here:
+it checks the gate's flow and verdict), and everything is torn down at
+the end.
 
 ```sh
 deploy/compose/rehearsal.sh me                    # builds the images, runs every gate, tears down
@@ -60,7 +75,7 @@ The first build of the images takes 10 to 25 minutes (a release build of
 Veil in `rust:1.99.1`); later ones reuse Cargo's cache. Results land in
 `deploy/compose/results/<stamp>/`, one directory per gate, laid out as the
 paid run's (§6). **The rehearsal's numbers measure nothing**: one machine
-plays nine, with tens of agents for seconds. It shows that every step of
+plays ten, with tens of agents for seconds. It shows that every step of
 the paid run works, end to end, before anything is rented.
 
 **The last rehearsal, 2026-11-13** (`integration` @ `dc4e3f82`, images
@@ -71,6 +86,10 @@ holder stopped (`docker stop`) the longest pause in landings was 642 ms,
 with it killed (`FAILOVER_HOW=kill`) 442 ms (target 2 s); both times every
 change landed on `main` exactly once (1,624), by the database and by the
 agents' answers. Teardown left nothing. For the flow only, as above.
+Rerun the same day on `dokit4` (`ccda6704`, squashed into the branch with the same code) after the objects moved to
+MinIO (`docs/DEPLOY.md` §9.0): every gate **ok**, the new `spaces` gate
+included (against the rehearsal's MinIO over TLS), the failover pause
+522 ms, 1,624 changes each landed once; teardown left nothing.
 
 At the end the script says `nothing of veil-dokit-me remains (containers,
 volumes, networks)`; check with `docker ps -a --filter
@@ -99,21 +118,46 @@ as in `.env.example`):
 | `NAME-lb` | `c-4` (4 dedicated vCPUs, 8 GB) | HAProxy 3.0, TLS passed through: the one address | 0.125 |
 | `NAME-yb1` to `-yb3` | `c-8` (8 dedicated vCPUs, 16 GB) | YugabyteDB 2025.2.8.1, one node each, three copies of every tablet | 3 × 0.250 |
 | `NAME-driver1`, `-driver2` | `c-8` | `veil-bench`, the simulated agents | 2 × 0.250 |
-| Spaces bucket | | the servers' object store | $5 a month, flat |
-| **total** | | | **2.875** |
+| `NAME-minio` | `c2-16vcpu-32gb` (16 dedicated vCPUs, 32 GB, 400 GB local SSD) | MinIO, the servers' object store: TLS with the run's CA, credentials made for the run, reached only by the run's droplets | 0.572 |
+| Spaces bucket | | the `spaces` gate's object store | $5 a month, flat |
+| **total** | | | **3.447** |
+
+Why that storage droplet: the headline asks about 2,150 reads and 2,750
+writes a second of it, and the gates write at most about 190 GiB in all
+(about 4.4 million pushes and landings at their offered rates × 45.6 KiB
+stored a push, counting merge copies as never deleted; about 45 GiB stay).
+Its own 400 GB SSD holds that with room, and takes thousands of small
+synced writes a second better than a network volume. A size with less
+disk takes `VEIL_DO_OBJECTS_VOLUME_GB=N` (a volume of N ≥ 250 GB, $0.10 a
+GB a month, deleted by the teardown). `VEIL_DO_OBJECTS=spaces` puts every
+server on Spaces instead (no storage droplet, $2.875 an hour), for runs
+that stay under the bucket's rate.
+
+Every topology, as `deploy/do/estimate.sh` prints it (built-in prices, two
+drivers, Spaces' $5 included):
+
+| Topology | USD/hour | 8 hours | A day forgotten | A month forgotten |
+|---|---:|---:|---:|---:|
+| one server, PostgreSQL, MinIO (the default) | 1.822 | 19.58 | 48.73 | 1,229.38 |
+| one server, YugabyteDB ×3, MinIO | 2.322 | 23.58 | 60.73 | 1,565.38 |
+| two servers + balancer, YugabyteDB ×3, MinIO | 2.947 | 28.58 | 75.73 | 1,985.38 |
+| **three servers + balancer, YugabyteDB ×3, MinIO (the full run)** | **3.447** | **32.58** | **87.73** | **2,321.38** |
+| the full run with objects on Spaces (no MinIO) | 2.875 | 28.00 | 74.00 | 1,937.00 |
+| three servers + balancer, PostgreSQL, MinIO | 2.947 | 28.58 | 75.73 | 1,985.38 |
+| the full run + the regional cache | 3.519 | 33.15 | 89.46 | 2,369.77 |
 
 | Step | Command | Takes | Costs (full topology) |
 |---|---|---|---|
 | 0. tests and estimate | `bash deploy/do/test/test.sh`; `deploy/do/estimate.sh` | a minute | nothing |
 | 1. images | `deploy/docker/build.sh` (prints the TAG) | 10 to 25 min the first time | nothing |
-| 2. create | `deploy/do/create.sh`, then `deploy/do/create.sh --approve` | 2 to 5 min | **billing starts**: $2.875 an hour, and the $5 Spaces month once the bucket exists |
-| 3. configure | `deploy/do/configure.sh --approve TAG` | 10 to 20 min (images shipped over SSH) | included in the hours |
+| 2. create | `deploy/do/create.sh`, then `deploy/do/create.sh --approve` | 2 to 5 min | **billing starts**: $3.447 an hour, and the $5 Spaces month once the `spaces` gate's bucket exists |
+| 3. configure | `deploy/do/configure.sh --approve TAG` (MinIO's credentials are made here, into `deploy/do/state/NAME/minio.env`) | 10 to 20 min (images shipped over SSH) | included in the hours |
 | 4. the gates | `deploy/do/bench.sh --approve GATE`, one at a time, in the order below | about 3 hours | included |
 | 5. logs | `deploy/do/logs.sh --approve` | 5 min | included |
 | 6. teardown | `deploy/do/destroy.sh --approve`; then `deploy/do/destroy.sh --check --approve` until it says `nothing left` | 5 min | billing stops |
 
-Planned: 8 hours of machines, **$28.00** with Spaces (`estimate.sh`); a
-teardown forgotten for a day costs $74.00, for a month $1,937.00. The
+Planned: 8 hours of machines, **$32.58** with Spaces (`estimate.sh`); a
+teardown forgotten for a day costs $87.73, for a month $2,321.38. The
 estimate refuses a plan of $100 or more.
 
 The gates, in order (each one line, sizes from `deploy/gates.sh`):
@@ -130,6 +174,7 @@ The gates, in order (each one line, sizes from `deploy/gates.sh`):
 | 8 | `deploy/do/bench.sh --approve objects` | fresh thin workspaces reading objects through a server and a regional cache the tool starts on `NAME-hub` | 4 min |
 | 9 | `deploy/do/bench.sh --approve openscion` | the OpenScion speed gates, Veil against Git on `NAME-hub`, 1,000 and 10,000 files, 5 runs | 15 min |
 | 10 | `deploy/do/bench.sh --approve scale` | the 1 GB profile through a server on `NAME-hub`: push, clone, pull, one directory, gc; the server's peak memory | 40 min |
+| 11 | `deploy/do/bench.sh --approve spaces` | **Veil on a real Spaces bucket**: a server on `NAME-hub` with its objects on Spaces, 100 agents on branches merging every 5th push, 20 pushes a second (19.6 storage requests a push: about 390 a second, half the bucket's 800), 5 minutes; passes with no error and no storage request given up; the store's `503 Slow Down` answers recorded | 7 min |
 
 The PR speed gate (100,000 PRs) is a server test (`prs::pr_speed`), not a
 benchmark that can run against a deployed server; it is measured locally
@@ -151,7 +196,7 @@ pull`); then your numbers are not the published ones.
 | PostgreSQL | `postgres:17-alpine` by digest | `deploy/versions.env` |
 | YugabyteDB | `yugabytedb/yugabyte:2025.2.8.1-b8` by digest | `deploy/versions.env` |
 | HAProxy | `haproxy:3.0-alpine` (3.0.30) by digest | `deploy/versions.env` |
-| MinIO (rehearsal only) | `bitnamilegacy/minio` by digest | `deploy/versions.env` |
+| MinIO (the paid run's storage droplet and the rehearsal) | `bitnamilegacy/minio` by digest | `deploy/versions.env` |
 | droplets | Ubuntu 24.04 (`ubuntu-24-04-x64`), Docker from Ubuntu | `deploy/do/lib.sh`, `deploy/do/cloud-init/docker.yaml` |
 
 Your images are built from the same commit and the same pinned bases, but
@@ -172,7 +217,9 @@ rehearsal: `deploy/compose/results/<stamp>/<gate>/`):
 | `commands.txt` | every `veil-bench` command line, and the machine it ran on |
 | `<label>.json` | the tool's raw results: one object per curve point under `runs`, with `ops_per_s`, `p50_ms`, `p99_ms`, `errors`, `db_commits_per_op`, `gates_missed`, … |
 | `<label>.md` | the same as a table; `<label>.log` the tool's output (`GATE MISSED:` lines name each missed target) |
-| `hub<N>-stats.json`, `hub<N>-docker-stats.log` | each server's request-path counters at the end (the landing service's batches, landings and timings among them: the tool fills its own `landing_*` fields only for a server it starts), and its CPU and memory every 5 s |
+| `hub<N>-stats.json`, `hub<N>-docker-stats.log` | each server's request-path counters at the end (the landing service's batches, landings and timings among them: the tool fills its own `landing_*` fields only for a server it starts; `s3_slow_down` and `s3_gave_up`, the object store's `503`/`429` answers and the requests given up after 10 s of retries), and its CPU and memory every 5 s |
+| `minio-docker-stats.log` | the MinIO storage droplet's CPU, memory, network and disk every 5 s: a run bound by the store shows here |
+| `spaces-verdict.md`, `spaces.json` | the `spaces` gate's verdict (`deploy/checks/spaces-verdict.py`): pushes, merges, errors, requests given up, `503` answers, pushes and storage requests a second |
 | `scaling.md` | the scaling table: each curve's throughput with 1, 2 and 3 servers (summed over the drivers), and its ratio to one server's |
 | `failover-verdict.md`, `failover-check.txt`, `failover-line.txt`, `failover-run.txt`, `failover-after.txt`, `failover.json`, `failover.landings.jsonl` | the failover verdict; the database's checks behind it and `main`'s first-parent line (`n\|snapshot\|change\|tickets`, tip first); what the gate did and when; the tool's numbers and its per-change log (one JSON line per `landed` answer: `ticket`, `change`, `landed`, `project`, `at_ms`; one per failed submit: `failed`, and `ticket` when the server gave one) |
 
@@ -182,7 +229,7 @@ tool's targets; the results are kept either way.
 ## 7. Teardown, and the check that nothing is left
 
 ```sh
-deploy/do/destroy.sh --approve           # droplets by tag, firewall, SSH key, tag; empties and deletes the Spaces buckets
+deploy/do/destroy.sh --approve           # droplets by tag (MinIO's objects with them), MinIO's volume if any, firewall, SSH key, tag; empties and deletes the Spaces buckets
 deploy/do/destroy.sh --check --approve   # exits 0 and says "nothing left" only when it is so
 ```
 
@@ -191,7 +238,7 @@ keys of that name, volumes, snapshots and load balancers whose names start
 with it, every reserved IP in the account (an unassigned one bills), and
 asks Spaces for each bucket the run could have made. Run it until it
 passes; look at Billing the next day. Rotate the token and the Spaces keys
-afterwards.
+afterwards (MinIO's credentials were made for the run and die with it).
 
 ## 8. What we measured
 
@@ -221,3 +268,4 @@ and the file it comes from. Empty: not run yet.
 | object reads from the regional cache's store; the cache's peak memory | `objects` | `objects.json` | |
 | OpenScion: import, clone, commit one file, clone one directory, 1,000 and 10,000 files, against Git | `openscion` | `openscion.md` | |
 | 1 GB profile: push, clone, pull; the server's peak memory | `scale` | `scale-1g.md` | |
+| On Spaces: pushes/s held of the 20 offered, merges into `main`, errors, requests given up, `503 Slow Down` answers | `spaces` | `spaces-verdict.md` (`spaces.json`: `ops_per_s`, `branch_merges`, `errors`, `s3_gave_up`, `s3_slow_down`) | |

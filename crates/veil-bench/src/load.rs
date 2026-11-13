@@ -1656,6 +1656,11 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         result["series"] = json!(series);
         result["steps"] = json!(if stepped { a.steps.clone() } else { Vec::new() });
         result["slowed"] = json!(c.slowed.load(Ordering::Relaxed));
+        // The object store's `503 Slow Down` and `429` answers, every try,
+        // and the requests that failed after the server's retries (a hosted
+        // store's rate limit, BUG-2290).
+        result["s3_slow_down"] = json!(stat("s3_slow_down"));
+        result["s3_gave_up"] = json!(stat("s3_gave_up"));
         result["protected"] = json!(a.protected);
         result["mix"] = json!(a.mix);
         result["people"] = json!(a.people.max(1));

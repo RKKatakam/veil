@@ -101,7 +101,7 @@ VEIL_DO_SPACES_SECRET=secret-spaces-val
 VEIL_DO_DB_PASSWORD=secret-db-pass
 ENV
 export FAKE_NAME=veil-kit-test
-export FAKE_DROPLETS="veil-kit-test-hub veil-kit-test-db veil-kit-test-driver1 veil-kit-test-driver2"
+export FAKE_DROPLETS="veil-kit-test-hub veil-kit-test-db veil-kit-test-driver1 veil-kit-test-driver2 veil-kit-test-minio"
 # State and results go under the test directory, never deploy/do/state or deploy/results.
 mkdir -p "$T/do"; cp "$DO"/*.sh "$T/do/"; cp -r "$DO/cloud-init" "$T/do/"
 sed -i "s|^STATE=\$DO_HERE/state/\$NAME|STATE=$T/state/\$NAME|" "$T/do/lib.sh"
@@ -117,7 +117,7 @@ chmod 600 "$VEIL_DO_ENV"
 out=$("$T/do/create.sh" 2>&1); check "create.sh dry run prints the plan" '[[ "$out" == *"would run: doctl compute droplet create veil-kit-test-hub"* ]]'
 "$T/do/estimate.sh" >/dev/null 2>&1; "$T/do/estimate.sh" --live >/dev/null 2>&1
 "$T/do/destroy.sh" >/dev/null 2>&1; "$T/do/configure.sh" >/dev/null 2>&1
-for g in pull land branches api landing scaling objects openscion scale; do "$T/do/bench.sh" "$g" >/dev/null 2>&1; done
+for g in pull land branches api landing scaling objects openscion scale spaces; do "$T/do/bench.sh" "$g" >/dev/null 2>&1; done
 VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3 "$T/do/bench.sh" failover >/dev/null 2>&1; VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3 "$T/do/configure.sh" >/dev/null 2>&1
 "$T/do/logs.sh" >/dev/null 2>&1
 check "no doctl, aws, curl, ssh or scp call without --approve" '[ ! -s "$FAKE_DOCTL_LOG" ] && [ ! -s "$FAKE_AWS_LOG" ] && [ ! -s "$FAKE_CURL_LOG" ] && [ ! -s "$FAKE_SSH_LOG" ]'
@@ -154,25 +154,28 @@ out=$("$T/do/create.sh" --approve 2>&1); rc=$?
 check "create.sh --approve succeeds" '[ $rc = 0 ]'
 check "imports an ssh key generated for the run (mode 600)" 'grep -q "compute ssh-key import veil-kit-test --public-key-file" "$FAKE_DOCTL_LOG" && [ "$(stat -c %a "$T/state/veil-kit-test/id_ed25519")" = 600 ]'
 check "firewall opens 22 and 8443 to the operator only" 'grep -q "firewall create --name veil-kit-test --tag-names veil-kit-test --inbound-rules protocol:tcp,ports:22,address:203.0.113.200/32 protocol:tcp,ports:8443,address:203.0.113.200/32" "$FAKE_DOCTL_LOG"'
-check "creates 4 droplets, all tagged, from cloud-init" '[ "$(grep -c "compute droplet create" "$FAKE_DOCTL_LOG")" = 4 ] && [ "$(grep "compute droplet create" "$FAKE_DOCTL_LOG" | grep -c -- "--tag-names veil-kit-test .*--user-data-file .*docker.yaml")" = 4 ]'
-check "sizes as configured" 'grep -q "create veil-kit-test-hub --region nyc3 --size c-16" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-test-driver2 --region nyc3 --size c-8" "$FAKE_DOCTL_LOG"'
+check "creates 5 droplets (the MinIO storage droplet included), all tagged, from cloud-init" '[ "$(grep -c "compute droplet create" "$FAKE_DOCTL_LOG")" = 5 ] && [ "$(grep "compute droplet create" "$FAKE_DOCTL_LOG" | grep -c -- "--tag-names veil-kit-test .*--user-data-file .*docker.yaml")" = 5 ]'
+check "sizes as configured" 'grep -q "create veil-kit-test-hub --region nyc3 --size c-16" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-test-driver2 --region nyc3 --size c-8" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-test-minio --region nyc3 --size c2-16vcpu-32gb" "$FAKE_DOCTL_LOG" && ! grep -q "volume create" "$FAKE_DOCTL_LOG"'
 . "$T/state/veil-kit-test/state.env"
 check "state holds the addresses and bucket" '[ "$IP_veil_kit_test_hub" = 203.0.113.1 ] && [ "$PRIV_veil_kit_test_db" = 10.10.0.2 ] && [[ "$BUCKET" == veil-kit-test-objects-* ]] && [ "$FW_ID" = fw-0001 ]'
 check "state file and directory are private" '[ "$(stat -c %a "$T/state/veil-kit-test/state.env")" = 600 ] && [ "$(stat -c %a "$T/state/veil-kit-test")" = 700 ]'
 out=$("$T/do/create.sh" --approve 2>&1 || true); check "a second create.sh refuses while state exists" '[[ "$out" == *"destroy.sh first"* ]]'
 out_cfg=$(VEIL_DO_WITH_CACHE=1 "$T/do/configure.sh" 2>&1)
-check "configure.sh dry run names the server command with Spaces and the private DB address" '[[ "$out_cfg" == *"--s3-endpoint https://nyc3.digitaloceanspaces.com --s3-bucket $BUCKET"* && "$out_cfg" == *"10.10.0.2:5432:5432"* ]]'
+check "configure.sh dry run points the server at MinIO on the private address of the storage droplet, and at the private DB" '[[ "$out_cfg" == *"--s3-endpoint https://10.10.0.5:9000 --s3-bucket $BUCKET --s3-region us-east-1"* && "$out_cfg" == *"10.10.0.2:5432:5432"* ]]'
+out_sp=$(VEIL_DO_OBJECTS=spaces "$T/do/configure.sh" 2>&1)
+check "with VEIL_DO_OBJECTS=spaces the server uses Spaces, and no MinIO is started" '[[ "$out_sp" == *"--s3-endpoint https://nyc3.digitaloceanspaces.com --s3-bucket $BUCKET --s3-region nyc3"* && "$out_sp" != *"--name minio"* && "$out_sp" == *"/etc/veil/hub.env (spaces keys"* ]]'
 out_pull=$("$T/do/bench.sh" pull 2>&1)
 check "bench.sh pull runs on a driver against the hub's private address" '[[ "$out_pull" == *"would run on 203.0.113.3: mkdir -p /srv/bench"* ]] && [[ "$out_pull" == *"--url https://10.10.0.1:8443 --ca /tls/ca.pem"* ]]'
 out_os=$("$T/do/bench.sh" openscion 2>&1)
 check "bench.sh openscion runs on the hub with its own server" '[[ "$out_os" == *"would run on 203.0.113.1"* && "$out_os" == *"--server /usr/local/bin/veil-server"* ]]'
-all_out="$out $out_cfg $out_pull $out_os $(cat "$FAKE_DOCTL_LOG")"
+all_out="$out $out_cfg $out_sp $out_pull $out_os $(cat "$FAKE_DOCTL_LOG")"
 check "no secret ever appears on a command line or in output" '[[ "$all_out" != *"dop_v1_fake_secret_token"* && "$all_out" != *"secret-spaces-key"* && "$all_out" != *"secret-spaces-val"* && "$all_out" != *"secret-db-pass"* ]]'
 
 echo "== 3. topology options and cost bounds"
 out=$(VEIL_DO_YB_NODES=3 VEIL_DO_WITH_CACHE=1 VEIL_DO_NAME=veil-kit-yb "$T/do/create.sh" 2>&1)
 check "YB_NODES=3 replaces the db droplet with three nodes, WITH_CACHE adds a cache" '[ "$(grep -c "would run: doctl compute droplet create veil-kit-yb-yb" <<<"$out")" = 3 ] && [[ "$out" != *"create veil-kit-yb-db "* ]] && [[ "$out" == *"create veil-kit-yb-cache --region nyc3 --size s-4vcpu-8gb"* ]]'
-out=$(VEIL_DO_YB_NODES=3 "$T/do/estimate.sh" 2>/dev/null); check "estimate prices the YugabyteDB topology and Spaces flat fee" '[[ "$out" == *"veil-kit-test-yb3 (yb)"* && "$out" == *"hourly rate (droplets):      \$1.750"* && "$out" == *"planned 8 hours + Spaces:    \$19.00"* && "$out" == *"24 hours left running:       \$47.00"* ]]'
+out=$(VEIL_DO_YB_NODES=3 "$T/do/estimate.sh" 2>/dev/null); check "estimate prices the YugabyteDB topology, the storage droplet and Spaces flat fee" '[[ "$out" == *"veil-kit-test-yb3 (yb)"* && "$out" == *"veil-kit-test-minio (minio)"*"c2-16vcpu-32gb"*"0.572"* && "$out" == *"hourly rate (droplets):      \$2.322"* && "$out" == *"planned 8 hours + Spaces:    \$23.58"* && "$out" == *"24 hours left running:       \$60.73"* ]]'
+out=$(VEIL_DO_YB_NODES=3 VEIL_DO_OBJECTS=spaces "$T/do/estimate.sh" 2>/dev/null); check "with objects on Spaces there is no storage droplet to price" '[[ "$out" != *"(minio)"* && "$out" == *"hourly rate (droplets):      \$1.750"* && "$out" == *"planned 8 hours + Spaces:    \$19.00"* ]]'
 check "estimate and create refuse an unknown droplet size, hours <= 0, or a plan >= \$100" '
     ! VEIL_DO_SIZE_HUB=c-999 "$T/do/estimate.sh" >/dev/null 2>&1 &&
     ! VEIL_DO_SIZE_HUB=c-999 "$T/do/create.sh" >/dev/null 2>&1 &&
@@ -188,12 +191,13 @@ echo "== 4. destroy.sh and partial create recovery"
 export FAKE_DOCTL_STATE_FILE=$T/fake-state; export FAKE_DOCTL_STATE=created; export FAKE_SPACES_STATE=exists
 export FAKE_BUCKET_NAME=$BUCKET
 out=$("$T/do/destroy.sh" --check --approve 2>&1 || true)
-check "the check detects droplets, firewall, ssh key and all 4 Spaces buckets" '[[ "$out" == *"droplets tagged veil-kit-test: 4"* && "$out" == *"firewalls named veil-kit-test: 1"* && "$out" == *"ssh keys named veil-kit-test: 1"* && "$out" == *"Spaces bucket $BUCKET-scale: HTTP 200"* && "$out" == *"SOMETHING IS LEFT"* ]]'
+check "the check detects droplets, firewall, ssh key and all 5 Spaces buckets" '[[ "$out" == *"droplets tagged veil-kit-test: 5"* && "$out" == *"firewalls named veil-kit-test: 1"* && "$out" == *"ssh keys named veil-kit-test: 1"* && "$out" == *"Spaces bucket $BUCKET-scale: HTTP 200"* && "$out" == *"Spaces bucket $BUCKET-spaces: HTTP 200"* && "$out" == *"SOMETHING IS LEFT"* ]]'
 : > "$FAKE_DOCTL_LOG"; : > "$FAKE_AWS_LOG"; : > "$FAKE_CURL_LOG"
 out=$(FAKE_DOCTL_STATE=created FAKE_SPACES_STATE=exists "$T/do/destroy.sh" --approve 2>&1 || true)
 check "destroy deletes droplets by tag, the firewall, the key and the tag" 'grep -q "compute droplet delete --tag-name veil-kit-test --force" "$FAKE_DOCTL_LOG" && grep -q "compute firewall delete fw-0001 --force" "$FAKE_DOCTL_LOG" && grep -q "compute ssh-key delete 4242 --force" "$FAKE_DOCTL_LOG" && grep -q "compute tag delete veil-kit-test --force" "$FAKE_DOCTL_LOG"'
-check "destroy empties and deletes all 4 Spaces buckets without secrets on argv" '
+check "destroy empties and deletes all 5 Spaces buckets without secrets on argv" '
     grep -q "s3://$BUCKET --force" "$FAKE_AWS_LOG" &&
+    grep -q "s3://$BUCKET-spaces --force" "$FAKE_AWS_LOG" &&
     grep -q "s3://$BUCKET-objects --force" "$FAKE_AWS_LOG" &&
     grep -q "s3://$BUCKET-openscion --force" "$FAKE_AWS_LOG" &&
     grep -q "s3://$BUCKET-scale --force" "$FAKE_AWS_LOG" &&
@@ -229,11 +233,13 @@ echo "== 5. the full topology: three servers behind the balancer, three Yugabyte
 : > "$FAKE_DOCTL_LOG"
 FULL="VEIL_DO_NAME=veil-kit-full VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3"
 export FAKE_NAME=veil-kit-full FAKE_DOCTL_STATE=created
-export FAKE_DROPLETS="veil-kit-full-hub veil-kit-full-hub2 veil-kit-full-hub3 veil-kit-full-lb veil-kit-full-yb1 veil-kit-full-yb2 veil-kit-full-yb3 veil-kit-full-driver1 veil-kit-full-driver2"
+export FAKE_DROPLETS="veil-kit-full-hub veil-kit-full-hub2 veil-kit-full-hub3 veil-kit-full-lb veil-kit-full-yb1 veil-kit-full-yb2 veil-kit-full-yb3 veil-kit-full-driver1 veil-kit-full-driver2 veil-kit-full-minio"
 out_est=$(env $FULL "$T/do/estimate.sh" 2>/dev/null)
-check "estimate prices the full topology, a forgotten day and month, and every topology" '[[ "$out_est" == *"veil-kit-full-hub3 (hub)"* && "$out_est" == *"veil-kit-full-lb (lb)"*"c-4"* && "$out_est" == *"hourly rate (droplets):      \$2.875"* && "$out_est" == *"planned 8 hours + Spaces:    \$28.00"* && "$out_est" == *"24 hours left running:       \$74.00"* && "$out_est" == *"a whole month forgotten:     \$1937.00"* && "$out_est" == *"three servers + balancer, YugabyteDB x3 (the full run)"*"2.875"*"28.00"*"74.00"*"1937.00"* && "$out_est" == *"one server, PostgreSQL (the default)"*"1.250"*"15.00"*"35.00"*"845.00"* ]]'
+check "estimate prices the full topology, a forgotten day and month, and every topology" '[[ "$out_est" == *"veil-kit-full-hub3 (hub)"* && "$out_est" == *"veil-kit-full-lb (lb)"*"c-4"* && "$out_est" == *"veil-kit-full-minio (minio)"* && "$out_est" == *"hourly rate (droplets):      \$3.447"* && "$out_est" == *"planned 8 hours + Spaces:    \$32.58"* && "$out_est" == *"24 hours left running:       \$87.73"* && "$out_est" == *"a whole month forgotten:     \$2321.38"* && "$out_est" == *"three servers + balancer, YugabyteDB x3, MinIO (the full run)"*"3.447"*"32.58"*"87.73"*"2321.38"* && "$out_est" == *"the full run with objects on Spaces (no MinIO)"*"2.875"*"28.00"*"74.00"*"1937.00"* && "$out_est" == *"one server, PostgreSQL, MinIO (the default)"*"1.822"*"19.58"*"48.73"*"1229.38"* ]]'
+out_est_sp=$(env $FULL VEIL_DO_OBJECTS=spaces "$T/do/estimate.sh" 2>/dev/null)
+check "estimate prices the full topology with objects on Spaces" '[[ "$out_est_sp" != *"(minio)"* && "$out_est_sp" == *"hourly rate (droplets):      \$2.875"* && "$out_est_sp" == *"planned 8 hours + Spaces:    \$28.00"* && "$out_est_sp" == *"a whole month forgotten:     \$1937.00"* ]]'
 out_c=$(env $FULL "$T/do/create.sh" --approve 2>&1); rc=$?
-check "create.sh makes 9 droplets: 3 servers, the balancer, 3 YugabyteDB nodes, 2 drivers" '[ $rc = 0 ] && [ "$(grep -c "compute droplet create" "$FAKE_DOCTL_LOG")" = 9 ] && grep -q "create veil-kit-full-hub3 --region nyc3 --size c-16" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-full-lb --region nyc3 --size c-4" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-full-yb3 --region nyc3 --size c-8" "$FAKE_DOCTL_LOG" && ! grep -q "create veil-kit-full-db " "$FAKE_DOCTL_LOG"'
+check "create.sh makes 10 droplets: 3 servers, the balancer, 3 YugabyteDB nodes, 2 drivers, the MinIO storage droplet" '[ $rc = 0 ] && [ "$(grep -c "compute droplet create" "$FAKE_DOCTL_LOG")" = 10 ] && grep -q "create veil-kit-full-minio --region nyc3 --size c2-16vcpu-32gb" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-full-hub3 --region nyc3 --size c-16" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-full-lb --region nyc3 --size c-4" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-full-yb3 --region nyc3 --size c-8" "$FAKE_DOCTL_LOG" && ! grep -q "create veil-kit-full-db " "$FAKE_DOCTL_LOG"'
 out_cfg=$(env $FULL "$T/do/configure.sh" 2>&1)
 check "configure.sh starts three YugabyteDB nodes joined to the first, and lifts the tablet limit on each" '[ "$(grep -c "bin/yugabyted start" <<<"$out_cfg")" = 3 ] && [ "$(grep -c -- "--join=10.10.0.5" <<<"$out_cfg")" = 2 ] && [ "$(grep -c "set_flag --force enforce_tablet_replica_limits false" <<<"$out_cfg")" = 3 ]'
 check "configure.sh runs the migrations once, then three servers, each on its own YugabyteDB node" '[ "$(grep -c "veil-server:[^ ]* migrate" <<<"$out_cfg")" = 1 ] && [ "$(grep -c "docker run -d --name veil-server" <<<"$out_cfg")" = 3 ] && [[ "$out_cfg" == *"the database URL of server 3) to 203.0.113.3"* ]]'
@@ -247,7 +253,7 @@ for g in $(. "$ROOT/deploy/gates.sh" >/dev/null 2>&1; echo "$GATES_ALL"); do
     all_bench="$all_bench $o"
     printf -v "bench_$g" '%s' "$o"
 done
-check "every gate's dry run succeeds and records run.txt, topology.env, images.txt" '[ "$(grep -c "would record run.txt" <<<"$all_bench")" = 10 ] && [ "$(grep -c "would record topology.env" <<<"$all_bench")" = 10 ]'
+check "every gate's dry run succeeds and records run.txt, topology.env, images.txt" '[ "$(grep -c "would record run.txt" <<<"$all_bench")" = 11 ] && [ "$(grep -c "would record topology.env" <<<"$all_bench")" = 11 ]'
 check "the drivers' gates run on a driver against the balancer's private address" '[[ "$bench_landing" == *"would run on 203.0.113.8: mkdir -p /srv/bench"*"--url https://10.10.0.4:8443"*"--mode landing --projects 1 --clients 10000 --people 100 --rates 1000"* ]] && [ "$(grep -c "\[landing-" <<<"$bench_landing")" = 6 ] && [[ "$bench_landing" == *"landing-mix-600s"*"--protected --mix"* ]]'
 check "branches runs the cost curve and the headline (300, 1,000 and 3,000 agents merging every 5th push)" '[[ "$bench_branches" == *"[branches on"* && "$bench_branches" == *"--clients 300,1000,3000 --rates max --merge-every 5"* ]]'
 check "scaling stops servers 2 and 3, then 3, then starts all, and drives from both drivers" '[[ "$bench_scaling" == *"scaling: 1 of 3 servers running"*"would run on 203.0.113.2: docker stop"*"would run on 203.0.113.3: docker stop"*"scaling: 2 of 3"*"scaling: 3 of 3"* ]] && [[ "$bench_scaling" == *"[scaling-3servers-landing@2 on 203.0.113.9]"*"--out /work/results/"*"scaling-3servers-landing@2.json"* ]]'
@@ -265,7 +271,7 @@ echo "== 6. configure.sh and bench.sh --approve on the full topology (fake ssh, 
 check "the dry runs above reached no droplet" '[ ! -s "$FAKE_SSH_LOG" ]'
 out_ac=$(env $FULL "$T/do/configure.sh" --approve dokit-test 2>&1 </dev/null); rc=$?
 check "configure.sh --approve succeeds" '[ $rc = 0 ] && [[ "$out_ac" == *"== configured."* ]]'
-check "it waits for cloud-init on all 9 droplets and gives each the certificate (ssh in a loop eats no droplet)" '[ "$(grep -c "cloud-init status --wait" "$FAKE_SSH_LOG")" = 9 ] && [ "$(grep -c "/etc/veil/tls/ca.pem$" "$FAKE_SSH_LOG")" = 9 ] && [ "$(grep -c "chmod 755 /etc/veil/tls" "$FAKE_SSH_LOG")" = 9 ]'
+check "it waits for cloud-init on all 10 droplets and gives each the certificate (ssh in a loop eats no droplet)" '[ "$(grep -c "cloud-init status --wait" "$FAKE_SSH_LOG")" = 10 ] && [ "$(grep -c "/etc/veil/tls/ca.pem$" "$FAKE_SSH_LOG")" = 10 ] && [ "$(grep -c "chmod 755 /etc/veil/tls" "$FAKE_SSH_LOG")" = 10 ]'
 check "every server and driver gets its hub.env as a file, and servers 2 and 3 the first one's keys" '[ "$(grep -c "/etc/veil/hub.env$" "$FAKE_SSH_LOG")" = 5 ] && [ "$(grep -c "203.0.113.2:/etc/veil/hubkeys/hub-" "$FAKE_SSH_LOG")" = 4 ] && [ "$(grep -c "203.0.113.3:/etc/veil/hubkeys/hub-" "$FAKE_SSH_LOG")" = 4 ]'
 S5=$T/state/veil-kit-full
 check "the fetched keys and env files stay private on this machine (in the run's 0700 state directory)" '[ "$(stat -c %a "$S5")" = 700 ] && [ "$(stat -c %a "$S5/hubkeys")" = 700 ] && [ "$(stat -c %a "$S5/hubkeys/hub-grant-key")" = 600 ] && [ "$(stat -c %a "$S5/hub3.env")" = 600 ]'
@@ -274,6 +280,19 @@ res=$(ls -d "$T"/results/veil-kit-full/*-pull 2>/dev/null | head -1)
 check "bench.sh --approve pull succeeds and records run.txt, topology.env, images.txt and commands.txt" '[ $rc = 0 ] && [ -n "$res" ] && [ -s "$res/run.txt" ] && [ -s "$res/topology.env" ] && [ -s "$res/images.txt" ] && [ -s "$res/commands.txt" ] && grep -q "^commit=" "$res/run.txt" && grep -q "revision=" "$res/images.txt"'
 leaks=$(cat "$FAKE_SSH_LOG" "$FAKE_DOCTL_LOG" "$FAKE_CURL_LOG"; echo "$out_ac $out_ab"; cat "$res"/* 2>/dev/null)
 check "no secret on an ssh or scp command line, in the output or in the results" '[[ "$leaks" != *"dop_v1_fake_secret_token"* && "$leaks" != *"secret-spaces-key"* && "$leaks" != *"secret-spaces-val"* && "$leaks" != *"secret-db-pass"* && "$leaks" != *"fake-server-key-material"* ]]'
+
+# MinIO on the storage droplet (VEIL_DO_OBJECTS=minio, the default).
+MIN_U=$(sed -n 's/^MINIO_ROOT_USER=//p' "$S5/minio.env"); MIN_P=$(sed -n 's/^MINIO_ROOT_PASSWORD=//p' "$S5/minio.env")
+check "MinIO's credentials are made for the run, into a private file (0600) of the state directory" '[ "$(stat -c %a "$S5/minio.env")" = 600 ] && [[ "$MIN_U" =~ ^veil[0-9a-f]{16}$ ]] && [[ "$MIN_P" =~ ^[0-9a-f]{48}$ ]]'
+check "they reach the storage droplet as a file, and MinIO reads them with --env-file, on the private address only, with TLS" 'grep -q "scp .*minio.env root@203.0.113.10:/etc/veil/minio.env$" "$FAKE_SSH_LOG" && grep -q "docker run -d --name minio .*-p 10.10.0.10:9000:9000 --env-file /etc/veil/minio.env -e MINIO_SCHEME=https .*/etc/veil/tls/server.pem:/certs/public.crt:ro .*/etc/veil/tls/ca.pem:/.mc/certs/CAs/veil-ca.crt:ro .*bitnamilegacy/minio:latest@sha256:" "$FAKE_SSH_LOG" && grep -q "df --output=avail -BG /srv/minio" "$FAKE_SSH_LOG"'
+check "the servers get MinIO's keys and the run's CA in hub.env (not the Spaces keys); the spaces gate's Spaces keys go to the first server only" 'grep -q "^VEIL_S3_ACCESS_KEY=$MIN_U$" "$S5/hub3.env" && grep -q "^VEIL_S3_CA=/tls/ca.pem$" "$S5/hub3.env" && ! grep -q secret-spaces "$S5/hub3.env" && grep -q "^VEIL_S3_ACCESS_KEY=secret-spaces-key$" "$S5/spaces.env" && [ "$(stat -c %a "$S5/spaces.env")" = 600 ] && [ "$(grep -c "/etc/veil/spaces.env$" "$FAKE_SSH_LOG")" = 1 ] && grep -q "root@203.0.113.1:/etc/veil/spaces.env$" "$FAKE_SSH_LOG"'
+check "the certificate names the storage droplet, and every server reaches MinIO over TLS on its private address" 'openssl x509 -in "$S5/tls/server.pem" -noout -text | grep -q "IP Address:10.10.0.10" && openssl x509 -in "$S5/tls/server.pem" -noout -text | grep -q "DNS:veil-kit-full-minio" && grep -q "docker run -d --name veil-server .*--s3-endpoint https://10.10.0.10:9000 --s3-bucket veil-kit-full-objects-[0-9a-f]* --s3-region us-east-1" "$FAKE_SSH_LOG" && [ "$(grep -c "docker run -d --name veil-server .*--s3-endpoint https://10.10.0.10:9000" "$FAKE_SSH_LOG")" = 3 ] && grep -q "^VEIL_S3_CA=" "$S5/hub1.env"'
+check "the firewall opens nothing to any address but the operator's (22, 8443, 8444): MinIO only to the run's droplets" '[ "$(grep -o "address:[0-9./]*" <<<"$(grep "firewall create --name veil-kit-full" "$FAKE_DOCTL_LOG" | sed "s/--outbound-rules.*//")" | sort -u)" = "address:203.0.113.200/32" ] && grep -q "firewall create --name veil-kit-full .*protocol:tcp,ports:all,tag:veil-kit-full" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-full-minio .*--tag-names veil-kit-full" "$FAKE_DOCTL_LOG"'
+rc=0; out_asp=$(env $FULL "$T/do/bench.sh" --approve spaces 2>&1 </dev/null) || rc=$?
+res_sp=$(ls -d "$T"/results/veil-kit-full/*-spaces 2>/dev/null | head -1)
+check "bench.sh --approve spaces runs on the first server with spaces.env, and fails without a result to judge" '[ $rc != 0 ] && grep -q "root@203.0.113.1 .*--env-file /etc/veil/spaces.env .*--s3-endpoint https://nyc3.digitaloceanspaces.com --s3-bucket veil-kit-full-objects-[0-9a-f]*-spaces --mode branches" "$FAKE_SSH_LOG" && grep -q "spaces.json | missing" "$res_sp/spaces-verdict.md" && grep -q "root@203.0.113.10:/srv/metrics/.*-spaces.stats .*/minio-docker-stats.log$" "$FAKE_SSH_LOG"'
+leaks=$(cat "$FAKE_SSH_LOG" "$FAKE_DOCTL_LOG" "$FAKE_CURL_LOG"; echo "$out_ac $out_ab $out_asp"; cat "$res"/* "$res_sp"/* 2>/dev/null)
+check "MinIO's credentials appear on no command line, in no output and in no result" '[ -n "$MIN_P" ] && [[ "$leaks" != *"$MIN_U"* && "$leaks" != *"$MIN_P"* && "$leaks" != *"secret-spaces-key"* && "$leaks" != *"secret-spaces-val"* ]]'
 
 echo "== 7. the failover verdict on made-up results (deploy/checks/failover-verdict.py)"
 # A run of 6 tickets: 5 answered `landed`; t6's submit lost its connection
@@ -320,5 +339,48 @@ check "a change answered twice, once under another ticket, fails" '[ "${vrc[move
 rm "$T/failover-clean/failover.landings.jsonl"
 rc=0; out=$(python3 "$V" "$T/failover-clean" 2>&1) || rc=$?
 check "a run without the per-change log fails" '[ $rc = 1 ] && [[ "$out" == *"| missing | **FAIL** |"* ]]'
+
+echo "== 8. the storage droplet's volume, the objects option, and the spaces gate"
+: > "$FAKE_DOCTL_LOG"
+VOL="VEIL_DO_NAME=veil-kit-vol VEIL_DO_SIZE_OBJECTS=c-8 VEIL_DO_OBJECTS_VOLUME_GB=300"
+export FAKE_NAME=veil-kit-vol FAKE_DOCTL_STATE=created
+export FAKE_DROPLETS="veil-kit-vol-hub veil-kit-vol-db veil-kit-vol-driver1 veil-kit-vol-driver2 veil-kit-vol-minio"
+check "invalid objects settings are refused: an unknown store, a volume under 250 GB, a volume with Spaces" '
+    ! VEIL_DO_OBJECTS=s3 "$T/do/estimate.sh" >/dev/null 2>&1 &&
+    ! VEIL_DO_OBJECTS_VOLUME_GB=100 "$T/do/create.sh" >/dev/null 2>&1 &&
+    ! VEIL_DO_OBJECTS=spaces VEIL_DO_OBJECTS_VOLUME_GB=300 "$T/do/create.sh" >/dev/null 2>&1 &&
+    ! VEIL_DO_OBJECTS_VOLUME_GB=-1 "$T/do/create.sh" >/dev/null 2>&1 &&
+    [ ! -s "$FAKE_DOCTL_LOG" ]'
+out_ve=$(env $VOL "$T/do/estimate.sh" 2>/dev/null)
+check "estimate prices the volume (300 GB at \$0.10 a month)" '[[ "$out_ve" == *"veil-kit-vol-minio-data (volume)"*"300 GiB"*"0.045"* && "$out_ve" == *"hourly rate (droplets):      \$1.545"* ]]'
+out_vc=$(env $VOL "$T/do/create.sh" --approve 2>&1); rc=$?
+check "create.sh makes the volume (ext4, tagged) and attaches it to the storage droplet at creation, and saves its id" '[ $rc = 0 ] && grep -q "compute volume create veil-kit-vol-minio-data --region nyc3 --size 300GiB --fs-type ext4 --tag veil-kit-vol" "$FAKE_DOCTL_LOG" && grep -q "droplet create veil-kit-vol-minio --region nyc3 --size c-8 .*--volumes vol-0001" "$FAKE_DOCTL_LOG" && [ "$(grep -c -- "--volumes" "$FAKE_DOCTL_LOG")" = 1 ] && grep -q "^VOL_ID=vol-0001$" "$T/state/veil-kit-vol/state.env"'
+out_vcfg=$(env $VOL "$T/do/configure.sh" 2>&1)
+check "configure.sh mounts the volume and keeps MinIO's data on it" '[[ "$out_vcfg" == *"dev=/dev/disk/by-id/scsi-0DO_Volume_veil-kit-vol-minio-data"*"mount -o discard,defaults,noatime"*"/mnt/minio-data"* && "$out_vcfg" == *"-v /mnt/minio-data:/bitnami/minio/data"* ]]'
+: > "$FAKE_DOCTL_LOG"
+out=$(FAKE_VOLUMES="veil-kit-vol-minio-data" FAKE_SPACES_STATE=gone env $VOL "$T/do/destroy.sh" --approve 2>&1 || true)
+check "destroy.sh deletes the volume (by its saved id and by name) after the droplets" 'grep -q "compute volume delete vol-0001 --force" "$FAKE_DOCTL_LOG" && [ "$(grep -c "compute volume delete" "$FAKE_DOCTL_LOG")" = 1 ] && [ "$(grep -n "droplet delete" "$FAKE_DOCTL_LOG" | cut -d: -f1)" -lt "$(grep -n "volume delete" "$FAKE_DOCTL_LOG" | cut -d: -f1)" ]'
+out=$(FAKE_DOCTL_STATE=destroyed FAKE_SPACES_STATE=gone FAKE_VOLUMES="veil-kit-vol-minio-data" env $VOL "$T/do/destroy.sh" --check --approve 2>&1 || true)
+check "the check fails while the volume remains" '[[ "$out" == *"block volumes named veil-kit-vol*: 1"* && "$out" == *"SOMETHING IS LEFT"* ]] && [ -f "$T/state/veil-kit-vol/state.env" ]'
+out=$(FAKE_DOCTL_STATE=destroyed FAKE_SPACES_STATE=gone env $VOL "$T/do/destroy.sh" --check --approve 2>&1); rc=$?
+check "with the volume gone the check passes and removes the state" '[ $rc = 0 ] && [[ "$out" == *"block volumes named veil-kit-vol*: 0"* ]] && [ ! -f "$T/state/veil-kit-vol/state.env" ]'
+out=$(env $VOL "$T/do/destroy.sh" 2>&1)
+check "destroy.sh dry run lists the volumes and names the one it would delete" '[[ "$out" == *"would run: doctl compute volume list --format ID,Name"* && "$out" == *"would delete every volume named veil-kit-vol-minio-data"* ]]'
+check "bench.sh spaces dry run: the first server, spaces.env, Spaces, the many-branch shape at 20 pushes/s for 5 minutes" '[[ "$bench_spaces" == *"[spaces on 203.0.113.1]"*"load --server /usr/local/bin/veil-server --s3-endpoint https://nyc3.digitaloceanspaces.com --s3-bucket"*"-spaces --mode branches --projects 1 --clients 100 --rates 20 --merge-every 5 --duration 300"* && "$bench_spaces" == *"--env-file /etc/veil/spaces.env"* && "$bench_objects" == *"--env-file /etc/veil/hub.env"* && "$bench_objects" != *"spaces.env"* ]]'
+check "in the MinIO topology the same-machine gates keep their objects on MinIO" '[[ "$bench_objects" == *"--s3-endpoint https://10.10.0.10:9000 --s3-bucket"* && "$bench_scale" == *"--s3-endpoint https://10.10.0.10:9000"* ]]'
+check "the topology beside results names the object store, without a secret" '[[ "$topo" == *"OBJECTS=minio"* && "$topo" == *"SIZE_OBJECTS=c2-16vcpu-32gb"* && "$topo" == *"MINIO_IMAGE=bitnamilegacy/minio"* ]]'
+# The spaces gate's verdict on made-up results.
+fake_spaces() { # DIR, errors, gave_up (or null), slow_down
+    mkdir -p "$1"
+    printf '{"runs":[{"ops":6000,"ops_per_s":19.9,"rate":20,"errors":%s,"first_error":null,"branch_merges":1190,"storage_reads_per_op":8.7,"storage_writes_per_op":11.2,"s3_gave_up":%s,"s3_slow_down":%s,"p50_ms":80,"p99_ms":400}]}\n' "$2" "$3" "$4" > "$1/spaces.json"
+}
+SV=$ROOT/deploy/checks/spaces-verdict.py
+fake_spaces "$T/sp-clean" 0 0 37; rc=0; out=$(python3 "$SV" "$T/sp-clean" 2>&1) || rc=$?
+check "a clean spaces run passes and records the 503 answers and the requests a second" '[ $rc = 0 ] && [[ "$out" == *"spaces: every check passed"* && "$out" == *"| \`503 Slow Down\` and 429 answers (every try) | 37 | recorded |"* && "$out" == *"| storage requests a second | 396 | recorded | one bucket allows 800 |"* ]]'
+fake_spaces "$T/sp-err" 3 0 0; fake_spaces "$T/sp-gave" 0 2 900; fake_spaces "$T/sp-old" 0 null null; mkdir -p "$T/sp-none"
+check "a spaces run fails on agents' errors, a request given up, missing counters, or no result" '
+    ! python3 "$SV" "$T/sp-err" >/dev/null && ! python3 "$SV" "$T/sp-gave" >/dev/null &&
+    ! python3 "$SV" "$T/sp-old" >/dev/null && ! python3 "$SV" "$T/sp-none" >/dev/null &&
+    [[ "$(python3 "$SV" "$T/sp-gave")" == *"| storage requests given up after the retries | 2 | **FAIL** |"* ]]'
 
 [ $fail = 0 ] && echo "deploy/do/test: all green" || { echo "deploy/do/test: FAILED"; exit 1; }

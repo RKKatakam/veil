@@ -240,6 +240,13 @@ const S3_RETRY_FOR: Duration = Duration::from_secs(10);
 const S3_FIRST_WAIT: Duration = Duration::from_millis(25);
 const S3_MOST_WAIT: Duration = Duration::from_secs(1);
 
+/// Answers `503` ("slow down") or `429` an S3 store gave this process, every
+/// try counted: a hosted store's request-rate limit (DigitalOcean Spaces,
+/// BUG-2290) shows here (`stats.json`'s `s3_slow_down`).
+pub static S3_SLOW_DOWN: AtomicU64 = AtomicU64::new(0);
+/// S3 requests that still failed when `S3_RETRY_FOR` ran out (`stats.json`'s `s3_gave_up`).
+pub static S3_GAVE_UP: AtomicU64 = AtomicU64::new(0);
+
 /// Send an S3 request (`make` builds it afresh for each try) and read its
 /// answer, again while the answer is a server error (5xx), 429 or 499, or
 /// the request fails, for at most [`S3_RETRY_FOR`] (BUG-861). A connection
@@ -275,9 +282,13 @@ async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers:
             if !(status.is_server_error() || matches!(status.as_u16(), 429 | 499)) {
                 return Ok((status.as_u16(), headers, body));
             }
+            if matches!(status.as_u16(), 503 | 429) {
+                S3_SLOW_DOWN.fetch_add(1, Ordering::Relaxed);
+            }
             let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
             let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
             if tokio::time::Instant::now() + wait + jitter >= dl {
+                S3_GAVE_UP.fetch_add(1, Ordering::Relaxed);
                 return Ok((status.as_u16(), headers, body));
             }
             tokio::time::sleep(wait + jitter).await;
@@ -288,6 +299,7 @@ async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers:
         let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
         let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
         if tokio::time::Instant::now() + wait + jitter >= dl || e.is_builder() {
+            S3_GAVE_UP.fetch_add(1, Ordering::Relaxed);
             return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times")));
         }
         tokio::time::sleep(wait + jitter).await;
@@ -297,17 +309,31 @@ async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers:
 }
 
 impl S3Store {
-    /// `endpoint` e.g. `http://127.0.0.1:9000`.
+    /// `endpoint` e.g. `http://127.0.0.1:9000`. An `https` endpoint is
+    /// trusted through the public roots, and also through the PEM
+    /// certificates in the file `VEIL_S3_CA` names, when set: a store
+    /// served with a deployment's own CA (`deploy/do`, MinIO on a droplet).
     pub fn new(endpoint: &str, bucket: &str, region: &str, key: &str, secret: &str) -> Result<S3Store> {
         let url = endpoint.parse().context("S3 endpoint")?;
         let bucket = rusty_s3::Bucket::new(url, rusty_s3::UrlStyle::Path, bucket.to_string(), region.to_string())
             .map_err(|e| anyhow!("S3 bucket: {e}"))?;
+        // Idle connections are dropped before the store drops them (AWS
+        // after about 20 s), so few requests meet a closed one.
+        let mut http = reqwest::Client::builder().pool_max_idle_per_host(64).pool_idle_timeout(Duration::from_secs(15));
+        if let Some(ca) = std::env::var_os("VEIL_S3_CA").filter(|v| !v.is_empty()) {
+            let pem = std::fs::read(&ca).with_context(|| format!("reading VEIL_S3_CA ({})", PathBuf::from(&ca).display()))?;
+            let certs = reqwest::Certificate::from_pem_bundle(&pem).context("VEIL_S3_CA: PEM certificates")?;
+            if certs.is_empty() {
+                bail!("VEIL_S3_CA ({}) holds no certificate", PathBuf::from(&ca).display());
+            }
+            for c in certs {
+                http = http.add_root_certificate(c);
+            }
+        }
         Ok(S3Store {
             bucket,
             credentials: rusty_s3::Credentials::new(key, secret),
-            // Idle connections are dropped before the store drops them (AWS
-            // after about 20 s), so few requests meet a closed one.
-            http: reqwest::Client::builder().pool_max_idle_per_host(64).pool_idle_timeout(Duration::from_secs(15)).build()?,
+            http: http.build()?,
         })
     }
 

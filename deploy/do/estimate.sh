@@ -3,7 +3,9 @@
 # cost"), from the topology in deploy/do/.env. Prints the hourly rate and
 # the total for VEIL_DO_HOURS, what a teardown forgotten for a day and for
 # a month would cost, and the same four numbers for every topology the kit
-# offers (one to three servers, PostgreSQL or YugabyteDB). Never talks to
+# offers (one to three servers, PostgreSQL or YugabyteDB, objects on MinIO
+# or on Spaces). Spaces' flat fee is in every line: the `spaces` gate
+# makes a bucket whatever VEIL_DO_OBJECTS says. Never talks to
 # DigitalOcean unless `--live --approve`, which replaces the built-in
 # prices with the API's.
 set -euo pipefail
@@ -38,6 +40,8 @@ while read -r role name size; do
     p=${live[$size]:-$(price_of "$size")}
     line "$name ($role)" "$size" "$p"
 done < <(droplets)
+volume_hourly() { if [ "$OBJECTS" = minio ] && [ "$OBJECTS_VOLUME_GB" -gt 0 ]; then echo "$OBJECTS_VOLUME_GB * $VOLUME_GB_MONTHLY / 672" | bc -l; else echo 0; fi; }
+[ "$(volume_hourly)" = 0 ] || line "$VOLUME_NAME (volume)" "${OBJECTS_VOLUME_GB} GiB" "$(volume_hourly)"
 sp=$(echo "$SPACES_MONTHLY / 672" | bc -l)
 printf '%-28s %-16s %10.3f %12.2f  (billed as a flat %s/month while a bucket exists)\n' "Spaces bucket" "250 GiB" "$sp" "$SPACES_MONTHLY" "\$$SPACES_MONTHLY"
 printf '%-28s %-16s %10s %12s\n' "bandwidth" "pooled, included" "0" "0"
@@ -53,8 +57,9 @@ printf 'planned %s hours + Spaces:    $%.2f\n' "$HOURS" "$planned"
 printf '24 hours left running:       $%.2f\n' "$day"
 printf 'a whole month forgotten:     $%.2f  <- why destroy.sh and its check matter\n' "$(echo "$total * 672 + $SPACES_MONTHLY" | bc -l)"
 # Every topology, with this .env's sizes and drivers.
-topo_hourly() { # servers, YugabyteDB nodes, cache: the droplets' USD/hour
-    local HUBS=$1 YB_NODES=$2 WITH_CACHE=$3 t=0 role name size p
+topo_hourly() { # servers, YugabyteDB nodes, cache, objects: the droplets' (and volume's) USD/hour
+    local HUBS=$1 YB_NODES=$2 WITH_CACHE=$3 OBJECTS=$4 role name size p t
+    t=$(volume_hourly)
     while read -r role name size; do
         p=${live[$size]:-$(price_of "$size")}
         [ -n "$p" ] || { echo unknown; return; }   # never priced as free
@@ -64,14 +69,15 @@ topo_hourly() { # servers, YugabyteDB nodes, cache: the droplets' USD/hour
 }
 echo
 echo "every topology (sizes and $DRIVERS driver(s) as above; + Spaces \$$SPACES_MONTHLY):"
-printf '   %-58s %9s %9s %11s %13s\n' "topology" "USD/hour" "${HOURS} h" "a day left" "a month left"
-for t in "1 0 0 one server, PostgreSQL (the default)" "1 3 0 one server, YugabyteDB x3" \
-         "2 3 0 two servers + balancer, YugabyteDB x3" "3 3 0 three servers + balancer, YugabyteDB x3 (the full run)" \
-         "3 0 0 three servers + balancer, PostgreSQL" "3 3 1 the full run + the cache"; do
-    read -r h y c label <<<"$t"
-    r=$(topo_hourly "$h" "$y" "$c")
-    [ "$r" != unknown ] || { printf '   %-58s %9s   (no built-in price for one of its sizes)\n' "$label" unknown; continue; }
-    printf '   %-58s %9.3f %9.2f %11.2f %13.2f\n' "$label" "$r" "$(echo "$r * $HOURS + $SPACES_MONTHLY" | bc -l)" \
+printf '   %-66s %9s %9s %11s %13s\n' "topology" "USD/hour" "${HOURS} h" "a day left" "a month left"
+for t in "1 0 0 minio one server, PostgreSQL, MinIO (the default)" "1 3 0 minio one server, YugabyteDB x3, MinIO" \
+         "2 3 0 minio two servers + balancer, YugabyteDB x3, MinIO" "3 3 0 minio three servers + balancer, YugabyteDB x3, MinIO (the full run)" \
+         "3 3 0 spaces the full run with objects on Spaces (no MinIO)" \
+         "3 0 0 minio three servers + balancer, PostgreSQL, MinIO" "3 3 1 minio the full run + the cache"; do
+    read -r h y c o label <<<"$t"
+    r=$(topo_hourly "$h" "$y" "$c" "$o")
+    [ "$r" != unknown ] || { printf '   %-66s %9s   (no built-in price for one of its sizes)\n' "$label" unknown; continue; }
+    printf '   %-66s %9.3f %9.2f %11.2f %13.2f\n' "$label" "$r" "$(echo "$r * $HOURS + $SPACES_MONTHLY" | bc -l)" \
         "$(echo "$r * 24 + $SPACES_MONTHLY" | bc -l)" "$(echo "$r * 672 + $SPACES_MONTHLY" | bc -l)"
 done
 if [ $LIVE = 0 ] || [ $APPROVED = 0 ]; then echo "(built-in list prices; confirm with: $0 --live --approve, or doctl compute size list)"; fi

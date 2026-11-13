@@ -1,7 +1,8 @@
 # The local rehearsal of Veil's multi-machine test (docs/DEPLOY.md §4,
 # docs/REPRODUCE.md): the paid topology on one machine, small. Three
 # YugabyteDB nodes (profile `yb`; or PostgreSQL 17, profile `pg`), MinIO
-# standing in for Spaces, two servers on the one database and bucket,
+# (as on the paid run's storage droplet: TLS with the run's CA), two
+# servers on the one database and bucket,
 # HAProxy in front of them (the one address), and the load driver.
 # deploy/compose/rehearsal.sh brings it up in order and runs the gates;
 # every variable below comes from the env file it writes.
@@ -10,7 +11,7 @@
 x-server: &server
   image: veil-server:${TAG:?set TAG}
   command: ["--listen", "0.0.0.0:8443", "--data", "/var/lib/veil", "--db-connections", "${DB_CONNECTIONS:-16}",
-            "--s3-endpoint", "http://minio:9000", "--s3-bucket", "veil-rehearsal", "--tls-cert", "/tls/server.pem", "--tls-key", "/tls/server-key.pem",
+            "--s3-endpoint", "https://minio:9000", "--s3-bucket", "veil-rehearsal", "--tls-cert", "/tls/server.pem", "--tls-key", "/tls/server-key.pem",
             "--device-rate", "1000000000/1000000000", "--anonymous-rate", "1000000000/1000000000", "--max-connections", "262144"]
   mem_limit: ${HUB_MEM:-1g}
   ulimits: { nofile: { soft: 1048576, hard: 1048576 } }
@@ -71,8 +72,14 @@ services:
     environment:
       MINIO_ROOT_USER: ${S3_KEY:?set S3_KEY}
       MINIO_ROOT_PASSWORD: ${S3_SECRET:?set S3_SECRET}
+      MINIO_SCHEME: https
+    # TLS from the run's certificate; the image's setup client (mc) checks
+    # it against the run's CA (deploy/do/configure.sh does the same).
     volumes:
       - miniodata:/bitnami/minio/data
+      - ${TLS_DIR}/server.pem:/certs/public.crt:ro
+      - ${TLS_DIR}/server-key.pem:/certs/private.key:ro
+      - ${TLS_DIR}/ca.pem:/.mc/certs/CAs/veil-ca.crt:ro
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9000'"]
       interval: 2s
@@ -93,6 +100,7 @@ services:
       VEIL_DATABASE_URL: ${DB_URL_1}
       VEIL_S3_ACCESS_KEY: ${S3_KEY}
       VEIL_S3_SECRET_KEY: ${S3_SECRET}
+      VEIL_S3_CA: /tls/ca.pem
     volumes:
       - hub1data:/var/lib/veil
       - ${TLS_DIR:?set TLS_DIR}:/tls:ro
@@ -119,6 +127,7 @@ services:
       VEIL_DATABASE_URL: ${DB_URL_2:?set DB_URL_2}
       VEIL_S3_ACCESS_KEY: ${S3_KEY}
       VEIL_S3_SECRET_KEY: ${S3_SECRET}
+      VEIL_S3_CA: /tls/ca.pem
     volumes:
       - hub2data:/var/lib/veil
       - ${TLS_DIR}:/tls:ro
@@ -144,6 +153,7 @@ services:
       VEIL_DATABASE_URL: ${DB_URL_1}
       VEIL_S3_ACCESS_KEY: ${S3_KEY}
       VEIL_S3_SECRET_KEY: ${S3_SECRET}
+      VEIL_S3_CA: /tls/ca.pem
     volumes:
       - benchwork:/work
       - ${RESULTS_DIR:?set RESULTS_DIR}:/work/results

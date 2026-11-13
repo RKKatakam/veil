@@ -2,9 +2,10 @@
 # The local rehearsal of the multi-machine test (docs/DEPLOY.md §4,
 # docs/REPRODUCE.md): the paid topology in Docker Compose on one machine,
 # small. Builds the images, brings up three YugabyteDB nodes (or
-# PostgreSQL), MinIO, two servers on the one database and bucket and
+# PostgreSQL), MinIO (over TLS, as on the paid run's storage droplet), two servers on the one database and bucket and
 # HAProxy in front of them, runs every gate of deploy/gates.sh briefly
-# (seconds, tens of agents; failover included) through the balancer, and
+# (seconds, tens of agents; failover included; the `spaces` gate against
+# the MinIO, as no Spaces bucket is at hand) through the balancer, and
 # tears down everything of this run (containers, network, volumes).
 #
 #   deploy/compose/rehearsal.sh [NAME]      # NAME distinguishes concurrent runs (default: the user)
@@ -43,6 +44,7 @@ STEP_LIMIT=${STEP_LIMIT:-1200}
 : "${HEADLINE_AGENTS:=10,30}" "${MERGE_EVERY:=5}" "${HEADLINE_DURATION:=10}"
 : "${SCALING_SERVERS:=1 2}" "${SCALING_DURATION:=8}" "${SCALING_PULL_CLIENTS:=20}" "${SCALING_BRANCH_CLIENTS:=20}"
 : "${SCALING_LANDING_PROJECTS:=4}" "${SCALING_LANDING_CLIENTS:=20}"
+: "${SPACES_AGENTS:=10}" "${SPACES_RATE:=5}" "${SPACES_DURATION:=10}"
 : "${FAILOVER_AGENTS:=40}" "${FAILOVER_PEOPLE:=4}" "${FAILOVER_RATE:=40}" "${FAILOVER_DURATION:=40}" "${FAILOVER_AFTER:=15}" "${FAILOVER_SETTLE:=60}"
 GATES_DIR=$ROOT/deploy
 . "$GATES_DIR/gates.sh"
@@ -64,7 +66,7 @@ fi
 # (never committed; see .gitignore).
 mkdir -p "$HERE/.tls"; chmod 700 "$HERE/.tls"
 TLS_DIR=$HERE/.tls/$NAME
-"$ROOT/deploy/tls/mkcert.sh" "$TLS_DIR" lb hub1 hub2 localhost 127.0.0.1 >/dev/null || exit 1
+"$ROOT/deploy/tls/mkcert.sh" "$TLS_DIR" lb hub1 hub2 minio localhost 127.0.0.1 >/dev/null || exit 1
 LB_CFG=$HERE/.tls/$NAME-haproxy.cfg
 HAPROXY_DNS=127.0.0.11:53 "$ROOT/deploy/lb/haproxy-cfg.sh" hub1:8443 hub2:8443 > "$LB_CFG"; chmod 644 "$LB_CFG"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -109,7 +111,7 @@ export COMPOSE_PROFILES=$DB,bench
 C() { D compose -p "$PROJECT" --env-file "$ENV_FILE" "$@"; }
 
 cleanup() {
-    for s in hub1 hub2 lb migrate $([ "$DB" = yb ] && echo yb1 yb2 yb3 || echo postgres); do
+    for s in hub1 hub2 lb migrate minio $([ "$DB" = yb ] && echo yb1 yb2 yb3 || echo postgres); do
         C logs --no-color "$s" > "$OUT/$s.log" 2>&1 || true
     done
     if [ "${KEEP:-0}" = 1 ]; then
@@ -189,8 +191,11 @@ bounded() { # seconds, command...
 URL=https://lb:8443
 SERVERS=2
 DRY=0
-OWN=(--server /usr/local/bin/veil-server --s3-endpoint http://minio:9000)
+OWN=(--server /usr/local/bin/veil-server --s3-endpoint https://minio:9000)
 OWN_BUCKET=veil-rehearsal
+# No Spaces bucket here: the `spaces` gate's flow, against the MinIO.
+SPACES_OWN=("${OWN[@]}")
+SPACES_BUCKET=veil-rehearsal-spaces
 DRIVERS=1
 record() { cat > "$G_OUT/$1"; }
 bench() { # driver|drivers|hub, label, veil-bench arguments...

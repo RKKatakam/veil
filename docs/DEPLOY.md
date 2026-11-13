@@ -1,6 +1,7 @@
 # Deploying Veil for the DigitalOcean test
 
-> **Status: kit ready, nothing rented** (2026-11-12). This runbook takes the
+> **Status: kit ready, nothing rented** (2026-11-12; objects on MinIO and the
+> `spaces` gate, 2026-11-13). This runbook takes the
 > server as built (`docs/HUB.md` §13, phases 1 to 4) through one paid test
 > on DigitalOcean, budget under $100, as `docs/design/server/README.md`
 > ("Plan to the DigitalOcean test") asks. **Nothing is created at
@@ -9,6 +10,14 @@
 > `deploy/` (`deploy/README.md`). **For someone with only the public
 > repository: `docs/REPRODUCE.md`**, the same run step by step, with the
 > table its numbers go in.
+>
+> **Objects (owner, 2026-11-13; BUG-2290):** one Spaces bucket allows about
+> 800 requests a second and the many-branch headline needs about 4,900, so
+> **the speed runs keep objects in MinIO on a storage droplet of the run**
+> (the S3-compatible server the rehearsal uses, pinned in
+> `deploy/versions.env`; `VEIL_DO_OBJECTS=minio`, the default), and **one
+> short, low-rate gate, `spaces`, runs on a real Spaces bucket** to show
+> Veil works there (§2.3).
 
 The test's goals (owner, 2026-11-12): show that Veil **scales on a
 realistic agent workload across machines** (many agents, each on a branch
@@ -70,7 +79,8 @@ prints it priced):
 | `NAME-hub` | `c-16` (16 dedicated vCPUs, 32 GB) | `veil-server` in its container, port 8443; also hosts the gates that start a server of their own (§6) | the load curves saturate the server's CPU before anything else (`docs/design/scale/LOAD.md`); a dedicated-CPU size gives steady numbers |
 | `NAME-db` | `c-8` (8 vCPUs, 16 GB, 200 GB NVMe) | PostgreSQL 17 in a container (`postgres:17-alpine`, `pg_stat_statements`, `max_connections=1500`), on the VPC's private address only | see "Why not managed PostgreSQL" |
 | `NAME-driver1`, `-driver2` | `c-8` each | `veil-bench` in its container: 10,000 simulated agents fit in one process on 8 cores | two, so one can drive pulls while the other drives landings |
-| Spaces bucket `NAME-objects-…` | 250 GiB, 1 TiB out | the server's object store (S3 API, `https://REGION.digitaloceanspaces.com`, path-style), created by the server itself at first start | |
+| `NAME-minio` | `c2-16vcpu-32gb` (16 dedicated vCPUs, 32 GB, 400 GB local SSD) | MinIO (`deploy/versions.env`), the servers' object store, on the VPC's private address only, TLS with the run's CA; bucket `NAME-objects-…`, created by the server itself at first start | §2.3: the headline's 4,900 requests a second are six times what a Spaces bucket allows |
+| Spaces bucket `NAME-objects-…-spaces` | 250 GiB, 1 TiB out | the `spaces` gate's object store (S3 API, `https://REGION.digitaloceanspaces.com`, path-style), created by that gate's own server | to show Veil works on Spaces (§2.3) |
 
 Options (all in `deploy/do/.env`; `estimate.sh` prices them, `create.sh`
 makes them, `destroy.sh` removes them by tag, `deploy/do/test/test.sh`
@@ -94,14 +104,23 @@ covers them):
   into one `main` with 10,000 agents) is specified on such a cluster, and
   its landing service (S17) is merged: the `landing` and `failover` gates
   run on it.
+- **`VEIL_DO_OBJECTS=spaces`** drops the storage droplet: every server
+  keeps its objects in the Spaces bucket `NAME-objects-…`, as the kit did
+  before 2026-11-13. It holds only runs that stay under the bucket's
+  request rate (§2.3).
+- **`VEIL_DO_OBJECTS_VOLUME_GB=N`** (at least 250) keeps MinIO's data on a
+  block-storage volume `NAME-minio-data` of N GB, attached to the storage
+  droplet when it is created, instead of its local disk: for a
+  `VEIL_DO_SIZE_OBJECTS` with less disk than the gates need. `destroy.sh`
+  deletes it.
 - **`VEIL_DO_WITH_CACHE=1`** adds `NAME-cache` (`s-4vcpu-8gb`) running
   `veil-server cache` (the regional cache, `docs/HUB.md` §13.18) in front of
   the servers, for `vl` clients and manual tests. The cache *gate* cannot be
   run against it (BUG-1591, §6), so it is off by default.
 
-**The full topology** for the paid run is `VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3`:
-nine droplets, $2.875 an hour, **$28.00 for the planned 8 hours** with
-Spaces (below).
+**The full topology** for the paid run is `VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3`
+(objects on MinIO, the default): ten droplets, $3.447 an hour, **$32.58
+for the planned 8 hours** with Spaces' flat fee for the `spaces` gate (below).
 
 ### 2.1 One address in front of several servers: HAProxy on a droplet
 
@@ -184,7 +203,9 @@ prices):
 | balancer `c-4` (with 2 or 3 servers) | 0.125 | 1.00 | 3.00 |
 | db `c-8`, or each of 3 YugabyteDB `c-8` | 0.250 | 2.00 | 6.00 |
 | driver1 + driver2, `c-8` | 0.500 | 4.00 | 12.00 |
-| Spaces (flat $5/month while any bucket exists) | 0.007 | 5.00 | 5.00 |
+| MinIO storage droplet `c2-16vcpu-32gb` (`VEIL_DO_OBJECTS=minio`) | 0.572 | 4.58 | 13.73 |
+| a volume for MinIO instead of the local disk (optional, $0.10 a GB a month; 300 GB) | 0.045 | 0.36 | 1.07 |
+| Spaces (flat $5/month while any bucket exists: the `spaces` gate's) | 0.007 | 5.00 | 5.00 |
 | bandwidth (pooled transfer included with the droplets) | 0 | 0 | 0 |
 
 `deploy/do/estimate.sh` prints the configured topology line by line, then
@@ -192,18 +213,111 @@ every topology the kit offers (its output, built-in prices, two drivers):
 
 | Topology | $/hour | Planned 8 h + Spaces | A day forgotten | A month forgotten |
 |---|---:|---:|---:|---:|
-| one server, PostgreSQL (the default) | 1.250 | 15.00 | 35.00 | 845.00 |
-| one server, YugabyteDB ×3 | 1.750 | 19.00 | 47.00 | 1,181.00 |
-| two servers + balancer, YugabyteDB ×3 | 2.375 | 24.00 | 62.00 | 1,601.00 |
-| **three servers + balancer, YugabyteDB ×3 (the full run)** | **2.875** | **28.00** | **74.00** | **1,937.00** |
-| three servers + balancer, PostgreSQL | 2.375 | 24.00 | 62.00 | 1,601.00 |
-| the full run + the cache | 2.947 | 28.58 | 75.73 | 1,985.38 |
+| one server, PostgreSQL, MinIO (the default) | 1.822 | 19.58 | 48.73 | 1,229.38 |
+| one server, YugabyteDB ×3, MinIO | 2.322 | 23.58 | 60.73 | 1,565.38 |
+| two servers + balancer, YugabyteDB ×3, MinIO | 2.947 | 28.58 | 75.73 | 1,985.38 |
+| **three servers + balancer, YugabyteDB ×3, MinIO (the full run)** | **3.447** | **32.58** | **87.73** | **2,321.38** |
+| the full run with objects on Spaces (`VEIL_DO_OBJECTS=spaces`, no MinIO) | 2.875 | 28.00 | 74.00 | 1,937.00 |
+| three servers + balancer, PostgreSQL, MinIO | 2.947 | 28.58 | 75.73 | 1,985.38 |
+| the full run + the cache | 3.519 | 33.15 | 89.46 | 2,369.77 |
 
 The planned test is about 8 hours of machines: under an hour to create and
 configure, about three for the gates (§6, `docs/REPRODUCE.md` §4 times
 each), half an hour for logs and teardown, the rest spare. Even a day of
-the full topology left running stays under $75; a month forgotten would
-be nearly $2,000, which is what `destroy.sh`'s check is for.
+the full topology left running stays under $90; a month forgotten would
+be over $2,300, which is what `destroy.sh`'s check is for.
+
+### 2.3 Objects: MinIO on a storage droplet, and the `spaces` gate
+
+**The decision (owner, 2026-11-13; BUG-2290).** The many-branch headline
+makes about **8.6 storage reads and 11.0 storage writes a push**
+(`docs/design/scale/LOAD.md`, "Storage reads in the many-branch headline",
+300 agents for 10 minutes): at 250 pushes a second, about 2,150 reads and
+2,750 writes, **4,900 requests a second**. One DigitalOcean Spaces bucket
+allows 800 operations a second, all kinds together, and answers more with
+`503 Slow Down` ([Spaces Limits](https://docs.digitalocean.com/products/spaces/details/limits/));
+the server retries a `503` for at most 10 s, then the request fails. A
+speed run on Spaces would measure Spaces' throttling. So:
+
+- **the speed runs keep objects in MinIO** on a storage droplet of the run
+  (`VEIL_DO_OBJECTS=minio`, the default): the S3-compatible server the
+  rehearsal runs, pinned by digest in `deploy/versions.env`;
+- **the `spaces` gate** runs the many-branch shape for 5 minutes on a real
+  Spaces bucket, at a rate under its limit, to show Veil works there
+  (correctness and flow, not speed).
+
+**The storage droplet, `NAME-minio`** (`VEIL_DO_SIZE_OBJECTS`, default
+`c2-16vcpu-32gb`: 16 dedicated vCPUs, 32 GB, 400 GB of local SSD). Sized
+from the headline's rate and from the bytes the gates write:
+
+| What | Estimate | From |
+|---|---:|---|
+| requests a second, headline | 2,150 reads + 2,750 writes | 8.6 + 11.0 a push × 250 pushes/s |
+| bytes written a second, headline | about 11 MiB | 45.6 KiB stored a push (LOAD.md: merges copy each object about once a size class) |
+| operations that store, every gate at its offered or `max` rate | at most about 4.4 million | headline 3 × 300 s × 250/s; landing 3 variants × 780 s × 1,000/s; land and api 12 runs × 20 s × 4,000/s; scaling 3 × 60 s × 4,500/s; failover 120 s × 300/s |
+| bytes written over the gates | **at most about 190 GiB**, plus the `scale` gate's 1 GB profile | 4.4 million × 45.6 KiB, as if no merged-away pack were ever deleted |
+| bytes kept | about 45 GiB | 10.7 KiB a push stay listed after merging (1.64 GB after 150,000 pushes, LOAD.md) |
+
+So the droplet needs about 200 GiB free at most, written at tens of MiB a
+second in thousands of small synced writes: **its own local SSD**
+(`configure.sh` refuses to start MinIO with under 250 GB free, the
+`OBJECTS_NEED_GB` of `deploy/do/lib.sh`), not a block-storage volume, which
+is network storage with per-volume limits on operations a second. 16
+dedicated vCPUs are the servers' size class: MinIO verifies TLS and
+signatures on every request, and the landing and scaling gates may ask
+more of it than the headline. Its CPU, memory and disk are sampled beside
+every gate (`minio-docker-stats.log`, §6.2) and by `logs.sh`, so a run
+bound by the store shows it. A size with less disk takes a volume
+(`VEIL_DO_OBJECTS_VOLUME_GB=N`, at least 250): `create.sh` makes it
+(`NAME-minio-data`, ext4, tagged `NAME`) and attaches it when the droplet
+is created, `configure.sh` mounts it at `/mnt/minio-data`, `destroy.sh`
+deletes it (by the id it saved and by name, retrying while it detaches),
+and its check counts every volume named `NAME*`.
+
+How `configure.sh` runs it:
+
+- **TLS from the run's CA:** the run's one certificate also names the
+  storage droplet (its private address and name); MinIO serves it
+  (`MINIO_SCHEME=https`, the certificate as `/certs/public.crt`), and the
+  image's setup client checks it against the CA. The servers trust the CA
+  through `VEIL_S3_CA=/tls/ca.pem` in their `hub.env` (the server adds the
+  PEM certificates of the file `VEIL_S3_CA` names to the public roots for
+  its S3 client; servers the benchmark tool starts inherit it).
+- **Credentials made for the run:** `deploy/do/state/NAME/minio.env` (mode
+  0600: a random user and a 48-hex-digit password), copied to the droplet
+  as `/etc/veil/minio.env` (root-only) and read by Docker's `--env-file`;
+  the servers get them in their `hub.env`. Never on a command line, in
+  user-data, in an image, in git or in a result (`deploy/do/test/test.sh`
+  checks every command line, output and results file for them).
+- **Reached only by the run's droplets:** MinIO listens on the droplet's
+  private address only (`-p PRIVATE:9000:9000`), and the run's one cloud
+  firewall lets in only droplets tagged `NAME` (and the operator, on 22,
+  8443 and 8444 only).
+- Its objects go with the droplet (or the volume) at teardown; there is
+  nothing to empty.
+
+With `VEIL_DO_OBJECTS=spaces` none of this exists and the servers use the
+Spaces bucket, as before.
+
+**The `spaces` gate.** `bench.sh --approve spaces` starts a server of its
+own on the first server's machine (as `objects`, `openscion` and `scale`
+do), with its objects in the Spaces bucket `BUCKET-spaces` (created by
+that server; `destroy.sh` empties and deletes it with the others) and the
+Spaces keys from `/etc/veil/spaces.env` (root-only, on the first server
+only), and drives the many-branch shape at it: **100 agents, each on its
+branch, merging every 5th push, 20 pushes a second, for 5 minutes**
+(`SPACES_AGENTS`, `SPACES_RATE`, `SPACES_DURATION`). The rate: 8.6 + 11.0 =
+19.6 requests a push, so the bucket's 800 a second is reached at 40
+pushes a second; 20 (about 390 requests a second) leaves half of it for
+the setup's bursts, the background merges and the deriver. The server
+counts every `503 Slow Down` (and `429`) answer the store gives, each try,
+and every request still failing when its 10 s of retries run out
+(`stats.json`'s `s3_slow_down` and `s3_gave_up`); the tool records both
+in `spaces.json`, and `deploy/checks/spaces-verdict.py` writes
+`spaces-verdict.md`. It **fails** on an error an agent saw, on any request
+given up, on no push or no merge into `main`, or on missing counters; the
+`503` answers, the rate held and the requests a second against the 800
+are recorded, not judged.
 
 ## 3. The images
 
@@ -229,9 +343,10 @@ One `Dockerfile` (`deploy/docker/Dockerfile`), one build stage
   OpenScion gates compare with Git and start a server of their own). Runs
   as `bench` (uid 10002) in the `/work` volume.
 
-Nothing secret is baked in: the Spaces keys and the database URL come from
-the environment (`VEIL_S3_ACCESS_KEY`, `VEIL_S3_SECRET_KEY`,
-`VEIL_DATABASE_URL`) and the TLS key from a mounted file. The images are
+Nothing secret is baked in: the object store's keys and the database URL
+come from the environment (`VEIL_S3_ACCESS_KEY`, `VEIL_S3_SECRET_KEY`,
+`VEIL_DATABASE_URL`; `VEIL_S3_CA` names a CA for a store with a
+certificate of its own, §2.3) and the TLS key from a mounted file. The images are
 never pushed to a registry: `configure.sh` ships them over SSH (`docker save
 | zstd | docker load`). The build takes about 2.5 minutes on 8 cores.
 
@@ -269,7 +384,8 @@ only `hostssl` lines; not yet run against a managed service.
 
 The paid topology on one machine, small, in Docker Compose
 (`deploy/compose/docker-compose.yml`): **three YugabyteDB nodes** (`yb1`
-to `yb3`; or PostgreSQL 17 with `DB=pg`), MinIO standing in for Spaces,
+to `yb3`; or PostgreSQL 17 with `DB=pg`), MinIO (over TLS with the
+rehearsal's CA, as on the paid run's storage droplet, §2.3),
 the migrations, **two servers** (`hub1`, `hub2`, the second given the
 first's keys by `hub2-keys`, as `configure.sh` does) on the one database
 and bucket, **HAProxy** (`lb`, the same configuration as the paid run's,
@@ -286,9 +402,11 @@ HAProxy 256 MB).
 up in order (the database, the tablet limit lifted on each master, MinIO,
 the migrations, the first server, the keys, the second server, the
 balancer), smoke-tests the balancer's HTTPS with the rehearsal CA, runs
-every gate including `failover`, writes each gate's results directory as
-the paid run does (§6), and tears down the containers, network and
-volumes of its own Compose project (`veil-dokit-NAME`) only:
+every gate including `failover` and `spaces` (against the MinIO there, as
+no Spaces bucket is at hand: its flow and its verdict, not Spaces),
+writes each gate's results directory as the paid run does (§6), and
+tears down the containers, network and volumes of its own Compose
+project (`veil-dokit-NAME`) only:
 
 ```sh
 deploy/compose/rehearsal.sh NAME                       # build, every gate, tear down
@@ -303,7 +421,7 @@ log in `deploy/compose/results/<stamp>/`. On a machine others use, run
 it alone (it needs 11.5 GB), give it its own `NAME` and `LB_PORT`, and
 leave other Compose projects alone: its teardown removes only its own
 project's containers, network and volumes. **The rehearsal's
-numbers are for the flow only**: one machine plays nine. The rehearsals of
+numbers are for the flow only**: one machine plays ten. The rehearsals of
 2026-11-13 and 2026-11-12 are in §9.
 
 ## 5. The DigitalOcean run, in order
@@ -320,11 +438,11 @@ deploy/do/estimate.sh --live --approve     # the API's prices (reads only; needs
 # 1. images
 deploy/docker/build.sh                     # prints TAG
 
-# 2. create: ssh key, firewall, droplets (tagged NAME), state file
+# 2. create: ssh key, firewall, droplets (tagged NAME; the MinIO storage droplet included), state file
 deploy/do/create.sh                        # dry run: the plan and every command
 deploy/do/create.sh --approve              # <- the owner's approval; the first thing that bills
 
-# 3. configure: wait for cloud-init, certificate, ship images, database, migrations, server, smoke test
+# 3. configure: wait for cloud-init, certificate, ship images, database, MinIO, migrations, server, smoke test
 deploy/do/configure.sh --approve [TAG]
 
 # 4. the gates (§6), one at a time; results under deploy/results/NAME/
@@ -338,6 +456,7 @@ deploy/do/bench.sh --approve failover      # VEIL_DO_HUBS>=2: the lease holder s
 deploy/do/bench.sh --approve objects
 deploy/do/bench.sh --approve openscion
 deploy/do/bench.sh --approve scale
+deploy/do/bench.sh --approve spaces        # 5 minutes on a real Spaces bucket at 20 pushes/s (§2.3)
 
 # 5. logs and metrics from every droplet
 deploy/do/logs.sh --approve
@@ -354,17 +473,21 @@ deletes by tag, including anything a run that died left behind):
    0700; ignored by git) and imported;
 2. a cloud firewall: inbound 22, 8443 and 8444 from the operator's address,
    everything between droplets tagged `NAME`, nothing else in; all out;
-3. the droplets from `deploy/do/cloud-init/docker.yaml` (Ubuntu 24.04,
+3. with `VEIL_DO_OBJECTS_VOLUME_GB`, the storage droplet's volume
+   `NAME-minio-data` (§2.3);
+4. the droplets from `deploy/do/cloud-init/docker.yaml` (Ubuntu 24.04,
    Docker and zstd from Ubuntu, file-descriptor and port-range limits
    raised; **no secrets in user-data**, which any process on a droplet can
-   read from the metadata service);
-4. `deploy/do/state/NAME/state.env` (mode 0600): ids, public and private
+   read from the metadata service), the storage droplet `NAME-minio`
+   among them;
+5. `deploy/do/state/NAME/state.env` (mode 0600): ids, public and private
    addresses, the bucket's name.
 
 `configure.sh --approve` then copies secrets as root-only files
 (`/etc/veil/*.env`, `/etc/veil/tls/`), starts PostgreSQL (or the YugabyteDB
 nodes, lifting the tablet limit on each, §2.2) on the private addresses,
-runs `veil-server migrate` once (BUG-838), starts the first server with
+starts MinIO on the storage droplet (TLS with the run's certificate,
+credentials made for the run, §2.3), runs `veil-server migrate` once (BUG-838), starts the first server with
 `--restart unless-stopped`, waits for its health check, copies its keys to
 the other servers and starts them (§2), starts the balancer, smoke-tests
 the one address with the run's CA, and ends with `vl login` instructions. A `vl` on your machine then
@@ -397,8 +520,11 @@ reach the balancer (or the only server) over the VPC.
 | `objects` | the first server's machine, with a server and a cache the tool starts itself (BUG-1591) against the same database and a bucket of its own | `load --mode objects --via server,cache`, 10/100/1,000 fresh thin workspaces | phase 2 §8 and `docs/HUB.md` §13.18: 99 % of objects from the cache's store; the cache under 512 MiB |
 | `openscion` | the first server's machine, a server the tool starts itself | `openscion`, 1k and 10k files, 5 runs, Git beside | `docs/OVERVIEW.md` "Speed gates", and beating Git on the same machine |
 | `scale` | the first server's machine, a server the tool starts itself | `run --profile 1g` (push, clone, pull, clone one directory, gc) | `docs/design/scale/BASELINE.md`: the 1 GB profile; server peak memory under 1 GB (`storage-and-cost.md` §9) |
+| `spaces` | the first server's machine, a server the tool starts itself with its objects on a real Spaces bucket (`BUCKET-spaces`, the keys from `/etc/veil/spaces.env`) | `load --mode branches --merge-every 5`, 100 agents, 20 pushes/s, 300 s | §2.3: Veil works on Spaces (no error, no request given up, merges into `main`); the store's `503 Slow Down` answers recorded, not speed (BUG-2290) |
 
-The three same-machine gates stop nothing: the serving container keeps
+In the MinIO topology the same-machine gates' own servers keep their
+objects on the MinIO too (their buckets `BUCKET-objects`, `-openscion`,
+`-scale`); the `spaces` gate's on Spaces. The four same-machine gates stop nothing: the serving container keeps
 running beside the tool's own server (another port, another data
 directory, the same database, a bucket of its own), as
 `scripts/bench-server.sh` does locally. Run them while no driver gate runs.
@@ -493,8 +619,9 @@ made them; `docs/REPRODUCE.md` §6 says how to read each file:
 | `images.txt` | the ids of the images built here, of the ones each server and driver has, the containers running, and the pinned third-party digests |
 | `commands.txt` | every `veil-bench` command line and the machine it ran on |
 | `<label>.json`, `<label>.md`, `<label>.log` | the tool's raw results, its tables, its output; `@<n>` in a label is driver *n* |
-| `hub<N>-stats.json`, `hub<N>-docker-stats.log` | each server's request-path counters at the end of the gate, and its `docker stats` every 5 s |
-| `scaling.md`; `failover-verdict.md`, `failover-*.txt` | the scaling table; the failover verdict and the records behind it |
+| `hub<N>-stats.json`, `hub<N>-docker-stats.log` | each server's request-path counters at the end of the gate (`s3_slow_down`, `s3_gave_up`: the object store's `503`/`429` answers and the requests given up), and its `docker stats` every 5 s |
+| `minio-docker-stats.log` | the MinIO storage droplet's `docker stats` every 5 s (`VEIL_DO_OBJECTS=minio`) |
+| `scaling.md`; `failover-verdict.md`, `failover-*.txt`; `spaces-verdict.md` | the scaling table; the failover verdict and the records behind it; the `spaces` gate's verdict |
 
 ## 7. Logs and metrics
 
@@ -507,7 +634,8 @@ memory, disk, uptime and the kernel log's tail (`system.txt`); on each
 server its counters (`server-stats.json`) and the `docker stats` samples
 of every gate (`metrics/`); on the database droplet the 30 most-called
 statements from `pg_stat_statements`; on each YugabyteDB node the
-cluster's servers and the tablets it holds (`yb.txt`). DigitalOcean's own graphs (CPU,
+cluster's servers and the tablets it holds (`yb.txt`); on the storage
+droplet the space MinIO's data takes (`minio-disk.txt`). DigitalOcean's own graphs (CPU,
 memory, disk, bandwidth per droplet) are in the control panel, since the
 droplets are created with monitoring on. For anything live:
 `ssh -i deploy/do/state/NAME/id_ed25519 root@IP docker logs -f veil-server`.
@@ -515,14 +643,18 @@ droplets are created with monitoring on. For anything live:
 ## 8. Teardown
 
 ```sh
-deploy/do/destroy.sh --approve            # droplets by tag, firewall, ssh key, tag; empties and deletes the bucket
+deploy/do/destroy.sh --approve            # droplets by tag, MinIO's volume if any, firewall, ssh key, tag; empties and deletes the Spaces buckets
 deploy/do/destroy.sh --check --approve    # nothing left?
 ```
 
 The check counts droplets tagged `NAME`, firewalls and SSH keys named
 `NAME`, block volumes, snapshots and load balancers starting with `NAME`,
 reserved IPs in the account (an unassigned one bills $4/month), and asks
-Spaces whether the bucket still exists (HTTP 404 means gone). It exits
+Spaces whether each bucket still exists (HTTP 404 means gone): the
+servers' (with `VEIL_DO_OBJECTS=spaces`), the same-machine gates' and the
+`spaces` gate's (`BUCKET-spaces`). MinIO's objects go with its droplet,
+or with its volume, which `destroy.sh` deletes by the id it saved and by
+name, retrying for two minutes while it detaches from the deleted droplet. It exits
 non-zero while anything is left and removes the state file only when
 nothing is. The bucket is emptied and deleted with `aws s3 rb --force`
 when `awscli` is installed; otherwise the check names it and it is deleted
@@ -531,6 +663,32 @@ left the Spaces subscription ends. Look at Billing the next day: the test
 appears as hourly line items.
 
 ## 9. Rehearsal results
+
+### 9.0 The rehearsal of 2026-11-13, objects over TLS and the `spaces` gate (`dokit4`)
+
+`bash ~/.cache/veil-orch/heavy.sh dokit4-rehearsal 12 bash
+deploy/compose/rehearsal.sh dokit4` on `dokit4` @ `ccda6704` (a work
+commit squashed into the branch's commit: the same code, only this
+section's text added; images built by the script, tag `ccda6704`; three YugabyteDB nodes; Compose
+project `veil-dokit-dokit4`), after the kit moved the speed runs' objects
+to MinIO (§2.3). New in this one: MinIO serves TLS with the rehearsal's
+certificate, and both servers and every server the tool started reach it
+over `https` trusting the CA through `VEIL_S3_CA`, as on the paid run's
+storage droplet; and the `spaces` gate ran, against that MinIO (10 agents,
+5 pushes/s, 10 s).
+
+| Gate | Result |
+|---|---|
+| `pull`, `land`, `api` | ok (19, 20, 19 s) |
+| `branches` | ok (47 s) |
+| `landing` | ok (41 s) |
+| `scaling` | ok (86 s) |
+| `failover` (stop) | ok: the lease moved from server 1; longest pause in landings 522 ms (target 2 s); 1,624 changes landed, each once on `main`, by the database and by the agents' answers |
+| `objects`, `openscion`, `scale` | ok (17, 5, 9 s) |
+| `spaces` | ok: 49 pushes at 4.9/s of 5 offered, 9 merges into `main`, no error, no request given up, 0 `503` answers; 2.8 reads and 14.3 writes a push |
+
+Up in 63 s; teardown: "nothing of veil-dokit-dokit4 remains (containers,
+volumes, networks)". For the flow only: one machine plays ten.
 
 ### 9.1 The rehearsal of 2026-11-13 (the final one before the paid run)
 
@@ -697,7 +855,7 @@ no secret on a command line; where `bench.sh` runs each gate; and that
 `destroy.sh` deletes by tag and its check fails while anything is left (a
 load balancer, a reserved IP, a volume or a bucket included). For **the
 full topology** (three servers, the balancer, three YugabyteDB nodes) they
-check that `create.sh` makes all nine droplets at their sizes; that
+check that `create.sh` makes all ten droplets (the storage droplet among them) at their sizes; that
 `estimate.sh` prices it and every other topology, a day and a month
 forgotten included; that `configure.sh` joins the YugabyteDB nodes, lifts
 the tablet limit on each, migrates once, starts each server on its own
@@ -713,7 +871,25 @@ one landing explained by a failed submit's ticket and one by a failed
 submit without one), and a change told landed but not on `main`, one told
 landed and twice on `main`, a landing no agent was told about beyond the
 failed submits, a change answered twice as two snapshots, and a run
-without the per-change log each fail. `configure.sh`, `bench.sh` and `logs.sh`
+without the per-change log each fail. For **objects** (§2.3, section 8
+of the tests and the end of section 6) they check that the default
+topology makes the MinIO storage droplet at its size and none with
+`VEIL_DO_OBJECTS=spaces`; that the servers and the same-machine gates
+point at MinIO's private address over TLS with the run's CA (and at
+Spaces with `spaces`); that MinIO's credentials are made for the run in a
+0600 file, travel as a file, are read with `--env-file`, and appear on no
+command line, in no output and in no result; that the certificate names
+the storage droplet; that the firewall opens nothing to any address but
+the operator's; that a volume is made, attached, mounted, priced,
+deleted by `destroy.sh` and counted by its check (which fails while it
+remains); that invalid object settings are refused; that the `spaces`
+gate runs on the first server with `spaces.env` at 20 pushes a second;
+and that its verdict passes a clean run (recording its `503` answers)
+and fails one with errors, a request given up, missing counters or no
+result. Every new check was seen to fail on a mutation of the kit (the
+volume not attached, the CA or MinIO's private binding dropped, MinIO's
+password on the command line, the Spaces keys not used, the volume not
+deleted, the rate raised). `configure.sh`, `bench.sh` and `logs.sh`
 over real SSH are exercised only by the rehearsal's equivalent Docker
 commands (§4) and by the DigitalOcean run.
 
@@ -723,7 +899,7 @@ commands (§4) and by the DigitalOcean run.
   confirm with `estimate.sh --live --approve` before approving. Sizes may be
   unavailable in a region (`doctl compute size list` shows `Available`); the
   estimate and `create.sh` take the sizes from `.env`.
-- **Droplet limit.** New accounts often may not create 4 or 9 droplets at
+- **Droplet limit.** New accounts often may not create 5 or 10 droplets at
   once; `create.sh` then fails on the first refused droplet and leaves the
   earlier ones running: `destroy.sh --approve` removes them by tag.
 - **The database is not encrypted in transit in the kit**: its URL has no
@@ -744,22 +920,28 @@ commands (§4) and by the DigitalOcean run.
   G2's commits per push (BUG-1946) and landings across projects
   (BUG-1948). The paid run measures them across machines; it is not
   expected to pass them. BUG-1593 (commits per landing) is fixed.
-- **Spaces' request rate (BUG-2290).** One Spaces bucket allows 800
-  operations a second, all kinds together (500, of which 300 writes and
-  lists, for buckets made before DigitalOcean's upgrade), answers more
-  with `503 Slow Down`, and asks for a support ticket above 150 a second
-  sustained ([Spaces Limits](https://docs.digitalocean.com/products/spaces/details/limits/),
+- **Spaces' request rate (BUG-2290): decided by the owner, 2026-11-13.**
+  One Spaces bucket allows 800 operations a second, all kinds together
+  (500, of which 300 writes and lists, for buckets made before
+  DigitalOcean's upgrade), answers more with `503 Slow Down`, and asks for
+  a support ticket above 150 a second sustained
+  ([Spaces Limits](https://docs.digitalocean.com/products/spaces/details/limits/),
   [Performance Best Practices](https://docs.digitalocean.com/products/spaces/concepts/best-practices/)).
-  The many-branch headline makes about 8.6 reads and 11.0 writes a push
-  (local, 300 agents for 10 minutes, after BUG-2271's fix; 272 reads
-  before it): at 250 pushes/s about 4,900 requests a second. The server
-  retries a `503` for at most 10 s, then the request fails, so at that
-  rate the run measures Spaces' throttling. **Before the run, ask
-  DigitalOcean support to raise the bucket's limit to at least 6,000
-  operations a second; without that, set `HEADLINE_RATE=40`** (about 800
-  requests a second) and read the headline as a correctness run, not a
-  speed one. The server's object cache (256 MiB) is not the limit: 99 %
-  of its lookups hit in that run.
+  The many-branch headline makes about 8.6 reads and 11.0 writes a push:
+  at 250 pushes/s about 4,900 requests a second. **The speed runs
+  therefore keep objects in MinIO on the run's storage droplet, and the
+  `spaces` gate runs 5 minutes at 20 pushes a second (about 390 requests
+  a second) on a real bucket** (§2.3). Its `503` answers are counted by
+  the server and recorded. Two consequences: the published speed numbers
+  are on a self-hosted S3-compatible store, not on Spaces (`REPRODUCE.md`
+  says so beside them); and a deployment on Spaces at the headline's
+  rate needs the bucket's limit raised, several buckets, or fewer
+  requests a push (counting the writes by kind is the next step).
+- **The storage droplet** is one MinIO on one disk: no replication, and
+  if it fails the run stops (the servers' requests fail after 10 s of
+  retries). Its objects live only for the run. The image is the server
+  as Bitnami last packaged it (`deploy/versions.env`), pinned by digest;
+  MinIO no longer publishes images on Docker Hub.
 - **YugabyteDB restarts.** A node that restarts turns the tablet-replica
   limit on again (§2.2); nothing in the gates creates tables, but a
   migration would fail on it.
@@ -769,9 +951,13 @@ commands (§4) and by the DigitalOcean run.
   --wait` on every droplet (usually 1 to 3 minutes). A droplet that never
   reaches "done" is reported; `ssh root@IP cloud-init status --long` says why.
 - **Secrets.** Only in `deploy/do/.env` (0600, ignored), `deploy/do/state/`
-  (0700, ignored) and root-only files on the droplets; never on a command
-  line (`test.sh` checks the dry run for that), never in user-data, never
-  in an image. Rotate the token and the Spaces keys after the test.
+  (0700, ignored; MinIO's credentials, made for each run, are its
+  `minio.env`) and root-only files on the droplets (`hub.env`,
+  `spaces.env`, `minio.env`); never on a command line (`test.sh` checks
+  the dry runs and the `--approve` runs with fake `ssh` for that), never
+  in user-data, never in an image or a result. Rotate the token and the
+  Spaces keys after the test; MinIO's die with its droplet.
 - **The certificate** is valid 30 days; `vl` clients pin the run's CA.
-- **Spaces** bills $5 for the month however short the test; it ends when
-  the last bucket is deleted.
+- **Spaces** bills $5 for the month however short the test (the `spaces`
+  gate makes a bucket even when the servers use MinIO); it ends when the
+  last bucket is deleted.

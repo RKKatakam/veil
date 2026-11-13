@@ -27,7 +27,10 @@ case "$*" in
     "compute firewall list"*)        [ "${FAKE_DOCTL_STATE:-created}" = created ] && echo "fw-0001 ${FAKE_NAME:-veil-test}"; true ;;
     "compute ssh-key list --format Name"*)  [ "${FAKE_DOCTL_STATE:-created}" = created ] && echo "${FAKE_NAME:-veil-test}"; true ;;
     "compute ssh-key list"*)         [ "${FAKE_DOCTL_STATE:-created}" = created ] && echo "4242 ${FAKE_NAME:-veil-test}"; true ;;
-    "compute volume list"*)          [ -n "${FAKE_VOLUMES:-}" ] && printf '%s\n' "$FAKE_VOLUMES"; true ;;
+    "compute volume create"*)        echo vol-0001 ;;
+    "compute volume list --format ID,Name"*)
+        i=0; for v in ${FAKE_VOLUMES:-}; do i=$((i+1)); echo "vol-000$i $v"; done ;;
+    "compute volume list"*)          [ -n "${FAKE_VOLUMES:-}" ] && printf '%s\n' $FAKE_VOLUMES; true ;;
     "compute reserved-ip list"*)     [ -n "${FAKE_RESERVED_IPS:-}" ] && printf '%s\n' "$FAKE_RESERVED_IPS"; true ;;
     "compute load-balancer list"*)   [ -n "${FAKE_LBS:-}" ] && printf '%s\n' "$FAKE_LBS"; true ;;
     "compute size list"*)            printf 'c-16 0.5\nc-8 0.25\n' ;;
