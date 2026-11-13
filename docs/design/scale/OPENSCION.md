@@ -888,10 +888,18 @@ durability are as they were. No repository format change, no new flag.
   (thin and `--full`: after the clone, after a pull with changes inside
   and outside and a move, with a file of the person's own in a folder never
   written, and after an edit pushed, the project outside the folder is as
-  others left it and nothing outside it was fetched). `sync::bug_832`'s
-  admin clone, thin now, reads the project's recorded policy and seals the
-  edit of the folder's `.env` under its rule, as a whole clone does (the
-  test now expects that; fin's views still keep it local).
+  others left it and nothing outside it was fetched);
+  `a_one_folder_clone_never_writes_a_file_beside_its_folder` (the admin,
+  who can read the root's files: none written or fetched, a file of their
+  own there never recorded). What a one-directory clone left out is the
+  checkout record's own set (`chosen`, `docs/FORMAT.md`), not every hidden
+  path: a file the checkout could not write and a folder the server
+  refuses are written once they can be, as before (review `rv-clifast3`:
+  the branch first took every hidden path for one left out, and `fill_in`
+  wrote every readable file beside the folder, the root's `.veilpolicy`
+  among them). `sync::bug_832` is unchanged: without the project's
+  `.veilpolicy` on disk an edit of the folder's `.env` stays local in
+  every one-directory clone, the admin's too.
 * **A fresh clone's set-up flushes (item 4)**, about 60 one after another,
   are deferred to one barrier before the checkout's journal, for a clone
   into a directory it makes only, and only on the backend of that
