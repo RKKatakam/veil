@@ -2458,12 +2458,13 @@ fn bug_2130_a_policy_push_and_an_admin_removal_take_the_gate_in_one_order() {
 /// connection of the pool its transaction holds one of. Writers that fill
 /// the pool, each in its transaction before its announcement, wait for a
 /// connection none of them gives back: every one until the pool's
-/// `acquire_timeout` (30 s). Here 16 group-member removals (the test
+/// `acquire_timeout` (30 s), then failed `503`. Now one that gets no
+/// connection within 100 ms takes the gate unannounced. Here 16 group-member removals (the test
 /// server's pool), 8 in each of two projects (a project runs at most 12
-/// requests at once), wait in their transactions at an invite row this
-/// test holds; once it is freed, each takes the gate.
+/// requests at once), each cancelling an invite of its own, wait in their
+/// transactions at the invite rows this test holds; once they are freed,
+/// each takes the gate.
 #[test]
-#[ignore = "BUG-2131: writers filling the pool wait for their announcement's connection until acquire_timeout"]
 fn bug_2131_writers_filling_the_pool_are_answered() {
     use sqlx::Connection;
     let th = TestHub::start();
@@ -2476,60 +2477,70 @@ fn bug_2131_writers_filling_the_pool_are_answered() {
         let pid = project_id(&th, &p.name);
         let admin_id: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.admin.name).fetch_one(&h.db)).unwrap();
         let gid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'devs'").bind(pid).fetch_one(&h.db)).unwrap();
-        th.rt
-            .block_on(
-                sqlx::query("INSERT INTO invites (project_id, invite_key, person, group_id, expires_at, created_by, created_at) VALUES ($1, 'k2131', $2, $3, $4, $5, $6)")
-                    .bind(pid)
-                    .bind(&p.fin.name)
-                    .bind(gid)
-                    .bind(now + 3_600_000)
-                    .bind(admin_id)
-                    .bind(now)
-                    .execute(&h.db),
-            )
-            .unwrap();
+        for i in 0..8 {
+            th.rt
+                .block_on(
+                    sqlx::query("INSERT INTO invites (project_id, invite_key, person, group_id, expires_at, created_by, created_at) VALUES ($1, $2, $2, $3, $4, $5, $6)")
+                        .bind(pid)
+                        .bind(format!("nobody-2131-{i}"))
+                        .bind(gid)
+                        .bind(now + 3_600_000)
+                        .bind(admin_id)
+                        .bind(now)
+                        .execute(&h.db),
+                )
+                .unwrap();
+        }
     }
     // Outside the server's pool.
     let mut outside = th.rt.block_on(sqlx::PgConnection::connect(&url)).unwrap();
     let mut hold = th.rt.block_on(outside.begin()).unwrap();
-    th.rt.block_on(sqlx::query("SELECT 1 FROM invites WHERE invite_key = 'k2131' FOR UPDATE").execute(&mut *hold)).unwrap();
-    let held = th.rt.block_on(backend_pid(&mut hold));
+    let held = th.rt.block_on(sqlx::query("SELECT 1 FROM invites WHERE invite_key LIKE 'nobody-2131-%' FOR UPDATE").execute(&mut *hold)).unwrap();
+    assert_eq!(held.rows_affected(), 16);
     let mut probe = th.rt.block_on(sqlx::PgConnection::connect(&url)).unwrap();
     std::thread::scope(|scope| {
-        let mut asks = Vec::new();
+        let (mut asks, api) = (Vec::new(), &api);
         for p in &projects {
-            for _ in 0..8 {
-                asks.push(scope.spawn(|| {
+            for i in 0..8 {
+                asks.push(scope.spawn(move || {
                     let t = Instant::now();
-                    let r = api.post_json(Some(&p.admin.token()), &format!("/v1/projects/{}/groups/devs/members/remove", p.name), &json!({"people": [p.fin.name]}));
+                    let r = api.post_json(
+                        Some(&p.admin.token()),
+                        &format!("/v1/projects/{}/groups/devs/members/remove", p.name),
+                        &json!({"people": [format!("nobody-2131-{i}")]}),
+                    );
                     (r, t.elapsed())
                 }));
             }
         }
-        let until = Instant::now() + Duration::from_secs(8);
+        let until = Instant::now() + Duration::from_secs(5);
         loop {
             let n: i64 = th
                 .rt
                 .block_on(
-                    sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))")
-                        .bind(held)
-                        .fetch_one(&mut probe),
+                    sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                         AND query LIKE 'DELETE FROM invites%'",
+                    )
+                    .fetch_one(&mut probe),
                 )
                 .unwrap();
             if n >= 16 || Instant::now() >= until {
+                eprintln!("bug_2131: {n} removals wait at their invite rows");
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let freed = Instant::now();
         th.rt.block_on(hold.rollback()).unwrap();
         for a in asks {
             let (r, took) = a.join().unwrap();
+            eprintln!("bug_2131: answered {} in {took:?}, {:?} after the rows were freed", r.status, freed.elapsed());
             assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-            assert!(took < Duration::from_secs(15), "a removal took {took:?}");
+            assert!(freed.elapsed() < Duration::from_secs(8), "the removals were answered {:?} after the rows were freed", freed.elapsed());
         }
     });
 }
-
 
 /// BUG-2132: a writer's announcement goes when its request does, also
 /// when the request is dropped mid-way (its client went away, or

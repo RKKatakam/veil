@@ -3300,6 +3300,7 @@ async fn push_staged(
             let mut moved = Vec::new();
             let mut lineages: Vec<(String, i64)> = Vec::new();
             let mut rules_changed = false;
+            let mut policy = None;
             for (branch, cur, new, accept, policy_text_update) in plans {
                 let (recorded, read_under) = plan_recorded.get(&branch).copied().unwrap_or((false, None));
                 let rows = match (cur, new) {
@@ -3358,17 +3359,10 @@ async fn push_staged(
                     // Someone else moved it first: nothing of this push lands.
                     return Err(Error::conflict(format!("branch '{branch}' moved during the push; pull, then push again")));
                 }
-                if let Some(text) = accept {
-                    // Bumps the project's access epoch (a trigger): every
-                    // server's cached permissions for it are void.
-                    crate::perm::accept_policy(&mut *c, pid, &text).await?;
-                    rules_changed = true;
-                } else if let Some(text) = policy_text_update {
-                    sqlx::query("UPDATE projects SET policy_text = $1 WHERE id = $2")
-                        .bind(&text)
-                        .bind(pid)
-                        .execute(&mut *c)
-                        .await?;
+                if accept.is_some() || policy_text_update.is_some() {
+                    // Written after the review gate (below): the project's
+                    // row comes after it (lock order, BUG-2130).
+                    policy = Some((accept, policy_text_update));
                     rules_changed = true;
                 }
                 if let (true, Some(l)) = (branch == default_branch, &rules_landing) {
@@ -3472,6 +3466,19 @@ async fn push_staged(
             // holding every row the push writes.
             if rules_changed {
                 crate::prs::close_review_gate(&mut *c, pid).await?;
+            }
+            match policy {
+                // Bumps the project's access epoch (a trigger): every
+                // server's cached permissions for it are void.
+                Some((Some(text), _)) => crate::perm::accept_policy(&mut *c, pid, &text).await?,
+                Some((None, Some(text))) => {
+                    sqlx::query("UPDATE projects SET policy_text = $1 WHERE id = $2")
+                        .bind(&text)
+                        .bind(pid)
+                        .execute(&mut *c)
+                        .await?;
+                }
+                _ => {}
             }
             Ok((moved, memo_stored))
         })

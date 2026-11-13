@@ -26,8 +26,8 @@
 //! A writer's row goes when its transaction ends (`db::transaction` deletes
 //! it after the commit or the rollback). A row whose writer went away
 //! without (a server stopped) is found by the advisory lock its transaction
-//! held (`WRITER_BASE ^ id`): one announced more than `STALE_MS` ago whose
-//! lock nobody holds is removed by the batch waiting for it.
+//! held (`writer_key`): one announced more than `STALE_MS` ago whose lock
+//! nobody holds is removed by the batch waiting for it.
 
 use std::{
     sync::{Arc, Mutex},
@@ -40,8 +40,13 @@ use crate::error::Result;
 
 /// The gate's advisory-lock key is `REVIEW_GATE_BASE ^ project`.
 const REVIEW_GATE_BASE: i64 = 0x7665_696c_7276_6774; // "veilrvgt"
-/// A writer's own advisory-lock key, held by its transaction: `WRITER_BASE ^ id`.
-const WRITER_BASE: i64 = 0x7665_696c_7277_7472; // "veilrwtr"
+/// A writer's own advisory-lock key, held by its transaction: `-id`, below
+/// zero, so never another lock's key (each other one is a positive base
+/// XOR a project; BUG-2130: `0x7665_696c_7277_7472 ^ id` was the review
+/// gate of project `id ^ 70406`).
+fn writer_key(id: i64) -> i64 {
+    -id
+}
 /// A writer's row older than this, whose lock nobody holds, is of a writer
 /// that went away.
 const STALE_MS: i64 = 2_000;
@@ -49,6 +54,8 @@ const STALE_MS: i64 = 2_000;
 /// gate anyway (the gate keeps every landing right; only the writer's
 /// precedence is given up): a lease's half, as for its objects.
 const WAIT_AT_MOST: Duration = Duration::from_secs(1);
+/// How long a writer waits for a connection to announce itself on.
+const ANNOUNCE_WAIT: Duration = Duration::from_millis(100);
 
 /// The writers' rows of one attempt of a `db::transaction`, deleted when it
 /// ends.
@@ -63,15 +70,37 @@ tokio::task_local! {
     static WRITERS: Writers;
 }
 
+impl Writers {
+    fn take(&self) -> Vec<i64> {
+        std::mem::take(&mut *self.ids.lock().unwrap_or_else(|e| e.into_inner())).into_iter().map(|(_, id)| id).collect()
+    }
+}
+
+/// The rows of an attempt dropped before it ended (its request's client
+/// went away, the deadline, a panic): deleted on their own (BUG-2132).
+struct Leftover(Writers);
+
+impl Drop for Leftover {
+    fn drop(&mut self) {
+        let ids = self.0.take();
+        if let (false, Ok(rt)) = (ids.is_empty(), tokio::runtime::Handle::try_current()) {
+            let db = self.0.db.clone();
+            rt.spawn(async move {
+                let _ = sqlx::query("DELETE FROM review_writers WHERE id = ANY($1)").bind(&ids).execute(&db).await;
+            });
+        }
+    }
+}
+
 /// Run one attempt of a transaction (`fut`), then delete the rows of the
 /// writers it announced, whether it committed or not.
 pub(crate) async fn scoped<F: std::future::Future>(db: &PgPool, fut: F) -> F::Output {
-    let w = Writers {
+    let w = Leftover(Writers {
         db: db.clone(),
         ids: Arc::default(),
-    };
-    let r = WRITERS.scope(w.clone(), fut).await;
-    let ids: Vec<i64> = std::mem::take(&mut *w.ids.lock().unwrap()).into_iter().map(|(_, id)| id).collect();
+    });
+    let r = WRITERS.scope(w.0.clone(), fut).await;
+    let ids = w.0.take();
     if !ids.is_empty() {
         // Should this fail, a batch waiting for them removes them once
         // stale (their transaction is over, so their locks are free).
@@ -82,7 +111,8 @@ pub(crate) async fn scoped<F: std::future::Future>(db: &PgPool, fut: F) -> F::Ou
 
 /// Take the review gate of `project` exclusively, for this transaction:
 /// announced first (a row committed on its own, on another connection of
-/// `db::transaction`'s pool), so that no batch asks for the gate after it.
+/// `db::transaction`'s pool, if one is free within `ANNOUNCE_WAIT`), so
+/// that no batch asks for the gate after it.
 /// Inside a `db::transaction` only (every writer is): outside one the gate
 /// is taken without the announcement.
 pub(crate) async fn close_review_gate(c: &mut PgConnection, project: i64) -> Result<()> {
@@ -96,18 +126,26 @@ pub(crate) async fn close_review_gate(c: &mut PgConnection, project: i64) -> Res
     let id = match known {
         Some(id) => id,
         None => {
+            // Its transaction holds one of the pool's connections: writers
+            // filling the pool would each wait for another (BUG-2131). One
+            // that gets none soon asks for the gate unannounced (the gate
+            // keeps every landing right; only its precedence is given up).
+            let Ok(conn) = tokio::time::timeout(ANNOUNCE_WAIT, scope.db.acquire()).await else {
+                sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(gate).execute(&mut *c).await?;
+                return Ok(());
+            };
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO review_writers (project_id, since_ms) VALUES ($1, (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT) RETURNING id",
             )
             .bind(project)
-            .fetch_one(&scope.db)
+            .fetch_one(&mut *conn?)
             .await?;
             scope.ids.lock().unwrap().push((project, id));
             id
         }
     };
     sqlx::query("SELECT pg_advisory_xact_lock($1), pg_advisory_xact_lock($2)")
-        .bind(WRITER_BASE ^ id)
+        .bind(writer_key(id))
         .bind(gate)
         .execute(&mut *c)
         .await?;
@@ -158,7 +196,7 @@ pub async fn wait_review_writers(db: &PgPool, project: i64, ids: &[i64]) -> Resu
         for (id, _) in left.iter().filter(|(_, stale)| *stale) {
             // Its transaction is over if its lock is free.
             let mut tx = db.begin().await?;
-            let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)").bind(WRITER_BASE ^ id).fetch_one(&mut *tx).await?;
+            let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)").bind(writer_key(*id)).fetch_one(&mut *tx).await?;
             if free {
                 sqlx::query("DELETE FROM review_writers WHERE id = $1").bind(id).execute(&mut *tx).await?;
             }
@@ -169,5 +207,22 @@ pub async fn wait_review_writers(db: &PgPool, project: i64, ids: &[i64]) -> Resu
         }
         tokio::time::sleep(pause).await;
         pause = (pause * 2).min(Duration::from_millis(8));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BUG-2130: no writer's key is the review gate of a project (nor any
+    /// other lock's key: each is a positive base XOR a project).
+    #[test]
+    fn a_writers_key_is_no_projects_review_gate() {
+        for id in (1..=1_000_000).chain([1 << 31, 1 << 40, i64::MAX]) {
+            let key = writer_key(id);
+            let project = key ^ REVIEW_GATE_BASE;
+            assert!(project < 0, "writer {id}'s key is project {project}'s review gate");
+            assert!(key < 0, "writer {id}'s key {key} may be another lock's");
+        }
     }
 }

@@ -1035,8 +1035,10 @@ pub async fn create_group(State(hub): State<HubState>, caller: Caller, Path((p, 
             // person loses what it gave them (BUG-2111). The review gate,
             // before the project's row (lock order).
             crate::prs::close_review_gate(&mut *c, pid).await?;
+            // NO KEY UPDATE: a transaction waiting for the gate may hold
+            // the row KEY SHARE (a foreign key's check: BUG-2130).
             let text: String =
-                sqlx::query_scalar("SELECT policy_bindings FROM projects WHERE id = $1 FOR UPDATE").bind(pid).fetch_one(&mut *c).await?;
+                sqlx::query_scalar("SELECT policy_bindings FROM projects WHERE id = $1 FOR NO KEY UPDATE").bind(pid).fetch_one(&mut *c).await?;
             let mut bindings: std::collections::BTreeMap<String, Binding> = serde_json::from_str(&text).unwrap_or_default();
             if let Some(b) = bindings.get_mut(&g) {
                 *b = Binding::Group(gid);
@@ -1219,7 +1221,9 @@ async fn change_admins(hub: HubState, caller: Caller, p: String, add: bool, req:
                 // review gate, before the project's row (lock order).
                 crate::prs::close_review_gate(&mut *c, pid).await?;
             }
-            let _: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+            // NO KEY UPDATE: a push waiting for the gate holds the row KEY
+            // SHARE (its rows' foreign keys: BUG-2130).
+            let _: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE id = $1 FOR NO KEY UPDATE")
                 .bind(pid)
                 .fetch_one(&mut *c)
                 .await?;

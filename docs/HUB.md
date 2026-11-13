@@ -5475,9 +5475,10 @@ transaction per landing instead of 23.
    removed (first, before the project's row); a landing of the default
    branch whose rules record changes or that accepts or changes the access
    policy (`prs::state::record_landing` answers whether the rules record
-   does: the push takes the gate last, once it has written everything, a
-   commit through the API after its branch row, the default branch's own
-   batch instead of taking it shared); an embargo's release moving its
+   does: the push takes the gate last, once it has written everything but
+   the project's row, which it writes after; a commit through the API
+   after its branch row, before the project's row; the default branch's
+   own batch instead of taking it shared); an embargo's release moving its
    holds into `pr_holds` and retargeting its PRs (`finish_release`, after
    the line's row); and a revert recorded as landed
    (`bisect::record_revert_landed`). Such a write commits before a batch
@@ -5492,7 +5493,8 @@ transaction per landing instead of 23.
    first **announces** itself: a row in `review_writers` (migration 43)
    committed on its own, on another connection of the
    `db::transaction`'s pool, and its transaction then takes its own
-   advisory lock and the gate. A batch takes the gate in one statement only
+   advisory lock (key `-id`: below zero, so no other lock's, whose keys
+   are a positive base XOR a project; BUG-2130) and the gate. A batch takes the gate in one statement only
    if no writer of its project is announced in that statement's snapshot;
    if one is, it takes nothing, rolls back, waits outside any transaction
    for the writers it found (polling, at most 1 s, then it goes in
@@ -5502,11 +5504,14 @@ transaction per landing instead of 23.
    ask for the gate, each once: a writer waits at most for the batches
    already committing, and a batch at most for the writers announced
    before it looked, so a stream of writers does not starve batches
-   either. Neither relies on how the database queues lock requests (by
+   either. (A batch that waited its 1 s asks too, ignoring the writer:
+   so the bound holds while batches hold the gate under 1 s, as they do
+   but for a slow store, waited for at most half a lease, 1 s, inside.) Neither relies on how the database queues lock requests (by
    hand on YugabyteDB with the same three loops running the batches' ask:
    the writer got the gate 0.63 s after it asked, when the batch already
    in ended). `db::transaction` deletes a writer's row when its attempt
-   ends, committed or not; a row left by a server that stopped is removed
+   ends, committed or not, and a task deletes it when the attempt is
+   dropped (its client went away, the deadline, a panic: BUG-2132); a row left by a server that stopped is removed
    by the batch waiting for it once it is 2 s old and its writer's lock is
    free. Writers wait for one another on the gate as before (an exclusive
    lock among writers only).
@@ -5514,7 +5519,11 @@ transaction per landing instead of 23.
    (`pack_gc::guard_root_write`), the landing lease's row, branch rows, the
    review gate, then the rows it writes (queue rows, PRs, snapshots, the
    project's row); nothing that holds the gate waits for a lease or a
-   branch row, so no cycle is possible through them. (A release locks its
+   branch row, so no cycle is possible through them. A transaction that
+   waits for the gate may hold the project's row `KEY SHARE` (its rows'
+   foreign keys), so one holding the gate locks that row `FOR NO KEY
+   UPDATE`, never `FOR UPDATE` (an admin's removal, a group's creation:
+   BUG-2130). (A release locks its
    line's record, `embargo_lines`, before the line's branch row, as it did
    before the gate; the push therefore takes the gate after its own
    writes, an embargo's record among them. `Storing` is waited for last,
