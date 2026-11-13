@@ -2075,3 +2075,151 @@ fn bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them() {
     assert_eq!((r.status, r.json()["code"].as_str()), (409, Some("not_ready")), "landed on a held path: {}", String::from_utf8_lossy(&r.body));
     assert!(String::from_utf8_lossy(&r.body).contains("asked for changes"), "{}", String::from_utf8_lossy(&r.body));
 }
+
+/// `main` protected, and a PR of dev's adding `file` on its own branch:
+/// the PR's tip, id and patch. `review(who, verdict)` posts a signed verdict.
+fn protected_main_and_a_pr(api: &Api, p: &Project, file: &str) -> (ObjectId, String, String) {
+    let dev_tok = p.dev.token();
+    write_files(&p.dir, &[(".veilrules", "[branches.main]\nprotected = true\n")]);
+    p.admin.commit_main(&p.dir, "protect main with review rules");
+    p.admin.ok(&p.dir, &["push"]);
+    let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": base.hex(), "edits": [put(file, "pub fn feat() {}\n")]}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let feat: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).unwrap();
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "feat", "expected": null, "new": feat.hex()}], "force": false}),
+    );
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", r.json());
+    let pr = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs", p.name), &json!({"head": "feat", "title": "add feat"})).json();
+    (feat, pr["id"].as_str().unwrap().to_string(), pr["patch"].as_str().unwrap().to_string())
+}
+
+fn post_verdict(api: &Api, p: &Project, who: &Person, pr_id: &str, patch: &str, verdict: &str) -> Reply {
+    let sig = who.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, pr_id, patch, verdict));
+    api.post_json(
+        Some(&who.token()),
+        &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+        &json!({"patch": patch, "verdict": verdict, "signature": sig}),
+    )
+}
+
+/// The review gate's advisory-lock key (`prs::REVIEW_GATE_BASE ^ project`).
+fn review_gate_key(pid: i64) -> i64 {
+    0x7665_696c_7276_6774_i64 ^ pid
+}
+
+/// BUG-2110: a verdict (or a rules push, a new revision, an embargo
+/// release, a revert recorded) takes the review gate exclusively and waits
+/// for the batches already holding it shared; a batch that asks for it
+/// after the writer must queue behind it, or a busy project's overlapping
+/// batches starve the writer. PostgreSQL queues it; YugabyteDB (2025.2)
+/// grants it at once. Here two transactions stand in for two batches on
+/// other branches: the first holds the gate shared while the verdict
+/// waits, the second asks after it; once the first ends the verdict must
+/// be written, with the second still open.
+#[test]
+#[ignore = "BUG-2110: on YugabyteDB a shared review gate is granted past a waiting exclusive one: a verdict waits as long as batches overlap"]
+fn bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (_, pr_id, patch) = protected_main_and_a_pr(&api, &p, "src/feature-2110.rs");
+    let h = th.hub();
+    let key = review_gate_key(pid);
+    let mut first = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt.block_on(sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(key).execute(&mut *first)).unwrap();
+    let written = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reviewer = scope.spawn(|| {
+            let r = post_verdict(&api, &p, &p.admin, &pr_id, &patch, "approve");
+            written.store(true, Ordering::SeqCst);
+            r
+        });
+        th.rt.block_on(wait_for_sql_lock(&h.db, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the gate"));
+        assert!(!written.load(Ordering::SeqCst), "the verdict did not wait for a batch holding the gate");
+        // A batch arriving after the writer: queued behind it (its ask times
+        // out here), or granted past it.
+        let mut second = th.rt.block_on(h.db.begin()).unwrap();
+        th.rt.block_on(sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *second)).unwrap();
+        let granted = th.rt.block_on(sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(key).execute(&mut *second)).is_ok();
+        th.rt.block_on(first.rollback()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !written.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let in_time = written.load(Ordering::SeqCst);
+        th.rt.block_on(second.rollback()).unwrap();
+        let r = reviewer.join().unwrap();
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(in_time, "the verdict still waited 5 s after the batches before it ended (a later shared ask granted past it: {granted})");
+    });
+}
+
+/// BUG-2111: an approval counts while its reviewer may write every path of
+/// the PR (`review::gate_conn`), read in the batch's transaction; taking the
+/// reviewer's access away (here: out of the group that writes `src/`) takes
+/// no lock the batch waits for. Answered while the batch that counted the
+/// approval is open, it does not stop that batch landing the change with
+/// an approval that no longer counts. Either the removal waits for the
+/// batch, or the batch refuses the change.
+#[test]
+#[ignore = "BUG-2111: a reviewer's access taken away while the batch commits does not stop it landing with that reviewer's approval"]
+fn bug_2111_a_reviewer_removed_while_the_batch_commits_does_not_approve_it() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let dev_tok = p.dev.token();
+    // sec writes `src/` as one of devs, and is the PR's one reviewer.
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let (feat, pr_id, patch) = protected_main_and_a_pr(&api, &p, "src/feature-2111.rs");
+    let r = post_verdict(&api, &p, &p.sec, &pr_id, &patch, "approve");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true, "{}", r.json());
+
+    hold_lease(&th, pid, "main");
+    let r = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/land", p.name), &json!({"onto": "main", "snapshot": feat.hex(), "wait": false}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "queued", "{}", r.json());
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    // The batch counts sec's approval in its transaction, then is held at
+    // the entry's row.
+    let h = th.hub();
+    let mut held = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt
+        .block_on(sqlx::query("SELECT 1 FROM landing_queue WHERE project_id = $1 AND ticket = $2 FOR UPDATE").bind(pid).bind(&ticket).fetch_one(&mut *held))
+        .unwrap();
+    release_lease(&th, pid, "main");
+    th.rt.block_on(wait_for_sql_lock(&h.db, "UPDATE landing_queue AS q%", "the batch never reached its entries' rows"));
+
+    let removed = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let admin = scope.spawn(|| {
+            let o = p.admin.run(&p.dir, &["group", "remove", "devs", &p.sec.name]);
+            removed.store(true, Ordering::SeqCst);
+            o
+        });
+        let until = Instant::now() + Duration::from_secs(3);
+        while !removed.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let removed_while_held = removed.load(Ordering::SeqCst);
+        th.rt.block_on(held.rollback()).unwrap();
+        let o = admin.join().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let done = outcome(&api, &dev_tok, &p.name, &ticket);
+        assert_ne!(done["state"], "queued", "{done}");
+        assert!(
+            !(removed_while_held && done["state"] == "landed"),
+            "sec was out of devs (answered) before the batch committed, and the change landed on sec's approval: {done}"
+        );
+    });
+}
