@@ -415,6 +415,15 @@ pub struct Stats {
     pub p_derive_finish_us: AtomicU64,
     pub p_derive_prs_us: AtomicU64,
     pub p_derive_big: AtomicU64,
+    pub p_c_base_us: AtomicU64,
+    pub p_c_build_us: AtomicU64,
+    pub p_c_put_us: AtomicU64,
+    pub p_c_stack_us: AtomicU64,
+    pub p_c_commit_us: AtomicU64,
+    pub p_fills: AtomicU64,
+    pub p_fill_us: AtomicU64,
+    pub p_search_runs: AtomicU64,
+    pub p_search_us: AtomicU64,
 }
 
 /// A waiting ticket's answer channels, and the branch it waits on.

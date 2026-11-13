@@ -365,5 +365,14 @@ fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
         "landing_p_derive_finish_us": hub.landing.stats.p_derive_finish_us.load(Relaxed),
         "landing_p_derive_prs_us": hub.landing.stats.p_derive_prs_us.load(Relaxed),
         "landing_p_derive_big": hub.landing.stats.p_derive_big.load(Relaxed),
+        "landing_p_c_base_us": hub.landing.stats.p_c_base_us.load(Relaxed),
+        "landing_p_c_build_us": hub.landing.stats.p_c_build_us.load(Relaxed),
+        "landing_p_c_put_us": hub.landing.stats.p_c_put_us.load(Relaxed),
+        "landing_p_c_stack_us": hub.landing.stats.p_c_stack_us.load(Relaxed),
+        "landing_p_c_commit_us": hub.landing.stats.p_c_commit_us.load(Relaxed),
+        "landing_p_fills": hub.landing.stats.p_fills.load(Relaxed),
+        "landing_p_fill_us": hub.landing.stats.p_fill_us.load(Relaxed),
+        "landing_p_search_runs": hub.landing.stats.p_search_runs.load(Relaxed),
+        "landing_p_search_us": hub.landing.stats.p_search_us.load(Relaxed),
     })
 }

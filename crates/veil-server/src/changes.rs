@@ -1083,6 +1083,8 @@ pub(crate) async fn create_with(
     if req.edits.iter().any(|e| !viewer.within_narrowing(&e.path)) {
         return Err(sync::agent_refusal(sync::NARROWED_WRITE));
     }
+    let st = &hub.landing.stats;
+    let t_c = std::time::Instant::now();
     let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     // Uploads are staged (S28): read into memory with what the change makes,
     // stored only once every check passed (BUG-930).
@@ -1116,6 +1118,7 @@ pub(crate) async fn create_with(
             return Err(bad(format!("cannot land work built on unreleased embargo {eid} onto '{}'", q.branch)));
         }
     }
+    crate::landing::prof(&st.p_c_base_us, t_c);
     let base_proj = if req.base == ObjectId([0; 32]) {
         sync::projected(hub, project, viewer, base_real).await?
     } else {
@@ -1220,7 +1223,9 @@ pub(crate) async fn create_with(
                 }
             }
         }
+        let t_b = std::time::Instant::now();
         let built = build(hub, &plan, &who, parent, pparent).await?;
+        crate::landing::prof(&st.p_c_build_us, t_b);
         // The one rule of every tip an agent session sets (`sync::agent_tip`):
         // for a narrowed one, anything outside its paths first (a stack of
         // its person's own changes may hold more); then the files that decide
@@ -1234,7 +1239,10 @@ pub(crate) async fn create_with(
             _ => None,
         };
         // Stored before anything reads them (a landing's stack may).
+        let t_p = std::time::Instant::now();
         sync::put_all(hub, project.id, built.store.clone()).await?;
+        crate::landing::prof(&st.p_c_put_us, t_p);
+        let t_s = std::time::Instant::now();
         // A landing of edits: the stack is the submitter's history from the
         // branch up to this one, as for a pushed snapshot (BUG-1112).
         if let Some((_, q)) = land.as_mut() {
@@ -1279,6 +1287,7 @@ pub(crate) async fn create_with(
                 first.review = Some(claim);
             }
         }
+        crate::landing::prof(&st.p_c_stack_us, t_s);
         // The branch rules: a move of the default branch changes them only
         // for an admin, judged against its tip (BUG-1102).
         let rules_moved = match cur {
@@ -1349,7 +1358,10 @@ pub(crate) async fn create_with(
             },
             _ => None,
         };
-        match commit(hub, &plan, &who, &built, &restacked, person.id, gc_epoch, mv, land.as_ref(), base_embargo.as_deref()).await {
+        let t_m = std::time::Instant::now();
+        let committed = commit(hub, &plan, &who, &built, &restacked, person.id, gc_epoch, mv, land.as_ref(), base_embargo.as_deref()).await;
+        crate::landing::prof(&st.p_c_commit_us, t_m);
+        match committed {
             Ok(m) => break (built, m),
             // The tip moved during the request: try again on the new one,
             // with the access as it is now (BUG-1051).
