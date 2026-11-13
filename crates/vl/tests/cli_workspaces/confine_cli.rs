@@ -415,7 +415,10 @@ fn injected_secrets_are_still_removed_and_quarantine_still_works() {
     assert!(!out.contains("isolated-value"), "{out}");
     let o = t.exec(&["agent", "--with-isolated", "--", "sh", "-c", "cat .netrc; cp .netrc copy.txt; echo 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' > creds.txt"]);
     let out = text(&o);
-    assert!(o.status.success(), "{out}");
+    // Recorded without creds.txt, which it names (BUG-2171); the injected
+    // copy, taken out, is not counted.
+    assert_eq!(o.status.code(), Some(3), "{out}");
+    assert!(out.contains("  creds.txt (") && !out.contains("  copy.txt ("), "{out}");
     assert!(out.contains(ISOLATED), "the injected file is visible inside: {out}");
     assert!(!t.files("agent").join(".netrc").exists(), "the injected file was left in the sandbox");
     for p in ["copy.txt", ".netrc", "creds.txt"] {
@@ -1483,8 +1486,9 @@ fn bug_1030_masks_hold_and_the_layers_mount_whatever_a_run_left_at_a_masked_path
 
 /// Run `script` in workspace `agent`, then `vl undo` until the workspace
 /// is gone (its sandbox directory stays), and make `agent` again.
-fn undo_and_make_again(t: &T, script: &str) {
-    run_out(t, &["agent", "--", "sh", "-c", script]);
+fn undo_and_make_again(t: &T, script: &str, status: i32) {
+    let o = t.exec(&["agent", "--", "sh", "-c", script]);
+    assert_eq!(o.status.code(), Some(status), "{}", text(&o));
     for _ in 0..8 {
         if !t.env.stdout("alice", &t.proj, &["ws", "list"]).contains("agent") {
             break;
@@ -1504,7 +1508,7 @@ fn bug_1031_a_new_workspace_of_the_same_name_never_sees_the_old_ones_layers() {
     agent_home(&t);
     let canary = t.env.dir("old-canary");
     write(&canary, "keep", "canary\n");
-    undo_and_make_again(&t, &format!("echo OLD-LAYER-77b1 > ~/.claude/x; ln -s {}/keep ~/.claude/link", canary.display()));
+    undo_and_make_again(&t, &format!("echo OLD-LAYER-77b1 > ~/.claude/x; ln -s {}/keep ~/.claude/link", canary.display()), 0);
     let before = snapshot(&canary, &[]);
     let out = run_out(&t, &["agent", "--", "sh", "-c", "cat ~/.claude/x ~/.claude/link 2>&1; echo end"]);
     assert!(!out.contains("OLD-LAYER-77b1") && !out.contains("canary"), "the new workspace saw the old one's layer: {out}");
@@ -1520,7 +1524,8 @@ fn bug_1031_a_new_workspace_of_the_same_name_never_sees_the_old_ones_layers() {
 #[test]
 fn bug_1033_a_new_workspace_of_the_same_name_never_gets_the_old_ones_files() {
     let t = T::new();
-    undo_and_make_again(&t, "echo 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' > creds.txt");
+    // Exit 3: recorded without the quarantined creds.txt (BUG-2171).
+    undo_and_make_again(&t, "echo 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' > creds.txt", 3);
     let out = run_out(&t, &["agent", "--", "sh", "-c", "cat creds.txt 2>&1; echo end"]);
     assert!(!out.contains("EXAMPLEKEY"), "the new workspace saw the old one's files: {out}");
     assert!(t.cat("creds.txt").is_none(), "the old workspace's files were recorded in the new one");

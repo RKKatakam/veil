@@ -56,6 +56,13 @@ fn on_disk(proj: &Path, path: &str) -> Vec<String> {
 }
 
 /// The invariant: the output is recorded, or still on disk.
+/// The exit status a run that finished must have: 3 while the sandbox
+/// holds the quarantined `creds.txt` and the run covers it (`full`: not
+/// `--only src`), as `vl commit` (BUG-2171); 0 otherwise.
+fn expected(proj: &Path, full: bool) -> Option<i32> {
+    Some(if full && sandbox(proj).join("files/creds.txt").exists() { 3 } else { 0 })
+}
+
 fn survives(env: &Env, proj: &Path, path: &str, content: &str) -> bool {
     cat(env, proj, path).as_deref() == Some(content) || on_disk(proj, path).iter().any(|c| c == content)
 }
@@ -188,7 +195,7 @@ fn run_case(c: &Case) {
         Failure::InterruptedSync => {
             // Quarantined work, a hand edit outside the set, and the
             // command's output inside it, all unrecorded…
-            env.ok(
+            env.quarantined(
                 "alice",
                 &proj,
                 &[
@@ -202,7 +209,7 @@ fn run_case(c: &Case) {
                 ],
             );
             let o = env.vl("alice", &proj, &argv);
-            assert!(o.status.success(), "{tag}: {}", text(&o));
+            assert_eq!(o.status.code(), expected(&proj, !c.sparse), "{tag}: {}", text(&o));
             if c.sparse {
                 write(&sandbox(&proj).join("files"), "docs/hand.md", "edited by hand\n");
             }
@@ -212,7 +219,8 @@ fn run_case(c: &Case) {
             m["running"] = "deadbeef".into();
             std::fs::write(&mpath, serde_json::to_vec(&m).unwrap()).unwrap();
             let o = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "true"]);
-            assert!(o.status.success() && text(&o).contains("Rebuilding"), "{tag}: {}", text(&o));
+            assert_eq!(o.status.code(), expected(&proj, true), "{tag}: {}", text(&o));
+            assert!(text(&o).contains("Rebuilding"), "{tag}: {}", text(&o));
             assert!(survives(&env, &proj, "creds.txt", "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"), "{tag}: quarantined work lost");
             if c.sparse {
                 assert!(survives(&env, &proj, "docs/hand.md", "edited by hand\n"), "{tag}: the hand edit outside the set was lost");
@@ -225,7 +233,7 @@ fn run_case(c: &Case) {
     let o = env.vl("alice", &proj, &["ws", "exec", "agent", "--record-only"]);
     assert!(o.status.success(), "{tag}: --record-only: {}", text(&o));
     let o = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "true"]);
-    assert!(o.status.success(), "{tag}: next run: {}", text(&o));
+    assert_eq!(o.status.code(), expected(&proj, true), "{tag}: next run: {}", text(&o));
     match c.failure {
         // A run that cannot be recorded after a restart (its files may be
         // torn) is kept whole, not recorded.

@@ -388,12 +388,15 @@ fn bug_1931_an_unrecorded_edit_of_such_a_file_is_not_cleaned_as_a_copy() {
         let t = T::new(&[("README.md", &readme), (".env", &format!("APP_URL={URL}\nAPI_KEY=Xk29vLq8sPzQw7LmTr4Bn6Yc\n"))]);
         let o = t.exec(flags, r#"echo 'key = "AKIAIOSFODNN7EXAMPLE"' >> README.md"#);
         let out = text(&o);
-        assert!(o.status.success(), "{flags:?}: the run works:\n{out}");
+        // The run works; recorded without the held-back edit, so exit 3 (BUG-2171).
+        assert_eq!(o.status.code(), Some(3), "{flags:?}: the run works:\n{out}");
+        assert!(out.contains("  README.md (aws-access-key-id at line 4; edit held back)"), "{flags:?}: named as left out:\n{out}");
         assert!(out.lines().any(|l| l.contains("README.md") && l.contains("quarantined")), "{flags:?}: control: the scanner holds the edit back:\n{out}");
         assert_eq!(t.ok(&["cat", "-r", "agent@", "README.md"]), readme, "{flags:?}: control: the edit is not recorded");
         assert!(!out.lines().any(|l| l.contains("README.md") && l.contains("cleaned")), "{flags:?}: the edit is not cleaned as a copy:\n{out}");
         let o = t.exec(flags, "grep -q AKIAIOSFODNN7EXAMPLE README.md");
-        assert!(o.status.success(), "{flags:?}: the held-back edit is still in the sandbox:\n{}", text(&o));
+        // grep's 0, and the edit still held back: exit 3.
+        assert_eq!(o.status.code(), Some(3), "{flags:?}: the held-back edit is still in the sandbox:\n{}", text(&o));
     }
 }
 

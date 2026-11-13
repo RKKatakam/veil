@@ -333,7 +333,7 @@ fn a_workspace_moved_during_the_run_keeps_both_results() {
 fn ws_rm_removes_the_sandbox_but_not_quarantined_work_without_force() {
     let env = Env::new();
     let proj = project(&env);
-    exec(&env, &proj, &["--", "sh", "-c", "echo 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' > creds.txt"]);
+    env.quarantined("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", "echo 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' > creds.txt"]);
     let dir = proj.join(".veil/local/sandboxes/agent");
     assert!(dir.join("files/creds.txt").exists(), "quarantined work stays in the sandbox");
     let o = env.vl("alice", &proj, &["ws", "rm", "agent"]);
