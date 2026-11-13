@@ -402,7 +402,13 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
     let mut overlay = plan.pending.clone();
     overlay.extend(shaped.made.iter().map(|(k, v)| (*k, v.clone())));
     let (p, w, hub2) = (plan.clone(), who.clone(), hub.clone());
-    sync::blocking_with(hub, who.project.id, overlay, move |src| {
+    // The trees the push's checks graft are held, not stored as they are
+    // made (BUG-2362: each was written alone, two waits on a local store's
+    // journal apiece, 7 to 11 ms of a landing's submit while it held its
+    // project's gate): they are stored with the change's other objects,
+    // all at once, before anything reads them from the store.
+    let held = sync::Staged::held();
+    sync::blocking_in(hub, who.project.id, overlay, Some(held.clone()), move |src| {
         let n = Snapshot {
             parents: vec![parent],
             change_id: p.change_id,
@@ -446,6 +452,11 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
                         store.push((d, raw.clone()));
                     }
                 }
+            }
+        }
+        for (id, raw) in held.made() {
+            if seen.insert(id) {
+                store.push((id, raw));
             }
         }
         store.push((real_id, raw));
