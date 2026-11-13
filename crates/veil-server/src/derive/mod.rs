@@ -946,11 +946,14 @@ impl<'a> Batch<'a> {
             if expanded.contains(&x) {
                 continue;
             }
+            let t_w = std::time::Instant::now();
             if self.graph.row(&x)?.is_some() {
                 done.insert(x);
+                crate::landing::prof(&self.cx.hub().landing.stats.p_d_walk_us, t_w);
                 continue;
             }
             let s = self.cx.src.snapshot(&x)?;
+            crate::landing::prof(&self.cx.hub().landing.stats.p_d_walk_us, t_w);
             expanded.insert(x);
             stack.push((x, true));
             for p in s.parents.iter().rev() {
@@ -975,7 +978,9 @@ impl<'a> Batch<'a> {
         if row.flags & FLAG_EMBARGO_LINE != 0 {
             row.changed = Some(WITHHELD.into());
         } else {
+            let t_tc = std::time::Instant::now();
             let (ch, dirs) = self.tree_changes(x, &s.parents)?;
+            crate::landing::prof(&self.cx.hub().landing.stats.p_d_tree_us, t_tc);
             for k in self.keys_of(&ch, &dirs) {
                 self.writes.rules.push((k, row.generation, hex.clone()));
             }
@@ -996,10 +1001,14 @@ impl<'a> Batch<'a> {
                 if ch.len() + dirs.len() > changes::MAX_PATHS {
                     row.changed = Some(MANY.into());
                 } else {
+                    let t_so = std::time::Instant::now();
                     let (from, capped, similar) = changes::sources(src, &ch)?;
+                    crate::landing::prof(&self.cx.hub().landing.stats.p_d_sources_us, t_so);
+                    let t_lc = std::time::Instant::now();
                     let wants: Vec<(String, ObjectId)> =
                         ch.iter().flat_map(|c| s.parents.iter().map(move |p| (c.path.clone(), *p))).collect();
                     let mut prevs = self.last_changes(&wants)?.into_iter();
+                    crate::landing::prof(&self.cx.hub().landing.stats.p_d_last_us, t_lc);
                     let mut paths = Vec::with_capacity(ch.len());
                     for ((c, from), capped) in ch.into_iter().zip(from).zip(capped) {
                         paths.push(PathChange {
@@ -1135,6 +1144,8 @@ impl<'a> Batch<'a> {
 
     fn flush_with_progress(&mut self, progress: Option<(&[String], &[String])>) -> Result<()> {
         let cx = self.cx;
+        let t_fl = std::time::Instant::now();
+        let _t = Timer(&cx.hub().landing.stats.p_d_flush_us, t_fl);
         let mut w = std::mem::take(&mut self.writes);
         let objects = std::mem::take(&mut w.objects);
         upload_objects(&cx.src.rt, cx.hub(), cx.project(), objects)?;
@@ -1157,6 +1168,14 @@ impl<'a> Batch<'a> {
         self.graph.pending.clear();
         self.history.clear();
         Ok(())
+    }
+}
+
+/// PROFILE (lateslow): adds its time when dropped.
+struct Timer<'a>(&'a std::sync::atomic::AtomicU64, std::time::Instant);
+impl Drop for Timer<'_> {
+    fn drop(&mut self) {
+        crate::landing::prof(self.0, self.1);
     }
 }
 
