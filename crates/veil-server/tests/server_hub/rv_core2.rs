@@ -2367,3 +2367,211 @@ fn bug_2110_a_writer_that_went_away_does_not_stop_landings() {
     let left: i64 = th.rt.block_on(sqlx::query_scalar("SELECT count(*) FROM review_writers WHERE project_id = $1").bind(pid).fetch_one(&h.db)).unwrap();
     assert_eq!(left, 0, "the stale writer's row was not removed");
 }
+
+/// Whether two of this database's backends wait for each other (a
+/// deadlock PostgreSQL has not broken yet). YugabyteDB does not report
+/// `pg_blocking_pids`: answered false.
+async fn a_lock_cycle(db: &sqlx::PgPool) -> bool {
+    if is_yugabyte(db).await {
+        return false;
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity a, LATERAL unnest(pg_blocking_pids(a.pid)) AS b(pid) \
+         WHERE a.datname = current_database() AND a.pid = ANY(pg_blocking_pids(b.pid)))",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+/// BUG-2130: the review gate before the project's row, everywhere. An
+/// admin's removal takes the gate, then the project's row; a push that
+/// accepted a new access policy wrote the project's row
+/// (`perm::accept_policy`) and took the gate after, last. Granted the gate
+/// while such a push waited for it, the removal waited for the push's row
+/// and the push for the gate: a deadlock. Here a transaction standing in
+/// for a batch holds the gate shared; the removal asks for it, then the
+/// push; once the stand-in ends, neither may wait for the other, and both
+/// are answered.
+#[test]
+fn bug_2130_a_policy_push_and_an_admin_removal_take_the_gate_in_one_order() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let h = th.hub();
+    let admins = format!("/v1/projects/{}/admins", p.name);
+    let r = api.post_json(Some(&p.admin.token()), &admins, &json!({"people": [p.carol.name]}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    p.admin.ok(&p.dir, &["access", &format!("{BILL_DIR}/"), "finance", "security"]);
+    p.admin.commit_main(&p.dir, "billing for security too");
+    let yb = th.rt.block_on(is_yugabyte(&h.db));
+    let mut batch = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt.block_on(sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(review_gate_key(pid)).execute(&mut *batch)).unwrap();
+    let batch_pid = th.rt.block_on(backend_pid(&mut batch));
+    std::thread::scope(|scope| {
+        let removal = scope.spawn(|| api.post_json(Some(&p.admin.token()), &format!("{admins}/remove"), &json!({"people": [p.carol.name]})));
+        th.rt.block_on(wait_blocked_by(&h.db, batch_pid, "SELECT pg_advisory_xact_lock(%", "the removal never waited for the gate"));
+        let push = scope.spawn(|| p.admin.ok(&p.dir, &["push"]));
+        // The push waits for the gate too (after the removal).
+        if yb {
+            std::thread::sleep(Duration::from_secs(3));
+        } else {
+            let until = Instant::now() + Duration::from_secs(30);
+            loop {
+                let n: i64 = th
+                    .rt
+                    .block_on(
+                        sqlx::query_scalar(
+                            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+                             AND query LIKE 'SELECT pg_advisory_xact_lock(%' AND $1 = ANY(pg_blocking_pids(pid))",
+                        )
+                        .bind(batch_pid)
+                        .fetch_one(&h.db),
+                    )
+                    .unwrap();
+                if n >= 2 {
+                    break;
+                }
+                assert!(Instant::now() < until, "the push never waited for the gate");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        th.rt.block_on(batch.rollback()).unwrap();
+        // PostgreSQL breaks a deadlock after `deadlock_timeout` (1 s).
+        let until = Instant::now() + Duration::from_millis(1500);
+        let mut cycle = false;
+        while Instant::now() < until && !cycle {
+            cycle = th.rt.block_on(a_lock_cycle(&h.db));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let r = removal.join().unwrap();
+        let pushed = push.join().unwrap();
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(!r.json()["admins"].as_array().unwrap().iter().any(|a| a == &json!(p.carol.name)), "{}", r.json());
+        assert!(!pushed.is_empty());
+        assert!(!cycle, "the removal and the push waited for each other");
+    });
+}
+
+/// BUG-2131: a writer of the review gate announces itself on a second
+/// connection of the pool its transaction holds one of. Writers that fill
+/// the pool, each in its transaction before its announcement, wait for a
+/// connection none of them gives back: every one until the pool's
+/// `acquire_timeout` (30 s). Here 16 group-member removals (the test
+/// server's pool), 8 in each of two projects (a project runs at most 12
+/// requests at once), wait in their transactions at an invite row this
+/// test holds; once it is freed, each takes the gate.
+#[test]
+#[ignore = "BUG-2131: writers filling the pool wait for their announcement's connection until acquire_timeout"]
+fn bug_2131_writers_filling_the_pool_are_answered() {
+    use sqlx::Connection;
+    let th = TestHub::start();
+    let projects = [setup_project(&th), setup_project(&th)];
+    let api = th.api();
+    let h = th.hub();
+    let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    let now = veil_core::now_millis();
+    for p in &projects {
+        let pid = project_id(&th, &p.name);
+        let admin_id: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.admin.name).fetch_one(&h.db)).unwrap();
+        let gid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'devs'").bind(pid).fetch_one(&h.db)).unwrap();
+        th.rt
+            .block_on(
+                sqlx::query("INSERT INTO invites (project_id, invite_key, person, group_id, expires_at, created_by, created_at) VALUES ($1, 'k2131', $2, $3, $4, $5, $6)")
+                    .bind(pid)
+                    .bind(&p.fin.name)
+                    .bind(gid)
+                    .bind(now + 3_600_000)
+                    .bind(admin_id)
+                    .bind(now)
+                    .execute(&h.db),
+            )
+            .unwrap();
+    }
+    // Outside the server's pool.
+    let mut outside = th.rt.block_on(sqlx::PgConnection::connect(&url)).unwrap();
+    let mut hold = th.rt.block_on(outside.begin()).unwrap();
+    th.rt.block_on(sqlx::query("SELECT 1 FROM invites WHERE invite_key = 'k2131' FOR UPDATE").execute(&mut *hold)).unwrap();
+    let held = th.rt.block_on(backend_pid(&mut hold));
+    let mut probe = th.rt.block_on(sqlx::PgConnection::connect(&url)).unwrap();
+    std::thread::scope(|scope| {
+        let mut asks = Vec::new();
+        for p in &projects {
+            for _ in 0..8 {
+                asks.push(scope.spawn(|| {
+                    let t = Instant::now();
+                    let r = api.post_json(Some(&p.admin.token()), &format!("/v1/projects/{}/groups/devs/members/remove", p.name), &json!({"people": [p.fin.name]}));
+                    (r, t.elapsed())
+                }));
+            }
+        }
+        let until = Instant::now() + Duration::from_secs(8);
+        loop {
+            let n: i64 = th
+                .rt
+                .block_on(
+                    sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))")
+                        .bind(held)
+                        .fetch_one(&mut probe),
+                )
+                .unwrap();
+            if n >= 16 || Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        th.rt.block_on(hold.rollback()).unwrap();
+        for a in asks {
+            let (r, took) = a.join().unwrap();
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            assert!(took < Duration::from_secs(15), "a removal took {took:?}");
+        }
+    });
+}
+
+
+/// BUG-2132: a writer's announcement goes when its request does, also
+/// when the request is dropped mid-way (its client went away, or
+/// `db::transaction`'s deadline): `review_gate::scoped` deleted the rows
+/// only after its transaction's future ran to the end. Here a verdict
+/// waits for the gate held by a stand-in batch; its client gives up after
+/// a second; once the stand-in ends, no announcement of the project is
+/// left.
+#[test]
+fn bug_2132_a_writer_whose_request_is_dropped_leaves_no_announcement() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (_, pr_id, patch) = protected_main_and_a_pr(&api, &p, "src/feature-2132.rs");
+    let h = th.hub();
+    let count = || -> i64 { th.rt.block_on(sqlx::query_scalar("SELECT count(*) FROM review_writers WHERE project_id = $1").bind(pid).fetch_one(&h.db)).unwrap() };
+    let mut batch = th.rt.block_on(h.db.begin()).unwrap();
+    th.rt.block_on(sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(review_gate_key(pid)).execute(&mut *batch)).unwrap();
+    std::thread::scope(|scope| {
+        let reviewer = scope.spawn(|| {
+            let sig = p.admin.identity().sign(SIG_CONTEXT_HUB_PR_REVIEW, &review_message(&p.name, &pr_id, &patch, "approve"));
+            api.post_json_within(
+                &p.admin.token(),
+                &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+                &json!({"patch": patch, "verdict": "approve", "signature": sig}),
+                Duration::from_secs(2),
+            )
+        });
+        let until = Instant::now() + Duration::from_secs(30);
+        while count() == 0 {
+            assert!(Instant::now() < until, "the verdict never announced itself");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(reviewer.join().is_err(), "the verdict was answered while the gate was held");
+    });
+    // The server notices the client gone.
+    std::thread::sleep(Duration::from_millis(500));
+    th.rt.block_on(batch.rollback()).unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while count() != 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(count(), 0, "the dropped verdict's announcement was left");
+}
