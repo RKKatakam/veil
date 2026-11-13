@@ -227,3 +227,51 @@ fn bug_2270_a_merge_whose_staged_pack_was_discarded_gives_way() {
     read_all(&hub, pid, &ids, "after the merge");
     read_all(&fresh, pid, &ids, "after the merge, another server");
 }
+
+/// BUG-2280: the packs a background merge replaced are deleted only by a
+/// later pass on the project (`sweep_discarded`, once their grace period
+/// has passed), and a pass runs only when a push finds 64 small packs
+/// listed. A project that goes quiet after a burst keeps the packs its
+/// last minute of merges replaced stored for good (and a crashed merge's
+/// staged pack, swept only by a later pass's `sweep_staged`). Here the
+/// grace period is made to pass at once (the discarded rows aged): nothing
+/// deletes them.
+#[test]
+#[ignore = "BUG-2280: packs a background merge replaced stay stored once the project goes quiet"]
+fn bug_2280_packs_a_background_merge_replaced_are_deleted_after_the_grace_period() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    for i in 0..MERGE_MIN_PACKS + 8 {
+        push_file(&api, &p, "quiet", &format!("src/q{i}.txt"));
+    }
+    let h = hub.hub();
+    let until = Instant::now() + Duration::from_secs(30);
+    while (h.pack_gc.background_merges.load(Ordering::Relaxed) == 0 || small_and_discarded(&hub, pid).0 >= MERGE_MIN_PACKS as i64)
+        && Instant::now() < until
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(h.pack_gc.background_merges.load(Ordering::Relaxed) >= 1, "the pushes started a background merge");
+    let (small, discarded) = small_and_discarded(&hub, pid);
+    assert!(small < MERGE_MIN_PACKS as i64, "{small} small packs still listed");
+    assert!(discarded >= MERGE_MIN_PACKS as i64 / 2, "the merges replaced the pushes' packs: {discarded} discarded");
+    // The grace period passes (as it does a minute later).
+    let aged = hub
+        .rt
+        .block_on(
+            sqlx::query("UPDATE packs SET discarded_at = discarded_at - $2 WHERE project_id = $1 AND state = 2")
+                .bind(pid)
+                .bind(2 * pack_gc::DEFAULT_PACK_GRACE_MS)
+                .execute(&h.db),
+        )
+        .expect("the discarded rows are aged");
+    assert_eq!(aged.rows_affected() as i64, discarded);
+    let until = Instant::now() + Duration::from_millis(pack_gc::DEFAULT_PACK_GRACE_MS as u64) + Duration::from_secs(15);
+    while small_and_discarded(&hub, pid).1 > 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let (_, left) = small_and_discarded(&hub, pid);
+    assert_eq!(left, 0, "{left} replaced packs still stored after their grace period, with no push since");
+}
