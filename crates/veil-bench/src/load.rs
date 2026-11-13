@@ -412,19 +412,45 @@ impl Agent<'_> {
 
     /// `vl pull`, as the server sees it. `true` if `main` had moved.
     fn pull(&mut self) -> Result<bool> {
-        self.c.requests.fetch_add(1, Ordering::Relaxed);
-        let r = self.api.get(self.token, &self.path("/tips"))?;
+        self.pull_by(None)
+    }
+
+    /// Send a request. With a deadline (an agent landing), an answer
+    /// telling it to come back later is waited out and the request sent
+    /// again, counted under `busy`, as `vl` does (BUG-2222); without one
+    /// (the flood, which counts it as an error), the first answer.
+    fn asked(&self, deadline: Option<Instant>, mut send: impl FnMut() -> Result<Reply>) -> Result<Reply> {
+        match deadline {
+            Some(d) => asked_until_answered(d, send, || self.c.count(&self.c.busy, 1)),
+            None => send(),
+        }
+    }
+
+    /// The project's tips ([`Agent::asked`]).
+    fn tips_by(&self, deadline: Option<Instant>) -> Result<Tips> {
+        let r = self.asked(deadline, || {
+            self.c.requests.fetch_add(1, Ordering::Relaxed);
+            self.api.get(self.token, &self.path("/tips"))
+        })?;
         ok(&r, "tips")?;
-        let tips: Tips = serde_json::from_slice(&r.body)?;
+        Ok(serde_json::from_slice(&r.body)?)
+    }
+
+    /// [`Agent::pull`], its requests sent as [`Agent::asked`] says.
+    fn pull_by(&mut self, deadline: Option<Instant>) -> Result<bool> {
+        let tips = self.tips_by(deadline)?;
         // A branch of its own starts from `main`.
         self.exists = tips.branches.contains_key(&self.branch);
         let tip = *tips.branches.get(&self.branch).or_else(|| tips.branches.get("main")).ok_or_else(|| anyhow!("no main"))?;
         if self.clone.tip.is_some_and(|(t, _)| t == tip) {
             return Ok(false);
         }
-        self.c.requests.fetch_add(1, Ordering::Relaxed);
         let stop: Vec<ObjectId> = self.clone.tip.map(|(t, _)| t).into_iter().collect();
-        let h = self.api.post_json(Some(self.token), &self.path("/history"), &HistoryRequest { tips: vec![tip], stop, limit: None })?;
+        let history = HistoryRequest { tips: vec![tip], stop, limit: None };
+        let h = self.asked(deadline, || {
+            self.c.requests.fetch_add(1, Ordering::Relaxed);
+            self.api.post_json(Some(self.token), &self.path("/history"), &history)
+        })?;
         ok(&h, "history")?;
         let mut new = Vec::new();
         let mut tip_tree = None;
@@ -500,7 +526,7 @@ impl Agent<'_> {
     /// push`); the number of collisions on the way: pushes that lost to
     /// another landing between this agent's pull and its push.
     fn land(&mut self, deadline: Instant) -> Result<u64> {
-        self.pull()?;
+        self.pull_by(Some(deadline))?;
         let mut collisions = 0;
         let mut attempt = 0u32;
         loop {
@@ -509,7 +535,7 @@ impl Agent<'_> {
                 bail!("no landing within the deadline after {collisions} collisions");
             }
             let Some((tip, root)) = self.clone.tip else {
-                self.pull()?;
+                self.pull_by(Some(deadline))?;
                 continue;
             };
             self.files += 1;
@@ -609,7 +635,7 @@ impl Agent<'_> {
                         // Lost the race inside the push (moved meanwhile).
                         collisions += 1;
                         self.c.count(&self.c.collisions, 1);
-                        self.pull()?;
+                        self.pull_by(Some(deadline))?;
                         continue;
                     }
                     self.exists = true;
@@ -625,7 +651,7 @@ impl Agent<'_> {
                         Some(t) if t == snap => self.clone.tip = Some((snap, child)),
                         _ => {
                             self.clone.tip = None;
-                            self.pull()?;
+                            self.pull_by(Some(deadline))?;
                         }
                     }
                     // `--merge-every`: the branch lands on `main` (what of it
@@ -658,7 +684,7 @@ impl Agent<'_> {
                 409 => {
                     collisions += 1;
                     self.c.count(&self.c.collisions, 1);
-                    self.pull()?;
+                    self.pull_by(Some(deadline))?;
                 }
                 503 => {
                     self.c.count(&self.c.busy, 1);
@@ -746,10 +772,7 @@ impl Agent<'_> {
             let base = match self.clone.tip {
                 Some((t, _)) => t,
                 None => {
-                    self.c.requests.fetch_add(1, Ordering::Relaxed);
-                    let r = self.api.get(self.token, &self.path("/tips"))?;
-                    ok(&r, "tips")?;
-                    let tips: Tips = serde_json::from_slice(&r.body)?;
+                    let tips = self.tips_by(Some(deadline))?;
                     *tips.branches.get("main").ok_or_else(|| anyhow!("no main"))?
                 }
             };
@@ -805,10 +828,7 @@ impl Agent<'_> {
                 // An overlap is always made on the tip, read just before.
                 Some((t, _)) if kind >= 3 => t,
                 _ => {
-                    self.c.requests.fetch_add(1, Ordering::Relaxed);
-                    let r = self.api.get(self.token, &self.path("/tips"))?;
-                    ok(&r, "tips")?;
-                    let tips: Tips = serde_json::from_slice(&r.body)?;
+                    let tips = self.tips_by(Some(deadline))?;
                     *tips.branches.get("main").ok_or_else(|| anyhow!("no main"))?
                 }
             };
