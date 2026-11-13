@@ -1220,6 +1220,11 @@ impl Service {
         let tx_results = results.clone();
         let tx_hub = hub.clone();
         let stored_outside = stored.clone();
+        // The review gate's writers found announced, and whether they were
+        // waited for (then those announced since are not looked at: they
+        // wait for this batch).
+        let writers_seen: Arc<std::sync::Mutex<(Vec<i64>, bool)>> = Arc::default();
+        let tx_writers = writers_seen.clone();
         let mut run = tx_fn(move |c| {
             let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing, active_review_checks, review_guard) = (
                 ls.clone(),
@@ -1251,6 +1256,7 @@ impl Service {
             let landed_prs = tx_landed_prs.clone();
             let tx_hub = tx_hub.clone();
             let stored = stored.clone();
+            let writers_seen = tx_writers.clone();
             Box::pin(async move {
                 crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 // Fencing: only the lease's current holder moves the branch.
@@ -1324,17 +1330,25 @@ impl Service {
                 // The review gate, before anything the review rules come
                 // from is read again (BUG-1886, BUG-2061): exclusively by a
                 // batch that changes them (the default branch's
-                // `.veilrules`), shared by every other batch with a
-                // person's entry. Whatever changes the rules or the holds
-                // commits before this reads, or waits for this commit.
+                // `.veilrules`, or the access an approval needs: BUG-2111),
+                // shared by every other batch with a person's entry.
+                // Whatever changes the rules, the holds or that access
+                // commits before this reads, or waits for this commit. A
+                // writer announced first (`prs::gate`, BUG-2110): the batch
+                // waits for it outside the transaction and runs again.
                 let rules_change = match &rules_landing {
                     Some(l) => crate::prs::state::changes_rules(&mut *c, pid, l).await?,
                     None => false,
                 };
-                if rules_change {
+                if rules_change || accept.is_some() {
                     crate::prs::close_review_gate(&mut *c, pid).await?;
                 } else if has_active_user_entries && review_guard.is_some() {
-                    crate::prs::share_review_gate(&mut *c, pid).await?;
+                    let look = !writers_seen.lock().unwrap().1;
+                    let writers = crate::prs::gate::share_review_gate(&mut *c, pid, look).await?;
+                    if !writers.is_empty() {
+                        writers_seen.lock().unwrap().0 = writers;
+                        return Err(Error::conflict(REVIEW_WRITERS));
+                    }
                 }
                 // Re-verify the review rules and PR gates inside the batch's
                 // commit transaction before recording new rules or updating
@@ -1539,6 +1553,11 @@ impl Service {
         let r = loop {
             match crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, &mut run).await {
                 Err(Error::Api { code: "conflict", message, .. }) if message == STORE_SLOW => Storing::wait(&stored_outside).await?,
+                Err(Error::Api { code: "conflict", message, .. }) if message == REVIEW_WRITERS => {
+                    let ids = std::mem::take(&mut writers_seen.lock().unwrap().0);
+                    crate::prs::gate::wait_review_writers(&hub.db, pid, &ids).await?;
+                    writers_seen.lock().unwrap().1 = true;
+                }
                 r => break r,
             }
         };
@@ -1693,6 +1712,9 @@ const MOVED: &str = "the branch moved under the landing service";
 /// transaction's last statement: it is rolled back, waits for them without
 /// holding anything, and runs again (BUG-1982).
 const STORE_SLOW: &str = "the batch's objects are still being stored";
+/// The review gate's writers are announced (BUG-2110): waited for outside
+/// the transaction, which then runs again.
+const REVIEW_WRITERS: &str = "the review gate's writers come first";
 /// How long a batch's transaction waits for its objects before it lets go
 /// of the lease's row: half the lease.
 const STORE_IN_TRANSACTION: Duration = Duration::from_millis(LEASE_MS as u64 / 2);

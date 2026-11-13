@@ -2116,16 +2116,18 @@ fn review_gate_key(pid: i64) -> i64 {
 }
 
 /// BUG-2110: a verdict (or a rules push, a new revision, an embargo
-/// release, a revert recorded) takes the review gate exclusively and waits
-/// for the batches already holding it shared; a batch that asks for it
-/// after the writer must queue behind it, or a busy project's overlapping
-/// batches starve the writer. PostgreSQL queues it; YugabyteDB (2025.2)
-/// grants it at once. Here two transactions stand in for two batches on
-/// other branches: the first holds the gate shared while the verdict
-/// waits, the second asks after it; once the first ends the verdict must
-/// be written, with the second still open.
+/// release, a revert recorded, a reviewer's access taken) takes the review
+/// gate exclusively and waits for the batches already holding it shared; a
+/// batch that comes after the writer must not get in before it, or a busy
+/// project's overlapping batches starve the writer: YugabyteDB (2025.2)
+/// grants a later shared request past a waiting exclusive one. The writer
+/// announces itself first (`prs::gate`), and a batch asks for the gate only
+/// when no writer is announced. Here two transactions stand in for two
+/// batches on other branches: the first holds the gate while the verdict
+/// waits; the second runs a batch's ask after the verdict's and finds the
+/// verdict announced, so does not take the gate; once the first ends the
+/// verdict is written, with the second still open.
 #[test]
-#[ignore = "BUG-2110: on YugabyteDB a shared review gate is granted past a waiting exclusive one: a verdict waits as long as batches overlap"]
 fn bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate() {
     let th = TestHub::start();
     let p = setup_project(&th);
@@ -2145,11 +2147,12 @@ fn bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate() {
         });
         th.rt.block_on(wait_for_sql_lock(&h.db, "SELECT pg_advisory_xact_lock(%", "the verdict never waited for the gate"));
         assert!(!written.load(Ordering::SeqCst), "the verdict did not wait for a batch holding the gate");
-        // A batch arriving after the writer: queued behind it (its ask times
-        // out here), or granted past it.
+        // A batch arriving after the writer: it finds the writer announced
+        // and leaves the gate to it.
         let mut second = th.rt.block_on(h.db.begin()).unwrap();
         th.rt.block_on(sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *second)).unwrap();
-        let granted = th.rt.block_on(sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(key).execute(&mut *second)).is_ok();
+        let writers = th.rt.block_on(veil_server::prs::gate::share_review_gate(&mut second, pid, true)).unwrap();
+        assert_eq!(writers.len(), 1, "the batch after the verdict did not find it announced");
         th.rt.block_on(first.rollback()).unwrap();
         let until = Instant::now() + Duration::from_secs(5);
         while !written.load(Ordering::SeqCst) && Instant::now() < until {
@@ -2159,7 +2162,9 @@ fn bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate() {
         th.rt.block_on(second.rollback()).unwrap();
         let r = reviewer.join().unwrap();
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-        assert!(in_time, "the verdict still waited 5 s after the batches before it ended (a later shared ask granted past it: {granted})");
+        assert!(in_time, "the verdict still waited 5 s after the batch before it ended");
+        let left: i64 = th.rt.block_on(sqlx::query_scalar("SELECT count(*) FROM review_writers WHERE project_id = $1").bind(pid).fetch_one(&h.db)).unwrap();
+        assert_eq!(left, 0, "the verdict's announcement outlived it");
     });
 }
 
@@ -2171,7 +2176,6 @@ fn bug_2110_a_verdict_waits_only_for_the_batches_already_holding_the_gate() {
 /// an approval that no longer counts. Either the removal waits for the
 /// batch, or the batch refuses the change.
 #[test]
-#[ignore = "BUG-2111: a reviewer's access taken away while the batch commits does not stop it landing with that reviewer's approval"]
 fn bug_2111_a_reviewer_removed_while_the_batch_commits_does_not_approve_it() {
     let th = TestHub::start();
     let p = setup_project(&th);
@@ -2221,5 +2225,95 @@ fn bug_2111_a_reviewer_removed_while_the_batch_commits_does_not_approve_it() {
             !(removed_while_held && done["state"] == "landed"),
             "sec was out of devs (answered) before the batch committed, and the change landed on sec's approval: {done}"
         );
+        // The removal waited for the batch, which counted sec's approval
+        // and landed first.
+        assert!(!removed_while_held, "the removal did not wait for the batch that counted sec's approval");
+        assert_eq!(done["state"], "landed", "{done}");
     });
+}
+
+/// BUG-2110: stand-ins for batches on other branches, run as a batch runs
+/// its ask for the review gate (`prs::gate`), overlap without end: three
+/// loops, each holding the gate shared 150 ms at a time, 50 ms apart, so
+/// that at every instant at least two hold it. Three verdicts in a row are
+/// each answered within a bound of the order of one batch's commit, on
+/// PostgreSQL and on YugabyteDB, and the batches go on meanwhile (each
+/// waits only for a writer announced before it asked).
+#[test]
+fn bug_2110_writers_are_answered_in_bounded_time_while_batches_overlap_without_end() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let (_, pr_id, patch) = protected_main_and_a_pr(&api, &p, "src/feature-2110b.rs");
+    let h = th.hub();
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let loops: Vec<_> = (0..3u64)
+        .map(|i| {
+            let (db, stop, done) = (h.db.clone(), stop.clone(), done.clone());
+            th.rt.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50 * i)).await;
+                while !stop.load(Ordering::SeqCst) {
+                    let mut tx = db.begin().await.unwrap();
+                    let writers = veil_server::prs::gate::share_review_gate(&mut tx, pid, true).await.unwrap();
+                    if !writers.is_empty() {
+                        tx.rollback().await.unwrap();
+                        veil_server::prs::gate::wait_review_writers(&db, pid, &writers).await.unwrap();
+                        tx = db.begin().await.unwrap();
+                        let again = veil_server::prs::gate::share_review_gate(&mut tx, pid, false).await.unwrap();
+                        assert!(again.is_empty(), "{again:?}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    tx.commit().await.unwrap();
+                    done.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(600));
+    let mut took = Vec::new();
+    for verdict in ["approve", "request-changes", "approve"] {
+        let before = done.load(Ordering::SeqCst);
+        let t = Instant::now();
+        let r = post_verdict(&api, &p, &p.admin, &pr_id, &patch, verdict);
+        took.push(t.elapsed());
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        // The batches go on: more of them commit before the next verdict.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(done.load(Ordering::SeqCst) >= before + 3, "the batches stopped while the writers wrote");
+    }
+    stop.store(true, Ordering::SeqCst);
+    for l in loops {
+        th.rt.block_on(l).unwrap();
+    }
+    assert!(took.iter().all(|d| *d < Duration::from_secs(2)), "a verdict waited past the batches holding the gate when it asked: {took:?}");
+    let r = api.get(Some(&p.dev.token()), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true, "{}", r.json());
+}
+
+/// BUG-2110: a writer that went away announced (its server stopped before
+/// its transaction ended) does not hold landings back: a batch that finds
+/// its row, stale and its lock free, removes it and lands.
+#[test]
+fn bug_2110_a_writer_that_went_away_does_not_stop_landings() {
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let dev_tok = p.dev.token();
+    let (feat, pr_id, patch) = protected_main_and_a_pr(&api, &p, "src/feature-2110c.rs");
+    let r = post_verdict(&api, &p, &p.admin, &pr_id, &patch, "approve");
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["review"]["ready"], true, "{}", r.json());
+    let h = th.hub();
+    th.rt.block_on(sqlx::query("INSERT INTO review_writers (project_id, since_ms) VALUES ($1, 0)").bind(pid).execute(&h.db)).unwrap();
+    let r = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/land", p.name), &json!({"onto": "main", "snapshot": feat.hex(), "wait": false}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let ticket = r.json()["ticket"].as_str().unwrap().to_string();
+    let done = outcome(&api, &dev_tok, &p.name, &ticket);
+    assert_eq!(done["state"], "landed", "{done}");
+    let left: i64 = th.rt.block_on(sqlx::query_scalar("SELECT count(*) FROM review_writers WHERE project_id = $1").bind(pid).fetch_one(&h.db)).unwrap();
+    assert_eq!(left, 0, "the stale writer's row was not removed");
 }

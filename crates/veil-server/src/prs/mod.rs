@@ -37,6 +37,7 @@
 
 pub mod class;
 pub mod embargo;
+pub mod gate;
 pub mod review;
 pub mod revision;
 pub mod rules;
@@ -1121,13 +1122,23 @@ pub async fn close(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resu
     let me = participant(ask, caller)?;
     let pr = visible(hub, ask, id).await?;
     owner_or_admin(ask, me, &pr)?;
-    let n = sqlx::query("UPDATE prs SET state = 'closed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
-        .bind(veil_core::now_millis())
-        .bind(ask.project.id)
-        .bind(&pr.id)
-        .execute(&hub.db)
-        .await?
-        .rows_affected();
+    let (project, prid, now) = (ask.project.id, pr.id.clone(), veil_core::now_millis());
+    // A closed PR's approvals count no more: the review gate, ordered
+    // against every landing batch (BUG-2111).
+    let n = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
+        let prid = prid.clone();
+        Box::pin(async move {
+            close_review_gate(&mut *c, project).await?;
+            Ok(sqlx::query("UPDATE prs SET state = 'closed', updated_at = $1 WHERE project_id = $2 AND id = $3 AND state = 'open'")
+                .bind(now)
+                .bind(project)
+                .bind(&prid)
+                .execute(&mut *c)
+                .await?
+                .rows_affected())
+        })
+    })
+    .await?;
     if n > 0 {
         crate::events::emit_pr(hub, ask.project.id, &pr.id, "pr.closed").await;
     }
@@ -2055,28 +2066,7 @@ pub async fn verify_landing_review(
     Ok(Err(format!("{NOT_READY} {}", reasons.join("; "))))
 }
 
-/// The review gate of a project (BUG-1886): a transaction-scoped advisory
-/// lock that a landing batch's transaction takes shared before it reads the
-/// review rules' rows again (`prs`, `pr_reviews`, `pr_holds`), and that every
-/// write which can make a change not ready takes exclusively, first: a
-/// verdict and the holds it places ([`review::put_verdict`]) and a PR's new
-/// revision. Either the write commits before the batch reads (the batch sees
-/// it), or it waits until the batch has committed: every landing meets the
-/// review rules in force when it commits. Batches do not wait for one
-/// another.
-const REVIEW_GATE_BASE: i64 = 0x7665_696c_7276_6774; // "veilrvgt"
-
-/// Take the review gate of `project` exclusively, for this transaction.
-pub(crate) async fn close_review_gate(c: &mut sqlx::PgConnection, project: i64) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(REVIEW_GATE_BASE ^ project).execute(&mut *c).await?;
-    Ok(())
-}
-
-/// Take the review gate of `project` shared, for this transaction.
-pub(crate) async fn share_review_gate(c: &mut sqlx::PgConnection, project: i64) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(REVIEW_GATE_BASE ^ project).execute(&mut *c).await?;
-    Ok(())
-}
+pub(crate) use self::gate::close_review_gate;
 
 /// One entry of a landing batch, for [`verify_landing_reviews`]: what
 /// [`verify_landing_review`] is asked of it.

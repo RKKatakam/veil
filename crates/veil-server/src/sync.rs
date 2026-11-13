@@ -3362,15 +3362,17 @@ async fn push_staged(
                     // Bumps the project's access epoch (a trigger): every
                     // server's cached permissions for it are void.
                     crate::perm::accept_policy(&mut *c, pid, &text).await?;
+                    rules_changed = true;
                 } else if let Some(text) = policy_text_update {
                     sqlx::query("UPDATE projects SET policy_text = $1 WHERE id = $2")
                         .bind(&text)
                         .bind(pid)
                         .execute(&mut *c)
                         .await?;
+                    rules_changed = true;
                 }
                 if let (true, Some(l)) = (branch == default_branch, &rules_landing) {
-                    rules_changed = crate::prs::state::record_landing(&mut *c, pid, l).await?;
+                    rules_changed |= crate::prs::state::record_landing(&mut *c, pid, l).await?;
                 }
                 moved.push(branch);
             }
@@ -3463,9 +3465,11 @@ async fn push_staged(
                     .execute(&mut *c)
                     .await?;
             }
-            // New review rules wait for every batch already re-reading them
-            // and are read by every batch after (BUG-2061): the review
-            // gate, exclusively, last, holding every row the push writes.
+            // New review rules, or a new access policy (an approval counts
+            // while its reviewer may write the PR's paths: BUG-2111), wait
+            // for every batch already re-reading them and are read by every
+            // batch after (BUG-2061): the review gate, exclusively, last,
+            // holding every row the push writes.
             if rules_changed {
                 crate::prs::close_review_gate(&mut *c, pid).await?;
             }

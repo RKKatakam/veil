@@ -697,23 +697,29 @@ async fn commit(
                     crate::landing::record_changes(&mut *c, pid, branch, lineage, &on_branch.0, &on_branch.1, &on_branch.2).await?;
                 }
                 moved = Some(rows == 1);
+                let mut gate = false;
                 if rows == 1 {
                     if let Some(text) = &accept {
                         crate::perm::accept_policy(&mut *c, pid, text).await?;
+                        gate = true;
                     } else if let Some(text) = &policy_text_update {
                         sqlx::query("UPDATE projects SET policy_text = $1 WHERE id = $2")
                             .bind(text)
                             .bind(pid)
                             .execute(&mut *c)
                             .await?;
+                        gate = true;
                     }
                 }
                 if let (1, Some(l)) = (rows, &rules_landing) {
-                    // New review rules: the review gate, exclusively, after
-                    // the branch row (BUG-2061).
-                    if crate::prs::state::record_landing(&mut *c, pid, l).await? {
-                        crate::prs::close_review_gate(&mut *c, pid).await?;
-                    }
+                    gate |= crate::prs::state::record_landing(&mut *c, pid, l).await?;
+                }
+                if gate {
+                    // New review rules (BUG-2061), or a new access policy (an
+                    // approval counts while its reviewer may write the PR's
+                    // paths: BUG-2111): the review gate, exclusively, after
+                    // the branch row.
+                    crate::prs::close_review_gate(&mut *c, pid).await?;
                 }
             }
             let mut memos = Vec::new();
