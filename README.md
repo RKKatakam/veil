@@ -57,27 +57,29 @@ blame and search answered by the server in milliseconds.
 
 ## Measured
 
-Measured on 2026-11-12, on one 32-core machine that also ran the load
-generator, PostgreSQL and the object store. The full tables, misses
-included, are in [LOAD.md](docs/design/scale/LOAD.md) (landings) and
+Landings measured on 2026-11-13 (the code as published, `dc4e3f82`), the
+comparison with Git on 2026-11-12, on one 32-core machine that also ran the
+load generator, PostgreSQL (with the deployment's settings) and the object
+store. The full tables, misses included, are in
+[LOAD.md](docs/design/scale/LOAD.md) (landings) and
 [OPENSCION.md](docs/design/scale/OPENSCION.md) (beside Git).
 
-**Landing changes on one `main`** (10,000 agents of 100 people offering
-1,000 a second; the target is 1,000 a second held, p99 under 1 s):
+**Landing changes on one `main`** (10,000 agents offering 1,000 a second,
+three minutes unless noted; the target is 1,000 a second held, p99 under 1 s):
 
-| | Veil | Note |
-|---|---|---|
-| Held for three minutes | **996 a second** (p50 280 ms, p99 1.19 s) | Protected `main`: 998 (p99 1.22 s). All agents one person's: 995 (p99 1.16 s). For comparison: 20 to 30 a second with pull, rebase, push and retry. |
-| Three minutes, protected `main`, 3 % overlapping and 2 % conflicting changes | 951 a second (p50 1.36 s, p99 10.8 s) | |
-| Ten minutes, with those overlapping changes | 808 a second | Holds about 1,000 for two minutes, then 650 to 800: BUG-1955, open |
-| Offered 1.5 times what it can land | lands about 1,000 a second | Agents past capacity are told at once to come back; the backlog clears within about 20 s after the load drops |
+| | Landed a second | p50 / p99 | Note |
+|---|---|---|---|
+| Agents of 100 people | **996** | 348 ms / 1.44 s | 1.20 database commits a landing; nothing refused. For comparison: 20 to 30 a second with pull, rebase, push and retry. |
+| Protected `main` | **996** | 284 ms / 1.20 s | 1.15 commits a landing |
+| All agents one person's | **998** | 220 ms / 1.60 s | 1.24 commits a landing |
+| Protected `main`, 3 % overlapping and 2 % conflicting changes | 860 and 794 (two runs) | 4.9 s / 41 s and 11.6 s / 55 s | **Misses**: 951 a second on 2026-11-12. The batch now merges overlapping changes itself, which lowered commits a landing (1.64 then, 1.31 and 1.34 now) but slowed each batch (BUG-2220) |
+| The same, ten minutes | 799 | 45 s / 68 s | **Misses**: 604 to 992 a second per 10 s (BUG-1955); 808 on 2026-11-12 |
+| Offered 1.5 times what it can land for 90 s, then 300 a second | 963 on average while overloaded | p99 under 0.3 s once the backlog is gone (one 10 s stretch at 1.0 s) | Agents past capacity are told at once to come back; every landing made is one an agent sees; the backlog clears 90 s after the load drops |
+| Many agents, each on its own branch, landing it on `main` every 5th push | 72 pushes and 13.4 branch landings a second (300 agents), 116 and 19.5 (1,000) | 2.1 s / 21 s (300) | **Falls** from 218 pushes and 48 landings a second in a 30 s run: the server's CPU per push is 104 ms over 30 s, 395 ms over 180 s; without the landings on `main` the same agents push 633 a second for 180 s (BUG-2221) |
 
-The p99 is just over the target, and the runs with overlapping changes
-miss it. These runs were made before two later changes: the early "come
-back later" answer, and BUG-1956's fix (changes that merged cleanly were
-refused as conflicts when several touched one file), merged since and not yet measured again.
-An earlier version of this page gave 993 landings a second from a
-15-second run, which ends before the queue grows.
+What still misses: p99 under 1 s at 1,000 a second (1.2 to 1.6 s), p50
+under 150 ms (220 to 348 ms), the mix at 1,000 a second for three and for ten
+minutes, and the many-branch workload over minutes rather than seconds.
 
 **Beside Git**, on the same files (medians of 5 to 9):
 
