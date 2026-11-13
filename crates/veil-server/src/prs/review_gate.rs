@@ -42,7 +42,7 @@ use crate::error::Result;
 const REVIEW_GATE_BASE: i64 = 0x7665_696c_7276_6774; // "veilrvgt"
 /// A writer's own advisory-lock key, held by its transaction: `-id`, below
 /// zero, so never another lock's key (each other one is a positive base
-/// XOR a project; BUG-2130: `0x7665_696c_7277_7472 ^ id` was the review
+/// XOR a project; BUG-2133: `0x7665_696c_7277_7472 ^ id` was the review
 /// gate of project `id ^ 70406`).
 fn writer_key(id: i64) -> i64 {
     -id
@@ -214,7 +214,7 @@ pub async fn wait_review_writers(db: &PgPool, project: i64, ids: &[i64]) -> Resu
 mod tests {
     use super::*;
 
-    /// BUG-2130: no writer's key is the review gate of a project (nor any
+    /// BUG-2133: no writer's key is the review gate of a project (nor any
     /// other lock's key: each is a positive base XOR a project).
     #[test]
     fn a_writers_key_is_no_projects_review_gate() {
