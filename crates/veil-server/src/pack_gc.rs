@@ -379,7 +379,9 @@ pub const SWEEP_SCAN: std::time::Duration = std::time::Duration::from_secs(600);
 /// but rows they find `DISCARDED` past the grace period (a discarded row
 /// never turns listed) and discard only rows still `STAGED`. The task
 /// looks again at least every [`SWEEP_RECHECK`], so it never sleeps past
-/// what another server swept or discarded meanwhile.
+/// what another server swept or discarded meanwhile; after each pass it
+/// ran it calls [`maybe_schedule`], so a background merge skipped while
+/// the pass held the lock is not left undone.
 pub fn schedule_sweep(hub: &Arc<Hub>, project: i64) {
     {
         let mut sweeping = hub.pack_gc.sweeping.lock().unwrap();
@@ -408,7 +410,13 @@ pub fn schedule_sweep(hub: &Arc<Hub>, project: i64) {
                     if due > now {
                         std::time::Duration::from_millis((due - now) as u64).min(SWEEP_RECHECK)
                     } else {
-                        match run_project(&hub, project, &Options::sweep_only()).await {
+                        let r = run_project(&hub, project, &Options::sweep_only()).await;
+                        if matches!(&r, Ok(r) if !r.skipped) {
+                            // A background merge that found the lock held
+                            // by this pass counts again.
+                            maybe_schedule(&hub, project);
+                        }
+                        match r {
                             Ok(r) if !r.skipped && r.discarded_packs_swept + r.staged_packs_swept > 0 => {
                                 hub.pack_gc.sweeps.fetch_add(1, Ordering::Relaxed);
                                 std::time::Duration::ZERO
