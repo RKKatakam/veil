@@ -1199,20 +1199,28 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
     assert_eq!(del2.status, 200);
 
     for off in [40_000i64, 70_000] {
-        hub.rt
-            .block_on(pack_gc::run_project(
-                &hub.hub(),
-                pid,
-                &Options {
-                    min_packs_to_merge: 1,
-                    run_gc: true,
-                    retention_window_ms: 60_000,
-                    pack_grace_ms: 300_000,
-                    now_offset_ms: off,
-                    ..Options::default()
-                },
-            ))
-            .unwrap();
+        let opts = Options {
+            min_packs_to_merge: 1,
+            run_gc: true,
+            retention_window_ms: 60_000,
+            pack_grace_ms: 300_000,
+            now_offset_ms: off,
+            ..Options::default()
+        };
+        // A pass that lost a race with another database's schema change on a
+        // shared YugabyteDB (40001) is run again, as the server's own GC loop
+        // runs it at its next tick (BUG-2212).
+        let mut tries = 0;
+        loop {
+            match hub.rt.block_on(pack_gc::run_project(&hub.hub(), pid, &opts)) {
+                Ok(_) => break,
+                Err(e) if e.is_retryable() && tries < 20 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => panic!("GC pass at offset {off}: {e:?}"),
+            }
+        }
     }
     let (shared_blob_id, _) = make_blob("SHARED-BLOB-1780\n");
     assert!(
