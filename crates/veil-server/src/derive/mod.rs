@@ -271,6 +271,38 @@ impl Cx {
         Ok(Some(r))
     }
 
+    /// The stored rows of `ids`, read in one statement and cached: the ids
+    /// that have one.
+    pub fn stored_rows(&self, ids: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        type Row = (String, i64, i64, String, String, i32, String, Option<String>);
+        let pool = self.pool();
+        let hex: Vec<String> = ids.iter().map(ObjectId::hex).collect();
+        let rows: Vec<Row> = self.db(|| {
+            sqlx::query_as(
+                "SELECT snapshot, generation, depth, parents, change_id, flags, skip, changed FROM graph WHERE project_id = $1 AND snapshot = ANY($2)",
+            )
+            .bind(self.project())
+            .bind(&hex)
+            .fetch_all(pool)
+        })?;
+        let mut found = HashSet::new();
+        for (id, generation, depth, parents, change_id, flags, skip, changed) in rows {
+            let id = ObjectId::from_hex(&id).map_err(bad)?;
+            let r = Arc::new(GraphRow {
+                generation,
+                depth,
+                parents: serde_json::from_str(&parents).map_err(bad)?,
+                change_id,
+                flags,
+                skip: serde_json::from_str(&skip).map_err(bad)?,
+                changed,
+            });
+            self.hub().derive.rows.insert(row_key(self.project(), &id), r, 256);
+            found.insert(id);
+        }
+        Ok(found)
+    }
+
     /// The changed paths of a snapshot whose row says `changed`; `None`
     /// for `many` and `withheld` (queries walk the trees, or wait for the
     /// release).
@@ -754,7 +786,20 @@ pub struct Batch<'a> {
     history: HashMap<String, Vec<(i64, ObjectId)>>,
     writes: Writes,
     pub stats: Stats,
+    /// Read ahead for the snapshots about to be derived (BUG-2361): what
+    /// each changed against its first parent, and the deepest
+    /// [`HISTORY_AHEAD`] stored `file_history` rows of each path they
+    /// change, as the database held them when read (forgotten at a flush).
+    ahead_trees: HashMap<ObjectId, (Vec<Change>, Vec<String>)>,
+    ahead_history: HashMap<String, Vec<(i64, ObjectId)>>,
 }
+
+/// Stored `file_history` rows of a path read ahead ([`Batch::read_ahead`]):
+/// as many as `last_changes` reads first.
+const HISTORY_AHEAD: usize = 8;
+/// Snapshots read ahead at once, and threads reading their trees.
+const AHEAD: usize = 512;
+const AHEAD_THREADS: usize = 8;
 
 fn run(cx: &Cx, scope: Scope) -> Result<Stats> {
     let pool = cx.pool();
@@ -809,6 +854,8 @@ impl<'a> Batch<'a> {
             history: HashMap::new(),
             writes: Writes::default(),
             stats: Stats::default(),
+            ahead_trees: HashMap::new(),
+            ahead_history: HashMap::new(),
         })
     }
 
@@ -915,39 +962,59 @@ impl<'a> Batch<'a> {
     /// What snapshot `id` (with `parents`) changed against its first parent:
     /// the leaves, and the folders that changed with no leaf below them
     /// ([`changes::diff`]).
-    fn tree_changes(&self, id: ObjectId, parents: &[ObjectId]) -> Result<(Vec<Change>, Vec<String>)> {
-        let src = &self.cx.src;
-        let tree = src.snapshot(&id)?.tree;
-        let base = match parents.first() {
-            Some(p) => src.snapshot(p)?.tree,
-            None => veil_core::hub::project::empty_tree_id(),
-        };
-        changes::diff(src, base, tree)
+    fn tree_changes(&mut self, id: ObjectId, parents: &[ObjectId]) -> Result<(Vec<Change>, Vec<String>)> {
+        match self.ahead_trees.remove(&id) {
+            Some(c) => Ok(c),
+            None => tree_changes(&self.cx.src, id, parents),
+        }
     }
 
     /// Derive, parents first, every snapshot `roots` reach that has no
     /// value yet.
     fn derive_from(&mut self, roots: &[ObjectId]) -> Result<()> {
+        let order = self.underived(roots)?;
+        for chunk in order.chunks(AHEAD) {
+            self.read_ahead(chunk)?;
+            for x in chunk {
+                self.derive_one(*x)?;
+                if self.writes.full() {
+                    self.flush()?;
+                }
+            }
+        }
+        self.ahead_trees.clear();
+        self.ahead_history.clear();
+        Ok(())
+    }
+
+    /// Every snapshot `roots` reach that has no value yet, parents first.
+    /// Whether a snapshot is derived is asked of the database once for up
+    /// to [`AHEAD`] of them down its first parents (BUG-2361: once for each,
+    /// a statement for every snapshot landed, that found nothing): only the
+    /// project's deriver, which holds its lock, writes rows.
+    fn underived(&mut self, roots: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        let mut order = Vec::new();
         let mut done: HashSet<ObjectId> = HashSet::new();
         let mut expanded: HashSet<ObjectId> = HashSet::new();
+        let mut absent: HashSet<ObjectId> = HashSet::new();
         let mut stack: Vec<(ObjectId, bool)> = roots.iter().map(|r| (*r, false)).collect();
         while let Some((x, ready)) = stack.pop() {
             if done.contains(&x) {
                 continue;
             }
             if ready {
-                self.derive_one(x)?;
+                order.push(x);
                 done.insert(x);
-                if self.writes.full() {
-                    self.flush()?;
-                }
                 continue;
             }
             if expanded.contains(&x) {
                 continue;
             }
             let t_w = std::time::Instant::now();
-            if self.graph.row(&x)?.is_some() {
+            if !absent.contains(&x) {
+                self.ask_rows(x, &mut absent)?;
+            }
+            if !absent.contains(&x) && self.graph.row(&x)?.is_some() {
                 done.insert(x);
                 crate::landing::prof(&self.cx.hub().landing.stats.p_d_walk_us, t_w);
                 continue;
@@ -961,6 +1028,100 @@ impl<'a> Batch<'a> {
                     stack.push((*p, false));
                 }
             }
+        }
+        Ok(order)
+    }
+
+    /// Ask the database at once whether `x` and up to [`AHEAD`] snapshots
+    /// down its first parents are derived, unless one is known to be (in
+    /// the batch or the rows' cache): the rows found are cached, the others
+    /// added to `absent`.
+    fn ask_rows(&mut self, x: ObjectId, absent: &mut HashSet<ObjectId>) -> Result<()> {
+        let src = &self.cx.src;
+        let known = |y: &ObjectId| {
+            *y == root_snapshot_id() || self.graph.pending.contains_key(y) || self.cx.hub().derive.rows.get(&row_key(self.cx.project(), y)).is_some()
+        };
+        let mut ids = Vec::new();
+        let mut y = x;
+        while ids.len() < AHEAD && !known(&y) && !absent.contains(&y) {
+            ids.push(y);
+            match src.snapshot(&y)?.parents.first() {
+                Some(p) => y = *p,
+                None => break,
+            }
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let found = self.cx.stored_rows(&ids)?;
+        absent.extend(ids.into_iter().filter(|i| !found.contains(i)));
+        Ok(())
+    }
+
+    /// Read ahead for `chunk` (about to be derived in this order): what each
+    /// changed, on [`AHEAD_THREADS`] threads (each read is an object read,
+    /// some from disk), and the stored history of every path they change,
+    /// in one statement per [`ROWS_PER_STATEMENT`] paths instead of one
+    /// for each snapshot (BUG-2361).
+    fn read_ahead(&mut self, chunk: &[ObjectId]) -> Result<()> {
+        let src = &self.cx.src;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let read: Vec<Result<Vec<(ObjectId, (Vec<Change>, Vec<String>))>>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..AHEAD_THREADS.min(chunk.len()))
+                .map(|_| {
+                    sc.spawn(|| {
+                        deriving(|| {
+                            let mut out = Vec::new();
+                            loop {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some(x) = chunk.get(i) else { return Ok(out) };
+                                let parents = src.snapshot(x)?.parents.clone();
+                                out.push((*x, tree_changes(src, *x, &parents)?));
+                            }
+                        })
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(bad("a tree reader panicked")))).collect()
+        });
+        for r in read {
+            self.ahead_trees.extend(r?);
+        }
+        let mut keys: Vec<String> = self
+            .ahead_trees
+            .values()
+            .flat_map(|(ch, _)| ch.iter().map(|c| changes::path_key(&c.path)))
+            .filter(|k| !self.ahead_history.contains_key(k))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        keys.sort();
+        let pool = self.cx.pool();
+        let project = self.cx.project();
+        for keys in keys.chunks(ROWS_PER_STATEMENT) {
+            let rows: Vec<(i64, i64, String)> = self.cx.db(|| {
+                sqlx::query_as(
+                    "SELECT k.n, f.depth, f.snapshot FROM UNNEST($2::text[]) WITH ORDINALITY AS k(path_key, n) \
+                     CROSS JOIN LATERAL (SELECT depth, snapshot FROM file_history \
+                       WHERE project_id = $1 AND path_key = k.path_key \
+                       ORDER BY depth DESC, snapshot DESC LIMIT 8) f",
+                )
+                .bind(project)
+                .bind(keys)
+                .fetch_all(pool)
+            })?;
+            for k in keys {
+                self.ahead_history.insert(k.clone(), Vec::new());
+            }
+            for (n, d, snap) in rows {
+                let snap = ObjectId::from_hex(&snap).map_err(bad)?;
+                self.ahead_history.get_mut(&keys[n as usize - 1]).expect("every key").push((d, snap));
+            }
+        }
+        // The statement's order (`depth DESC, snapshot DESC`), whatever
+        // order the join returned them in.
+        for rows in self.ahead_history.values_mut() {
+            rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.hex().cmp(&a.1.hex())));
         }
         Ok(())
     }
@@ -1069,6 +1230,31 @@ impl<'a> Batch<'a> {
                 ask.push(i);
             }
         }
+        // The rows read ahead are the deepest stored ones of the path; those
+        // at or above `at`'s depth begin the list the database would give,
+        // in its order: a hit there is its answer, and with fewer than it
+        // reads first there is nothing more to find.
+        let mut still = Vec::with_capacity(ask.len());
+        for i in ask {
+            let Some(rows) = self.ahead_history.get(&changes::path_key(&wants[i].0)) else {
+                still.push(i);
+                continue;
+            };
+            let (at, d) = (wants[i].1, depth_of[i]);
+            let mut hit = None;
+            for (dd, c) in rows.iter().filter(|(dd, _)| *dd <= d) {
+                if self.graph.at_depth(at, *dd)? == Some(*c) {
+                    hit = Some(*c);
+                    break;
+                }
+            }
+            match hit {
+                Some(c) => out[i] = Some(c),
+                None if rows.len() < HISTORY_AHEAD => {}
+                None => still.push(i),
+            }
+        }
+        let ask = still;
         if ask.is_empty() {
             return Ok(out);
         }
@@ -1164,9 +1350,11 @@ impl<'a> Batch<'a> {
             })?;
         }
         cache_derive_rows(cx.hub(), project, &w);
-        // Written rows are read from the cache or the database from now on.
+        // Written rows are read from the cache or the database from now on;
+        // the history read ahead is no longer all the database holds.
         self.graph.pending.clear();
         self.history.clear();
+        self.ahead_history.clear();
         Ok(())
     }
 }
@@ -1179,6 +1367,18 @@ impl Drop for Timer<'_> {
     }
 }
 
+/// What snapshot `id` (with `parents`) changed against its first parent:
+/// the leaves, and the folders that changed with no leaf below them
+/// ([`changes::diff`]).
+fn tree_changes(src: &Source, id: ObjectId, parents: &[ObjectId]) -> Result<(Vec<Change>, Vec<String>)> {
+    let tree = src.snapshot(&id)?.tree;
+    let base = match parents.first() {
+        Some(p) => src.snapshot(p)?.tree,
+        None => veil_core::hub::project::empty_tree_id(),
+    };
+    changes::diff(src, base, tree)
+}
+
 fn upload_objects(rt: &tokio::runtime::Handle, hub: &Arc<Hub>, project: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<()> {
     if objects.is_empty() {
         return Ok(());
@@ -1187,8 +1387,12 @@ fn upload_objects(rt: &tokio::runtime::Handle, hub: &Arc<Hub>, project: i64, obj
     rt.block_on(async {
         let mut set = tokio::task::JoinSet::new();
         let mut it = objects.into_iter();
+        // As many at once as the store takes (BUG-2361: 32 at a time, a
+        // flush of 512 snapshots waited for 16 rounds of a local store's
+        // journal).
+        let at_once = hub.objects.blob_store().writes_at_once().max(1);
         loop {
-            while set.len() < 32 {
+            while set.len() < at_once {
                 let Some((id, raw)) = it.next() else { break };
                 let h = hub.clone();
                 set.spawn(async move { h.objects.put(project, &id, raw).await });

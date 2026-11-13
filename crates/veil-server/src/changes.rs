@@ -384,6 +384,7 @@ struct Plan {
 async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectId, pparent: ObjectId) -> Result<Built> {
     // The caller's tree, as their `vl` would push it.
     let (p, w) = (plan.clone(), who.clone());
+    let t_sh = std::time::Instant::now();
     let shaped = sync::blocking_with(hub, w.project.id, plan.pending.clone(), move |src| {
         let view = w.project.view(&w.viewer);
         let mut pr = Projector::new(src, &view);
@@ -396,6 +397,7 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
         Ok(Shaped { tree, made, entries })
     })
     .await?;
+    crate::landing::prof(&hub.landing.stats.p_b_shape_us, t_sh);
     // The push's checks on it, then the caller's projection.
     let mut overlay = plan.pending.clone();
     overlay.extend(shaped.made.iter().map(|(k, v)| (*k, v.clone())));
@@ -418,9 +420,13 @@ async fn build(hub: &Arc<Hub>, plan: &Arc<Plan>, who: &Arc<Who>, parent: ObjectI
         };
         let mut known = p.uploaded.clone();
         known.extend(src.pending.keys().copied());
+        let t_cs = std::time::Instant::now();
         let (real_id, real, raw) = complete_signed(src, &w, &known, n, parent, &hub2.identity)?;
+        crate::landing::prof(&hub2.landing.stats.p_b_complete_us, t_cs);
+        let t_po = std::time::Instant::now();
         let view = w.project.view(&w.viewer);
         let (mine, mine_raw) = sync::project_one(src, &view, real_id, &real, vec![pparent], p.ppredecessors.clone(), vec![], None, &hub2.identity)?;
+        crate::landing::prof(&hub2.landing.stats.p_b_project_us, t_po);
         // What the full tree holds of what this change made: the blobs, and
         // the trees of the caller's that are the full tree's (all of them
         // for someone who sees everything there; the graft stored its own).
