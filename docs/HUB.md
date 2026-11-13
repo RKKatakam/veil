@@ -5490,7 +5490,7 @@ transaction per landing instead of 23.
    batches on several branches overlapping, a writer waited as long as
    they did (by hand: 6.7 s, the whole time three loops of overlapping
    150 ms shared holds ran; PostgreSQL queues them: 0.65 s). Now a writer
-   first **announces** itself: a row in `review_writers` (migration 43)
+   first **announces** itself: a row in `review_writers` (migration 38)
    committed on its own, on another connection of the
    `db::transaction`'s pool, and its transaction then takes its own
    advisory lock (key `-id`: below zero, so no other lock's, whose keys

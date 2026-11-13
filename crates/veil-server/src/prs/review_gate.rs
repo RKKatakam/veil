@@ -12,7 +12,7 @@
 //! A writer is never starved by a stream of batches, though YugabyteDB
 //! grants a later shared request past a waiting exclusive one (BUG-2110):
 //! before it asks for the gate, a writer **announces** itself in
-//! `review_writers`, a row committed on its own (migration 43), and a
+//! `review_writers`, a row committed on its own (migration 38), and a
 //! batch asks for the gate only when no writer is announced in the same
 //! statement's snapshot. A batch that finds one rolls back, waits outside
 //! any transaction until the writers it found are gone
