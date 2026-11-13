@@ -2167,19 +2167,36 @@ fn s16_unreachable_or_warming_server_is_reported_clearly() {
             .await
             .unwrap()
     });
-    hub.rt.block_on(async {
-        sqlx::query("DELETE FROM view_graph WHERE project_id = $1").bind(pid).execute(&hub.hub().db).await.unwrap();
-        sqlx::query(
-            "INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, 'admin', 'other-server', $2) \
-             ON CONFLICT (project_id, view_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at",
-        )
-        .bind(pid)
-        .bind(veil_core::now_millis() + 600_000)
-        .execute(&hub.hub().db)
-        .await
-        .unwrap();
-    });
+    // Held before the rows are deleted (BUG-2342): a fill still running from
+    // the pushes (the rows' fill, or the file history's under its lease)
+    // wrote the rows again after the delete, and `vl log` answered the
+    // whole history. The rows' slots are taken once their fills end; the
+    // lease is taken as a server takes it, once the fill holding it gives
+    // it back.
     let _busy = hub.rt.block_on(hub.hub().query.hold_row_fills());
+    hub.rt.block_on(async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let now = veil_core::now_millis();
+            let got: Option<String> = sqlx::query_scalar(
+                "INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, 'admin', 'other-server', $2) \
+                 ON CONFLICT (project_id, view_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at \
+                 WHERE view_fills.expires_at < $3 RETURNING holder",
+            )
+            .bind(pid)
+            .bind(now + 600_000)
+            .bind(now)
+            .fetch_optional(&hub.hub().db)
+            .await
+            .unwrap();
+            if got.is_some() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the file history's fill kept its lease for 2 minutes");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        sqlx::query("DELETE FROM view_graph WHERE project_id = $1").bind(pid).execute(&hub.hub().db).await.unwrap();
+    });
     hub.hub().query.rows.clear();
 
     let warming_cmds: &[&[&str]] = &[

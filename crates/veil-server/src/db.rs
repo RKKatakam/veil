@@ -333,10 +333,11 @@ where
                     // something now: [`retry_requests`] does not run it again.
                     crate::limits::mark_committed();
                     // A commit that timed out may have committed: neither is
-                    // `f` run again (BUG-890).
+                    // `f` run again (BUG-890). Its text only: the database
+                    // error itself would be found retryable (BUG-2340).
                     match r {
                         Err(Error::Db(e)) if e.as_database_error().is_some_and(|d| crate::error::is_rpc_timeout(d.message())) => {
-                            Err(Error::Other(anyhow::Error::new(e).context("the commit timed out; its outcome is unknown")))
+                            Err(Error::Other(anyhow::anyhow!("the commit timed out; its outcome is unknown: {e}")))
                         }
                         r => r,
                     }

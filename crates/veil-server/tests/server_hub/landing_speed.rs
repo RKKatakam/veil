@@ -199,7 +199,11 @@ async fn rows_fetched(c: &mut sqlx::PgConnection) -> i64 {
 /// queue reads no more.
 #[test]
 fn bug_1941_choosing_a_batch_reads_a_bounded_part_of_a_long_queue() {
-    let hub = TestHub::start();
+    // A database of its own (BUG-2341): on YugabyteDB the SERIALIZABLE
+    // transaction below, seconds long, made the other tests' inserts whose
+    // foreign key names a person (pack rows, group members) fail meanwhile.
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let hub = TestHub::start_on(&crate::grants::fresh_database(&rt), Duration::from_secs(3600));
     let p = setup_project(&hub);
     let pid = project_id_of(&hub, &p.name);
     let db = hub.hub().db.clone();

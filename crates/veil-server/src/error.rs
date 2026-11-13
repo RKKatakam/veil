@@ -55,8 +55,18 @@ impl Error {
 
     /// A transaction that lost a serialisation race (PostgreSQL and
     /// YugabyteDB report 40001; deadlocks 40P01): run it again.
+    /// A database error that reached here through `anyhow` (the object
+    /// store's statements, `pack::Packs` and `store::Objects`) is judged as
+    /// one (BUG-2340: their lost races answered "internal error").
     pub fn is_retryable(&self) -> bool {
-        let Error::Db(e) = self else { return false };
+        let e = match self {
+            Error::Db(e) => e,
+            Error::Other(e) => match e.chain().find_map(|c| c.downcast_ref::<sqlx::Error>()) {
+                Some(e) => e,
+                None => return false,
+            },
+            Error::Api { .. } => return false,
+        };
         match e.as_database_error() {
             Some(d) => {
                 // Serialisation failure, deadlock, lock or statement
@@ -146,6 +156,13 @@ impl IntoResponse for Error {
                 r.extensions_mut().insert(crate::db::Retryable);
                 return r;
             }
+            // A lost race of the object store's statements (BUG-2340), as
+            // any other: run again, or "busy" at the deadline.
+            e @ Error::Other(_) if e.is_retryable() => {
+                let mut r = Error::busy().into_response();
+                r.extensions_mut().insert(crate::db::Retryable);
+                return r;
+            }
             Error::Other(e) => {
                 eprintln!("veil-server: error: {e:#}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error".to_string())
@@ -212,5 +229,19 @@ mod tests {
         let db = |m| Error::Db(sqlx::Error::Database(Box::new(YbError(m))));
         assert!(db("Timed out: Perform RPC (request call id 81) to 127.0.0.1:9100 timed out after 15.000s; Rpc timeout, passed: 15.0s, timeout: 15.000s").is_retryable());
         assert!(!db("internal error: tablet not found").is_retryable());
+    }
+
+    /// BUG-2340: a database error through `anyhow` (the object store's
+    /// statements), with context or not, is judged as one; a commit whose
+    /// outcome is unknown (`db::transaction`) is never run again.
+    #[test]
+    fn bug_2340_a_database_error_through_anyhow_is_judged_as_one() {
+        const RPC: &str = "Timed out: Perform RPC (request call id 81) to 127.0.0.1:9100 timed out after 15.000s; Rpc timeout";
+        let sqlx_err = |m| sqlx::Error::Database(Box::new(YbError(m)));
+        assert!(Error::Other(anyhow::Error::from(sqlx_err(RPC))).is_retryable());
+        assert!(Error::Other(anyhow::Error::from(sqlx_err(RPC)).context("1 of 2 packs")).is_retryable());
+        assert!(!Error::Other(anyhow::Error::from(sqlx_err("internal error: tablet not found"))).is_retryable());
+        assert!(!Error::Other(anyhow::anyhow!("the commit timed out; its outcome is unknown: {}", sqlx_err(RPC))).is_retryable());
+        assert!(!Error::busy().is_retryable());
     }
 }
