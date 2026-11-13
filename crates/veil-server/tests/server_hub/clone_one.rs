@@ -239,7 +239,9 @@ fn a_one_folder_clone_records_only_what_it_wrote() {
         let out = p.fin.ok(p.fin.home.path(), &args);
         assert!(out.contains("Cloned"), "{out}");
         assert_eq!(out.contains("thin"), !full, "{out}");
-        assert_eq!(std::fs::read_to_string(d.join(BILL_DIR).join("acme/invoice.txt")).unwrap(), format!("{BILL_MARK}\nsecond"));
+        // What the project holds now (the thin round pushed an edit).
+        let invoice = std::fs::read_to_string(p.dir.join(BILL_DIR).join("acme/invoice.txt")).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join(BILL_DIR).join("acme/invoice.txt")).unwrap(), invoice);
         assert!(!d.join("src").exists(), "a folder outside --only was written");
         assert_clean(&p.fin.ok(&d, &["status"]), "after the clone");
         assert!(!has_marker(&everything_in(&d), PUBLIC_MARK), "full {full}: an object outside --only was fetched");
