@@ -83,10 +83,14 @@ echo "== starting PostgreSQL and MinIO ($TAG)"
 # 4 GB of shared buffers): with PostgreSQL's default 128 MB a landing run's
 # database (1.5 GB after three minutes) is written out by the backends
 # themselves, a third of their time (BUG-1955). Durability as deployed
-# (`synchronous_commit = on`).
+# (`synchronous_commit = on`). The deployment's checkpoint spacing too
+# (BUG-2364): with the default 1 GB of WAL between checkpoints a landing run
+# checkpointed every 20 to 28 s, and full-page images made 6 of its 7.5 GB
+# of WAL.
 D run -d --name "$PG" -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 --shm-size=1g \
     postgres:17-alpine -c max_connections=500 -c shared_preload_libraries=pg_stat_statements \
-    -c shared_buffers=4GB -c effective_cache_size=12GB -c synchronous_commit=on >/dev/null || exit 1
+    -c shared_buffers=4GB -c effective_cache_size=12GB -c synchronous_commit=on \
+    -c max_wal_size=16GB -c checkpoint_timeout=15min >/dev/null || exit 1
 D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 \
     bitnamilegacy/minio:latest >/dev/null || exit 1
 PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000)

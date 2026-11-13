@@ -99,7 +99,7 @@ else
         copy_to "$STATE/pg.env" "$DBIP" /etc/veil/pg.env
         copy_to "$DO_ROOT/deploy/compose/init.sql" "$DBIP" /etc/veil/init.sql
     else echo "would copy the PostgreSQL env file and deploy/compose/init.sql to $DBIP" >&2; fi
-    remote "$DBIP" "docker rm -f pg >/dev/null 2>&1; docker run -d --name pg --restart unless-stopped -p $DBPRIV:5432:5432 --env-file /etc/veil/pg.env -v pgdata:/var/lib/postgresql/data -v /etc/veil/init.sql:/docker-entrypoint-initdb.d/10-veil.sql:ro --shm-size=1g $PG_IMAGE -c max_connections=1500 -c shared_preload_libraries=pg_stat_statements -c shared_buffers=4GB -c effective_cache_size=12GB -c synchronous_commit=on"
+    remote "$DBIP" "docker rm -f pg >/dev/null 2>&1; docker run -d --name pg --restart unless-stopped -p $DBPRIV:5432:5432 --env-file /etc/veil/pg.env -v pgdata:/var/lib/postgresql/data -v /etc/veil/init.sql:/docker-entrypoint-initdb.d/10-veil.sql:ro --shm-size=1g $PG_IMAGE -c max_connections=1500 -c shared_preload_libraries=pg_stat_statements -c shared_buffers=4GB -c effective_cache_size=12GB -c synchronous_commit=on -c max_wal_size=16GB -c checkpoint_timeout=15min"
     remote "$DBIP" 'for i in $(seq 60); do docker exec pg pg_isready -U veil -d veil >/dev/null 2>&1 && docker exec pg psql -U veil -d veil -tAc "select 1" >/dev/null 2>&1 && break; sleep 2; done; echo "   postgres answers"'
 fi
 
