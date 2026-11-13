@@ -557,6 +557,32 @@ server's landed-from-itself records as second landings. The tool's
 database-commit counter reads 0 on YugabyteDB (it counts PostgreSQL
 transaction ids): commits per landing are measured on PostgreSQL only.
 
+**Failover again, 2026-11-13** (`dokit3`; images `veil-server:93f14e54`
+and `veil-bench:93f14e54`, whose Rust is staging `169cd8f8`'s: BUG-1970's
+fix, the per-change landing log; the same topology and sizes, `GATES=failover`,
+once with `docker stop` and once with `FAILOVER_HOW=kill`). The verdict now
+also holds every answer the agents got against `main`'s first-parent line
+(§6.1). Again for the flow only: one machine.
+
+| Run | Lease | Exactly once (database) | Exactly once (the agents' answers) | Longest pause after the stop (30 s before) | Verdict |
+|---|---|---|---|---|---|
+| stop (`20261113T012547Z`) | server 2 → server 1, epoch 1 → 2 | `main` = 2 set-up + 1,622 landed, nothing queued | 1,621 answered `landed`, each on `main` once under its ticket; 1 landing no agent heard of, against 22 failed submits without a ticket (broken connections to the stopped server) | **481 ms** (311 ms) | pass |
+| kill (`20261113T012950Z`) | server 2 → server 1, epoch 1 → 2 | `main` = 2 + 1,621, nothing queued | 1,620 answered, each once; 1 unheard of, against 23 failed submits | **2,711 ms** (392 ms) | exactly once: pass; pause: **miss** |
+
+Before BUG-1970's fix both pauses were about 2.4 s. A clean stop now
+gives the lease up at once (two earlier stop runs of this round: 628 and
+307 ms); a crash still waits for the lease to expire (`LEASE_MS`, 2 s)
+and for the next server's retry, BUG-1970's cause (2), left open.
+
+Found by this round, both fixed in the kit: the agents' change ids are in
+Veil's letters (`k`–`z`) and the graph's in hex, and the `landed`
+snapshot ids an agent is answered are its own projection, not `main`'s
+(the verdict compares hex change ids and tickets); and in the rehearsal
+the second server could not write its data directory, so the gate found
+no lease holder when that server held it (**BUG-2080**: the first kill
+run, `20261112T231814Z`, failed so; both runs above had server 2 holding
+the lease).
+
 ### 9.2 The rehearsal of 2026-11-09 (one server, PostgreSQL)
 
 `deploy/compose/rehearsal.sh boat` on Boat machines (8 vCPU, 16 GB, Docker

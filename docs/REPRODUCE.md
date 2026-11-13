@@ -52,6 +52,7 @@ and everything is torn down at the end.
 deploy/compose/rehearsal.sh me                    # builds the images, runs every gate, tears down
 SKIP_BUILD=1 TAG=<tag> deploy/compose/rehearsal.sh me      # reuse images built before
 GATES="failover scaling" SKIP_BUILD=1 TAG=<tag> deploy/compose/rehearsal.sh me
+GATES=failover FAILOVER_HOW=kill SKIP_BUILD=1 TAG=<tag> deploy/compose/rehearsal.sh me   # the lease holder killed, not stopped
 DB=pg deploy/compose/rehearsal.sh me              # PostgreSQL 17 instead of YugabyteDB
 ```
 
