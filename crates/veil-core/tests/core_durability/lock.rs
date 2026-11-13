@@ -123,6 +123,50 @@ fn mutual_exclusion_under_contention() {
     }
 }
 
+/// Threads that keep asking for the lock take turns: one that releases and
+/// asks again queues behind those already waiting, so no waiter sees more
+/// than one acquisition by each other thread while it waits (BUG-1986: a
+/// releaser took the lock straight back, about 110 times in a row, and one
+/// waiter gave up after its 20 s wait on a loaded machine). Counted in
+/// acquisitions, not time, so load cannot make it flaky; the bound has
+/// slack for a thread descheduled between counting and asking.
+#[test]
+fn contenders_take_turns_and_none_starves() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const THREADS: u64 = 8;
+    for (fs, _tmp) in backends() {
+        let done = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let fs = fs.clone();
+                let done = done.clone();
+                thread::spawn(move || {
+                    let mut spans = Vec::new();
+                    for _ in 0..15 {
+                        let before = done.load(Ordering::SeqCst);
+                        let l = RepoLock::acquire_with(fs.clone(), &quick(20_000));
+                        let l = l.expect("acquired within the wait");
+                        spans.push(done.load(Ordering::SeqCst) - before);
+                        thread::yield_now();
+                        done.fetch_add(1, Ordering::SeqCst);
+                        drop(l);
+                    }
+                    spans
+                })
+            })
+            .collect();
+        let spans: Vec<Vec<u64>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(done.load(Ordering::SeqCst), THREADS * 15, "every acquisition succeeded on {}", fs.kind());
+        let worst = spans.iter().flatten().max().copied().unwrap();
+        assert!(
+            worst <= 3 * (THREADS - 1),
+            "on {}, a waiter saw {worst} acquisitions by others while it waited (at most {} with turns); per thread: {spans:?}",
+            fs.kind(),
+            THREADS - 1
+        );
+    }
+}
+
 #[test]
 fn long_transaction_keeps_its_lock() {
     // The old scheme stole any lock older than a fixed age. Now the holder
@@ -748,4 +792,68 @@ fn fsck_reports_leftover_sub_guards() {
         notes.iter().any(|n| n.contains(".veil/lock.steal.abcdefabcdefabcd present") && n.contains("stale")),
         "{notes:#?}"
     );
+}
+
+/// A waiter whose turn is first and which gives up (its wait runs out)
+/// passes its turn on: the next waiter of this process takes the lock once
+/// it is released, at once (woken by the release), not after its own wait.
+/// A turn kept after an early return would leave every later waiter
+/// unable to create the free lock (BUG-1986's turns).
+#[test]
+fn a_waiter_that_gives_up_passes_its_turn_on() {
+    for (fs, _tmp) in backends() {
+        let held = RepoLock::acquire_with(fs.clone(), &quick(1_000)).expect("the first acquisition");
+        let first = {
+            let fs = fs.clone();
+            thread::spawn(move || RepoLock::acquire_with(fs, &quick(500)).map(drop))
+        };
+        // The first waiter takes its turn before the second asks.
+        thread::sleep(Duration::from_millis(200));
+        let second = {
+            let fs = fs.clone();
+            thread::spawn(move || RepoLock::acquire_with(fs, &quick(10_000)).map(drop))
+        };
+        let gave_up = first.join().unwrap();
+        assert!(matches!(gave_up, Err(VeilError::Locked(_))), "the first waiter's wait ran out on {}: {gave_up:?}", fs.kind());
+        let released = Instant::now();
+        drop(held);
+        let got = second.join().unwrap();
+        assert!(got.is_ok(), "the second waiter took the lock on {}: {got:?}", fs.kind());
+        assert!(released.elapsed() < Duration::from_secs(9), "the second waiter was let in on {} only at its own deadline", fs.kind());
+    }
+}
+
+/// Several waiters of this process and a live holder in another process:
+/// none of them robs it, first in turn or not, and its release, which this
+/// process sees only by polling, lets them all in, one after another.
+#[cfg(unix)]
+#[test]
+fn waiters_in_turn_outlast_a_live_foreign_holder() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(tmp.path()));
+    let mut child = std::process::Command::new("sleep").arg("30").spawn().expect("spawn `sleep`");
+    plant(&*fs, &foreign_lock(child.id(), 60_000));
+    let got = Arc::new(AtomicU64::new(0));
+    let waiters: Vec<_> = (0..4)
+        .map(|_| {
+            let fs = fs.clone();
+            let got = got.clone();
+            thread::spawn(move || {
+                let l = RepoLock::acquire_with(fs, &quick(20_000));
+                let l = l.expect("acquired after the foreign holder let go");
+                got.fetch_add(1, Ordering::SeqCst);
+                drop(l);
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(got.load(Ordering::SeqCst), 0, "a waiter robbed a live holder in another process");
+    fs.remove_file(&lock_path()).expect("the foreign holder lets go");
+    for w in waiters {
+        w.join().unwrap();
+    }
+    assert_eq!(got.load(Ordering::SeqCst), 4);
+    child.kill().unwrap();
+    child.wait().unwrap();
 }

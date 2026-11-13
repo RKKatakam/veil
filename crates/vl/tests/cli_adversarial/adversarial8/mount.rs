@@ -413,12 +413,20 @@ fn deleting_while_listing_skips_nothing() {
     let (mnt, _g) = mount(&env, U, &proj, "agent");
     std::fs::create_dir(mnt.join("many")).unwrap();
     for i in 0..3000 {
-        std::fs::write(mnt.join(format!("many/file-{i:05}.txt")), "x").unwrap();
+        let f = format!("many/file-{i:05}.txt");
+        std::fs::write(mnt.join(&f), "x").unwrap_or_else(|e| panic!("writing {f} through the mount: {e}"));
     }
     let r = std::fs::remove_dir_all(mnt.join("many"));
-    let left = std::fs::read_dir(mnt.join("many")).map(|d| d.count()).unwrap_or(0);
+    // What is left, by name (BUG-1983: a failure on a loaded machine kept
+    // no more than the summary).
+    let left: Vec<String> = match std::fs::read_dir(mnt.join("many")) {
+        Ok(d) => d.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()).unwrap_or_else(|e| format!("<{e}>"))).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => vec![format!("<listing failed: {e}>")],
+    };
     env.ok(U, &proj, &["ws", "unmount", "agent"]);
-    assert!(r.is_ok() && left == 0, "remove_dir_all: {r:?}; {left} entries left");
+    let shown: Vec<&String> = left.iter().take(20).collect();
+    assert!(r.is_ok() && left.is_empty(), "remove_dir_all: {r:?}; {} entries left: {shown:?}", left.len());
 }
 
 /// `vl undo` while the mount holds new work: `Ctx::open` first has the
