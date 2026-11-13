@@ -53,6 +53,13 @@ $EDITOR deploy/do/.env     # token, Spaces keys, a database password, your IP, t
 `deploy/do/.env` is ignored by git. The scripts also read these variables
 from the environment, which wins over the file.
 
+**Connect each server straight to the database.** Put no transaction-pooling
+proxy (pgbouncer in transaction mode, or YugabyteDB's connection manager)
+between them: the server holds session-level advisory locks (its landing
+leases' crash detection, HUB §13.32 item 13; migrations; the deriver), and
+under transaction pooling another client's statement can run on the
+connection that holds one. The kit connects directly.
+
 ## 2. Topology and cost
 
 **Default topology** (`deploy/do/.env.example`; `deploy/do/estimate.sh`

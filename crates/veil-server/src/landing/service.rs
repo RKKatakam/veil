@@ -110,7 +110,9 @@ const DB_NOW: &str = "(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT";
 /// the next epoch by a compare-and-swap on the one read; this server's
 /// lock of that epoch is taken first, and the row's `lock_epoch` says
 /// whether it was.
-async fn take_lease(hub: &Hub, project: i64, branch: &str) -> Result<Option<i64>> {
+/// The lease's epoch, and whether this server holds that epoch's lock
+/// (only then may it unlock it: a key of another branch can be the same).
+async fn take_lease(hub: &Hub, project: i64, branch: &str) -> Result<Option<(i64, bool)>> {
     let me = &hub.landing.holder;
     // The probe takes the holder's lock and lets it go in one statement
     // (on any connection: nothing is kept), only for an unexpired lease of
@@ -159,7 +161,7 @@ async fn take_lease(hub: &Hub, project: i64, branch: &str) -> Result<Option<i64>
     if locked && !matches!(took, Ok(Some(_))) {
         locks.unlock(&hub.db, project, branch, next).await;
     }
-    Ok(took?)
+    Ok(took?.map(|epoch| (epoch, locked)))
 }
 
 /// Renew the lease; `false` if it was lost.
@@ -452,19 +454,26 @@ pub(super) async fn run(hub: &Arc<Hub>, project: i64, branch: &str, wake: Arc<No
     if hub.landing.stopping() {
         return Ok(false);
     }
-    let Some(epoch) = take_lease(hub, project, branch).await? else { return Ok(true) };
+    let Some((epoch, locked)) = take_lease(hub, project, branch).await? else { return Ok(true) };
     hub.landing.taken.fetch_add(1, Ordering::SeqCst);
-    let name: Option<String> = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project).fetch_optional(&hub.db).await?;
-    let Some(name) = name else { return Ok(false) };
-    let s = Service {
-        hub: hub.clone(),
-        project,
-        name,
-        branch: branch.to_string(),
-        epoch,
-        won: Default::default(),
+    let name: Result<Option<String>> = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1").bind(project).fetch_optional(&hub.db).await.map_err(Into::into);
+    // Every way out below gives the lease (and the lock, if this server took
+    // it) up, so a lease of a project gone or unreadable is not left held.
+    let r = match name {
+        Ok(Some(name)) => {
+            let s = Service {
+                hub: hub.clone(),
+                project,
+                name,
+                branch: branch.to_string(),
+                epoch,
+                won: Default::default(),
+            };
+            s.run(wake).await
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
     };
-    let r = s.run(wake).await;
     let _ = sqlx::query("UPDATE landing_leases SET expires_at = 0 WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4")
         .bind(project)
         .bind(branch)
@@ -472,8 +481,11 @@ pub(super) async fn run(hub: &Arc<Hub>, project: i64, branch: &str, wake: Arc<No
         .bind(epoch)
         .execute(&hub.db)
         .await;
-    // Given up (or lost): its lock goes too, so it is never taken over by it later.
-    hub.landing.locks.unlock(&hub.db, project, branch, epoch).await;
+    // Given up (or lost): its lock goes too, so it is never taken over by it
+    // later; only a lock this server took is unlocked (rv-failover2 nit 1).
+    if locked {
+        hub.landing.locks.unlock(&hub.db, project, branch, epoch).await;
+    }
     r.map(|_| false)
 }
 
