@@ -389,3 +389,97 @@ fn bug_2280_a_crashed_merges_staged_pack_is_swept_without_a_push() {
     let due = fresh.rt.block_on(pack_gc::projects_to_sweep(&f)).expect("the look runs");
     assert!(!due.contains(&pid), "nothing of the project is left to sweep");
 }
+
+/// BUG-2310: an upload a sweep discarded past its staged grace period
+/// (`DEFAULT_STAGED_GRACE_MS`), and whose row it then deleted past the
+/// pack grace period, is never listed by a push that named it before
+/// the sweep: the push is held at its listing transaction (the project's
+/// GC epoch row locked, as a switch does) while the sweeps run, as a
+/// sweeper does on a server other than the one with the upload's index
+/// in hand. It is refused with "push again", the branch does not move
+/// and no row lists the deleted pack.
+#[test]
+fn bug_2310_a_push_never_lists_an_upload_swept_while_it_ran() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    push_file(&api, &p, "slow", "src/first.txt");
+    let h = hub.hub();
+    hub.rt.block_on(pack_gc::read_gc_epoch(&h, pid)).expect("the epoch row is there");
+    let uploads = |hub: &TestHub| -> Vec<(String, i16)> {
+        hub.rt
+            .block_on(
+                sqlx::query_as("SELECT name, state FROM packs WHERE project_id = $1 AND person_id IS NOT NULL AND state <> 1")
+                    .bind(pid)
+                    .fetch_all(&hub.hub().db),
+            )
+            .unwrap()
+    };
+    assert!(uploads(&hub).is_empty(), "no upload is left staged");
+    let tip = tip_of(&api, &p.admin.token(), &p.name, "slow");
+    // The project's GC epoch row held, as a switch holds it: the push
+    // waits at its listing transaction's first statement.
+    let mut held = hub.rt.block_on(h.db.begin()).expect("a transaction");
+    let locked: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE")
+                .bind(pid)
+                .fetch_one(&mut *held),
+        )
+        .expect("the epoch row is locked");
+    assert!(locked >= 0);
+    std::thread::scope(|s| {
+        let pushing = s.spawn(|| {
+            let mut c = Craft::new(&api, &p.admin, &p.name, "slow");
+            c.file("src/second.txt", "second\n");
+            c.push_edited("slow", tip, |_| {}).1
+        });
+        let until = Instant::now() + Duration::from_secs(30);
+        while uploads(&hub).is_empty() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let up = uploads(&hub);
+        assert_eq!(up.len(), 1, "the push uploaded one pack: {up:?}");
+        assert_eq!(up[0].1, 0, "staged");
+        // The push reaches its listing transaction.
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(!pushing.is_finished(), "the push waits at its listing transaction");
+        // An hour passes: another server's sweep discards the upload and,
+        // once the grace period has passed, deletes its row.
+        let other = TestHub::beside(&hub);
+        let o = other.hub();
+        other.rt.block_on(async {
+            sqlx::query("UPDATE packs SET created_at = created_at - $2 WHERE project_id = $1 AND name = $3")
+                .bind(pid)
+                .bind(2 * pack_gc::DEFAULT_STAGED_GRACE_MS)
+                .bind(&up[0].0)
+                .execute(&o.db)
+                .await
+                .expect("the upload is aged");
+            let r = pack_gc::run_project(&o, pid, &Options::sweep_only()).await.expect("the sweep runs");
+            assert_eq!(r.staged_packs_swept, 1, "the upload is discarded: {r:?}");
+            sqlx::query("UPDATE packs SET discarded_at = discarded_at - $2 WHERE project_id = $1 AND name = $3")
+                .bind(pid)
+                .bind(2 * pack_gc::DEFAULT_PACK_GRACE_MS)
+                .bind(&up[0].0)
+                .execute(&o.db)
+                .await
+                .expect("the discarded row is aged");
+            let r = pack_gc::run_project(&o, pid, &Options::sweep_only()).await.expect("the sweep runs");
+            assert_eq!(r.discarded_packs_swept, 1, "the upload's row is deleted: {r:?}");
+        });
+        assert!(!stored(&hub, pid, &up[0].0), "the upload's storage object is deleted");
+        hub.rt.block_on(held.rollback()).expect("the epoch row is released");
+        let r = pushing.join().unwrap();
+        assert_eq!(r.status, 409, "{}", String::from_utf8_lossy(&r.body));
+        assert!(String::from_utf8_lossy(&r.body).contains("push again"), "{}", String::from_utf8_lossy(&r.body));
+        let rows: i64 = hub
+            .rt
+            .block_on(sqlx::query_scalar("SELECT count(*) FROM packs WHERE project_id = $1 AND name = $2").bind(pid).bind(&up[0].0).fetch_one(&h.db))
+            .unwrap();
+        assert_eq!(rows, 0, "no row lists the deleted upload");
+        assert_eq!(tip_of(&api, &p.admin.token(), &p.name, "slow"), tip, "the branch did not move");
+    });
+}
