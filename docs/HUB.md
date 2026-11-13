@@ -2585,7 +2585,7 @@ agent's base is its own last landing, or a tip it read; batches record the
 tip they move from); the derived commit graph when it holds the tip (its
 jump table, bounded by generation), never waiting for the deriver; when it
 does not hold the tip yet, the part of the line it does not hold is read
-from the store, once per submit (at most 4,096 snapshots), down to the
+from the store, once per submit (at most 256 snapshots), down to the
 first snapshots it holds, and the graph answers below them; else a
 walk down from the tip shared by the whole stack: while the line is read,
 at most 256 snapshots (a base a few landings below a tip the deriver has

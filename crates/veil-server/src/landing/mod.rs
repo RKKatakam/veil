@@ -1565,7 +1565,7 @@ pub(crate) struct Ancestry {
     walks: Vec<crate::derive::graph::Descent>,
     /// While the derived graph does not hold the tip: the snapshots below
     /// it that it does not hold yet, and the ones it holds where they end
-    /// (`Ancestry::top`; `Some(None)`: more than [`WALK_BUDGET`]).
+    /// (`Ancestry::top`; `Some(None)`: more than `NEAR_WALK`).
     top: Option<Option<(std::collections::HashSet<ObjectId>, Vec<ObjectId>)>>,
 }
 
@@ -1686,7 +1686,9 @@ impl Ancestry {
     /// hold, read down to the first ones it holds on every line, which are
     /// returned too: everything below the tip is one of the first or below
     /// one of the second (a derived snapshot's parents are derived). Read
-    /// once per submit; `None` past [`WALK_BUDGET`] (the older walks then).
+    /// once per submit; `None` past `NEAR_WALK` snapshots (the deriver far
+    /// behind): the older walks then, as before, after at most `NEAR_WALK`
+    /// reads here (not `WALK_BUDGET`: the walks would read it all again).
     async fn top(&mut self) -> Result<Option<&(std::collections::HashSet<ObjectId>, Vec<ObjectId>)>> {
         if self.top.is_none() {
             let tip = self.tip;
@@ -1699,7 +1701,7 @@ impl Ancestry {
                         base.push(y);
                         continue;
                     }
-                    if above.len() == WALK_BUDGET {
+                    if above.len() == NEAR_WALK {
                         return Ok(None);
                     }
                     above.insert(y);

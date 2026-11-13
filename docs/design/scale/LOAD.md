@@ -1432,8 +1432,9 @@ shared by every question of the submit with the same starting points; a
 snapshot found not below a tip is remembered so (per server, at most
 262,144 such facts; history never changes, so a fact never goes stale) and
 the next walk for it stops at that tip; while the deriver does not hold
-`main`'s tip, the part it does not hold is read from the store once per
-submit and the graph answers below it. A landing now reads what `main`
+`main`'s tip, the part it does not hold (at most 256 snapshots; further
+behind, the older walks) is read from the store once per submit and the
+graph answers below it. A landing now reads what `main`
 gained since the branch's last landing. `is_below` answers exactly as
 `is_ancestor` (tests `branch_landing::bug_2221_*`).
 
