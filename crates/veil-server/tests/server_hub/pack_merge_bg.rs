@@ -64,6 +64,7 @@ fn read_all(hub: &TestHub, project: i64, ids: &[ObjectId], when: &str) {
 /// Three agents push 100 times each to branches of their own, while
 /// readers on this server and on a second one read every snapshot pushed
 /// so far, again and again, and the second server runs merges of its own
+/// (once the first server merged in the background)
 /// that sweep replaced packs at once (no grace period): the small listed
 /// packs stay bounded throughout (each push lists one; nobody runs a merge
 /// on the first server), the background merges ran, and no read ever
@@ -105,10 +106,16 @@ fn bug_2230_background_merging_keeps_packs_bounded_and_readers_never_miss() {
             });
         }
         {
-            let (other, done) = (&other, &done);
+            let (hub, other, done) = (&hub, &other, &done);
             s.spawn(move || {
                 let oh = other.hub();
                 let opts = Options { min_packs_to_merge: MERGE_MIN_PACKS, pack_grace_ms: 0, ..Options::merge_only() };
+                // Only once the first server merged in the background: run
+                // from the start, these merges did its work before its task
+                // had its turn (on YugabyteDB, no background merge at all).
+                while !done.load(Ordering::SeqCst) && hub.hub().pack_gc.background_merges.load(Ordering::Relaxed) == 0 {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 while !done.load(Ordering::SeqCst) {
                     other.rt.block_on(pack_gc::run_project(&oh, pid, &opts)).expect("the second server's merge runs");
                     std::thread::sleep(Duration::from_millis(300));
