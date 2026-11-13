@@ -993,7 +993,11 @@ impl Objects {
 
     /// Write `objects` as one staged pack of `project` for a merge or
     /// garbage-collection pass (`person_id` `None`, S29), recorded in `packs`
-    /// before its storage object is written.
+    /// before its storage object is written. **Its objects are not cached**
+    /// (BUG-2230): a merge rewrites objects nobody asked for, up to
+    /// `pack_gc::MAX_MERGED_BYTES` a pack, and caching them pushed the
+    /// requests' own objects out (under the background merges of the
+    /// many-branch run, the store's reads went from 4 to 57 a push).
     pub async fn put_job_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Held)> {
         self.write_pack(project, objects, true, None).await
     }
@@ -1003,8 +1007,10 @@ impl Objects {
     async fn write_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>, record: bool, staged_by: Option<i64>) -> Result<(Arc<str>, Held)> {
         let share = self.packs.bound().take_for(Some(project), Index::write_weight_of(objects.len()) as u64).await?;
         let name: Arc<str> = crate::pack::new_name().into();
-        for (id, enc) in &objects {
-            self.cache.insert(Self::staged_key(project, &name, id, false), enc.clone(), enc.len());
+        if staged_by.is_some() {
+            for (id, enc) in &objects {
+                self.cache.insert(Self::staged_key(project, &name, id, false), enc.clone(), enc.len());
+            }
         }
         let (bytes, index) = crate::pack::build(objects)?;
         let size = bytes.len() as u64;
