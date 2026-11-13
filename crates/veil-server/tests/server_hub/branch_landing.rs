@@ -223,3 +223,46 @@ fn bug_2221_is_below_answers_as_is_ancestor_whatever_was_remembered() {
     let v = land_on_main(&api, &p, y);
     assert_eq!(v["landed"].as_array().map(Vec::len), Some(1), "{v}");
 }
+
+/// BUG-2230: under the many-branch headline every push's pack stays listed
+/// (about 78,000 after 10 minutes at 300 agents), and each object lookup
+/// that misses the newest packs probes every pack's index
+/// (`pack::Packs::find_in`, 28 % of the server's CPU at 560 s) while each
+/// listing reads every row: S29's background merge
+/// (`pack_gc::maybe_schedule`, HUB §13.37) is never called. Once a
+/// project's small listed packs reach `MERGE_MIN_PACKS`, the server merges
+/// them in the background, without anyone running it.
+#[test]
+#[ignore = "BUG-2230: small packs are never merged in the background (pack_gc::maybe_schedule is never called)"]
+fn bug_2230_small_packs_are_merged_in_the_background_once_they_pile_up() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let h = hub.hub();
+    let counts = || {
+        hub.rt
+            .block_on(
+                sqlx::query_as::<_, (i64, i64)>(
+                    "SELECT count(*) FILTER (WHERE state = 1 AND size <= $2), count(*) FILTER (WHERE state = 2) FROM packs WHERE project_id = $1",
+                )
+                .bind(pid)
+                .bind(veil_server::pack_gc::SMALL_PACK_BYTES as i64)
+                .fetch_one(&h.db),
+            )
+            .unwrap()
+    };
+    let pushes = veil_server::pack_gc::MERGE_MIN_PACKS + 8;
+    for i in 0..pushes {
+        push_file(&hub.api(), &p, "agent-1", &format!("src/agent/p{i}.txt"));
+    }
+    let (small, discarded) = counts();
+    assert!(small + discarded >= pushes as i64, "each push listed a pack: {small} small listed, {discarded} discarded");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (mut small, mut discarded) = (small, discarded);
+    while (small >= veil_server::pack_gc::MERGE_MIN_PACKS as i64 || discarded == 0) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        (small, discarded) = counts();
+    }
+    assert!(discarded > 0, "no pack was merged within 30 s of {pushes} pushes ({small} small packs listed)");
+    assert!(small < veil_server::pack_gc::MERGE_MIN_PACKS as i64, "{small} small packs still listed after the merges");
+}
