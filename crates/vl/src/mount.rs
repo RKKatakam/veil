@@ -70,7 +70,7 @@ use veil_core::{
 use self::fs::{DiskFiles, Journal, Lower, MountFs, ReaderView};
 use crate::{
     ctx::{load_identity, user_for, Ctx},
-    render::{bold, one_line, safe, warn},
+    render::{bold, one_line, safe, warn, LeftOut},
 };
 
 /// Where mounts keep their state, relative to the project directory.
@@ -616,7 +616,7 @@ impl Recorder {
 
     /// Record the overlay after a `vl ws exec --mount` run and remove any
     /// unrecorded files holding a secret value from the mount (`VISIBILITY.md`).
-    fn record_exec(&mut self) -> Result<Vec<String>> {
+    fn record_exec(&mut self) -> Result<(Vec<String>, Vec<LeftOut>)> {
         let mut notes = self.record()?;
         let cleaned = self.clean_secret_copies()?;
         if !cleaned.is_empty() {
@@ -625,7 +625,13 @@ impl Recorder {
                 cleaned.join(", ")
             ));
         }
-        Ok(notes)
+        // A clean overlay holds nothing of the command's (its last report
+        // may be of files since taken out).
+        let left = match self.fs.is_clean() {
+            true => Vec::new(),
+            false => crate::render::left_out(&self.report, true),
+        };
+        Ok((notes, left))
     }
 
     /// Remove files in the upper layer that hold a secret value given to the
@@ -776,6 +782,9 @@ struct Reply {
     notes: Vec<String>,
     #[serde(default)]
     error: Option<String>,
+    /// `record-exec`: the files the recording left out as secrets (BUG-2171).
+    #[serde(default)]
+    left: Vec<LeftOut>,
 }
 
 /// Send `request` to the process serving `state`'s mount. `None` when
@@ -1331,7 +1340,7 @@ impl ExecMount {
     /// After the run: the mount records what it holds into the workspace
     /// (its notes), removes any copies of secrets, and one this run mounted
     /// is then unmounted.
-    pub fn finish(self) -> Result<Vec<String>> {
+    pub fn finish(self) -> Result<(Vec<String>, Vec<LeftOut>)> {
         let paths = Paths::new(&self.root, &self.ws);
         let st = paths.load_state()?.ok_or_else(|| anyhow!("the mount of workspace '{}' has no state", safe(&self.ws)))?;
         let lost = || anyhow!("the mount process does not answer; `vl ws unmount {}` records what the command wrote", safe(&self.ws));
@@ -1339,7 +1348,7 @@ impl ExecMount {
         if let Some(e) = r.error {
             bail!("the command's output was not recorded: {e}. It stays in the mount; `vl ws unmount {}` records it", safe(&self.ws));
         }
-        let mut notes = r.notes;
+        let (mut notes, left) = (r.notes, r.left);
         if let Some(parent) = &self.ours {
             match request(&st, "unmount", Duration::from_secs(600)) {
                 Some(Ok(u)) => {
@@ -1358,7 +1367,7 @@ impl ExecMount {
                 None => {}
             }
         }
-        Ok(notes)
+        Ok((notes, left))
     }
 }
 
@@ -1449,20 +1458,20 @@ fn serve(root: &Path, ws: &str, dir: &Path, record_every: u64, banner: bool) -> 
         match msg {
             Ok(Msg::Request(req, reply)) => match req.as_str() {
                 "status" => {
-                    reply.send(Reply { ok: true, notes: Vec::new(), error: None });
+                    reply.send(Reply { ok: true, left: Vec::new(), notes: Vec::new(), error: None });
                 }
                 "record" => {
                     let r = match rec.record() {
-                        Ok(n) => Reply { ok: true, notes: n, error: None },
-                        Err(e) => Reply { ok: false, notes: Vec::new(), error: Some(format!("{e:#}")) },
+                        Ok(n) => Reply { ok: true, left: Vec::new(), notes: n, error: None },
+                        Err(e) => Reply { ok: false, left: Vec::new(), notes: Vec::new(), error: Some(format!("{e:#}")) },
                     };
                     last_record = Instant::now();
                     reply.send(r);
                 }
                 "record-exec" => {
                     let r = match rec.record_exec() {
-                        Ok(n) => Reply { ok: true, notes: n, error: None },
-                        Err(e) => Reply { ok: false, notes: Vec::new(), error: Some(format!("{e:#}")) },
+                        Ok((n, left)) => Reply { ok: true, left, notes: n, error: None },
+                        Err(e) => Reply { ok: false, left: Vec::new(), notes: Vec::new(), error: Some(format!("{e:#}")) },
                     };
                     last_record = Instant::now();
                     reply.send(r);
@@ -1472,7 +1481,7 @@ fn serve(root: &Path, ws: &str, dir: &Path, record_every: u64, banner: bool) -> 
                         Ok(n) => pending_notes.extend(n),
                         Err(e) => {
                             reply.send(Reply {
-                                ok: false,
+                                ok: false, left: Vec::new(),
                                 notes: Vec::new(),
                                 error: Some(format!("could not record the mount, so it stays mounted: {e:#}")),
                             });
@@ -1483,7 +1492,7 @@ fn serve(root: &Path, ws: &str, dir: &Path, record_every: u64, banner: bool) -> 
                         Ok(()) => unmounting = Some(Some(reply)),
                         Err(e) => {
                             reply.send(Reply {
-                                ok: false,
+                                ok: false, left: Vec::new(),
                                 notes: std::mem::take(&mut pending_notes),
                                 error: Some(format!(
                                     "{} is busy ({e}); its edits are recorded, but it stays mounted. Close the files open there \
@@ -1496,7 +1505,7 @@ fn serve(root: &Path, ws: &str, dir: &Path, record_every: u64, banner: bool) -> 
                 }
                 _ => {
                     reply.send(Reply {
-                        ok: false,
+                        ok: false, left: Vec::new(),
                         notes: Vec::new(),
                         error: Some(format!("the mount is {}", if unmounting.is_some() { "being unmounted" } else { "busy" })),
                     });
@@ -1563,9 +1572,9 @@ fn serve(root: &Path, ws: &str, dir: &Path, record_every: u64, banner: bool) -> 
         let _ = std::fs::remove_dir(parent);
     }
     let reply = match &result {
-        Ok(()) => Reply { ok: true, notes: out.clone(), error: None },
+        Ok(()) => Reply { ok: true, left: Vec::new(), notes: out.clone(), error: None },
         Err(e) => Reply {
-            ok: false,
+            ok: false, left: Vec::new(),
             notes: out.clone(),
             error: Some(format!("unmounted, but the last recording failed: {e:#}; `vl ws unmount {ws}` retries it")),
         },
@@ -1690,7 +1699,7 @@ pub fn cmd_unmount(ctx: &mut Ctx, ws: &str) -> Result<()> {
     let from_exec = mp
         .parent()
         .is_some_and(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(EXEC_PREFIX)));
-    let mut notes = if from_exec { rec.record_exec()? } else { rec.record()? };
+    let mut notes = if from_exec { rec.record_exec()?.0 } else { rec.record()? };
     rec.finish(&mut notes)?;
     for n in &notes {
         eprintln!("{n}");

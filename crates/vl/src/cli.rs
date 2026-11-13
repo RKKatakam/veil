@@ -1648,6 +1648,15 @@ pub enum WsCmd {
     /// started stops. --memory, --cpus, --cpu-time, --pids and --timeout
     /// limit it ([exec.limits] gives defaults); vl itself stays outside
     /// the limits, so the run is always recorded.
+    ///
+    /// Exits with the command's status, but 3 for a 0 when the recording
+    /// left out files the secret scanner quarantined (the rest recorded
+    /// all the same), naming each either way. They stay in the sandbox
+    /// (in that workspace, `vl isolate FILE` keeps one on purpose, `vl
+    /// expose --force FILE` records one that is not a secret); an
+    /// --ephemeral run moves them, with their permissions, to
+    /// .veil/local/ephemeral-kept/ (never recorded or pushed; `vl doctor`
+    /// lists it) before its directory goes.
     Exec {
         /// Workspace to run in (or use --ephemeral).
         name: Option<String>,

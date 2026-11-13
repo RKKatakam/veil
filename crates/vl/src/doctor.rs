@@ -307,6 +307,16 @@ fn check_sandboxes(r: &mut Report) {
 
 /// The repository's persistent `ws exec` sandboxes.
 fn check_ws_sandboxes(r: &mut Report, root: &Path, repo: Option<&Repo>) {
+    let kept = sandbox::ephemeral_kept(root);
+    if !kept.is_empty() {
+        let mut detail: Vec<String> = kept.iter().map(|d| d.display().to_string()).collect();
+        detail.push(
+            "files `vl ws exec --ephemeral` runs left out because they look like a secret, in no snapshot (BUG-2171): \
+             record what you need from a working copy, then delete them"
+                .into(),
+        );
+        r.warn(format!("{} director(ies) of quarantined files kept from `ws exec --ephemeral` runs", kept.len()), &detail);
+    }
     let status = sandbox::persistent_status(root, repo);
     if status.is_empty() {
         return;

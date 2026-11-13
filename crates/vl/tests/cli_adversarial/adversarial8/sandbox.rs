@@ -137,7 +137,8 @@ fn a_secret_that_lands_after_an_injected_run_is_never_recorded() {
 fn a_rebuild_keeps_quarantined_work() {
     let env = Env::new();
     let proj = project(&env);
-    exec(&env, &proj, &["--", "sh", "-c", "echo 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' > creds.txt"]);
+    // Recorded without creds.txt: exit 3 (BUG-2171).
+    env.quarantined(U, &proj, &["ws", "exec", "agent", "--", "sh", "-c", "echo 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' > creds.txt"]);
     assert!(files_dir(&proj).join("creds.txt").exists(), "quarantined work stays in the sandbox");
     exec(&env, &proj, &["--only", "src", "--", "true"]);
     write(&files_dir(&proj), "README.md", "edited by hand, kept outside --only src\n");

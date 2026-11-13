@@ -75,7 +75,10 @@ use veil_core::{
 use crate::{
     confine::Confine,
     ctx::{print_checkout_problems, print_working_copy_warnings, Ctx},
-    render::{dim, one_line, policy_edit_held_message, print_build_warnings, safe, warn, yellow},
+    render::{
+        dim, left_out, one_line, policy_edit_held_message, print_build_warnings, print_left_out, safe, warn, yellow, LeftOut,
+        QUARANTINE_STATUS,
+    },
 };
 
 /// Hidden first argument that turns `vl` into a sandbox reaper.
@@ -154,6 +157,34 @@ fn warn_strays(set: &SparseSet, strays: &[VPath], removed: bool) {
         if removed { " (removed from the sandbox)" } else { "" },
         list.join(", ")
     ));
+}
+
+/// The exit status of a `vl ws exec` whose command exited `code` and whose
+/// recording left out the files `left` as secrets (BUG-2171): the
+/// command's own status, but [`QUARANTINE_STATUS`] for a 0, so a harness
+/// that checks it notices; the files are named on standard error either
+/// way, with `hint` (where they are and how to resolve them; `until`: the
+/// next run exits 3 while they are there).
+fn exec_status(code: i32, left: &[LeftOut], hint: &str, until: bool) -> ExitCode {
+    if left.is_empty() {
+        return ExitCode::from(code.clamp(0, 255) as u8);
+    }
+    print_left_out(left, "recorded", hint, until && code == 0);
+    match code {
+        0 => ExitCode::from(QUARANTINE_STATUS),
+        c => ExitCode::from(c.clamp(0, 255) as u8),
+    }
+}
+
+/// Where a persistent sandbox's quarantined files are, and how to resolve them.
+fn persistent_hint(name: &str, paths: &SandboxPaths) -> String {
+    format!(
+        "they stay in the sandbox of workspace {n} ({}), on this machine only, and are never recorded or pushed. Fix a \
+         file there and run again; or, in that workspace (`vl ws switch {n}`), `vl isolate <file>` keeps it local on \
+         purpose and, if it is not a secret, `vl expose --force <file>` has the next run record it",
+        paths.files.display(),
+        n = safe(name)
+    )
 }
 
 pub fn exec(ctx: &mut Ctx, a: &Exec<'_>) -> Result<ExitCode> {
@@ -244,7 +275,8 @@ fn exec_mounted(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confin
     };
     let code = run_command(&mount.dir, &paths.dir, a.command, confine, Some(&layers_dir), Some(&server));
     drop(server);
-    for n in mount.finish()?.iter().filter(|n| !n.starts_with("Recorded ")) {
+    let (notes, left) = mount.finish()?;
+    for n in notes.iter().filter(|n| !n.starts_with("Recorded ")) {
         warn(&format!("mount of workspace {}: {n}", safe(name)));
     }
     ctx.repo.reload()?;
@@ -259,8 +291,13 @@ fn exec_mounted(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confin
         }
         eprintln!("Recorded {}", one_line(&ctx.repo, &ctx.repo.workspace_wc(name)?));
     }
-    let code = code?;
-    Ok(ExitCode::from(code.clamp(0, 255) as u8))
+    let hint = format!(
+        "they stay in the mount of workspace {n}, on this machine only, and are never recorded or pushed. Fix a file \
+         there and run again; or, in that workspace (`vl ws switch {n}`), `vl isolate <file>` keeps it local on purpose \
+         and, if it is not a secret, `vl expose --force <file>` has the next run record it",
+        n = safe(name)
+    );
+    Ok(exec_status(code?, &left, &hint, true))
 }
 
 // ---- persistent sandboxes --------------------------------------------------
@@ -416,12 +453,14 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
             yellow("Recording"),
             safe(name)
         );
-        finish(ctx, name, &paths, &mut m, &mut cache, &fs, None, None)?;
+        let left = finish(ctx, name, &paths, &mut m, &mut cache, &fs, None, None)?;
+        if a.record_only {
+            run.finish();
+            return Ok(exec_status(0, &left, &persistent_hint(name, &paths), true));
+        }
     }
     if a.record_only {
-        if !recovered {
-            eprintln!("Nothing to record: the sandbox of workspace {} holds no unrecorded run", safe(name));
-        }
+        eprintln!("Nothing to record: the sandbox of workspace {} holds no unrecorded run", safe(name));
         run.finish();
         return Ok(ExitCode::SUCCESS);
     }
@@ -587,10 +626,9 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     cache = paths.load_cache();
     // Nothing may have run (the command was not found): recording finds no
     // change and the injected files are taken out as after any run.
-    finish(ctx, name, &paths, &mut m, &mut cache, &fs, injection.as_ref(), Some(&kept))?;
+    let left = finish(ctx, name, &paths, &mut m, &mut cache, &fs, injection.as_ref(), Some(&kept))?;
     run.finish();
-    let code = code?;
-    Ok(ExitCode::from(code.clamp(0, 255) as u8))
+    Ok(exec_status(code?, &left, &persistent_hint(name, &paths), true))
 }
 
 /// The workspace socket's recording of a checked-out sandbox while its
@@ -763,7 +801,7 @@ fn finish(
     fs: &SandboxFs,
     injection: Option<&core::Injection>,
     kept: Option<&[VPath]>,
-) -> Result<()> {
+) -> Result<Vec<LeftOut>> {
     let p = m.pending.clone().expect("a pending run");
     // One recorder of the workspace at a time, and its operations are the
     // workspace's (`vl undo` there undoes them).
@@ -786,7 +824,7 @@ fn finish_recording(
     injection: Option<&core::Injection>,
     kept: Option<&[VPath]>,
     p: Pending,
-) -> Result<()> {
+) -> Result<Vec<LeftOut>> {
     let store = ctx.repo.store().clone();
     let synced = m.tree.ok_or_else(|| anyhow!("the sandbox's manifest names no tree"))?;
     let set = m.only_set()?;
@@ -1076,7 +1114,7 @@ fn finish_recording(
         Outcome::Unchanged => eprintln!("No changes in {}", one_line(&ctx.repo, &ctx.repo.workspace_wc(name)?)),
         Outcome::Resumed => eprintln!("Finished cleaning up after the run recorded as {}", one_line(&ctx.repo, &recorded)),
     }
-    Ok(())
+    Ok(report.as_ref().map(|r| left_out(r, true)).unwrap_or_default())
 }
 
 /// What recording a run did.
@@ -1343,7 +1381,7 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
     let sb = Sandbox::create("ephemeral")?;
     let dir = sb.path().to_path_buf();
     let sandbox = SandboxFs::new(&dir, None, false).with_forbidden_targets(std::iter::once(ctx.root.clone()).chain(crate::ctx::veil_private_dirs()));
-    let result = (|| -> Result<i32> {
+    let result = (|| -> Result<(i32, Vec<LeftOut>, String)> {
         let to = match &set {
             Some(s) => restrict_tree(ctx.repo.store(), &tree, s)?,
             None => tree,
@@ -1405,11 +1443,98 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
             warn(&msg);
         }
         eprintln!("Recorded {}", one_line(&ctx.repo, &id));
-        Ok(code)
+        // What the recording left out as a secret goes with the throwaway
+        // directory unless it is moved out first (BUG-2171).
+        let left = left_out(&report, true);
+        let hint = match left.is_empty() {
+            true => String::new(),
+            false => keep_left_out(&ctx.root, &dir, &left, &one_line(&ctx.repo, &id)),
+        };
+        Ok((code, left, hint))
     })();
     drop(sb);
-    let code = result?;
-    Ok(ExitCode::from(code.clamp(0, 255) as u8))
+    let (code, left, hint) = result?;
+    Ok(exec_status(code, &left, &hint, false))
+}
+
+/// `.veil/local/ephemeral-kept`: the files `--ephemeral` runs left out as
+/// secrets, one directory per run (BUG-2171). Local, like the vault: never
+/// recorded, synced or pushed; `vl doctor` lists what is there.
+pub const EPHEMERAL_KEPT_DIR: &str = ".veil/local/ephemeral-kept";
+
+/// Move the files `left` out of the throwaway sandbox `dir` into a new
+/// directory of [`EPHEMERAL_KEPT_DIR`], each at its path in the sandbox and
+/// with its permissions, and say where (the hint of the run's message;
+/// `change`: the change recorded without them). A file that cannot be
+/// moved is named as lost with the sandbox.
+fn keep_left_out(root: &Path, dir: &Path, left: &[LeftOut], change: &str) -> String {
+    let mut to = root.to_path_buf();
+    to.extend(EPHEMERAL_KEPT_DIR.split('/'));
+    to.push(format!("{}-{}", veil_core::now_millis(), hex::encode(veil_core::crypto::random_bytes::<2>())));
+    let mut failed = Vec::new();
+    for f in left {
+        if let Err(e) = keep_one(dir, &to, &f.path) {
+            failed.push(format!("{} ({e})", safe(f.path.as_str())));
+        }
+    }
+    if !failed.is_empty() {
+        warn(&format!(
+            "could not move {} out of the throwaway sandbox: lost with it. Run the command again in a workspace \
+             (`vl ws exec NAME`), whose sandbox keeps such files",
+            failed.join(", ")
+        ));
+    }
+    format!(
+        "moved out of the throwaway sandbox, with the same permissions, to {}: on this machine only, never recorded or \
+         pushed (`vl doctor` lists it until you delete it). The change recorded without them is {change}: to add one, \
+         put it in a working copy of that change (`vl edit <change>`), then fix it, `vl isolate` it or, if it is not a \
+         secret, `vl expose --force` it",
+        to.display()
+    )
+}
+
+/// Move `path` of the sandbox `dir` to the same path under `to`: renamed,
+/// or copied (with its permissions) across filesystems, then synced.
+fn keep_one(dir: &Path, to: &Path, path: &VPath) -> std::io::Result<()> {
+    let rel: PathBuf = path.as_str().split('/').collect();
+    let (from, dest) = (dir.join(&rel), to.join(&rel));
+    if !std::fs::symlink_metadata(&from)?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    // Only a file inside the sandbox: never one a link in its path leads to.
+    let parent = from.parent().map(std::fs::canonicalize).transpose()?;
+    if !parent.is_some_and(|p| std::fs::canonicalize(dir).is_ok_and(|d| p.starts_with(d))) {
+        return Err(std::io::Error::other("its path leads out of the sandbox"));
+    }
+    let mut made = Vec::new();
+    for d in dest.ancestors().skip(1) {
+        if d.exists() {
+            break;
+        }
+        made.push(d.to_path_buf());
+    }
+    for d in made.iter().rev() {
+        private_dir(d)?;
+    }
+    if std::fs::rename(&from, &dest).is_err() {
+        std::fs::copy(&from, &dest)?;
+    }
+    std::fs::File::open(&dest)?.sync_all()?;
+    if let Some(parent) = dest.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// The directories of [`EPHEMERAL_KEPT_DIR`] under the project at `root`.
+pub fn ephemeral_kept(root: &Path) -> Vec<PathBuf> {
+    let mut base = root.to_path_buf();
+    base.extend(EPHEMERAL_KEPT_DIR.split('/'));
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&base)
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    out.sort();
+    out
 }
 
 /// A throwaway sandbox directory under `$TMPDIR` (`--ephemeral`).

@@ -99,6 +99,8 @@ The command's output is never deleted when something fails: if vl is killed or t
 
 On Linux the command runs confined (bubblewrap): the sandbox appears at the project's real path, starting in the sub-folder you ran vl from; the computer's tools are read-only; HOME and /tmp are empty and private (~/.ssh, ~/.gnupg, the Veil identity and other projects are not there); only the sandbox's own processes are visible. A read-only allow-list shows toolchains and agent configuration (~/.cargo, ~/.rustup, ~/.claude, ...; more with --allow or [exec.confine] allow in .veil/local/config.toml or $VEIL_HOME/config.toml). When the command exits, everything it started stops. --memory, --cpus, --cpu-time, --pids and --timeout limit it ([exec.limits] gives defaults); vl itself stays outside the limits, so the run is always recorded.
 
+Exits with the command's status, but 3 for a 0 when the recording left out files the secret scanner quarantined (the rest recorded all the same), naming each either way. They stay in the sandbox (in that workspace, `vl isolate FILE` keeps one on purpose, `vl expose --force FILE` records one that is not a secret); an --ephemeral run moves them, with their permissions, to .veil/local/ephemeral-kept/ (never recorded or pushed; `vl doctor` lists it) before its directory goes.
+
 ```text
 vl workspace exec [OPTIONS] [NAME] [-- <COMMAND>...]
 ```

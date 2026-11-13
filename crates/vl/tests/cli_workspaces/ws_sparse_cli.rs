@@ -305,15 +305,15 @@ fn ephemeral_runs_can_be_sparse() {
 fn quarantined_work_outside_a_narrower_set_is_kept_and_guarded() {
     let env = Env::new();
     let proj = project(&env);
-    exec(&env, &proj, &["--", "sh", "-c", "echo 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' > docs/creds.txt"]);
+    env.quarantined("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", "echo 'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' > docs/creds.txt"]);
     let dir = files_dir(&proj);
     assert!(dir.join("docs/creds.txt").exists());
     exec(&env, &proj, &["--only", "src", "--", "true"]);
     assert!(dir.join("docs/creds.txt").exists(), "quarantined work was removed");
     let o = env.vl("alice", &proj, &["ws", "rm", "agent"]);
     assert!(!o.status.success() && text(&o).contains("docs/creds.txt"), "{}", text(&o));
-    // Back to the whole tree: still quarantined, still there.
-    exec(&env, &proj, &["--", "true"]);
+    // Back to the whole tree: still quarantined (exit 3), still there.
+    env.quarantined("alice", &proj, &["ws", "exec", "agent", "--", "true"]);
     assert!(dir.join("docs/creds.txt").exists());
     assert!(!paths(&env, &proj, "agent@").contains(&"docs/creds.txt".to_string()));
 }
