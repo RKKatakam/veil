@@ -256,7 +256,7 @@ fn bug_2280_packs_a_background_merge_replaced_are_deleted_after_the_grace_period
     assert!(h.pack_gc.background_merges.load(Ordering::Relaxed) >= 1, "the pushes started a background merge");
     let (small, discarded) = small_and_discarded(&hub, pid);
     assert!(small < MERGE_MIN_PACKS as i64, "{small} small packs still listed");
-    assert!(discarded >= MERGE_MIN_PACKS as i64 / 2, "the merges replaced the pushes' packs: {discarded} discarded");
+    assert!(discarded >= pack_gc::TIER_MIN_PACKS as i64, "the merges replaced the pushes' packs: {discarded} discarded");
     // The grace period passes (as it does a minute later).
     let aged = hub
         .rt
