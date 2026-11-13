@@ -16,6 +16,9 @@
 //! On `SIGUSR1` the server writes its request-path counters (storage
 //! writes and reads, cache hits and misses) to `DATA/stats.json`, for the
 //! benchmarks' cost gates (`docs/design/server/storage-and-cost.md` §9).
+// The stats answer's `serde_json::json!` has more fields than the default
+// macro recursion limit allows (BUG-2220's and BUG-2221's counters).
+#![recursion_limit = "256"]
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
