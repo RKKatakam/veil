@@ -116,10 +116,10 @@ fn a_secret_deep_inside_a_large_file_is_quarantined() {
     let mut body = "// generated\n".repeat(3 * MIB / 13).into_bytes();
     body.extend_from_slice(b"const k = \"AKIAZ7QXN4PL2WVR8TQM\";\nconst s = \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY9\";\n");
     write_bytes(&proj, "gen/bundle.js", &body);
-    let out = env.ok("alice", &proj, &["commit", "-m", "bundle"]);
-    assert!(out.contains("quarantined"), "{out}");
+    let out = env.quarantined("alice", &proj, &["commit", "-m", "bundle"]);
+    assert!(out.contains("  gen/bundle.js ("), "{out}");
     env.ok("alice", &proj, &["remote", "add", "origin", "../hub"]);
-    env.ok("alice", &proj, &["push"]);
+    env.quarantined("alice", &proj, &["push"]);
     assert_absent(
         &env.path("hub"),
         "AKIAZ7QXN4PL2WVR8TQM",

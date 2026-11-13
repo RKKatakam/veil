@@ -425,7 +425,7 @@ fn quarantined_edits_are_never_lost() {
     write(&proj, "config.js", edit);
     let st = env.ok("alice", &proj, &["status"]);
     assert!(st.contains("quarantined"), "{st}");
-    env.ok("alice", &proj, &["new", "main"]);
+    env.quarantined("alice", &proj, &["new", "main"]);
     env.ok("alice", &proj, &["status"]);
     let on_disk = read(&proj, "config.js");
     let in_vault = {

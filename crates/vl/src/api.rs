@@ -730,6 +730,22 @@ pub struct Quarantined {
     pub tier: &'static str,
 }
 
+/// The working copy's quarantined files, as `vl status --json` and `vl
+/// commit` (`veil.commit/2`) list them.
+pub fn quarantined(report: &veil_core::builder::BuildReport) -> Vec<Quarantined> {
+    report
+        .quarantined
+        .iter()
+        .map(|(p, f)| Quarantined {
+            path: path(p),
+            rule: f[0].rule,
+            line: f[0].line,
+            state: if report.quarantine_kept.contains(p) { "held_back" } else { "never_recorded" },
+            tier: "quarantined",
+        })
+        .collect()
+}
+
 #[derive(Serialize, Debug)]
 pub struct PolicyHeldBack {
     /// With a trailing `/` when `dir`.
@@ -854,17 +870,7 @@ pub fn status(ctx: &Ctx) -> Result<Status> {
                 .collect()
         },
         isolated: report.isolated.iter().map(path).collect(),
-        quarantined: report
-            .quarantined
-            .iter()
-            .map(|(p, f)| Quarantined {
-                path: path(p),
-                rule: f[0].rule,
-                line: f[0].line,
-                state: if report.quarantine_kept.contains(p) { "held_back" } else { "never_recorded" },
-                tier: "quarantined",
-            })
-            .collect(),
+        quarantined: quarantined(report),
         policy_held_back: report
             .policy_held_back
             .iter()
@@ -3114,6 +3120,9 @@ pub struct Committed {
     pub advanced: Vec<String>,
     /// Tags at the parent that stayed.
     pub kept: Vec<KeptTag>,
+    /// Files the commit left out because they look like secrets
+    /// (BUG-2140): as in `veil.status/2`. Not empty, `vl commit` exits 3.
+    pub quarantined: Vec<Quarantined>,
     pub operation: OpRef,
     #[serde(skip)]
     pub(crate) result: veil_core::commands::CommitResult,
@@ -3152,6 +3161,7 @@ pub fn commit(ctx: &mut Ctx, message: &str, advance: bool, record: bool) -> Resu
                 TagKept::Release => KeptTag { name: name.clone(), reason: "release_tag" },
             })
             .collect(),
+        quarantined: quarantined(&ctx.report),
         operation: op_ref(repo),
         result: r,
     })

@@ -362,6 +362,31 @@ $ cat cfg.js
 k = process.env.AWS_KEY
 ```
 
+A quarantine never passes as a plain success: **`vl commit`, `vl new` and
+`vl push` exit 3** while the working copy holds a quarantined file. The
+work is done all the same (the change is recorded, or pushed, without the
+file), and each file left out is named on standard error, so a script that
+commits and pushes stops instead of shipping a change with a file silently
+missing:
+
+```text
+$ vl commit -m "read the key"
+warning: cfg.js quarantined: looks like a secret (aws-access-key-id at line 1: AKIA…(20 chars)); not snapshotted. Move the secret into a secret file (`.env`, …), fix it, or `vl isolate|expose --force cfg.js`
+Committed nttkpyky eaf4b24e read the key
+error: committed, but without 1 quarantined file (it looks like a secret):
+  cfg.js (aws-access-key-id at line 1; never recorded)
+hint: to keep a file on this machine on purpose, `vl isolate <file>`; if it is not a secret, `vl expose --force <file>` records it. Exit status 3 until then
+Working copy now at: ulpkqvwl f976af5d (empty) (no description set)
+$ echo $?
+3
+```
+
+Once each file is resolved (fixed, `vl isolate`d or `vl expose --force`d),
+the same commands exit 0; a file you isolated on purpose never makes them
+fail. Read-only commands (`vl status`, `vl log`, `vl diff`) exit 0 and list
+the files; `vl status --json` has them in `quarantined`, and the `commit`
+result of `vl serve --local` carries the same list.
+
 ## `vl scan` in CI
 
 `vl scan` scans the working copy and **exits 1** if a public file holds a

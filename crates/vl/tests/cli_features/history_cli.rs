@@ -168,8 +168,9 @@ fn world() -> World {
     let mirror = env.root.join("mirror");
     env.ok("alice", &alice, &["remote", "add", "origin", team.to_str().unwrap()]);
     env.ok("alice", &alice, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
-    env.ok("alice", &alice, &["push"]);
-    env.ok("alice", &alice, &["push", "mirror"]);
+    // Pushed; `leak.txt` stays quarantined, so each push says so (BUG-2140).
+    env.quarantined("alice", &alice, &["push"]);
+    env.quarantined("alice", &alice, &["push", "mirror"]);
     env.ok("bob", &env.root, &["clone", "team", "bob"]);
     env.ok("carol", &env.root, &["clone", "mirror", "carol"]);
     World { bob: env.root.join("bob"), carol: env.root.join("carol"), env, alice }

@@ -73,7 +73,10 @@ fn init_isolates_secrets_and_commits_without_staging() {
     assert!(st.contains("A src/lib.rs"));
     assert!(st.contains("L .netrc"));
     assert!(st.contains("Q leak.txt"));
-    env.ok("alice", &proj, &["commit", "-m", "first"]);
+    // Committed without `leak.txt`, which the exit status 3 tells (BUG-2140).
+    let out = env.vl("alice", &proj, &["commit", "-m", "first"]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("  leak.txt (aws-access-key-id at line 1; never recorded)"));
     let files = env.stdout("alice", &proj, &["files", "-r", "@-"]);
     let paths: Vec<&str> = files.lines().filter_map(|l| l.split_whitespace().last()).collect();
     assert_eq!(paths, vec![".veilpolicy", "src/lib.rs"], "{files}");

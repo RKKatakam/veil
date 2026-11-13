@@ -440,6 +440,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         }
         Cmd::New { revs, message } => {
             api::new_change(ctx, revs, message)?;
+            return Ok(render::quarantine_status(&ctx.report, "started a new change"));
         }
         Cmd::Commit { message, no_advance, hooks } => {
             let message = hooks::before_commit(ctx, hooks, message, !cli.no_snapshot, "commit")?;
@@ -455,6 +456,7 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                     files.join(", ")
                 ));
             }
+            return Ok(render::quarantine_status(&ctx.report, "committed"));
         }
         Cmd::Edit { rev } => {
             let id = ctx.rev(rev)?;
@@ -706,10 +708,18 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
         Cmd::Push { remote, tag, force, hooks } => {
             let name = remote.as_deref().unwrap_or("origin");
             #[cfg(debug_assertions)]
-            if test_remotes::is_path_remote(ctx, name) {
-                return test_remotes::push(ctx, name, tag, *force, hooks);
-            }
-            return hub_cmd::push(ctx, name, tag, *force, hooks);
+            let code = match test_remotes::is_path_remote(ctx, name) {
+                true => test_remotes::push(ctx, name, tag, *force, hooks)?,
+                false => hub_cmd::push(ctx, name, tag, *force, hooks)?,
+            };
+            #[cfg(not(debug_assertions))]
+            let code = hub_cmd::push(ctx, name, tag, *force, hooks)?;
+            // Pushed: a change recorded without a quarantined file must not
+            // pass as a plain success either (BUG-2140, the route of BUG-1980).
+            return Ok(match code == ExitCode::SUCCESS {
+                true => render::quarantine_status(&ctx.report, "pushed"),
+                false => code,
+            });
         }
         Cmd::Land { rev, onto, remote, no_wait, status } => {
             return hub_cmd::land(ctx, remote, rev.as_deref(), onto.as_deref(), !*no_wait, status.as_deref());

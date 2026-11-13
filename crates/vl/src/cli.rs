@@ -368,6 +368,11 @@ pub enum Cmd {
         hooks: hooks::NoVerifyArgs,
     },
     /// Start a new change on top of REVS (default: @). Several = merge.
+    ///
+    /// Exits 3 (the work done all the same) while the working copy holds
+    /// files the secret scanner quarantined, naming each: `vl isolate
+    /// FILE` keeps one on this machine on purpose, `vl expose --force FILE`
+    /// records one that is not a secret.
     New {
         /// Parents of the new change.
         revs: Vec<String>,
@@ -379,6 +384,11 @@ pub enum Cmd {
     ///
     /// Tags that pointed at the change's parent move to it (`main` follows
     /// your commits).
+    ///
+    /// Exits 3 (the work done all the same) while the working copy holds
+    /// files the secret scanner quarantined, naming each: `vl isolate
+    /// FILE` keeps one on this machine on purpose, `vl expose --force FILE`
+    /// records one that is not a secret.
     Commit {
         /// Description of the change being committed.
         #[arg(short, long)]
@@ -716,6 +726,11 @@ pub enum Cmd {
     Remote(RemoteCmd),
     /// Send tags and their history to the Veil server, which moves each
     /// branch only if nobody moved it meanwhile (and checks your access).
+    ///
+    /// Exits 3 (the work done all the same) while the working copy holds
+    /// files the secret scanner quarantined, naming each: `vl isolate
+    /// FILE` keeps one on this machine on purpose, `vl expose --force FILE`
+    /// records one that is not a secret.
     Push {
         /// Remote to push to (default: origin).
         remote: Option<String>,

@@ -148,7 +148,7 @@ fn a_copy_of_the_env_file_under_another_name_is_quarantined() {
     std::fs::copy(r.path(".netrc"), r.path("env-backup.txt")).unwrap();
     let st = r.status();
     assert!(st.contains("Q env-backup.txt"), "{st}");
-    r.commit("after copy");
+    r.quarantined(&["commit", "-m", "after copy"]);
     assert!(!r.paths("@-").contains(&"env-backup.txt".to_string()));
     assert_no_plaintext(&r, "after copying .netrc");
 }

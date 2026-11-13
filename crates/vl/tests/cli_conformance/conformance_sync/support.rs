@@ -82,6 +82,17 @@ impl Env {
         t
     }
 
+    /// stdout + stderr of a `vl commit`, `vl new` or `vl push` that did its
+    /// work while the working copy holds a quarantined file: exit status 3
+    /// exactly (BUG-2140).
+    pub fn quarantined(&self, user: &str, cwd: &Path, args: &[&str]) -> String {
+        let out = self.vl(user, cwd, args);
+        let t = text(&out);
+        assert_eq!(out.status.code(), Some(3), "vl {args:?}: expected exit 3 (quarantined):\n{t}");
+        assert!(t.contains("quarantined file"), "vl {args:?}:\n{t}");
+        t
+    }
+
     /// stdout + stderr; asserts a clean failure (non-zero exit, no panic).
     pub fn fails(&self, user: &str, cwd: &Path, args: &[&str]) -> String {
         let out = self.vl(user, cwd, args);

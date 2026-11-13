@@ -224,10 +224,14 @@ fn a_quarantined_file_reaches_no_remote() {
     let env = Env::new();
     let proj = env.project("alice", "proj", &[("a.txt", "a\n")]);
     write(&proj, "cfg.js", "const k = \"AKIAZ7QXN4PL2WVR8TQM\";\nconst s = \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY9\";\n");
-    let out = env.ok("alice", &proj, &["commit", "-m", "with a leak"]);
-    assert!(out.to_lowercase().contains("quarantin"), "{out}");
-    let hub = push_to(&env, &proj, "origin", false);
-    let mirror = push_to(&env, &proj, "mirror", true);
+    let out = env.quarantined("alice", &proj, &["commit", "-m", "with a leak"]);
+    assert!(out.contains("  cfg.js ("), "{out}");
+    // Each push exits 3 while `cfg.js` stays quarantined (BUG-2140).
+    let (hub, mirror) = (env.path("origin"), env.path("mirror"));
+    env.ok("alice", &proj, &["remote", "add", "origin", hub.to_str().unwrap()]);
+    env.ok("alice", &proj, &["remote", "add", "mirror", mirror.to_str().unwrap(), "--public"]);
+    env.quarantined("alice", &proj, &["push", "origin"]);
+    env.quarantined("alice", &proj, &["push", "mirror"]);
     for d in [&hub, &mirror] {
         assert_absent(d, "AKIAZ7QXN4PL2WVR8TQM", "quarantined credential");
     }

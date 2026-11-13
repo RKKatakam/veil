@@ -7,6 +7,8 @@ Describe the working-copy change and start a new one on top.
 
 Tags that pointed at the change's parent move to it (`main` follows your commits).
 
+Exits 3 (the work done all the same) while the working copy holds files the secret scanner quarantined, naming each: `vl isolate FILE` keeps one on this machine on purpose, `vl expose --force FILE` records one that is not a secret.
+
 ```text
 vl commit [OPTIONS] --message <MESSAGE>
 ```

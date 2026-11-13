@@ -89,7 +89,8 @@ fn ls_shows_every_tier_and_status_marks_every_file() {
     assert_eq!(v["quarantined"][0]["tier"], "quarantined");
 
     // Bob clones the team remote without a key for `team`.
-    env.ok("alice", &dir, &["push"]);
+    // Pushed; `cfg.js` stays quarantined, so the push exits 3 (BUG-2140).
+    env.quarantined("alice", &dir, &["push"]);
     env.ok("bob", &env.root, &["clone", "team", "bob"]);
     let bob = env.root.join("bob");
     let files = ls(&env, "bob", &bob, &[]);

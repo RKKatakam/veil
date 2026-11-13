@@ -257,7 +257,7 @@ fn adding_a_credential_quarantines_the_file() {
     let st = r.status();
     assert!(st.contains("Q config.js"), "{st}");
     assert!(r.paths("@").is_empty());
-    r.commit("one");
+    r.quarantined(&["commit", "-m", "one"]);
     assert!(r.paths("@-").is_empty());
     assert!(!contains_bytes(&all_bytes(&r.path(".veil/objects")), "AKIAIOSFODNN7EXAMPLE"));
 }

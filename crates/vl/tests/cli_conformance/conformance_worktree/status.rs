@@ -162,8 +162,12 @@ fn commit_records_random_bytes_and_quarantines_a_url_password() {
     blob.extend(random(64 << 10));
     r.write("assets/blob.bin", &blob);
     r.write("config/app.yaml", "database:\r\n  url: postgres://app:Xk9mQ2vL7pR4@db.example.com/app\r\n");
-    let out = r.ok(&["commit", "-m", "assets"]);
+    // Recorded without the quarantined file, and saying so (BUG-2140).
+    let run = r.run(&["commit", "-m", "assets"]);
+    let out = text(&run);
+    assert_eq!(run.status.code(), Some(3), "{out}");
     assert!(out.contains("warning: config/app.yaml quarantined"), "{out}");
+    assert!(out.contains("  config/app.yaml (url-password at line 2; never recorded)"), "{out}");
     assert!(!out.contains("blob.bin"), "{out}");
     assert_eq!(r.paths("@-"), vec!["assets/blob.bin"]);
     assert_eq!(std::fs::read(r.path("assets/blob.bin")).unwrap(), blob);

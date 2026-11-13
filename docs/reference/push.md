@@ -3,7 +3,9 @@
 
 # `vl push`
 
-Send tags and their history to the Veil server, which moves each branch only if nobody moved it meanwhile (and checks your access)
+Send tags and their history to the Veil server, which moves each branch only if nobody moved it meanwhile (and checks your access).
+
+Exits 3 (the work done all the same) while the working copy holds files the secret scanner quarantined, naming each: `vl isolate FILE` keeps one on this machine on purpose, `vl expose --force FILE` records one that is not a secret.
 
 ```text
 vl push [OPTIONS] [REMOTE]

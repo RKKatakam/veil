@@ -443,8 +443,9 @@ fn a_file_in_the_way_of_a_directory_is_kept_and_reported() {
     assert!(child.wait_with_output().unwrap().status.success());
     let out = env.vl(U, &proj, &["new", "t@"]);
     let status = env.vl(U, &proj, &["status"]);
+    // `cfg` stays quarantined: `vl new` says so with exit 3 (BUG-2140).
     assert!(
-        out.status.success() && status.status.success(),
+        out.status.code() == Some(3) && status.status.success(),
         "checkout: {}\nnext command: {}",
         text(&out).trim(),
         text(&status).trim()

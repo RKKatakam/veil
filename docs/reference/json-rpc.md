@@ -145,6 +145,7 @@ The working copy was recorded (if nothing changed, no operation was).
 | `working_copy` | [snapshot reference](json.md#snapshot-reference) | the new, empty change on top of it |
 | `advanced` | list of strings | tags that moved from the parent to the committed change |
 | `kept` | list of objects | tags at the parent that stayed: `name`; `reason`, `cloaked_line` (a commit on a line cloaked for `scope` never moves an uncloaked tag) or `no_advance`; `scope` (null for `no_advance`) |
+| `quarantined` | list of objects | files left out of the commit because they look like secrets, as in [`veil.status/2`](json.md#veilstatus2)'s `quarantined`: `path`, `rule`, `line`, `state` (`never_recorded` or `held_back`), `tier`. Not empty, `vl commit` on the command line exits 3; here the call succeeds and this list tells |
 | `operation` | [operation](#operation) | |
 
 #### Operation

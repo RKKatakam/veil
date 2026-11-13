@@ -42,6 +42,10 @@ static STDOUT_ERROR: OnceLock<String> = OnceLock::new();
 /// Exit status for output cut short by a closed pipe: 128 + SIGPIPE.
 pub const BROKEN_PIPE_STATUS: u8 = 141;
 
+/// Exit status of `vl commit`, `vl new` and `vl push` when the working copy
+/// holds quarantined files (BUG-2140): the work is done, without them.
+pub const QUARANTINE_STATUS: u8 = 3;
+
 /// Standard output that never fails: see the module notes above.
 pub struct Out;
 
@@ -271,6 +275,33 @@ pub fn first_line(s: &str) -> Cow<'_, str> {
 /// `change id  snapshot id  description` on one line.
 pub fn one_line(repo: &Repo, id: &ObjectId) -> String {
     crate::api::text::one_line(&crate::api::snapshot_ref(repo, id))
+}
+
+/// The exit status of a command that recorded, finalised or pushed work
+/// (`vl commit`, `vl new`, `vl push`): [`QUARANTINE_STATUS`], with every
+/// file named on standard error, while the working copy holds files the
+/// scanner quarantined, which no snapshot has; success otherwise
+/// (BUG-2140: a script that commits and pushes must notice).
+pub fn quarantine_status(r: &BuildReport, done: &str) -> ExitCode {
+    if r.quarantined.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    let n = r.quarantined.len();
+    let (files, look) = if n == 1 { ("file", "it looks") } else { ("files", "they look") };
+    err_line(format_args!(
+        "{} {done}, but without {n} quarantined {files} ({look} like a secret):",
+        red("error:")
+    ));
+    for (p, findings) in &r.quarantined {
+        let f = &findings[0];
+        let state = if r.quarantine_kept.contains(p) { "edit held back" } else { "never recorded" };
+        err_line(format_args!("  {} ({} at line {}; {state})", safe(p.as_str()), f.rule, f.line));
+    }
+    err_line(format_args!(
+        "{} to keep a file on this machine on purpose, `vl isolate <file>`; if it is not a secret, `vl expose --force <file>` records it. Exit status {QUARANTINE_STATUS} until then",
+        yellow("hint:")
+    ));
+    ExitCode::from(QUARANTINE_STATUS)
 }
 
 pub fn print_build_warnings(r: &BuildReport) {

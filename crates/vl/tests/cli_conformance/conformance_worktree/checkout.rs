@@ -291,9 +291,9 @@ fn a_quarantined_file_survives_checkouts() {
     r.write("leak.js", LEAKY);
     let st = r.ok(&["status"]);
     assert!(st.contains("Q leak.js"), "{st}");
-    r.ok(&["new", base.as_str()]);
+    r.quarantined(&["new", base.as_str()]);
     assert_eq!(r.read("leak.js"), LEAKY);
-    r.ok(&["new", "root"]);
+    r.quarantined(&["new", "root"]);
     assert_eq!(r.read("leak.js"), LEAKY);
 }
 

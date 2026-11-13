@@ -395,6 +395,30 @@ fn write_methods_record_operations_that_undo_takes_back() {
     let _ = env.ok("alice", &alice, &["fsck"]);
 }
 
+// BUG-2140: the commit result names the files left out as secrets, as
+// `veil.status/2` does, so an agent on the socket sees what `vl commit`'s
+// exit status 3 tells a script.
+#[test]
+fn the_commit_result_lists_the_quarantined_files_it_left_out() {
+    let (env, alice, _) = world();
+    let server = Server::start(&env, "alice", &alice);
+    let mut c = server.conn();
+    write(&alice, "keep.txt", "plain\n");
+    write(&alice, "cfg.js", "const key = 'AKIAIOSFODNN7EXAMPLE';\n");
+    let cm = c.ok("commit", json!({"message": "with a key"}));
+    assert_eq!(cm["schema"], "veil.commit/2");
+    assert_eq!(cm["committed"]["description"], "with a key");
+    assert_eq!(
+        cm["quarantined"],
+        json!([{"path": "cfg.js", "rule": "aws-access-key-id", "line": 1, "state": "never_recorded", "tier": "quarantined"}]),
+        "{cm}"
+    );
+    env.ok("alice", &alice, &["isolate", "cfg.js"]);
+    let cm = c.ok("commit", json!({"message": "isolated"}));
+    assert_eq!(cm["committed"]["description"], "isolated");
+    assert_eq!(cm["quarantined"], json!([]), "{cm}");
+}
+
 #[test]
 fn no_stale_data_after_a_cli_command() {
     let (env, alice, _) = world();
