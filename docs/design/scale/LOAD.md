@@ -1442,13 +1442,14 @@ gained since the branch's last landing. `is_below` answers exactly as
 |---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 300 | 180 s | before | **67.4** | 2,065 | 24,428 | 13.8 (2,481) | 417.9 | 28.2 | 17.3 | 1.2 | 102.3 | 0 | 34,354 |
 | 300 | 180 s | after | **226.7** | 1,250 | 3,866 | 45.4 (8,177) | 41.5 | 9.4 | 33.8 | 7.7 | 130.9 | 0 | 1 |
+| 300 | 180 s | after, final (`840ed33d`: at most 256 read with the deriver behind) | **248.5** | 1,002 | 4,133 | 49.8 (8,971) | 42.4 | 10.5 | 15.5 | 3.8 | 134.2 | 0 | 125 |
 | 1,000 | 180 s | before | **110.5** | 6,018 | 38,707 | 19.7 (3,547) | 233.8 | 25.8 | 13.7 | 1.5 | 77.8 | 195 | 154,821 |
 | 1,000 | 180 s | after | **212.8** | 4,355 | 9,925 | 42.9 (7,717) | 71.9 | 15.3 | 14.5 | 3.1 | 107.3 | 0 | 69,439 |
 | 300 | 600 s | before | **30.7** | 5,605 | 52,414 | 6.1 (3,646) | 938.1 | 28.8 | 22.0 | 0.7 | 117.2 | 219 | 179,403 |
 | 300 | 600 s | after | **109.2** | 1,510 | 17,515 | 21.4 (12,818) | 136.8 | 14.9 | 23.4 | 2.6 | 155.8 | 0 | 77,144 |
 
-- **3.4 times the pushes over 3 minutes at 300 agents, 1.9 times at
-  1,000, 3.6 times over 10 minutes**; the server's CPU per push at
+- **3.4 times the pushes over 3 minutes at 300 agents (3.7 with the
+  final build), 1.9 times at 1,000, 3.6 times over 10 minutes**; the server's CPU per push at
   300 agents for 3 minutes is 41.5 ms where it was 417.9 (103.9 in a
   30 s run before). The before runs' errors are the bench's own
   (`tips: 503 busy` not waited out, the rest of BUG-2222); the after
