@@ -5490,7 +5490,8 @@ transaction per landing instead of 23.
    most for the batches already committing. PostgreSQL queues a lock
    request behind a waiting one it conflicts with, so batches that come
    after a waiting exclusive request wait behind it: a rules push on a busy
-   project is not starved.
+   project is not starved. (YugabyteDB grants them past it, so there a
+   writer waits as long as batches overlap: BUG-2110, open.)
 
 **Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
 `concurrency.rs`, unit tests in `limits/landing.rs`):
