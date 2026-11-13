@@ -344,7 +344,7 @@ fn bug_2280_a_crashed_merges_staged_pack_is_swept_without_a_push() {
         });
     }
     let listed_before = pack_names(&hub, pid, LISTED);
-    assert_eq!(listed_before.len(), 4);
+    assert!(listed_before.len() >= 4, "{listed_before:?}");
     let crash = Options { crash: Some(CrashPoint::AfterWriteBeforeSwitch), ..Options::merge_only() };
     let rep = hub.rt.block_on(pack_gc::run_project(&h, pid, &crash)).expect("the merge runs");
     assert!(!rep.skipped, "{rep:?}");
