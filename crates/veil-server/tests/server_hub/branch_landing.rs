@@ -47,46 +47,83 @@ fn land_on_main(api: &Api, p: &Project, snapshot: ObjectId) -> serde_json::Value
     v
 }
 
-/// BUG-2221: a branch landed on `main` again and again reads, at each
-/// landing, about what `main` gained since its last one, not `main`'s
-/// whole history since the branch left it. An agent pushes two files to
-/// its branch and lands it; between its landings `main` gains 30 other
-/// landings. Before the fix the eighth landing read every snapshot of
-/// `main` newer than each of the branch's 16 snapshots (about 2,000);
-/// now a few times the 32 `main` gained.
-#[test]
-fn bug_2221_a_branch_landed_again_and_again_reads_only_what_main_gained_since() {
-    let hub = TestHub::start();
-    let p = setup_project(&hub);
-    let pid = project_id_of(&hub, &p.name);
+/// An agent pushes two files to its branch and lands it on `main`, eight
+/// times; between its landings `main` gains 30 other landings. With
+/// `behind`, the derived graph loses those 30 before each of the agent's
+/// landings (as when the deriver is a few landings behind `main`'s tip).
+/// The graph rows each of the agent's landings read.
+fn landed_again_and_again(hub: &TestHub, p: &Project, behind: bool) -> Vec<u64> {
+    let pid = project_id_of(hub, &p.name);
     let api = hub.api();
     let tok = p.admin.token();
-    let stats = || hub.hub().landing.stats.graph_reads.load(Ordering::Relaxed);
+    let h = hub.hub();
+    let stats = || h.landing.stats.graph_reads.load(Ordering::Relaxed);
     let mut reads = Vec::new();
+    let mut gained: Vec<String> = Vec::new();
     for round in 0..8 {
         let mut snap = ObjectId([0; 32]);
         for k in 0..2 {
-            snap = push_file(&api, &p, "agent-1", &format!("src/agent/f{round}-{k}.txt"));
+            snap = push_file(&api, p, "agent-1", &format!("src/agent/f{round}-{k}.txt"));
         }
-        derive(&hub, pid, tip_of(&api, &tok, &p.name, "main").unwrap());
+        let main = tip_of(&api, &tok, &p.name, "main").unwrap();
+        derive(hub, pid, main);
+        if behind && !gained.is_empty() {
+            hub.rt.block_on(sqlx::query("DELETE FROM graph WHERE project_id = $1 AND snapshot = ANY($2)").bind(pid).bind(&gained).execute(&h.db)).unwrap();
+            h.derive.clear_cache();
+            let held = hub.rt.block_on(veil_server::derive::read(&h, pid, move |g| Ok(g.row(&main)?.is_some()))).unwrap();
+            assert!(!held, "the graph does not hold main's tip");
+        }
         let before = stats();
-        let v = land_on_main(&api, &p, snap);
+        let v = land_on_main(&api, p, snap);
         reads.push(stats() - before);
         // Only this round's two changes land: the earlier ones are skipped
         // as landed already.
         assert_eq!(v["landed"].as_array().map(Vec::len), Some(2), "round {round}: {v}");
+        gained.clear();
         for n in 0..30 {
             let base = tip_of(&api, &tok, &p.name, "main").unwrap();
             let r = crate::limits::land_edit(&api, &tok, &p.name, base, &format!("src/main/r{round}-{n}.txt"), "x\n", true);
             assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-            assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+            let v = r.json();
+            assert_eq!(v["state"], "landed", "{v}");
+            gained.push(v["landed"].as_array().unwrap().last().unwrap().as_str().unwrap().to_string());
         }
     }
-    // Every landing after the first reads about what main gained since the
-    // one before (30 landings and the 2 copies), each twice at most (the
-    // new snapshots' walk and the remembered ones'), whatever the history.
+    reads
+}
+
+/// BUG-2221: a branch landed on `main` again and again reads, at each
+/// landing, about what `main` gained since its last one, not `main`'s
+/// whole history since the branch left it. Before the fix the eighth
+/// landing read every snapshot of `main` newer than each of the branch's
+/// 16 snapshots (about 2,000 rows); now about the 32 `main` gained.
+#[test]
+fn bug_2221_a_branch_landed_again_and_again_reads_only_what_main_gained_since() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let reads = landed_again_and_again(&hub, &p, false);
+    // Every landing after the first reads what main gained since the one
+    // before (30 landings and the 2 copies), each twice at most (the new
+    // snapshots' walk and the remembered ones'), whatever the history.
     for (round, n) in reads.iter().enumerate().skip(1) {
-        assert!(*n <= 4 * 32 + 16, "landing {round} of the branch read {n} graph rows: {reads:?}");
+        assert!(*n <= 2 * 32 + 8, "landing {round} of the branch read {n} graph rows: {reads:?}");
+    }
+}
+
+/// BUG-2221, with the deriver behind `main`'s tip (it is, most of the time,
+/// under many landings): the part of `main` it does not hold yet is read
+/// from the store down to where the graph holds it, once per submit, and
+/// the graph answers below that, with the same answers (each landing
+/// brings exactly its own two changes) and as little read: before, a
+/// submit read up to 4,096 snapshots of `main` from the store, then asked
+/// the graph from the snapshot it stopped at.
+#[test]
+fn bug_2221_with_the_deriver_behind_a_branch_landing_reads_only_what_main_gained_since() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let reads = landed_again_and_again(&hub, &p, true);
+    for (round, n) in reads.iter().enumerate().skip(1) {
+        assert!(*n <= 2 * 32 + 8, "landing {round} of the branch read {n} graph rows: {reads:?}");
     }
 }
 

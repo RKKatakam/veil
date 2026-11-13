@@ -1563,6 +1563,10 @@ pub(crate) struct Ancestry {
     /// The derived graph's walks down from the tip (or the frontier),
     /// shared by every question of the submit (BUG-2221).
     walks: Vec<crate::derive::graph::Descent>,
+    /// While the derived graph does not hold the tip: the snapshots below
+    /// it that it does not hold yet, and the ones it holds where they end
+    /// (`Ancestry::top`; `Some(None)`: more than [`WALK_BUDGET`]).
+    top: Option<Option<(std::collections::HashSet<ObjectId>, Vec<ObjectId>)>>,
 }
 
 /// More than [`MAX_REVISIONS`] revisions of a change to look through.
@@ -1599,6 +1603,7 @@ impl Ancestry {
             staged,
             recorded: true,
             walks: Vec::new(),
+            top: None,
         }
     }
 
@@ -1652,12 +1657,64 @@ impl Ancestry {
             self.known.insert(x, v);
             return Ok(Some(v));
         }
+        // The deriver a few landings behind (BUG-2221): below the part of
+        // the line it does not hold yet, the graph answers.
+        if let Some((above, base)) = self.top().await? {
+            let v = above.contains(&x) || {
+                let base = base.clone();
+                let mut walks = std::mem::take(&mut self.walks);
+                let (v, walks) = crate::derive::read(&self.hub, self.project, move |g| {
+                    let v = g.row(&x)?.is_some() && g.is_below(&mut walks, x, &base)?;
+                    Ok((v, walks))
+                })
+                .await?;
+                self.walks = walks;
+                v
+            };
+            self.known.insert(x, v);
+            return Ok(Some(v));
+        }
         let (found, done) = self.walk_until(x, NEAR_WALK).await?;
         if found || done {
             self.known.insert(x, found);
             return Ok(Some(found));
         }
         Ok(None)
+    }
+
+    /// The snapshots below the tip (and it) that the derived graph does not
+    /// hold, read down to the first ones it holds on every line, which are
+    /// returned too: everything below the tip is one of the first or below
+    /// one of the second (a derived snapshot's parents are derived). Read
+    /// once per submit; `None` past [`WALK_BUDGET`] (the older walks then).
+    async fn top(&mut self) -> Result<Option<&(std::collections::HashSet<ObjectId>, Vec<ObjectId>)>> {
+        if self.top.is_none() {
+            let tip = self.tip;
+            let top = crate::derive::read(&self.hub, self.project, move |g| {
+                let (mut above, mut base) = (std::collections::HashSet::new(), Vec::new());
+                let mut seen = std::collections::HashSet::from([tip]);
+                let mut todo = vec![tip];
+                while let Some(y) = todo.pop() {
+                    if g.row(&y)?.is_some() {
+                        base.push(y);
+                        continue;
+                    }
+                    if above.len() == WALK_BUDGET {
+                        return Ok(None);
+                    }
+                    above.insert(y);
+                    for p in g.cx.src.snapshot(&y)?.parents.iter() {
+                        if seen.insert(*p) {
+                            todo.push(*p);
+                        }
+                    }
+                }
+                Ok(Some((above, base)))
+            })
+            .await?;
+            self.top = Some(top);
+        }
+        Ok(self.top.as_ref().and_then(|t| t.as_ref()))
     }
 
     /// Is `x` the tip or below it?

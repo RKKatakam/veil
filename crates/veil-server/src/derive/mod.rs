@@ -110,7 +110,9 @@ pub struct Workers {
     rows: LruCache<Arc<GraphRow>>,
     /// By `(project, x)`: a snapshot `x` was found not to be below
     /// (`graph::Graph::is_below`, BUG-2221). History never changes, so
-    /// this stays true; a later walk from a newer tip stops there.
+    /// this stays true (even when the graph rows are dropped, or the
+    /// project's graph made again); a later walk from a newer tip stops
+    /// there.
     not_below: LruCache<ObjectId>,
 }
 
@@ -145,7 +147,6 @@ impl Workers {
     /// tests' crash and resume).
     pub fn clear_cache(&self) {
         self.rows.clear();
-        self.not_below.clear();
     }
 }
 
