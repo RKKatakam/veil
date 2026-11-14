@@ -221,7 +221,10 @@ fn bug_2430_a_store_busy_or_unreachable_past_the_retries_answers_busy_and_the_re
     let (api, token) = (hub.api(), admin.token());
 
     for (how, m) in [("answering 429", SLOW_DOWN), ("closing connections", CLOSE)] {
-        let raw = O::Blob(format!("bug 2430: stored once the store is back ({how})\n").into_bytes()).encode();
+        // Content of this run only: test servers share one bucket and list its
+        // packs at start, so content an earlier run stored is never uploaded
+        // again and the store is never asked (BUG-2434).
+        let raw = O::Blob(format!("bug 2430: stored once the store is back ({how}) {}\n", unique("run")).into_bytes()).encode();
         let id = veil_core::ObjectId::hash(&raw);
         let slowed = S3_SLOW_DOWN.load(Ordering::SeqCst);
         mode.store(m, Ordering::SeqCst);
