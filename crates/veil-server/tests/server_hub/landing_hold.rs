@@ -1212,25 +1212,26 @@ fn bug_2362_a_submits_grafted_trees_are_stored_with_its_objects() {
     let v = r.json();
     assert_eq!(v["state"], "landed", "{v}");
     let tip = api.tips(Some(&admin), &p.name).unwrap().branches["main"];
-    // The landed snapshot's every tree and blob, from the store itself.
-    let store = hub.hub().objects.blob_store().clone();
-    let mut todo = vec![hub.rt.block_on(hub.hub().objects.get(pid, &tip)).unwrap().map(|raw| match veil_core::object::Object::decode(&raw).unwrap() {
-        veil_core::object::Object::Snapshot(s) => s.tree,
-        _ => panic!("the tip is a snapshot"),
-    })
-    .expect("the landed snapshot is stored")];
+    // The landed snapshot's every tree and blob, read by a second server
+    // beside this one (the same database and object storage, nothing of
+    // this one's memory): each is in the store.
+    let other = TestHub::beside(&hub);
+    let objects = &other.hub().objects;
+    let read = |id: &veil_core::ObjectId| {
+        let raw = other.rt.block_on(objects.get(pid, id)).unwrap();
+        veil_core::object::Object::decode(&raw.unwrap_or_else(|| panic!("{} is stored", id.short()))).unwrap()
+    };
+    let veil_core::object::Object::Snapshot(landed) = read(&tip) else { panic!("the tip is a snapshot") };
+    let mut todo = vec![landed.tree];
     let mut trees = 0;
     while let Some(t) = todo.pop() {
-        let key = veil_server::store::object_key(pid, &t);
-        assert!(hub.rt.block_on(store.exists(&key)).unwrap(), "tree {} of the landed snapshot is stored", t.short());
-        let raw = hub.rt.block_on(hub.hub().objects.get(pid, &t)).unwrap().unwrap();
-        let veil_core::object::Object::Tree(tree) = veil_core::object::Object::decode(&raw).unwrap() else { panic!("a tree") };
+        let veil_core::object::Object::Tree(tree) = read(&t) else { panic!("{} is a tree", t.short()) };
         trees += 1;
         for e in &tree.entries {
             if e.kind == veil_core::object::EntryKind::Dir {
                 todo.push(e.id);
             } else {
-                assert!(hub.rt.block_on(store.exists(&veil_server::store::object_key(pid, &e.id))).unwrap(), "{} is stored", e.id.short());
+                read(&e.id);
             }
         }
     }
