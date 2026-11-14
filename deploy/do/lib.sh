@@ -66,6 +66,17 @@ if [ "$OBJECTS_VOLUME_GB" -gt 0 ]; then
     [ "$OBJECTS_VOLUME_GB" -ge "$OBJECTS_NEED_GB" ] || { echo "do: a volume of $OBJECTS_VOLUME_GB GB is under the $OBJECTS_NEED_GB GB the gates need" >&2; exit 2; }
     [[ "$NAME" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "do: a volume's name must be lowercase and start with a letter: VEIL_DO_NAME '$NAME'" >&2; exit 2; }
 fi
+# The storage droplet needs dedicated CPUs (BUG-2431): on the first paid run
+# a shared-CPU s-4vcpu-8gb ran MinIO at its four vCPUs' limit from the
+# many-branch headline on. estimate.sh and create.sh refuse a Basic (`s-*`)
+# size for it; destroy.sh and logs.sh never do, so a run made before can
+# still be torn down.
+refuse_shared_objects() { # script name
+    if [ "$OBJECTS" = minio ] && [[ "$SIZE_OBJECTS" == s-* ]]; then
+        echo "$1: VEIL_DO_SIZE_OBJECTS=$SIZE_OBJECTS is a shared-CPU (Basic) size: the MinIO storage droplet must have dedicated CPUs (a CPU-Optimized c-*/c2-*, General Purpose g-*, Memory-Optimized m-* or Storage-Optimized so-* size; docs/DEPLOY.md §2.3, BUG-2431)" >&2
+        exit 2
+    fi
+}
 [[ "$HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ "$(echo "$HOURS > 0" | bc -l)" = 1 ] || { echo "do: invalid VEIL_DO_HOURS '$HOURS' (must be > 0)" >&2; exit 2; }
 IMAGE=ubuntu-24-04-x64
 # Third-party images, pinned (deploy/versions.env: the rehearsal runs the same).

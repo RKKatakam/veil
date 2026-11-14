@@ -18,6 +18,7 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 [ $# -eq 0 ] || { echo "create: unknown argument '$1' (usage: create.sh [--approve|--dry-run])" >&2; exit 2; }
+refuse_shared_objects create
 : "${VEIL_DO_OPERATOR_IP:?set VEIL_DO_OPERATOR_IP in $ENV_FILE (your public IPv4)}"
 [[ "$VEIL_DO_OPERATOR_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$VEIL_DO_OPERATOR_IP" != "0.0.0.0" ] || {
     echo "create: invalid VEIL_DO_OPERATOR_IP '$VEIL_DO_OPERATOR_IP' (must be your single public IPv4 address)" >&2; exit 2

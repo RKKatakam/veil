@@ -17,6 +17,7 @@ for a in "$@"; do
         *) echo "estimate: unknown argument '$a' (usage: estimate.sh [--live [--approve]])" >&2; exit 2 ;;
     esac
 done
+refuse_shared_objects estimate
 [ $APPROVED = 1 ] && [ $LIVE = 0 ] && { echo "estimate: --approve is only used with --live (built-in prices need no approval)" >&2; exit 2; }
 declare -A live
 if [ $LIVE = 1 ]; then
