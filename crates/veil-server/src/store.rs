@@ -248,7 +248,7 @@ pub static S3_SLOW_DOWN: AtomicU64 = AtomicU64::new(0);
 pub static S3_GAVE_UP: AtomicU64 = AtomicU64::new(0);
 
 /// The object store stayed busy (an answer that is tried again: 5xx, 429,
-/// 499) or unreachable for all of [`S3_RETRY_FOR`]. A request it fails is
+/// 499) or unreachable for all of `S3_RETRY_FOR`. A request it fails is
 /// answered `503 busy` with a time to come back, never `500 internal`
 /// (BUG-2430: a MinIO restarting under load gave pushes "internal error").
 #[derive(Debug)]

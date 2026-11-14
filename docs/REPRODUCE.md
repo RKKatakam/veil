@@ -35,7 +35,7 @@ someone running Veil on their own machines would have.
 | Docker 24+ with Compose v2 | the image build, the rehearsal, shipping images to the machines | `docker compose version` |
 | 12 GB of free memory, 40 GB of disk, 8 or more cores | the rehearsal (every container has a memory limit; they add up to 11.5 GB) | `free -g`, `df -h` |
 | `bash`, `curl`, `openssl`, `python3`, `bc` | the scripts, the certificates, the estimate, the tables | |
-| `doctl` 1.100+, `ssh`, `scp`, `zstd` | the paid run only | `doctl version` |
+| `doctl` **1.186.0**, `ssh`, `scp`, `zstd` | the paid run only. The kit was run with `doctl` 1.186.0 (2026-11-14); 2.x has been released since and is untested with it: install 1.186.0 (`https://github.com/digitalocean/doctl/releases/tag/v1.186.0`), or run `bash deploy/do/test/test.sh` and a dry run with 2.x first | `doctl version` |
 | `awscli` (optional) | the paid run's teardown empties the Spaces bucket with it; without it you delete the bucket in the control panel | `aws --version` |
 
 For the paid run, at DigitalOcean: an account with a payment method; a
@@ -44,6 +44,28 @@ key pair (API → Spaces Keys; for the `spaces` gate and the teardown's
 check); a **droplet limit of at least 10** (the full topology has 10
 droplets with the storage droplet; new accounts often have 3 to 5: ask
 for more under Account); your public IPv4 address (`curl -4 -s https://ifconfig.me`).
+
+**The account limits to check before paying for anything.** The first
+paid run (2026-11-14, `docs/DEPLOY.md` §9.0) met them only at create time:
+its account could make no droplet over 4 vCPUs, so it ran scaled down,
+and no speed number came of it. You need:
+
+- a droplet limit of at least 10: `doctl account get` (the `Droplet
+  Limit` column);
+- **CPU-Optimized 8- and 16-vCPU droplets** (`c-8`, `c-16`,
+  `c2-16vcpu-32gb`, the topology of `docs/DEPLOY.md` §2) **in one region
+  that has Spaces**: `doctl compute size list --format
+  Slug,VCPUs,Memory,Disk,PriceHourly,Regions,Available` lists the sizes and
+  the regions that offer them, but not what your account may use; a size
+  the account may not use is refused only when a droplet is created (in
+  the control panel's Create Droplet page it cannot be chosen). Ask
+  DigitalOcean support to allow these sizes before the run;
+- a **dedicated-CPU** size for the storage droplet: `estimate.sh` and
+  `create.sh` refuse a shared-CPU (`s-*`) one (BUG-2431);
+- block-storage volumes, only if you keep MinIO's data on one
+  (`VEIL_DO_OBJECTS_VOLUME_GB`): the first run's request for a 250 GiB
+  volume was refused with `422 invalid size specified`, cause unknown
+  (BUG-2433).
 
 ## 2. Check out the commit
 
@@ -79,7 +101,7 @@ plays ten, with tens of agents for seconds. It shows that every step of
 the paid run works, end to end, before anything is rented.
 
 **The last rehearsal, 2026-11-13** (`integration` @ `dc4e3f82`, images
-built by the script; `docs/DEPLOY.md` §9.1): every gate **ok** (`pull`,
+built by the script; `docs/DEPLOY.md` §9.2): every gate **ok** (`pull`,
 `land`, `branches`, `api`, `landing`, `scaling`, `failover`, `objects`,
 `openscion`, `scale`), and the failover gate run twice: with the lease
 holder stopped (`docker stop`) the longest pause in landings was 642 ms,
@@ -87,7 +109,7 @@ with it killed (`FAILOVER_HOW=kill`) 442 ms (target 2 s); both times every
 change landed on `main` exactly once (1,624), by the database and by the
 agents' answers. Teardown left nothing. For the flow only, as above.
 Rerun the same day on `dokit4` (`ccda6704`, squashed into the branch with the same code) after the objects moved to
-MinIO (`docs/DEPLOY.md` §9.0): every gate **ok**, the new `spaces` gate
+MinIO (`docs/DEPLOY.md` §9.1): every gate **ok**, the new `spaces` gate
 included (against the rehearsal's MinIO over TLS), the failover pause
 522 ms, 1,624 changes each landed once; teardown left nothing.
 
@@ -196,7 +218,8 @@ pull`); then your numbers are not the published ones.
 | PostgreSQL | `postgres:17-alpine` by digest | `deploy/versions.env` |
 | YugabyteDB | `yugabytedb/yugabyte:2025.2.8.1-b8` by digest | `deploy/versions.env` |
 | HAProxy | `haproxy:3.0-alpine` (3.0.30) by digest | `deploy/versions.env` |
-| MinIO (the paid run's storage droplet and the rehearsal) | `bitnamilegacy/minio` by digest | `deploy/versions.env` |
+| MinIO (the paid run's storage droplet and the rehearsal) | `bitnamilegacy/minio` by digest, started as its server binary (`MINIO_BIN`, `MINIO_ARGS`) | `deploy/versions.env` |
+| `doctl` | 1.186.0 | this page, §1 |
 | droplets | Ubuntu 24.04 (`ubuntu-24-04-x64`), Docker from Ubuntu | `deploy/do/lib.sh`, `deploy/do/cloud-init/docker.yaml` |
 
 Your images are built from the same commit and the same pinned bases, but
@@ -243,7 +266,10 @@ afterwards (MinIO's credentials were made for the run and die with it).
 ## 8. What we measured
 
 Filled in from the paid run's result directories; each cell names the gate
-and the file it comes from. Empty: not run yet.
+and the file it comes from. Empty: not run yet. The first paid run
+(2026-11-14, four-vCPU droplets) filled in nothing: it was limited by its
+shared-CPU storage droplet, and its numbers are in `docs/DEPLOY.md` §9.0
+with what each is worth.
 
 | Number | Gate | From | Value |
 |---|---|---|---|
