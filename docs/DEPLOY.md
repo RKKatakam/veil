@@ -13,6 +13,9 @@
 > repository: `docs/REPRODUCE.md`**, the same run step by step, with the
 > table its numbers go in.
 >
+> **Google Cloud (2026-11-14):** the same kit for Google Cloud, hybrid Spot,
+> is `deploy/gcp`, §12 (kit ready, nothing rented).
+>
 > **Objects (owner, 2026-11-13; BUG-2290):** one Spaces bucket allows about
 > 800 requests a second and the many-branch headline needs about 4,900, so
 > **the speed runs keep objects in MinIO on a storage droplet of the run**
@@ -968,6 +971,7 @@ Found and filed by the rehearsal:
 
 ```sh
 bash deploy/do/test/test.sh       # the provisioning scripts against a fake doctl
+bash deploy/gcp/test/test.sh      # the Google Cloud kit against a fake gcloud (§12.7)
 ```
 
 The fake (`deploy/do/test/fake-doctl`) records every call and answers made-up
@@ -1087,3 +1091,261 @@ commands (§4) and by the DigitalOcean run.
 - **Spaces** bills $5 for the month however short the test (the `spaces`
   gate makes a bucket even when the servers use MinIO); it ends when the
   last bucket is deleted.
+
+## 12. Google Cloud (`deploy/gcp`)
+
+> **Status: kit ready, nothing rented** (2026-11-14). The same flow and
+> the same safety as the DigitalOcean kit: every script is a dry run
+> without `--approve`, and nothing talks to Google Cloud, not even to read,
+> without it. **For someone with only the public repository:
+> `docs/REPRODUCE.md` §9**, step by step.
+
+The Google Cloud kit makes the machines differently and runs the same
+steps on them. What runs on the machines is written once and shared:
+`deploy/do/configure.sh`, `bench.sh` and `logs.sh` source the kit's
+`lib.sh` named by `VEIL_KIT` (`do` by default; `deploy/gcp/configure.sh`,
+`bench.sh` and `logs.sh` run them with `VEIL_KIT=gcp`), the ssh, state and
+address helpers are `deploy/kit.sh`, and the gates and their checks are
+`deploy/gates.sh` and `deploy/checks/`. So a fix to the steps (MinIO
+started directly, BUG-2432; its restarts failing a gate; the certificate
+naming `localhost`) reaches both kits. What is Google's own: `lib.sh`
+(settings, `run_gcloud`, the machine list, Spot or on-demand, prices),
+`estimate.sh`, `preflight.sh`, `create.sh`, `destroy.sh`, the Spot watch
+in `bench.sh`, and `cloud-init/docker.yaml`.
+
+### 12.1 Topology: hybrid Spot, one zone
+
+Owner's decision, 2026-11-14. One region and one zone
+(`VEIL_GCP_ZONE`, default `us-central1-a`), one subnet of the run's own
+VPC network:
+
+| Machine | Type | Model | Boot disk | Runs |
+|---|---|---|---|---|
+| `NAME-hub`, `-hub2`, `-hub3` | `c2d-standard-16` (16 vCPUs, 64 GB) | **Spot** | 200 GB | `veil-server`, one each, on the one database and bucket |
+| `NAME-lb` | `e2-standard-4` (4 vCPUs, 16 GB) | **Spot** | 20 GB | HAProxy 3.0, TLS passed through: the one address |
+| `NAME-yb1` to `-yb3` | `c2d-standard-8` (8 vCPUs, 32 GB) | on-demand | 100 GB | YugabyteDB, one node each |
+| `NAME-driver1`, `-driver2` | `c2d-standard-8` | **Spot** | 100 GB | `veil-bench`, the simulated agents |
+| `NAME-minio` | `c2d-standard-16` + 1 × 375 GB local NVMe SSD | on-demand | 20 GB | MinIO, its data on the local SSD |
+
+Every type is settable (`VEIL_GCP_SIZE_*`, `deploy/gcp/.env.example`), as
+are the counts (`VEIL_GCP_HUBS`, `VEIL_GCP_YB_NODES=0` for PostgreSQL,
+`VEIL_GCP_DRIVERS`) and the model: `VEIL_GCP_SPOT=hybrid` (the default),
+`all` or `none`. The storage machine must have dedicated vCPUs and a local
+SSD: E2 and the shared-core types are refused for it (BUG-2431; E2 cannot
+have a local SSD at all).
+
+**Why hybrid.** A Spot VM costs about half (C2D) or 60% (E2) of its
+on-demand price, and Google may reclaim it at any time. Losing a server,
+the balancer or a driver costs one gate's rerun: the VM stops, keeps its
+disk, and starts again as it was (§12.5). Losing a YugabyteDB node or the
+storage machine would cost the run's data (MinIO's local SSD comes back
+blank), so they stay on-demand. `all` is the cheapest; a reclaimed
+database or storage machine then means `configure.sh` again and the gates
+before it lose their objects.
+
+**Spot VMs stop, not delete** (`--instance-termination-action=STOP`). A
+stopped VM keeps its boot disk (the images shipped to it, `/etc/veil`, the
+servers' keys in `veil-data`), its internal address and its containers,
+which restart themselves when it starts: `bench.sh` starts it and the gate
+reruns without reconfiguring anything. Deleted, it would need a new VM,
+the images shipped again and the shared keys copied again. The cost of
+stopping: a stopped VM bills its disk (a 200 GB server disk is $20 a
+month) until `destroy.sh`, whose check counts stopped VMs and their disks.
+A started VM gets a new public address (saved to the state; the drivers
+use private addresses, which stay); the certificate still names the old
+public one, which matters only to `vl login` from outside the run.
+
+**Network.** The run's own network `NAME-net` and subnet `NAME-subnet`
+(`10.42.0.0/24`), so no other network's rules apply (the `default`
+network opens SSH to the world). Two firewall rules for the instances
+tagged `NAME`: `NAME-operator`, SSH and 8443 (8444 with the cache) from
+the operator's one IPv4 address; `NAME-internal`, everything between the
+run's own machines. Google's implied rules deny every other ingress.
+Every VM and its disk carry the label `veil-run=NAME` and the tag `NAME`
+(firewall rules, networks and subnets take no labels: they are found by
+their exact names).
+
+**Access and credentials.** The machines take one SSH key: the run's own,
+generated into `deploy/gcp/state/NAME/` and written into the cloud-init
+user-data as root's only key. The instances turn OS Login off and block
+the project's SSH keys, so neither the project's keys nor anyone's
+personal ones get in, and ssh offers only the run's key
+(`IdentitiesOnly`). The VMs have no service account and no scopes: a
+machine of the run cannot call Google Cloud. The operator's credentials
+are either a service account's key file (`VEIL_GCP_CREDENTIALS`, its path,
+mode 0600, handed to gcloud as `CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`:
+the key is never read by the kit, copied, printed or on a command line)
+or the operator's active `gcloud auth login`. The account needs
+`roles/compute.admin` on the project (and `roles/viewer` for
+`preflight.sh`'s reads of billing, services and policies). Secrets reach the machines as on DigitalOcean: root-only
+files over SSH (`hub.env`, `minio.env`), never in metadata or user-data.
+
+**No `spaces` gate.** It runs on a DigitalOcean Spaces bucket; the GCP
+kit refuses it. Objects are on MinIO, as in the DigitalOcean speed runs.
+
+### 12.2 Cost
+
+`deploy/gcp/estimate.sh` prints it line by line. Built-in list prices for
+us-central1, read on 2026-11-14 from Google's pricing pages (on-demand:
+Compute Engine's VM pricing; Spot: the Spot VMs page, which changes up to
+once a day; local SSD $0.08 and pd-balanced $0.10 a GiB a month; an
+external IPv4 address $0.005 an hour, $0.0025 on a Spot VM), rounded up to
+the millidollar. `estimate.sh --live --approve` reads the current prices
+from the Cloud Billing Catalog API (read only; the access token goes to
+curl on stdin). It refuses a plan of $100 or more, and any type it has no
+price for. The default topology, hybrid:
+
+| Item | USD/hour |
+|---|---:|
+| 3 servers, `c2d-standard-16`, Spot | 3 × 0.333 |
+| balancer, `e2-standard-4`, Spot | 0.081 |
+| 3 YugabyteDB nodes, `c2d-standard-8`, on-demand | 3 × 0.364 |
+| 2 drivers, `c2d-standard-8`, Spot | 2 × 0.167 |
+| storage, `c2d-standard-16`, on-demand | 0.727 |
+| its local SSD, 375 GiB | 0.041 |
+| boot disks, 1,140 GiB pd-balanced | 0.156 |
+| 10 external IPv4 addresses (4 standard, 6 Spot) | 0.035 |
+| **total** | **3.465** |
+
+| Model | USD/hour | 8 hours | A day forgotten | A month forgotten |
+|---|---:|---:|---:|---:|
+| on-demand (`VEIL_GCP_SPOT=none`) | 5.110 | 40.88 | 122.65 | 3,730.49 |
+| **hybrid Spot (the default)** | **3.465** | **27.72** | **83.17** | **2,529.64** |
+| all Spot | 2.470 | 19.76 | 59.29 | 1,803.29 |
+
+Stopped VMs (reclaimed and never started, or a teardown that deleted
+nothing but stopped everything) still bill their disks: $114 a month.
+Traffic between the machines is free (one zone, internal addresses); the
+images go in free; the results that come out are a few megabytes.
+
+### 12.3 Quotas
+
+A new project's quotas are smaller than the plan. `deploy/gcp/preflight.sh
+--approve` (read only) compares them with the plan and prints, for each
+one short, the quota, where, and the new limit to ask for; the request is
+made in the console (IAM & Admin > Quotas & System Limits, Compute Engine
+API, the quota's name, Edit quotas) and is free. The default plan needs,
+in the region:
+
+| Quota | Needed | Why |
+|---|---:|---|
+| `C2D_CPUS` (C2D CPUs) | 104 | 40 on-demand (YugabyteDB, storage) + 64 Spot (servers, drivers); only 40 if the region grants `PREEMPTIBLE_CPUS` |
+| `PREEMPTIBLE_CPUS` | 68 | only where granted: Spot VMs count there, else against the on-demand quotas |
+| `CPUS` | 4 | the E2 balancer |
+| `LOCAL_SSD_TOTAL_GB` | 375 | MinIO's SSD |
+| `SSD_TOTAL_GB` | 1,140 | the pd-balanced boot disks |
+| `IN_USE_ADDRESSES` | 10 | one external address per VM (SSH from the operator) |
+| `INSTANCES` | 10 | |
+| `CPUS_ALL_REGIONS` (global) | 108 | every vCPU of the run |
+
+A free-trial account cannot ask for more quota (and is held to a few
+vCPUs): the billing account must be upgraded to a paid one first (the
+trial's credit stays). `preflight.sh` also checks that the project is
+active, billing is enabled, the Compute Engine API is on, every machine
+type is offered in the zone, and no organisation policy enforces OS Login
+(the kit's machines take only the run's own key).
+
+### 12.4 The run, in order
+
+```sh
+bash deploy/gcp/test/test.sh                 # the kit's own tests (a fake gcloud; nothing leaves the machine)
+cp deploy/gcp/.env.example deploy/gcp/.env && chmod 600 deploy/gcp/.env && $EDITOR deploy/gcp/.env
+deploy/gcp/preflight.sh --approve            # reads only: project, billing, API, types, quotas
+deploy/gcp/estimate.sh                       # built-in prices; --live --approve for today's
+deploy/docker/build.sh                       # veil-server:TAG and veil-bench:TAG
+deploy/gcp/create.sh                         # dry run: the plan and every command
+deploy/gcp/create.sh --approve               # <- the owner's approval; the first thing that bills
+deploy/gcp/configure.sh --approve [TAG]      # the shared steps (§5, step 3)
+deploy/gcp/bench.sh --approve pull           # ... every gate of §6 but `spaces`, one at a time
+deploy/gcp/logs.sh --approve
+deploy/gcp/destroy.sh --approve
+deploy/gcp/destroy.sh --check --approve      # repeat until it says "nothing left"
+```
+
+### 12.5 Spot reclaims
+
+`deploy/gcp/bench.sh` watches the Spot VMs around each gate:
+
+- **before**, any Spot VM not `RUNNING` (reclaimed between gates) is
+  started and recovered, and the gate's `run.txt` says
+  `spot_restarted_before=NAME`;
+- **after**, a Spot VM reclaimed during the gate (a
+  `compute.instances.preempted` operation in the zone that was not there
+  before it, or a Spot VM not `RUNNING`) makes the result invalid: its
+  `run.txt` gets `spot_reclaimed_during=NAME`, `result_valid=no` and
+  `rerun=<the rerun's directory>`; the VM is started and recovered; the
+  gate runs once more, its `run.txt` saying `rerun_of=`, and its result
+  stands when nothing was reclaimed during it (`result_valid=yes`). A
+  second reclaim fails the gate (exit 3), both results invalid, with no
+  third run. Every gate's `run.txt` says `spot_reclaimed_during=` and
+  `result_valid=`; only `yes` results are published.
+
+Recovery: `gcloud compute instances start` (retried for five minutes when
+the zone has no Spot capacity), the new public addresses saved, cloud-init
+and Docker awaited; then a server's container is started and its health
+awaited, the balancer's or the cache's started. A reclaimed YugabyteDB
+node or storage machine (`VEIL_GCP_SPOT=all` only), or a private address
+that changed, means `configure.sh --approve` again, which the script runs
+(`spot_reconfigured=yes`). The shared steps' own check still applies:
+MinIO restarting during a gate fails it (`minio-restarts.txt`).
+
+### 12.6 Teardown
+
+`deploy/gcp/destroy.sh --approve` deletes every VM of the run, **running
+or stopped** (a reclaimed Spot VM is stopped, not gone), zone by zone with
+all its disks; any disk left; the firewall rules; the subnet; the network;
+any address. It finds them by the label `veil-run=NAME` or by the exact
+names the kit gives (never a bare prefix: `NAME=veil` cannot reach a run
+named `veil-big`), so a run that died before saving its state is cleaned
+up too. Then, and on its own with `--check --approve`, it lists VMs in any
+state (saying how many are stopped), disks, firewall rules, subnets,
+networks, external addresses, snapshots and images, fails while any is
+left or while gcloud itself fails, and removes the state file only when
+all are gone. Glance at Billing > Reports in the console the next day.
+
+### 12.7 Testing the kit
+
+`bash deploy/gcp/test/test.sh` (75 checks) runs every script against a
+fake gcloud (`deploy/gcp/test/fake-gcloud`), a made-up project that
+remembers what was created, stopped and deleted, with fake ssh, scp,
+docker and curl. It checks that the dry runs of the full topology exit 0,
+call nothing and write nothing; the approval gate (a project, credentials,
+a private key file); that `create.sh --approve` issues exactly the
+expected commands (the network, the subnet, the two firewall rules with
+only the operator's address from outside, ten labelled VMs, Spot exactly
+where `VEIL_GCP_SPOT` says, the local SSD on the on-demand storage
+machine, no service account, only the run's public key in the metadata);
+the estimate (the three models, $100 refused, unknown and E2 storage types
+refused, live prices with the token on stdin only); `configure.sh` through
+the shared steps (MinIO on the local SSD and started directly, `localhost`
+in the certificate, no `spaces.env`); the Spot watch (a clean gate valid; a
+reclaim during a gate marks it invalid, starts the VM and reruns once; a
+second reclaim fails without a third run; a VM down before a gate is
+started first; a reclaimed storage machine with `all` reconfigures);
+teardown (stopped VMs and their disks found and deleted, the check failing
+on any leftover and on a gcloud failure, a half-made run cleaned up without
+state); `preflight.sh` (short quotas and what to request, enough,
+`PREEMPTIBLE_CPUS`, billing off, a missing type, OS Login enforced); and
+that no secret (the key file's content, the access token, MinIO's
+credentials, the servers' keys, the database password) is on a command
+line, in an output, in the metadata, the state or a result. With
+`VEIL_GCP_REAL_GCLOUD=/path/to/gcloud`, every command shape the scripts
+issued is also parsed by the real gcloud CLI, without credentials or a
+network (each stops at "no active account", none at its arguments): 593.0.0
+parsed all of them. Mutations of the Spot watch (no rerun, reclaims
+ignored) and of the teardown's listing (running VMs only) each fail it.
+
+### 12.8 Risks and open items (Google Cloud)
+
+- **Spot capacity and prices.** Spot prices change up to daily, and a zone
+  can be out of Spot C2D capacity: `create.sh` then fails on the refused
+  VM (`destroy.sh --approve` cleans up), and a restart after a reclaim is
+  retried for five minutes. Another zone (`VEIL_GCP_ZONE`), or
+  `VEIL_GCP_SPOT=none`.
+- **Quota requests** take minutes to two days; ask before the run day.
+- **The storage machine's local SSD** is lost if the machine stops (a
+  host error, an operator's stop): the run's objects go with it. It is
+  on-demand, with the default host-maintenance policy (live migration).
+- **Not run on Google Cloud yet**: the kit is tested against a fake gcloud
+  and the real CLI's parser only; the first real run will be its test,
+  as DigitalOcean's first was (§9.0).

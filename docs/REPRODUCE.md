@@ -4,7 +4,8 @@ This is for someone who has only the public repository
 (`https://github.com/RKKatakam/veil`) and wants to check the numbers Veil
 publishes about running across machines, or measure their own. It needs
 nothing from the Veil project: a Linux or macOS machine with Docker for the
-free rehearsal, and a DigitalOcean account for the paid run.
+free rehearsal, and a DigitalOcean account for the paid run, or a Google
+Cloud project (§9).
 
 What the test shows (the owner's goals, 2026-11-12): that Veil **scales on
 a realistic agent workload across machines**, with many agents each on a
@@ -295,3 +296,109 @@ with what each is worth.
 | OpenScion: import, clone, commit one file, clone one directory, 1,000 and 10,000 files, against Git | `openscion` | `openscion.md` | |
 | 1 GB profile: push, clone, pull; the server's peak memory | `scale` | `scale-1g.md` | |
 | On Spaces: pushes/s held of the 20 offered, merges into `main`, errors, requests given up, `503 Slow Down` answers | `spaces` | `spaces-verdict.md` (`spaces.json`: `ops_per_s`, `branch_merges`, `errors`, `s3_gave_up`, `s3_slow_down`) | |
+
+## 9. The paid run on Google Cloud instead
+
+The same gates on Google Cloud, with the kit in `deploy/gcp` (the reasons
+for each choice: `docs/DEPLOY.md` §12). Three servers, the balancer and
+the two drivers are **Spot VMs** (about half the price; Google may reclaim
+one, and the gate it interrupted is then marked invalid and rerun); the
+three YugabyteDB nodes and the MinIO storage machine are on-demand. In
+us-central1, at the list prices of 2026-11-14: **$3.47 an hour, $27.72 for
+8 hours** ($40.88 all on-demand, $19.76 all Spot). There is no `spaces`
+gate (it needs a DigitalOcean Spaces bucket). Every script is a dry run
+without `--approve`, and without it nothing talks to Google Cloud.
+
+**1. A project with billing.** In the console
+(`https://console.cloud.google.com`): create a project (note its id), and
+link a billing account to it (Billing > Link a billing account). **A
+free-trial account cannot ask for more quota and is held to a few vCPUs:
+upgrade it to a paid account first** (Billing > Overview > Upgrade; the
+remaining trial credit stays). Enable the Compute Engine API (APIs &
+Services > Enable APIs, `Compute Engine API`; with gcloud:
+`gcloud services enable compute.googleapis.com --project=PROJECT_ID`), and
+for `estimate.sh --live` the Cloud Billing API (`cloudbilling.googleapis.com`).
+The project must not be under an organisation policy that enforces OS
+Login (`preflight.sh` checks): the run's machines take only the run's own
+SSH key.
+
+**2. The gcloud CLI, pinned.** Version 593.0.0, the one the kit was
+checked with (`deploy/gcp/test/test.sh` with `VEIL_GCP_REAL_GCLOUD`).
+Google publishes a SHA-256 only for the current download on its install
+page (`https://cloud.google.com/sdk/docs/install`); on 2026-11-14 that was
+593.0.0, `google-cloud-cli-linux-x86_64.tar.gz`,
+`181a74765ab1f2d3dd37bc1b7f9b53b6f5b348eef44ea2e194b9ed41310b44bb`. The
+versioned file has the same contents (its gzip header differs); its
+SHA-256, measured here:
+
+```sh
+mkdir -p ~/.local/share/google-cloud-cli-593.0.0 && cd ~/.local/share/google-cloud-cli-593.0.0
+curl -fLO https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-593.0.0-linux-x86_64.tar.gz
+echo "42c32b7553c712f71fcf6f124546c0519437f53755f47f9bd0c957998cd6b826  google-cloud-cli-593.0.0-linux-x86_64.tar.gz" | sha256sum -c -
+tar -xzf google-cloud-cli-593.0.0-linux-x86_64.tar.gz && rm google-cloud-cli-593.0.0-linux-x86_64.tar.gz
+export PATH=$HOME/.local/share/google-cloud-cli-593.0.0/google-cloud-sdk/bin:$PATH
+gcloud --version          # Google Cloud SDK 593.0.0
+```
+
+(No `sudo`, no install script. On macOS take the `darwin` file of the same
+version, and check it against the install page's checksum when it is
+still the current one.)
+
+**3. Credentials.** Either `gcloud auth login` (your own account, which
+needs the Compute Admin role on the project), or a service account with
+`roles/compute.admin` (and `roles/viewer`, for the preflight's reads) and its key file: `VEIL_GCP_CREDENTIALS=/path/key.json`
+(`chmod 600`). The kit hands gcloud the key file's path in an environment
+variable; it never reads, copies or prints the key. Delete the key after
+the run.
+
+**4. Settings, the kit's tests, and the preflight.**
+
+```sh
+cp deploy/gcp/.env.example deploy/gcp/.env && chmod 600 deploy/gcp/.env
+$EDITOR deploy/gcp/.env          # VEIL_GCP_PROJECT, VEIL_GCP_OPERATOR_IP (curl -4 -s https://ifconfig.me), and the credentials
+bash deploy/gcp/test/test.sh     # the kit against a fake gcloud: "all green"
+deploy/gcp/preflight.sh --approve    # reads only: project, billing, API, machine types in the zone, quotas
+```
+
+**5. Quotas.** A new project has less than the run needs. `preflight.sh`
+prints each quota that is short, where, and the new limit; ask for each in
+the console: IAM & Admin > Quotas & System Limits, filter by the Compute
+Engine API and the quota's name, tick it, Edit quotas, enter the new
+limit, and give a reason ("a performance test of a version control server,
+10 VMs for 8 hours"). For the default plan in us-central1:
+
+| Quota | Region | At least |
+|---|---|---:|
+| C2D CPUs (`C2D_CPUS`) | us-central1 | 104 (40 if the region grants Preemptible CPUs) |
+| Preemptible CPUs (`PREEMPTIBLE_CPUS`), if the region has it | us-central1 | 68 |
+| CPUs (`CPUS`) | us-central1 | 4 |
+| Local SSD (`LOCAL_SSD_TOTAL_GB`) | us-central1 | 375 |
+| Persistent Disk SSD (`SSD_TOTAL_GB`) | us-central1 | 1,140 |
+| In-use regional external IPv4 addresses (`IN_USE_ADDRESSES`) | us-central1 | 10 |
+| VM instances (`INSTANCES`) | us-central1 | 10 |
+| CPUs, all regions (`CPUS_ALL_REGIONS`) | global | 108 |
+
+Answers take minutes to two days. Run `preflight.sh --approve` again
+until it says "ready".
+
+**6. The run.**
+
+```sh
+deploy/gcp/estimate.sh                   # the plan's cost (refuses $100 or more); --live --approve for today's prices
+deploy/docker/build.sh                   # the images, as in §4
+deploy/gcp/create.sh                     # dry run: the plan and every command
+deploy/gcp/create.sh --approve           # the first thing that bills
+deploy/gcp/configure.sh --approve        # the same steps on the machines as on DigitalOcean
+deploy/gcp/bench.sh --approve branches   # then each gate of §4 but `spaces`, one at a time
+deploy/gcp/logs.sh --approve
+deploy/gcp/destroy.sh --approve          # every VM (stopped ones too) with its disks, the rules, the subnet, the network
+deploy/gcp/destroy.sh --check --approve  # until it says "nothing left"
+```
+
+Results land in `deploy/results/NAME/<stamp>-<gate>/` as in §6. Each
+`run.txt` also says whether a Spot VM was reclaimed during the gate
+(`spot_reclaimed_during=`) and whether the result stands
+(`result_valid=yes`); a gate that was reclaimed has a second directory,
+`<stamp>-rerun-<gate>`, with `rerun_of=`. Use only `result_valid=yes`
+results. A stopped VM still bills its disk until `destroy.sh`: run the
+check until it passes, and look at Billing > Reports the next day.

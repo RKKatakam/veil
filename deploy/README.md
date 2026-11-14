@@ -14,9 +14,12 @@ the public repository alone, `docs/REPRODUCE.md`. In short:
 | `lb/haproxy-cfg.sh` | the balancer's configuration (HAProxy, TLS passed through) in front of several servers |
 | `compose/` | the local rehearsal of the multi-machine topology: three YugabyteDB nodes (or PostgreSQL), MinIO over TLS, two servers, HAProxy, one driver; `rehearsal.sh` runs every gate briefly and tears down |
 | `do/` | DigitalOcean provisioning as `doctl` scripts: `estimate.sh`, `create.sh`, `configure.sh`, `bench.sh`, `logs.sh`, `destroy.sh`; dry runs unless `--approve`; `test/test.sh` tests them against a fake `doctl`. Objects: `VEIL_DO_OBJECTS=minio` (default: MinIO on a storage droplet of the run, for the speed runs; one Spaces bucket allows about 800 requests/s, the headline needs about 4,900) or `spaces` (`docs/DEPLOY.md` §2.3) |
+| `gcp/` | Google Cloud provisioning as `gcloud` scripts (`docs/DEPLOY.md` §12, `docs/REPRODUCE.md` §9): `preflight.sh` (project, billing, API, quotas; reads only), `estimate.sh`, `create.sh`, `configure.sh`, `bench.sh` (with the Spot watch: a gate a reclaim interrupted is marked invalid and rerun once), `logs.sh`, `destroy.sh`; hybrid Spot by default (`VEIL_GCP_SPOT`); dry runs unless `--approve`; `test/test.sh` tests them against a fake `gcloud` |
+| `kit.sh` | the helpers both cloud kits share (ssh with the run's key only, the state file, addresses); the steps on the machines (`do/configure.sh`, `do/bench.sh`, `do/logs.sh`) are shared too: `gcp/` runs them with `VEIL_KIT=gcp` |
 | `results/` (ignored) | `deploy/results/NAME/<stamp>-<gate>/`: each gate's raw results with the commit, image ids, topology and command lines that made them (`docs/DEPLOY.md` §6.2) |
 
-Nothing here talks to DigitalOcean, creates anything or publishes anything
-without `--approve`, and nothing secret is committed: `deploy/do/.env`,
-`deploy/do/state/` (where each run's MinIO credentials are made),
+Nothing here talks to DigitalOcean or Google Cloud, creates anything or
+publishes anything without `--approve`, and nothing secret is committed:
+`deploy/do/.env`, `deploy/gcp/.env`, `deploy/do/state/` and
+`deploy/gcp/state/` (where each run's keys and MinIO credentials are made),
 `deploy/compose/.tls/` and the results directories are ignored by git.
