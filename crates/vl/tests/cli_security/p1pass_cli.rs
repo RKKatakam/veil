@@ -1000,21 +1000,36 @@ fn p1pass_g6_formats_8_to_10_upgrade_or_refuse_clearly_without_silent_loss() {
     copy_dir_all(&fixtures.join("format-8"), &f8);
     let f8_alice = f8.join("alice");
     let f8_home = f8.join("home-alice");
-    let run_f8 = |args: &[&str]| -> Output {
+    // Background maintenance (`vl gc --auto`, started detached after a
+    // command when it is due) is off for every command but the dry run:
+    // once the fixture's last prune is a week old, the `vl log` below would
+    // start one that runs on after `vl log` returned, into the snapshots
+    // (BUG-2400). The dry run runs with it forced on, on a repository it is
+    // due for, so a dry run that started maintenance would show in the
+    // snapshot (the log line is written before the child starts).
+    let run_f8_gc = |args: &[&str], gc: &str| -> Output {
         Command::new(env!("CARGO_BIN_EXE_vl"))
             .args(args)
             .current_dir(&f8_alice)
             .env("VEIL_HOME", &f8_home)
             .env("VEIL_USER", "alice")
             .env("NO_COLOR", "1")
+            .env_remove("CI")
+            .env("VEIL_GC_AUTO", gc)
             .output()
             .unwrap()
     };
+    let run_f8 = |args: &[&str]| run_f8_gc(args, "0");
     let log_before = run_f8(&["log"]);
     assert!(log_before.status.success(), "format 8 must open cleanly: {}", text(&log_before));
+    let last_prune: i64 = std::fs::read_to_string(f8_alice.join(".veil/local/gc/last-prune")).unwrap().trim().parse().unwrap();
+    assert!(
+        veil_core::now_millis() - last_prune > veil_core::maintenance::AUTO_PRUNE_AFTER.as_millis() as i64,
+        "the fixture must be due for background maintenance"
+    );
 
     let before_dry = snapshot_bytes(&f8_alice);
-    let dry = run_f8(&["upgrade", "--dry-run"]);
+    let dry = run_f8_gc(&["upgrade", "--dry-run"], "1");
     assert!(dry.status.success(), "{}", text(&dry));
     assert!(
         text(&dry).contains(&format!("Would upgrade this repository from format 8 to format {REPO_FORMAT}")),
