@@ -123,7 +123,7 @@ chmod 600 "$VEIL_DO_ENV"
 out=$("$T/do/create.sh" 2>&1); check "create.sh dry run prints the plan" '[[ "$out" == *"would run: doctl compute droplet create veil-kit-test-hub"* ]]'
 "$T/do/estimate.sh" >/dev/null 2>&1; "$T/do/estimate.sh" --live >/dev/null 2>&1
 "$T/do/destroy.sh" >/dev/null 2>&1; "$T/do/configure.sh" >/dev/null 2>&1
-for g in pull land branches api landing scaling objects openscion scale spaces; do "$T/do/bench.sh" "$g" >/dev/null 2>&1; done
+for g in pull land branches api landing agents scaling objects openscion scale spaces; do "$T/do/bench.sh" "$g" >/dev/null 2>&1; done
 VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3 "$T/do/bench.sh" failover >/dev/null 2>&1; VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3 "$T/do/configure.sh" >/dev/null 2>&1
 "$T/do/logs.sh" >/dev/null 2>&1
 check "no doctl, aws, curl, ssh or scp call without --approve" '[ ! -s "$FAKE_DOCTL_LOG" ] && [ ! -s "$FAKE_AWS_LOG" ] && [ ! -s "$FAKE_CURL_LOG" ] && [ ! -s "$FAKE_SSH_LOG" ]'
@@ -259,7 +259,7 @@ for g in $(. "$ROOT/deploy/gates.sh" >/dev/null 2>&1; echo "$GATES_ALL"); do
     all_bench="$all_bench $o"
     printf -v "bench_$g" '%s' "$o"
 done
-check "every gate's dry run succeeds and records run.txt, topology.env, images.txt" '[ "$(grep -c "would record run.txt" <<<"$all_bench")" = 11 ] && [ "$(grep -c "would record topology.env" <<<"$all_bench")" = 11 ]'
+check "every gate's dry run succeeds and records run.txt, topology.env, images.txt" '[ "$(grep -c "would record run.txt" <<<"$all_bench")" = 12 ] && [ "$(grep -c "would record topology.env" <<<"$all_bench")" = 12 ]'
 check "the drivers' gates run on a driver against the balancer's private address" '[[ "$bench_landing" == *"would run on 203.0.113.8: mkdir -p /srv/bench"*"--url https://10.10.0.4:8443"*"--mode landing --projects 1 --clients 10000 --people 100 --rates 1000"* ]] && [ "$(grep -c "\[landing-" <<<"$bench_landing")" = 6 ] && [[ "$bench_landing" == *"landing-mix-600s"*"--protected --mix"* ]]'
 check "branches runs the cost curve and the headline (300, 1,000 and 3,000 agents merging every 5th push)" '[[ "$bench_branches" == *"[branches on"* && "$bench_branches" == *"--clients 300,1000,3000 --rates max --merge-every 5"* ]]'
 check "scaling stops servers 2 and 3, then 3, then starts all, and drives from both drivers" '[[ "$bench_scaling" == *"scaling: 1 of 3 servers running"*"would run on 203.0.113.2: docker stop"*"would run on 203.0.113.3: docker stop"*"scaling: 2 of 3"*"scaling: 3 of 3"* ]] && [[ "$bench_scaling" == *"[scaling-3servers-landing@2 on 203.0.113.9]"*"--out /work/results/"*"scaling-3servers-landing@2.json"* ]]'

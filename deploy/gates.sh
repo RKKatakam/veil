@@ -42,6 +42,15 @@ GATES_DIR=${GATES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 # branches, the headline: agents each on a branch of their own, landing it
 # on `main` (through the landing service) after every MERGE_EVERY-th push.
 : "${HEADLINE_AGENTS:=300,1000,3000}" "${MERGE_EVERY:=5}" "${HEADLINE_RATE:=max}" "${HEADLINE_DURATION:=300}"
+# agents: coding agents at their pace (veil-bench load --mode agents): a
+# think time between operations (AGENTS_THINK seconds of agent time on
+# average, compressed AGENTS_TIME_SCALE times: the report states both and
+# each rate uncompressed), AGENTS_SUBAGENTS subagents forked once a cycle and
+# merged into the agent's branch, and its branch landed on `main` every
+# AGENTS_LAND_EVERY pushes (about every 45 minutes of agent time). One run per
+# agent count, AGENTS_DURATION seconds each: about 10 minutes for the two.
+: "${AGENTS_COUNTS:=1000 10000}" "${AGENTS_DURATION:=180}" "${AGENTS_THINK:=120}" "${AGENTS_TIME_SCALE:=20}"
+: "${AGENTS_SUBAGENTS:=3}" "${AGENTS_LAND_EVERY:=20}"
 # scaling: the same three curves with 1, 2 and 3 servers running, driven
 # from every driver at once (the numbers are summed).
 : "${SCALING_SERVERS:=1 2 3}" "${SCALING_DURATION:=60}"
@@ -59,14 +68,14 @@ GATES_DIR=${GATES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 # setup's bursts, the merges and the deriver. 100 agents, 5 minutes.
 : "${SPACES_AGENTS:=100}" "${SPACES_RATE:=20}" "${SPACES_DURATION:=300}"
 
-GATES_ALL="pull land branches api landing scaling failover objects openscion scale spaces"
+GATES_ALL="pull land branches api landing agents scaling failover objects openscion scale spaces"
 # The settings recorded beside every result (run.txt).
 GATE_SETTINGS="DURATION WARMUP PULL_CLIENTS PULL_BACKGROUND LAND_PROJECTS LAND_CLIENTS BRANCH_CLIENTS OBJECT_CLIENTS
  OPENSCION_FILES OPENSCION_RUNS SCALE_PROFILE SCALE_RUNS LANDING_AGENTS LANDING_PEOPLE LANDING_RATE LANDING_DURATIONS
  LANDING_VARIANTS HEADLINE_AGENTS MERGE_EVERY HEADLINE_RATE HEADLINE_DURATION SCALING_SERVERS SCALING_DURATION
  SCALING_PULL_CLIENTS SCALING_BRANCH_CLIENTS SCALING_LANDING_PROJECTS SCALING_LANDING_CLIENTS FAILOVER_AGENTS
  FAILOVER_PEOPLE FAILOVER_RATE FAILOVER_DURATION FAILOVER_AFTER FAILOVER_HOW FAILOVER_SETTLE SPACES_AGENTS SPACES_RATE
- SPACES_DURATION"
+ SPACES_DURATION AGENTS_COUNTS AGENTS_DURATION AGENTS_THINK AGENTS_TIME_SCALE AGENTS_SUBAGENTS AGENTS_LAND_EVERY"
 
 db_one() { db_sql | head -1; }
 db_now_us() { echo "select (extract(epoch from clock_timestamp()) * 1000000)::bigint" | db_one; }
@@ -108,6 +117,11 @@ run_gate() {
                     esac
                     bench driver "landing-$v-${d}s" "${load[@]}" --duration "$d" --mode landing --projects 1 --clients "$LANDING_AGENTS" --people "$LANDING_PEOPLE" --rates "$LANDING_RATE" "${flags[@]+"${flags[@]}"}" --dir /work/landing --out "$R/landing-$v-${d}s.json" "$@" || rc=1
                 done
+            done ;;
+        agents)
+            local n
+            for n in $AGENTS_COUNTS; do
+                bench driver "agents-$n" "${load[@]}" --duration "$AGENTS_DURATION" --mode agents --projects 1 --clients "$n" --think "$AGENTS_THINK" --time-scale "$AGENTS_TIME_SCALE" --subagents "$AGENTS_SUBAGENTS" --merge-every "$AGENTS_LAND_EVERY" --dir /work/agents --out "$R/agents-$n.json" "$@" || rc=1
             done ;;
         scaling) gate_scaling "$@" || rc=1 ;;
         failover) gate_failover "$@" || rc=$? ;;

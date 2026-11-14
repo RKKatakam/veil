@@ -46,6 +46,23 @@
 //! project (`a/NNNN`, made from `main` by its first push): pushes never
 //! collide, so a run measures what one push costs.
 //!
+//! In `agents` mode every agent works as a coding agent does, at its pace
+//! (open loop): between operations it *thinks* (reasons and tests
+//! locally) for an exponentially distributed time, `--think` seconds on
+//! average, divided by `--time-scale` (a compressed run: the report states
+//! the scale and each rate as it would be uncompressed). Each agent pushes
+//! to a branch of its own (`a/NNNN`); once a cycle (half way) it forks
+//! `--subagents` subagents, each on a branch made off its own
+//! (`a/NNNN-sF-J`), which push [`SUB_PUSHES`] times, thinking between, and
+//! are then merged into the parent's branch through the landing service
+//! (`onto` the parent's branch); the parent pulls the merged branch and
+//! goes on. After every `--merge-every` pushes of its own it lands its
+//! branch on `main` through the landing service. Each agent starts at a
+//! random point of its cycle. Reported per kind of operation (a push to
+//! one's branch, a subagent's merge into its parent's, a landing on
+//! `main`, a pull or workspace start): rate, p50/p99, errors and "come
+//! back" answers, beside the run's database costs.
+//!
 //! In `objects` mode (S9, `docs/HUB.md` §13.18) every agent reads as a
 //! fresh thin workspace, in a closed loop: the tips and its read grant from
 //! the server, then through the object routes (`--via cache`: a regional
@@ -108,6 +125,9 @@ pub enum Mode {
     Landing,
     /// Read as fresh thin workspaces, through the object routes.
     Objects,
+    /// Agents at a realistic pace: think time, subagent branches merged
+    /// into their parent's, occasional landings on `main`.
+    Agents,
 }
 
 /// The cost gates (`storage-and-cost.md` §9).
@@ -211,6 +231,13 @@ pub struct Args {
     /// snapshot) and each submit that failed (the error; the ticket when
     /// one was given), from the start of the run, warm-up included.
     pub log: Option<PathBuf>,
+    /// `agents`: the mean think time between an agent's operations, in
+    /// seconds of agent time.
+    pub think: f64,
+    /// `agents`: think times are divided by this (1: real time).
+    pub time_scale: f64,
+    /// `agents`: subagents each agent forks once a cycle (0: none).
+    pub subagents: usize,
 }
 
 /// How often a landing run's time series takes a row ([`series_row`]).
@@ -322,7 +349,7 @@ fn root_snapshot_id() -> ObjectId {
 }
 
 /// What one agent holds of one project.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Held {
     /// `main` as this agent last saw it, and its root tree.
     tip: Option<(ObjectId, ObjectId)>,
@@ -362,6 +389,18 @@ struct Counters {
     first_error: Mutex<Option<String>>,
     /// `Args::log`, open.
     log: Option<Mutex<std::fs::File>>,
+    /// `agents`: per kind of operation.
+    kinds: Mutex<HashMap<&'static str, KindCount>>,
+}
+
+/// `agents`: one kind of operation's counts while measuring.
+#[derive(Default)]
+struct KindCount {
+    ops: u64,
+    errors: u64,
+    /// "Come back later" answers waited out on the way.
+    came_back: u64,
+    latencies: Vec<f64>,
 }
 
 impl Counters {
@@ -377,6 +416,34 @@ impl Counters {
             line["project"] = json!(project);
             line["at_ms"] = json!(veil_core::now_millis());
             let _ = std::io::Write::write_all(&mut *f.lock().unwrap(), format!("{line}\n").as_bytes());
+        }
+    }
+
+    /// `agents`: an operation of `kind` by agent `agent`, scheduled at
+    /// `scheduled` (latency counts from then), that waited out `came_back`
+    /// answers telling it to come back later.
+    fn record(&self, kind: &'static str, agent: usize, scheduled: Instant, came_back: u64, r: Result<()>) {
+        if !self.measuring.load(Ordering::Relaxed) {
+            return;
+        }
+        let ms = scheduled.elapsed().as_secs_f64() * 1000.0;
+        let mut kinds = self.kinds.lock().unwrap();
+        let k = kinds.entry(kind).or_default();
+        k.came_back += came_back;
+        match r {
+            Ok(()) => {
+                k.ops += 1;
+                k.latencies.push(ms);
+                drop(kinds);
+                self.ops.fetch_add(1, Ordering::Relaxed);
+                self.latencies.lock().unwrap().push(ms);
+                self.finished_agents.lock().unwrap().insert(agent);
+            }
+            Err(e) => {
+                k.errors += 1;
+                drop(kinds);
+                self.error(&e);
+            }
         }
     }
 
@@ -400,6 +467,12 @@ struct Agent<'a> {
     /// whether that exists yet.
     branch: String,
     exists: bool,
+    /// The branch a new `branch` is made from (`main`; a subagent's
+    /// parent's branch).
+    start: String,
+    /// Answers telling it to come back later, so far (`agents` counts
+    /// them per operation).
+    came_back: std::cell::Cell<u64>,
     clone: Held,
     files: u64,
     c: &'a Counters,
@@ -425,9 +498,15 @@ impl Agent<'_> {
     /// (the flood, which counts it as an error), the first answer.
     fn asked(&self, deadline: Option<Instant>, mut send: impl FnMut() -> Result<Reply>) -> Result<Reply> {
         match deadline {
-            Some(d) => asked_until_answered(d, send, || self.c.count(&self.c.busy, 1)),
+            Some(d) => asked_until_answered(d, send, || self.busy()),
             None => send(),
         }
+    }
+
+    /// A busy answer, waited out.
+    fn busy(&self) {
+        self.c.count(&self.c.busy, 1);
+        self.came_back.set(self.came_back.get() + 1);
     }
 
     /// The project's tips ([`Agent::asked`]).
@@ -445,7 +524,7 @@ impl Agent<'_> {
         let tips = self.tips_by(deadline)?;
         // A branch of its own starts from `main`.
         self.exists = tips.branches.contains_key(&self.branch);
-        let tip = *tips.branches.get(&self.branch).or_else(|| tips.branches.get("main")).ok_or_else(|| anyhow!("no main"))?;
+        let tip = *tips.branches.get(&self.branch).or_else(|| tips.branches.get(&self.start)).ok_or_else(|| anyhow!("no {}", self.start))?;
         if self.clone.tip.is_some_and(|(t, _)| t == tip) {
             return Ok(false);
         }
@@ -608,7 +687,7 @@ impl Agent<'_> {
             self.c.requests.fetch_add(2, Ordering::Relaxed);
             let up = self.api.post(Some(self.token), &self.path("/objects"), &frames, false)?;
             if up.status == 503 {
-                self.c.count(&self.c.busy, 1);
+                self.busy();
                 backoff(attempt);
                 continue;
             }
@@ -691,7 +770,7 @@ impl Agent<'_> {
                     self.pull_by(Some(deadline))?;
                 }
                 503 => {
-                    self.c.count(&self.c.busy, 1);
+                    self.busy();
                     backoff(attempt);
                 }
                 _ => ok(&r, "push").map(|_| ())?,
@@ -1354,10 +1433,12 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                         project: name.clone(),
                         dir: vec!["w".into(), format!("g{:02}", (i / projects) / 32), format!("a{:04}", i / projects)],
                         branch: match a.mode {
-                            Mode::Branches => format!("a/{:04}", i / projects),
+                            Mode::Branches | Mode::Agents => format!("a/{:04}", i / projects),
                             _ => "main".into(),
                         },
                         exists: false,
+                        start: "main".into(),
+                        came_back: Default::default(),
                         clone: Held::default(),
                         files: 0,
                         c,
@@ -1398,6 +1479,12 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                     c.error(&e);
                 }
                 ready.wait();
+                if a.mode == Mode::Agents {
+                    let plan = Plan { think_s: a.think / a.time_scale, land_every: a.merge_every, subagents: a.subagents };
+                    agent.merge_every = 0;
+                    agent.live(i, &plan, cx.base, cx.ca, stop);
+                    return;
+                }
                 while !stop.load(Ordering::Relaxed) {
                     let scheduled = match (a.mode, rate) {
                         (Mode::Land | Mode::Branches | Mode::Api | Mode::Landing, Rate::PerSecond(_)) => {
@@ -1420,6 +1507,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                         Mode::Api => agent.land_api(scheduled + Duration::from_secs(60)),
                         Mode::Landing => agent.land_service(scheduled + Duration::from_secs(60)),
                         Mode::Objects => agent.read(),
+                        Mode::Agents => unreachable!("an agent of `agents` lives in `Agent::live`"),
                     };
                     let done = Instant::now();
                     if !c.measuring.load(Ordering::Relaxed) {
@@ -1455,6 +1543,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                         dir: vec!["w".into(), "bg".into(), format!("p{p}")],
                         branch: "main".into(),
                         exists: false,
+                        start: "main".into(),
+                        came_back: Default::default(),
                         clone: Held::default(),
                         files: 0,
                         c: bg,
@@ -1498,6 +1588,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                         dir: vec!["w".into(), "flood".into(), format!("f{i}")],
                         branch: "main".into(),
                         exists: false,
+                        start: "main".into(),
+                        came_back: Default::default(),
                         clone: Held::default(),
                         files: 0,
                         c: fl,
@@ -1658,13 +1750,13 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         // `derive_progress` writes.
         let push_commits = writes.map(|w| {
             let aside = match &commit_kinds {
-                Some(k) => k.aside(a.mode != Mode::Landing && c.merges.load(Ordering::Relaxed) > 0),
+                Some(k) => k.aside(a.mode == Mode::Agents || (a.mode != Mode::Landing && c.merges.load(Ordering::Relaxed) > 0)),
                 None => deriver.unwrap_or(0.0),
             };
             per_op((w - aside - stat("pack_row_commits").unwrap_or(0.0)).max(0.0))
         });
         result = json!({
-            "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Branches => "branches", Mode::Api => "api", Mode::Landing => "landing", Mode::Objects => "objects" },
+            "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Branches => "branches", Mode::Api => "api", Mode::Landing => "landing", Mode::Objects => "objects", Mode::Agents => "agents" },
 
             "projects": projects,
             "clients": clients,
@@ -1744,6 +1836,9 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         }
         result["landing_merging"] = json!(stat("landing_merging"));
         result["landing_conflicts"] = json!(stat("landing_conflicts"));
+        if a.mode == Mode::Agents {
+            agents_result(&mut result, a, clients, elapsed, &c, commit_kinds.as_ref());
+        }
         result["flood"] = json!(flood);
         result["flood_ops_per_s"] = json!((fl.ops.load(Ordering::Relaxed) - flood_ops0) as f64 / elapsed);
         result["flood_errors"] = json!(fl.errors.load(Ordering::Relaxed) - flood_errors0);
@@ -1776,6 +1871,229 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         result["derive_behind"] = json!(behind);
     }
     Ok(result)
+}
+
+/// `agents`: the per-kind results, the pace and its compression, and the
+/// database commits by kind per operation of the kind that makes them.
+fn agents_result(result: &mut serde_json::Value, a: &Args, clients: usize, elapsed: f64, c: &Counters, commit_kinds: Option<&CommitKinds>) {
+    let kinds = std::mem::take(&mut *c.kinds.lock().unwrap());
+    let ops_of = |k: &str| kinds.get(k).map_or(0.0, |k| k.ops as f64);
+    let mut by_kind = serde_json::Map::new();
+    for (name, mut k) in kinds.iter().map(|(n, k)| (*n, KindCount { latencies: k.latencies.clone(), ..*k })) {
+        k.latencies.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        by_kind.insert(
+            name.into(),
+            json!({
+                "ops": k.ops,
+                "per_s": k.ops as f64 / elapsed,
+                // The same agents at real-time pace.
+                "per_s_uncompressed": k.ops as f64 / elapsed / a.time_scale,
+                "p50_ms": percentile(&k.latencies, 0.5),
+                "p99_ms": percentile(&k.latencies, 0.99),
+                "errors": k.errors,
+                "came_back": k.came_back,
+            }),
+        );
+    }
+    // Hours of agent time the window stands for (the parents', not their subagents').
+    let agent_hours = clients as f64 * elapsed * a.time_scale / 3600.0;
+    let per = |x: f64, n: f64| if n > 0.0 { x / n } else { f64::NAN };
+    let kind = |names: &[&str]| commit_kinds.map(|k| k.by_kind.iter().filter(|(n, _)| names.contains(&n.as_str())).map(|(_, v)| v).sum::<f64>());
+    result["kinds"] = json!(by_kind);
+    result["think_s"] = json!(a.think);
+    result["time_scale"] = json!(a.time_scale);
+    result["think_real_s"] = json!(a.think / a.time_scale);
+    result["subagents"] = json!(a.subagents);
+    result["sub_pushes"] = json!(SUB_PUSHES);
+    result["land_every"] = json!(a.merge_every);
+    result["agent_hours"] = json!(agent_hours);
+    result["landings_per_agent_hour"] = json!(per(ops_of("landing"), agent_hours));
+    result["db_commits_per_push"] = json!(kind(&["push"]).map(|n| per(n, ops_of("push"))));
+    result["db_commits_per_land"] = json!(kind(&["land_submit", "land_batch"]).map(|n| per(n, ops_of("merge") + ops_of("landing"))));
+}
+
+/// `agents`: subagents push this many times before they are merged into
+/// their parent's branch.
+pub const SUB_PUSHES: u64 = 3;
+
+/// `agents`: an agent's pace and shape.
+struct Plan {
+    /// Mean think time, real seconds (compressed).
+    think_s: f64,
+    /// Pushes between landings on `main` (0: never).
+    land_every: u64,
+    subagents: usize,
+}
+
+/// `agents`: what an agent does after a think.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Push,
+    /// Its subagents' work, merged into its branch.
+    Fork,
+    /// Its branch onto `main`.
+    Land,
+}
+
+/// `agents`: one cycle of an agent's steps: `land_every` pushes (10 when
+/// it never lands), its subagents forked half way, then the landing.
+fn agent_cycle(land_every: u64, subagents: usize) -> Vec<Step> {
+    let pushes = if land_every > 0 { land_every } else { 10 };
+    let mut steps = Vec::new();
+    for k in 0..pushes {
+        if subagents > 0 && k == pushes / 2 {
+            steps.push(Step::Fork);
+        }
+        steps.push(Step::Push);
+    }
+    if land_every > 0 {
+        steps.push(Step::Land);
+    }
+    steps
+}
+
+/// An exponentially distributed think time of mean `mean_s` seconds, from
+/// `u` uniform in [0, 1).
+fn think_time(mean_s: f64, u: f64) -> Duration {
+    Duration::from_secs_f64(-mean_s * (1.0 - u.clamp(0.0, 1.0 - f64::EPSILON)).ln())
+}
+
+/// Uniform in [0, 1).
+fn uniform() -> f64 {
+    (u64::from_le_bytes(veil_core::crypto::random_bytes::<8>()) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Sleep until `at`, waking up for `stop`: false when stopped.
+fn sleep_until(at: Instant, stop: &AtomicBool) -> bool {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let left = at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
+/// How long an `agents` operation may take, from its scheduled time.
+const OP_DEADLINE: Duration = Duration::from_secs(60);
+
+impl<'a> Agent<'a> {
+    /// `agents`: run `op` as an operation of `kind`, recorded for agent `me`.
+    fn timed(&mut self, kind: &'static str, me: usize, scheduled: Instant, op: impl FnOnce(&mut Self) -> Result<()>) {
+        let before = self.came_back.get();
+        let r = op(self);
+        self.c.record(kind, me, scheduled, self.came_back.get() - before, r);
+    }
+
+    /// Land this agent's tip onto `onto` through the landing service, as
+    /// `vl land --onto` does, waiting out answers to come back later.
+    fn land_on(&self, onto: &str, deadline: Instant) -> Result<()> {
+        let (snap, _) = self.clone.tip.ok_or_else(|| anyhow!("nothing to land"))?;
+        let body = json!({"onto": onto, "snapshot": snap.hex()});
+        let path = self.path("/land");
+        let r = asked_until_answered(
+            deadline,
+            || {
+                self.c.requests.fetch_add(1, Ordering::Relaxed);
+                self.api.post_json(Some(self.token), &path, &body)
+            },
+            || self.came_back.set(self.came_back.get() + 1),
+        )?;
+        ok(&r, &format!("land onto {onto}"))?;
+        let v: serde_json::Value = serde_json::from_slice(&r.body)?;
+        if v["state"].as_str() != Some("landed") {
+            bail!("did not land onto {onto}: {v}");
+        }
+        Ok(())
+    }
+
+    /// `agents`: one agent's life until `stop` (the module's comment).
+    fn live(&mut self, me: usize, plan: &Plan, base: &str, ca: Option<&str>, stop: &AtomicBool) {
+        let cycle = agent_cycle(plan.land_every, plan.subagents);
+        let mut at = ((uniform() * cycle.len() as f64) as usize).min(cycle.len() - 1);
+        let mut forks = 0u64;
+        loop {
+            let scheduled = Instant::now() + think_time(plan.think_s, uniform());
+            if !sleep_until(scheduled, stop) {
+                return;
+            }
+            let deadline = scheduled + OP_DEADLINE;
+            match cycle[at] {
+                // Before its branch exists (a run starts anywhere in the
+                // cycle) there is nothing to branch off or to land: a push.
+                Step::Fork | Step::Land if !self.exists => self.timed("push", me, scheduled, |a| a.land(deadline).map(|_| ())),
+                Step::Push => self.timed("push", me, scheduled, |a| a.land(deadline).map(|_| ())),
+                Step::Land => self.timed("landing", me, scheduled, |a| a.land_on("main", deadline)),
+                Step::Fork => {
+                    forks += 1;
+                    let parent = self.branch.clone();
+                    std::thread::scope(|s| {
+                        for j in 0..plan.subagents {
+                            let api = match Api::new(base, ca) {
+                                Ok(api) => api,
+                                Err(e) => {
+                                    self.c.record("merge", me, scheduled, 0, Err(e));
+                                    continue;
+                                }
+                            };
+                            let mut sub = Agent {
+                                api,
+                                token: self.token,
+                                identity: self.identity,
+                                project: self.project.clone(),
+                                dir: self.dir.iter().cloned().chain([format!("s{forks}-{j}")]).collect(),
+                                branch: format!("{parent}-s{forks}-{j}"),
+                                exists: false,
+                                start: parent.clone(),
+                                came_back: Default::default(),
+                                clone: self.clone.clone(),
+                                files: 0,
+                                c: self.c,
+                                objects: None,
+                                mix: false,
+                                merge_every: 0,
+                            };
+                            let parent = &parent;
+                            let spawned = std::thread::Builder::new().stack_size(256 << 10).spawn_scoped(s, move || sub.sub_life(me, plan, parent, stop));
+                            if let Err(e) = spawned {
+                                self.c.record("merge", me, scheduled, 0, Err(e.into()));
+                            }
+                        }
+                    });
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // Its branch, with the subagents' work merged in.
+                    let now = Instant::now();
+                    self.timed("pull", me, now, |a| a.pull_by(Some(now + OP_DEADLINE)).map(|_| ()));
+                }
+            }
+            at = (at + 1) % cycle.len();
+        }
+    }
+
+    /// `agents`: a subagent's life: a workspace on its parent's branch,
+    /// [`SUB_PUSHES`] pushes to a branch of its own, then merged into
+    /// `parent` through the landing service.
+    fn sub_life(&mut self, me: usize, plan: &Plan, parent: &str, stop: &AtomicBool) {
+        let now = Instant::now();
+        self.timed("pull", me, now, |a| a.pull_by(Some(now + OP_DEADLINE)).map(|_| ()));
+        for _ in 0..SUB_PUSHES {
+            let scheduled = Instant::now() + think_time(plan.think_s, uniform());
+            if !sleep_until(scheduled, stop) {
+                return;
+            }
+            self.timed("push", me, scheduled, |a| a.land(scheduled + OP_DEADLINE).map(|_| ()));
+        }
+        let scheduled = Instant::now() + think_time(plan.think_s, uniform());
+        if !sleep_until(scheduled, stop) {
+            return;
+        }
+        self.timed("merge", me, scheduled, |a| a.land_on(parent, scheduled + OP_DEADLINE));
+    }
 }
 
 /// What a landing run's time series reads at one moment.
@@ -1902,6 +2220,55 @@ fn series_text(r: &serde_json::Value, markdown: bool) -> String {
     out
 }
 
+/// The order of an `agents` run's kinds of operation, and their names.
+const AGENT_KINDS: [(&str, &str); 4] = [
+    ("push", "push to one's own branch"),
+    ("merge", "subagent merged into its parent's branch"),
+    ("landing", "branch landed on `main`"),
+    ("pull", "pull or workspace start"),
+];
+
+/// An `agents` run's pace and its table by kind of operation (Markdown).
+fn agents_text(r: &serde_json::Value) -> String {
+    if r["mode"] != "agents" {
+        return String::new();
+    }
+    let f = |x: &serde_json::Value, d: usize| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{v:.d$}")).unwrap_or_else(|| "–".into());
+    let mut out = format!(
+        "Agents at a coding agent's pace: {} agents, think time {} s of agent time on average (exponential), time scale {} \
+         (so {} s real); each forks {} subagents a cycle ({} pushes each, then merged into its branch) and lands its branch on \
+         `main` every {} pushes. {} s measured stand for {} agent-hours: {} landings on `main` per agent-hour. \
+         Database commits per push {}, per landing (merges and landings on `main`) {}; statements per operation {}.\n\n\
+         | Operation | Done (/s) | Uncompressed (/s) | p50 (ms) | p99 (ms) | Errors | Told to come back |\n|---|---:|---:|---:|---:|---:|---:|\n",
+        r["clients"],
+        f(&r["think_s"], 0),
+        f(&r["time_scale"], 0),
+        f(&r["think_real_s"], 2),
+        r["subagents"],
+        r["sub_pushes"],
+        r["land_every"],
+        f(&r["seconds"], 0),
+        f(&r["agent_hours"], 1),
+        f(&r["landings_per_agent_hour"], 2),
+        f(&r["db_commits_per_push"], 2),
+        f(&r["db_commits_per_land"], 2),
+        f(&r["db_per_op"], 1),
+    );
+    for (k, name) in AGENT_KINDS {
+        let x = &r["kinds"][k];
+        out.push_str(&format!(
+            "| {name} | {} | {} | {} | {} | {} | {} |\n",
+            f(&x["per_s"], 1),
+            f(&x["per_s_uncompressed"], 2),
+            f(&x["p50_ms"], 1),
+            f(&x["p99_ms"], 1),
+            x["errors"].as_u64().unwrap_or(0),
+            x["came_back"].as_u64().unwrap_or(0),
+        ));
+    }
+    out
+}
+
 /// Branches of `projects` whose derived history is not their tip.
 fn derive_behind(rt: &tokio::runtime::Runtime, url: &str, projects: &[String]) -> Option<i64> {
     rt.block_on(async {
@@ -1961,7 +2328,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         server_stats: _server.as_ref().map(|s: &crate::server::Server| (s.pid(), a.dir.join("server").join("stats.json"))),
     };
     let rates = match a.mode {
-        Mode::Pull | Mode::Objects => vec![Rate::Max],
+        Mode::Pull | Mode::Objects | Mode::Agents => vec![Rate::Max],
         Mode::Land | Mode::Branches | Mode::Api | Mode::Landing => a.rates.clone(),
     };
     // `objects --via cache`: one regional cache in front of the server
@@ -1982,6 +2349,7 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
                 let mut r = run_one(&cx, a, projects, clients, rate, cache.as_ref().filter(|_| via))?;
                 eprintln!("      {}", line(&r));
                 eprint!("{}", series_text(&r, false));
+                eprint!("{}", agents_text(&r));
                 // A flood's work is counted against the quiet runs' operations:
                 // the cost gates do not apply to them.
                 let missed = if a.flood > 0 { Vec::new() } else { missed_gates(&r, a.background) };
@@ -2137,6 +2505,9 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             series_text(r, true)
         ));
     }
+    for r in v["runs"].as_array().into_iter().flatten().filter(|r| r["mode"] == "agents") {
+        out.push_str(&format!("\n{}", agents_text(r)));
+    }
     let objects: Vec<&serde_json::Value> = v["runs"].as_array().into_iter().flatten().filter(|r| r["mode"] == "objects").collect();
     if !objects.is_empty() {
         out.push_str(
@@ -2206,6 +2577,65 @@ mod tests {
         assert!(missed_gates(&run(1.0, 1.6), 0.0).is_empty(), "a push's one commit; a landing alone in its batch");
         assert_eq!(missed_gates(&run(1.3, 1.6), 0.0).len(), 1, "more than a commit a push");
         assert_eq!(missed_gates(&run(1.0, 2.5), 0.0).len(), 1, "more than a submit and a batch a landing");
+    }
+
+    /// `agents`: a cycle is `land_every` pushes with the fork half way and
+    /// the landing last; without landings, 10 pushes; without subagents,
+    /// no fork.
+    #[test]
+    fn an_agents_cycle_forks_half_way_and_lands_last() {
+        use Step::*;
+        assert_eq!(agent_cycle(4, 3), vec![Push, Push, Fork, Push, Push, Land]);
+        assert_eq!(agent_cycle(1, 2), vec![Fork, Push, Land]);
+        assert_eq!(agent_cycle(3, 0), vec![Push, Push, Push, Land]);
+        let never = agent_cycle(0, 1);
+        assert_eq!((never.len(), never.iter().filter(|s| **s == Fork).count(), never.contains(&Land)), (11, 1, false));
+    }
+
+    /// `agents`: think times are exponential with the mean asked (the
+    /// compressed one: the caller divides by the time scale), never
+    /// negative, and a mean of 0 is no think at all.
+    #[test]
+    fn think_times_are_exponential_with_the_mean_asked() {
+        assert_eq!(think_time(0.0, 0.7), Duration::ZERO);
+        assert_eq!(think_time(2.0, 0.0), Duration::ZERO);
+        // The median of an exponential is mean × ln 2.
+        assert!((think_time(2.0, 0.5).as_secs_f64() - 2.0 * std::f64::consts::LN_2).abs() < 1e-9);
+        assert!(think_time(2.0, 1.0).as_secs_f64().is_finite(), "u = 1 is clamped");
+        let n = 20_000;
+        let mean = (0..n).map(|_| think_time(3.0, uniform()).as_secs_f64()).sum::<f64>() / n as f64;
+        assert!((mean - 3.0).abs() < 0.15, "sample mean {mean}");
+        assert!((0..1000).map(|_| uniform()).all(|u| (0.0..1.0).contains(&u)));
+    }
+
+    /// `agents`: an operation is counted under its kind only while
+    /// measuring, with its "come back" answers; a failure is an error of
+    /// its kind and of the run.
+    #[test]
+    fn agents_operations_are_counted_by_kind() {
+        let c = Counters::default();
+        c.record("push", 1, Instant::now(), 2, Ok(()));
+        assert!(c.kinds.lock().unwrap().is_empty(), "not measuring yet");
+        c.measuring.store(true, Ordering::Relaxed);
+        c.record("push", 1, Instant::now(), 2, Ok(()));
+        c.record("push", 2, Instant::now(), 0, Ok(()));
+        c.record("merge", 1, Instant::now(), 1, Err(anyhow!("refused")));
+        let k = c.kinds.lock().unwrap();
+        assert_eq!((k["push"].ops, k["push"].came_back, k["push"].errors, k["push"].latencies.len()), (2, 2, 0, 2));
+        assert_eq!((k["merge"].ops, k["merge"].came_back, k["merge"].errors), (0, 1, 1));
+        assert_eq!((c.ops.load(Ordering::Relaxed), c.errors.load(Ordering::Relaxed)), (2, 1));
+        assert_eq!(c.finished_agents.lock().unwrap().len(), 2);
+    }
+
+    /// `agents`: stopping wakes a think at once.
+    #[test]
+    fn a_think_wakes_for_stop() {
+        let stop = AtomicBool::new(false);
+        assert!(sleep_until(Instant::now() + Duration::from_millis(5), &stop));
+        stop.store(true, Ordering::Relaxed);
+        let t = Instant::now();
+        assert!(!sleep_until(Instant::now() + Duration::from_secs(60), &stop));
+        assert!(t.elapsed() < Duration::from_secs(1));
     }
 
     fn reply(status: u16, body: serde_json::Value) -> Reply {

@@ -8,7 +8,7 @@
 //! veil-bench report RESULTS.json
 //! veil-bench openscion --vl PATH --server PATH --database-url URL [--s3-…] --dir DIR --out RESULTS.json
 //! veil-bench openscion-memory --out RESULTS.json
-//! veil-bench load --mode pull|land|branches|api|landing|objects [--via server,cache] (--server PATH --database-url URL | --url URL [--ca PEM])
+//! veil-bench load --mode pull|land|branches|api|landing|objects|agents [--via server,cache] (--server PATH --database-url URL | --url URL [--ca PEM])
 //!                 --projects 1,10 --clients 10,100 [--rates 0.35,3.5,max] --out RESULTS.json
 //! ```
 //!
@@ -147,8 +147,11 @@ enum Cmd {
         /// branch of its own), `api` (agents land them through
         /// `POST …/changes`, letting the server rebase), `landing`
         /// (through the landing service, `POST …/land`: batched, on the
-        /// base each agent last saw) or `objects` (agents read as fresh
-        /// thin workspaces through the object routes).
+        /// base each agent last saw), `objects` (agents read as fresh
+        /// thin workspaces through the object routes) or `agents` (at a
+        /// coding agent's pace: think time, subagent branches merged into
+        /// the agent's, its branch landed on `main` every `--merge-every`
+        /// pushes).
         #[arg(long)]
         mode: String,
         /// A running server (`https://host:port`); else `--server` starts one here.
@@ -211,7 +214,7 @@ enum Cmd {
         /// conflict (else every change is a new file of the agent's own).
         #[arg(long)]
         mix: bool,
-        /// `branches`: land the agent's branch on `main` after every N pushes.
+        /// `branches`, `agents`: land the agent's branch on `main` after every N pushes.
         #[arg(long, default_value_t = 0)]
         merge_every: u64,
         /// `landing`: the agents belong to this many people, in turn.
@@ -223,6 +226,17 @@ enum Cmd {
         /// the warm-up's rate.
         #[arg(long, value_delimiter = ',')]
         steps: Vec<String>,
+        /// `agents`: mean think time between an agent's operations, in
+        /// seconds of agent time (exponentially distributed).
+        #[arg(long, default_value_t = 120.0)]
+        think: f64,
+        /// `agents`: think times are divided by this (a compressed run;
+        /// the report states each rate uncompressed too).
+        #[arg(long, default_value_t = 1.0)]
+        time_scale: f64,
+        /// `agents`: subagents each agent forks once a cycle.
+        #[arg(long, default_value_t = 3)]
+        subagents: usize,
     },
     /// Generate a repository (and keep it).
     Gen(GenArgs),
@@ -378,6 +392,9 @@ fn main() -> Result<()> {
             merge_every,
             people,
             steps,
+            think,
+            time_scale,
+            subagents,
         } => {
             let mode = match mode.as_str() {
                 "pull" => load::Mode::Pull,
@@ -386,8 +403,12 @@ fn main() -> Result<()> {
                 "api" => load::Mode::Api,
                 "landing" => load::Mode::Landing,
                 "objects" => load::Mode::Objects,
-                m => return Err(anyhow!("--mode {m}: pull, land, branches, api, landing or objects")),
+                "agents" => load::Mode::Agents,
+                m => return Err(anyhow!("--mode {m}: pull, land, branches, api, landing, objects or agents")),
             };
+            if !(time_scale > 0.0 && think >= 0.0 && think.is_finite()) {
+                return Err(anyhow!("--think must be at least 0 and --time-scale above 0"));
+            }
             let vias = via
                 .iter()
                 .map(|v| match v.as_str() {
@@ -432,6 +453,9 @@ fn main() -> Result<()> {
                 // `landing`: each landing told, and each submit that failed,
                 // beside the results (`docs/DEPLOY.md` §6.1).
                 log: Some(out.with_extension("landings.jsonl")),
+                think,
+                time_scale,
+                subagents,
             })?;
             std::fs::write(&out, serde_json::to_vec_pretty(&v)?)?;
             let md = load::markdown(&v)?;

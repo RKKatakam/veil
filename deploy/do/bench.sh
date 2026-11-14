@@ -14,7 +14,7 @@
 #
 #   bench.sh [--approve] GATE [veil-bench flags...]
 #
-# GATE (deploy/gates.sh): pull land branches api landing scaling failover   (drivers,
+# GATE (deploy/gates.sh): pull land branches api landing agents scaling failover   (drivers,
 #   against the one address)   objects openscion scale   (the first server's machine,
 #   with a server the tool starts itself)   spaces   (the same, its server on a
 #   Spaces bucket, BUCKET-spaces, with /etc/veil/spaces.env's keys, at a rate
