@@ -57,26 +57,29 @@ blame and search answered by the server in milliseconds.
 
 ## Measured
 
-Landings measured on the evening of 2026-11-13 (the code as published,
-`171a625a`), the comparison with Git on 2026-11-12, on one 32-core machine
-that also ran the load generator, PostgreSQL (with the deployment's
-settings) and the object store (a local directory). These are one-machine
-numbers; the paid run across several machines will keep objects in MinIO
-for its speed gates (BUG-2290's decision). The full tables, misses
-included, are in [LOAD.md](docs/design/scale/LOAD.md) (landings) and
+Landings measured on 2026-11-14 (the code as published, `1e141f0b`), the
+comparison with Git on 2026-11-12, on one 32-core machine that also ran
+the load generator, PostgreSQL (with the deployment's settings) and the
+object store (a local directory). These are one-machine numbers: the load
+tool, the server and the database share 32 cores and 30 GB of memory,
+which runs short about 100 s into a 10,000-agent run (BUG-2363). The paid
+run across several machines will keep objects in MinIO for its speed
+gates (BUG-2290's decision). The full tables, commands and misses are in
+[LOAD.md](docs/design/scale/LOAD.md) (landings) and
 [OPENSCION.md](docs/design/scale/OPENSCION.md) (beside Git).
 
 **Landing changes on one `main`** (10,000 agents offering 1,000 a second,
-three minutes unless noted; the target is 1,000 a second held, p99 under 1 s):
+three minutes unless noted; the target is 1,000 a second held, p99 under
+1 s, p50 under 150 ms):
 
 | | Landed a second | p50 / p99 | Note |
 |---|---|---|---|
-| Agents of 100 people | **988** | 344 ms / 1.76 s | 1.18 database commits a landing; nothing failed. For comparison: 20 to 30 a second with pull, rebase, push and retry. |
-| Protected `main` | **998** | 315 ms / 1.78 s | 1.23 commits a landing |
-| All agents one person's | **977** | 552 ms / 6.99 s | 1.22 commits a landing; from 130 s on, 69,288 answers told agents to come back (BUG-1955) |
-| Protected `main`, 3 % overlapping and 2 % conflicting changes | **973 and 959** (two runs) | 545 ms / 8.0 s and 316 ms / 10.6 s | p99 **misses**; 860 and 794 a second this morning, before BUG-2220's fix |
-| The same, ten minutes | 834 | 11.6 s / 69 s | **Misses**: 628 to 1,043 a second per 10 s; 39,329 landings given up (BUG-1955); 799 this morning |
-| Offered 1.5 times what it can land for 90 s, then 300 a second (this morning, `dc4e3f82`; not run again) | 963 on average while overloaded | p99 under 0.3 s once the backlog is gone (one 10 s stretch at 1.0 s) | Agents past capacity are told at once to come back; every landing made is one an agent sees; the backlog clears 90 s after the load drops |
+| Agents of 100 people | **995** | 236 ms / 1.35 s | 1.09 database commits a landing; nothing failed. For comparison: 20 to 30 a second with pull, rebase, push and retry. |
+| Protected `main` | **995** | 286 ms / 1.39 s | 1.08 commits a landing |
+| All agents one person's | **997** | 652 ms / 6.15 s | 1.10 commits a landing; from 100 to 140 s, 45,270 answers told agents to come back (BUG-1955) |
+| Protected `main`, 3 % overlapping and 2 % conflicting changes | **977 and 970** (two runs) | 447 ms / 4.3 s and 515 ms / 6.4 s | p99 **misses**; the queue reaches its bound about 150 s in, and 26 and 155 landings were given up |
+| The same, ten minutes | 917 | 6.0 s / 50 s | **Misses**: 691 to 1,043 a second per 10 s; 8,804 landings given up (BUG-1955) |
+| Offered 1.5 times what it can land for 90 s, then 300 a second | 1,089 on average while overloaded | p50 22 to 76 ms and p99 under 0.7 s once the backlog is gone (two 10 s stretches at 1.3 and 1.5 s) | Agents past capacity are told at once to come back; the backlog clears 60 s after the load drops |
 
 **Many agents, each on its own branch**, pushing in a closed loop and
 landing the branch on `main` every 5th push (as many as they can; one
@@ -84,17 +87,17 @@ person's agents):
 
 | Agents, run | Pushes a second | Branches landed on `main` a second | p50 / p99 (a push) | Note |
 |---|---|---|---|---|
-| 300, three minutes | **372** | **74.7** | 789 ms / 1.61 s | **p99 misses 1 s**; 40 ms of server CPU a push; 6.8 storage reads a push; nothing told to come back. This morning: 72 and 13.4, p99 21 s (BUG-2221) |
-| 1,000, three minutes | **258** | **52.4** | 4.0 s / 6.2 s | **p99 misses 1 s**; 7,290 requests told to come back, each waited out; this morning 116 and 19.5 |
-| 300, ten minutes | **246** | **49.2** | 1.07 s / 3.6 s | **p99 misses 1 s**; holds over ten minutes (30.7 pushes a second before BUG-2221's fix); 8.5 storage reads a push, 99.5 % object cache hits; 94 packs listed at the end |
+| 300, three minutes | **382** | **76.6** | 737 ms / 1.64 s | **p99 misses 1 s**; 39 ms of server CPU a push; 1.00 database commit a push of its own; nothing told to come back |
+| 1,000, three minutes | **266** | **53.7** | 3.9 s / 5.9 s | **p99 misses 1 s**; 4,166 requests told to come back, each waited out; none failed |
+| 300, ten minutes | **251** | **50.4** | 1.07 s / 3.6 s | **p99 misses 1 s**; holds over ten minutes; 6.1 storage reads a push, 99.8 % object cache hits |
 
-What still misses: p99 under 1 s at 1,000 landings a second (1.8 to 7.0 s;
-from about 130 s on, an accepted landing waits longer while the queue
-stays short, BUG-1955), p50 under 150 ms (315 to 552 ms), the mix's p99,
-the mix at 1,000 a second for ten minutes, and p99 under 1 s in the
-many-branch shape (1.6 to 6.2 s). Every many-branch run also misses the
-benchmark's cost gate of one database commit a push (2.3 to 3.2,
-BUG-2350).
+What still misses: p99 under 1 s at 1,000 landings a second (1.35 to
+6.2 s), p50 under 150 ms (236 to 652 ms), the mix's p99, the mix at 1,000
+a second for ten minutes (917), and p99 under 1 s in the many-branch shape
+(1.6 to 5.9 s). With the mix the batch bounds it: each batch's commit
+waits for its objects' `fsync`s on this machine's disk. The many-branch
+runs now pass the benchmark's cost gate of one database commit a push
+(BUG-2350, fixed).
 
 **Beside Git**, on the same files (medians of 5 to 9):
 
