@@ -155,6 +155,9 @@ out=$(VEIL_GCP_OPERATOR_IP=0.0.0.0/0 "$K/create.sh" --approve 2>&1 || true)
 check "create.sh refuses a wildcard or CIDR operator address" '[[ "$out" == *"invalid VEIL_GCP_OPERATOR_IP"* ]]'
 out=$(VEIL_GCP_SIZE_OBJECTS=e2-standard-16 "$K/create.sh" --approve 2>&1 || true)
 check "create.sh refuses an E2 or shared-core storage machine (no dedicated vCPUs, no local SSD; BUG-2431)" '[[ "$out" == *"cannot be the storage machine"* ]]'
+refused=0; for t in t2d-standard-16 c3d-standard-16; do
+    o=$(VEIL_GCP_SIZE_OBJECTS=$t "$K/estimate.sh" 2>&1) && continue; [[ "$o" == *"cannot be the storage machine"* ]] && refused=$((refused + 1)); done
+check "a storage type that cannot take an attached local SSD (T2D, C3D) is refused before anything is made" '[ $refused = 2 ]'
 check "no resource command so far" '! grep -qE "^gcloud compute (networks|firewall-rules|instances|disks)" "$FAKE_GCLOUD_LOG"'
 
 echo "== 3. create.sh --approve: the full topology, hybrid Spot"

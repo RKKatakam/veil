@@ -95,12 +95,14 @@ done
 [[ "$SUBNET_RANGE" =~ ^10\.[0-9]+\.[0-9]+\.0/2[0-4]$ ]] || bad "invalid VEIL_GCP_SUBNET_RANGE '$SUBNET_RANGE' (a 10.x.y.0/20 to /24 range)"
 [[ "$HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ "$(echo "$HOURS > 0" | bc -l)" = 1 ] || bad "invalid VEIL_GCP_HOURS '$HOURS' (must be > 0)"
 # The storage machine needs dedicated CPUs (BUG-2431: MinIO on a shared-CPU
-# machine collapsed on the first paid run) and a local SSD, which E2 and
-# the shared-core types cannot have. estimate.sh and create.sh refuse them.
+# machine collapsed on the first paid run) and a local SSD attached with
+# --local-ssd, which only these families' predefined types take (E2 and the
+# shared-core types have neither; T2D has no local SSD; C3D and newer take
+# one only as their -lssd types). estimate.sh and create.sh refuse the rest.
 refuse_shared_objects() { # script name
     case "$SIZE_OBJECTS" in
-        e2-*|f1-*|g1-*|*-micro|*-small|*-medium)
-            echo "$1: VEIL_GCP_SIZE_OBJECTS=$SIZE_OBJECTS cannot be the storage machine: it needs dedicated vCPUs and a local NVMe SSD (C2D, N2, N2D, C3D...; docs/DEPLOY.md §12, BUG-2431)" >&2
+        c2d-*|c2-*|n2d-*|n2-*|n1-*) ;;
+        *)  echo "$1: VEIL_GCP_SIZE_OBJECTS=$SIZE_OBJECTS cannot be the storage machine: it needs dedicated vCPUs and an attached local NVMe SSD (C2D, C2, N2D, N2 or N1; docs/DEPLOY.md §12, BUG-2431)" >&2
             exit 2 ;;
     esac
 }

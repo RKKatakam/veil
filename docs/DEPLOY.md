@@ -1278,7 +1278,10 @@ deploy/gcp/destroy.sh --check --approve      # repeat until it says "nothing lef
   stands when nothing was reclaimed during it (`result_valid=yes`). A
   second reclaim fails the gate (exit 3), both results invalid, with no
   third run. Every gate's `run.txt` says `spot_reclaimed_during=` and
-  `result_valid=`; only `yes` results are published.
+  `result_valid=`; only `yes` results are published. When gcloud cannot
+  answer whether a Spot VM was reclaimed (an API or credentials failure
+  after the gate), the result is `result_valid=no` and the gate fails
+  (exit 1), never taken as "nothing reclaimed".
 
 Recovery: `gcloud compute instances start` (retried for five minutes when
 the zone has no Spot capacity), the new public addresses saved, cloud-init
@@ -1287,7 +1290,17 @@ awaited, the balancer's or the cache's started. A reclaimed YugabyteDB
 node or storage machine (`VEIL_GCP_SPOT=all` only), or a private address
 that changed, means `configure.sh --approve` again, which the script runs
 (`spot_reconfigured=yes`). The shared steps' own check still applies:
-MinIO restarting during a gate fails it (`minio-restarts.txt`).
+MinIO restarting during a gate, or its restart count unreadable, fails it
+(`minio-restarts.txt`).
+
+A restarted VM keeps its private address (the gates, the balancer, the
+servers and MinIO use only those, all in the certificate) but gets a new
+public one, which the certificate does not name: the gates are unaffected,
+but `vl login https://PUBLIC:8443` to a restarted balancer (or single
+server) fails its TLS check until `configure.sh --approve` makes a new
+certificate. A reclaim during `configure.sh` fails it; then run any gate
+(`bench.sh` starts the stopped VM first and saves its new address, and may
+stop there), and `configure.sh --approve` again.
 
 ### 12.6 Teardown
 
@@ -1305,7 +1318,7 @@ all are gone. Glance at Billing > Reports in the console the next day.
 
 ### 12.7 Testing the kit
 
-`bash deploy/gcp/test/test.sh` (75 checks) runs every script against a
+`bash deploy/gcp/test/test.sh` (76 checks) runs every script against a
 fake gcloud (`deploy/gcp/test/fake-gcloud`), a made-up project that
 remembers what was created, stopped and deleted, with fake ssh, scp,
 docker and curl. It checks that the dry runs of the full topology exit 0,
