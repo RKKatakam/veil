@@ -10,4 +10,8 @@ deploy/do/.env
 deploy/do/.env.*
 !deploy/do/.env.example
 deploy/do/state/
+deploy/gcp/.env
+deploy/gcp/.env.*
+!deploy/gcp/.env.example
+deploy/gcp/state/
 deploy/results/

@@ -1,8 +1,8 @@
 #cloud-config
 # Every machine of the Veil test on Google Cloud: Docker from Ubuntu's
 # repository, zstd for the image transfer, the directories the scripts use,
-# and root's SSH key: the run's own public key, which create.sh puts in
-# place of @@RUN_SSH_PUBLIC_KEY@@. It is the only key: the instances block
+# and root's SSH key: the run's own public key, which create.sh puts
+# in place of the placeholder below. It is the only key: the instances block
 # the project's SSH keys (block-project-ssh-keys) and turn OS Login off,
 # so neither the project's keys nor anyone's personal keys get in. No secret
 # here (user-data is readable from the metadata server); configure.sh copies

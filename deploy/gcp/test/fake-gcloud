@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# A stand-in for gcloud used by deploy/gcp/test/test.sh: records every call
+# in $FAKE_GCLOUD_LOG and keeps a made-up project in $FAKE_GCLOUD_DIR
+# (instances with their state, disks, firewall rules, networks, subnets,
+# preemption operations). It never talks to Google Cloud. Not for real use.
+#   instances: name zone status natIP privIP
+set -euo pipefail
+D=${FAKE_GCLOUD_DIR:?}
+echo "gcloud $*" >> "${FAKE_GCLOUD_LOG:?}"
+# Which credentials a real gcloud would use: the override's path, never its content.
+echo "cred=${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-none} prompts=${CLOUDSDK_CORE_DISABLE_PROMPTS:-unset}" >> "$D/env.log"
+[ "${FAKE_GCLOUD_FAIL:-0}" = 1 ] && { echo "fake-gcloud: simulated API failure" >&2; exit 1; }
+touch "$D/instances" "$D/disks" "$D/fw" "$D/nets" "$D/subnets" "$D/ops"
+args=("$@")
+names() { # the positional arguments after the first N words
+    local i=0 a
+    for a in "${args[@]:$1}"; do [[ "$a" == -* ]] || echo "$a"; done
+}
+flag() { # --name -> its value
+    local a
+    for a in "${args[@]}"; do [[ "$a" == "$1="* ]] && { echo "${a#*=}"; return; }; done
+}
+drop() { # file, names...: remove lines whose first field is one of the names
+    local f=$1; shift
+    awk -v n=" $* " 'index(n, " " $1 " ") == 0' "$D/$f" > "$D/$f.tmp"; mv "$D/$f.tmp" "$D/$f"
+}
+case "$*" in
+    "auth list"*) [ -n "${FAKE_GCLOUD_ACCOUNT-operator-account}" ] && echo "${FAKE_GCLOUD_ACCOUNT-operator-account}"; true ;;
+    "auth print-access-token"*) echo "fake-access-token-not-for-argv" ;;
+    "projects describe"*) echo ACTIVE ;;
+    "billing projects describe"*) echo "${FAKE_BILLING:-True}" ;;
+    "services list"*) echo compute.googleapis.com ;;
+    "compute machine-types list"*) t=$(flag --filter); t=${t#name=}; [ "$t" = "${FAKE_NO_TYPE:-}" ] || echo "$t" ;;
+    "compute regions describe"*) cat "${FAKE_REGION_JSON:?}" ;;
+    "compute project-info describe"*) cat "${FAKE_PROJECT_JSON:?}" ;;
+    "compute networks subnets create"*) names 4 >> "$D/subnets" ;;
+    "compute networks subnets list"*) awk -v r="${FAKE_REGION:-us-central1}" '{print $1, r}' "$D/subnets" ;;
+    "compute networks subnets delete"*) drop subnets $(names 4) ;;
+    "compute networks create"*) names 3 >> "$D/nets" ;;
+    "compute networks list"*) cat "$D/nets" ;;
+    "compute networks delete"*) drop nets $(names 3) ;;
+    "compute firewall-rules create"*) names 3 >> "$D/fw" ;;
+    "compute firewall-rules list"*) cat "$D/fw" ;;
+    "compute firewall-rules delete"*) drop fw $(names 3) ;;
+    "compute instances create"*)
+        n=$(($(wc -l < "$D/instances") + 1))
+        if [ -n "${FAKE_MAX_INSTANCES:-}" ] && [ "$n" -gt "$FAKE_MAX_INSTANCES" ]; then echo "fake-gcloud: quota exceeded" >&2; exit 1; fi
+        name=$(names 3 | head -1); zone=$(flag --zone)
+        echo "$name $zone RUNNING 203.0.113.$n 10.42.0.$n" >> "$D/instances"
+        echo "$name $zone" >> "$D/disks"
+        echo "$name" ;;
+    "compute instances start"*)
+        for name in $(names 3); do
+            k=$(($(cat "$D/starts" 2>/dev/null || echo 0) + 1)); echo $k > "$D/starts"
+            awk -v n="$name" -v ip="198.51.100.$k" '$1 == n {$3 = "RUNNING"; $4 = ip} {print}' "$D/instances" > "$D/i.tmp"; mv "$D/i.tmp" "$D/instances"
+        done ;;
+    "compute instances list"*)
+        f=$(flag --format)
+        case "$f" in
+            *natIP*) awk '{nat = ($3 == "RUNNING") ? $4 : ""; print $1 "," nat "," $5 "," $3}' "$D/instances" ;;
+            "csv[no-heading](name,status)") awk '{print $1 "," $3}' "$D/instances" ;;
+            *) awk '{print $1, $2, $3}' "$D/instances" ;;
+        esac ;;
+    "compute instances delete"*)
+        drop instances $(names 3)
+        [[ " $* " == *" --delete-disks=all "* ]] && drop disks $(names 3); true ;;
+    "compute disks add-labels"*) ;;
+    "compute disks list"*) cat "$D/disks" ;;
+    "compute disks delete"*) drop disks $(names 3) ;;
+    "compute operations list"*) cat "$D/ops" ;;
+    "compute addresses list"*) [ -n "${FAKE_ADDRESSES:-}" ] && echo "$FAKE_ADDRESSES us-central1"; true ;;
+    "compute addresses delete"*|"compute snapshots list"*|"compute images list"*) ;;
+    *) echo "fake-gcloud: unexpected command: $*" >&2; exit 64 ;;
+esac
