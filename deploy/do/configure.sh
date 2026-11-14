@@ -84,8 +84,13 @@ if [ "$YB_NODES" -gt 0 ]; then
     for i in $(seq "$YB_NODES"); do
         n=$NAME-yb$i; ip=$(addr "$n"); priv=$(paddr "$n")
         join=""; [ "$i" -gt 1 ] && join="--join=$FIRST"
+        # YugabyteDB's master refuses a long local hostname ("Unable to
+        # determine local hostname: File name too long"): Google Cloud names a
+        # machine NAME.ZONE.c.PROJECT.internal. The machine's short name, kept
+        # in /etc/hosts, works on every cloud.
+        remote "$ip" "hostnamectl set-hostname $n && { grep -q ' $n\$' /etc/hosts || echo '$priv $n' >> /etc/hosts; }"
         remote "$ip" "docker rm -f yb >/dev/null 2>&1; docker run -d --name yb --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v yb-data:/root/var $YB_IMAGE bin/yugabyted start --background=false --advertise_address=$priv $join --tserver_flags=yb_enable_read_committed_isolation=true,ysql_num_shards_per_tserver=1 --master_flags=enforce_tablet_replica_limits=false"
-        remote "$ip" 'for i in $(seq 120); do docker exec yb bin/ysqlsh -h '"$priv"' -tAc "select 1" >/dev/null 2>&1 && break; sleep 2; done; echo "   yb'"$i"' answers"'
+        remote "$ip" 'for i in $(seq 120); do docker exec yb bin/ysqlsh -h '"$priv"' -tAc "select 1" >/dev/null 2>&1 && { echo "   yb'"$i"' answers"; exit 0; }; sleep 2; done; echo "configure: yb'"$i"' did not answer in 4 minutes (docker logs yb on it)" >&2; exit 1'
     done
     remote "$YB1" 'for i in $(seq 60); do n=$(docker exec yb bin/ysqlsh -h '"$FIRST"' -tAc "select count(*) from yb_servers()" 2>/dev/null); [ "$n" = '"$YB_NODES"' ] && break; sleep 2; done; echo "   YugabyteDB nodes in the cluster: $n (expected '"$YB_NODES"')"; [ "$n" = '"$YB_NODES"' ]'
     # yugabyted turns enforce_tablet_replica_limits on at every start,
