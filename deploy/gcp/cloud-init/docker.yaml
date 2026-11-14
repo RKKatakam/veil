@@ -1,0 +1,47 @@
+#cloud-config
+# Every machine of the Veil test on Google Cloud: Docker from Ubuntu's
+# repository, zstd for the image transfer, the directories the scripts use,
+# and root's SSH key: the run's own public key, which create.sh puts in
+# place of @@RUN_SSH_PUBLIC_KEY@@. It is the only key: the instances block
+# the project's SSH keys (block-project-ssh-keys) and turn OS Login off,
+# so neither the project's keys nor anyone's personal keys get in. No secret
+# here (user-data is readable from the metadata server); configure.sh copies
+# secrets over SSH afterwards, as root-only files. The kernel settings and
+# file limits are files, not one-off commands: a Spot VM that was reclaimed
+# and started again keeps them.
+disable_root: false
+ssh_pwauth: false
+package_update: true
+packages:
+  - docker.io
+  - zstd
+  - chrony
+write_files:
+  - path: /root/.ssh/authorized_keys
+    owner: root:root
+    permissions: '0600'
+    content: |
+      @@RUN_SSH_PUBLIC_KEY@@
+  - path: /etc/ssh/sshd_config.d/10-veil.conf
+    permissions: '0644'
+    content: |
+      PermitRootLogin prohibit-password
+      PasswordAuthentication no
+  - path: /etc/sysctl.d/90-veil.conf
+    permissions: '0644'
+    content: |
+      net.core.somaxconn = 4096
+      net.ipv4.ip_local_port_range = 10000 65000
+      fs.file-max = 2097152
+  - path: /etc/security/limits.d/90-veil.conf
+    permissions: '0644'
+    content: |
+      * soft nofile 1048576
+      * hard nofile 1048576
+runcmd:
+  - chmod 700 /root/.ssh
+  - systemctl enable --now docker
+  - mkdir -p /etc/veil/tls /srv/bench /srv/metrics
+  - chmod 700 /etc/veil
+  - sysctl --system
+  - systemctl reload ssh || systemctl reload sshd || true

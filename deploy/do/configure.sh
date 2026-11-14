@@ -47,6 +47,9 @@ CERT_NAMES=()
 while read -r role name size; do
     case $role in hub|lb|cache|minio) CERT_NAMES+=("$(addr "$name")" "$(paddr "$name")" "$name") ;; esac
 done < <(droplets)
+# And `localhost`: anything on a machine that reaches its own service over
+# TLS by that name (MinIO's setup did, BUG-2432) finds it in the certificate.
+CERT_NAMES+=(localhost 127.0.0.1)
 if [ $APPROVED = 1 ]; then "$DO_ROOT/deploy/tls/mkcert.sh" "$STATE/tls" "${CERT_NAMES[@]}"; else echo "would run mkcert for ${CERT_NAMES[*]}" >&2; fi
 while read -r role name size; do
     ip=$(ip_of "$name"); ip=${ip:-${name}_IP}
