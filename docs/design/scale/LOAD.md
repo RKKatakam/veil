@@ -1908,6 +1908,7 @@ from `pg_stat_statements` over the whole run; per push):
 | the deriver's run | 0.06 | 0.07 | background (S12) |
 | **all** | **4.60** | **3.66** | |
 | **the push's own, as the gate counts it** | **2.49** | **1.00** | |
+| what the push waits for: its transaction and its staged-pack rows | 3.05 | 3.05 | unchanged: the gate's 1.00 leaves out the pack rows (S28) |
 
 Under 300 agents a deriver run takes about 32 snapshots at once, past its
 inline caps (16 snapshots, 64 file-history rows): it leaves the view
@@ -1916,6 +1917,11 @@ own. A fill projected its tips one memo at a time, each stored in a commit
 of its own; the update committed each branch's code index and its names
 apart. And the tool charged the push with everything but the deriver's
 `derive_progress` writes and the pack rows.
+
+Of the 1.49 the gate's figure fell, 0.94 is commits no longer made (the
+memos stored together, the search index in one transaction: 4.60 to 3.66
+in all); the rest is the landings' (0.29, now gated per branch landing)
+and the background work's (0.26), now counted by kind and set aside.
 
 **What changed**:
 - a fill works out its tips' projections with the memo rows deferred and
@@ -1929,8 +1935,8 @@ apart. And the tool charged the push with everything but the deriver's
   head moved meanwhile;
 - `veil-bench` charges a push with every commit but the pack rows, the
   background kinds (`derive`, `fill`, `search`, `pack_gc`,
-  `land_service`) and, in a mode whose operations are pushes, the
-  landings' (`land_submit`, `land_batch`), gated per branch landing at
+  `land_service`) and, when branches land beside the pushes
+  (`--merge-every`), the landings' (`land_submit`, `land_batch`), gated per branch landing at
   2 (`db_branch_landing_commits_per_landing`): its submit and at most a
   batch of its own. The landing service's 1.5 holds at its target rate,
   where batches fill; at 50 branch landings a second most are alone in

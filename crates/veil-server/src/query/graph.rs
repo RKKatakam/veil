@@ -792,13 +792,14 @@ async fn walk_tips(
 }
 
 /// The projections of `tips` for `viewer`, as `sync::projected` answers
-/// them, the memo rows they need stored together: one statement (one
-/// commit) for every `ROWS_PER_STATEMENT` rows (BUG-2350: stored one at a
-/// time, each its own commit, a fill of 300 branches' tips cost 300).
-/// Should a row stored first (by another server) hold another projection,
-/// what was worked out is dropped (a snapshot's projection names its
-/// parents'), and the tips are projected again one memo at a time, each
-/// stored one taken as it is (`sync::projected`).
+/// them, the memo rows they need stored together: one transaction (one
+/// commit), a statement for every `ROWS_PER_STATEMENT` rows (BUG-2350:
+/// stored one at a time, each its own commit, a fill of 300 branches' tips
+/// cost 300). Should a row stored first (by another server) hold another
+/// projection, the whole batch is rolled back, since its rows below that
+/// one name the projection worked out here (BUG-2390), and the tips are
+/// projected again one memo at a time, each stored one taken as it is
+/// (`sync::projected`).
 async fn project_tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], progress: &Progress) -> Result<Vec<ObjectId>> {
     if let Ok(Some(ps)) = project_tips_together(hub, project, viewer, tips, progress).await {
         return Ok(ps);
@@ -819,6 +820,8 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
         ps.push(crate::store::not_own(Box::pin(sync::projected_inner(hub, project, viewer, *t, Some(&mut deferred)))).await?);
     }
     let now = veil_core::now_millis();
+    let mut tx = hub.db.begin().await?;
+    let mut wrote = false;
     for chunk in deferred.rows.chunks(ROWS_PER_STATEMENT) {
         let keys: Vec<&str> = chunk.iter().map(|(k, _, _)| k.as_str()).collect();
         let reals: Vec<String> = chunk.iter().map(|(_, r, _)| r.hex()).collect();
@@ -835,11 +838,9 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
         .bind(&projected)
         .bind(now)
         .bind(&collapsed)
-        .fetch_all(&hub.db)
+        .fetch_all(&mut *tx)
         .await?;
-        if !inserted.is_empty() {
-            hub.commits.count(crate::db::Commit::Fill);
-        }
+        wrote |= !inserted.is_empty();
         if inserted.len() < chunk.len() {
             // Stored first by another request: the same projection, or
             // what was worked out here is not used.
@@ -853,12 +854,17 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
             .bind(project.id)
             .bind(&k2)
             .bind(&r2)
-            .fetch_all(&hub.db)
+            .fetch_all(&mut *tx)
             .await?;
             if stored.len() != k2.len() || stored.iter().any(|(k, r, p)| ours.get(&(k.as_str(), r.as_str())) != Some(&p.as_str())) {
+                tx.rollback().await?;
                 return Ok(None);
             }
         }
+    }
+    tx.commit().await?;
+    if wrote {
+        hub.commits.count(crate::db::Commit::Fill);
     }
     for (k, r, p) in &deferred.rows {
         hub.caches.put_memo(project.id, k, r, p);

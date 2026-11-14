@@ -1091,6 +1091,15 @@ impl CommitKinds {
             by_kind,
         })
     }
+
+    /// The commits not charged to a push: the background work's and, when
+    /// `landings_gated` (branch landings beside the pushes, gated per
+    /// landing), the landings'. A push that queues its own landing
+    /// (`--protected` without `--merge-every`) keeps its submit, which no
+    /// other gate counts (BUG-2350 review).
+    fn aside(&self, landings_gated: bool) -> f64 {
+        self.background + if landings_gated { self.landing } else { 0.0 }
+    }
 }
 
 /// The gates one run missed (`storage-and-cost.md` §9).
@@ -1642,17 +1651,14 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         // they are written (uploads', and a push's own: S28) aside, and
         // the background work's (the deriver's, the fills', the search
         // index's, the pack merges', the landing service's leases) and,
-        // in a mode whose operations are pushes, the landings' (their
+        // when branches land beside the pushes (`--merge-every`), the landings' (their
         // submits and batches, gated per branch landing), as the server counts
         // them by kind (BUG-2350). A commit no kind names is charged to
         // the push. Without the server's counts, the deriver's are its
         // `derive_progress` writes.
         let push_commits = writes.map(|w| {
             let aside = match &commit_kinds {
-                Some(k) => {
-                    let landings = if a.mode == Mode::Landing { 0.0 } else { k.landing };
-                    k.background + landings
-                }
+                Some(k) => k.aside(a.mode != Mode::Landing && c.merges.load(Ordering::Relaxed) > 0),
                 None => deriver.unwrap_or(0.0),
             };
             per_op((w - aside - stat("pack_row_commits").unwrap_or(0.0)).max(0.0))
@@ -2191,6 +2197,8 @@ mod tests {
         };
         let k = CommitKinds::between(&at(10, 0, 0, 5, 0, 0, 0, 0, 0), &at(1010, 200, 120, 75, 190, 2, 46, 1, 3)).expect("counted by kind");
         assert_eq!((k.landing, k.background), (320.0, 70.0 + 190.0 + 2.0 + 46.0 + 1.0));
+        assert_eq!(k.aside(true), 320.0 + 309.0, "branch landings, gated per landing, are not the push's");
+        assert_eq!(k.aside(false), 309.0, "a landing no gate counts stays the push's");
         assert!(CommitKinds::between(&json!({}), &at(1, 0, 0, 0, 0, 0, 0, 0, 0)).is_none(), "a server that counts no kinds");
         let run = |own: f64, landing: f64| {
             json!({"mode": "branches", "ops": 1000.0, "db_push_commits_per_op": own, "branch_merges": 200.0, "db_branch_landing_commits_per_landing": landing})

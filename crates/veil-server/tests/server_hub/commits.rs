@@ -3,6 +3,7 @@
 //! that takes many branches' pushes at once writes everything derived from
 //! them in its one transaction.
 
+use veil_core::ObjectId;
 use veil_server::{db::Commit, sync::root_snapshot_id};
 
 use crate::{
@@ -202,4 +203,67 @@ fn bug_2350_a_memo_stored_first_wins_over_a_fills_batch() {
         let p = th.rt.block_on(veil_server::sync::projected(&hub, &project, &anyone, *t)).unwrap();
         assert_eq!(rows[&t.hex()], p.hex(), "each other tip's memo is its projection");
     }
+}
+
+/// BUG-2390: a fill's batch of memos is stored by one `INSERT … ON
+/// CONFLICT DO NOTHING`, which skips a row stored first but stores the rest
+/// of the batch. A parent's row stored first with another projection (by
+/// another server, between the fill's working out and its insert) is kept,
+/// yet its child's row, worked out on the fill's own projection of that
+/// parent, was stored beside it: the child's memo names a parent that is
+/// not the parent's memo, and every fill of that view key over it failed
+/// ("does not name its parents' projections"). Now the batch is one
+/// transaction, rolled back whole, and the fill falls back to one memo at a
+/// time (`sync::projected`), which works the child out on the stored parent.
+#[test]
+fn bug_2390_a_childs_memo_is_built_on_its_parents_stored_memo() {
+    let th = TestHub::start();
+    let (text, bindings) = policy(900_003);
+    let mut h = Hist::new(&th, &text, &bindings);
+    let base = h.commit(&th, &[root_snapshot_id()], Files::from([("pub/a.txt".to_string(), b"a\n".to_vec())]), [1; 16], 1, None);
+    h.set_branch(&th, "main", base);
+    let first = th.rt.block_on(veil_server::derive::landing(&h.hub, h.id, vec!["main".to_string()])).unwrap();
+    assert_eq!(first.branches, vec!["main".to_string()], "the first landing derived main");
+    let files = |n: u8| Files::from([("pub/a.txt".to_string(), b"a\n".to_vec()), (format!("pub/p{n}.txt"), vec![b'p', n])]);
+    let parent = h.commit(&th, &[base], files(1), [7; 16], 200, None);
+    let child = h.commit(&th, &[parent], files(2), [8; 16], 201, None);
+    h.set_branch(&th, "side", child);
+    let hub = h.hub.clone();
+    let project = h.project(&th);
+    let anyone = veil_server::perm::Viewer::default();
+    let vk = project.view(&anyone).key();
+    // Another server's projection of the parent, stored the moment this
+    // server's insert of it begins (a trigger: the race made certain).
+    let other = th.rt.block_on(veil_server::sync::projected(&hub, &project, &anyone, base)).unwrap();
+    let f = format!("bug_2390_plant_{}", h.id);
+    let plant = format!(
+        "CREATE FUNCTION {f}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         IF NEW.project_id = {pid} AND NEW.real_id = '{real}' AND NEW.projected_id <> '{other}' THEN \
+         INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+         VALUES (NEW.project_id, NEW.view_key, NEW.real_id, '{other}', 0, false) ON CONFLICT DO NOTHING; END IF; \
+         RETURN NEW; END $$; \
+         CREATE TRIGGER {f} BEFORE INSERT ON projections FOR EACH ROW EXECUTE FUNCTION {f}();",
+        pid = h.id,
+        real = parent.hex(),
+        other = other.hex(),
+    );
+    th.rt.block_on(sqlx::raw_sql(&plant).execute(&hub.db)).unwrap();
+    let ps = th.rt.block_on(veil_server::query::graph::extend(&hub, &project, &anyone, &[child]));
+    th.rt.block_on(sqlx::raw_sql(&format!("DROP TRIGGER {f} ON projections; DROP FUNCTION {f}();")).execute(&hub.db)).unwrap();
+    let ps = ps.expect("the fill of the child's branch");
+    let memo = |real: ObjectId| -> String {
+        th.rt
+            .block_on(
+                sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                    .bind(h.id)
+                    .bind(&vk)
+                    .bind(real.hex())
+                    .fetch_one(&hub.db),
+            )
+            .unwrap()
+    };
+    assert_eq!(memo(parent), other.hex(), "the parent's row stored first is kept");
+    assert_eq!(memo(child), ps[0].hex(), "the fill answers the child's stored memo");
+    let pc = th.rt.block_on(veil_server::sync::blocking(&hub, h.id, move |src| Ok(src.snapshot(&ps[0])?))).unwrap();
+    assert_eq!(pc.parents, vec![other], "the child's memo is built on its parent's stored memo");
 }
