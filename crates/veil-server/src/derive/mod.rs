@@ -957,14 +957,17 @@ impl<'a> Batch<'a> {
     /// value yet.
     fn derive_from(&mut self, roots: &[ObjectId]) -> Result<()> {
         let order = self.underived(roots)?;
-        for chunk in order.chunks(AHEAD) {
-            self.read_ahead(chunk)?;
-            for x in chunk {
+        let mut at = 0;
+        while at < order.len() {
+            let chunk = &order[at..order.len().min(at + AHEAD)];
+            let n = self.read_ahead(chunk)?;
+            for x in &chunk[..n] {
                 self.derive_one(*x)?;
                 if self.writes.full() {
                     self.flush()?;
                 }
             }
+            at += n;
         }
         self.ahead_trees.clear();
         self.ahead_history.clear();
@@ -1043,22 +1046,31 @@ impl<'a> Batch<'a> {
     /// changed, on [`AHEAD_THREADS`] threads (each read is an object read,
     /// some from disk), and the stored history of every path they change,
     /// in one statement per [`ROWS_PER_STATEMENT`] paths instead of one
-    /// for each snapshot (BUG-2361).
-    fn read_ahead(&mut self, chunk: &[ObjectId]) -> Result<()> {
+    /// for each snapshot (BUG-2361). It reads the first snapshots of
+    /// `chunk` until they changed [`MAX_QUEUED_ROWS`] paths (BUG-2380: what
+    /// 512 snapshots changed is unbounded, as a batch's rows were before
+    /// BUG-867's fix): how many it read, at least one.
+    fn read_ahead(&mut self, chunk: &[ObjectId]) -> Result<usize> {
         let src = &self.cx.src;
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let held = std::sync::atomic::AtomicUsize::new(0);
         let read: Vec<Result<Vec<(ObjectId, TreeChanges)>>> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..AHEAD_THREADS.min(chunk.len()))
                 .map(|_| {
                     sc.spawn(|| {
                         deriving(|| {
                             let mut out = Vec::new();
-                            loop {
-                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let Some(x) = chunk.get(i) else { return Ok(out) };
+                            // Every index taken is read: those read are a
+                            // prefix of `chunk`.
+                            while held.load(std::sync::atomic::Ordering::SeqCst) < MAX_QUEUED_ROWS {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let Some(x) = chunk.get(i) else { break };
                                 let parents = src.snapshot(x)?.parents.clone();
-                                out.push((*x, tree_changes(src, *x, &parents)?));
+                                let c = tree_changes(src, *x, &parents)?;
+                                held.fetch_add(c.0.len() + c.1.len(), std::sync::atomic::Ordering::SeqCst);
+                                out.push((*x, c));
                             }
+                            Ok(out)
                         })
                     })
                 })
@@ -1104,7 +1116,7 @@ impl<'a> Batch<'a> {
         for rows in self.ahead_history.values_mut() {
             rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.hex().cmp(&a.1.hex())));
         }
-        Ok(())
+        Ok(next.into_inner().min(chunk.len()))
     }
 
     /// Compute and queue every value of `x`, whose parents are derived.

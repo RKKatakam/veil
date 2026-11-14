@@ -5653,7 +5653,9 @@ transaction per landing instead of 23.
    second on the benchmark's machine, so at 1,000 landings a second it
    fell 56 to 300 s behind, and each run was longer than the last. Now it
    asks whether up to 512 snapshots down a first-parent line are derived
-   in one statement, reads what a chunk of 512 changed on 8 threads, and
+   in one statement, reads what a chunk of up to 512 changed on 8 threads
+   (a chunk ends once it changed 100,000 paths, the batch's own bound since
+   BUG-867: BUG-2380), and
    the deepest 8 stored history rows of every path the chunk changes in
    one statement per 1,000 paths; a path's rows at or above the asking
    snapshot's depth begin the list the per-snapshot statement gave, in its

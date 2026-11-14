@@ -1774,6 +1774,24 @@ mod s12_adversarial {
         assert!(grew < 1 << 30, "memory rose {} MiB deriving one batch", grew >> 20);
     }
 
+    /// BUG-2380: the deriver's read-ahead (BUG-2361) held what up to 512
+    /// snapshots changed at once, whatever they changed: BUG-867's push of
+    /// one folder alternating between two trees, 160 snapshots of 50,000
+    /// paths, drove the deriver's memory past 1 GiB again. BUG-867's test
+    /// (a process of its own) with that many snapshots.
+    #[test]
+    fn bug_2380_the_read_ahead_holds_bounded_memory() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "derived::s12_adversarial::bug_867_a_derive_batch_holds_unbounded_memory", "--nocapture"])
+            .env("VEIL_BUG867_CHILD", "1")
+            .env("VEIL_BUG867_SNAPSHOTS", "160")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        println!("{}", stdout.lines().find(|l| l.contains("BUG-867:")).unwrap_or_default());
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    }
+
     /// BUG-868: every snapshot that changed more than 100,000 paths (`many`)
     /// is checked, against the trees, for every path of every later change
     /// on the same line. `many` snapshots cost a member nothing to make (one
