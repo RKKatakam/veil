@@ -767,7 +767,12 @@ without the setup step, and `configure.sh` checks that it is still up 15
 s later (BUG-2432); a gate during which MinIO restarted fails, with its
 restart count before and after in `minio-restarts.txt` (§6.2);
 `estimate.sh` and `create.sh` refuse a shared-CPU storage droplet
-(BUG-2431). `doctl` 2.x has been released since; the kit was run with
+(BUG-2431). The rehearsal with MinIO started directly (`dorun1` @ `8bcbf200`,
+three YugabyteDB nodes, Compose project `veil-dokit-dorun1`): every gate
+**ok**, MinIO never restarted and ran no setup step; `failover` moved the
+lease with a longest pause of 301 ms and no change lost or landed twice;
+`spaces` (against the MinIO) 49 pushes, 7 merges, no error; teardown left
+nothing of the project. `doctl` 2.x has been released since; the kit was run with
 1.186.0 (`docs/REPRODUCE.md` pins it).
 
 **What the next run needs:**
