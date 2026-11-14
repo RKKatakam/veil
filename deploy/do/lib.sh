@@ -48,8 +48,10 @@ OBJECTS=${VEIL_DO_OBJECTS:-minio}
 # needs a block-storage volume of OBJECTS_VOLUME_GB (0: the droplet's disk).
 SIZE_OBJECTS=${VEIL_DO_SIZE_OBJECTS:-c2-16vcpu-32gb}
 OBJECTS_VOLUME_GB=${VEIL_DO_OBJECTS_VOLUME_GB:-0}
-# The free space configure.sh requires where MinIO keeps its data.
-OBJECTS_NEED_GB=250
+# The free space configure.sh requires where MinIO keeps its data (the
+# full gates write up to about 200 GiB; a run with smaller gates may lower it).
+OBJECTS_NEED_GB=${VEIL_DO_OBJECTS_NEED_GB:-250}
+[[ "$OBJECTS_NEED_GB" =~ ^[1-9][0-9]*$ ]] || { echo "do: invalid VEIL_DO_OBJECTS_NEED_GB '$OBJECTS_NEED_GB'" >&2; exit 2; }
 [[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]] || { echo "do: invalid VEIL_DO_NAME '$NAME' (use letters, digits and hyphens)" >&2; exit 2; }
 [[ "$REGION" =~ ^[a-z0-9-]+$ ]] || { echo "do: invalid VEIL_DO_REGION '$REGION'" >&2; exit 2; }
 [[ "$DRIVERS" =~ ^[1-9][0-9]*$ ]] || { echo "do: invalid VEIL_DO_DRIVERS '$DRIVERS'" >&2; exit 2; }
