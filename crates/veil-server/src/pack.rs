@@ -2356,6 +2356,7 @@ mod tests {
             embargo: Default::default(),
             pack_gc: Default::default(),
             limits: crate::limits::Limits::new(Default::default(), 1),
+            commits: Default::default(),
         });
         let all_slots: Vec<(ObjectId, Slot)> = sorted_ids.iter().map(|id| (*id, valid_idx.get(id).unwrap())).collect();
         let touched: HashSet<ObjectId> = sorted_ids.iter().copied().collect();
@@ -2547,6 +2548,7 @@ mod tests {
             embargo: Default::default(),
             pack_gc: Default::default(),
             limits: crate::limits::Limits::new(Default::default(), 1),
+            commits: Default::default(),
         });
         let total_objs = MAX_OBJECTS + 50_000;
         let mut made_map = HashMap::with_capacity(total_objs);

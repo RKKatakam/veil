@@ -652,6 +652,8 @@ async fn commit(
             (cs, aus, ls)
         }
     };
+    // An API commit is its push; one that queues a landing, the landing's submit.
+    let kind = if land.is_some() { crate::db::Commit::LandSubmit } else { crate::db::Commit::Push };
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let (real, cid, accept, policy_text_update, mv, view_key, snaps, moved_refs, land, on_branch, expected_prev, base_embargo) = (
             real.clone(),
@@ -861,6 +863,7 @@ async fn commit(
         })
     })
     .await?;
+    hub.commits.count(kind);
     let (r, memos) = r;
     for id in &committed {
         hub.caches.put_committed(pid, id);

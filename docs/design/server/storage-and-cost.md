@@ -115,6 +115,8 @@ In each API server's memory, never in the database:
 
 `scripts/bench-server.sh` prints these counts with every profile, so every performance round and every server milestone shows its cost next to its speed.
 
+**How a push's commits are counted** (BUG-2350, 2026-11-14): the server counts its database commits by kind where each is made (`db::Commit`: the push's, a landing's submit and batch, the landing service's leases, the deriver's, the fills', a request's projection memo, the search index's, the pack merges'), and `veil-bench` charges a push with every commit the database made in the window but the staged-pack rows, the background kinds and, where the operations are pushes, the landings', which are gated per branch landing (2: its submit and at most a batch of its own, since batches seldom fill at those rates; the landing service's 1.5 is at its target rate). A commit no kind names stays the push's.
+
 ## 10. Other performance work in the plan
 
 Found by the benchmarks of 2026-11-06. Each is a small fix round, not a milestone:
