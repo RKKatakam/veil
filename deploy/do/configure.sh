@@ -16,14 +16,19 @@
 # (the object store's keys, the database URL), spaces.env on the first
 # server (the Spaces keys of the `spaces` gate), minio.env on the storage
 # droplet (MinIO's credentials, generated here into the run's private state
-# directory, never on a command line).
+# directory, never on a command line). On Google Cloud (VEIL_KIT=gcp) there
+# is no Spaces bucket: no spaces.env, and MinIO keeps its data on the
+# storage machine's local NVMe SSD (deploy/gcp/lib.sh `local_ssd_mount`).
 #   configure.sh [--approve] [TAG]     TAG: the image tag (default: this commit's)
 set -euo pipefail
-. "$(dirname "$0")/lib.sh"
+# The steps on the machines are shared with deploy/gcp, which runs this
+# script with VEIL_KIT=gcp: then its lib.sh is the one sourced.
+case ${VEIL_KIT:-do} in do|gcp) ;; *) echo "invalid VEIL_KIT '${VEIL_KIT:-}' (do or gcp)" >&2; exit 2 ;; esac
+. "$(dirname "$0")/../${VEIL_KIT:-do}/lib.sh"
 [ $# -le 1 ] && [[ "${1:-}" != -* ]] || { echo "configure: unknown argument '${1:-}' (usage: configure.sh [--approve|--dry-run] [TAG])" >&2; exit 2; }
 TAG=${1:-$(cd "$DO_ROOT" && git describe --always --dirty --abbrev=8)}
-: "${VEIL_DO_SPACES_KEY:?set VEIL_DO_SPACES_KEY in $ENV_FILE}"; : "${VEIL_DO_SPACES_SECRET:?set VEIL_DO_SPACES_SECRET in $ENV_FILE}"
-[ "$YB_NODES" -gt 0 ] || : "${VEIL_DO_DB_PASSWORD:?set VEIL_DO_DB_PASSWORD in $ENV_FILE}"
+if [ "$SPACES_GATE" = 1 ]; then : "${VEIL_DO_SPACES_KEY:?set VEIL_DO_SPACES_KEY in $ENV_FILE}"; : "${VEIL_DO_SPACES_SECRET:?set VEIL_DO_SPACES_SECRET in $ENV_FILE}"; fi
+[ "$YB_NODES" -gt 0 ] || [ -n "$DB_PASSWORD" ] || { echo "configure: set ${ENV_PREFIX}DB_PASSWORD in $ENV_FILE" >&2; exit 2; }
 [ $APPROVED = 1 ] && require_created
 [ -n "$BUCKET" ] || BUCKET="$NAME-objects-DRY"
 FRONT=$(front_host public); FRONT_PRIV=$(front_host private)
@@ -52,7 +57,7 @@ done < <(droplets)
 echo "== 3. shipping images veil-server:$TAG and veil-bench:$TAG"
 ship() { # image, host
     if [ $APPROVED = 1 ]; then
-        D save "$1" | zstd -T0 -3 | ssh -i "$STATE/id_ed25519" -o UserKnownHostsFile="$STATE/known_hosts" -o StrictHostKeyChecking=accept-new "root@$2" 'zstd -d | docker load' >/dev/null
+        D save "$1" | zstd -T0 -3 | ssh -i "$STATE/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$STATE/known_hosts" -o StrictHostKeyChecking=accept-new "root@$2" 'zstd -d | docker load' >/dev/null
         echo "   $1 -> $2"
     else echo "would ship $1 to $2 (docker save | zstd | ssh docker load)" >&2; fi
 }
@@ -95,7 +100,7 @@ else
     DBIP=$(ip_of "$NAME-db"); DBIP=${DBIP:-DB_IP}; DBPRIV=$(priv_of "$NAME-db"); DBPRIV=${DBPRIV:-DB_PRIVATE_IP}
     # The password goes over as a root-only file, read by Docker's --env-file.
     if [ $APPROVED = 1 ]; then
-        umask 077; printf 'POSTGRES_USER=veil\nPOSTGRES_PASSWORD=%s\nPOSTGRES_DB=veil\n' "$VEIL_DO_DB_PASSWORD" > "$STATE/pg.env"; umask 022
+        umask 077; printf 'POSTGRES_USER=veil\nPOSTGRES_PASSWORD=%s\nPOSTGRES_DB=veil\n' "$DB_PASSWORD" > "$STATE/pg.env"; umask 022
         copy_to "$STATE/pg.env" "$DBIP" /etc/veil/pg.env
         copy_to "$DO_ROOT/deploy/compose/init.sql" "$DBIP" /etc/veil/init.sql
     else echo "would copy the PostgreSQL env file and deploy/compose/init.sql to $DBIP" >&2; fi
@@ -119,6 +124,8 @@ if [ "$OBJECTS" = minio ]; then
     if [ "$OBJECTS_VOLUME_GB" -gt 0 ]; then
         MDATA=/mnt/minio-data
         remote "$MIP" "dev=/dev/disk/by-id/scsi-0DO_Volume_$VOLUME_NAME; for i in \$(seq 60); do [ -e \$dev ] && break; sleep 2; done; mkdir -p $MDATA && { mountpoint -q $MDATA || mount -o discard,defaults,noatime \$dev $MDATA; }"
+    elif [ "${OBJECTS_LOCAL_SSD:-0}" = 1 ]; then
+        MDATA=/mnt/minio-data; remote "$MIP" "$(local_ssd_mount "$MDATA")"
     else MDATA=/srv/minio; fi
     remote "$MIP" "chmod 600 /etc/veil/minio.env && mkdir -p $MDATA && chown 1001:1001 $MDATA && a=\$(df --output=avail -BG $MDATA | tail -1 | tr -dc 0-9) && echo \"   MinIO's data in $MDATA: \${a} GB free (needs $OBJECTS_NEED_GB)\" && [ \"\$a\" -ge $OBJECTS_NEED_GB ] || { echo 'configure: too little disk for MinIO: a larger VEIL_DO_SIZE_OBJECTS, or VEIL_DO_OBJECTS_VOLUME_GB' >&2; exit 1; }"
     # Bitnami's MinIO serves TLS from /certs; its setup's client (mc) checks
@@ -152,7 +159,8 @@ hub_env() { # server number, host
 for i in $(seq "$HUBS"); do hub_env "$i" "$(addr "$(hub_name "$i")")"; done
 while read -r role name size; do [ "$role" = driver ] && hub_env 1 "$(addr "$name")"; done < <(droplets)
 # The `spaces` gate's own server (on the first server's machine) uses Spaces.
-if [ $APPROVED = 1 ]; then
+if [ "$SPACES_GATE" = 0 ]; then :
+elif [ $APPROVED = 1 ]; then
     umask 077; printf 'VEIL_S3_ACCESS_KEY=%s\nVEIL_S3_SECRET_KEY=%s\nVEIL_DATABASE_URL=%s\n' "$VEIL_DO_SPACES_KEY" "$VEIL_DO_SPACES_SECRET" "$(database_url 1)" > "$STATE/spaces.env"; umask 022
     copy_to "$STATE/spaces.env" "$HUB1" /etc/veil/spaces.env
 else echo "would copy /etc/veil/spaces.env (Spaces keys, the database URL of server 1) to $HUB1" >&2; fi
@@ -208,7 +216,7 @@ echo "== 6. smoke test from here"
 if [ $APPROVED = 1 ]; then
     code=$(curl -s --http1.1 -o /dev/null -w '%{http_code}' --max-time 10 --cacert "$STATE/tls/ca.pem" "https://$FRONT:8443/v1/epochs" || echo 000)
     echo "   https://$FRONT:8443/v1/epochs -> HTTP $code with the run's CA (a 4xx is expected: the route needs a grant)"
-    case "$code" in 2*|4*) ;; *) echo "configure: the server did not answer cleanly (HTTP $code); see deploy/do/logs.sh" >&2; exit 1 ;; esac
+    case "$code" in 2*|4*) ;; *) echo "configure: the server did not answer cleanly (HTTP $code); see deploy/$KIT/logs.sh" >&2; exit 1 ;; esac
     save_state TAG "$TAG"
-    echo "== configured. vl clients: vl login https://$FRONT:8443 --ca $STATE/tls/ca.pem ; benchmarks: deploy/do/bench.sh --approve <gate>"
+    echo "== configured. vl clients: vl login https://$FRONT:8443 --ca $STATE/tls/ca.pem ; benchmarks: deploy/$KIT/bench.sh --approve <gate>"
 else echo "would curl https://$FRONT:8443/v1/epochs with the run's CA" >&2; fi

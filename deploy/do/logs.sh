@@ -5,7 +5,10 @@
 # recorded, memory and disk (MinIO's data on the storage droplet), and the
 # kernel's log tail.
 set -euo pipefail
-. "$(dirname "$0")/lib.sh"
+# The steps on the machines are shared with deploy/gcp, which runs this
+# script with VEIL_KIT=gcp: then its lib.sh is the one sourced.
+case ${VEIL_KIT:-do} in do|gcp) ;; *) echo "invalid VEIL_KIT '${VEIL_KIT:-}' (do or gcp)" >&2; exit 2 ;; esac
+. "$(dirname "$0")/../${VEIL_KIT:-do}/lib.sh"
 [ $# -eq 0 ] || { echo "logs: unknown argument '$1' (usage: logs.sh [--approve|--dry-run])" >&2; exit 2; }
 [ $APPROVED = 1 ] && require_created
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)

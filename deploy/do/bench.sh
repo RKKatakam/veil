@@ -21,19 +21,26 @@
 #   (DURATION=20, LANDING_AGENTS=10000, ...: docs/REPRODUCE.md); DRIVER=n picks
 #   the driver of a one-driver gate; STEP_LIMIT (default 3600 s) bounds each command.
 set -euo pipefail
-. "$(dirname "$0")/lib.sh"
+# The steps on the machines are shared with deploy/gcp, which runs this
+# script with VEIL_KIT=gcp: then its lib.sh is the one sourced.
+case ${VEIL_KIT:-do} in do|gcp) ;; *) echo "invalid VEIL_KIT '${VEIL_KIT:-}' (do or gcp)" >&2; exit 2 ;; esac
+. "$(dirname "$0")/../${VEIL_KIT:-do}/lib.sh"
 GATES_DIR=$DO_ROOT/deploy
 . "$GATES_DIR/gates.sh"
 GATE=${1:?gate: one of $GATES_ALL}; shift
 case " $GATES_ALL " in *" $GATE "*) ;; *) echo "bench: unknown gate '$GATE' (one of: $GATES_ALL)" >&2; exit 2 ;; esac
-[ "$GATE" != failover ] || [ "$HUBS" -ge 2 ] || { echo "bench: failover needs VEIL_DO_HUBS=2 or 3 (one server cannot fail over)" >&2; exit 2; }
+[ "$GATE" != failover ] || [ "$HUBS" -ge 2 ] || { echo "bench: failover needs ${ENV_PREFIX}HUBS=2 or 3 (one server cannot fail over)" >&2; exit 2; }
+[ "$GATE" != spaces ] || [ "$SPACES_GATE" = 1 ] || { echo "bench: the spaces gate runs on a DigitalOcean Spaces bucket; the $KIT kit has none" >&2; exit 2; }
 [ $APPROVED = 1 ] && require_created
 # TAG: the one configure.sh saved in the state file, else this commit's.
 TAG=${TAG:-$(cd "$DO_ROOT" && git describe --always --dirty --abbrev=8 2>/dev/null || echo dev)}
 COMMIT=$(cd "$DO_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)
 [ -n "$BUCKET" ] || BUCKET="$NAME-objects-DRY"
 STEP_LIMIT=${STEP_LIMIT:-3600}
-STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+# BENCH_STAMP: the results directory's stamp, when a caller picks it
+# (deploy/gcp/bench.sh, to mark a gate a spot reclaim interrupted).
+STAMP=${BENCH_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}
+[[ "$STAMP" =~ ^[0-9A-Za-z-]+$ ]] || { echo "bench: invalid BENCH_STAMP '$STAMP'" >&2; exit 2; }
 OUT=$DO_ROOT/deploy/results/$NAME/$STAMP-$GATE
 [ $APPROVED = 1 ] && mkdir -p "$OUT"
 DRY=$((1 - APPROVED))
@@ -42,7 +49,7 @@ URL=https://$(front_host private):8443
 SERVERS=$HUBS
 OWN=(--server /usr/local/bin/veil-server --s3-endpoint "$(objects_endpoint)")
 OWN_BUCKET=$BUCKET
-SPACES_OWN=(--server /usr/local/bin/veil-server --s3-endpoint "$SPACES_ENDPOINT")
+SPACES_OWN=(--server /usr/local/bin/veil-server --s3-endpoint "${SPACES_ENDPOINT:-}")
 SPACES_BUCKET=$BUCKET-spaces
 addr() { local v; v=$(ip_of "$1"); echo "${v:-${1}_IP}"; }            # public (a placeholder in a dry run)
 paddr() { local v; v=$(priv_of "$1"); echo "${v:-${1}_PRIVATE_IP}"; }  # private

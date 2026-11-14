@@ -21,6 +21,10 @@ if [ -f "$ENV_FILE" ]; then
     while IFS= read -r kv; do [ -n "$kv" ] && export "$kv"; done <<<"$saved"
 fi
 
+# Which kit this is, for the steps deploy/do and deploy/gcp share
+# (deploy/kit.sh): its name, its settings' prefix, whether it has the
+# `spaces` gate (a DigitalOcean Spaces bucket), and the PostgreSQL password.
+KIT=do; ENV_PREFIX=VEIL_DO_; SPACES_GATE=1; DB_PASSWORD=${VEIL_DO_DB_PASSWORD:-}
 NAME=${VEIL_DO_NAME:-veil-test}
 REGION=${VEIL_DO_REGION:-nyc3}
 SIZE_HUB=${VEIL_DO_SIZE_HUB:-c-16}
@@ -100,57 +104,10 @@ fi
 run_do() { # doctl arguments...
     if [ $APPROVED = 1 ]; then doctl "$@"; else echo "would run: doctl $*" >&2; fi
 }
-# Secrets never appear on a command line: they go through files or stdin.
-# `remote` never reads stdin (ssh -n): inside `while read …; done < <(droplets)`
-# ssh would forward the rest of the list to the droplet, and the loop would
-# stop after its first droplet. `remote_stdin` is for a command fed on stdin.
-remote() { # host, command...   (ssh as root with this run's key)
-    _ssh -n "$@"
-}
-remote_stdin() { # host, command...   (stdin goes to the command)
-    _ssh "" "$@"
-}
-_ssh() { # -n or "", host, command...
-    local n=$1 host=$2; shift 2
-    if [ $APPROVED = 1 ]; then
-        ssh ${n:+"$n"} -i "$STATE/id_ed25519" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" \
-            -o ConnectTimeout=15 -o BatchMode=yes "root@$host" "$@"
-    else echo "would run on $host: $*" >&2; fi
-}
-copy_to() { # local, host, remote path
-    if [ $APPROVED = 1 ]; then
-        scp -q -i "$STATE/id_ed25519" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" "$1" "root@$2:$3"
-    else echo "would copy $1 to $2:$3" >&2; fi
-}
-copy_from() { # host, remote path, local
-    if [ $APPROVED = 1 ]; then
-        scp -q -r -i "$STATE/id_ed25519" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" "root@$1:$2" "$3"
-    else echo "would copy $1:$2 to $3" >&2; fi
-}
-ensure_state_dir() {
-    mkdir -p "$STATE"; chmod 700 "$(dirname "$STATE")" "$STATE"
-}
-save_state() { # KEY VALUE: remembered across scripts
-    ensure_state_dir
-    touch "$STATE_FILE"; chmod 600 "$STATE_FILE"
-    grep -v "^$1=" "$STATE_FILE" > "$STATE_FILE.tmp" || true
-    printf '%s=%q\n' "$1" "$2" >> "$STATE_FILE.tmp"; mv "$STATE_FILE.tmp" "$STATE_FILE"; chmod 600 "$STATE_FILE"
-    printf -v "$1" '%s' "$2"
-}
-require_created() { # require a finished create.sh before configure/bench/logs --approve
-    [ -f "$STATE_FILE" ] && [ -f "$STATE/id_ed25519" ] && [ -n "${BUCKET:-}" ] || {
-        echo "do: no complete state for '$NAME' ($STATE_FILE); run deploy/do/create.sh --approve first" >&2; exit 2
-    }
-    local role name size
-    while read -r role name size; do
-        [ -n "$(ip_of "$name")" ] && [ -n "$(priv_of "$name")" ] || {
-            echo "do: missing address for '$name' in $STATE_FILE; create.sh did not finish (run destroy.sh --approve first)" >&2; exit 2
-        }
-    done < <(droplets)
-}
+# ssh, scp, the state file, addresses, the database URL: shared with deploy/gcp.
+. "$DO_ROOT/deploy/kit.sh"
 # The droplets of this topology: role, name, size. The first server keeps
 # the name NAME-hub; the others are NAME-hub2 and NAME-hub3.
-hub_name() { if [ "$1" = 1 ]; then echo "$NAME-hub"; else echo "$NAME-hub$1"; fi; }
 droplets() {
     local i
     for i in $(seq "$HUBS"); do echo "hub $(hub_name "$i") $SIZE_HUB"; done
@@ -163,35 +120,9 @@ droplets() {
     [ "$WITH_CACHE" = 1 ] && echo "cache $NAME-cache $SIZE_CACHE"
     return 0
 }
-# Addresses saved by create.sh: IP_<name with - as _> and PRIV_<…>.
-ip_of() { local v=IP_${1//-/_}; echo "${!v:-}"; }
-priv_of() { local v=PRIV_${1//-/_}; echo "${!v:-}"; }
-# The database URL the servers and the benchmarks use (private network).
-# With YugabyteDB, server I connects to node I (any node serves the whole
-# database), so the servers' connections are spread over the cluster.
-database_url() { # [server number, default 1]
-    local i=${1:-1} n
-    if [ "$YB_NODES" -gt 0 ]; then
-        n=$(( (i - 1) % YB_NODES + 1 )); n=$(priv_of "$NAME-yb$n")
-        echo "postgres://yugabyte@${n:-YB${i}_PRIVATE_IP}:5433/yugabyte"
-    else echo "postgres://veil:${VEIL_DO_DB_PASSWORD:-}@$(priv_of "$NAME-db"):5432/veil"; fi
-}
-# The object store the servers use: MinIO on the storage droplet's private
-# address (TLS with the run's certificate), or the Spaces endpoint.
-objects_endpoint() {
-    if [ "$OBJECTS" = minio ]; then
-        local v; v=$(priv_of "$NAME-minio"); echo "https://${v:-$NAME-minio_PRIVATE_IP}:9000"
-    else echo "$SPACES_ENDPOINT"; fi
-}
 # The storage droplet's volume (when OBJECTS_VOLUME_GB > 0) and the device
 # it appears as on the droplet.
 VOLUME_NAME=$NAME-minio-data
-# The one address agents and `vl` use: the balancer's with several
-# servers, else the server's. `front_host public|private`.
-front_host() {
-    local n=$NAME-hub v; [ "$HUBS" -gt 1 ] && n=$NAME-lb
-    if [ "$1" = public ]; then v=$(ip_of "$n"); echo "${v:-${n}_IP}"; else v=$(priv_of "$n"); echo "${v:-${n}_PRIVATE_IP}"; fi
-}
 # The topology as recorded beside every result: the settings without the
 # secrets (a fixed list of names, so a new secret can never leak into it).
 topology() {
