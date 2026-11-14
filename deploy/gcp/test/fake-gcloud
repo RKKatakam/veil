@@ -30,6 +30,7 @@ case "$*" in
     "projects describe"*) echo ACTIVE ;;
     "billing projects describe"*) echo "${FAKE_BILLING:-True}" ;;
     "services list"*) echo compute.googleapis.com ;;
+    "resource-manager org-policies describe"*) echo "${FAKE_OSLOGIN_ENFORCED:-}" ;;
     "compute machine-types list"*) t=$(flag --filter); t=${t#name=}; [ "$t" = "${FAKE_NO_TYPE:-}" ] || echo "$t" ;;
     "compute regions describe"*) cat "${FAKE_REGION_JSON:?}" ;;
     "compute project-info describe"*) cat "${FAKE_PROJECT_JSON:?}" ;;

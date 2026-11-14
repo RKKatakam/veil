@@ -4,7 +4,8 @@
 #   1. the project exists and is active;
 #   2. billing is enabled on it;
 #   3. the Compute Engine API is enabled (and says whether the Cloud
-#      Billing API is, for estimate.sh --live);
+#      Billing API is, for estimate.sh --live), and no organisation policy
+#      enforces OS Login (the kit's machines take only the run's own key);
 #   4. every machine type of the plan exists in the zone;
 #   5. the quotas in the region (CPUS, C2D_CPUS, PREEMPTIBLE_CPUS,
 #      LOCAL_SSD_TOTAL_GB, SSD_TOTAL_GB, IN_USE_ADDRESSES, INSTANCES) and
@@ -53,6 +54,15 @@ if [ $APPROVED = 1 ]; then
         { say "compute.googleapis.com: NOT enabled: gcloud services enable compute.googleapis.com --project=$PROJECT"; fail=1; }
     grep -qx cloudbilling.googleapis.com <<<"$apis" && say "cloudbilling.googleapis.com: enabled (estimate.sh --live can read prices)" ||
         say "cloudbilling.googleapis.com: not enabled (only estimate.sh --live needs it: gcloud services enable cloudbilling.googleapis.com --project=$PROJECT)"
+fi
+echo "== 3b. OS Login"
+# The kit reaches its machines as root with the run's own key, which an
+# organisation policy enforcing OS Login would refuse (configure.sh could
+# not connect).
+pol=$(run_gcloud resource-manager org-policies describe compute.requireOsLogin --effective --format='value(booleanPolicy.enforced)' 2>/dev/null || true)
+if [ $APPROVED = 1 ]; then
+    case "$pol" in True|true) say "the organisation enforces OS Login (compute.requireOsLogin): the kit cannot reach its machines; use a project outside that policy"; fail=1 ;;
+        *) say "OS Login not enforced by policy: the run's key can reach its machines" ;; esac
 fi
 echo "== 4. machine types in $ZONE"
 for t in "${types[@]}"; do

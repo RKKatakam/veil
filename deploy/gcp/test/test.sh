@@ -254,7 +254,7 @@ awk '$1 == "veil-kit-driver2" {$3 = "TERMINATED"} {print}' "$FAKE_GCLOUD_DIR/ins
 out=$("$K/destroy.sh" --check --approve 2>&1 || true)
 check "the check counts every VM, a stopped Spot VM among them, their disks, the firewall rules, subnet and network" '[[ "$out" == *"VMs (any state): 10 (of which stopped, e.g. reclaimed Spot VMs, still billing their disks: 1)"* && "$out" == *"disks: 10"* && "$out" == *"firewall rules: 2"* && "$out" == *"subnets: 1"* && "$out" == *"networks: 1"* && "$out" == *"SOMETHING IS LEFT"* ]]'
 check "the check only reads" '! grep -qE "^gcloud compute [a-z -]+ (delete|create|start|stop)" "$FAKE_GCLOUD_LOG"'
-check "it looks by the label or the kit's exact names, never a bare prefix" 'grep -q "^gcloud compute instances list --filter=labels.veil-run=veil-kit OR name~'"'"'^veil-kit-(hub\[23\]?|lb|db|yb\[0-9\]|driver\[0-9\]|minio|cache)\$'"'"'" "$FAKE_GCLOUD_LOG" && ! grep -q "name~'"'"'^veil-kit-'"'"'" "$FAKE_GCLOUD_LOG"'
+check "it looks by the label or the kit's exact names (never a bare prefix), whatever the VMs' state" 'grep -q "^gcloud compute instances list --filter=labels.veil-run=veil-kit OR name~'"'"'^veil-kit-(hub\[23\]?|lb|db|yb\[0-9\]|driver\[0-9\]|minio|cache)\$'"'"' --format=value(name,zone.basename(),status) " "$FAKE_GCLOUD_LOG" && ! grep -q "name~'"'"'^veil-kit-'"'"'" "$FAKE_GCLOUD_LOG"'
 check "the check fails when gcloud itself fails" '! FAKE_GCLOUD_FAIL=1 "$K/destroy.sh" --check --approve >/dev/null 2>&1'
 cp "$FAKE_GCLOUD_DIR/instances" "$T/instances.bak"
 : > "$FAKE_GCLOUD_LOG"
@@ -302,6 +302,8 @@ rc=0; out=$(FAKE_REGION_JSON=$T/region-pre.json FAKE_PROJECT_JSON=$T/project-ok.
 check "with PREEMPTIBLE_CPUS granted, the 68 Spot vCPUs count there and C2D_CPUS needs only the 40 on-demand" '[ $rc = 0 ] && [[ "$out" == *"PREEMPTIBLE_CPUS           us-central1       96       0      96      68  ok"* && "$out" == *"C2D_CPUS                   us-central1       48       0      48      40  ok"* ]]'
 rc=0; out=$(FAKE_BILLING=False FAKE_NO_TYPE=c2d-standard-8 FAKE_REGION_JSON=$T/region-ok.json FAKE_PROJECT_JSON=$T/project-ok.json "$K/preflight.sh" --approve 2>&1) || rc=$?
 check "billing off or a type the zone lacks: not ready" '[ $rc = 1 ] && [[ "$out" == *"billing: NOT enabled"* && "$out" == *"c2d-standard-8: NOT offered in us-central1-a"* ]]'
+rc=0; out=$(FAKE_OSLOGIN_ENFORCED=True FAKE_REGION_JSON=$T/region-ok.json FAKE_PROJECT_JSON=$T/project-ok.json "$K/preflight.sh" --approve 2>&1) || rc=$?
+check "an organisation policy enforcing OS Login: not ready" '[ $rc = 1 ] && [[ "$out" == *"enforces OS Login"* ]]'
 
 echo "== 9. secrets"
 everything=$(cat "$FAKE_GCLOUD_LOG" "$FAKE_SSH_LOG" "$FAKE_CURL_LOG" "$FAKE_GCLOUD_DIR/env.log" 2>/dev/null; echo "$out_c $out_cfg"; cat "$T"/state/*/user-data.yaml "$T"/state/*/state.env 2>/dev/null; find "$T/results" -type f -exec cat {} + 2>/dev/null || true)
