@@ -74,6 +74,11 @@ echo "ssh $*" >> "${FAKE_SSH_LOG:?}"
 case "$*" in
     *"cat /var/lib/veil/hub-"*) echo "fake-server-key-material" ;;
     *"cat /var/lib/veil/stats.json"*) echo '{"landing_batches": 0}' ;;
+    *"{{.RestartCount}}' minio"*)
+        # MinIO's restart count: 0, or one more at every look while it restarts.
+        f=${FAKE_SSH_LOG}.restarts; n=$(cat "$f" 2>/dev/null || echo 0)
+        [ "${FAKE_MINIO_RESTARTING:-0}" = 1 ] && n=$((n + 1)) && echo "$n" > "$f"
+        echo "$n" ;;
 esac
 exit 0
 SSH
@@ -284,13 +289,20 @@ check "no secret on an ssh or scp command line, in the output or in the results"
 # MinIO on the storage droplet (VEIL_DO_OBJECTS=minio, the default).
 MIN_U=$(sed -n 's/^MINIO_ROOT_USER=//p' "$S5/minio.env"); MIN_P=$(sed -n 's/^MINIO_ROOT_PASSWORD=//p' "$S5/minio.env")
 check "MinIO's credentials are made for the run, into a private file (0600) of the state directory" '[ "$(stat -c %a "$S5/minio.env")" = 600 ] && [[ "$MIN_U" =~ ^veil[0-9a-f]{16}$ ]] && [[ "$MIN_P" =~ ^[0-9a-f]{48}$ ]]'
-check "they reach the storage droplet as a file, and MinIO reads them with --env-file, on the private address only, with TLS" 'grep -q "scp .*minio.env root@203.0.113.10:/etc/veil/minio.env$" "$FAKE_SSH_LOG" && grep -q "docker run -d --name minio .*-p 10.10.0.10:9000:9000 --env-file /etc/veil/minio.env -e MINIO_SCHEME=https .*/etc/veil/tls/server.pem:/certs/public.crt:ro .*-v /etc/veil/mc:/.mc .*bitnamilegacy/minio:latest@sha256:" "$FAKE_SSH_LOG" && grep -q "cp /etc/veil/tls/ca.pem /etc/veil/mc/certs/CAs/veil-ca.crt && chown -R 1001:1001 /etc/veil/mc" "$FAKE_SSH_LOG" && grep -q "df --output=avail -BG /srv/minio" "$FAKE_SSH_LOG"'
+check "they reach the storage droplet as a file, and MinIO reads them with --env-file, on the private address only, with TLS" 'grep -q "scp .*minio.env root@203.0.113.10:/etc/veil/minio.env$" "$FAKE_SSH_LOG" && grep -q "docker run -d --name minio .*-p 10.10.0.10:9000:9000 --env-file /etc/veil/minio.env .*/etc/veil/tls/server.pem:/certs/public.crt:ro .*bitnamilegacy/minio:latest@sha256:" "$FAKE_SSH_LOG" && grep -q "df --output=avail -BG /srv/minio" "$FAKE_SSH_LOG"'
+. "$ROOT/deploy/versions.env"
+check "MinIO starts directly (its server binary with TLS from /certs), never through the image setup step, and is checked to stay up (BUG-2432)" '[ "$MINIO_BIN" = /opt/bitnami/minio/bin/minio ] && [[ "$MINIO_ARGS" == "server --certs-dir /certs "* ]] && grep -q -- "docker run -d --name minio .*--entrypoint $MINIO_BIN bitnamilegacy/minio:latest@sha256:[0-9a-f]* $MINIO_ARGS\"\?$" "$FAKE_SSH_LOG" && ! grep -q "/\.mc\|MINIO_SCHEME\|setup finished" "$FAKE_SSH_LOG" && grep -q "{{.RestartCount}} {{.State.Running}}\" minio); \[ \"\$r\" = \"0 true\" \]" "$FAKE_SSH_LOG"'
+check "the rehearsal starts MinIO the same way (the same binary and arguments from deploy/versions.env), without the setup client" 'grep -q "entrypoint: \${MINIO_BIN:?" "$ROOT/deploy/compose/docker-compose.yml" && grep -q "command: \${MINIO_ARGS:?" "$ROOT/deploy/compose/docker-compose.yml" && ! grep -q "/\.mc\|MINIO_SCHEME" "$ROOT/deploy/compose/docker-compose.yml" && grep -q "^MINIO_ARGS=\"\$MINIO_ARGS\"$" "$ROOT/deploy/compose/rehearsal.sh"'
 check "the servers get MinIO's keys and the run's CA in hub.env (not the Spaces keys); the spaces gate's Spaces keys go to the first server only" 'grep -q "^VEIL_S3_ACCESS_KEY=$MIN_U$" "$S5/hub3.env" && grep -q "^VEIL_S3_CA=/tls/ca.pem$" "$S5/hub3.env" && ! grep -q secret-spaces "$S5/hub3.env" && grep -q "^VEIL_S3_ACCESS_KEY=secret-spaces-key$" "$S5/spaces.env" && [ "$(stat -c %a "$S5/spaces.env")" = 600 ] && [ "$(grep -c "/etc/veil/spaces.env$" "$FAKE_SSH_LOG")" = 1 ] && grep -q "root@203.0.113.1:/etc/veil/spaces.env$" "$FAKE_SSH_LOG"'
 check "the certificate names the storage droplet, and every server reaches MinIO over TLS on its private address" 'openssl x509 -in "$S5/tls/server.pem" -noout -text | grep -q "IP Address:10.10.0.10" && openssl x509 -in "$S5/tls/server.pem" -noout -text | grep -q "DNS:veil-kit-full-minio" && grep -q "docker run -d --name veil-server .*--s3-endpoint https://10.10.0.10:9000 --s3-bucket veil-kit-full-objects-[0-9a-f]* --s3-region us-east-1" "$FAKE_SSH_LOG" && [ "$(grep -c "docker run -d --name veil-server .*--s3-endpoint https://10.10.0.10:9000" "$FAKE_SSH_LOG")" = 3 ] && grep -q "^VEIL_S3_CA=" "$S5/hub1.env"'
 check "the firewall opens nothing to any address but the operator's (22, 8443, 8444): MinIO only to the run's droplets" '[ "$(grep -o "address:[0-9./]*" <<<"$(grep "firewall create --name veil-kit-full" "$FAKE_DOCTL_LOG" | sed "s/--outbound-rules.*//")" | sort -u)" = "address:203.0.113.200/32" ] && grep -q "firewall create --name veil-kit-full .*protocol:tcp,ports:all,tag:veil-kit-full" "$FAKE_DOCTL_LOG" && grep -q "create veil-kit-full-minio .*--tag-names veil-kit-full" "$FAKE_DOCTL_LOG"'
 rc=0; out_asp=$(env $FULL "$T/do/bench.sh" --approve spaces 2>&1 </dev/null) || rc=$?
 res_sp=$(ls -d "$T"/results/veil-kit-full/*-spaces 2>/dev/null | head -1)
 check "bench.sh --approve spaces runs on the first server with spaces.env, and fails without a result to judge" '[ $rc != 0 ] && grep -q "root@203.0.113.1 .*--env-file /etc/veil/spaces.env .*--s3-endpoint https://nyc3.digitaloceanspaces.com --s3-bucket veil-kit-full-objects-[0-9a-f]*-spaces --mode branches" "$FAKE_SSH_LOG" && grep -q "spaces.json | missing" "$res_sp/spaces-verdict.md" && grep -q "root@203.0.113.10:/srv/metrics/.*-spaces.stats .*/minio-docker-stats.log$" "$FAKE_SSH_LOG"'
+check "bench.sh records MinIO's restart count before and after a gate" 'grep -q "^before=0 after=0$" "$res/minio-restarts.txt"'
+rc=0; out_rs=$(FAKE_MINIO_RESTARTING=1 env $FULL "$T/do/bench.sh" --approve api 2>&1 </dev/null) || rc=$?
+res_rs=$(ls -d "$T"/results/veil-kit-full/*-api 2>/dev/null | head -1)
+check "a gate during which MinIO restarted fails, as not valid (BUG-2432)" '[ $rc != 0 ] && [[ "$out_rs" == *"MinIO restarted during the gate (restart count 1, then 2)"* ]] && grep -q "^before=1 after=2$" "$res_rs/minio-restarts.txt"'
 leaks=$(cat "$FAKE_SSH_LOG" "$FAKE_DOCTL_LOG" "$FAKE_CURL_LOG"; echo "$out_ac $out_ab $out_asp"; cat "$res"/* "$res_sp"/* 2>/dev/null)
 check "MinIO's credentials appear on no command line, in no output and in no result" '[ -n "$MIN_P" ] && [[ "$leaks" != *"$MIN_U"* && "$leaks" != *"$MIN_P"* && "$leaks" != *"secret-spaces-key"* && "$leaks" != *"secret-spaces-val"* ]]'
 
@@ -351,6 +363,15 @@ check "invalid objects settings are refused: an unknown store, a volume under 25
     ! VEIL_DO_OBJECTS=spaces VEIL_DO_OBJECTS_VOLUME_GB=300 "$T/do/create.sh" >/dev/null 2>&1 &&
     ! VEIL_DO_OBJECTS_VOLUME_GB=-1 "$T/do/create.sh" >/dev/null 2>&1 &&
     [ ! -s "$FAKE_DOCTL_LOG" ]'
+out_sh=$(VEIL_DO_SIZE_OBJECTS=s-4vcpu-8gb "$T/do/estimate.sh" 2>&1 || true)
+check "a shared-CPU storage droplet is refused by estimate.sh and create.sh (BUG-2431), not with objects on Spaces" '
+    [[ "$out_sh" == *"VEIL_DO_SIZE_OBJECTS=s-4vcpu-8gb is a shared-CPU"* ]] &&
+    ! VEIL_DO_SIZE_OBJECTS=s-4vcpu-8gb "$T/do/estimate.sh" >/dev/null 2>&1 &&
+    ! VEIL_DO_SIZE_OBJECTS=s-8vcpu-16gb-amd "$T/do/create.sh" >/dev/null 2>&1 &&
+    ! VEIL_DO_TOKEN=dop_v1_fake_secret_token VEIL_DO_SIZE_OBJECTS=s-4vcpu-8gb "$T/do/create.sh" --approve >/dev/null 2>&1 &&
+    [ ! -s "$FAKE_DOCTL_LOG" ] &&
+    VEIL_DO_OBJECTS=spaces VEIL_DO_SIZE_OBJECTS=s-4vcpu-8gb "$T/do/estimate.sh" >/dev/null 2>&1 &&
+    VEIL_DO_SIZE_OBJECTS=c-8 VEIL_DO_OBJECTS_VOLUME_GB=300 "$T/do/estimate.sh" >/dev/null 2>&1'
 out_ve=$(env $VOL "$T/do/estimate.sh" 2>/dev/null)
 check "estimate prices the volume (300 GB at \$0.10 a month)" '[[ "$out_ve" == *"veil-kit-vol-minio-data (volume)"*"300 GiB"*"0.045"* && "$out_ve" == *"hourly rate (droplets):      \$1.545"* ]]'
 out_vc=$(env $VOL "$T/do/create.sh" --approve 2>&1); rc=$?

@@ -87,6 +87,8 @@ PG_IMAGE=$PG_IMAGE
 YB_IMAGE=$YB_IMAGE
 HAPROXY_IMAGE=$HAPROXY_IMAGE
 MINIO_IMAGE=$MINIO_IMAGE
+MINIO_BIN=$MINIO_BIN
+MINIO_ARGS="$MINIO_ARGS"
 DB_PASSWORD=$DB_PASSWORD
 DB_URL_1=$DB_URL_1
 DB_URL_2=$DB_URL_2
@@ -235,6 +237,9 @@ for GATE in $GATES; do
     rc=0; run_gate "$GATE" || rc=$?
     for i in 1 2; do hub_stats "$i" > "$G_OUT/hub$i-stats.json" || true; done
     gate_report "$GATE" "$G_OUT" || rc=1
+    # A gate is only valid on a store that stayed up (BUG-2432).
+    mr=$(D inspect -f '{{.RestartCount}}' "$(C ps -aq minio)" 2>/dev/null || echo '?')
+    [ "$mr" = 0 ] || { echo "   MinIO restarted ($mr times so far): the gate's results are not valid"; rc=1; }
     if [ $rc = 0 ]; then r=ok; else r="FAIL (exit $rc)"; status=1; fi
     echo "   $GATE: $r in $((SECONDS - t0)) s ($G_OUT)"
     summary+=("$GATE: $r in $((SECONDS - t0)) s")

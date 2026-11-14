@@ -87,6 +87,27 @@ impl Error {
     }
 }
 
+/// Is `e`, or what it wraps (an I/O error's inner chain included), a `T`?
+/// A store's errors reach a route through `anyhow` and, from a body being
+/// read, inside an I/O error.
+pub fn caused_by<T: std::error::Error + 'static>(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.is::<T>()
+            || c.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).is_some_and(|i| {
+                let mut cur: &(dyn std::error::Error + 'static) = i;
+                loop {
+                    if cur.is::<T>() {
+                        return true;
+                    }
+                    match cur.source() {
+                        Some(s) => cur = s,
+                        None => return false,
+                    }
+                }
+            })
+    })
+}
+
 /// YugabyteDB's `XX000 … Rpc timeout`: a tablet RPC that did not answer in
 /// time. Before a commit nothing took effect; on the commit itself the
 /// outcome is unknown.
@@ -147,6 +168,19 @@ impl IntoResponse for Error {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "busy",
                     &e.to_string(),
+                    Some(crate::limits::shed_wait()),
+                    false,
+                );
+            }
+            // The object store stayed busy (429, 503) or unreachable for all
+            // of its retries (BUG-2430: a MinIO restarting under load gave
+            // clients "internal error"): the caller may try again.
+            Error::Other(e) if crate::error::caused_by::<crate::store::StoreUnavailable>(&e) => {
+                eprintln!("veil-server: {e:#}");
+                return crate::limits::refuse(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "busy",
+                    "the object store is busy; try again",
                     Some(crate::limits::shed_wait()),
                     false,
                 );

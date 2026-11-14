@@ -9,6 +9,7 @@
 #   *.json, *.md   the tool's raw results and its tables; LABEL.log its output
 #   hub<N>-stats.json, hub<N>-docker-stats.log   each server's counters and samples
 #   minio-docker-stats.log   the MinIO storage droplet's samples (VEIL_DO_OBJECTS=minio)
+#   minio-restarts.txt       MinIO's restart count before and after the gate (a change fails it)
 #   scaling.md, failover-verdict.md, failover-*.txt     the gates' own tables and checks
 #
 #   bench.sh [--approve] GATE [veil-bench flags...]
@@ -141,9 +142,21 @@ for h in "${SAMPLED[@]}"; do
     remote "$h" "mkdir -p /srv/metrics; rm -f /srv/metrics/$STAMP-$GATE.stats; nohup sh -c 'while true; do echo \"\$(date -u +%FT%TZ) \$(docker stats --no-stream --format \"{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} net={{.NetIO}} blk={{.BlockIO}}\" | tr \"\\n\" \";\")\"; sleep 5; done' > /srv/metrics/$STAMP-$GATE.stats 2>/dev/null & echo \$! > /srv/metrics/$STAMP-$GATE.pid"
 done
 
+# MinIO's restarts before and after: a gate is only valid on a store that
+# stayed up (BUG-2432: on the first paid run it restarted every 72 s). The
+# `spaces` gate's server keeps its objects on Spaces.
+WATCH_MINIO=0; [ "$OBJECTS" = minio ] && [ "$GATE" != spaces ] && WATCH_MINIO=1
+minio_restarts() { remote "$(addr "$NAME-minio")" "docker inspect -f '{{.RestartCount}}' minio" 2>/dev/null || echo unknown; }
+[ $WATCH_MINIO = 0 ] || R0=$(minio_restarts)
+
 echo "== $GATE against $URL ($HUBS server(s), $DRIVERS driver(s)), limit ${STEP_LIMIT}s per command"
 rc=0
 run_gate "$GATE" "$@" || rc=$?
+if [ $WATCH_MINIO = 1 ]; then
+    R1=$(minio_restarts)
+    [ $APPROVED = 1 ] && echo "before=$R0 after=$R1" > "$OUT/minio-restarts.txt"
+    [ "$R0" = "$R1" ] || { echo "bench: MinIO restarted during the gate (restart count $R0, then $R1): its results are not valid" >&2; rc=1; }
+fi
 
 for i in $(seq "${#SAMPLED[@]}"); do
     h=${SAMPLED[$((i - 1))]}; label=hub$i; [ "$i" -gt "$HUBS" ] && label=minio

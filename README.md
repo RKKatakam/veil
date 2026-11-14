@@ -68,6 +68,13 @@ gates (BUG-2290's decision). The full tables, commands and misses are in
 [LOAD.md](docs/design/scale/LOAD.md) (landings) and
 [OPENSCION.md](docs/design/scale/OPENSCION.md) (beside Git).
 
+**Across machines: no numbers yet.** A first multi-machine run on
+DigitalOcean (2026-11-14) was attempted on 4-vCPU machines, the largest
+the account allowed. It was limited by its storage droplet, a shared-CPU
+machine whose MinIO also restarted every 72 seconds, so it gives no speed
+result; what it showed, and what the next run needs, is in
+[DEPLOY.md §9.0](docs/DEPLOY.md#90-first-run-on-digitalocean-2026-11-14-four-vcpu-machines-limited-by-its-storage-droplet).
+
 **Landing changes on one `main`** (10,000 agents offering 1,000 a second,
 three minutes unless noted; the target is 1,000 a second held, p99 under
 1 s, p50 under 150 ms):

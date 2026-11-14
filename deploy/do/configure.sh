@@ -128,13 +128,18 @@ if [ "$OBJECTS" = minio ]; then
         MDATA=/mnt/minio-data; remote "$MIP" "$(local_ssd_mount "$MDATA")"
     else MDATA=/srv/minio; fi
     remote "$MIP" "chmod 600 /etc/veil/minio.env && mkdir -p $MDATA && chown 1001:1001 $MDATA && a=\$(df --output=avail -BG $MDATA | tail -1 | tr -dc 0-9) && echo \"   MinIO's data in $MDATA: \${a} GB free (needs $OBJECTS_NEED_GB)\" && [ \"\$a\" -ge $OBJECTS_NEED_GB ] || { echo 'configure: too little disk for MinIO: a larger VEIL_DO_SIZE_OBJECTS, or VEIL_DO_OBJECTS_VOLUME_GB' >&2; exit 1; }"
-    # Bitnami's MinIO serves TLS from /certs; its setup's client (mc) checks
-    # the certificate against the run's CA. The client's whole config folder
-    # (/.mc) is a directory MinIO's user owns: mounting only the CA file made
-    # Docker create /.mc as root, and the setup's copy into it failed.
-    remote "$MIP" "mkdir -p /etc/veil/mc/certs/CAs && cp /etc/veil/tls/ca.pem /etc/veil/mc/certs/CAs/veil-ca.crt && chown -R 1001:1001 /etc/veil/mc && chmod -R go-w /etc/veil/mc"
-    remote "$MIP" "docker rm -f minio >/dev/null 2>&1; docker run -d --name minio --restart unless-stopped -p $MPRIV:9000:9000 --env-file /etc/veil/minio.env -e MINIO_SCHEME=https -v $MDATA:/bitnami/minio/data -v /etc/veil/tls/server.pem:/certs/public.crt:ro -v /etc/veil/tls/server-key.pem:/certs/private.key:ro -v /etc/veil/mc:/.mc --ulimit nofile=1048576:1048576 $MINIO_IMAGE"
-    remote "$MIP" 'for i in $(seq 90); do docker logs minio 2>&1 | grep -q "setup finished" && curl -sf --cacert /etc/veil/tls/ca.pem https://'"$MPRIV"':9000/minio/health/live >/dev/null && break; sleep 2; done; curl -sf --cacert /etc/veil/tls/ca.pem https://'"$MPRIV"':9000/minio/health/live >/dev/null && echo "   minio answers over TLS" || { echo "configure: MinIO did not come up; docker logs minio on '"$MIP"'" >&2; exit 1; }'
+    # MinIO is started directly, not through the image's start-up script
+    # (BUG-2432): that script first runs a setup step whose client (mc)
+    # adds the local server over TLS as `localhost`, which the run's
+    # certificate does not name; a failed setup exits the container, so on
+    # the first paid run Docker restarted MinIO every 72 s for the whole run.
+    # Started directly it serves TLS from /certs with the run's credentials
+    # (--env-file), and nothing runs before it on a restart. The bucket is
+    # made by the server at first start. deploy/compose/docker-compose.yml
+    # starts it the same way.
+    remote "$MIP" "docker rm -f minio >/dev/null 2>&1; docker run -d --name minio --restart unless-stopped -p $MPRIV:9000:9000 --env-file /etc/veil/minio.env -v $MDATA:/bitnami/minio/data -v /etc/veil/tls/server.pem:/certs/public.crt:ro -v /etc/veil/tls/server-key.pem:/certs/private.key:ro --ulimit nofile=1048576:1048576 --entrypoint $MINIO_BIN $MINIO_IMAGE $MINIO_ARGS"
+    # It answers over TLS, and is still the same process 15 s later.
+    remote "$MIP" 'for i in $(seq 90); do curl -sf --cacert /etc/veil/tls/ca.pem https://'"$MPRIV"':9000/minio/health/live >/dev/null && break; sleep 2; done; curl -sf --cacert /etc/veil/tls/ca.pem https://'"$MPRIV"':9000/minio/health/live >/dev/null && echo "   minio answers over TLS" || { echo "configure: MinIO did not come up; docker logs minio on '"$MIP"'" >&2; exit 1; }; sleep 15; r=$(docker inspect -f "{{.RestartCount}} {{.State.Running}}" minio); [ "$r" = "0 true" ] || { echo "configure: MinIO is restarting (restarts, running: $r); docker logs minio on '"$MIP"'" >&2; exit 1; }'
 fi
 
 echo "== 5. the servers ($HUBS), all on the one database and the bucket $BUCKET ($OBJECTS: $(objects_endpoint))"

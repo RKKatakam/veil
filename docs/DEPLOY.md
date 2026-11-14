@@ -1,7 +1,9 @@
 # Deploying Veil for the DigitalOcean test
 
-> **Status: kit ready, nothing rented** (2026-11-12; objects on MinIO and the
-> `spaces` gate, 2026-11-13). This runbook takes the
+> **Status: one paid run made, scaled down; no speed result from it**
+> (2026-11-14, §9.0: four-vCPU droplets, limited by its shared-CPU storage
+> droplet; the kit fixed since). Kit ready 2026-11-12; objects on MinIO and
+> the `spaces` gate, 2026-11-13. This runbook takes the
 > server as built (`docs/HUB.md` §13, phases 1 to 4) through one paid test
 > on DigitalOcean, budget under $100, as `docs/design/server/README.md`
 > ("Plan to the DigitalOcean test") asks. **Nothing is created at
@@ -36,7 +38,7 @@ On the operator's machine:
 | Tool | Why | Check |
 |---|---|---|
 | Docker 24+ with Compose v2 | building the images; the rehearsal; `docker save` ships images to the droplets | `docker compose version` |
-| `doctl` 1.100+ | DigitalOcean's CLI; every create and delete goes through it | `doctl version` (not needed for dry runs or the rehearsal) |
+| `doctl` 1.186.0 | DigitalOcean's CLI; every create and delete goes through it. The kit was run with 1.186.0; 2.x is untested (`docs/REPRODUCE.md`) | `doctl version` (not needed for dry runs or the rehearsal) |
 | `ssh`, `scp`, `zstd`, `openssl`, `curl` 7.75+ | configuring the droplets, the certificates, the Spaces check (`curl --aws-sigv4`) | |
 | `awscli` (optional) | `destroy.sh` empties and deletes the Spaces bucket with it; without it the bucket is deleted in the control panel | `aws --version` |
 | `bc`, `python3` | the estimate; the kit's tests | |
@@ -46,9 +48,13 @@ At DigitalOcean (the owner, once; nothing the scripts do):
 1. an account with a payment method, and a **personal access token** with
    read and write scope (API → Tokens);
 2. a **Spaces access key** pair (API → Spaces Keys);
-3. the account's **droplet limit** at least 9 for the full topology (three
-   servers, the balancer, three YugabyteDB nodes, two drivers), 4 for the
-   default (the default limit is often 3 or 5: Account → request an increase);
+3. the account's **droplet limit** at least 10 for the full topology (three
+   servers, the balancer, three YugabyteDB nodes, two drivers, the storage
+   droplet), 5 for the default (the default limit is often 3 or 5: Account
+   → request an increase), and **the sizes allowed**: CPU-Optimized 8- and
+   16-vCPU droplets (`c-8`, `c-16`, `c2-16vcpu-32gb`) in one region that
+   has Spaces. A new account may be held to 4 vCPUs a droplet (the first
+   paid run's was, §9.0); `docs/REPRODUCE.md` says how to check;
 4. the operator's **public IPv4** (`curl -4 -s https://ifconfig.me`): SSH
    and the server's port are open to it only.
 
@@ -161,8 +167,8 @@ What `configure.sh` sets up, and why:
   writes are spread over the cluster. Veil's schema (migrations 1 to 39) is
   many small tables and indexes: a node holds a replica of every tablet,
   about three times the number of tables and indexes in all. The
-  rehearsal's count is in §9.1 (124 on `yb1` at one tablet per table;
-  122 per node with migrations 1 to 36, §9.2).
+  rehearsal's count is in §9.2 (124 on `yb1` at one tablet per table;
+  122 per node with migrations 1 to 36, §9.3).
 - **The tablet-replica limit lifted on every master**:
   `yugabyted` turns `enforce_tablet_replica_limits` on at each start,
   whatever `--master_flags` says (the same as `scripts/verify-server.sh`
@@ -258,7 +264,11 @@ from the headline's rate and from the bytes the gates write:
 | bytes written over the gates | **at most about 190 GiB**, plus the `scale` gate's 1 GB profile | 4.4 million × 45.6 KiB, as if no merged-away pack were ever deleted |
 | bytes kept | about 45 GiB | 10.7 KiB a push stay listed after merging (1.64 GB after 150,000 pushes, LOAD.md) |
 
-So the droplet needs about 200 GiB free at most, written at tens of MiB a
+**Its CPUs must be dedicated** (BUG-2431): on the first paid run (§9.0)
+a shared-CPU `s-4vcpu-8gb` ran MinIO at its limit from the many-branch
+headline on and answered hundreds of thousands of `429`s, so
+`estimate.sh` and `create.sh` refuse a Basic (`s-*`) `VEIL_DO_SIZE_OBJECTS`
+with `VEIL_DO_OBJECTS=minio`. So the droplet needs about 200 GiB free at most, written at tens of MiB a
 second in thousands of small synced writes: **its own local SSD**
 (`configure.sh` refuses to start MinIO with under 250 GB free, the
 `OBJECTS_NEED_GB` of `deploy/do/lib.sh`), not a block-storage volume, which
@@ -276,10 +286,14 @@ and its check counts every volume named `NAME*`.
 
 How `configure.sh` runs it:
 
-- **TLS from the run's CA:** the run's one certificate also names the
-  storage droplet (its private address and name); MinIO serves it
-  (`MINIO_SCHEME=https`, the certificate as `/certs/public.crt`), and the
-  image's setup client checks it against the CA. The servers trust the CA
+- **Started directly, TLS from the run's CA:** the container runs the
+  MinIO server binary itself (`MINIO_BIN` and `MINIO_ARGS` in
+  `deploy/versions.env`, the rehearsal's too), never the image's
+  start-up script, whose setup step looped on the first paid run
+  (BUG-2432, §9.0); `configure.sh` checks that it answers over TLS and has
+  not restarted 15 s later. The run's one certificate also names the
+  storage droplet (its private address and name); MinIO serves it from
+  `/certs` (`public.crt`, `private.key`). The servers trust the CA
   through `VEIL_S3_CA=/tls/ca.pem` in their `hub.env` (the server adds the
   PEM certificates of the file `VEIL_S3_CA` names to the public roots for
   its S3 client; servers the benchmark tool starts inherit it).
@@ -621,6 +635,7 @@ made them; `docs/REPRODUCE.md` §6 says how to read each file:
 | `<label>.json`, `<label>.md`, `<label>.log` | the tool's raw results, its tables, its output; `@<n>` in a label is driver *n* |
 | `hub<N>-stats.json`, `hub<N>-docker-stats.log` | each server's request-path counters at the end of the gate (`s3_slow_down`, `s3_gave_up`: the object store's `503`/`429` answers and the requests given up), and its `docker stats` every 5 s |
 | `minio-docker-stats.log` | the MinIO storage droplet's `docker stats` every 5 s (`VEIL_DO_OBJECTS=minio`) |
+| `minio-restarts.txt` | MinIO's restart count before and after the gate (`before=N after=M`); a change fails the gate, whose results are then not valid (BUG-2432; not for `spaces`, whose server uses Spaces) |
 | `scaling.md`; `failover-verdict.md`, `failover-*.txt`; `spaces-verdict.md` | the scaling table; the failover verdict and the records behind it; the `spaces` gate's verdict |
 
 ## 7. Logs and metrics
@@ -662,9 +677,119 @@ in the control panel (Spaces → bucket → Settings → Destroy). With no bucke
 left the Spaces subscription ends. Look at Billing the next day: the test
 appears as hourly line items.
 
-## 9. Rehearsal results
+## 9. Results: the first paid run and the rehearsals
 
-### 9.0 The rehearsal of 2026-11-13, objects over TLS and the `spaces` gate (`dokit4`)
+### 9.0 First run on DigitalOcean, 2026-11-14 (four-vCPU machines; limited by its storage droplet)
+
+**No speed number from this run stands.** The light gates (`pull`,
+`land`, `api`) passed with no error; from the many-branch headline on, the
+run measured its storage droplet, and from the `landing` gate on, nothing
+it measured is valid. The results are in `deploy/results/veil-test/`
+(git-ignored), one folder per gate and every machine's logs; the numbers
+below are read from those files.
+
+**What ran, and why that.** The account allowed no droplet over 4 vCPUs:
+`c-8`, `c-16` and `c2-16vcpu-32gb` were refused, and `c-4` was offered
+only in ams3, blr1, lon1, nyc1 and sfo2. The owner chose a scaled run in
+**ams3**: three servers, the HAProxy balancer, three YugabyteDB nodes and
+two drivers, all **`c-4`** (4 dedicated vCPUs, 8 GB); MinIO on a
+**`s-4vcpu-8gb`** (4 **shared** vCPUs, 8 GB, its own 160 GB disk),
+because a `c-4`'s disk is too small and creating a 250 GiB volume for it
+failed with `422 invalid size specified` (BUG-2433, cause unknown).
+`VEIL_DO_OBJECTS_NEED_GB` was lowered to fit that disk, and the gates
+were sized down: `LANDING_AGENTS=4000`, `HEADLINE_AGENTS=300,1000`, and
+from the `landing` gate on `LANDING_DURATIONS=180`;
+`VEIL_DO_DB_CONNECTIONS=32`. Images `735dc651` (public `main`); the kit
+at `f8ae264e`, then `6174aaa0` (below); `doctl` 1.186.0. Billed from
+18:20 to 20:05 UTC: ten droplets at $1.197 an hour at list price (nine
+`c-4` at $0.125, the `s-4vcpu-8gb` at $0.072), $2.09 for the 1 h 45 min,
+**about $2.2 in all**. Everything was destroyed and the check passed;
+the run's Spaces key was deleted.
+
+| Gate (start, UTC) | What the files say | Valid? |
+|---|---|---|
+| `pull` (18:46) | 10, 100, 1,000 clients: 746, 2,387, 292 pulls/s; p99 93 ms, 299 ms, 5.4 s; **0 errors**. The first attempt (18:42) lost its JSON to a kit bug (below) | as a flow and correctness result; the rates are four-vCPU servers' beside a restarting store, not a speed claim |
+| `land` (18:48) | one project: 7.1/s (1 client), 3.1/s (50); 10 projects: 37.7 and 22.7/s; 100 projects, 100 clients: 106 and 110/s; **0 errors** | the same |
+| `api` (18:53) | 15.1/s, 45.7/s, 82 and 91/s; 50 clients on one or ten projects: 2.9 and 15.2/s with p99 18 to 21 s; **0 errors** | the same |
+| `branches` (18:58) | cost curve, 1, 10, 100 agents: 8.3, 33.0, 26.4 pushes/s, 0 errors. **Headline**, merging every 5th push: 300 agents **16.1 pushes/s**, p99 53 s, **883 errors** (the first: a branch landing told to come back until its deadline), 26,697 told to come back; 1,000 agents (709 finishing) **6.7/s**, p99 78 s, **3,652 errors** (the first: `tips: HTTP 500 internal`), 254,027 told to come back | **no**: bound by the store |
+| `landing` (19:16; plain, protected, mix; 4,000 agents of 100 people, 1,000/s offered, 180 s) | **0 landed**: the servers' landing counters did not move; 123,091, 122,015 and 121,974 errors; the per-change logs list 2,483, 2,321 and 1,721 changes "still queued after the server's wait" | **no** |
+| `failover` (19:34) | stopped while setting up: `upload: HTTP 500 internal` | **no** |
+| `spaces` (19:36; its own server on the first server's machine, objects on a real Spaces bucket in ams3) | **FAIL**: 3,558 pushes, 11.9/s of 20 offered, 686 merges into `main`; **991 errors** (the first: `push: HTTP 500 internal`); 93,461 `503 Slow Down`/429 answers, 15 requests given up; **55.8 reads** and 12.0 writes a push, 804 requests a second against the bucket's 800 | the flow on Spaces is shown; the rate was too high (below) |
+| `scaling` (19:43) | stopped during its two-server step when the run was stopped | **no** |
+
+CPU (`docker stats` every 5 s; 400 % is a droplet's four vCPUs): the
+servers averaged 11 to 47 % in every gate to the headline and 20 to 24 %
+in `landing` (peaks 195 to 268 %), so they were mostly idle; the load
+tool used 0.1 to 0.4 cores. **MinIO** averaged 42 to 94 % in `pull`,
+`land` and `api`, **176 % (peak 424 %) in `branches`**, 162 % (peak
+326 %) in `landing`, and 282 to 286 % in `failover` and `spaces`.
+
+**Why.** Three things, two of them in the storage droplet:
+
+1. **MinIO restarted every 72 seconds for the whole run** (BUG-2432): 63
+   restarts from 18:37 to 19:54, the first at idle, before any gate. The
+   image's start-up script runs a setup step whose client adds the local
+   server as `https://localhost:9000`; the run's certificate names the
+   storage droplet's addresses and name, not `localhost` (the
+   rehearsal's does, which is why it never showed there). The setup gave
+   up after twelve tries ("Failed to add temporary MinIO server"), the
+   container exited, and Docker started it again. `configure.sh` waited
+   only for `/minio/health/live`, which MinIO answers while the setup
+   runs. Each restart refused connections for a moment (each server
+   logged `Connection refused` 48 to 53 times); the light gates rode over
+   it on the server's 10 s of retries.
+2. **Four shared vCPUs were far too few for the store** (BUG-2431). From
+   the headline on MinIO ran at its droplet's limit; in the `landing`
+   gate it answered `429` to about 495,000 of the three servers' requests
+   (their `s3_slow_down` counters), and the servers gave up on 2,550
+   requests after 10 s of retries each. Its 15-minute load average was
+   634 when the logs were collected (19:55). The landing gate's 4,000
+   agents' entries stayed queued, and the servers kept storing for them
+   after the gate (their storage counters kept rising through `failover`
+   and `spaces`), so the later gates met a store still loaded.
+3. **A store given up on answered `500 internal`** (BUG-2430): the 500s
+   of `branches`, `failover` and `spaces` (where Spaces' own `503 Slow
+   Down` outlasted the retries). Fixed: such a request is answered `503
+   busy` with `retry_after_ms`, as other overload is.
+
+The `spaces` gate also showed that its rate was set from too low a read
+count: 55.8 reads a push on a fresh project, not the headline's 8.6, so 20
+pushes a second made 804 requests a second, the bucket's whole limit.
+
+**Kit bugs found and fixed during the run** (in `6174aaa0`):
+`VEIL_DO_OBJECTS_NEED_GB` sets the free disk MinIO needs (it was fixed at
+250 GB); MinIO's setup client got its own config folder (mounting only
+the CA file made Docker create `/.mc` as root, and the setup could not
+write it); `bench.sh` makes the gate's results folder on each driver
+(`veil-bench` does not make its `--out` folder: the first `pull`
+attempt's JSON was lost). Fixed after it: MinIO now starts directly,
+without the setup step, and `configure.sh` checks that it is still up 15
+s later (BUG-2432); a gate during which MinIO restarted fails, with its
+restart count before and after in `minio-restarts.txt` (§6.2);
+`estimate.sh` and `create.sh` refuse a shared-CPU storage droplet
+(BUG-2431). The rehearsal with MinIO started directly (`dorun1` @ `8bcbf200`,
+three YugabyteDB nodes, Compose project `veil-dokit-dorun1`): every gate
+**ok**, MinIO never restarted and ran no setup step; `failover` moved the
+lease with a longest pause of 301 ms and no change lost or landed twice;
+`spaces` (against the MinIO) 49 pushes, 7 merges, no error; teardown left
+nothing of the project. `doctl` 2.x has been released since; the kit was run with
+1.186.0 (`docs/REPRODUCE.md` pins it).
+
+**What the next run needs:**
+
+- an account that may create **CPU-Optimized 8- and 16-vCPU droplets**
+  (and `c2-16vcpu-32gb`) in one region that has Spaces, and at least ten
+  droplets (`docs/REPRODUCE.md` §1 says how to check):
+  the topology of §2, or the same shape at one size smaller throughout,
+  never a shared-CPU storage droplet;
+- the store's disk on the droplet itself (`c2-16vcpu-32gb`), or a volume
+  once BUG-2433's `422` is understood;
+- the `spaces` gate at about 10 pushes a second (`SPACES_RATE=10`), or its
+  reads a push measured first;
+- before reading any number: each gate's `minio-restarts.txt` unchanged,
+  and `s3_gave_up` in its `hub*-stats.json` not rising.
+
+### 9.1 The rehearsal of 2026-11-13, objects over TLS and the `spaces` gate (`dokit4`)
 
 `bash ~/.cache/veil-orch/heavy.sh dokit4-rehearsal 12 bash
 deploy/compose/rehearsal.sh dokit4` on `dokit4` @ `ccda6704` (a work
@@ -690,7 +815,7 @@ storage droplet; and the `spaces` gate ran, against that MinIO (10 agents,
 Up in 63 s; teardown: "nothing of veil-dokit-dokit4 remains (containers,
 volumes, networks)". For the flow only: one machine plays ten.
 
-### 9.1 The rehearsal of 2026-11-13 (the final one before the paid run)
+### 9.2 The rehearsal of 2026-11-13 (the final one before the paid run)
 
 `deploy/compose/rehearsal.sh finalbench` on the development machine (32
 cores, 30 GB, Docker 28; through `~/.cache/veil-orch/heavy.sh`, alone in
@@ -725,13 +850,13 @@ by SIGKILL); not committed.
 
 **The crash takeover is rehearsed** (BUG-1970 cause (2), fixed on
 `failover2`): a killed lease holder paused landings 442 ms here, where it
-paused 2,711 ms on 2026-11-13 before the fix (§9.2) and 2,358 ms on
+paused 2,711 ms on 2026-11-13 before the fix (§9.3) and 2,358 ms on
 2026-11-12; a clean stop 642 ms (481 ms before). Both are within the 2 s
 target; on one machine, so for the flow only. A machine that vanishes
 (no closed connection) still waits for the lease's 2 s expiry. No new
 problem in the kit.
 
-### 9.2 The rehearsal of 2026-11-12 (the multi-machine topology)
+### 9.3 The rehearsal of 2026-11-12 (the multi-machine topology)
 
 `deploy/compose/rehearsal.sh` on the development machine (32 cores, 30 GB,
 Docker 28; shared with other work), `dokit2`, images `veil-server:dokit2`
@@ -783,7 +908,7 @@ and for the next server's retry, BUG-1970's cause (2), left open.
 Cause (2) is fixed since on `failover2` (`docs/HUB.md` §13.32 item 13:
 a server finds a dead holder's session lock free and takes the lease over
 at once, in 57 to 623 ms in the server tests on both databases);
-rehearsed since: §9.1. A machine that vanishes still waits for the lease's expiry.
+rehearsed since: §9.2. A machine that vanishes still waits for the lease's expiry.
 
 Found by this round, both fixed in the kit: the agents' change ids are in
 Veil's letters (`k`–`z`) and the graph's in hex, and the `landed`
@@ -794,7 +919,7 @@ no lease holder when that server held it (**BUG-2080**: the first kill
 run, `20261112T231814Z`, failed so; both runs above had server 2 holding
 the lease).
 
-### 9.3 The rehearsal of 2026-11-09 (one server, PostgreSQL)
+### 9.4 The rehearsal of 2026-11-09 (one server, PostgreSQL)
 
 `deploy/compose/rehearsal.sh boat` on Boat machines (8 vCPU, 16 GB, Docker
 28), `integration` `ae3d57ed`, 15 s per load point, 1,000 files and one
@@ -939,7 +1064,8 @@ commands (§4) and by the DigitalOcean run.
   requests a push (counting the writes by kind is the next step).
 - **The storage droplet** is one MinIO on one disk: no replication, and
   if it fails the run stops (the servers' requests fail after 10 s of
-  retries). Its objects live only for the run. The image is the server
+  retries, answered `503 busy`, BUG-2430). It needs dedicated CPUs
+  (BUG-2431); a gate during which it restarted fails (BUG-2432). Its objects live only for the run. The image is the server
   as Bitnami last packaged it (`deploy/versions.env`), pinned by digest;
   MinIO no longer publishes images on Docker Hub.
 - **YugabyteDB restarts.** A node that restarts turns the tablet-replica

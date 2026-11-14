@@ -342,21 +342,7 @@ impl std::error::Error for IndexesFull {}
 
 /// Is `e` (or what it wraps, an I/O error's inner chain included) [`IndexesFull`]?
 pub fn indexes_full(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| {
-        c.is::<IndexesFull>()
-            || c.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).is_some_and(|i| {
-                let mut cur: &(dyn std::error::Error + 'static) = i;
-                loop {
-                    if cur.is::<IndexesFull>() {
-                        return true;
-                    }
-                    match cur.source() {
-                        Some(s) => cur = s,
-                        None => return false,
-                    }
-                }
-            })
-    })
+    crate::error::caused_by::<IndexesFull>(e)
 }
 
 #[derive(Default)]

@@ -247,6 +247,28 @@ pub static S3_SLOW_DOWN: AtomicU64 = AtomicU64::new(0);
 /// S3 requests that still failed when `S3_RETRY_FOR` ran out (`stats.json`'s `s3_gave_up`).
 pub static S3_GAVE_UP: AtomicU64 = AtomicU64::new(0);
 
+/// The object store stayed busy (an answer that is tried again: 5xx, 429,
+/// 499) or unreachable for all of `S3_RETRY_FOR`. A request it fails is
+/// answered `503 busy` with a time to come back, never `500 internal`
+/// (BUG-2430: a MinIO restarting under load gave pushes "internal error").
+#[derive(Debug)]
+pub struct StoreUnavailable {
+    what: String,
+    source: Option<reqwest::Error>,
+}
+
+impl std::fmt::Display for StoreUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.what)
+    }
+}
+
+impl std::error::Error for StoreUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|e| e as _)
+    }
+}
+
 /// Send an S3 request (`make` builds it afresh for each try) and read its
 /// answer, again while the answer is a server error (5xx), 429 or 499, or
 /// the request fails, for at most [`S3_RETRY_FOR`] (BUG-861). A connection
@@ -256,7 +278,8 @@ pub static S3_GAVE_UP: AtomicU64 = AtomicU64::new(0);
 /// its own shutdown cancelled, as a MinIO just started for a setup step
 /// stops, BUG-1953), are tried again:
 /// every request the store sends is idempotent (GET, HEAD, DELETE, and PUT
-/// of a key that names its content or a pack's fresh random name).
+/// of a key that names its content or a pack's fresh random name). When the
+/// bound runs out, the error is a [`StoreUnavailable`].
 async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
     s3_send_inner(make, false).await.map(|(status, _, body)| (status, body))
 }
@@ -289,7 +312,7 @@ async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers:
             let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
             if tokio::time::Instant::now() + wait + jitter >= dl {
                 S3_GAVE_UP.fetch_add(1, Ordering::Relaxed);
-                return Ok((status.as_u16(), headers, body));
+                return Err(StoreUnavailable { what: format!("S3 {} answered HTTP {} {tries} times", method(&make), status.as_u16()), source: None }.into());
             }
             tokio::time::sleep(wait + jitter).await;
             wait = (wait * 2).min(S3_MOST_WAIT);
@@ -298,14 +321,22 @@ async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers:
         let e = answer.unwrap_err();
         let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
         let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
-        if tokio::time::Instant::now() + wait + jitter >= dl || e.is_builder() {
+        if e.is_builder() {
+            return Err(anyhow::Error::new(e).context("S3 request"));
+        }
+        if tokio::time::Instant::now() + wait + jitter >= dl {
             S3_GAVE_UP.fetch_add(1, Ordering::Relaxed);
-            return Err(anyhow::Error::new(e).context(format!("S3 request failed {tries} times")));
+            return Err(StoreUnavailable { what: format!("S3 {} failed {tries} times", method(&make)), source: Some(e) }.into());
         }
         tokio::time::sleep(wait + jitter).await;
         wait = (wait * 2).min(S3_MOST_WAIT);
     }
     unreachable!()
+}
+
+/// The method of the request `make` builds, for a log line.
+fn method(make: &impl Fn() -> reqwest::RequestBuilder) -> String {
+    make().build().map(|r| r.method().to_string()).unwrap_or_default()
 }
 
 impl S3Store {
