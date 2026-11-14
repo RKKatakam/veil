@@ -217,7 +217,8 @@ pub(crate) struct PreparedWrite {
     pub shard_branch: String,
     pub rows: Vec<(String, String, i64, i64, i64, i64)>,
     pub removed: Vec<String>,
-    pub walk: Option<(String, String)>,
+    /// The branches' walks this write takes to their tips: `(branch, tip)`.
+    pub walks: Vec<(String, String)>,
     pub gc_epoch: i64,
 }
 
@@ -232,7 +233,7 @@ impl PreparedWrite {
         shard_branch: &str,
         shards: &BTreeMap<String, Shard>,
         removed: Vec<String>,
-        walk: Option<(&str, &str)>,
+        walks: Vec<(String, String)>,
         gc_epoch: i64,
     ) -> Self {
         let rows = shards
@@ -248,7 +249,7 @@ impl PreparedWrite {
             shard_branch: shard_branch.to_string(),
             rows,
             removed,
-            walk: walk.map(|(b, s)| (b.to_string(), s.to_string())),
+            walks,
             gc_epoch,
         }
     }
@@ -357,16 +358,18 @@ pub(crate) async fn apply_write(
             .execute(&mut **tx)
             .await?;
     }
-    if let Some((b, s)) = &w.walk {
+    if !w.walks.is_empty() {
+        let (branches, tips): (Vec<&str>, Vec<&str>) = w.walks.iter().map(|(b, s)| (b.as_str(), s.as_str())).unzip();
         sqlx::query(
-            "INSERT INTO search_heads (project_id, kind, branch, snapshot, lines, version) VALUES ($1, $2, $3, $4, $5, 1) \
+            "INSERT INTO search_heads (project_id, kind, branch, snapshot, lines, version) \
+             SELECT $1, $2, b, s, $5, 1 FROM UNNEST($3::text[], $4::text[]) AS t(b, s) \
              ON CONFLICT (project_id, kind, branch) DO UPDATE SET snapshot = EXCLUDED.snapshot, lines = EXCLUDED.lines, \
              version = search_heads.version + 1",
         )
         .bind(project)
         .bind(WALK)
-        .bind(b)
-        .bind(s)
+        .bind(&branches)
+        .bind(&tips)
         .bind(&w.lines)
         .execute(&mut **tx)
         .await?;
@@ -705,6 +708,15 @@ pub async fn update(hub: &Arc<Hub>, project: i64, branches: Option<Vec<String>>)
     };
     tokio::task::spawn_blocking(move || {
         let lines = cx.lines()?;
+        // Every branch in one transaction (BUG-2350: an update of the
+        // branches many pushes moved cost two commits a branch); when a
+        // compare-and-swap is lost to another update, or anything fails,
+        // they are taken one at a time, as before.
+        let mut stats = Stats::default();
+        if let Ok(true) = all_at_once(&cx, &lines, &wanted, &default, &mut stats) {
+            stats.branches = wanted.iter().map(|(n, _)| n.clone()).collect();
+            return Ok(stats);
+        }
         let mut stats = Stats::default();
         // One branch's failure does not stop the others; the first error
         // is returned once all were tried (the next update tries again).
@@ -781,6 +793,34 @@ fn textlike(e: &TreeEntry) -> (i64, i64) {
     }
 }
 
+/// Move the code index of each of `wanted` (`(branch, tip)`) and the names
+/// index to their tips in one transaction: `false` (nothing written) if a
+/// head moved meanwhile.
+fn all_at_once(cx: &Cx, lines: &Lines, wanted: &[(String, ObjectId)], default: &str, stats: &mut Stats) -> Result<bool> {
+    let pool = &cx.hub().derive.db;
+    let g = Graph::new(cx);
+    let mut writes = Vec::new();
+    for (branch, tip) in wanted {
+        writes.extend(prepare_code(cx, &g, lines, branch, *tip, default, stats)?);
+    }
+    writes.extend(prepare_names_of(cx, &g, lines, wanted, default, stats)?);
+    if writes.is_empty() {
+        return Ok(true);
+    }
+    cx.db(|| async {
+        let mut tx = pool.begin().await?;
+        for w in &writes {
+            if !apply_write(&mut tx, cx.project(), w).await? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        }
+        tx.commit().await?;
+        cx.hub().commits.count(crate::db::Commit::Search);
+        Ok(true)
+    })
+}
+
 /// Move `branch`'s code index to `tip`.
 fn code(cx: &Cx, lines: &Lines, branch: &str, tip: ObjectId, default: &str, stats: &mut Stats) -> Result<()> {
     let pool = &cx.hub().derive.db;
@@ -796,6 +836,7 @@ fn code(cx: &Cx, lines: &Lines, branch: &str, tip: ObjectId, default: &str, stat
                 return Ok(false);
             }
             tx.commit().await?;
+            cx.hub().commits.count(crate::db::Commit::Search);
             Ok(true)
         })?;
         if ok {
@@ -921,7 +962,7 @@ fn prepare_code(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId, 
         branch,
         &write,
         removed,
-        None,
+        Vec::new(),
         gc_epoch,
     )))
 }
@@ -1011,6 +1052,7 @@ fn names(cx: &Cx, lines: &Lines, branch: &str, tip: ObjectId, default: &str, sta
                 return Ok(false);
             }
             tx.commit().await?;
+            cx.hub().commits.count(crate::db::Commit::Search);
             Ok(true)
         })?;
         if ok {
@@ -1021,17 +1063,33 @@ fn names(cx: &Cx, lines: &Lines, branch: &str, tip: ObjectId, default: &str, sta
 }
 
 fn prepare_names(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId, default: &str, stats: &mut Stats) -> Result<Option<PreparedWrite>> {
+    prepare_names_of(cx, g, lines, &[(branch.to_string(), tip)], default, stats)
+}
+
+/// [`prepare_names`] for several branches at once: the names index is the
+/// project's one (its head a compare-and-swap), so an update of many
+/// branches moves it once, each snapshot walked once, and moves every
+/// branch's walk with it (BUG-2350).
+fn prepare_names_of(cx: &Cx, g: &Graph, lines: &Lines, tips: &[(String, ObjectId)], default: &str, stats: &mut Stats) -> Result<Option<PreparedWrite>> {
     let src = &cx.src;
     let pool = &cx.hub().derive.db;
-    if withheld(g, &tip)? {
-        return Ok(None);
-    }
     let ident = identity(lines);
     let all: BTreeSet<String> = lines.all().into_iter().collect();
     let gc_epoch = read_gc_epoch_cx(cx, pool)?;
     let (head, old) = read_state(cx, pool, NAMES, "", None)?;
-    let walked = read_head(cx, pool, WALK, branch)?;
-    if head.as_ref().is_some_and(|h| h.lines == ident) && walked.as_ref().is_some_and(|w| w.snapshot == tip.hex()) {
+    // The branches whose walk is behind their tip (a withheld tip waits).
+    let mut todo = Vec::new();
+    for (branch, tip) in tips {
+        if withheld(g, tip)? {
+            continue;
+        }
+        let walked = read_head(cx, pool, WALK, branch)?;
+        if head.as_ref().is_some_and(|h| h.lines == ident) && walked.as_ref().is_some_and(|w| w.snapshot == tip.hex()) {
+            continue;
+        }
+        todo.push((branch.as_str(), *tip, walked));
+    }
+    if todo.is_empty() {
         return Ok(None);
     }
     let mut shards = old.clone();
@@ -1075,18 +1133,26 @@ fn prepare_names(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId,
         }
         write(&mut moved, &mut shards, &mut touched, stats)?;
     }
-    let mut stops: Vec<ObjectId> = Vec::new();
-    if head.is_some() {
-        if let Some(w) = &walked {
-            stops.push(oid(&w.snapshot)?);
-        }
-        if branch != default {
-            if let Some(w) = read_head(cx, pool, WALK, default)? {
+    let default_walk = match head.is_some() && todo.iter().any(|(b, ..)| *b != default) {
+        true => read_head(cx, pool, WALK, default)?,
+        false => None,
+    };
+    let mut new = Vec::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for (branch, tip, walked) in &todo {
+        let mut stops: Vec<ObjectId> = Vec::new();
+        if head.is_some() {
+            if let Some(w) = walked {
                 stops.push(oid(&w.snapshot)?);
             }
+            if *branch != default {
+                if let Some(w) = &default_walk {
+                    stops.push(oid(&w.snapshot)?);
+                }
+            }
         }
+        new.extend(rev_list(g, *tip, &stops)?.into_iter().filter(|s| seen.insert(*s)));
     }
-    let new = rev_list(g, tip, &stops)?;
     stats.walked += new.len();
     let mut gathered: BTreeMap<String, BTreeMap<String, u8>> = BTreeMap::new();
     let mut held = 0usize;
@@ -1118,7 +1184,7 @@ fn prepare_names(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId,
     }
     flush(&mut gathered, &mut shards, &mut touched, stats)?;
     let write: BTreeMap<String, Shard> = touched.iter().filter_map(|k| shards.get(k).map(|s| (k.clone(), s.clone()))).collect();
-    let tip_hex = tip.hex();
+    let walks = todo.iter().map(|(b, t, _)| (b.to_string(), t.hex())).collect();
     Ok(Some(PreparedWrite::new(
         NAMES,
         "",
@@ -1128,7 +1194,7 @@ fn prepare_names(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId,
         "",
         &write,
         removed,
-        Some((branch, &tip_hex)),
+        walks,
         gc_epoch,
     )))
 }

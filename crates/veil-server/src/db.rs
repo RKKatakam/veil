@@ -276,6 +276,87 @@ async fn migrate_once(c: &mut PgConnection) -> Result<()> {
 
 pub type TxFuture<'t, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>;
 
+/// What a database commit was made for, counted where it is made
+/// ([`Commits::count`]; BUG-2350): the server's counters (`SIGUSR1`) give the
+/// load tool's cost gates (`storage-and-cost.md` §9) the commits by kind,
+/// so a push is charged its own and not the background work beside it.
+/// The staged-pack rows are counted apart (`Objects::pack_rows`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Commit {
+    /// A push's one transaction (`sync::push_with`), one that queues no landing.
+    Push,
+    /// A push's transaction that queues a landing (`POST …/land`, a push
+    /// to a protected branch): the landing's submit.
+    LandSubmit,
+    /// A landing batch of the landing service.
+    LandBatch,
+    /// The landing service's lease and clean-up rows.
+    LandService,
+    /// The deriver's transactions (S12; one a landing run, BUG-1593).
+    Derive,
+    /// A view key's fill (`query::graph`, `query::files`): its rows, its
+    /// lease, and the projection memos it stores.
+    Fill,
+    /// A projection memo stored by a request on its own (a viewer's first
+    /// look at a snapshot no transaction memoised).
+    Memo,
+    /// The search index's own transactions (an update the deriver's run
+    /// did not take).
+    Search,
+    /// Pack merges and garbage collection (S29).
+    PackGc,
+}
+
+impl Commit {
+    const ALL: [Commit; 9] = [
+        Commit::Push,
+        Commit::LandSubmit,
+        Commit::LandBatch,
+        Commit::LandService,
+        Commit::Derive,
+        Commit::Fill,
+        Commit::Memo,
+        Commit::Search,
+        Commit::PackGc,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Commit::Push => "push",
+            Commit::LandSubmit => "land_submit",
+            Commit::LandBatch => "land_batch",
+            Commit::LandService => "land_service",
+            Commit::Derive => "derive",
+            Commit::Fill => "fill",
+            Commit::Memo => "memo",
+            Commit::Search => "search",
+            Commit::PackGc => "pack_gc",
+        }
+    }
+}
+
+/// A server's database commits by kind ([`Commit`]), `Hub::commits`.
+#[derive(Default)]
+pub struct Commits([std::sync::atomic::AtomicU64; Commit::ALL.len()]);
+
+impl Commits {
+    /// Count one database commit of `kind` (a transaction that committed,
+    /// or a write that committed on its own).
+    pub fn count(&self, kind: Commit) {
+        self.0[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The commits of `kind` counted so far.
+    pub fn of(&self, kind: Commit) -> u64 {
+        self.0[kind as usize].load(Ordering::Relaxed)
+    }
+
+    /// The commits counted so far, by kind (`{"push": n, …}`).
+    pub fn by_kind(&self) -> serde_json::Value {
+        Commit::ALL.iter().map(|k| (k.name().to_string(), serde_json::json!(self.of(*k)))).collect::<serde_json::Map<_, _>>().into()
+    }
+}
+
 /// How long one statement may run, or wait for a lock, before the database
 /// cancels it (every connection sets these): nothing waits forever.
 pub const STATEMENT_TIMEOUT: Duration = Duration::from_secs(15);

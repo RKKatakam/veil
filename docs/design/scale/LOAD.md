@@ -2017,6 +2017,114 @@ same evening:
   to 6.9 s on the same build: where the batch first falls behind, and the
   memory the machine has free when the run starts (BUG-2363), decide it.
 
+## Database commits by kind (BUG-2350, BUG-1946, 2026-11-14, `commits2350`)
+
+The many-branch headline missed the tool's cost gate of one database
+commit a push (`storage-and-cost.md` §9) in every run: 2.34 to 3.23
+commits a push of the push's own. The server now counts its commits where
+each is made (`Hub::commits`, by `db::Commit` kind, in the counters it
+writes on `SIGUSR1`), and `veil-bench` reports them per operation
+(`db_commits_by_kind_per_op`).
+
+**Where they went** (300 agents, 180 s, `--merge-every 5`, on `febdaced`,
+from `pg_stat_statements` over the whole run; per push):
+
+| Kind | Before | After | Whose |
+|---|---:|---:|---|
+| the push's transaction | 1.00 | 1.00 | the push's |
+| staged-pack rows (the upload's, the push's own pack's) | 2.05 | 2.05 | the push's, recorded before the pack is written (BUG-1399); set aside by the gate since S28 |
+| the branch landing's submit | 0.20 | 0.20 | the landing's (every fifth push lands): gated per branch landing, 2 |
+| its share of the landing batch | 0.09 | 0.09 | the landing's |
+| projection memos the fills stored, **one commit each** | 0.86 | **0** (in the fills' below) | background: the view of anyone on Earth (the bench's `README` is outside every rule) |
+| the fills' leases and rows (and, after, their memos) | 0.13 | 0.18 | background |
+| the search index's update, **two commits a branch** | 0.14 | **0.001** | background |
+| pack merges | 0.05 | 0.07 | background (S29) |
+| the deriver's run | 0.06 | 0.07 | background (S12) |
+| **all** | **4.60** | **3.66** | |
+| **the push's own, as the gate counts it** | **2.49** | **1.00** | |
+| what the push waits for: its transaction and its staged-pack rows | 3.05 | 3.05 | unchanged: the gate's 1.00 leaves out the pack rows (S28) |
+
+Under 300 agents a deriver run takes about 32 snapshots at once, past its
+inline caps (16 snapshots, 64 file-history rows): it leaves the view
+keys' rows and memos to fills and its search index to an update of its
+own. A fill projected its tips one memo at a time, each stored in a commit
+of its own; the update committed each branch's code index and its names
+apart. And the tool charged the push with everything but the deriver's
+`derive_progress` writes and the pack rows.
+
+Of the 1.49 the gate's figure fell, 0.94 is commits no longer made (the
+memos stored together, the search index in one transaction: 4.60 to 3.66
+in all); the rest is the landings' (0.29, now gated per branch landing)
+and the background work's (0.26), now counted by kind and set aside.
+
+**What changed**:
+- a fill works out its tips' projections with the memo rows deferred and
+  stores them together, one statement a 500 rows
+  (`query::graph::project_tips`); a row another server stored first with
+  another projection makes it drop what it worked out and project one memo
+  at a time, as before (`commits::bug_2350_a_memo_stored_first_wins_over_a_fills_batch`);
+- a search update moves every branch it takes, and the project's names
+  index once for all of them, in one transaction
+  (`search::index::all_at_once`); one branch at a time, as before, when a
+  head moved meanwhile;
+- `veil-bench` charges a push with every commit but the pack rows, the
+  background kinds (`derive`, `fill`, `search`, `pack_gc`,
+  `land_service`) and, when branches land beside the pushes
+  (`--merge-every`), the landings' (`land_submit`, `land_batch`), gated per branch landing at
+  2 (`db_branch_landing_commits_per_landing`): its submit and at most a
+  batch of its own. The landing service's 1.5 holds at its target rate,
+  where batches fill; at 50 branch landings a second most are alone in
+  their batch (1.46 to 1.60 measured).
+  A commit no kind names stays the push's.
+- **Tried and dropped**: raising the inline caps (to 256 snapshots), so a
+  run would write its memos, rows and search index in its one commit. The
+  deriver, holding its lock through them, fell behind: about 540 runs in
+  3 minutes instead of about 4,500, landings told `503 warming` (135
+  errors), 320.2 pushes a second and p99 3,455 ms (378.2 and 1,517
+  before). With the search index left out of the run again: 354.4 a
+  second, p99 3,253 ms, no errors, and still a fill (with its memos) for
+  most runs, which had grown past the new caps.
+
+**Before → after**, the headline (`.scratch/bench-custom.sh custom`,
+objects local, as in "Final local measurements on `171a625a`"; the
+1,000-agent and 10-minute "before" are that section's, the same code):
+
+| Agents | Run | Pushes (/s) | Branches landed (/s) | p50 (ms) | p99 (ms) | Server CPU (ms/push) | DB CPU (ms/push) | DB commits per push, all (the push's own) | Commits per branch landing | Errors | Load before / after |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 300 | 180 s, before | 378.2 | 75.6 | 793 | 1,517 | 40.3 | 18.5 | 4.60 (2.49) | — | 0 | 0.50 / 63.46 |
+| 300 | 180 s, after | **390.3** | **78.1** | 729 | 1,559 | 39.4 | 17.3 | **3.66 (1.00)** | 1.46 | 0 | 1.53 / 65.37 |
+| 1,000 | 180 s, before | 258.2 | 52.4 | 4,021 | 6,183 | 77.6 | 13.8 | 5.31 (3.20) | — | 0 (7,290 told to come back) | 14.76 / 43.26 |
+| 1,000 | 180 s, after | **263.6** | **53.1** | 3,944 | 5,867 | 75.7 | 13.7 | **3.66 (1.00)** | 1.60 | 0 (6,823 told to come back) | 13.35 / 65.38 |
+| 300 | 600 s, before | 245.8 | 49.2 | 1,069 | 3,596 | 72.6 | 25.1 | 5.35 (3.23) | — | 0 | 13.93 / 46.86 |
+| 300 | 600 s, after | **252.0** | **50.4** | 1,056 | 3,611 | 72.0 | 24.4 | **3.68 (1.00)** | 1.48 | 0 | 1.30 / 47.40 |
+
+The push's gate held in every run. The 1,000-agent run, made with the
+branch-landing gate first set at 1.5, printed `GATE MISSED: branches:
+1.60 database commits per branch landing`; the gate is 2 since (above).
+Storage writes stay 2.0 a push of its own.
+
+**`scripts/bench-server.sh load`** (MinIO, 15 s points; "before" is the
+same tool with `SERVER_BIN` set to `febdaced`'s server, which counts no
+kinds, so the deriver's `derive_progress` writes are set aside as
+before): the push's own commits (all commits).
+
+| Curve | Before | After |
+|---|---|---|
+| `land`, 1, 10, 100 projects | 1.08, 1.87, 1.89 (3.88, 4.01, 3.94) | **1.00, 1.00, 1.00** (3.86, 3.23, 3.22) |
+| `branches`, 1, 10, 100 agents | 1.23, 2.28, 1.34 (4.10, 4.38, 3.36) | **1.00, 1.00, 1.00** (4.07, 3.40, 3.05) |
+| `api`, 1, 10, 100 projects | 1.06, 1.11, 2.02 | **1.02, 1.00, 1.00** |
+| `hot` landings, 5, 20, 40, 80 a second | 5.43, 2.52, 1.80, 13.73 | **1.00, 1.07, 1.02**, 10.21 |
+| `api-hot`, 20, 50, 100 a second, max | 1.50, 7.17, 6.88, 7.17 | 1.08, **1.01**, 7.37, 7.11 |
+
+Pushes a second rose with the commits saved where the curve is not bound
+elsewhere (`land` at 100 projects 1,189 → 1,278; `branches` at 10 agents
+509 → 544; `api` at 10 projects 376 → 426). The gate misses went from 16
+to 3: `hot` at 80 a second and `api-hot` at 100 and max, past capacity
+(about 40 collisions a landing), where each retry's own commits count;
+the same before (BUG-2370). The load averages after the two profile runs
+were 85 and 104 (other agents' work beside them): the speeds there are
+indicative only, the commit counts are not affected.
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |

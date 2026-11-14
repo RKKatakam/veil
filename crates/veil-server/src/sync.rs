@@ -416,6 +416,8 @@ pub(crate) struct Deferred {
     pub(crate) fresh: HashMap<ObjectId, Option<ObjectId>>,
     /// Memo rows `(view key, real, projected)` for the push's transaction.
     pub(crate) rows: Vec<(String, ObjectId, ObjectId)>,
+    /// `rows` by view key and real snapshot.
+    index: HashMap<(String, ObjectId), ObjectId>,
     /// Those of them whose real snapshot collapsed into its first parent's
     /// projection (a change hidden from that view).
     pub(crate) collapsed: HashSet<ObjectId>,
@@ -502,7 +504,7 @@ pub(crate) async fn projected_inner(
             let fresh = deferred.as_ref().is_some_and(|d| d.fresh.contains_key(&x));
             // A push's new snapshot has no memo yet, except one this push
             // just worked out.
-            let mine = deferred.as_ref().and_then(|d| d.rows.iter().find(|(k, r, _)| *k == view_key && *r == x).map(|(_, _, p)| *p));
+            let mine = deferred.as_ref().and_then(|d| d.index.get(&(view_key.clone(), x)).copied());
             let memo = match mine {
                 Some(p) => Some(p),
                 None if fresh => None,
@@ -596,6 +598,7 @@ pub(crate) async fn projected_inner(
                     }
                 }
                 d.rows.push((view_key.clone(), x, result));
+                d.index.insert((view_key.clone(), x), result);
                 if collapsed {
                     d.collapsed.insert(x);
                 }
@@ -618,6 +621,12 @@ pub(crate) async fn projected_inner(
                 .execute(&hub.db)
                 .await?
                 .rows_affected();
+                if inserted == 1 {
+                    hub.commits.count(match crate::query::graph::filling() {
+                        true => crate::db::Commit::Fill,
+                        false => crate::db::Commit::Memo,
+                    });
+                }
                 // Another request stored it first: every server answers what
                 // is stored.
                 let stored = if inserted == 1 {
@@ -3139,6 +3148,7 @@ async fn push_staged(
     let mut deferred = Deferred {
         fresh: completed.iter().map(|c| (c.real, c.origin)).collect(),
         rows: Vec::new(),
+        index: HashMap::new(),
         collapsed: HashSet::new(),
         staged: Some(st.clone()),
         made: Vec::new(),
@@ -3533,7 +3543,10 @@ async fn push_staged(
     })
     .await;
         match r {
-            Ok(r) => r,
+            Ok(r) => {
+                hub.commits.count(if queued.is_empty() { crate::db::Commit::Push } else { crate::db::Commit::LandSubmit });
+                r
+            }
             Err(e) => {
                 for w in waiters {
                     crate::landing::abandon(hub, w);

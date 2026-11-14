@@ -115,6 +115,10 @@ pub const GATE_COMMITS_PER_PUSH: f64 = 1.0;
 /// Database commits per landing through the landing service (phase 4 §7):
 /// the submit's, and its share of its batch's.
 pub const GATE_COMMITS_PER_LANDING: f64 = 1.5;
+/// Database commits per branch landing beside pushes (`--merge-every`): its
+/// submit's and at most a batch of its own, since at those rates a batch
+/// seldom fills (BUG-2350).
+pub const GATE_COMMITS_PER_BRANCH_LANDING: f64 = 2.0;
 pub const GATE_STATEMENTS_PER_WARM_PULL: f64 = 5.0;
 /// Storage writes of a push's own requests (S28: its upload's pack, and
 /// the push's own pack when the server completes it), per push attempt (a
@@ -1065,6 +1069,39 @@ fn server_stats(pid: u32, file: &std::path::Path) -> Option<serde_json::Value> {
     None
 }
 
+/// The database commits the server this tool started counted by kind over
+/// the window (its `commits` counters, BUG-2350).
+struct CommitKinds {
+    by_kind: Vec<(String, f64)>,
+    /// The landings' own: their submits and batches.
+    landing: f64,
+    /// Work beside the requests: the deriver's, the view keys' fills', the
+    /// search index's own, pack merges' and the landing service's leases.
+    background: f64,
+}
+
+impl CommitKinds {
+    fn between(before: &serde_json::Value, after: &serde_json::Value) -> Option<CommitKinds> {
+        let (b, a) = (before["commits"].as_object()?, after["commits"].as_object()?);
+        let by_kind: Vec<(String, f64)> = a.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()? - b.get(k)?.as_f64()?))).collect();
+        let sum = |ks: &[&str]| by_kind.iter().filter(|(k, _)| ks.contains(&k.as_str())).map(|(_, v)| v).sum::<f64>();
+        Some(CommitKinds {
+            landing: sum(&["land_submit", "land_batch"]),
+            background: sum(&["derive", "fill", "search", "pack_gc", "land_service"]),
+            by_kind,
+        })
+    }
+
+    /// The commits not charged to a push: the background work's and, when
+    /// `landings_gated` (branch landings beside the pushes, gated per
+    /// landing), the landings'. A push that queues its own landing
+    /// (`--protected` without `--merge-every`) keeps its submit, which no
+    /// other gate counts (BUG-2350 review).
+    fn aside(&self, landings_gated: bool) -> f64 {
+        self.background + if landings_gated { self.landing } else { 0.0 }
+    }
+}
+
 /// The gates one run missed (`storage-and-cost.md` §9).
 pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
     let mut out = Vec::new();
@@ -1083,7 +1120,11 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
         let ops = r["ops"].as_f64().unwrap_or(0.0);
         let over = |c: f64| c * ops > GATE_COMMITS_PER_PUSH * ops * 1.02 + 20.0;
         if let Some(c) = r["db_push_commits_per_op"].as_f64().filter(|c| over(*c)) {
-            out.push(format!("{mode}: {c:.2} database commits per landing, the deriver's aside (gate: {GATE_COMMITS_PER_PUSH})"));
+            out.push(format!("{mode}: {c:.2} database commits per push, the background work's aside (gate: {GATE_COMMITS_PER_PUSH})"));
+        }
+        let merges = r["branch_merges"].as_f64().unwrap_or(0.0);
+        if let Some(c) = r["db_branch_landing_commits_per_landing"].as_f64().filter(|c| c * merges > GATE_COMMITS_PER_BRANCH_LANDING * merges * 1.02 + 20.0) {
+            out.push(format!("{mode}: {c:.2} database commits per branch landing (gate: {GATE_COMMITS_PER_BRANCH_LANDING})"));
         }
         // Pushes only: an API commit stores its objects loose (S10).
         if mode != "api" {
@@ -1595,6 +1636,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         let server_stats = cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f)).zip(before_server_stats);
         let stat = |k: &str| server_stats.as_ref().and_then(|(b, a)| Some(b[k].as_f64()? - a[k].as_f64()?));
         let dml = cx.stats.and_then(|(rt, url)| db_writes(rt, url)).zip(before_dml).map(|((_, bw), (_, aw))| bw - aw);
+        let commit_kinds = server_stats.as_ref().and_then(|(b, a)| CommitKinds::between(a, b));
         let requests = c.requests.load(Ordering::Relaxed) - req0;
         let cache_stats = cache.and_then(|k| self::server_stats(k.pid(), &k.dir.join("stats.json"))).zip(before_cache);
         let cstat = |k: &str| cache_stats.as_ref().and_then(|(b, a)| Some(b[k].as_f64()? - a[k].as_f64()?));
@@ -1605,6 +1647,22 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         let mut lat = std::mem::take(&mut *c.latencies.lock().unwrap());
         lat.sort_by(|x, y| x.partial_cmp(y).unwrap());
         let per_op = |x: f64| if ops > 0.0 { x / ops } else { f64::NAN };
+        // The push's transaction: the rows that record packs before
+        // they are written (uploads', and a push's own: S28) aside, and
+        // the background work's (the deriver's, the fills', the search
+        // index's, the pack merges', the landing service's leases) and,
+        // when branches land beside the pushes (`--merge-every`), the landings' (their
+        // submits and batches, gated per branch landing), as the server counts
+        // them by kind (BUG-2350). A commit no kind names is charged to
+        // the push. Without the server's counts, the deriver's are its
+        // `derive_progress` writes.
+        let push_commits = writes.map(|w| {
+            let aside = match &commit_kinds {
+                Some(k) => k.aside(a.mode != Mode::Landing && c.merges.load(Ordering::Relaxed) > 0),
+                None => deriver.unwrap_or(0.0),
+            };
+            per_op((w - aside - stat("pack_row_commits").unwrap_or(0.0)).max(0.0))
+        });
         result = json!({
             "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Branches => "branches", Mode::Api => "api", Mode::Landing => "landing", Mode::Objects => "objects" },
 
@@ -1632,10 +1690,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "db_per_request": stmts.map(|(n, _)| if requests > 0 { n / requests as f64 } else { f64::NAN }),
             "db_commits_per_op": writes.map(per_op),
             "db_deriver_writes_per_op": deriver.map(per_op),
-            // The push's transaction: the deriver's aside, and the rows that
-            // record packs before they are written (uploads', and a push's
-            // own: S28, counted by the server).
-            "db_push_commits_per_op": writes.zip(deriver).map(|(w, d)| per_op((w - d - stat("pack_row_commits").unwrap_or(0.0)).max(0.0))),
+            "db_push_commits_per_op": push_commits,
             "db_pack_row_commits_per_op": stat("pack_row_commits").map(per_op),
             "storage_writes_per_op": stat("storage_writes").map(per_op),
             // Counted by the server where they are made (BUG-1398).
@@ -1664,7 +1719,13 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         result["protected"] = json!(a.protected);
         result["mix"] = json!(a.mix);
         result["people"] = json!(a.people.max(1));
+        result["db_commits_by_kind_per_op"] = json!(commit_kinds.as_ref().map(|k| k.by_kind.iter().map(|(n, v)| (n.clone(), json!(per_op(*v)))).collect::<serde_json::Map<_, _>>()));
         result["branch_merges"] = json!(c.merges.load(Ordering::Relaxed));
+        // A branch's landing on `main` (`--merge-every`): its submit's
+        // commit and its share of its batch's.
+        let merges = c.merges.load(Ordering::Relaxed) as f64;
+        result["db_branch_landing_commits_per_landing"] =
+            json!(commit_kinds.as_ref().filter(|_| a.mode != Mode::Landing && merges > 0.0).map(|k| k.landing / merges));
         result["branch_merge_waits"] = json!(c.merge_waits.load(Ordering::Relaxed));
         // The landing service's own counters (the server this tool started).
         let ratio = |a: Option<f64>, b: Option<f64>, k: f64| a.zip(b).map(|(a, b)| if b > 0.0 { a / b / k } else { f64::NAN });
@@ -2122,6 +2183,29 @@ mod tests {
         let raced = |w: f64| json!({"mode": "land", "ops": 1000.0, "collisions_per_op": 4.0, "storage_push_writes_per_op": w});
         assert!(missed_gates(&raced(9.0), 0.0).is_empty());
         assert_eq!(missed_gates(&raced(12.0), 0.0).len(), 1);
+    }
+
+    /// BUG-2350: the commits the server counts by kind are charged where
+    /// they belong: the background work's and the landings' are not the
+    /// push's (a request's projection memo is); a branch landing is gated
+    /// at its submit and at most a batch of its own.
+    #[test]
+    fn bug_2350_commits_by_kind_are_charged_where_they_belong() {
+        let at = |push: u64, submit: u64, batch: u64, derive: u64, fill: u64, search: u64, gc: u64, service: u64, memo: u64| {
+            json!({"commits": {"push": push, "land_submit": submit, "land_batch": batch, "land_service": service, "derive": derive,
+                               "fill": fill, "memo": memo, "search": search, "pack_gc": gc}})
+        };
+        let k = CommitKinds::between(&at(10, 0, 0, 5, 0, 0, 0, 0, 0), &at(1010, 200, 120, 75, 190, 2, 46, 1, 3)).expect("counted by kind");
+        assert_eq!((k.landing, k.background), (320.0, 70.0 + 190.0 + 2.0 + 46.0 + 1.0));
+        assert_eq!(k.aside(true), 320.0 + 309.0, "branch landings, gated per landing, are not the push's");
+        assert_eq!(k.aside(false), 309.0, "a landing no gate counts stays the push's");
+        assert!(CommitKinds::between(&json!({}), &at(1, 0, 0, 0, 0, 0, 0, 0, 0)).is_none(), "a server that counts no kinds");
+        let run = |own: f64, landing: f64| {
+            json!({"mode": "branches", "ops": 1000.0, "db_push_commits_per_op": own, "branch_merges": 200.0, "db_branch_landing_commits_per_landing": landing})
+        };
+        assert!(missed_gates(&run(1.0, 1.6), 0.0).is_empty(), "a push's one commit; a landing alone in its batch");
+        assert_eq!(missed_gates(&run(1.3, 1.6), 0.0).len(), 1, "more than a commit a push");
+        assert_eq!(missed_gates(&run(1.0, 2.5), 0.0).len(), 1, "more than a submit and a batch a landing");
     }
 
     fn reply(status: u16, body: serde_json::Value) -> Reply {

@@ -564,6 +564,7 @@ async fn finish_landing_run(hub: &Arc<Hub>, project: i64, p: PreparedLanding) ->
                     s_done = all_ok;
                 }
                 tx.commit().await?;
+                hub.commits.count(crate::db::Commit::Derive);
                 Ok((fb, sk, s_done))
             }
             .await;
@@ -1331,6 +1332,7 @@ impl<'a> Batch<'a> {
                 let mut tx = pool.begin().await?;
                 write_derive_tx(&mut tx, project, &w, progress).await?;
                 tx.commit().await?;
+                cx.hub().commits.count(crate::db::Commit::Derive);
                 Ok(())
             })?;
         }

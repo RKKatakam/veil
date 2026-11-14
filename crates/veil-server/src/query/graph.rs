@@ -743,6 +743,12 @@ pub(crate) fn projected_one() {
     let _ = FILLING.try_with(|p| p.step());
 }
 
+/// Whether this task is a fill's (its projection memos are the fill's
+/// commits: `db::Commit::Fill`).
+pub(crate) fn filling() -> bool {
+    FILLING.try_with(|_| ()).is_ok()
+}
+
 /// [`extend`] (`files`) or [`extend_rows`]; the walk runs in one of
 /// `slots` (the projections before it hold none).
 async fn walk_tips(
@@ -754,10 +760,7 @@ async fn walk_tips(
     progress: &Progress,
     slots: Option<&Arc<tokio::sync::Semaphore>>,
 ) -> Result<Vec<ObjectId>> {
-    let mut ps = Vec::with_capacity(tips.len());
-    for t in tips {
-        ps.push(FILLING.scope(progress.clone(), sync::projected(hub, project, viewer, *t)).await?);
-    }
+    let ps = project_tips(hub, project, viewer, tips, progress).await?;
     let _slot = match slots {
         Some(s) => Some(s.clone().acquire_owned().await.map_err(|e| Error::Other(e.into()))?),
         None => None,
@@ -786,6 +789,88 @@ async fn walk_tips(
     })
     .await?;
     Ok(ps)
+}
+
+/// The projections of `tips` for `viewer`, as `sync::projected` answers
+/// them, the memo rows they need stored together: one transaction (one
+/// commit), a statement for every `ROWS_PER_STATEMENT` rows (BUG-2350:
+/// stored one at a time, each its own commit, a fill of 300 branches' tips
+/// cost 300). Should a row stored first (by another server) hold another
+/// projection, the whole batch is rolled back, since its rows below that
+/// one name the projection worked out here (BUG-2390), and the tips are
+/// projected again one memo at a time, each stored one taken as it is
+/// (`sync::projected`).
+async fn project_tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], progress: &Progress) -> Result<Vec<ObjectId>> {
+    if let Ok(Some(ps)) = project_tips_together(hub, project, viewer, tips, progress).await {
+        return Ok(ps);
+    }
+    let mut ps = Vec::with_capacity(tips.len());
+    for t in tips {
+        ps.push(FILLING.scope(progress.clone(), sync::projected(hub, project, viewer, *t)).await?);
+    }
+    Ok(ps)
+}
+
+/// [`project_tips`] with the memo rows stored together; `None` if a row
+/// stored first holds another projection.
+async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], progress: &Progress) -> Result<Option<Vec<ObjectId>>> {
+    let mut deferred = sync::Deferred::default();
+    let mut ps = Vec::with_capacity(tips.len());
+    for t in tips {
+        ps.push(crate::store::not_own(Box::pin(sync::projected_inner(hub, project, viewer, *t, Some(&mut deferred)))).await?);
+    }
+    let now = veil_core::now_millis();
+    let mut tx = hub.db.begin().await?;
+    let mut wrote = false;
+    for chunk in deferred.rows.chunks(ROWS_PER_STATEMENT) {
+        let keys: Vec<&str> = chunk.iter().map(|(k, _, _)| k.as_str()).collect();
+        let reals: Vec<String> = chunk.iter().map(|(_, r, _)| r.hex()).collect();
+        let projected: Vec<String> = chunk.iter().map(|(_, _, p)| p.hex()).collect();
+        let collapsed: Vec<bool> = chunk.iter().map(|(_, r, _)| deferred.collapsed.contains(r)).collect();
+        let inserted: Vec<(String, String)> = sqlx::query_as(
+            "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+             SELECT $1, k, r, p, $5, c FROM UNNEST($2::text[], $3::text[], $4::text[], $6::bool[]) AS t(k, r, p, c) \
+             ON CONFLICT DO NOTHING RETURNING view_key, real_id",
+        )
+        .bind(project.id)
+        .bind(&keys)
+        .bind(&reals)
+        .bind(&projected)
+        .bind(now)
+        .bind(&collapsed)
+        .fetch_all(&mut *tx)
+        .await?;
+        wrote |= !inserted.is_empty();
+        if inserted.len() < chunk.len() {
+            // Stored first by another request: the same projection, or
+            // what was worked out here is not used.
+            let inserted: HashSet<(&str, &str)> = inserted.iter().map(|(k, r)| (k.as_str(), r.as_str())).collect();
+            let ours: HashMap<(&str, &str), &str> = keys.iter().zip(&reals).zip(&projected).map(|((k, r), p)| ((*k, r.as_str()), p.as_str())).collect();
+            let (k2, r2): (Vec<&str>, Vec<&str>) = ours.keys().filter(|kr| !inserted.contains(*kr)).copied().unzip();
+            let stored: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT p.view_key, p.real_id, p.projected_id FROM projections p \
+                 JOIN UNNEST($2::text[], $3::text[]) AS t(k, r) ON p.view_key = t.k AND p.real_id = t.r WHERE p.project_id = $1",
+            )
+            .bind(project.id)
+            .bind(&k2)
+            .bind(&r2)
+            .fetch_all(&mut *tx)
+            .await?;
+            if stored.len() != k2.len() || stored.iter().any(|(k, r, p)| ours.get(&(k.as_str(), r.as_str())) != Some(&p.as_str())) {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+        }
+    }
+    tx.commit().await?;
+    if wrote {
+        hub.commits.count(crate::db::Commit::Fill);
+    }
+    for (k, r, p) in &deferred.rows {
+        hub.caches.put_memo(project.id, k, r, p);
+        progress.step();
+    }
+    Ok(Some(ps))
 }
 
 /// Most snapshots one [`Walk::learn`] asks about at once.
@@ -1059,6 +1144,7 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             }
             G::write_rows_tx(&mut tx, project, vk, &graph, marked).await?;
             tx.commit().await?;
+            hub.commits.count(crate::db::Commit::Fill);
             Ok(())
         })?;
         for (i, r, _) in &graph {
@@ -1572,6 +1658,9 @@ async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &st
         .bind(now)
         .fetch_optional(&hub.db)
         .await?;
+        if got.is_some() {
+            hub.commits.count(crate::db::Commit::Fill);
+        }
         Ok::<bool, Error>(got.is_some())
     };
     let wait = tokio::time::Instant::now() + FILL_LOCK_WAIT;
@@ -1601,12 +1690,15 @@ async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &st
     };
     if let Some(renew) = renew {
         renew.abort();
-        let _ = sqlx::query("DELETE FROM view_fills WHERE project_id = $1 AND view_key = $2 AND holder = $3")
+        let gone = sqlx::query("DELETE FROM view_fills WHERE project_id = $1 AND view_key = $2 AND holder = $3")
             .bind(project.id)
             .bind(vk)
             .bind(&holder)
             .execute(&hub.db)
             .await;
+        if gone.is_ok_and(|g| g.rows_affected() == 1) {
+            hub.commits.count(crate::db::Commit::Fill);
+        }
     }
     r
 }

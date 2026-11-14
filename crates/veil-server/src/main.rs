@@ -311,6 +311,7 @@ fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
         "object_cache_misses": hub.objects.cache_misses.load(Relaxed),
         "storage_own_writes": hub.objects.own_writes.load(Relaxed),
         "pack_row_commits": hub.objects.pack_rows.load(Relaxed),
+        "commits": hub.commits.by_kind(),
         "s3_slow_down": veil_server::store::S3_SLOW_DOWN.load(Relaxed),
         "s3_gave_up": veil_server::store::S3_GAVE_UP.load(Relaxed),
         "session_hits": c.session_hits.load(Relaxed),

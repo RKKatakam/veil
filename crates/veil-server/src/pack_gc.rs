@@ -851,7 +851,7 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
             }
             let expired_hexes: Vec<String> = expired_unreferenced.iter().map(ObjectId::hex).collect();
             let maybe_gce: Option<i64> =
-                crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
+                gc_transaction(hub, |c| {
                     let expected = expected.clone();
                     let expired_hexes = expired_hexes.clone();
                     Box::pin(async move {
@@ -1153,7 +1153,7 @@ async fn compact_batch(
     };
 
     let switched: Option<Option<i64>> =
-        crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
+        gc_transaction(hub, |c| {
             let old_names = old_names.clone();
             let new_names = new_names.clone();
             let check_stamp = check_stamp.clone();
@@ -1355,12 +1355,15 @@ async fn sweep_discarded(
     }
     hub.objects.forget_packs(project, &arcs);
 
-    sqlx::query("DELETE FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3")
+    let swept = sqlx::query("DELETE FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3")
         .bind(project)
         .bind(&deleted_names)
         .bind(DISCARDED)
         .execute(&hub.db)
         .await?;
+    if swept.rows_affected() > 0 {
+        hub.commits.count(crate::db::Commit::PackGc);
+    }
 
     report.discarded_packs_swept += deleted_names.len();
     Ok(())
@@ -1537,7 +1540,7 @@ async fn mark_and_sweep_loose(
         }
         let expired_hexes: Vec<String> = expired_unreferenced.iter().map(ObjectId::hex).collect();
         let purged: Result<(RefStamp, Option<i64>)> =
-            crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
+            gc_transaction(hub, |c| {
                 let stamp = stamp.clone();
                 let expired_hexes = expired_hexes.clone();
                 Box::pin(async move {
@@ -1577,7 +1580,7 @@ async fn mark_and_sweep_loose(
             }
         }
         if deleted_any_loose {
-            let gce2 = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, |c| {
+            let gce2 = gc_transaction(hub, |c| {
                 let deleted_loose_only_hexes = deleted_loose_only_hexes.clone();
                 Box::pin(async move {
                     lock_gc_epoch_tx(c, project).await?;
@@ -2213,4 +2216,17 @@ async fn walk_from_roots(
     }
 
     Ok(reachable)
+}
+
+/// A READ COMMITTED `db::transaction` of the merges and garbage collection,
+/// counted as theirs (`db::Commit::PackGc`) when it commits.
+async fn gc_transaction<T, F>(hub: &crate::Hub, f: F) -> Result<T>
+where
+    F: for<'t> FnMut(&'t mut sqlx::PgConnection) -> crate::db::TxFuture<'t, T>,
+{
+    let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, f).await;
+    if r.is_ok() {
+        hub.commits.count(crate::db::Commit::PackGc);
+    }
+    r
 }

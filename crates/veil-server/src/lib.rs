@@ -105,6 +105,8 @@ pub struct Hub {
     pub pack_gc: pack_gc::State,
     /// Rate limits, the request budget, bulkheads and health (S24).
     pub limits: limits::Limits,
+    /// Its database commits by kind (BUG-2350).
+    pub commits: db::Commits,
 }
 
 pub type HubState = Arc<Hub>;
@@ -245,6 +247,7 @@ pub async fn start(config: Config) -> Result<Running> {
         embargo: embargo::State::default(),
         pack_gc: pack_gc::State::default(),
         limits: limits::Limits::new(config.limits, config.db_connections),
+        commits: Default::default(),
     });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;

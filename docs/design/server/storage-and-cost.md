@@ -109,11 +109,13 @@ In each API server's memory, never in the database:
 | Measure | Gate |
 |---|---|
 | Storage writes per push | 2 or fewer (once S28 is in; 1 per new object before): gated by `veil-bench load` for landings (the deriver's background writes aside, `storage_push_writes_per_op`) |
-| Database commits per push | 1 (once S4 is in) |
+| Database commits per push | 1 (once S4 is in): the push's transaction; the staged-pack rows (about 2 a push since S28) and the background work's are reported, not gated (below) |
 | Database statements per pull, warm caches | 5 or fewer |
 | Server peak memory, 1 GB profile | under 1 GB |
 
 `scripts/bench-server.sh` prints these counts with every profile, so every performance round and every server milestone shows its cost next to its speed.
+
+**How a push's commits are counted** (BUG-2350, 2026-11-14): the server counts its database commits by kind where each is made (`db::Commit`: the push's, a landing's submit and batch, the landing service's leases, the deriver's, the fills', a request's projection memo, the search index's, the pack merges'), and `veil-bench` charges a push with every commit the database made in the window but the staged-pack rows, the background kinds and, when branches land beside the pushes (`--merge-every`), the landings', which are gated per branch landing (2: its submit and at most a batch of its own, since batches seldom fill at those rates; the landing service's 1.5 is at its target rate). A commit no kind names stays the push's. **What the gate of 1 leaves out, said plainly:** the staged-pack rows are commits the push waits for (one per upload request and one for the push's own pack, §7 (3), BUG-1399; set aside by `veil-bench` since S28, 2026-11-08), about 2 a push; with them, a push costs about **3 commits before it answers** (3.05 in the many-branch headline, `LOAD.md` "Database commits by kind"), and about 3.7 in all with the background work's. The background kinds (the deriver's, the fills', the search index's, the pack merges', the landing service's leases) are reported per push (`db_commits_by_kind_per_op`), not gated.
 
 ## 10. Other performance work in the plan
 

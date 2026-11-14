@@ -161,6 +161,9 @@ async fn take_lease(hub: &Hub, project: i64, branch: &str) -> Result<Option<(i64
     if locked && !matches!(took, Ok(Some(_))) {
         locks.unlock(&hub.db, project, branch, next).await;
     }
+    if matches!(took, Ok(Some(_))) {
+        hub.commits.count(crate::db::Commit::LandService);
+    }
     Ok(took?.map(|epoch| (epoch, locked)))
 }
 
@@ -177,6 +180,9 @@ async fn renew(hub: &Hub, project: i64, branch: &str, epoch: i64) -> Result<bool
     .execute(&hub.db)
     .await?
     .rows_affected();
+    if n == 1 {
+        hub.commits.count(crate::db::Commit::LandService);
+    }
     Ok(n == 1)
 }
 
@@ -528,13 +534,16 @@ pub(super) async fn run(hub: &Arc<Hub>, project: i64, branch: &str, wake: Arc<No
         Ok(None) => Ok(()),
         Err(e) => Err(e),
     };
-    let _ = sqlx::query("UPDATE landing_leases SET expires_at = 0 WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4")
+    let released = sqlx::query("UPDATE landing_leases SET expires_at = 0 WHERE project_id = $1 AND branch = $2 AND holder = $3 AND epoch = $4")
         .bind(project)
         .bind(branch)
         .bind(&hub.landing.holder)
         .bind(epoch)
         .execute(&hub.db)
         .await;
+    if released.is_ok_and(|r| r.rows_affected() == 1) {
+        hub.commits.count(crate::db::Commit::LandService);
+    }
     // Given up (or lost): its lock goes too, so it is never taken over by it
     // later; only a lock this server took is unlocked (rv-failover2 nit 1).
     if locked {
@@ -702,7 +711,7 @@ impl Service {
     /// [`CLEAN_CHUNK`] of each.
     async fn clean(&self) -> Result<()> {
         let before = veil_core::now_millis() - KEEP_DONE_MS;
-        sqlx::query(
+        let q = sqlx::query(
             "DELETE FROM landing_queue WHERE (project_id, branch, seq) IN (SELECT project_id, branch, seq FROM landing_queue \
              WHERE project_id = $1 AND done_at < $2 AND state NOT IN ('queued', 'merging') LIMIT $3)",
         )
@@ -711,7 +720,10 @@ impl Service {
         .bind(CLEAN_CHUNK)
         .execute(&self.hub.db)
         .await?;
-        sqlx::query(
+        if q.rows_affected() > 0 {
+            self.hub.commits.count(crate::db::Commit::LandService);
+        }
+        let l = sqlx::query(
             "DELETE FROM landings WHERE (project_id, branch, lineage, submitted) IN (SELECT project_id, branch, lineage, submitted \
              FROM landings WHERE project_id = $1 AND at < $2 LIMIT $3)",
         )
@@ -720,6 +732,9 @@ impl Service {
         .bind(CLEAN_CHUNK)
         .execute(&self.hub.db)
         .await?;
+        if l.rows_affected() > 0 {
+            self.hub.commits.count(crate::db::Commit::LandService);
+        }
         Ok(())
     }
 
@@ -1672,7 +1687,10 @@ impl Service {
             }
         };
         let (results, marked_prs) = match r {
-            Ok(r) => r,
+            Ok(r) => {
+                hub.commits.count(crate::db::Commit::LandBatch);
+                r
+            }
             Err(Error::Api { code: "conflict", message, .. }) if message == LEASE_LOST => {
                 hub.landing.stats.lease_lost.fetch_add(1, Ordering::Relaxed);
                 return Ok(Committed::LeaseLost);

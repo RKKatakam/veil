@@ -2182,6 +2182,7 @@ mod tests {
             embargo: Default::default(),
             pack_gc: Default::default(),
             limits: crate::limits::Limits::new(Default::default(), 1),
+            commits: Default::default(),
         });
         let bound = objects.packs.bound();
         let first_share = bound.take(64 << 20).await.unwrap();

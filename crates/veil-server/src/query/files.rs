@@ -256,6 +256,7 @@ impl Fill {
                 let mut tx = pool.begin().await?;
                 Self::write_rows_tx(&mut tx, cx.project(), g.vk, &pending).await?;
                 tx.commit().await?;
+                cx.hub().commits.count(crate::db::Commit::Fill);
                 Ok(())
             })?;
         }
