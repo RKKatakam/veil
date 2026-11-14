@@ -171,6 +171,13 @@ impl Staged {
         })
     }
 
+    /// What the checks made and hold (never stored by them).
+    pub(crate) fn made(&self) -> Vec<(ObjectId, Bytes)> {
+        let mut v: Vec<(ObjectId, Bytes)> = self.made.lock().unwrap().iter().map(|(k, v)| (*k, v.clone())).collect();
+        v.sort_by_key(|a| a.0);
+        v
+    }
+
     /// The same uploads and made objects, with reads counted apart (one
     /// snapshot's completion).
     fn child(&self) -> Arc<Staged> {
@@ -239,7 +246,9 @@ impl Source {
         if let Some(b) = builtin(id) {
             return Ok(b);
         }
-        if self.staged.is_some() {
+        // A staged or made object from where `raw` reads it; anything else
+        // from the store, uncached, as without them.
+        if self.staged.as_ref().is_some_and(|st| st.at.contains_key(id) || st.made.lock().unwrap().contains_key(id)) {
             return self.raw(id);
         }
         self.hub
@@ -358,7 +367,7 @@ pub(crate) async fn blocking_staged<T: Send + 'static>(
     blocking_in(hub, project, HashMap::new(), staged, f).await
 }
 
-async fn blocking_in<T: Send + 'static>(
+pub(crate) async fn blocking_in<T: Send + 'static>(
     hub: &Arc<Hub>,
     project: i64,
     pending: HashMap<ObjectId, Bytes>,

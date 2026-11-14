@@ -1774,6 +1774,24 @@ mod s12_adversarial {
         assert!(grew < 1 << 30, "memory rose {} MiB deriving one batch", grew >> 20);
     }
 
+    /// BUG-2380: the deriver's read-ahead (BUG-2361) held what up to 512
+    /// snapshots changed at once, whatever they changed: BUG-867's push of
+    /// one folder alternating between two trees, 160 snapshots of 50,000
+    /// paths, drove the deriver's memory past 1 GiB again. BUG-867's test
+    /// (a process of its own) with that many snapshots.
+    #[test]
+    fn bug_2380_the_read_ahead_holds_bounded_memory() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "derived::s12_adversarial::bug_867_a_derive_batch_holds_unbounded_memory", "--nocapture"])
+            .env("VEIL_BUG867_CHILD", "1")
+            .env("VEIL_BUG867_SNAPSHOTS", "160")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        println!("{}", stdout.lines().find(|l| l.contains("BUG-867:")).unwrap_or_default());
+        assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    }
+
     /// BUG-868: every snapshot that changed more than 100,000 paths (`many`)
     /// is checked, against the trees, for every path of every later change
     /// on the same line. `many` snapshots cost a member nothing to make (one
@@ -2135,5 +2153,87 @@ mod s12_adversarial {
                 .unwrap()
         });
         assert_eq!(through, l.hex());
+    }
+}
+
+/// BUG-2361: the deriver reads ahead (whether up to 512 snapshots are
+/// derived, in one statement; what each changed, on several threads; the
+/// stored file history of every path a chunk changes, in one statement)
+/// instead of asking once for each snapshot. Its values are the ones a read
+/// at a time gave: a line longer than a chunk, derived in runs that find
+/// the earlier runs' rows in the database, with a path changed on another
+/// line deeper than where the main line asks about it (more rows than one
+/// read ahead holds, none of them on the asking line), has every snapshot
+/// derived once and every `prev` and file-history start the model gives.
+#[test]
+fn bug_2361_the_read_ahead_derives_what_one_read_at_a_time_did() {
+    let th = TestHub::start();
+    let (text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &text, &bindings);
+    let root = root_snapshot_id();
+    let hot = "pub/hot.txt".to_string();
+    let mut n = 0u128;
+    let mut ts = 1_700_000_000_000i64;
+    let mut commit = |h: &mut Hist, parents: &[ObjectId], files: Files| {
+        n += 1;
+        ts += 1_000;
+        h.commit(&th, parents, files, n.to_le_bytes(), ts, None)
+    };
+    // The other line: 40 changes of the hot path from the root.
+    let mut side = root;
+    let mut files = Files::new();
+    for i in 0..40 {
+        files.insert(hot.clone(), format!("side {i}\n").into_bytes());
+        side = commit(&mut h, &[side], files.clone());
+    }
+    h.set_branch(&th, "side", side);
+    let stats = h.derive(&th);
+    assert_eq!(stats.snapshots, 40, "the other line derived");
+    // The main line, derived in runs of 20, 600 (longer than a chunk) and
+    // 80: the hot path changed every 7th snapshot, a new file in the others.
+    let mut main = root;
+    let mut files = Files::new();
+    let mut derived = 40;
+    for (run, len) in [(0, 20), (1, 600), (2, 80)] {
+        for i in 0..len {
+            let k = run * 1_000 + i;
+            if k % 7 == 0 {
+                files.insert(hot.clone(), format!("main {k}\n").into_bytes());
+            } else {
+                files.insert(format!("pub/f{k}.txt"), format!("file {k}\n").into_bytes());
+            }
+            main = commit(&mut h, &[main], files.clone());
+        }
+        h.set_branch(&th, "main", main);
+        let stats = h.derive(&th);
+        assert_eq!(stats.snapshots, len, "run {run}: every new snapshot derived once");
+        derived += len;
+    }
+    assert_eq!(derived, h.order.len());
+    assert_eq!(h.derive(&th).snapshots, 0, "nothing left to derive");
+    let order = h.order.clone();
+    let (starts, prevs) = th
+        .rt
+        .block_on(derive::read(&h.hub, h.id, move |g| {
+            let mut starts = Vec::new();
+            let mut prevs = Vec::new();
+            for s in &order {
+                starts.push((*s, derive::last_change(g.cx, "pub/hot.txt", *s)?));
+                if let Some(c) = g.cx.changed(g.get(s)?.changed.as_deref().unwrap())? {
+                    for pc in c.paths {
+                        prevs.push((*s, pc.path, pc.prev));
+                    }
+                }
+            }
+            Ok((starts, prevs))
+        }))
+        .unwrap();
+    assert_eq!(prevs.len(), h.order.len(), "one changed path a snapshot");
+    for (s, got) in starts {
+        assert_eq!(got, model_last_change(&h, s, &hot), "the hot path's history at {}", s.short());
+    }
+    for (s, path, prev) in prevs {
+        let want: Vec<Option<ObjectId>> = h.parents[&s].iter().map(|p| model_last_change(&h, *p, &path)).collect();
+        assert_eq!(prev, want, "prev of {path} in {}", s.short());
     }
 }
