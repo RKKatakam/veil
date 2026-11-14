@@ -1957,7 +1957,7 @@ fn on_threads<T: Sync, R: Send>(items: &[T], threads: usize, least: usize, f: im
     }
     let f = &f;
     std::thread::scope(|s| {
-        let parts: Vec<_> = items.chunks(per).map(|part| s.spawn(move || part.iter().map(f).collect::<Vec<R>>())).collect();
+        let parts: Vec<_> = items.chunks(per).map(|part| crate::spawn_scoped(s, move || part.iter().map(f).collect::<Vec<R>>())).collect();
         parts.into_iter().flat_map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
     })
 }

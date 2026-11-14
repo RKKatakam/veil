@@ -161,6 +161,53 @@ fn bug_1052_a_deep_edit_never_takes_the_server_down() {
     assert!(out.status.success() && text.contains("deep edits answered"), "the server went down: {:?}\n{}", out.status, &text[text.len().saturating_sub(600)..]);
 }
 
+/// Every thread the server starts itself has the stack the walks over a
+/// tree `MAX_TREE_DEPTH` deep need (`veil_server::spawn_scoped`): BUG-2410's
+/// deriver read-ahead ran them on `std::thread::scope`'s 2 MiB threads, and
+/// the push above aborted the server. The server's code is read for any
+/// other way of starting a thread.
+#[test]
+fn bug_2410_every_thread_the_server_starts_has_the_deep_tree_stack() {
+    fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut all = Vec::new();
+    files(&src, &mut all);
+    let (mut scopes, mut bad) = (0, Vec::new());
+    for p in &all {
+        let text = std::fs::read_to_string(p).unwrap();
+        let name = p.strip_prefix(&src).unwrap().display().to_string();
+        if name == "lib.rs" {
+            assert!(text.contains("stack_size(THREAD_STACK).spawn_scoped("), "the helper sets the stack");
+            continue;
+        }
+        for banned in ["thread::spawn", "thread::Builder", "rayon"] {
+            if text.contains(banned) {
+                bad.push(format!("{name}: {banned}"));
+            }
+        }
+        // A scope's threads are spawned by the helper, never `s.spawn(`.
+        for (at, _) in text.match_indices("thread::scope(|") {
+            scopes += 1;
+            let var: String = text[at + "thread::scope(|".len()..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let call = format!("{var}.spawn(");
+            if text.match_indices(&call).any(|(i, _)| !text[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_')) {
+                bad.push(format!("{name}: {var}.spawn("));
+            }
+        }
+    }
+    assert!(scopes >= 5, "the scan found the server's thread scopes: {scopes}");
+    assert!(bad.is_empty(), "threads started without veil_server::spawn_scoped: {bad:?}");
+}
+
 #[test]
 #[ignore = "helper of bug_1052 (run in a child process)"]
 fn deep_edit_in_a_child() {

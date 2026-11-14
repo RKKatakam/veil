@@ -1139,7 +1139,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                 };
                 std::thread::scope(|s| {
                     for _ in 0..n_workers {
-                        s.spawn(|| {
+                        crate::spawn_scoped(s, || {
                             let mut prev_text: Option<Arc<Text>> = base_ref.clone();
                             loop {
                                 if aborted.load(std::sync::atomic::Ordering::Acquire) || lease_ref.is_some_and(|l| !l.live()) {
@@ -1405,7 +1405,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                         let ids_ref = &needed_ids;
                         std::thread::scope(|s| {
                             for _ in 0..n_m {
-                                s.spawn(|| loop {
+                                crate::spawn_scoped(s, || loop {
                                     let j = next_m.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if j >= ids_ref.len() {
                                         break;
@@ -1459,7 +1459,7 @@ impl<'f, 'g, 'a, 'h, 'b> Blamer<'f, 'g, 'a, 'h, 'b> {
                     let pk_ref = &pk_by_str;
                     std::thread::scope(|s| {
                         for _ in 0..n_enc {
-                            s.spawn(|| loop {
+                            crate::spawn_scoped(s, || loop {
                                 let k = next_k.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if k >= keeps_ref.len() {
                                     break;

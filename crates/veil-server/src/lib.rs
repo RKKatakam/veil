@@ -66,6 +66,15 @@ use veil_core::{cache::LruCache, object::Tree, object::TreeEncoding, Identity};
 /// touches.
 pub const THREAD_STACK: usize = 64 << 20;
 
+/// Spawn `f` on a scoped thread of [`THREAD_STACK`]: every thread the
+/// server starts itself runs on one (BUG-2410: `std::thread::scope`'s
+/// threads have 2 MiB, and the deriver's read-ahead walked a tree 600
+/// folders deep on one and aborted the server). Panics, as
+/// `Scope::spawn` does, if the thread cannot be started.
+pub fn spawn_scoped<'s, 'e, T: Send + 's>(s: &'s std::thread::Scope<'s, 'e>, f: impl FnOnce() -> T + Send + 's) -> std::thread::ScopedJoinHandle<'s, T> {
+    std::thread::Builder::new().stack_size(THREAD_STACK).spawn_scoped(s, f).expect("failed to spawn a thread")
+}
+
 /// Shared server state.
 pub struct Hub {
     pub db: sqlx::PgPool,

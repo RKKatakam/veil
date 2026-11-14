@@ -1058,7 +1058,7 @@ impl<'a> Batch<'a> {
         let read: Vec<Result<Vec<(ObjectId, TreeChanges)>>> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..AHEAD_THREADS.min(chunk.len()))
                 .map(|_| {
-                    sc.spawn(|| {
+                    crate::spawn_scoped(sc, || {
                         deriving(|| {
                             let mut out = Vec::new();
                             // Every index taken is read: those read are a
