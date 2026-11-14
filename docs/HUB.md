@@ -5632,6 +5632,50 @@ transaction per landing instead of 23.
    batch's thread. The batch's build is timed by part in the server's
    counters (`landing_*_us`). Measured: `docs/design/scale/LOAD.md`, "The
    mix's regression found and fixed".
+15. **A submit's grafted trees are stored with its other objects**
+   (`changes.rs` `build`, BUG-2362). The push's checks on a submitted
+   change (`sync::complete`) graft the submitter's tree onto the full one
+   and stored each full tree they made as they made it, one write after
+   another, each waiting twice for a local store's journal: 7 to 11 ms of
+   a submit's 40 while it held one of its project's 48 gate places. They
+   are now held (`sync::Staged::held`, as the batch's re-check does) and
+   stored with the change's blobs, trees and snapshots, all at once, before
+   the stack is read or the change queued: nothing names an object that
+   is not stored. A submit took 33 ms instead of 40 to 42 (its build 3.6
+   ms instead of 14), and its wait for a gate place 102 ms on average
+   instead of 0.5 to 1 s, with the gate's mix at 1,000 a second.
+16. **The deriver keeps up with 1,000 landings a second** (`derive/mod.rs`
+   `Batch::underived`, `read_ahead`, BUG-2361). A run asked the database,
+   for each snapshot it found, whether it was derived (a statement that
+   found nothing, once for every snapshot landed), read what each changed
+   one snapshot at a time, and asked for each changed path's stored
+   history in a statement of its own; it derived 570 to 700 snapshots a
+   second on the benchmark's machine, so at 1,000 landings a second it
+   fell 56 to 300 s behind, and each run was longer than the last. Now it
+   asks whether up to 512 snapshots down a first-parent line are derived
+   in one statement, reads what a chunk of 512 changed on 8 threads, and
+   the deepest 8 stored history rows of every path the chunk changes in
+   one statement per 1,000 paths; a path's rows at or above the asking
+   snapshot's depth begin the list the per-snapshot statement gave, in its
+   order, so a hit there is its answer, fewer than 8 rows mean there is
+   nothing more, and otherwise it asks as before (the read-ahead is
+   forgotten at every flush, after which the database holds more). Its
+   changed-path objects are written as many at once as the store takes
+   (32 before). The values are the ones a read at a time gave
+   (`derived::bug_2361_*`, `derived::derived_graph_matches_direct_walks`).
+   Measured: 0.2 to 5.5 s behind at the end of three minutes at 1,000 a
+   second (77 to 103 s before), runs of about 100 snapshots ten times a
+   second.
+17. **The database checkpoints every 16 GB of WAL or 15 minutes**
+   (`deploy/do/configure.sh`, `scripts/bench-server.sh`, BUG-2360). With
+   PostgreSQL's default `max_wal_size` of 1 GB, 1,000 landings a second
+   checkpointed every 20 to 28 s from 25 s into a run, and each
+   checkpoint's full-page images made 6 of a three-minute run's 7.5 GB of
+   WAL, every commit waiting on the WAL behind them. Durability is
+   unchanged (`synchronous_commit = on`); a crash replays at most that much
+   WAL. The same benchmark: 989/s, p99 3.3 s, nothing told to come back,
+   against 959 to 972/s, p99 6.7 to 9.4 s and 30,000 to 92,000 told to come
+   back with the default.
 
 **Guarantees and tests** (`crates/veil-server/tests/server_hub/limits.rs`,
 `concurrency.rs`, unit tests in `limits/landing.rs`):
