@@ -1883,6 +1883,140 @@ answer to a landing behind 2 s of waiting landings.
 | the many-branch headline over 10 min | 245.8 pushes/s, 49.2 branch landings/s, p99 3.6 s, nothing told to come back | no fixed target; **holds** (fell to 30.7/s this morning) |
 | the tool's cost gate in the many-branch shape | 2.34 to 3.23 commits a push of its own | 1: **miss** (BUG-2350) |
 
+## The late slowdown profiled and fixed (BUG-1955, 2026-11-13 night, `lateslow`)
+
+From 130 to 150 s into a landing run (BUG-1955's open item on `mixperf`
+and `finalbench2`) an accepted submit waited longer while the queue
+stayed short, landings behind 2 s of waiting were answered `503 busy`,
+and the deriver ended 56 to 300 s behind. Profiled on the three-minute
+mix (`--protected --mix --people 100`, 10,000 agents, 1,000/s, objects in
+a local directory, the machine and harness of `finalbench2`), with a
+build kept off the branch that timed a submit by part (its wait for a
+gate place, base, build, the push's checks, store, stack, commit, its wait
+in the queue), the deriver by part, and the store's writes; and samplers
+beside it: the database's active backends every 0.2 s
+(`pg_stat_activity`), its tables, checkpoints and WAL every 5 s
+(`pg_stat_checkpointer`, `pg_stat_wal`, `log_checkpoints`), the server's
+threads and the benchmark scope's memory every 10 s, `vmstat` every 5 s,
+and `pg_stat_statements` at the end (`.scratch/bench-prof.sh` on the
+branch, not committed).
+
+**What it showed.** A landing's latency is mostly its wait for one of
+its project's 48 gate places: a submit held one for 40 to 42 ms on
+average (24 ms in the first 10 s, 45 to 50 ms late in the run), so the
+gate took about 1,100 submits a second, and at 1,000 offered it was
+nearly full from the start (gate wait 0.5 to 1 s on average over the
+run). Everything that made a submit slower tipped it over:
+
+1. **Checkpoints every 20 to 28 s.** With PostgreSQL's default
+   `max_wal_size` (1 GB) the database checkpointed from 25 s in, 14 times
+   in a run ("checkpoints are occurring too frequently"); full-page
+   images were 6.1 of 7.5 GB of WAL, and `LWLock:WALWrite` was the
+   backends' first wait. The deployment's database had the same default.
+2. **The deriver could not keep up.** One derive run took 1.76 ms a
+   snapshot (570/s): a statement for every snapshot asking whether it was
+   derived (348,806 that found nothing in a run), the history of its
+   changed path asked one snapshot at a time, its changed-path objects
+   written 32 at once. At 1,000 landings a second each run was longer
+   than the last (the last of a run derived 25,580 snapshots in 45 s),
+   and after a long run every viewer's graph was filled again in the
+   background.
+3. **Memory ran out at 85 to 115 s.** The load tool's 10,000 agents hold
+   6 GB, the server 1.6 GB, PostgreSQL 4 GB of shared buffers; free memory
+   fell from 15.8 GB to under 1 GB, the benchmark's scope reached 15.7 of
+   its 16 GB (`heavy_run`), and the server's object files were dropped
+   from the page cache: reads from disk rose fivefold (5 to 30–45 MB/s),
+   and the deriver's tree reads tripled. Where a run crosses it depends
+   on the memory free when it starts (other agents' work): what made
+   "where it starts varies from run to run". A harness limit (BUG-2363):
+   on the paid run the load tool has machines of its own.
+4. **A submit's grafted trees were stored one at a time.** Of a submit's
+   build (14 ms), the push's checks took 10: `sync::complete` stored each
+   full tree its graft made as it made it, each write two waits on the
+   journal (10 to 15 ms per object on this machine), one after another.
+5. Not the cause: the blocking-thread pool (a queue delay of 0.0 to 0.1 ms
+   for a blocking step or a store write, though its 512 threads all
+   existed), and table bloat (the queue's dead rows were vacuumed every
+   minute). Not looked at further once the above accounted for it: the
+   classification memo, the `is_below` facts, background pack merging.
+
+**The fixes**, each kept only if the same benchmark improved:
+
+| Run (3 min, mix, 1,000/s) | Landed (/s) | p50 (ms) | p99 (ms) | Told to come back | Failed | Gate wait (ms, mean) | Submit (ms) | Build (ms) | Deriver behind at the end | Commits per landing |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `febdaced` + timers (four runs) | 959.4 to 971.7 | 370 to 990 | 6,664 to 9,394 | 30,498 to 92,020 | 0 to 158 | 545 to 1,045 | 40.2 to 41.7 | 14.1 to 14.7 | 77 to 103 s | 1.29 to 1.33 |
+| + checkpoints every 16 GB or 15 min (BUG-2360) | 989.2 | 298 | 3,252 | 0 | 0 | 296 | 37.6 | 12.7 | 29 s | 1.31 |
+| + the deriver reads ahead (BUG-2361) | 990.1 | 332 | 2,907 | 0 | 0 | 253 | 38.5 | 12.8 | 5.5 s | 1.38 |
+| + a submit's grafted trees held (BUG-2362) | 986.4 | 284 | 2,370 | 121 | 0 | 102 | 32.9 | 3.6 | 0.2 s | 1.35 |
+| + a local store writing 1,024 at once on threads of its own (not kept) | 985.9 | 316 | 4,126 | 14,287 | 41 | 78 | 30.3 | 3.4 | 4.2 s | 1.32 |
+
+The last change did not help: a batch's ~600 objects stored in one round
+instead of three took 28 to 35 ms instead of 33 to 46, each write's two
+`fsync`s slower (13 to 17 ms) with four times as many in flight: the
+disk's journal is the limit, not how many wait on it. The deriver's runs
+are now about 100 snapshots ten times a second (1,900 runs in three
+minutes against 15 to 51), which costs about 0.04 more commits a landing.
+
+**What bounds p99 now** (the last row's run before it): the batch.
+Its cycle is its commit (50 to 60 ms for 55 to 60 landings late in the
+run), which waits for its objects (28 to 46 ms: three rounds of 256
+writes, each two `fsync`s of 11 to 17 ms) and runs some 20 statements;
+the next batch's build (32 to 40 ms) runs meanwhile. That is about 1,000
+landings a second on this machine: with the mix's merges and conflicts
+coming back, the queue grows to 500 to 2,300 late in a run, and a landing
+waits for the batches ahead of it (its wait after the submit 0.3 s on
+average, 1 to 2 s at p99 per 10 s late in the run). p50 cannot reach
+150 ms here: a landing waits on average half a cycle to be picked, then
+a build and a commit (about 125 ms), after a 30 ms submit. What would
+move it: objects in an object store rather than `fsync`ed files (the
+paid run's MinIO), the load tool on machines of its own (BUG-2363).
+
+**Measured after** (`lateslow` @ `1367a122`, 2026-11-14 00:13 to 00:50
+UTC, the commands of "Final local measurements on `171a625a`" above:
+`scripts/bench-server.sh`, now with the deployment's checkpoint spacing,
+and `.scratch/bench-custom.sh` built from it; each through
+`bench-quiet.sh`; load before 3.2 to 15.9, after 35 to 137). "Before" is
+`finalbench2` on `171a625a`, the same machine, harness and commands the
+same evening:
+
+| Run | Before (`171a625a`) | After (`lateslow`) |
+|---|---|---|
+| protected, 100 people, 3 min | 997.9/s, p50 315 ms, p99 1,780 ms, 1.23 commits, nothing told to come back, deriver 56 s behind | **996.6/s** (880 to 1,107 per 10 s), **290 ms, 1,781 ms**, 1.27, nothing told, **0.0 s** |
+| protected, mix, 3 min | 973.1 and 959.4/s, p50 545 and 316 ms, p99 8.0 and 10.6 s, 55,397 and 74,343 told, 26 and 7 failed, deriver 116 and 100 s behind | **975.0/s**, 558 ms, **6.9 s**, 37,784 told (from 140 s), 205 failed, 1.36 commits, **0.2 s**; the profile's run of the same build: 986.4/s, 284 ms, 2.4 s, 121 told, 0.2 s |
+| protected, mix, 10 min | 833.8/s, p50 11.6 s, p99 69.3 s, 1.23 commits, 39,329 failed, 1,649,065 told, deriver 300 s behind | **929.9/s** (623 to 1,038 per 10 s), **3.3 s, 44.8 s**, 1.29, **6,865** failed, 1,425,279 told, **12.9 s** |
+| many branches, 300 agents, 10 min | 245.8 pushes/s, 49.2 branch landings/s, p50 1,069 ms, p99 3,596 ms, 5.35 (3.23) commits a push, 0 errors | 245.6, 49.2 (29,505), 1,099 ms, 3,689 ms, 5.64 (3.47), 0 errors, 18.6 server cores (the tool's BUG-2350 gate missed as before) |
+
+**Ten minutes, the mix** (a row a minute):
+
+| t (s) | landed/s | queue | p50 ms | p99 ms | wait p50 | wait p99 | told to wait | failed | per batch | commits/landing |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 60 | 946 | 110 | 283 | 5,119 | 278 | 1,195 | 0 | 0 | 56.7 | 1.46 |
+| 120 | 951 | 422 | 467 | 2,046 | 460 | 921 | 0 | 0 | 54.0 | 1.33 |
+| 180 | 974 | 1,447 | 653 | 3,325 | 651 | 2,913 | 0 | 0 | 58.6 | 1.26 |
+| 240 | 845 | 1,913 | 2,104 | 6,244 | 2,087 | 2,859 | 5,998 | 70 | 56.8 | 1.35 |
+| 300 | 955 | 2,079 | 4,350 | 18,767 | 2,030 | 5,288 | 31,230 | 155 | 56.8 | 1.36 |
+| 360 | 1,022 | 1,939 | 6,756 | 27,468 | 2,050 | 4,725 | 43,112 | 159 | 59.0 | 1.31 |
+| 420 | 763 | 1,935 | 11,835 | 45,408 | 3,154 | 6,124 | 40,375 | 168 | 61.0 | 1.26 |
+| 480 | 839 | 1,926 | 16,958 | 45,476 | 2,225 | 3,198 | 53,967 | 234 | 59.9 | 1.31 |
+| 540 | 892 | 1,954 | 22,281 | 54,236 | 2,679 | 3,615 | 47,041 | 386 | 60.2 | 1.26 |
+| 600 | 919 | 1,974 | 30,963 | 45,307 | 4,202 | 7,483 | 42,183 | 231 | 62.1 | 1.21 |
+
+- **The late slowdown's causes are gone**: no checkpoint during a run,
+  the deriver within a second of the tip over three minutes (13 s after
+  ten, against 300 s), and a submit's wait for a gate place under 0.1 s
+  on average. The plain protected run is unchanged in rate and p99 (it
+  had no late slowdown in `finalbench2`).
+- **What now bounds the mix is the batch**, as the profile's table says:
+  from 120 to 240 s the queue fills to its bound (about 2,000) with
+  batches of 55 to 62 of 64, the service lands 850 to 1,000 a second, and
+  past that bound submitters are told to come back; over ten minutes the
+  overlaps and conflicts that come back (about 100 a second) keep it
+  there. The rate over ten minutes is 929.9/s, still a **miss** of G4
+  here; p99 a **miss**.
+- Run to run, the three-minute mix's p99 spans 2.4 s (the profile's run)
+  to 6.9 s on the same build: where the batch first falls behind, and the
+  memory the machine has free when the run starts (BUG-2363), decide it.
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |
