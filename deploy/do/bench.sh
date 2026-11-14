@@ -155,7 +155,9 @@ run_gate "$GATE" "$@" || rc=$?
 if [ $WATCH_MINIO = 1 ]; then
     R1=$(minio_restarts)
     [ $APPROVED = 1 ] && echo "before=$R0 after=$R1" > "$OUT/minio-restarts.txt"
-    [ "$R0" = "$R1" ] || { echo "bench: MinIO restarted during the gate (restart count $R0, then $R1): its results are not valid" >&2; rc=1; }
+    if [ $APPROVED = 1 ] && ! [[ "$R0" =~ ^[0-9]+$ && "$R1" =~ ^[0-9]+$ ]]; then
+        echo "bench: MinIO's restart count could not be read (before: $R0, after: $R1): the gate's results are not valid" >&2; rc=1
+    elif [ "$R0" != "$R1" ]; then echo "bench: MinIO restarted during the gate (restart count $R0, then $R1): its results are not valid" >&2; rc=1; fi
 fi
 
 for i in $(seq "${#SAMPLED[@]}"); do

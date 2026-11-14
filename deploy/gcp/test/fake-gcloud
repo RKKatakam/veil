@@ -10,6 +10,10 @@ echo "gcloud $*" >> "${FAKE_GCLOUD_LOG:?}"
 # Which credentials a real gcloud would use: the override's path, never its content.
 echo "cred=${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-none} prompts=${CLOUDSDK_CORE_DISABLE_PROMPTS:-unset}" >> "$D/env.log"
 [ "${FAKE_GCLOUD_FAIL:-0}" = 1 ] && { echo "fake-gcloud: simulated API failure" >&2; exit 1; }
+# $D/lists-broken (made by the test's fake ssh during a gate): the listings fail.
+if [ -f "$D/lists-broken" ]; then
+    case "$*" in "compute operations list"*|"compute instances list"*) echo "fake-gcloud: simulated API failure" >&2; exit 1 ;; esac
+fi
 touch "$D/instances" "$D/disks" "$D/fw" "$D/nets" "$D/subnets" "$D/ops"
 args=("$@")
 names() { # the positional arguments after the first N words

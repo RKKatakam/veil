@@ -34,19 +34,21 @@ while read -r role name size; do ROLE[$name]=$role; is_spot "$role" && SPOTS+=("
 APPROVE=(); [ $APPROVED = 1 ] && APPROVE=(--approve)
 
 # The run's preemption operations in the zone (id name), and the Spot VMs not running.
+# Each fails when gcloud does (pipefail): an unanswered question is never
+# read as "nothing was reclaimed".
 preempted_ops() {
     local id target rest
     run_gcloud compute operations list --zones="$ZONE" --filter="operationType=compute.instances.preempted" \
         --format='value(id,targetLink.basename(),insertTime)' | while read -r id target rest; do
-        [ -n "${ROLE[$target]:-}" ] && echo "$id $target"
-    done; return 0
+        if [ -n "${ROLE[$target]:-}" ]; then echo "$id $target"; fi
+    done
 }
 spots_down() {
     local name status
     run_gcloud compute instances list --filter="labels.$LABEL=$NAME" --format='csv[no-heading](name,status)' |
         while IFS=, read -r name status; do
-            [[ " ${SPOTS[*]} " == *" $name "* ]] && [ "$status" != RUNNING ] && echo "$name"
-        done; return 0
+            if [[ " ${SPOTS[*]} " == *" $name "* ]] && [ "$status" != RUNNING ]; then echo "$name"; fi
+        done
 }
 note() { # results directory, line: kept in its run.txt
     if [ $APPROVED = 1 ]; then echo "$2" >> "$1/run.txt"; else echo "would add to run.txt: $2" >&2; fi
@@ -115,8 +117,12 @@ while :; do
     for l in "${NOTES[@]+"${NOTES[@]}"}"; do note "$OUT" "$l"; done; NOTES=()
     [ -z "$prev" ] || note "$OUT" "rerun_of=$prev"
     # Reclaimed during the gate: a preemption operation not seen before it, or a Spot VM down now.
-    now=$(preempted_ops)
-    hit=$( { awk -v seen=" $(echo $seen) " 'index(seen, " " $1 " ") == 0 {print $2}' <<<"$now"; spots_down; } | awk 'NF && !s[$0]++' | tr '\n' ' ')
+    if ! now=$(preempted_ops) || ! down=$(spots_down); then
+        note "$OUT" "result_valid=no (Google Cloud did not answer whether a Spot VM was reclaimed during the gate)"
+        echo "bench: could not ask Google Cloud whether a Spot VM was reclaimed during $GATE: its result is not valid" >&2
+        exit 1
+    fi
+    hit=$( { awk -v seen=" $(echo $seen) " 'index(seen, " " $1 " ") == 0 {print $2}' <<<"$now"; echo "$down"; } | awk 'NF && !s[$0]++' | tr '\n' ' ')
     seen=$(awk '{print $1}' <<<"$now")
     if [ -z "${hit// /}" ]; then
         note "$OUT" "spot_reclaimed_during=none"; note "$OUT" "result_valid=yes"

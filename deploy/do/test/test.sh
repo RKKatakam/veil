@@ -75,6 +75,7 @@ case "$*" in
     *"cat /var/lib/veil/hub-"*) echo "fake-server-key-material" ;;
     *"cat /var/lib/veil/stats.json"*) echo '{"landing_batches": 0}' ;;
     *"{{.RestartCount}}' minio"*)
+        [ "${FAKE_MINIO_UNREACHABLE:-0}" = 1 ] && exit 255
         # MinIO's restart count: 0, or one more at every look while it restarts.
         f=${FAKE_SSH_LOG}.restarts; n=$(cat "$f" 2>/dev/null || echo 0)
         [ "${FAKE_MINIO_RESTARTING:-0}" = 1 ] && n=$((n + 1)) && echo "$n" > "$f"
@@ -303,6 +304,8 @@ check "bench.sh records MinIO's restart count before and after a gate" 'grep -q 
 rc=0; out_rs=$(FAKE_MINIO_RESTARTING=1 env $FULL "$T/do/bench.sh" --approve api 2>&1 </dev/null) || rc=$?
 res_rs=$(ls -d "$T"/results/veil-kit-full/*-api 2>/dev/null | head -1)
 check "a gate during which MinIO restarted fails, as not valid (BUG-2432)" '[ $rc != 0 ] && [[ "$out_rs" == *"MinIO restarted during the gate (restart count 1, then 2)"* ]] && grep -q "^before=1 after=2$" "$res_rs/minio-restarts.txt"'
+rc=0; out_un=$(FAKE_MINIO_UNREACHABLE=1 env $FULL "$T/do/bench.sh" --approve api 2>&1 </dev/null) || rc=$?
+check "a gate whose MinIO restart count cannot be read fails, as not valid" '[ $rc != 0 ] && [[ "$out_un" == *"restart count could not be read (before: unknown, after: unknown)"* ]]'
 leaks=$(cat "$FAKE_SSH_LOG" "$FAKE_DOCTL_LOG" "$FAKE_CURL_LOG"; echo "$out_ac $out_ab $out_asp"; cat "$res"/* "$res_sp"/* 2>/dev/null)
 check "MinIO's credentials appear on no command line, in no output and in no result" '[ -n "$MIN_P" ] && [[ "$leaks" != *"$MIN_U"* && "$leaks" != *"$MIN_P"* && "$leaks" != *"secret-spaces-key"* && "$leaks" != *"secret-spaces-val"* ]]'
 

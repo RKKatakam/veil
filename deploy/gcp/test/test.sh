@@ -73,9 +73,12 @@ if [[ "$*" == *"timeout --kill-after"* ]] && [ -s "$D/preempt" ]; then
     awk -v n="$name" '$1 == n {$3 = "TERMINATED"} {print}' "$D/instances" > "$D/i.tmp"; mv "$D/i.tmp" "$D/instances"
     echo "op-$(( $(wc -l < "$D/ops") + 1 )) $name 2026-11-14T10:00:00.000-08:00" >> "$D/ops"
 fi
+# $D/break-lists: gcloud's listings fail from the gate on (fake-gcloud).
+if [[ "$*" == *"timeout --kill-after"* ]] && [ -f "$D/break-lists" ]; then touch "$D/lists-broken"; fi
 case "$*" in
     *"cat /var/lib/veil/hub-"*) echo "fake-server-key-material" ;;
     *"cat /var/lib/veil/stats.json"*) echo '{"landing_batches": 0}' ;;
+    *"{{.RestartCount}}' minio"*) echo 0 ;;
 esac
 exit 0
 SSH
@@ -234,6 +237,13 @@ printf '%s\n' veil-kit-driver1 veil-kit-driver1 > "$FAKE_GCLOUD_DIR/preempt"
 rc=0; out=$("$K/bench.sh" --approve pull 2>&1 </dev/null) || rc=$?
 mapfile -t rr < <(res pull)
 check "reclaimed during the rerun too: exit 3, both results invalid, no third run" '[ $rc = 3 ] && [ "${#rr[@]}" = 2 ] && grep -q "^result_valid=no" "${rr[0]}/run.txt" && grep -q "^result_valid=no" "${rr[1]}/run.txt" && [[ "$out" == *"not run a third time"* ]]'
+rm -rf "$T/results"; : > "$FAKE_GCLOUD_LOG"
+awk '$1 == "veil-kit-driver1" {$3 = "RUNNING"} {print}' "$FAKE_GCLOUD_DIR/instances" > "$T/i"; mv "$T/i" "$FAKE_GCLOUD_DIR/instances"
+touch "$FAKE_GCLOUD_DIR/break-lists"
+rc=0; out=$("$K/bench.sh" --approve pull 2>&1 </dev/null) || rc=$?
+rm -f "$FAKE_GCLOUD_DIR/break-lists" "$FAKE_GCLOUD_DIR/lists-broken"
+r1=$(res pull)
+check "gcloud failing to say whether a Spot VM was reclaimed during the gate: exit 1 and the result is not valid" '[ $rc = 1 ] && [ "$(grep -c . <<<"$r1")" = 1 ] && grep -q "^result_valid=no (Google Cloud did not answer" "$r1/run.txt" && ! grep -q "^result_valid=yes" "$r1/run.txt" && [[ "$out" == *"its result is not valid"* ]]'
 rm -rf "$T/results"; : > "$FAKE_GCLOUD_LOG"
 awk '$1 == "veil-kit-driver1" {$3 = "RUNNING"} $1 == "veil-kit-hub2" {$3 = "TERMINATED"} {print}' "$FAKE_GCLOUD_DIR/instances" > "$T/i"; mv "$T/i" "$FAKE_GCLOUD_DIR/instances"
 : > "$FAKE_SSH_LOG"
