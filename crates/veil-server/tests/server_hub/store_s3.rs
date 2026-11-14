@@ -225,6 +225,10 @@ fn bug_2430_a_store_busy_or_unreachable_past_the_retries_answers_busy_and_the_re
         let id = veil_core::ObjectId::hash(&raw);
         let slowed = S3_SLOW_DOWN.load(Ordering::SeqCst);
         mode.store(m, Ordering::SeqCst);
+        // Connections the proxy passed through before the switch notice it
+        // within 10 ms and close; until they do, a pooled one could still
+        // reach the store (BUG-2434: the upload then answered 200).
+        std::thread::sleep(Duration::from_millis(200));
         let start = Instant::now();
         let up = api.upload(&token, &name, &[(id, raw.clone())]);
         let took = start.elapsed();
