@@ -53,7 +53,7 @@ HUB1=$(addr "$NAME-hub")
 # through --env-file, never the command line.
 BENCH_ENV=/etc/veil/hub.env
 bench_cmd() { # veil-bench arguments...
-    echo "mkdir -p /srv/bench/results; chown -R 10002:10002 /srv/bench; timeout --kill-after=60 $STEP_LIMIT docker run --rm --network host --env-file $BENCH_ENV -v /srv/bench:/work -v /etc/veil/tls:/tls:ro --ulimit nofile=1048576:1048576 veil-bench:$TAG $(printf '%q ' "$@")"
+    echo "mkdir -p /srv/bench/results/$STAMP-$GATE; chown -R 10002:10002 /srv/bench; timeout --kill-after=60 $STEP_LIMIT docker run --rm --network host --env-file $BENCH_ENV -v /srv/bench:/work -v /etc/veil/tls:/tls:ro --ulimit nofile=1048576:1048576 veil-bench:$TAG $(printf '%q ' "$@")"
 }
 record() { # FILE: stdin kept in this gate's results directory
     if [ $APPROVED = 1 ]; then cat > "$OUT/$1"; else cat >/dev/null; echo "would record $1" >&2; fi
