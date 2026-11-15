@@ -782,7 +782,23 @@ pub(crate) async fn resolve_for(
     branches: &[&str],
     landing: bool,
 ) -> Result<Option<ObjectId>> {
-    resolve_for_mode(hub, project, viewer, id, branches, landing, false).await
+    resolve_for_mode(hub, project, viewer, id, branches, landing, false, None).await
+}
+
+/// [`resolve_for`] with the branch rows of `branches` and the default
+/// branch already read from the database by the caller in this request
+/// (`tips`, as `branches` stores them; rows of other branches are ignored):
+/// a push reads them once for all its resolutions.
+pub(crate) async fn resolve_for_in(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    id: &ObjectId,
+    branches: &[&str],
+    landing: bool,
+    tips: &[(String, String)],
+) -> Result<Option<ObjectId>> {
+    resolve_for_mode(hub, project, viewer, id, branches, landing, false, Some(tips)).await
 }
 
 /// As [`resolve_for`], preferring the uncollapsed commit `id` stands for over a
@@ -795,9 +811,10 @@ pub(crate) async fn resolve_exact_for(
     viewer: &Viewer,
     id: &ObjectId,
 ) -> Result<Option<ObjectId>> {
-    resolve_for_mode(hub, project, viewer, id, &[], true, true).await
+    resolve_for_mode(hub, project, viewer, id, &[], true, true, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_for_mode(
     hub: &Arc<Hub>,
     project: &Project,
@@ -806,6 +823,7 @@ async fn resolve_for_mode(
     branches: &[&str],
     landing: bool,
     prefer_own: bool,
+    read: Option<&[(String, String)]>,
 ) -> Result<Option<ObjectId>> {
     if *id == root_snapshot_id() {
         return Ok(Some(*id));
@@ -827,11 +845,14 @@ async fn resolve_for_mode(
     };
     let mut names: Vec<&str> = branches.to_vec();
     names.push(&project.default_branch);
-    let tips: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
-        .bind(project.id)
-        .bind(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
-        .fetch_all(&hub.db)
-        .await?;
+    let tips: Vec<(String, String)> = match read {
+        Some(rows) => rows.iter().filter(|(n, _)| names.contains(&n.as_str())).cloned().collect(),
+        None => sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
+            .bind(project.id)
+            .bind(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+            .fetch_all(&hub.db)
+            .await?,
+    };
     let tips = crate::embargo::filter_branches(hub, project, viewer, &tips).await?;
     for name in &names {
         if let Some(t) = tips.iter().find(|(n, _)| n == name).and_then(|(_, t)| ObjectId::from_hex(t).ok()) {
@@ -2593,14 +2614,16 @@ async fn push_staged(
     let root = root_snapshot_id();
     // Current tips (always from the database: a push never trusts a cache),
     // to pick which real snapshot a projected parent stands for (the
-    // branch's tip when it projects to it).
-    let current: HashMap<String, ObjectId> = {
-        let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1")
-            .bind(project.id)
-            .fetch_all(&hub.db)
-            .await?;
-        rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect()
-    };
+    // branch's tip when it projects to it): of the branches it moves and the
+    // default branch only, read once for the push and its resolutions
+    // (`resolve_for_in`), never every branch of the project.
+    let mut tip_names: Vec<String> = req.updates.iter().map(|u| u.branch.clone()).collect();
+    tip_names.push(project.default_branch.clone());
+    tip_names.sort();
+    tip_names.dedup();
+    let current_rows = branch_rows(hub, project.id, &tip_names).await?;
+    let mut current: HashMap<String, ObjectId> =
+        current_rows.iter().filter_map(|(n, t)| ObjectId::from_hex(t).ok().map(|t| (n.clone(), t))).collect();
     // An agent session never creates or recreates the default branch
     // (BUG-1538): decided before anything else of the push, so the answer is
     // one, whatever the snapshots hold. (`agent_tip` says the same for any
@@ -2638,7 +2661,7 @@ async fn push_staged(
             known.insert(id, vec![root]);
             continue;
         }
-        if let Some(r) = resolve_for(hub, project, viewer, &id, &moved_refs, lands_only).await? {
+        if let Some(r) = resolve_for_in(hub, project, viewer, &id, &moved_refs, lands_only, &current_rows).await? {
             known.insert(id, vec![r]);
             continue;
         }
@@ -2703,6 +2726,19 @@ async fn push_staged(
     // branch updates to their hidden `embargo/<id>` line (S22).
     let (embargo_upserts, embargo_releases, embargo_diverted) =
         crate::embargo::prepare_push(hub, project, viewer, &who.person.device_key, &mut req, &parents_of, &order, &real_of, Some(st.clone()), !land_all).await?;
+    // An update diverted to its embargo's hidden line (`embargo/<id>`) moves
+    // a branch not read above.
+    let diverted: Vec<String> = req.updates.iter().filter(|u| !tip_names.contains(&u.branch)).map(|u| u.branch.clone()).collect();
+    if !diverted.is_empty() {
+        for (n, t) in branch_rows(hub, project.id, &diverted).await? {
+            if let Ok(t) = ObjectId::from_hex(&t) {
+                current.insert(n, t);
+            }
+        }
+    }
+    let current = current;
+    // How many branches the project has, asked only when the push creates one.
+    let mut branch_count: Option<usize> = None;
     // What this pusher uploaded (BUG-824): a push names nothing else that
     // is not already where it was in a parent.
     let uploaded = Arc::new(uploaded);
@@ -2845,7 +2881,7 @@ async fn push_staged(
     // pushes may each add up to the bound; deletions in the push free slots at once).
     let created: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_some() && !current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
     let deleting: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_none() && current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
-    if !created.is_empty() && current.len().saturating_sub(deleting.len()) + created.len() > MAX_BRANCHES {
+    if !created.is_empty() && count_branches(hub, project.id, &mut branch_count).await?.saturating_sub(deleting.len()) + created.len() > MAX_BRANCHES {
         return Err(Error::bad_request(format!("a project has at most {MAX_BRANCHES} branches")));
     }
     for u in &req.updates {
@@ -3150,7 +3186,7 @@ async fn push_staged(
     }
     let planned_creates: HashSet<&str> = plans.iter().filter(|(_, cur, new, ..)| cur.is_none() && new.is_some()).map(|(b, ..)| b.as_str()).collect();
     let planned_deletes: HashSet<&str> = plans.iter().filter(|(_, cur, new, ..)| cur.is_some() && new.is_none()).map(|(b, ..)| b.as_str()).collect();
-    if !planned_creates.is_empty() && current.len().saturating_sub(planned_deletes.len()) + planned_creates.len() > MAX_BRANCHES {
+    if !planned_creates.is_empty() && count_branches(hub, project.id, &mut branch_count).await?.saturating_sub(planned_deletes.len()) + planned_creates.len() > MAX_BRANCHES {
         return Err(Error::bad_request(format!("a project has at most {MAX_BRANCHES} branches")));
     }
     // The pusher's projections of what this push moves branches to, worked
@@ -3712,6 +3748,26 @@ async fn push_staged(
         });
     }
     Ok((PushResult { results, warnings }, landings, kept))
+}
+
+/// The rows `(name, target)` of `project`'s branches named `names`, as
+/// stored now.
+async fn branch_rows(hub: &Hub, project: i64, names: &[String]) -> Result<Vec<(String, String)>> {
+    Ok(sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
+        .bind(project)
+        .bind(names)
+        .fetch_all(&hub.db)
+        .await?)
+}
+
+/// How many branches `project` has, read once (`count`) for a push.
+async fn count_branches(hub: &Hub, project: i64, count: &mut Option<usize>) -> Result<usize> {
+    if let Some(n) = *count {
+        return Ok(n);
+    }
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM branches WHERE project_id = $1").bind(project).fetch_one(&hub.db).await?;
+    *count = Some(n as usize);
+    Ok(n as usize)
 }
 
 /// The checks of new snapshot `id` (`n`) that need nothing but itself:
