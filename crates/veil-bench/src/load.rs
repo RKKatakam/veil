@@ -2246,7 +2246,8 @@ fn agents_text(r: &serde_json::Value) -> String {
     let f = |x: &serde_json::Value, d: usize| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{v:.d$}")).unwrap_or_else(|| "–".into());
     let mut out = format!(
         "Agents at a coding agent's pace: {} agents, think time {} s of agent time on average (exponential), time scale {} \
-         (so {} s real); each forks {} subagents a cycle ({} pushes each, then merged into its branch) and lands its branch on \
+         (so {} s real; the server carries the load of about {} agents at the real pace, each \
+         \"Uncompressed\" rate being these {} agents' at it); each forks {} subagents a cycle ({} pushes each, then merged into its branch) and lands its branch on \
          `main` every {} pushes. {} s measured stand for {} agent-hours: {} landings on `main` per agent-hour. \
          Database commits per push {}, per landing (merges and landings on `main`) {}; statements per operation {}.\n\n\
          | Operation | Done (/s) | Uncompressed (/s) | p50 (ms) | p99 (ms) | Changes landed per op | Errors | Told to come back |\n|---|---:|---:|---:|---:|---:|---:|---:|\n",
@@ -2254,6 +2255,8 @@ fn agents_text(r: &serde_json::Value) -> String {
         f(&r["think_s"], 0),
         f(&r["time_scale"], 0),
         f(&r["think_real_s"], 2),
+        r["clients"].as_f64().zip(r["time_scale"].as_f64()).map(|(n, t)| format!("{:.0}", n * t)).unwrap_or_else(|| "–".into()),
+        r["clients"],
         r["subagents"],
         r["sub_pushes"],
         r["land_every"],
