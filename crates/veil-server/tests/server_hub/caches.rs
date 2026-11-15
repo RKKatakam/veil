@@ -228,7 +228,9 @@ fn bug_2459_a_push_notifies_every_server_after_its_commit() {
     }
     // The server checks at start, by a notice to itself, that they arrive.
     let t = Instant::now();
-    while !h.caches.notices.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(10) {
+    // Under a whole suite's load that check can miss its 5 s and runs again
+    // (BUG-2463).
+    while !h.caches.notices.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(60) {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(h.caches.notices.load(Ordering::SeqCst), "PostgreSQL delivers notices, and the server found it does");

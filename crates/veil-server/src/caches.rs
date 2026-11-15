@@ -72,6 +72,9 @@ pub const TIPS_TTL: Duration = Duration::from_millis(100);
 /// ([`send_notices`]): far below [`TIPS_TTL`], and at any load at most this
 /// many commits a second for all the notices of a server.
 pub const NOTICE_EVERY: Duration = Duration::from_millis(5);
+/// How often a server whose database did not deliver its check notice
+/// checks again ([`listen`], BUG-2463).
+pub const NOTICE_RECHECK: Duration = Duration::from_secs(10);
 /// The notice channel every push notifies, with the project's id.
 pub const TIPS_CHANNEL: &str = "veil_tips";
 
@@ -640,15 +643,28 @@ pub async fn read_epochs(db: &sqlx::PgPool, person: i64, project: Option<i64>) -
 /// Listen for push notices on `TIPS_CHANNEL`, dropping each project's tips
 /// as they arrive, until `stop`. First checks that the database delivers
 /// them (YugabyteDB does not unless `ysql_yb_enable_listen_notify` is on):
-/// if it does not, tips only expire after [`TIPS_TTL`].
+/// until it does, tips only expire after [`TIPS_TTL`], and the check runs
+/// again every [`NOTICE_RECHECK`].
 pub async fn listen(hub: Arc<crate::Hub>, mut stop: tokio::sync::watch::Receiver<bool>) {
-    let mut listener = match start_listener(&hub).await {
-        Some(l) => l,
-        None => {
-            eprintln!("veil-server: the database does not deliver notices; branch tips expire after {TIPS_TTL:?} instead");
-            return;
+    // Checked again until it passes (BUG-2463): a notice slower than the
+    // check's 5 s under load, at start, turned notices off for good.
+    let mut said = false;
+    let mut listener = loop {
+        if let Some(l) = start_listener(&hub).await {
+            break l;
+        }
+        if !said {
+            eprintln!("veil-server: the database does not deliver notices; branch tips expire after {TIPS_TTL:?} instead (checked again every {NOTICE_RECHECK:?})");
+            said = true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(NOTICE_RECHECK) => {}
+            _ = stop.changed() => return,
         }
     };
+    if said {
+        eprintln!("veil-server: the database delivers notices now");
+    }
     hub.caches.notices.store(true, Ordering::SeqCst);
     loop {
         let n = tokio::select! {

@@ -1737,8 +1737,9 @@ and compares and swaps in the database. Notices: PostgreSQL delivers
 `NOTIFY` (another server saw a push within 5–15 ms in the tests, measured
 while the notice was still sent in the push's transaction);
 **YugabyteDB 2025.2 does not by default** (`ysql_yb_enable_listen_notify`
-is off), which the server detects at start (it sends itself a notice), and
-tips then expire after 100 ms only. Its change feed is not used. **The
+is off), which the server detects at start (it sends itself a notice, and
+checks again every 10 s until one arrives: BUG-2463), and tips then expire
+after 100 ms only. Its change feed is not used. **The
 notice is sent after the commit, never in the write's transaction**
 (BUG-2459): PostgreSQL commits the transactions that notify one at a time,
 under one lock for the whole database held through the commit's flush, so
