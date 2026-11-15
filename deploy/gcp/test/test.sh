@@ -28,7 +28,8 @@
 #      reclaimed during a gate marks it invalid, is started again and the gate
 #      rerun once (valid); reclaimed twice fails without a third run; a VM
 #      down before the gate is started first; with VEIL_GCP_SPOT=all a
-#      reclaimed storage machine means configure.sh again;
+#      reclaimed storage machine means configure.sh again; ssh knows a
+#      restarted VM by its name, not its new address (BUG-2458);
 #   7. destroy.sh: --check finds running and stopped VMs and their disks,
 #      a leftover disk, firewall rule, network or address, and fails when
 #      gcloud fails; destroy --approve deletes them all, then --check passes;
@@ -251,6 +252,7 @@ check "the first run.txt: reclaimed driver1, result invalid, which directory rer
 check "the rerun's run.txt: rerun_of the first, nothing reclaimed, valid" 'grep -qx "rerun_of=$(basename "${rr[0]}")" "${rr[1]}/run.txt" && grep -qx "spot_reclaimed_during=none" "${rr[1]}/run.txt" && grep -qx "result_valid=yes" "${rr[1]}/run.txt"'
 . "$S/state.env"
 check "driver1 was started again, its new public address saved, and the rerun reached it there" 'grep -q "^gcloud compute instances start veil-kit-driver1 --zone=us-central1-a" "$FAKE_GCLOUD_LOG" && [ "$IP_veil_kit_driver1" = 198.51.100.1 ] && grep -q "root@198.51.100.1 .*timeout --kill-after" "$FAKE_SSH_LOG" && [ "$(grep -c "instances start" "$FAKE_GCLOUD_LOG")" = 1 ]'
+check "the restarted driver1 is known by its name, not its new address (BUG-2458: an address another machine had earlier), and every ssh and scp pins the key by a machine's name" 'grep "root@198.51.100.1 .*timeout --kill-after" "$FAKE_SSH_LOG" | grep -q -- "-o HostKeyAlias=veil_kit_driver1 " && [ "$(grep -E "^(ssh|scp) " "$FAKE_SSH_LOG" | grep -vc -- "-o HostKeyAlias=veil_kit_[a-z0-9_]* ")" = 0 ]'
 rm -rf "$T/results"; : > "$FAKE_GCLOUD_LOG"
 printf '%s\n' veil-kit-driver1 veil-kit-driver1 > "$FAKE_GCLOUD_DIR/preempt"
 rc=0; out=$("$K/bench.sh" --approve pull 2>&1 </dev/null) || rc=$?

@@ -34,6 +34,16 @@ pg_settings() {
 # `remote` never reads stdin (ssh -n): inside `while read …; done < <(droplets)`
 # ssh would forward the rest of the list to the droplet, and the loop would
 # stop after its first droplet. `remote_stdin` is for a command fed on stdin.
+# Host keys are pinned by machine name (HostKeyAlias), not by address: a Spot
+# VM started again keeps its disk and so its host key, but may come back on a
+# public address another machine of the run had earlier, and ssh then refused
+# it as a changed key, failing every later step (BUG-2458). An address no
+# machine of the state has keeps the address as its name.
+host_alias() { # host address
+    local v
+    for v in ${!IP_*}; do [ "${!v}" = "$1" ] && { echo "${v#IP_}"; return; }; done
+    echo "$1"
+}
 remote() { # host, command...   (ssh as root with this run's key)
     _ssh -n "$@"
 }
@@ -44,17 +54,17 @@ _ssh() { # -n or "", host, command...
     local n=$1 host=$2; shift 2
     if [ $APPROVED = 1 ]; then
         ssh ${n:+"$n"} -i "$STATE/id_ed25519" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" \
-            -o ConnectTimeout=15 -o BatchMode=yes -o IdentitiesOnly=yes "root@$host" "$@"
+            -o HostKeyAlias="$(host_alias "$host")" -o ConnectTimeout=15 -o BatchMode=yes -o IdentitiesOnly=yes "root@$host" "$@"
     else echo "would run on $host: $*" >&2; fi
 }
 copy_to() { # local, host, remote path
     if [ $APPROVED = 1 ]; then
-        scp -q -i "$STATE/id_ed25519" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" "$1" "root@$2:$3"
+        scp -q -i "$STATE/id_ed25519" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" -o HostKeyAlias="$(host_alias "$2")" "$1" "root@$2:$3"
     else echo "would copy $1 to $2:$3" >&2; fi
 }
 copy_from() { # host, remote path, local
     if [ $APPROVED = 1 ]; then
-        scp -q -r -i "$STATE/id_ed25519" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" "root@$1:$2" "$3"
+        scp -q -r -i "$STATE/id_ed25519" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$STATE/known_hosts" -o HostKeyAlias="$(host_alias "$1")" "root@$1:$2" "$3"
     else echo "would copy $1:$2 to $3" >&2; fi
 }
 ensure_state_dir() {

@@ -60,7 +60,7 @@ done < <(droplets)
 echo "== 3. shipping images veil-server:$TAG and veil-bench:$TAG"
 ship() { # image, host
     if [ $APPROVED = 1 ]; then
-        D save "$1" | zstd -T0 -3 | ssh -i "$STATE/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$STATE/known_hosts" -o StrictHostKeyChecking=accept-new "root@$2" 'zstd -d | docker load' >/dev/null
+        D save "$1" | zstd -T0 -3 | ssh -i "$STATE/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$STATE/known_hosts" -o HostKeyAlias="$(host_alias "$2")" -o StrictHostKeyChecking=accept-new "root@$2" 'zstd -d | docker load' >/dev/null
         echo "   $1 -> $2"
     else echo "would ship $1 to $2 (docker save | zstd | ssh docker load)" >&2; fi
 }
