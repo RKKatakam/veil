@@ -868,7 +868,7 @@ fn bug_1881_a_push_committing_during_the_gc_switch_points_its_branch_at_deleted_
                     );
                     let _ = tx_done.send(r);
                 });
-                wait_for_sql_lock(&db, "UPDATE branches SET target%", "the push never reached its branch update").await;
+                wait_for_sql_lock(&db, "WITH u AS (UPDATE branches SET target%", "the push never reached its branch update").await;
                 // The row is released when GC is done (or after 8 s, were GC to wait for the push).
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(Duration::from_secs(8), release.notified()).await;

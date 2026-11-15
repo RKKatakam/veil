@@ -239,6 +239,9 @@ pub struct Caches {
     /// Per-project GC epochs (`access_epochs (project, -1)`), so deleted
     /// snapshots and projections never answer from memory after GC.
     gc_epochs: RwLock<HashMap<i64, i64>>,
+    /// Projects whose GC epoch row (`access_epochs (project, -1)`) this
+    /// server saw exist: such rows are never deleted (`pack_gc::push_gc_epoch`).
+    gc_rows: RwLock<std::collections::HashSet<i64>>,
     tips: Mutex<Tips>,
     /// Whether the database delivers this server's notices (checked when the
     /// listener starts); without them, tips expire after [`TIPS_TTL`] only.
@@ -279,6 +282,7 @@ impl Default for Caches {
             viewers: LruCache::new(VIEWERS_BUDGET),
             snapshots: LruCache::new(SNAPSHOTS_BUDGET),
             gc_epochs: RwLock::new(HashMap::new()),
+            gc_rows: RwLock::new(std::collections::HashSet::new()),
             tips: Mutex::new(Tips::default()),
             notices: AtomicBool::new(false),
             stats: Stats::default(),
@@ -289,6 +293,18 @@ impl Default for Caches {
 impl Caches {
     pub fn gc_epoch(&self, project: i64) -> i64 {
         self.gc_epochs.read().unwrap().get(&project).copied().unwrap_or(0)
+    }
+
+    /// Whether `project`'s GC epoch row is known to exist.
+    pub fn gc_row_known(&self, project: i64) -> bool {
+        self.gc_rows.read().unwrap().contains(&project)
+    }
+
+    /// `project`'s GC epoch row exists (it is never deleted).
+    pub fn know_gc_row(&self, project: i64) {
+        if !self.gc_row_known(project) {
+            self.gc_rows.write().unwrap().insert(project);
+        }
     }
 
     pub fn set_gc_epoch(&self, project: i64, epoch: i64) {

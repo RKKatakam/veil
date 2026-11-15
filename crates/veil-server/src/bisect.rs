@@ -214,6 +214,21 @@ pub async fn has_reverted_twice(c: &mut sqlx::PgConnection, project_id: i64) -> 
 /// unprotected branch still checks changes reverted twice there while
 /// leaving topic branches free.
 pub async fn branch_has_reverted_twice(hub: &Hub, project_id: i64, branch: &str) -> Result<bool> {
+    // Asked with whether any of the branch's reverts is still queued, in one
+    // statement: with none queued, there is nothing to bring up to date
+    // first (`sync_queued_reverts` reads only the queued ones), and the
+    // answer is the one read with it (every push to a branch asks).
+    let (queued, hit): (bool, bool) = sqlx::query_as(&format!(
+        "SELECT EXISTS (SELECT 1 FROM bisect_reverts WHERE project_id = $1 AND branch = $2 AND state = 'queued'), \
+         EXISTS (SELECT k FROM ({REVERTED_KEYS}) r WHERE branch = $2 GROUP BY k HAVING COUNT(*) >= 2)"
+    ))
+    .bind(project_id)
+    .bind(branch)
+    .fetch_one(&hub.db)
+    .await?;
+    if !queued {
+        return Ok(hit);
+    }
     sync_queued_reverts(hub, project_id, Some(branch)).await?;
     let hit: Option<String> =
         sqlx::query_scalar(&format!("SELECT k FROM ({REVERTED_KEYS}) r WHERE branch = $2 GROUP BY k HAVING COUNT(*) >= 2 LIMIT 1"))

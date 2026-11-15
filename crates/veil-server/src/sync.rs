@@ -782,7 +782,27 @@ pub(crate) async fn resolve_for(
     branches: &[&str],
     landing: bool,
 ) -> Result<Option<ObjectId>> {
-    resolve_for_mode(hub, project, viewer, id, branches, landing, false).await
+    resolve_for_mode(hub, project, viewer, id, branches, landing, false, None).await
+}
+
+/// [`resolve_for`] with the branch rows of `branches` and the default
+/// branch already read from the database by the caller in this request
+/// (`tips`, as `branches` stores them; rows of other branches are ignored):
+/// a push reads them once for all its resolutions. `no_embargo`: the same
+/// statement found no unreleased embargo line, so no tip it read is
+/// withheld from anyone (as of that statement, which read the tip).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_for_in(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    id: &ObjectId,
+    branches: &[&str],
+    landing: bool,
+    tips: &[(String, String)],
+    no_embargo: bool,
+) -> Result<Option<ObjectId>> {
+    resolve_for_mode(hub, project, viewer, id, branches, landing, false, Some((tips, no_embargo))).await
 }
 
 /// As [`resolve_for`], preferring the uncollapsed commit `id` stands for over a
@@ -795,9 +815,10 @@ pub(crate) async fn resolve_exact_for(
     viewer: &Viewer,
     id: &ObjectId,
 ) -> Result<Option<ObjectId>> {
-    resolve_for_mode(hub, project, viewer, id, &[], true, true).await
+    resolve_for_mode(hub, project, viewer, id, &[], true, true, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_for_mode(
     hub: &Arc<Hub>,
     project: &Project,
@@ -806,6 +827,7 @@ async fn resolve_for_mode(
     branches: &[&str],
     landing: bool,
     prefer_own: bool,
+    read: Option<(&[(String, String)], bool)>,
 ) -> Result<Option<ObjectId>> {
     if *id == root_snapshot_id() {
         return Ok(Some(*id));
@@ -827,23 +849,53 @@ async fn resolve_for_mode(
     };
     let mut names: Vec<&str> = branches.to_vec();
     names.push(&project.default_branch);
-    let tips: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
-        .bind(project.id)
-        .bind(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
-        .fetch_all(&hub.db)
-        .await?;
+    let tips: Vec<(String, String)> = match read {
+        Some((rows, _)) => rows.iter().filter(|(n, _)| names.contains(&n.as_str())).cloned().collect(),
+        None => sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
+            .bind(project.id)
+            .bind(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+            .fetch_all(&hub.db)
+            .await?,
+    };
     let tips = crate::embargo::filter_branches(hub, project, viewer, &tips).await?;
+    // No embargo line was unreleased when the tips were read (in that one
+    // statement): no tip is withheld.
+    let tips_free = read.is_some_and(|(_, free)| free);
     for name in &names {
         if let Some(t) = tips.iter().find(|(n, _)| n == name).and_then(|(_, t)| ObjectId::from_hex(t).ok()) {
-            if seen(t).await? {
+            let ok = match tips_free {
+                true => projected(hub, project, viewer, t).await? == *id,
+                false => seen(t).await?,
+            };
+            if ok {
                 return Ok(Some(t));
             }
         }
     }
     // Committed history named by its own id (after the tips: a snapshot
     // they see whole under a change hidden from them at the tip, BUG-1525).
-    if committed(hub, project.id, id).await? {
+    // Asked with whether any view's projection is `id`, in one statement:
+    // a new snapshot (a push's) is neither, and nothing they can see is it.
+    let projected_somewhere = if hub.caches.committed(project.id, id) {
         return Ok(seen(*id).await?.then_some(*id));
+    } else {
+        let gce = hub.caches.gc_epoch(project.id);
+        let (stored, projected): (bool, bool) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2), \
+             EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND projected_id = $2)",
+        )
+        .bind(project.id)
+        .bind(id.hex())
+        .fetch_one(&hub.db)
+        .await?;
+        if stored {
+            hub.caches.put_committed_at(project.id, gce, id);
+            return Ok(seen(*id).await?.then_some(*id));
+        }
+        projected
+    };
+    if !projected_somewhere {
+        return Ok(None);
     }
     let key = project.view(viewer).key();
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
@@ -920,15 +972,7 @@ async fn resolve_for_mode(
             false => Err(crate::query::graph::warming()),
         };
     }
-    let has_projection: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM projections WHERE project_id = $1 AND projected_id = $2 LIMIT 1")
-            .bind(project.id)
-            .bind(id.hex())
-            .fetch_optional(&hub.db)
-            .await?;
-    if has_projection.is_none() {
-        return Ok(None);
-    }
+    // Some view's projection is `id` (asked above).
     let named = *id;
     let cid = blocking(hub, project.id, move |src| match src.snapshot(&named) {
         Ok(s) => Ok(Some(s.change_id.to_string())),
@@ -2586,21 +2630,23 @@ async fn push_staged(
     if req.force && viewer.agent {
         return Err(agent_refusal("an agent session never forces a branch move"));
     }
-    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
+    let gc_epoch = crate::pack_gc::push_gc_epoch(hub, project.id, who.epochs.gc).await?;
     if req.updates.len() > MAX_PUSH_UPDATES {
         return Err(Error::bad_request(format!("at most {MAX_PUSH_UPDATES} branch updates per push")));
     }
     let root = root_snapshot_id();
     // Current tips (always from the database: a push never trusts a cache),
     // to pick which real snapshot a projected parent stands for (the
-    // branch's tip when it projects to it).
-    let current: HashMap<String, ObjectId> = {
-        let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1")
-            .bind(project.id)
-            .fetch_all(&hub.db)
-            .await?;
-        rows.into_iter().filter_map(|(n, t)| ObjectId::from_hex(&t).ok().map(|t| (n, t))).collect()
-    };
+    // branch's tip when it projects to it): of the branches it moves and the
+    // default branch only, read once for the push and its resolutions
+    // (`resolve_for_in`), never every branch of the project.
+    let mut tip_names: Vec<String> = req.updates.iter().map(|u| u.branch.clone()).collect();
+    tip_names.push(project.default_branch.clone());
+    tip_names.sort();
+    tip_names.dedup();
+    let (current_rows, tips_embargo_free) = branch_rows_unembargoed(hub, project.id, &tip_names).await?;
+    let mut current: HashMap<String, ObjectId> =
+        current_rows.iter().filter_map(|(n, t)| ObjectId::from_hex(t).ok().map(|t| (n.clone(), t))).collect();
     // An agent session never creates or recreates the default branch
     // (BUG-1538): decided before anything else of the push, so the answer is
     // one, whatever the snapshots hold. (`agent_tip` says the same for any
@@ -2638,7 +2684,7 @@ async fn push_staged(
             known.insert(id, vec![root]);
             continue;
         }
-        if let Some(r) = resolve_for(hub, project, viewer, &id, &moved_refs, lands_only).await? {
+        if let Some(r) = resolve_for_in(hub, project, viewer, &id, &moved_refs, lands_only, &current_rows, tips_embargo_free).await? {
             known.insert(id, vec![r]);
             continue;
         }
@@ -2686,13 +2732,24 @@ async fn push_staged(
         k.dedup();
         k
     };
-    let signers: HashMap<String, i64> =
-        sqlx::query_as::<_, (String, i64)>("SELECT signing_key, person_id FROM devices WHERE signing_key = ANY($1) AND removed_at IS NULL AND NOT pending")
-            .bind(&keys)
-            .fetch_all(&hub.db)
-            .await?
-            .into_iter()
-            .collect();
+    // Read with them: whether the project has any unreleased embargo line.
+    // After every resolution above, so each snapshot the push names was
+    // committed when this was read; with none, every embargo check below
+    // (`active_embargoes_of`, which reads the unreleased lines first and
+    // answers nothing without one) answers nothing as of this one read.
+    let (signers, embargoes): (HashMap<String, i64>, bool) = {
+        let rows: Vec<(Option<String>, Option<i64>, bool)> = sqlx::query_as(
+            "SELECT d.signing_key, d.person_id, e.active \
+             FROM (SELECT EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $2 AND released_at IS NULL) AS active) e \
+             LEFT JOIN devices d ON d.signing_key = ANY($1) AND d.removed_at IS NULL AND NOT d.pending",
+        )
+        .bind(&keys)
+        .bind(project.id)
+        .fetch_all(&hub.db)
+        .await?;
+        let embargoes = rows.iter().any(|r| r.2);
+        (rows.into_iter().filter_map(|(k, p, _)| Some((k?, p?))).collect(), embargoes)
+    };
     let mut real_of: HashMap<ObjectId, ObjectId> = HashMap::new();
     real_of.insert(root, root);
     for (id, reals) in &known {
@@ -2702,7 +2759,21 @@ async fn push_staged(
     // Validate embargoes (`req.embargoes` and `n.embargo`) and divert embargoed
     // branch updates to their hidden `embargo/<id>` line (S22).
     let (embargo_upserts, embargo_releases, embargo_diverted) =
-        crate::embargo::prepare_push(hub, project, viewer, &who.person.device_key, &mut req, &parents_of, &order, &real_of, Some(st.clone()), !land_all).await?;
+        crate::embargo::prepare_push(hub, project, viewer, &who.person.device_key, &mut req, &parents_of, &order, &real_of, Some(st.clone()), !land_all, embargoes)
+            .await?;
+    // An update diverted to its embargo's hidden line (`embargo/<id>`) moves
+    // a branch not read above.
+    let diverted: Vec<String> = req.updates.iter().filter(|u| !tip_names.contains(&u.branch)).map(|u| u.branch.clone()).collect();
+    if !diverted.is_empty() {
+        for (n, t) in branch_rows(hub, project.id, &diverted).await? {
+            if let Ok(t) = ObjectId::from_hex(&t) {
+                current.insert(n, t);
+            }
+        }
+    }
+    let current = current;
+    // How many branches the project has, asked only when the push creates one.
+    let mut branch_count: Option<usize> = None;
     // What this pusher uploaded (BUG-824): a push names nothing else that
     // is not already where it was in a parent.
     let uploaded = Arc::new(uploaded);
@@ -2845,7 +2916,7 @@ async fn push_staged(
     // pushes may each add up to the bound; deletions in the push free slots at once).
     let created: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_some() && !current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
     let deleting: HashSet<&str> = req.updates.iter().filter(|u| u.new.is_none() && current.contains_key(&u.branch)).map(|u| u.branch.as_str()).collect();
-    if !created.is_empty() && current.len().saturating_sub(deleting.len()) + created.len() > MAX_BRANCHES {
+    if !created.is_empty() && count_branches(hub, project.id, &mut branch_count).await?.saturating_sub(deleting.len()) + created.len() > MAX_BRANCHES {
         return Err(Error::bad_request(format!("a project has at most {MAX_BRANCHES} branches")));
     }
     for u in &req.updates {
@@ -3131,7 +3202,7 @@ async fn push_staged(
                 }
             }
         }
-        if !is_embargo_branch {
+        if !is_embargo_branch && embargoes {
             if let Some(n) = new_real {
                 let eids = crate::embargo::active_embargoes_of(hub, project.id, &[n], &real_parents_of, Some(st.clone())).await?;
                 if let Some(eid) = eids.into_iter().next() {
@@ -3150,7 +3221,7 @@ async fn push_staged(
     }
     let planned_creates: HashSet<&str> = plans.iter().filter(|(_, cur, new, ..)| cur.is_none() && new.is_some()).map(|(b, ..)| b.as_str()).collect();
     let planned_deletes: HashSet<&str> = plans.iter().filter(|(_, cur, new, ..)| cur.is_some() && new.is_none()).map(|(b, ..)| b.as_str()).collect();
-    if !planned_creates.is_empty() && current.len().saturating_sub(planned_deletes.len()) + planned_creates.len() > MAX_BRANCHES {
+    if !planned_creates.is_empty() && count_branches(hub, project.id, &mut branch_count).await?.saturating_sub(planned_deletes.len()) + planned_creates.len() > MAX_BRANCHES {
         return Err(Error::bad_request(format!("a project has at most {MAX_BRANCHES} branches")));
     }
     // The pusher's projections of what this push moves branches to, worked
@@ -3364,11 +3435,31 @@ async fn push_staged(
                     // The branch's changes stay all recorded (BUG-1524) only
                     // when this move's are (in a new lineage: the whole
                     // history), in the lineage the held ones were read under.
-                    (Some(c0), Some(n)) => sqlx::query_scalar::<_, i64>(
-                        "UPDATE branches SET target = $1, lineage = CASE WHEN $5 THEN nextval('branch_lineages') ELSE lineage END, \
-                         changes_recorded = $6 AND ($5 OR (changes_recorded AND ($7::BIGINT IS NULL OR lineage = $7))) \
-                         WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage",
-                    )
+                    (Some(c0), Some(n)) => {
+                        // The changes it brings (`landed_changes`, below for
+                        // the rest) recorded in the same statement, in the
+                        // lineage it returns, for a branch other than the
+                        // default one (whose review rules are recorded
+                        // first) and its embargo lines (never recorded).
+                        let with_changes = branch != default_branch && veil_core::embargo::embargo_id_of_branch(&branch).is_none();
+                        let none = (Vec::new(), Vec::new(), Vec::new());
+                        let (cs, aus, ls) = match with_changes {
+                            true => plan_changes.get(&branch).unwrap_or(&none),
+                            false => &none,
+                        };
+                        sqlx::query_scalar::<_, i64>(
+                            "WITH u AS (UPDATE branches SET target = $1, lineage = CASE WHEN $5 THEN nextval('branch_lineages') ELSE lineage END, \
+                             changes_recorded = $6 AND ($5 OR (changes_recorded AND ($7::BIGINT IS NULL OR lineage = $7))) \
+                             WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage), \
+                             rec AS (INSERT INTO landed_changes (project_id, branch, lineage, change_id, author, landed) \
+                             SELECT DISTINCT ON (ch, au) $2, $3, u.lineage, ch, au, ld \
+                             FROM u, unnest($8::TEXT[], $9::BIGINT[], $10::TEXT[]) WITH ORDINALITY AS v(ch, au, ld, ord) \
+                             ORDER BY ch, au, ord \
+                             ON CONFLICT (project_id, branch, lineage, change_id, author) DO UPDATE SET landed = EXCLUDED.landed \
+                             WHERE EXISTS (SELECT 1 FROM bisect_reverts br WHERE br.project_id = landed_changes.project_id AND br.branch = landed_changes.branch \
+                             AND br.lineage = landed_changes.lineage AND br.culprit = landed_changes.landed AND br.state = 'reverted')) \
+                             SELECT lineage FROM u",
+                        )
                         .bind(n.hex())
                         .bind(pid)
                         .bind(&branch)
@@ -3376,12 +3467,18 @@ async fn push_staged(
                         .bind(force)
                         .bind(recorded)
                         .bind(read_under)
+                        .bind(cs)
+                        .bind(aus)
+                        .bind(ls)
                         .fetch_optional(&mut *c)
                         .await?
                         .map_or(0, |lineage| {
-                            lineages.push((branch.clone(), lineage));
+                            if !with_changes {
+                                lineages.push((branch.clone(), lineage));
+                            }
                             1
-                        }),
+                        })
+                    }
                     (None, Some(n)) => sqlx::query_scalar::<_, i64>(
                         "INSERT INTO branches (project_id, name, target, changes_recorded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING lineage",
                     )
@@ -3447,97 +3544,85 @@ async fn push_staged(
                     }
                 }
             }
+            crate::embargo::record_in_tx(&mut *c, pid, &embargo_upserts, &embargo_snaps).await?;
             // The packs that hold what this push stored (S28): an upload's
             // staged pack, or the push's own. A pack a refused push of the
             // same person discarded first cannot be listed: nothing lands,
-            // and `vl` uploads again.
-            if !packs.0.is_empty() {
-                // Every pack was recorded staged before it was written; a
-                // row gone was discarded and then deleted with its storage
-                // object (a sweep of an upload past its grace period, by a
-                // server without this push's index in hand: BUG-2310).
-                // Locked: a racing discard or delete waits, then finds it
-                // listed.
-                let have: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND name = ANY($2) FOR UPDATE")
-                    .bind(pid)
-                    .bind(&packs.0)
-                    .fetch_all(&mut *c)
-                    .await?;
-                if have.len() != packs.0.len() {
-                    return Err(Error::conflict("an upload this push names was discarded; push again"));
-                }
-                // A staged row turns listed; a discarded one stays
-                // discarded.
-                let states: Vec<i16> = sqlx::query_scalar(
-                    "INSERT INTO packs (project_id, name, state, size, objects, created_at) \
-                     SELECT $1, n, $6, s, o, $5 FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) AS t(n, s, o) \
-                     ON CONFLICT (project_id, name) DO UPDATE \
-                     SET state = CASE WHEN packs.state = $7 THEN packs.state ELSE $6 END RETURNING state",
-                )
-                .bind(pid)
-                .bind(&packs.0)
-                .bind(&packs.1)
-                .bind(&packs.2)
-                .bind(veil_core::now_millis())
-                .bind(crate::pack::LISTED)
-                .bind(crate::pack::DISCARDED)
-                .fetch_all(&mut *c)
-                .await?;
-                if states.contains(&crate::pack::DISCARDED) {
-                    return Err(Error::conflict("an upload this push names was discarded; push again"));
-                }
-            }
+            // and `vl` uploads again. Every pack was recorded staged before
+            // it was written; a row gone was discarded and then deleted with
+            // its storage object (a sweep of an upload past its grace period,
+            // by a server without this push's index in hand: BUG-2310). The
+            // update locks them: a racing discard or delete waits, then finds
+            // them listed. A row missing is one state fewer back (no row is
+            // ever made here); a discarded one stays discarded.
+            // In the same statement, the push's rows: its snapshots (a row
+            // stored first by another push keeps its author unless it had
+            // none), their origins, its memos (a row stored first by another
+            // request wins, and is not cached here from this push's answer:
+            // those this one stored come back), its audit row, and the notice
+            // delivered at commit to every server: drop your tips.
+            let mut authors: Vec<(String, i64)> = Vec::with_capacity(new_reals.len());
+            let mut author_at: HashMap<&str, usize> = HashMap::with_capacity(new_reals.len());
             for (r, author) in &new_reals {
-                sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3) ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0")
-                    .bind(pid)
-                    .bind(r)
-                    .bind(*author)
-                    .execute(&mut *c)
-                    .await?;
+                // Each id once (one statement cannot update a row twice): the
+                // first author that is not 0, as one insert after another.
+                // Found by a map: a push may hold `MAX_PUSH_SNAPSHOTS`.
+                match author_at.get(r.as_str()) {
+                    Some(&i) if authors[i].1 == 0 => authors[i].1 = *author,
+                    Some(_) => {}
+                    None => {
+                        author_at.insert(r.as_str(), authors.len());
+                        authors.push((r.clone(), *author));
+                    }
+                }
             }
-            for (real, origin) in &origins {
-                sqlx::query("INSERT INTO origins (project_id, real_id, origin_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-                    .bind(pid)
-                    .bind(real)
-                    .bind(origin)
-                    .execute(&mut *c)
-                    .await?;
+            let (snap_ids, snap_authors): (Vec<String>, Vec<i64>) = authors.into_iter().unzip();
+            let (origin_reals, origin_ids): (Vec<String>, Vec<String>) = origins.iter().cloned().unzip();
+            let memo_keys: Vec<String> = memos.iter().map(|m| m.0.clone()).collect();
+            let memo_reals: Vec<String> = memos.iter().map(|m| m.1.clone()).collect();
+            let memo_projected: Vec<String> = memos.iter().map(|m| m.2.clone()).collect();
+            let memo_collapsed: Vec<bool> = memos.iter().map(|m| m.3).collect();
+            let notifies = notify && (!moved.is_empty() || !embargo_upserts.is_empty());
+            let (_, stored_keys, stored_reals, pack_states): (i64, Vec<String>, Vec<String>, Vec<i16>) = sqlx::query_as(
+                "WITH k AS (UPDATE packs SET state = CASE WHEN state = $17 THEN state ELSE $16 END \
+                   WHERE project_id = $1 AND name = ANY($18) RETURNING state), \
+                 s AS (INSERT INTO snapshots (project_id, id, author) SELECT $1, i, a FROM UNNEST($2::text[], $3::bigint[]) AS t(i, a) \
+                   ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0), \
+                 o AS (INSERT INTO origins (project_id, real_id, origin_id) SELECT $1, r, g FROM UNNEST($4::text[], $5::text[]) AS t(r, g) \
+                   ON CONFLICT DO NOTHING), \
+                 m AS (INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+                   SELECT $1, k, r, p, $6, c FROM UNNEST($7::text[], $8::text[], $9::text[], $10::bool[]) AS t(k, r, p, c) \
+                   ON CONFLICT DO NOTHING RETURNING view_key, real_id), \
+                 l AS (INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $6, $11, 'push', $12)), \
+                 n AS (SELECT pg_notify($13, $14) WHERE $15) \
+                 SELECT n.c, x.k, x.r, COALESCE((SELECT array_agg(state) FROM k), '{}') FROM (SELECT count(*) AS c FROM n) n, \
+                   (SELECT COALESCE(array_agg(view_key), '{}') AS k, COALESCE(array_agg(real_id), '{}') AS r FROM m) x",
+            )
+            .bind(pid)
+            .bind(&snap_ids)
+            .bind(&snap_authors)
+            .bind(&origin_reals)
+            .bind(&origin_ids)
+            .bind(veil_core::now_millis())
+            .bind(&memo_keys)
+            .bind(&memo_reals)
+            .bind(&memo_projected)
+            .bind(&memo_collapsed)
+            .bind(person)
+            .bind(format!("moved {moved:?}"))
+            .bind(crate::caches::TIPS_CHANNEL)
+            .bind(pid.to_string())
+            .bind(notifies)
+            .bind(crate::pack::LISTED)
+            .bind(crate::pack::DISCARDED)
+            .bind(&packs.0)
+            .fetch_one(&mut *c)
+            .await?;
+            if pack_states.len() != packs.0.len() || pack_states.contains(&crate::pack::DISCARDED) {
+                return Err(Error::conflict("an upload this push names was discarded; push again"));
             }
-            crate::embargo::record_in_tx(&mut *c, pid, &embargo_upserts, &embargo_snaps).await?;
-            // A row stored first by another request wins (and is not cached
-            // here from this push's answer).
-            let mut memo_stored = Vec::new();
-            for (view_key, real, projected, collapsed) in &memos {
-                let n = sqlx::query(
-                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, $6) \
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(pid)
-                .bind(view_key)
-                .bind(real)
-                .bind(projected)
-                .bind(veil_core::now_millis())
-                .bind(collapsed)
-                .execute(&mut *c)
-                .await?
-                .rows_affected();
-                memo_stored.push(n == 1);
-            }
-            sqlx::query("INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $2, $3, 'push', $4)")
-                .bind(pid)
-                .bind(veil_core::now_millis())
-                .bind(person)
-                .bind(format!("moved {moved:?}"))
-                .execute(&mut *c)
-                .await?;
-            // Delivered at commit, to every server: drop your tips.
-            if notify && (!moved.is_empty() || !embargo_upserts.is_empty()) {
-                sqlx::query("SELECT pg_notify($1, $2)")
-                    .bind(crate::caches::TIPS_CHANNEL)
-                    .bind(pid.to_string())
-                    .execute(&mut *c)
-                    .await?;
-            }
+            let stored: HashSet<(&str, &str)> = stored_keys.iter().map(|k| k.as_str()).zip(stored_reals.iter().map(|r| r.as_str())).collect();
+            let memo_stored: Vec<bool> = memos.iter().map(|m| stored.contains(&(m.0.as_str(), m.1.as_str()))).collect();
             // New review rules, or a new access policy (an approval counts
             // while its reviewer may write the PR's paths: BUG-2111), wait
             // for every batch already re-reading them and are read by every
@@ -3712,6 +3797,42 @@ async fn push_staged(
         });
     }
     Ok((PushResult { results, warnings }, landings, kept))
+}
+
+/// The rows `(name, target)` of `project`'s branches named `names`, as
+/// stored now.
+async fn branch_rows(hub: &Hub, project: i64, names: &[String]) -> Result<Vec<(String, String)>> {
+    Ok(sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
+        .bind(project)
+        .bind(names)
+        .fetch_all(&hub.db)
+        .await?)
+}
+
+/// [`branch_rows`], and whether no embargo line of `project` is unreleased,
+/// in one statement (so as of the moment the rows were read).
+async fn branch_rows_unembargoed(hub: &Hub, project: i64, names: &[String]) -> Result<(Vec<(String, String)>, bool)> {
+    let rows: Vec<(Option<String>, Option<String>, bool)> = sqlx::query_as(
+        "SELECT b.name, b.target, e.active \
+         FROM (SELECT EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $1 AND released_at IS NULL) AS active) e \
+         LEFT JOIN branches b ON b.project_id = $1 AND b.name = ANY($2)",
+    )
+    .bind(project)
+    .bind(names)
+    .fetch_all(&hub.db)
+    .await?;
+    let free = !rows.iter().any(|r| r.2);
+    Ok((rows.into_iter().filter_map(|(n, t, _)| Some((n?, t?))).collect(), free))
+}
+
+/// How many branches `project` has, read once (`count`) for a push.
+async fn count_branches(hub: &Hub, project: i64, count: &mut Option<usize>) -> Result<usize> {
+    if let Some(n) = *count {
+        return Ok(n);
+    }
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM branches WHERE project_id = $1").bind(project).fetch_one(&hub.db).await?;
+    *count = Some(n as usize);
+    Ok(n as usize)
 }
 
 /// The checks of new snapshot `id` (`n`) that need nothing but itself:

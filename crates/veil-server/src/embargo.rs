@@ -383,6 +383,7 @@ pub(crate) async fn prepare_push(
     real_of: &HashMap<ObjectId, ObjectId>,
     staged: Option<Arc<crate::sync::Staged>>,
     divert_branches: bool,
+    any_active: bool,
 ) -> Result<(Vec<LineUpsert>, Vec<(String, EmbargoRecord)>, HashMap<String, String>)> {
     let mut records_by_id: HashMap<String, EmbargoRecord> = HashMap::new();
     let mut releases: Vec<(String, EmbargoRecord)> = Vec::new();
@@ -470,6 +471,11 @@ pub(crate) async fn prepare_push(
     let root = crate::sync::root_snapshot_id();
     for (pushed, real) in real_of {
         if *real == root {
+            continue;
+        }
+        // The push read that no line is unreleased (`any_active`, after it
+        // resolved every snapshot it names): nothing is under one.
+        if !any_active {
             continue;
         }
         let eids = active_embargoes_of(hub, project.id, &[*real], &HashMap::new(), staged.clone()).await?;

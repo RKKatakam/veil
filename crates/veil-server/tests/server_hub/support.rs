@@ -1041,14 +1041,24 @@ impl Craft<'_> {
 
     /// Upload what the crafter made, then push `body` with the receipts
     /// the server gave for it, as `vl` does.
-    fn send(&self, mut body: serde_json::Value) -> Reply {
+    fn send(&self, body: serde_json::Value) -> Reply {
+        let r = self.try_send(body);
+        assert!(!r.1, "{}", String::from_utf8_lossy(&r.0.body));
+        r.0
+    }
+
+    /// Upload, then push `body`: the push's reply, or the upload's if it was
+    /// refused (then `true`).
+    fn try_send(&self, mut body: serde_json::Value) -> (Reply, bool) {
         let up = self.api.upload(&self.token, &self.project, &self.objects);
-        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+        if up.status != 200 {
+            return (up, true);
+        }
         let receipts = up.json()["receipts"].as_array().unwrap().clone();
         let map: serde_json::Map<String, serde_json::Value> =
             self.objects.iter().zip(receipts).map(|((id, _), r)| (id.hex(), r)).collect();
         body["receipts"] = serde_json::Value::Object(map);
-        self.api.post_json(Some(&self.token), &format!("/v1/projects/{}/push", self.project), &body)
+        (self.api.post_json(Some(&self.token), &format!("/v1/projects/{}/push", self.project), &body), false)
     }
 
     /// Point `path` at a copy of object `id` (fetched where the crafter
@@ -1145,7 +1155,15 @@ impl Craft<'_> {
 
     /// Commit and push to `branch`, expecting it at `expected` (`None`: a
     /// new branch).
-    pub fn push_to(mut self, branch: &str, expected: Option<ObjectId>) -> Reply {
+    pub fn push_to(self, branch: &str, expected: Option<ObjectId>) -> Reply {
+        let r = self.try_push_to(branch, expected);
+        assert!(!r.1, "{}", String::from_utf8_lossy(&r.0.body));
+        r.0
+    }
+
+    /// [`Craft::push_to`]: the push's reply, or the upload's if the server
+    /// refused it (then `true`).
+    pub fn try_push_to(mut self, branch: &str, expected: Option<ObjectId>) -> (Reply, bool) {
         let mut s = Snapshot {
             parents: vec![self.tip],
             change_id: veil_core::ChangeId::random(),
@@ -1163,7 +1181,7 @@ impl Craft<'_> {
         };
         s.sign(&self.identity);
         let id = self.put(O::Snapshot(s));
-        self.send(serde_json::json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": id.hex()}]}))
+        self.try_send(serde_json::json!({"updates": [{"branch": branch, "expected": expected.map(|e| e.hex()), "new": id.hex()}]}))
     }
 }
 
