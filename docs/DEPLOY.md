@@ -1360,6 +1360,60 @@ ignored) and of the teardown's listing (running VMs only) each fail it.
 - **The storage machine's local SSD** is lost if the machine stops (a
   host error, an operator's stop): the run's objects go with it. It is
   on-demand, with the default host-maintenance policy (live migration).
-- **Not run on Google Cloud yet**: the kit is tested against a fake gcloud
-  and the real CLI's parser only; the first real run will be its test,
-  as DigitalOcean's first was (§9.0).
+- **Run on Google Cloud** on 2026-11-14 and 15 (§12.9). The first run
+  found three kit bugs, all fixed:
+  - **No price for N2D drivers:** the kit had no built-in N2D price, so it refused the drivers chosen when the C2D quota was short (598cb4bf).
+  - **Long hostname:** the machine's long Google Cloud hostname crashed YugabyteDB's master (7dc2ba1a).
+  - **IP forwarding off:** Google's images turn it off, so containers couldn't reach the database (aa017c63).
+
+### 12.9 The runs on Google Cloud (2026-11-14 and 15)
+
+**Topology:** §12.1's default.
+- 3 servers (c2d-standard-16, Spot) and the balancer (e2-standard-4, Spot);
+- 3 YugabyteDB nodes (c2d-standard-8, on demand);
+- MinIO (c2d-standard-16, local NVMe, on demand);
+- 2 drivers (n2d-standard-8, Spot, as the C2D quota was 100 vCPUs);
+- us-central1-a.
+
+**Builds:** the server image `b6de7035` in both runs. The benchmark image
+was `b6de7035` in run 1 and `135245b2` in run 2 (the `agents` mode, and
+`warming` waited out).
+
+**Run 1** (21:43 to 00:44 UTC, about $10.50) ran every gate but `spaces`
+(DigitalOcean only), then two database layouts switched by hand on the
+same machines:
+- **colocated YugabyteDB:** a database `CREATE DATABASE … WITH COLOCATION = true`, migrated, the servers' `VEIL_DATABASE_URL` pointed at it, the servers restarted;
+- **PostgreSQL 17:** on the third YugabyteDB machine, its YugabyteDB stopped; `shared_buffers=8GB`, synchronous commit on.
+
+The `branches` gate ran again on each layout, at 300 and 1,000 agents for
+3 minutes.
+
+**Run 2** (01:19 to 02:03 UTC, about $3) ran the `agents` gate on the
+three layouts.
+
+No Spot VM was reclaimed, MinIO never restarted, and `destroy.sh --check`
+found nothing left after each run.
+
+| Gate | Result |
+|---|---|
+| `pull` | 866 / 5,590 / 3,928 pulls a second at 10 / 100 / 1,000 agents, 0 errors |
+| `land` | 13 a second (1 project, 1 agent); 8 (1 project, 50 agents: 41 collisions a landing); 102 (10 projects); **283** (100 projects); 0 errors |
+| `api` | 354 to 361 requests a second, 0 errors |
+| `branches` (as deployed) | pushes 17 / 98 / 118 a second at 1 / 10 / 100 agents. Headline at 300 / 1,000 / 3,000 agents: 6.7 / 8.1 / 5.7 merges on `main` a second, p99 39 / 61 / 70 s, errors 0 / 55 / 7,597 |
+| `branches`, colocated | pushes 19 / 113 / 137 a second; headline 15.6 / 12.5 merges a second at 300 / 1,000, p99 9.1 / 33 s, 0 errors |
+| `branches`, PostgreSQL | pushes 39 / 177 / 246 a second; headline 30.6 / 25.2 merges a second, p99 7.6 / 23 s; 123 / 301 `warming` answers counted as errors (benchmark bug, fixed in `135245b2`) |
+| `landing` (10,000 agents offering 1,000 a second, one project) | 106 / 91 / 85 a second for 180 s (plain / protected / mix), 63 / 65 for 600 s (plain / protected); mix for 600 s not run; collisions 0.00 to 0.02 a landing; the rest told to come back |
+| `scaling` | landings 93 / 185 / **279** a second on 1 / 2 / 3 servers (3.0×); pushes 88 / 138 / 153; pulls 300 / 528 / 514; 0 errors. Exit 1: one driver's set-up push gave up on a `busy` answer at 2 servers |
+| `failover` | every check passed: 17,386 changes landed once each, none lost or twice, none answered `landed` and missing |
+| `objects` | from the servers 499 / 740 / 766 reads a second (10 / 100 / 1,000 readers); through the cache 870 / 1,364 / 1,341, 99.96 to 100 % cache hits, cache peak 103 MiB; 0 errors |
+| `openscion` | Veil / Git: import 110 / 251 and 720 / 2,233 ms; clone 233 / 334 and 2,064 / 1,017 ms; commit one file 15 / 7 and 18 / 15 ms; clone one directory 64 / 76 and 64 / 86 ms (1k and 10k files) |
+| `scale` (1 GB) | first push 169 s, push one snapshot 0.33 s, thin clone 23 s, full clone 51 s, one folder 0.65 s, pull 0.08 s. Exit 1: the server peaked at 1,042 MiB during the full clone (gate 1 GB) |
+| `agents` (run 2; think 120 s compressed 20×, 3 subagents, landing every 20 pushes) | 1,000 agents: 79 / 71 / 102 pushes a second (as deployed / colocated / PostgreSQL), p50 6.4 / 7.4 / 3.5 s, 0 errors. 3,000: 37 to 40 a second on all three, 4,700 to 5,100 errors, servers at about 10 of 16 cores. 10,000 (PostgreSQL): 40 a second, about 19,500 errors |
+
+**What the runs found** (next steps, in order):
+1. **The branch-tips answer costs more with every branch.** Every push asks for the tips first, and the server signs a grant for every branch. Database statements per operation grew from 25 to 140 to 570 as branches piled up. This is the limit at 3,000 or more agents, on every database layout.
+2. **An agent can't delete a branch it merged into another branch** (403: only admins may delete a branch whose work isn't all on `main`). Subagent branches pile up.
+3. **The 1 GB project's full clone peaks at 1,042 MiB on the server.**
+4. **The benchmark's set-up gives up on a `busy` answer** (the 2-server scaling run lost one driver).
+5. **The colocated layout should be the kit's default for YugabyteDB:** it doubled the merge rate and removed the errors. PostgreSQL on its own machine is already a kit option (`VEIL_GCP_YB_NODES=0`); these runs switched by hand only to keep the same machines.
+6. **The 10-minute landing mix** is still to run across machines.
