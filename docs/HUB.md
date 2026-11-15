@@ -6082,4 +6082,7 @@ agents --think 120 --time-scale 20 --subagents 3 --merge-every 20
 
 All operations together: 160.9 → 222.4 a second at 1,000 agents, 84.3 →
 520.2 at 3,000; server CPU 116.9 → 12.7 ms an operation at 1,000, 201.7 →
-12.7 at 3,000.
+12.7 at 3,000. Rerun at 3,000 after review cycle 1 (the deletion locks
+`onto`, BUG-2447): 391.9 pushes a second, p50 / p99 1,050 / 9,098 ms, 0
+errors, 36,728 told to come back, 69.0 statements and 15.0 KiB received
+an operation.
