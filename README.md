@@ -32,7 +32,7 @@ ideas and bug reports are all welcome.
 | An agent forgets `git add`, or ends up on a detached HEAD | **No staging and no index.** Every `vl` command records the working copy first. Work can't be lost by forgetting a step. |
 | A conflict stops a rebase halfway, with markers in the tree | **A merge or rebase always finishes.** The conflict is stored as data in the change, to resolve later, by that agent or another. |
 | Twenty agents need twenty clones or worktrees | **Workspaces.** `vl ws exec NAME --mount -- cmd` gives a command its own copy of the project in milliseconds, whatever the project's size; files load when read. |
-| An agent runs on your machine with your SSH keys in reach | **Sandboxes** (bubblewrap, on Linux): its own files, home folder, processes and ports; limits on memory, CPU and time. A secret's value copied into another file is refused, not recorded. |
+| An agent runs on your machine with your SSH keys in reach | **Sandboxes, on Linux only** (bubblewrap): its own files, home folder, processes and ports; limits on memory, CPU and time. **On macOS there is no sandbox yet:** commands run with your user's full access. A secret's value copied into another file is refused, not recorded, on both. |
 | Every push to `main` races every other; losers pull, rebase and try again | **`vl land`.** The server lands changes on the newest `main` in batches, so nobody retries. Only a real conflict comes back, to the agent that caused it. |
 | A broken `main` blocks everyone until a person bisects it | **Land first, test after.** `main@tested` is the newest `main` that passed its checks, and agents start from it. The server bisects a failure and reverts the culprit; a change reverted twice needs a person. |
 | Anyone who can clone sees everything | **Folder permissions, enforced by the server,** in every answer: files, log, blame, search, diffs, PRs, CI. An agent's session can be narrowed to the folders its task needs. |
@@ -45,10 +45,14 @@ An agent's whole loop:
 ```sh
 vl ws new fix-login                 # starts from main@tested, the last main that passed its checks
 vl ws exec fix-login --mount --private-ports --memory 4G \
-   --agent "claude-code" --task "TASK-812" -- my-agent "fix the login bug"
+   --agent "claude-code" --task "TASK-812" -- my-agent "fix the login bug"   # sandboxed on Linux only
 vl attempt drop fix-login@ --reason "locking order deadlocks"   # a dead end, kept with its reason
 vl land fix-login@                  # the server puts it on main: no pull, no retry
 ```
+
+On macOS, leave out `--private-ports` and `--memory`: the sandbox and its
+limits are Linux-only for now, and `vl` refuses them there. Without them the
+command runs **unconfined**, with everything your user can read and change.
 
 Also built in: pull requests with risk-based approval rules, embargoes for
 security fixes (hidden until a deadline), secrets encrypted automatically
@@ -395,6 +399,11 @@ Start with [what Veil is](docs/OVERVIEW.md) and
 
 Veil supports **Linux and macOS**, on x86_64 and aarch64 (Apple
 silicon). Windows is not supported.
+
+**On macOS, everything works except the sandbox.** `vl ws exec` runs its
+command unconfined: no separate files, home folder, processes or ports, and
+no memory, CPU or time limits. The sandbox options are refused there. Run
+agents you don't trust on Linux, or in a Linux virtual machine.
 
 There is no release yet, so build `vl` from source, as below. The first
 release will ship a binary for each platform with an installer script and a
