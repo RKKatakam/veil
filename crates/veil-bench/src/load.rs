@@ -55,9 +55,9 @@
 //! `--subagents` subagents, each on a branch made off its own
 //! (`a/NNNN-sF-J`), which push [`SUB_PUSHES`] times, thinking between, and
 //! are then merged into the parent's branch through the landing service
-//! (`onto` the parent's branch); their branches stay (only admins may
-//! delete a branch whose work is not on `main`), so a run's branches grow
-//! with it. The parent pulls the merged branch and goes on. After every `--merge-every` pushes of its own it lands its
+//! (`onto` the parent's branch), which deletes their branches with the
+//! merge (`delete_branch`, `docs/HUB.md` §13.41), as `vl land --delete`
+//! does. The parent pulls the merged branch and goes on. After every `--merge-every` pushes of its own it lands its
 //! branch on `main` through the landing service. Each agent starts at a
 //! random point of its cycle. Reported per kind of operation (a push to
 //! one's branch, a subagent's merge into its parent's, a landing on
@@ -542,11 +542,14 @@ impl Agent<'_> {
         self.came_back.set(self.came_back.get() + 1);
     }
 
-    /// The project's tips ([`Agent::asked`]).
-    fn tips_by(&self, deadline: Option<Instant>) -> Result<Tips> {
+    /// The tips of `branches` and `main` ([`Agent::asked`]): what `vl`
+    /// asks for, never every branch (`tips?branches=`, `docs/HUB.md`
+    /// §13.41).
+    fn tips_by(&self, deadline: Option<Instant>, branches: &[String]) -> Result<Tips> {
+        let path = self.path(&veil_core::hub::wire::tips_query(branches));
         let r = self.asked(deadline, || {
             self.c.requests.fetch_add(1, Ordering::Relaxed);
-            self.api.get(self.token, &self.path("/tips"))
+            self.api.get(self.token, &path)
         })?;
         ok(&r, "tips")?;
         Ok(serde_json::from_slice(&r.body)?)
@@ -554,7 +557,7 @@ impl Agent<'_> {
 
     /// [`Agent::pull`], its requests sent as [`Agent::asked`] says.
     fn pull_by(&mut self, deadline: Option<Instant>) -> Result<bool> {
-        let tips = self.tips_by(deadline)?;
+        let tips = self.tips_by(deadline, &[self.branch.clone(), self.start.clone()])?;
         // A branch of its own starts from `main`.
         self.exists = tips.branches.contains_key(&self.branch);
         let tip = *tips.branches.get(&self.branch).or_else(|| tips.branches.get(&self.start)).ok_or_else(|| anyhow!("no {}", self.start))?;
@@ -817,7 +820,7 @@ impl Agent<'_> {
     /// module's comment); the objects it read.
     fn read(&mut self) -> Result<u64> {
         self.c.requests.fetch_add(1, Ordering::Relaxed);
-        let r = self.api.get(self.token, &self.path("/tips"))?;
+        let r = self.api.get(self.token, &self.path(&veil_core::hub::wire::tips_query(&[])))?;
         ok(&r, "tips")?;
         let tips: Tips = serde_json::from_slice(&r.body)?;
         let token = tips.grants.get("main").ok_or_else(|| anyhow!("no grant for main"))?;
@@ -888,7 +891,7 @@ impl Agent<'_> {
             let base = match self.clone.tip {
                 Some((t, _)) => t,
                 None => {
-                    let tips = self.tips_by(Some(deadline))?;
+                    let tips = self.tips_by(Some(deadline), &[])?;
                     *tips.branches.get("main").ok_or_else(|| anyhow!("no main"))?
                 }
             };
@@ -944,7 +947,7 @@ impl Agent<'_> {
                 // An overlap is always made on the tip, read just before.
                 Some((t, _)) if kind >= 3 => t,
                 _ => {
-                    let tips = self.tips_by(Some(deadline))?;
+                    let tips = self.tips_by(Some(deadline), &[])?;
                     *tips.branches.get("main").ok_or_else(|| anyhow!("no main"))?
                 }
             };
@@ -1510,7 +1513,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                 // The first clone (or read), before the clock starts (through
                 // the landing service an agent needs only the tip it lands on).
                 let first = match a.mode {
-                    Mode::Landing => agent.api.get(agent.token, &agent.path("/tips")).and_then(|r| {
+                    Mode::Landing => agent.api.get(agent.token, &agent.path(&veil_core::hub::wire::tips_query(&[]))).and_then(|r| {
                         ok(&r, "tips")?;
                         let tips: Tips = serde_json::from_slice(&r.body)?;
                         let tip = *tips.branches.get("main").ok_or_else(|| anyhow!("no main"))?;
@@ -2049,9 +2052,12 @@ impl<'a> Agent<'a> {
     /// Land this agent's tip onto `onto` through the landing service, as
     /// `vl land --onto` does, waiting out answers to come back later; the
     /// changes landed.
-    fn land_on(&self, onto: &str, deadline: Instant) -> Result<u64> {
+    fn land_on(&self, onto: &str, deadline: Instant, delete: bool) -> Result<u64> {
         let (snap, _) = self.clone.tip.ok_or_else(|| anyhow!("nothing to land"))?;
-        let body = json!({"onto": onto, "snapshot": snap.hex()});
+        let mut body = json!({"onto": onto, "snapshot": snap.hex()});
+        if delete {
+            body["delete_branch"] = json!(self.branch);
+        }
         let path = self.path("/land");
         let r = asked_until_answered(
             deadline,
@@ -2065,6 +2071,9 @@ impl<'a> Agent<'a> {
         let v: serde_json::Value = serde_json::from_slice(&r.body)?;
         if v["state"].as_str() != Some("landed") {
             bail!("did not land onto {onto}: {v}");
+        }
+        if delete && v["deleted_branch"].as_str() != Some(self.branch.as_str()) {
+            bail!("landed onto {onto}, but {} was not deleted: {v}", self.branch);
         }
         Ok(v["landed"].as_array().map_or(0, |l| l.len() as u64))
     }
@@ -2085,7 +2094,7 @@ impl<'a> Agent<'a> {
                 // cycle) there is nothing to branch off or to land: a push.
                 Step::Fork | Step::Land if !self.exists => self.timed("push", me, scheduled, |a| a.land(deadline).map(|_| 0)),
                 Step::Push => self.timed("push", me, scheduled, |a| a.land(deadline).map(|_| 0)),
-                Step::Land => self.timed("landing", me, scheduled, |a| a.land_on("main", deadline)),
+                Step::Land => self.timed("landing", me, scheduled, |a| a.land_on("main", deadline, false)),
                 Step::Fork => {
                     forks += 1;
                     let parent = self.branch.clone();
@@ -2151,10 +2160,9 @@ impl<'a> Agent<'a> {
         if !sleep_until(scheduled, stop) {
             return;
         }
-        self.timed("merge", me, scheduled, |a| a.land_on(parent, scheduled + OP_DEADLINE));
-        // Its branch stays: Veil lets only admins delete a branch whose
-        // work is not all on `main` (the parent's branch is not), so the
-        // project's branches grow with the run, as they do for agents today.
+        // Its branch is deleted with the merge: its work is all on the
+        // parent's then, so the project's branches do not grow with the run.
+        self.timed("merge", me, scheduled, |a| a.land_on(parent, scheduled + OP_DEADLINE, true));
     }
 }
 
@@ -2299,7 +2307,7 @@ fn agents_text(r: &serde_json::Value) -> String {
     let mut out = format!(
         "Agents at a coding agent's pace: {} agents, think time {} s of agent time on average (exponential), time scale {} \
          (so {} s real; the server carries the load of about {} agents at the real pace, each \
-         \"Uncompressed\" rate being these {} agents' at it); each forks {} subagents a cycle ({} pushes each, then merged into its branch) and lands its branch on \
+         \"Uncompressed\" rate being these {} agents' at it); each forks {} subagents a cycle ({} pushes each, then merged into its branch, their branch deleted with the merge) and lands its branch on \
          `main` every {} pushes. {} s measured stand for {} agent-hours: {} landings on `main` per agent-hour. \
          Database commits per push {}, per landing (merges and landings on `main`) {}; statements per operation {}.\n\n\
          | Operation | Done (/s) | Uncompressed (/s) | p50 (ms) | p99 (ms) | Changes landed per op | Errors | Told to come back |\n|---|---:|---:|---:|---:|---:|---:|---:|\n",

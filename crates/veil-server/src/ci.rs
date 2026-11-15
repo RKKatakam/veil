@@ -490,14 +490,22 @@ pub async fn tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, bran
 }
 
 /// All `<branch>@tested` pointers in `project` as `viewer` sees them, for
-/// [`veil_core::hub::wire::Tips::tested`].
-pub async fn all_tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<BTreeMap<String, ObjectId>> {
+/// [`veil_core::hub::wire::Tips::tested`]: of every branch, or (`only`) of
+/// those named (`tips?branches=`).
+pub async fn all_tested_for(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    only: Option<&std::collections::BTreeSet<String>>,
+) -> Result<BTreeMap<String, ObjectId>> {
+    let names: Option<Vec<String>> = only.map(|o| o.iter().cloned().collect());
     let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT t.branch, t.snapshot, b.hidden_for_embargo FROM tested t \
          JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
-         WHERE t.project_id = $1 AND t.lineage = b.lineage ORDER BY t.branch",
+         WHERE t.project_id = $1 AND t.lineage = b.lineage AND ($2::text[] IS NULL OR t.branch = ANY($2)) ORDER BY t.branch",
     )
     .bind(project.id)
+    .bind(names)
     .fetch_all(&hub.db)
     .await?;
     let mut out = BTreeMap::new();

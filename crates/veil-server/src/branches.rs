@@ -123,11 +123,13 @@ pub(crate) async fn source_of_pr(hub: &Hub, project: i64, head: &str, target: &s
 }
 
 /// A PR landed: delete its source branch, when the branch still points at
-/// the head that landed (so everything on it is on the target now). Never
-/// the default branch, the target, a protected branch or an embargo's line;
-/// not at all with `[branches] delete_merged = false` in `.veilrules`. The
-/// deletion is one compare-and-swap on the branch's tip. Best effort, after
-/// the landing: a branch it leaves is deleted by anyone who may write.
+/// the head that landed and that head is contained in the target now
+/// ([`contained`]). Never the default branch, the target, a protected
+/// branch or an embargo's line; not at all with `[branches] delete_merged =
+/// false` in `.veilrules`. One compare-and-swap on the branch's tip, with the
+/// target's row locked at the lineage it was found in ([`delete_held`]): a
+/// forced move of the target in flight is not raced. Best effort, after the
+/// landing: a branch it leaves is deleted by anyone who may write.
 pub(crate) async fn delete_landed_pr_branch(hub: &Arc<Hub>, project: &Project, pr: &str, revision: i32, actor: i64) -> Result<()> {
     let row: Option<(Option<String>, String, String)> = sqlx::query_as(
         "SELECT p.source_branch, p.target, r.head FROM prs p JOIN pr_revisions r ON r.project_id = p.project_id AND r.pr = p.id AND r.n = $3 \
@@ -146,15 +148,52 @@ pub(crate) async fn delete_landed_pr_branch(hub: &Arc<Hub>, project: &Project, p
     if !rules.delete_merged() || source == target || kept(&source, &project.default_branch, &rules.protected) {
         return Ok(());
     }
+    let head = ObjectId::from_hex(&head).map_err(|e| Error::Other(e.into()))?;
+    let Some(lineage) = merged_into(hub, project.id, &target, head).await? else {
+        return Ok(());
+    };
+    delete_held(hub, project.id, &source, head, &target, lineage, actor, format!("deleted the branch {source:?}: the PR {pr} landed")).await?;
+    Ok(())
+}
+
+/// The lineage `onto` is in, if `tip` is contained in it ([`contained`]).
+async fn merged_into(hub: &Arc<Hub>, project: i64, onto: &str, tip: ObjectId) -> Result<Option<i64>> {
+    let Some((onto_tip, lineage)) = tip_of(hub, project, onto).await? else {
+        return Ok(None);
+    };
+    let mut anc = Ancestry::new_staged(hub.clone(), project, onto, onto_tip, lineage, None);
+    Ok(contained(hub, project, &mut anc, onto_tip, tip).await?.then_some(lineage))
+}
+
+/// Delete `branch`, if it is still at `tip`, while `onto` (where its work
+/// is) is still in `lineage`: one transaction, `onto`'s row locked (`FOR
+/// SHARE`) before the deletion, so that two deletions each of a branch
+/// "merged" into the other (or a forced move of `onto`) cannot both pass on
+/// what the other has not committed yet (BUG-2447, BUG-2450). A deadlock between them
+/// is retried by [`transaction`], and the second then finds its `onto` gone.
+/// Recorded in `audit_log` with `details`; `true` if deleted. Public for
+/// the tests of that race only (`server_hub::branch_count`).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn delete_held(hub: &Arc<Hub>, pid: i64, branch: &str, tip: ObjectId, onto: &str, lineage: i64, actor: i64, details: String) -> Result<bool> {
     let notify = hub.caches.notices.load(Ordering::SeqCst);
-    let (pid, pr) = (project.id, pr.to_string());
+    let (b, o, t) = (branch.to_string(), onto.to_string(), tip.hex());
     let deleted = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
-        let (source, head, pr) = (source.clone(), head.clone(), pr.clone());
+        let (b, o, t, details) = (b.clone(), o.clone(), t.clone(), details.clone());
         Box::pin(async move {
+            let held: Option<i32> = sqlx::query_scalar("SELECT 1 FROM branches WHERE project_id = $1 AND name = $2 AND lineage = $3 FOR SHARE")
+                .bind(pid)
+                .bind(&o)
+                .bind(lineage)
+                .fetch_optional(&mut *c)
+                .await?;
+            if held.is_none() {
+                return Ok(false);
+            }
             let n = sqlx::query("DELETE FROM branches WHERE project_id = $1 AND name = $2 AND target = $3 AND hidden_for_embargo IS NULL")
                 .bind(pid)
-                .bind(&source)
-                .bind(&head)
+                .bind(&b)
+                .bind(&t)
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
@@ -163,7 +202,7 @@ pub(crate) async fn delete_landed_pr_branch(hub: &Arc<Hub>, project: &Project, p
                     .bind(pid)
                     .bind(veil_core::now_millis())
                     .bind(actor)
-                    .bind(format!("deleted the branch {source:?}: the PR {pr} landed"))
+                    .bind(&details)
                     .execute(&mut *c)
                     .await?;
                 if notify {
@@ -177,5 +216,64 @@ pub(crate) async fn delete_landed_pr_branch(hub: &Arc<Hub>, project: &Project, p
     if deleted {
         hub.caches.tips_changed(pid);
     }
-    Ok(())
+    Ok(deleted)
+}
+
+/// What a landing's `delete_branch` that was not deleted is told, whatever
+/// the reason (`docs/HUB.md` §13.41): deleted or not is the one bit it
+/// learns, the bit a push's deletion gives about the default branch.
+pub(crate) fn not_deleted(branch: &str, onto: &str) -> String {
+    format!(
+        "'{branch}' was not deleted: only a branch whose work is all on '{onto}' is, and never the default branch, a protected branch or an embargo's line"
+    )
+}
+
+/// A landing onto `onto` landed the snapshot `landed` (as the caller
+/// names it, `LandRequest::snapshot`), and the caller asked
+/// (`LandRequest::delete_branch`) to delete `branch`: delete it if its tip is
+/// that snapshot, as the caller sees it, so only the branch the landing came
+/// from (BUG-2448), and its tip is contained in `onto` now ([`contained`], as
+/// a push's deletion of a branch merged into the default branch), in one
+/// compare-and-swap on its tip with `onto`'s row locked at its lineage
+/// ([`delete_held`]). Never the default branch, a protected one or an
+/// embargo's line; only for someone who may write; for an agent session,
+/// only a branch it may move ([`agent_may_delete`]). `Ok(None)`: deleted;
+/// else why not, for the caller.
+pub(crate) async fn delete_merged_into(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    branch: &str,
+    landed: ObjectId,
+    onto: &str,
+    actor: i64,
+) -> Result<Option<String>> {
+    let no = || Ok(Some(not_deleted(branch, onto)));
+    if branch == onto || !project.view(viewer).writes_anything() {
+        return no();
+    }
+    let default_tip = tip_of(hub, project.id, &project.default_branch).await?.map(|(t, _)| t);
+    let rules = blocking_staged(hub, project.id, None, move |src| crate::landing::rules(src, default_tip)).await?;
+    if kept(branch, &project.default_branch, &rules.protected) {
+        return no();
+    }
+    // An embargo's hidden line is not there, as for a name that is not.
+    let Some((tip, _)) = tip_of(hub, project.id, branch).await? else {
+        return no();
+    };
+    if crate::sync::projected(hub, project, viewer, tip).await? != landed {
+        return no();
+    }
+    let Some(lineage) = merged_into(hub, project.id, onto, tip).await? else {
+        return no();
+    };
+    match agent_may_delete(hub, project, viewer, tip, None).await? {
+        Some(AgentTip::Narrowed) => return Ok(Some(crate::sync::NARROWED_MOVE.to_string())),
+        Some(AgentTip::Access) => return Ok(Some(crate::sync::AGENT_ACCESS_MOVE.to_string())),
+        Some(AgentTip::DefaultBranch) | None => {}
+    }
+    match delete_held(hub, project.id, branch, tip, onto, lineage, actor, format!("deleted the branch {branch:?}: it landed on {onto:?}")).await? {
+        true => Ok(None),
+        false => no(),
+    }
 }

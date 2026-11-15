@@ -726,15 +726,44 @@ async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name):
     })
     .await?;
     crate::audit(&hub.db, None, caller.person.as_ref().map(|p| p.id), "create project", &name).await;
-    tips(State(hub), caller, Path(name)).await
+    tips(State(hub), caller, Path(name), Query(TipsQuery::default())).await
 }
 
-async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>) -> Result<Json<Tips>> {
+#[derive(Deserialize, Default)]
+struct TipsQuery {
+    /// [`veil_core::hub::wire::TIPS_BRANCHES`]: the branches the caller
+    /// needs, separated by commas.
+    #[serde(default)]
+    branches: Option<String>,
+}
+
+/// `GET …/tips`: every branch, or with `?branches=a,b` (revision 8,
+/// `docs/HUB.md` §13.41) those and the default branch only, so that what a
+/// push or a landing asks for costs the same whatever the number of
+/// branches. Each branch's entry, grant and `@tested` are made as in the
+/// full answer; one named that does not exist, or that the caller may not
+/// see, is left out alike.
+async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Query(q): Query<TipsQuery>) -> Result<Json<Tips>> {
+    use veil_core::hub::wire::{MAX_TIPS_BRANCHES, TIPS_BRANCHES};
+    let only: Option<std::collections::BTreeSet<String>> = match &q.branches {
+        None => None,
+        Some(list) => {
+            let names: std::collections::BTreeSet<String> = list.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect();
+            if names.len() > MAX_TIPS_BRANCHES {
+                return Err(Error::bad_request(format!("at most {MAX_TIPS_BRANCHES} branches in `{TIPS_BRANCHES}`")));
+            }
+            Some(names)
+        }
+    };
     // The epochs the view was built under (`perm::open_at`): a later access
     // change voids the grants made with them.
     let (project, viewer, epochs) = perm::open_at(&hub, &p, &caller).await?;
-    let branches = sync::tips(&hub, &project, &viewer).await?.into_iter().collect();
-    let tested = crate::ci::all_tested_for(&hub, &project, &viewer).await?;
+    let only = only.map(|mut o| {
+        o.insert(project.default_branch.clone());
+        o
+    });
+    let branches = sync::tips(&hub, &project, &viewer, only.as_ref()).await?.into_iter().collect();
+    let tested = crate::ci::all_tested_for(&hub, &project, &viewer, only.as_ref()).await?;
     let embargoes = crate::embargo::embargoes_for(&hub, &project, &viewer).await?;
     let grants = crate::grant::for_tips(&hub, &project, &viewer, &caller, epochs, &branches).await?;
     Ok(Json(Tips {

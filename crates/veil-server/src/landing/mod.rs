@@ -774,6 +774,7 @@ pub fn queued(ticket: &str) -> LandResult {
         landed_since: Vec::new(),
         merges: 0,
         warnings: Vec::new(),
+        deleted_branch: None,
     }
 }
 
@@ -951,6 +952,15 @@ pub async fn submit(
     if !project.participant(viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
+    if let Some(b) = &req.delete_branch {
+        veil_core::commands::validate_tag_name(b).map_err(|_| Error::bad_request(format!("invalid branch name {b:?}")))?;
+        if req.snapshot.is_none() {
+            return Err(Error::bad_request("`delete_branch` goes with an uploaded `snapshot`: the branch it was pushed to"));
+        }
+        if *b == req.onto {
+            return Err(Error::bad_request("`delete_branch` names the branch landed from, not the one landed on"));
+        }
+    }
     // Past what the branch's service lands in time, the submitter is told
     // to come back, before anything is done for the submit (BUG-1955).
     if let Some(refused) = crate::limits::pressure::admit(hub, project.id, &req.onto, &who).await? {
@@ -979,8 +989,24 @@ pub async fn submit(
                 }
             };
             match landings.pop() {
-                // Projected for the pusher by `push_with`.
-                Some(l) => Ok(Ok(l)),
+                // Projected for the pusher by `push_with`. Landed: the
+                // branch it came from goes, when asked and its work is all
+                // on `onto` (`docs/HUB.md` §13.41). Best effort: the landing
+                // is committed, so a failure here (`warming`, `busy`) is a
+                // warning on its answer, never the answer (BUG-2449).
+                Some(mut l) => {
+                    if let (Some(b), LandState::Landed) = (&req.delete_branch, l.state) {
+                        match crate::branches::delete_merged_into(hub, project, viewer, b, snapshot, &onto, who.person.id).await {
+                            Ok(None) => l.deleted_branch = Some(b.clone()),
+                            Ok(Some(why)) => l.warnings.push(why),
+                            Err(e) => {
+                                eprintln!("veil-server: deleting a branch landed onto in project {}: {e:?}", project.id);
+                                l.warnings.push(crate::branches::not_deleted(b, &onto));
+                            }
+                        }
+                    }
+                    Ok(Ok(l))
+                }
                 // Refused before it was queued (nothing new, no branch, …).
                 None => Err(Error::bad_request(
                     pushed.results.into_iter().find_map(|r| r.message).unwrap_or_else(|| "nothing to land".into()),

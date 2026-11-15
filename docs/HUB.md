@@ -915,7 +915,7 @@ quay.io; the tests use the MinIO server binary packaged as
   | upload objects, push, read key rings | participants: admins, group members, people named on a rule |
   | force a branch move | admins |
   | delete a branch | admins. Anyone who may write a path, when the branch's work is all on the default branch (its tip is the default branch's tip or below it, or the landing service landed it there): `vl tag delete NAME`, then `vl push` (BUG-1885). Never this way: the default branch, a protected branch, an embargo's line, a forced push. An agent session: only a merged branch, and only one it may move (§13.27: its tip's change stays inside a narrowed session's paths and changes no file that decides access) |
-  | delete a pull request's source branch when it lands | the server, if the branch still points at the head that landed (never the default branch, the target, a protected branch or an embargo's line); `[branches] delete_merged = false` in `.veilrules` turns it off |
+  | delete a pull request's source branch when it lands | the server, if the branch still points at the head that landed and that head is on the target (`branches::contained`) (never the default branch, the target, a protected branch or an embargo's line); `[branches] delete_merged = false` in `.veilrules` turns it off |
 
 * **Every check is on the server, on every request**; removing someone
   takes effect on their next request, on every server: servers cache
@@ -2091,7 +2091,8 @@ caches (S9)), `crates/veil-server/src/grant.rs` (issuing, the routes, the
 feed); the access epochs are S4's (§13.14, `migrations/0006_access_epochs.sql`). Nothing new is encrypted:
 grants are **signed**.
 
-* **The grant.** `GET …/tips` (revision 3) returns, per branch, a grant
+* **The grant.** `GET …/tips` (revision 3) returns, per branch (with
+  `?branches=`, per branch named: §13.41), a grant
   and the server's grant key (`Tips::grants`, `Tips::grant_key`). A grant
   is `hex(JSON body) . hex(signature)`: Ed25519 by the server's **grant
   key** (`<data>/hub-grant-key`, an Ed25519 seed, 0600; servers sharing the
@@ -5988,3 +5989,100 @@ Design: [`docs/design/server/phase-4-agent-scale.md` §4.12, §6 row 18, §11 it
 | 11 | The web client works in tests and in no browser (HTTP/2 has no `Host`; a browser's forms carry `Origin: null`; a Worker script calls a function its WASM lacks) | One request authority for every check; `Origin: null` beside `Sec-Fetch-Site: same-origin` is a browser's own form (BUG-1907); the tests' clients speak HTTP/2 and send forms as a browser does; **the pages' JavaScript runs in a real browser** | `rv_s26::bug_1906_a_browser_enrolls_signs_in_and_signs_out_over_http2`, `web::bug_1906_the_web_client_works_over_http2_and_over_http1`, `rv_s26::the_token_in_a_pages_forms_is_the_sessions`, `rv_s26::the_worker_scripts_call_only_functions_the_wasm_exports`, `browser::a_real_browser_enrolls_signs_in_signs_out_and_shows_a_secret` (`scripts/web-browser-smoke.sh`) |
 
 
+
+### 13.41 What a push costs, whatever the number of branches (`GET …/tips?branches=`, a landing that deletes its merged branch)
+
+Found on Google Cloud (`docs/DEPLOY.md` §12.9): agents at a coding agent's
+pace stopped at about 3,000 on every database layout, the database's
+statements per operation growing 25 → 140 → 570 as branches piled up, and
+about 1.2 MB received per operation at 1,000 agents. Two causes:
+
+1. **Every push, landing and pull first asked for the tips, and the answer
+   held every branch**: per branch, the tip projected for the caller, a
+   read grant signed for it (with its projected root stored, §13.16), and
+   `<branch>@tested` projected. Its cost was the project's branch count.
+2. **An agent could not delete a subagent's branch once it was merged into
+   its own** (BUG-1885 lets a writer delete a branch whose work is all on
+   the *default* branch; an agent session deletes nothing else), so every
+   subagent branch stayed and cause 1 grew without end.
+
+**Guarantees (none weakened):**
+* A viewer never learns a branch, a tip, a grant or a `@tested` it could not
+  before: a named answer is the full answer with branches left out, each
+  entry made exactly as before; a name that does not exist, an embargo's
+  hidden line and a branch the viewer may not see are left out alike.
+* A grant binds exactly what it bound (device, projected root, epochs,
+  expiry); a narrowed agent session still gets none.
+* A deletion never loses work: the branch is deleted only when its tip is
+  contained in the branch the landing landed on (the same check as
+  BUG-1885's, `branches::contained`, against that branch instead of the
+  default one), in one transaction that locks the target's row at the
+  lineage the check was made in (`FOR SHARE`) before it deletes the branch
+  at its tip (`branches::delete_held`): a forced move of the target, or a
+  deletion of the target by the same path (two crossed landings, BUG-2447),
+  in flight waits or voids it. BUG-1885's push deletion and the PR
+  source-branch deletion lock the same way (BUG-2450).
+* Only the branch the landing came from: its tip, as the caller sees it, is
+  the snapshot the request landed (BUG-2448); any other deletion stays an
+  admin's, as BUG-1885 has it.
+* Never the default branch, a protected branch or an embargo's line; only by
+  someone who may write (`writes_anything`); an agent session only a branch
+  it may move (S11's `agent_may_delete`, as a push's deletion), and only
+  into a branch its person may write (the landing it asked for landed
+  there, under every check of a landing).
+* Recorded as today: one `audit_log` row ("deleted the branch …: it landed
+  on …"), the tips' notice sent. `vl` deletes its own tag in the same
+  operation, so `vl undo` then `vl push` restores the branch (a writer may
+  create a branch), as after any deletion.
+* What a refusal says is one generic sentence: deleted or not is the one
+  bit a push's deletion already gives about the default branch (BUG-1885).
+
+**Options weighed.** Caching the projected and signed per-branch answer
+per (view key, branch, tip) still sends every branch (the 1.2 MB) and
+pays a cache lookup per branch; paging keeps the total. Letting a push
+delete a branch contained in *any* branch would make the server search the
+branches for one, or the push name one, and lives in the push path's write
+transaction. **Built:** the client names the branches it needs, and the
+landing service, which already knows the branch a merge went to, deletes
+the merged branch when asked.
+
+* **`GET …/tips?branches=a,b`** (revision 8): only those branches and the
+  default branch, in `branches`, `grants` and `tested`; everything else of
+  the answer as before. At most 64 names (`400` past it). Without the
+  parameter, every branch, as before (`vl pull` mirrors every branch, and
+  says so). An older server ignores the parameter and answers in full,
+  which a client takes as it is.
+* **`LandRequest::delete_branch`** (revision 8, with an uploaded
+  `snapshot` only): once the stack landed in this request, delete that
+  branch under the guarantees above; `LandResult::deleted_branch` names it,
+  or a warning says why not. A landing still queued when the request
+  answers deletes nothing. Best effort: the landing is committed, so a
+  failure of the deletion (`warming`, `busy`) is a warning on the `landed`
+  answer, never the answer (BUG-2449). An older server refuses the field (`422`):
+  `vl` asks only a server of revision 8.
+* **`vl`**: `vl push` and `vl land` ask for the default branch alone (they
+  need the revision); the push's look for a view change asks for the
+  branches it pushes; `vl land BRANCH --onto B --delete` deletes the
+  branch, and its tag, once it landed.
+* **`veil-bench load`** asks for what the agent needs (its branch and the
+  one it started from), and `--mode agents` deletes a subagent's branch
+  with its merge.
+
+**Measured** (2026-11-15, one 32-thread machine, server, PostgreSQL 17
+and the load tool together, local object store; `veil-bench load --mode
+agents --think 120 --time-scale 20 --subagents 3 --merge-every 20
+--duration 180`; before: `30815e26`, the tree this change starts from):
+
+| Agents | | Pushes (/s) | Push p50 / p99 (ms) | Errors | Told to come back | DB statements per op | KiB received per op |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1,000 | before | 125.4 | 1,302 / 10,185 | 0 | 23,944 | 59.0 | 1,536.6 |
+| 1,000 | after | 175.5 | 18 / 95 | 0 | 0 | 60.9 | 4.6 |
+| 3,000 | before | 68.3 | 14,726 / 67,651 | 2,950 | 456,758 | 339.7 | 2,692.5 |
+| 3,000 | after | 406.0 | 1,103 / 7,054 | 0 | 17,109 | 70.3 | 16.2 |
+
+All operations together: 160.9 → 222.4 a second at 1,000 agents, 84.3 →
+520.2 at 3,000; server CPU 116.9 → 12.7 ms an operation at 1,000, 201.7 →
+12.7 at 3,000. Rerun at 3,000 after review cycle 1 (the deletion locks
+`onto`, BUG-2447): 391.9 pushes a second, p50 / p99 1,050 / 9,098 ms, 0
+errors, 36,728 told to come back, 69.0 statements and 15.0 KiB received
+an operation.

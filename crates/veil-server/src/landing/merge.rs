@@ -98,6 +98,7 @@ impl ConflictReport {
             landed_since: self.landed_since,
             merges: self.merges,
             warnings: Vec::new(),
+            deleted_branch: None,
         }
     }
 }

@@ -187,8 +187,8 @@ pub async fn project_overview_route(
     let up = url_part(pname);
     let rev = q.rev.as_deref().unwrap_or(&ask.project.default_branch);
 
-    let branches = sync::tips(&hub, &ask.project, &ask.viewer).await?;
-    let tested = crate::ci::all_tested_for(&hub, &ask.project, &ask.viewer).await?;
+    let branches = sync::tips(&hub, &ask.project, &ask.viewer, None).await?;
+    let tested = crate::ci::all_tested_for(&hub, &ask.project, &ask.viewer, None).await?;
     let embargoes = crate::embargo::embargoes_for(&hub, &ask.project, &ask.viewer).await?;
 
     let mut body = String::new();

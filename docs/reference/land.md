@@ -27,6 +27,7 @@ Options:
 | `--remote <REMOTE>` | The remote (default: `origin`) |
 | `--no-wait` | Answer with the ticket at once, without waiting |
 | `--status <TICKET>` | Show a submitted landing's outcome (waiting for it, unless --no-wait) |
+| `--delete` | Once it landed, delete the branch REV names, on the server and here, when the server's branch is at REV and its work is all on --onto then (a subagent's branch merged into its agent's). Never the default branch, a protected one or an embargo's line |
 
 ---
 
