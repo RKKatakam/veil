@@ -417,6 +417,18 @@ pub struct Confine {
 /// Whether this build confines `vl ws exec` at all.
 pub const BUILT: bool = cfg!(target_os = "linux");
 
+/// What a `vl ws exec` is told where confinement isn't built (every system
+/// but Linux, `BUILT`): a confinement flag or a limit is refused; else the
+/// run is unconfined, and says so as `--unconfined` does (BUG-2450: on macOS
+/// it ran unconfined without a word).
+fn unbuilt(a: &ConfineArgs) -> Result<&'static str> {
+    let asked = !a.allow.is_empty() || a.no_network || a.private_ports || !a.seed.is_empty() || Limits::new(a, &BTreeMap::new())?.any();
+    if asked {
+        bail!("confinement and limits are only built for Linux so far; run without --allow, --no-network, --private-ports, --seed and the limits");
+    }
+    Ok("no sandbox on this system (confinement is only built for Linux so far): the command runs unconfined, and can read and change everything your user can")
+}
+
 impl Confine {
     /// The confinement of a `vl ws exec` in the project at `root` (`None`:
     /// unconfined). Fails, before anything is touched, when confinement or a
@@ -432,12 +444,7 @@ impl Confine {
             return Ok(None);
         }
         if !BUILT {
-            let asked = !a.allow.is_empty() || a.no_network || a.private_ports || !a.seed.is_empty() || Limits::new(a, &BTreeMap::new())?.any();
-            if asked {
-                bail!(
-                    "confinement and limits are only built for Linux so far; run without --allow, --no-network, --private-ports, --seed and the limits"
-                );
-            }
+            warn(unbuilt(a)?);
             return Ok(None);
         }
         let limits = Limits::new(a, &cfg.limits)?;
@@ -2166,6 +2173,18 @@ mod net {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-2450: where confinement isn't built, a run without confinement
+    /// flags is told it is unconfined (it ran without a word on macOS), and
+    /// one asking for confinement or a limit is refused.
+    #[test]
+    fn bug_2450_a_run_without_a_sandbox_says_it_is_unconfined() {
+        let said = unbuilt(&ConfineArgs::default()).expect("a plain run goes ahead, unconfined");
+        assert!(said.contains("no sandbox on this system") && said.contains("everything your user can"), "{said}");
+        let asked = ConfineArgs { private_ports: true, ..ConfineArgs::default() };
+        let Err(e) = unbuilt(&asked) else { panic!("--private-ports was accepted where confinement isn't built") };
+        assert!(format!("{e:#}").contains("only built for Linux"), "{e:#}");
+    }
 
     #[test]
     fn sizes_durations_and_counts_parse_strictly() {
