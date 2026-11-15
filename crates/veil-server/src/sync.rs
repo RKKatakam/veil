@@ -3518,86 +3518,81 @@ async fn push_staged(
                 // server without this push's index in hand: BUG-2310).
                 // Locked: a racing discard or delete waits, then finds it
                 // listed.
-                let have: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND name = ANY($2) FOR UPDATE")
-                    .bind(pid)
-                    .bind(&packs.0)
-                    .fetch_all(&mut *c)
-                    .await?;
-                if have.len() != packs.0.len() {
-                    return Err(Error::conflict("an upload this push names was discarded; push again"));
-                }
-                // A staged row turns listed; a discarded one stays
-                // discarded.
+                // One statement: the rows' locks are the update's, and a row
+                // missing is one fewer state back (no row is ever made here).
                 let states: Vec<i16> = sqlx::query_scalar(
-                    "INSERT INTO packs (project_id, name, state, size, objects, created_at) \
-                     SELECT $1, n, $6, s, o, $5 FROM UNNEST($2::text[], $3::bigint[], $4::bigint[]) AS t(n, s, o) \
-                     ON CONFLICT (project_id, name) DO UPDATE \
-                     SET state = CASE WHEN packs.state = $7 THEN packs.state ELSE $6 END RETURNING state",
+                    "UPDATE packs SET state = CASE WHEN state = $4 THEN state ELSE $3 END \
+                     WHERE project_id = $1 AND name = ANY($2) RETURNING state",
                 )
                 .bind(pid)
                 .bind(&packs.0)
-                .bind(&packs.1)
-                .bind(&packs.2)
-                .bind(veil_core::now_millis())
                 .bind(crate::pack::LISTED)
                 .bind(crate::pack::DISCARDED)
                 .fetch_all(&mut *c)
                 .await?;
+                if states.len() != packs.0.len() {
+                    return Err(Error::conflict("an upload this push names was discarded; push again"));
+                }
                 if states.contains(&crate::pack::DISCARDED) {
                     return Err(Error::conflict("an upload this push names was discarded; push again"));
                 }
             }
-            for (r, author) in &new_reals {
-                sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3) ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0")
-                    .bind(pid)
-                    .bind(r)
-                    .bind(*author)
-                    .execute(&mut *c)
-                    .await?;
-            }
-            for (real, origin) in &origins {
-                sqlx::query("INSERT INTO origins (project_id, real_id, origin_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-                    .bind(pid)
-                    .bind(real)
-                    .bind(origin)
-                    .execute(&mut *c)
-                    .await?;
-            }
             crate::embargo::record_in_tx(&mut *c, pid, &embargo_upserts, &embargo_snaps).await?;
-            // A row stored first by another request wins (and is not cached
-            // here from this push's answer).
-            let mut memo_stored = Vec::new();
-            for (view_key, real, projected, collapsed) in &memos {
-                let n = sqlx::query(
-                    "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, $6) \
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(pid)
-                .bind(view_key)
-                .bind(real)
-                .bind(projected)
-                .bind(veil_core::now_millis())
-                .bind(collapsed)
-                .execute(&mut *c)
-                .await?
-                .rows_affected();
-                memo_stored.push(n == 1);
+            // The push's rows in one statement: its snapshots (a row stored
+            // first by another push keeps its author unless it had none),
+            // their origins, its memos (a row stored first by another request
+            // wins, and is not cached here from this push's answer: those
+            // this one stored come back), its audit row, and the notice
+            // delivered at commit to every server: drop your tips.
+            let mut authors: Vec<(String, i64)> = Vec::with_capacity(new_reals.len());
+            for (r, author) in &new_reals {
+                // Each id once (one statement cannot update a row twice): the
+                // first author that is not 0, as one insert after another.
+                match authors.iter_mut().find(|(x, _)| x == r) {
+                    Some((_, a)) if *a == 0 => *a = *author,
+                    Some(_) => {}
+                    None => authors.push((r.clone(), *author)),
+                }
             }
-            sqlx::query("INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $2, $3, 'push', $4)")
-                .bind(pid)
-                .bind(veil_core::now_millis())
-                .bind(person)
-                .bind(format!("moved {moved:?}"))
-                .execute(&mut *c)
-                .await?;
-            // Delivered at commit, to every server: drop your tips.
-            if notify && (!moved.is_empty() || !embargo_upserts.is_empty()) {
-                sqlx::query("SELECT pg_notify($1, $2)")
-                    .bind(crate::caches::TIPS_CHANNEL)
-                    .bind(pid.to_string())
-                    .execute(&mut *c)
-                    .await?;
-            }
+            let (snap_ids, snap_authors): (Vec<String>, Vec<i64>) = authors.into_iter().unzip();
+            let (origin_reals, origin_ids): (Vec<String>, Vec<String>) = origins.iter().cloned().unzip();
+            let memo_keys: Vec<String> = memos.iter().map(|m| m.0.clone()).collect();
+            let memo_reals: Vec<String> = memos.iter().map(|m| m.1.clone()).collect();
+            let memo_projected: Vec<String> = memos.iter().map(|m| m.2.clone()).collect();
+            let memo_collapsed: Vec<bool> = memos.iter().map(|m| m.3).collect();
+            let notifies = notify && (!moved.is_empty() || !embargo_upserts.is_empty());
+            let (_, stored_keys, stored_reals): (i64, Vec<String>, Vec<String>) = sqlx::query_as(
+                "WITH s AS (INSERT INTO snapshots (project_id, id, author) SELECT $1, i, a FROM UNNEST($2::text[], $3::bigint[]) AS t(i, a) \
+                   ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0), \
+                 o AS (INSERT INTO origins (project_id, real_id, origin_id) SELECT $1, r, g FROM UNNEST($4::text[], $5::text[]) AS t(r, g) \
+                   ON CONFLICT DO NOTHING), \
+                 m AS (INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+                   SELECT $1, k, r, p, $6, c FROM UNNEST($7::text[], $8::text[], $9::text[], $10::bool[]) AS t(k, r, p, c) \
+                   ON CONFLICT DO NOTHING RETURNING view_key, real_id), \
+                 l AS (INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $6, $11, 'push', $12)), \
+                 n AS (SELECT pg_notify($13, $14) WHERE $15) \
+                 SELECT n.c, x.k, x.r FROM (SELECT count(*) AS c FROM n) n, \
+                   (SELECT COALESCE(array_agg(view_key), '{}') AS k, COALESCE(array_agg(real_id), '{}') AS r FROM m) x",
+            )
+            .bind(pid)
+            .bind(&snap_ids)
+            .bind(&snap_authors)
+            .bind(&origin_reals)
+            .bind(&origin_ids)
+            .bind(veil_core::now_millis())
+            .bind(&memo_keys)
+            .bind(&memo_reals)
+            .bind(&memo_projected)
+            .bind(&memo_collapsed)
+            .bind(person)
+            .bind(format!("moved {moved:?}"))
+            .bind(crate::caches::TIPS_CHANNEL)
+            .bind(pid.to_string())
+            .bind(notifies)
+            .fetch_one(&mut *c)
+            .await?;
+            let stored: HashSet<(&str, &str)> = stored_keys.iter().map(|k| k.as_str()).zip(stored_reals.iter().map(|r| r.as_str())).collect();
+            let memo_stored: Vec<bool> = memos.iter().map(|m| stored.contains(&(m.0.as_str(), m.1.as_str()))).collect();
             // New review rules, or a new access policy (an approval counts
             // while its reviewer may write the PR's paths: BUG-2111), wait
             // for every batch already re-reading them and are read by every
