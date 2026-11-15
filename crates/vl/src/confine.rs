@@ -419,7 +419,7 @@ pub const BUILT: bool = cfg!(target_os = "linux");
 
 /// What a `vl ws exec` is told where confinement isn't built (every system
 /// but Linux, `BUILT`): a confinement flag or a limit is refused; else the
-/// run is unconfined, and says so as `--unconfined` does (BUG-2450: on macOS
+/// run is unconfined, and says so as `--unconfined` does (BUG-2455: on macOS
 /// it ran unconfined without a word).
 fn unbuilt(a: &ConfineArgs) -> Result<&'static str> {
     let asked = !a.allow.is_empty() || a.no_network || a.private_ports || !a.seed.is_empty() || Limits::new(a, &BTreeMap::new())?.any();
@@ -2174,11 +2174,11 @@ mod net {
 mod tests {
     use super::*;
 
-    /// BUG-2450: where confinement isn't built, a run without confinement
+    /// BUG-2455: where confinement isn't built, a run without confinement
     /// flags is told it is unconfined (it ran without a word on macOS), and
     /// one asking for confinement or a limit is refused.
     #[test]
-    fn bug_2450_a_run_without_a_sandbox_says_it_is_unconfined() {
+    fn bug_2455_a_run_without_a_sandbox_says_it_is_unconfined() {
         let said = unbuilt(&ConfineArgs::default()).expect("a plain run goes ahead, unconfined");
         assert!(said.contains("no sandbox on this system") && said.contains("everything your user can"), "{said}");
         let asked = ConfineArgs { private_ports: true, ..ConfineArgs::default() };
