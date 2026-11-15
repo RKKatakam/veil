@@ -863,8 +863,28 @@ async fn resolve_for_mode(
     }
     // Committed history named by its own id (after the tips: a snapshot
     // they see whole under a change hidden from them at the tip, BUG-1525).
-    if committed(hub, project.id, id).await? {
+    // Asked with whether any view's projection is `id`, in one statement:
+    // a new snapshot (a push's) is neither, and nothing they can see is it.
+    let projected_somewhere = if hub.caches.committed(project.id, id) {
         return Ok(seen(*id).await?.then_some(*id));
+    } else {
+        let gce = hub.caches.gc_epoch(project.id);
+        let (stored, projected): (bool, bool) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2), \
+             EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND projected_id = $2)",
+        )
+        .bind(project.id)
+        .bind(id.hex())
+        .fetch_one(&hub.db)
+        .await?;
+        if stored {
+            hub.caches.put_committed_at(project.id, gce, id);
+            return Ok(seen(*id).await?.then_some(*id));
+        }
+        projected
+    };
+    if !projected_somewhere {
+        return Ok(None);
     }
     let key = project.view(viewer).key();
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
@@ -941,15 +961,7 @@ async fn resolve_for_mode(
             false => Err(crate::query::graph::warming()),
         };
     }
-    let has_projection: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM projections WHERE project_id = $1 AND projected_id = $2 LIMIT 1")
-            .bind(project.id)
-            .bind(id.hex())
-            .fetch_optional(&hub.db)
-            .await?;
-    if has_projection.is_none() {
-        return Ok(None);
-    }
+    // Some view's projection is `id` (asked above).
     let named = *id;
     let cid = blocking(hub, project.id, move |src| match src.snapshot(&named) {
         Ok(s) => Ok(Some(s.change_id.to_string())),
