@@ -2332,9 +2332,11 @@ pub struct LandOutcome {
 /// the local tag `onto` to where they landed when it was at `rev` or below.
 ///
 /// With `delete` (the branch `rev` was pushed to, `docs/HUB.md` §13.41),
-/// the server deletes that branch once it landed, if its work is all on
-/// `onto`; its tag here goes too when it is still at `rev`, so that the
-/// next push does not make it again.
+/// the server deletes that branch once it landed, when the server's branch
+/// is at `rev` (BUG-2448) and its work is all on `onto`; refused here first
+/// when this clone last saw the server's branch elsewhere (push it first).
+/// Its tag here goes too when it is still at `rev`, so that the next push
+/// does not make it again.
 pub fn land(repo: &mut Repo, remote: &str, client: &Client, rev: ObjectId, onto: &str, wait: bool, delete: Option<&str>) -> Result<LandOutcome> {
     if veil_core::remote::embargo_blocks(repo, &[rev])?.into_iter().flatten().next().is_some() {
         bail!("this change is under an embargo: it lands only at its release");
@@ -2342,6 +2344,13 @@ pub fn land(repo: &mut Repo, remote: &str, client: &Client, rev: ObjectId, onto:
     let revision = client.tips_of(&[])?.map_or(0, |t| t.revision);
     if delete.is_some() && revision < veil_core::hub::wire::NAMED_TIPS_REVISION {
         bail!("the server at {} is older than this vl and does not delete a branch it landed; land without --delete", client.url.authority);
+    }
+    // The server deletes the branch only at the snapshot landed (BUG-2448):
+    // a branch pushed at an earlier change would stay, after the landing.
+    if let Some(b) = delete {
+        if repo.view().remote_tags.get(&format!("{remote}/{b}")) != Some(&rev) {
+            bail!("'{b}' on the server is not at the change being landed: push {b} first, or land without --delete");
+        }
     }
     let (uploaded, receipts) = upload_new(repo, remote, client, &[rev], revision >= 2)?;
     let result = client.land(&veil_core::hub::land::LandRequest {

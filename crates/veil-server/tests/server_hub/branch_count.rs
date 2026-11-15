@@ -321,6 +321,35 @@ fn bug_2446_vl_land_delete_deletes_the_merged_branch_and_its_tag() {
     assert!(!branches.contains_key("w-sub") && branches.contains_key("w-top"), "{branches:?}");
 }
 
+/// BUG-2448 through `vl`: the server deletes a branch only at the change
+/// landed, so `vl land --delete` of a change the server's branch isn't at
+/// (committed after the last push) is refused before anything is sent, and
+/// the branch stays; once pushed, the same command deletes it.
+#[test]
+fn bug_2448_vl_land_delete_refuses_a_branch_the_server_has_elsewhere() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let dir = p.dev.dir("clone");
+    p.dev.clone_trusting(&hub.url(&p.name), &dir, &p.fp);
+    write_files(&dir, &[("src/top.rs", "top\n")]);
+    p.dev.ok(&dir, &["commit", "--no-advance", "-m", "top"]);
+    p.dev.ok(&dir, &["tag", "set", "w-top", "-r", "@-"]);
+    write_files(&dir, &[("src/sub.rs", "sub\n")]);
+    p.dev.ok(&dir, &["commit", "--no-advance", "-m", "sub"]);
+    p.dev.ok(&dir, &["tag", "set", "w-sub", "-r", "@-"]);
+    p.dev.ok(&dir, &["push", "-t", "w-top", "-t", "w-sub"]);
+    write_files(&dir, &[("src/sub2.rs", "sub2\n")]);
+    p.dev.ok(&dir, &["commit", "--no-advance", "-m", "sub 2"]);
+    p.dev.ok(&dir, &["tag", "set", "w-sub", "-r", "@-"]);
+    let refused = p.dev.fails(&dir, &["land", "w-sub", "--onto", "w-top", "--delete"]);
+    assert!(refused.contains("'w-sub' on the server is not at the change being landed: push w-sub first"), "{refused}");
+    let branches = hub.api().tips(Some(&p.dev.token()), &p.name).unwrap().branches;
+    assert!(branches.contains_key("w-sub"), "{branches:?}");
+    p.dev.ok(&dir, &["push", "-t", "w-sub"]);
+    let out = p.dev.ok(&dir, &["land", "w-sub", "--onto", "w-top", "--delete"]);
+    assert!(out.contains("Deleted the branch 'w-sub'"), "{out}");
+}
+
 /// Run `statements` (one or several) on the test server's database.
 fn sql(hub: &TestHub, statements: &str) {
     let h = hub.hub();
@@ -343,9 +372,10 @@ fn land_reply(api: &Api, token: &str, project: &str, req: &Value) -> Reply {
 /// branches and each asking to delete the other, never both delete, and the
 /// work is on a branch left; four pairs at once, six times, every deletion's
 /// transaction held open 0.5 s by a trigger. (Since BUG-2448 a deletion
-/// needs the deleted branch's tip to be the snapshot landed, which the other
-/// landing moves away from: neither passes. The lock itself is shown by
-/// `bug_2447_two_crossed_deletions_never_both_commit`.)
+/// needs the deleted branch's tip to be the snapshot landed; when both
+/// landings are fast-forwards both branches end at it, so only the lock
+/// keeps one of them, as `bug_2447_two_crossed_deletions_never_both_commit`
+/// shows directly.)
 #[test]
 fn bug_2447_two_crossed_landings_never_delete_both_branches() {
     let hub = own_hub();
