@@ -985,13 +985,20 @@ impl Agent<'_> {
 }
 
 /// The milliseconds a `429` or `503` answer asks the caller to wait before
-/// it sends the request again (`retry_after_ms`), with a few more so that
-/// the agents told so together do not come back together.
+/// it sends the request again (`retry_after_ms`; a second for `warming`,
+/// which says "try again in a few seconds" and which `vl` waits on too),
+/// with a few more so that the agents told so together do not come back
+/// together.
 fn wait_asked(r: &Reply) -> Option<u64> {
     if !matches!(r.status, 429 | 503) {
         return None;
     }
-    let ms = serde_json::from_slice::<serde_json::Value>(&r.body).ok()?["retry_after_ms"].as_u64()?;
+    let v = serde_json::from_slice::<serde_json::Value>(&r.body).ok()?;
+    let ms = match v["retry_after_ms"].as_u64() {
+        Some(ms) => ms,
+        None if v["code"] == "warming" => 1_000,
+        None => return None,
+    };
     Some(ms + u64::from(veil_core::crypto::random_bytes::<1>()[0]) % (ms / 8).max(1))
 }
 
@@ -2690,6 +2697,15 @@ mod tests {
             .expect("handed back");
         assert_eq!((r.status, waited), (503, 0));
         assert!(ok(&r, "land the branch").is_err(), "the caller counts it as an error");
+
+        // `warming` ("this history is being prepared for you; try again in
+        // a few seconds") carries no `retry_after_ms` and is waited out too.
+        let warming = || reply(503, json!({"code": "warming", "message": "this history is being prepared for you; try again in a few seconds"}));
+        let mut answers = vec![warming(), reply(200, json!({"state": "landed"}))].into_iter();
+        let mut waited = 0;
+        let r = asked_until_answered(Instant::now() + Duration::from_secs(10), || Ok(answers.next().expect("no more asks than answers")), || waited += 1)
+            .expect("answered once the history is ready");
+        assert_eq!((r.status, waited), (200, 1));
 
         // Told to come back each time: it stops at the deadline.
         let start = Instant::now();
