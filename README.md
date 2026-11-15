@@ -57,23 +57,158 @@ blame and search answered by the server in milliseconds.
 
 ## Measured
 
-Landings measured on 2026-11-14 (the code as published, `1e141f0b`), the
-comparison with Git on 2026-11-12, on one 32-core machine that also ran
-the load generator, PostgreSQL (with the deployment's settings) and the
-object store (a local directory). These are one-machine numbers: the load
-tool, the server and the database share 32 cores and 30 GB of memory,
-which runs short about 100 s into a 10,000-agent run (BUG-2363). The paid
-run across several machines will keep objects in MinIO for its speed
-gates (BUG-2290's decision). The full tables, commands and misses are in
+Two sets of numbers: a deployment across ten machines on Google Cloud
+(2026-11-14 and 15), and one 32-core machine running everything. Misses
+are listed with the passes. The kits in `deploy/` set up the deployment
+and run the benchmarks ([DEPLOY.md §12](docs/DEPLOY.md#12-google-cloud-deploygcp)
+for Google Cloud; both runs together cost about $13.50). The colocated
+YugabyteDB and PostgreSQL layouts below were switched by hand on the same
+machines; the kit doesn't do that yet.
+
+### Across machines (Google Cloud, 2026-11-14 and 15)
+
+**The deployment:**
+- 3 Veil servers (c2d-standard-16, Spot) behind one HAProxy balancer;
+- a 3-node YugabyteDB cluster (c2d-standard-8, on demand);
+- MinIO for the objects (c2d-standard-16 with a local NVMe SSD);
+- 2 load machines (n2d-standard-8);
+- one zone (us-central1-a), network disks (pd-balanced).
+
+The server build was `b6de7035` throughout; the realistic-agents benchmark
+was `135245b2`. No Spot machine was reclaimed, and MinIO never restarted.
+
+**Reads** (0 errors in every row):
+
+| | 10 | 100 | 1,000 |
+|---|---|---|---|
+| Pulls a second (agents) | 866 | **5,590** | 3,928 |
+| Fresh thin workspaces a second, from the servers (readers; 103 files each) | 499 | 740 | 766 |
+| The same through the regional cache | 870 | **1,364** | 1,341 |
+
+- The regional cache answered 99.96 to 100 % of reads itself, using 6 to 8 times less server CPU per read, at a peak of 103 MiB.
+- The API (history, diffs and the like) answered 354 to 361 requests a second.
+
+**Landing** (0 errors in every row):
+- **Across 100 projects:** 283 landings a second, pushed straight onto each project's `main`.
+- **Server count:** landings grow exactly with the number of servers: 93, 185 and **279 a second (3.0×)** on 1, 2 and 3 servers.
+- **The rest flattens:** pushes (88, 138, 153 a second) and pulls (300, 528, 514 a second) stop growing after two servers. The database is the limit there.
+
+**Failover: passed every check.** The first server was stopped in the
+middle of a landing load, and another server took over the landing queue.
+- 17,386 changes landed, each exactly once on `main`.
+- None was lost or landed twice.
+- No agent was told "landed" for a change that is not on `main`.
+
+**Agents on branches of their own, landing on one `main`** (each pushes
+flat out, with no thinking time, and lands its branch every 5th push). The
+same machines, with three database layouts:
+
+| Database | Pushes a second, 100 agents | 300 agents | 1,000 agents |
+|---|---|---|---|
+| YugabyteDB, 3 nodes, as deployed (5 min) | 118 | 6.7 merges on `main` a second, p99 39 s, 0 errors | 8.1 a second, 55 errors |
+| YugabyteDB, 3 nodes, **colocated** (3 min) | 137 | **15.6** a second, p99 9 s, 0 errors | **12.5** a second, 0 errors |
+| **PostgreSQL on one of those 8-core machines** (3 min) | **246** | **30.6** a second, p99 7.6 s | **25.2** a second |
+
+- **Errors:** the PostgreSQL runs' 123 and 301 errors were `warming` answers ("try again in a few seconds"). `vl` waits those out; the benchmark counted them as errors. That is fixed in `135245b2`.
+- **Caveats:** the layouts after the first ran for 3 minutes instead of 5, on fresh databases.
+- **At 3,000 agents,** the deployed layout did 5.7 merges a second with 7,597 errors.
+
+**Agents at a coding agent's pace.** Each agent:
+- thinks 2 minutes between steps on average;
+- pushes to its own branch;
+- forks 3 subagents on branches off its own, which push 3 times each and are merged into it;
+- lands its branch on `main` every 20 pushes.
+
+The thinking is compressed 20 times, so 1,000 agents put the load of about
+20,000 agents at the real pace on the servers.
+
+| Database | Agents (at the real pace) | Pushes a second | p50 / p99 (a push) | Errors |
+|---|---|---|---|---|
+| YugabyteDB, as deployed | 1,000 (about 20,000) | 79 | 6.4 s / 22 s | **0** |
+| YugabyteDB, colocated | 1,000 (about 20,000) | 71 | 7.4 s / 26 s | **0** |
+| PostgreSQL, one machine | 1,000 (about 20,000) | **102** | **3.5 s / 18 s** | **0** |
+| Each of the three | 3,000 (about 60,000) | 37 to 40 | about 11 s / 70 s | 4,700 to 5,100 |
+| PostgreSQL, one machine | 10,000 (about 200,000) | 40 | 33 s / 64 s | about 19,500 |
+
+- Every subagent's work reached `main`: each subagent merge carried its 3 pushes.
+- **At 3,000 agents and more, the servers are the limit, not the database.** All three layouts give the same numbers, and the servers used about 10 of their 16 cores.
+- **The cause is in Veil.** A subagent's merged branch can't be deleted by its agent, so branches pile up, and every push first asks for the branch tips, for which the server signs a grant per branch. Database statements per operation grew from 25 to 140 to 570. It is the next thing to fix.
+
+**Landing on one `main` past its capacity** (10,000 agents offering 1,000
+a second, as deployed):
+- **Done:** 85 to 106 a second for 3 minutes, 63 to 65 for 10.
+- **Refused:** almost all the rest was told "busy, come back".
+- **Conflicts:** 0.00 to 0.02 collisions a landing.
+
+This was the standard YugabyteDB layout, the bottleneck above; the
+one-machine table below has the same test on PostgreSQL at 995 a second.
+
+**A 1 GB project:**
+
+| Operation | Time |
+|---|---|
+| First push, all history | 169 s |
+| Push of one new snapshot | 0.33 s |
+| Thin clone | 23 s (0.43 GB on disk) |
+| Full clone | 51 s |
+| Clone of one folder | 0.65 s |
+| Pull of one new snapshot | 0.08 s |
+| `status` | 10 to 30 ms |
+| `log -n 20` | 0.16 s |
+
+**Miss:** during the full clone the server's memory peaked at 1,042 MiB,
+over the 1 GB gate.
+
+**`vl` beside Git on a cloud machine** (network disk, 1,000 and 10,000
+files of 4 KiB):
+- **Veil was faster** at importing a folder (110 vs 251 ms; 720 vs 2,233 ms), cloning 1,000 files (233 vs 334 ms), cloning one folder (64 vs 76 and 86 ms) and `status` among 10,000 files (7 vs 13 ms).
+- **Git was faster** at committing one file (7 vs 15 ms; 15 vs 18 ms), `log -n 20` (about 2 vs 7 ms) and cloning all 10,000 files (1.0 vs 2.1 s).
+
+**Per day, beside Anthropic's reported load.** Anthropic's post on Scion
+([Redesigning source control](https://www.anthropic.com/research/redesigning-source-control))
+reports the load Scion **carries**: over 30,000 merges a day as of
+September 2026, and about 25 million CI checkouts a day. These are
+Anthropic's daily usage, **not Scion's maximum capacity**, which the post
+does not give. The figures below are Veil's measured rates held for a day:
+
+| Veil, measured | A second | A day | Anthropic's reported load |
+|---|---|---|---|
+| Merges on one `main`, agents on branches, PostgreSQL (300 agents) | 30.6 | **2.6 million** | over 30,000 merges a day |
+| The same, colocated YugabyteDB (300 agents) | 15.6 | 1.3 million | |
+| The same, YugabyteDB as deployed (300 agents, 0 errors) | 6.7 | 580,000 | |
+| Landings on `main` at a coding agent's pace (1,000 agents, about 20,000 at the real pace, 0 errors) | 2.6 to 3.1 | 220,000 to 270,000 | |
+| Subagent merges into their agents' branches (same run) | 5.8 to 9.7 | 500,000 to 840,000 | (Scion has few branches) |
+| Landings across 100 projects | 283 | 24 million | |
+| Landings on one `main`, one machine, PostgreSQL | 995 | 86 million | |
+| Pulls (100 agents) | 5,590 | 480 million | about 25 million CI checkouts a day |
+
+**These figures don't say Veil out-scales Scion:**
+- **Usage against capacity:** Anthropic's numbers are what Scion carries, not its ceiling.
+- **Repository size:** Veil's runs used small synthetic projects. Anthropic's monorepo has almost 100 GB of history and a working copy over 25 GB.
+- **Kind of work:** a Veil pull fetches a few objects, where a CI checkout is a whole workspace, and real merges are larger than the benchmark's changes.
+- **Holding the rate:** each rate was held for 3 to 10 minutes, not a day.
+
+What they show: on modest machines, Veil's design handles the merge rate
+that one of the busiest agent-driven repositories reported, with room to
+spare.
+
+**What the cloud runs did not show:** a project far bigger than 1 GB, more
+than one zone or region, and the 10-minute landing mix.
+
+The first multi-machine attempt, on DigitalOcean on 2026-11-14, gave no
+speed result. Its 4-vCPU storage droplet's MinIO restarted every 72
+seconds ([DEPLOY.md §9.0](docs/DEPLOY.md#90-first-run-on-digitalocean-2026-11-14-four-vcpu-machines-limited-by-its-storage-droplet)).
+
+### On one machine
+
+Landings measured on 2026-11-14 (`1e141f0b`), the comparison with Git on
+2026-11-12. One 32-core machine also ran the load generator, PostgreSQL
+(with the deployment's settings) and the object store (a local directory).
+The load tool, the server and the database share 32 cores and 30 GB of
+memory, which runs short about 100 s into a 10,000-agent run (BUG-2363).
+The full tables, commands and misses are in
 [LOAD.md](docs/design/scale/LOAD.md) (landings) and
 [OPENSCION.md](docs/design/scale/OPENSCION.md) (beside Git).
-
-**Across machines: no numbers yet.** A first multi-machine run on
-DigitalOcean (2026-11-14) was attempted on 4-vCPU machines, the largest
-the account allowed. It was limited by its storage droplet, a shared-CPU
-machine whose MinIO also restarted every 72 seconds, so it gives no speed
-result; what it showed, and what the next run needs, is in
-[DEPLOY.md §9.0](docs/DEPLOY.md#90-first-run-on-digitalocean-2026-11-14-four-vcpu-machines-limited-by-its-storage-droplet).
 
 **Landing changes on one `main`** (10,000 agents offering 1,000 a second,
 three minutes unless noted; the target is 1,000 a second held, p99 under
@@ -126,6 +261,70 @@ first time and 25 ms (p99) after; listing, searching, opening and updating
 among 100,000 pull requests take 6 to 22 ms (median); a workspace of
 200,000 files starts in under 300 ms.
 
+**Against OpenScion's targets.** Veil's speed gates are the four workloads
+published by OpenScion, an independent open implementation of the Scion
+design ([OVERVIEW.md](docs/OVERVIEW.md)). OpenScion measures in one
+process, in memory: no disk, no `fsync`, no process start.
+
+Measured the same way (`veil-bench openscion-memory`), Veil meets three of
+the four targets:
+
+| Workload | 1,000 files: target, Veil | 10,000 files: target, Veil |
+|---|---|---|
+| Import a folder | 22 ms, **8.8 ms** | 245 ms, **86 ms** |
+| Clone everything | 51 ms, **32 ms** | 544 ms, **303 ms** |
+| Commit one file | 2.5 ms, **0.9 ms** | 22 ms, **7.4 ms** |
+
+The fourth, cloning one folder, fetches from a server and has no in-memory
+form. As real `vl` commands on a real disk through a server, most of the
+targets are missed. That is why each gate also compares Veil with Git on
+the same machine (the tables above).
+
+## Design trade-offs
+
+Veil gives up some things on purpose. What each choice costs, and what it
+buys:
+
+**Always connected, no offline mode.**
+- *Costs:* nothing shared works without the server.
+- *Buys:* the server enforces every permission in every answer, does merges, history, blame and search for thin clients, and lands changes without anyone pulling or retrying.
+
+**Durable commits.**
+- *Costs:* Veil's commit `fsync`s its objects and its operation; Git's commit by default does not. That is most of why Git commits one file faster (about 8 against 9 to 15 ms).
+- *Buys:* a commit that has returned survives a crash. Veil won't trade that for speed.
+
+**Conflicts are checked before a change lands.**
+- *Costs:* some database work on every landing.
+- *Buys:* `main` never holds a conflict. A change that conflicts goes back to its agent, as data to resolve, never as markers in the tree. Scion lands first and has Claude fix conflicts afterwards.
+- *Tests still run after landing:* `main@tested` and automatic bisect-and-revert follow the same land-first, test-after idea.
+- *Measured:* at agent scale conflicts were rare (0.00 to 0.02 collisions a landing), and the check was not the bottleneck.
+
+**Many branches.**
+- *Costs:* more rows written per push.
+- *Buys:* every agent and subagent has its own branch, which is how agents work. Scion discourages branches other than `main` and releases.
+- *Open:* the growing cost of the branch-tips answer is the limit the realistic-agents run found. Making it independent of the number of branches is the next fix.
+
+**Permissions on every answer.**
+- *Costs:* a permission lookup in each request (cached).
+- *Buys:* nobody receives a file, a log line, a search hit or a diff from a folder they can't see.
+
+**Metadata in a database, contents in object storage.**
+- *What goes where:* PostgreSQL or YugabyteDB hold branches, the history graph, indexes, permissions, the landing queue and pull requests. File contents go to S3-compatible storage, in packs, with a background cleanup.
+- *Buys:* the database stays a small fraction of the repository's size.
+- *Costs:* packs need a pack list and cleanup, where storing every file version as its own object (as Scion does) would need neither but means many more objects.
+
+**PostgreSQL or YugabyteDB.**
+- *PostgreSQL:* one machine was 2 to 4 times faster than three YugabyteDB nodes in the runs above. It is the right choice for most teams, with a standby copy.
+- *YugabyteDB:* keeps working when a machine or a zone fails, and grows past one machine's writes. It needs the colocated layout, which more than doubled its merge rate.
+
+**Only secrets are encrypted.**
+- *Costs:* the server can read the code, as GitHub can.
+- *Buys:* the server can merge, index, search and blame it. Secret files (`.env`, keys) are encrypted on the client and follow the same permissions.
+
+**One `main` row per project.**
+- *Costs:* moving `main` is one compare-and-swap on one database row, done one at a time, as in Scion. No database removes that limit.
+- *Buys:* Veil's landing service batches many changes into each move. Pushing straight onto one `main` without it fell to 8 a second with 50 agents racing; the landing service holds 995 a second on one machine.
+
 ## Where it stands
 
 Veil is pre-release. Every planned feature is built; the work left is speed
@@ -139,16 +338,16 @@ and a run across several machines.
 | Landing at agent scale, CI, pull requests, embargoes, web client | Built; landing holds about 1,000 a second for three minutes, not yet ten with overlapping changes |
 | Review of the whole code base (eight passes) | Done: about 75 bugs found, all but a handful fixed |
 | Benchmarks on the final code | Run on 2026-11-12: 10 misses filed (BUG-1940 to BUG-1949); 5 fixed so far, the rest in progress |
-| A run across several machines | Next |
+| A run across several machines | Done on Google Cloud, 2026-11-14 and 15 (above). Next: the branch-tips cost, letting agents delete merged branches, the colocated YugabyteDB layout by default |
 
 The correctness suite is green: about 800 server tests, each run on
 PostgreSQL and on YugabyteDB, and about 2,300 client and engine tests. Every
 bug found is in [docs/BUGS.md](docs/BUGS.md) with the test that reproduces
 it, the open ones included.
 
-Not proven yet: scale across several machines (the numbers above are from
-one), the gates that have no benchmark yet (bisect over 10,000 candidates,
-server failover, workspaces of a million files), and the sandbox on macOS,
+Not proven yet: projects far bigger than 1 GB, more than one zone or region,
+the gates that have no benchmark yet (bisect over 10,000 candidates,
+workspaces of a million files), and the sandbox on macOS,
 where commands run unconfined for now. By design there is no offline mode:
 `vl` commits, splits, squashes and undoes locally, and everything shared
 goes through the server.
