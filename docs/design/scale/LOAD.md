@@ -2454,6 +2454,26 @@ tell a rise from noise; 100 and 1,000 agents were not run again. Pushes
 a second were higher after in all six (915.0 to 937.5 against 830.3 to
 891.1 at 300 agents).
 
+**The 1 GB profile's server memory gate** (`scripts/bench-server.sh 1g`,
+the full clone's server peak, gate under 1,024 MiB). Over every run on
+this machine: `30815e26` 1,011, 1,024 and 1,012 MiB (all pass); the
+branch-tips merge `9d37eeab` 1,017 (pass); this branch 1,032, 1,027,
+1,031 and 1,015 (one pass in four). The server's allocator was sampled
+every 250 ms through one run of each (jemalloc `stats.allocated`,
+`active`, `resident`, and `VmRSS`; a measuring-only build, not
+committed). At the full clone's peak, live memory is the same on both,
+782 and 784 MiB allocated, 927 and 926 MiB active; what differs is
+resident pages not in use, which jemalloc has not given back yet
+(resident 1,002 and 1,009 MiB, its `dirty_decay_ms` is 1,000). Nearly
+all of it is held from the initial push on (682 and 686 MiB allocated
+before the clone starts). The guess that the push's big statements (one
+statement for 10,000 snapshots' rows) leave grown connection buffers
+behind was tried directly: with at most 1,000 rows a statement the
+clone's peak was 1,048 MiB (allocated 786, active 938, resident 1,054),
+no lower. So the gate's margin is about the allocator's timing, not
+this branch's live memory: the full clone sits at the gate on every
+build (the cloud run saw 1,042 MiB there). Chunking was not kept.
+
 Commits stay 1.00 a push of its own (3.1 to 3.3 in all: the upload's and
 the push's own pack's staged rows, the deriver's). What bounds the rate
 here is the tips request each operation makes (13.7 ms at 300 agents,
