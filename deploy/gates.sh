@@ -51,6 +51,16 @@ GATES_DIR=${GATES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 # agent count, AGENTS_DURATION seconds each: about 10 minutes for the two.
 : "${AGENTS_COUNTS:=1000 10000}" "${AGENTS_DURATION:=180}" "${AGENTS_THINK:=120}" "${AGENTS_TIME_SCALE:=20}"
 : "${AGENTS_SUBAGENTS:=3}" "${AGENTS_LAND_EVERY:=20}"
+# onerepo: one busy repository. ONEREPO_AGENTS agents (one run per count,
+# ONEREPO_DURATION seconds each), each pushing to a branch of its own in
+# one project as fast as it is answered, from one driver (the agents of one
+# project sign in as one person, so one tool drives them all). Reported by
+# deploy/onerepo-table.py against ONEREPO_TARGET pushes a second, the figure
+# of GitHub's internal test (7,200 pushes a second, 5,000 agents on one
+# repository): pushes a second, database statements and commits per push,
+# the servers' and the database's CPU per push (their docker stats samples
+# inside the measured window) and what the target would need at those costs.
+: "${ONEREPO_AGENTS:=1000 5000}" "${ONEREPO_DURATION:=120}" "${ONEREPO_TARGET:=7200}"
 # scaling: the same three curves with 1, 2 and 3 servers running, driven
 # from every driver at once (the numbers are summed).
 : "${SCALING_SERVERS:=1 2 3}" "${SCALING_DURATION:=60}"
@@ -68,14 +78,15 @@ GATES_DIR=${GATES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 # setup's bursts, the merges and the deriver. 100 agents, 5 minutes.
 : "${SPACES_AGENTS:=100}" "${SPACES_RATE:=20}" "${SPACES_DURATION:=300}"
 
-GATES_ALL="pull land branches api landing agents scaling failover objects openscion scale spaces"
+GATES_ALL="pull land branches onerepo api landing agents scaling failover objects openscion scale spaces"
 # The settings recorded beside every result (run.txt).
 GATE_SETTINGS="DURATION WARMUP PULL_CLIENTS PULL_BACKGROUND LAND_PROJECTS LAND_CLIENTS BRANCH_CLIENTS OBJECT_CLIENTS
  OPENSCION_FILES OPENSCION_RUNS SCALE_PROFILE SCALE_RUNS LANDING_AGENTS LANDING_PEOPLE LANDING_RATE LANDING_DURATIONS
  LANDING_VARIANTS HEADLINE_AGENTS MERGE_EVERY HEADLINE_RATE HEADLINE_DURATION SCALING_SERVERS SCALING_DURATION
  SCALING_PULL_CLIENTS SCALING_BRANCH_CLIENTS SCALING_LANDING_PROJECTS SCALING_LANDING_CLIENTS FAILOVER_AGENTS
  FAILOVER_PEOPLE FAILOVER_RATE FAILOVER_DURATION FAILOVER_AFTER FAILOVER_HOW FAILOVER_SETTLE SPACES_AGENTS SPACES_RATE
- SPACES_DURATION AGENTS_COUNTS AGENTS_DURATION AGENTS_THINK AGENTS_TIME_SCALE AGENTS_SUBAGENTS AGENTS_LAND_EVERY"
+ SPACES_DURATION AGENTS_COUNTS AGENTS_DURATION AGENTS_THINK AGENTS_TIME_SCALE AGENTS_SUBAGENTS AGENTS_LAND_EVERY
+ ONEREPO_AGENTS ONEREPO_DURATION ONEREPO_TARGET"
 
 db_one() { db_sql | head -1; }
 db_now_us() { echo "select (extract(epoch from clock_timestamp()) * 1000000)::bigint" | db_one; }
@@ -98,6 +109,11 @@ run_gate() {
             bench driver pull "${load[@]}" --duration "$DURATION" --mode pull --projects 1 --clients "$PULL_CLIENTS" --background "$PULL_BACKGROUND" --dir /work/pull --out "$R/pull.json" "$@" || rc=1 ;;
         land)
             bench driver land "${load[@]}" --duration "$DURATION" --mode land --projects "$LAND_PROJECTS" --clients "$LAND_CLIENTS" --rates max --dir /work/land --out "$R/land.json" "$@" || rc=1 ;;
+        onerepo)
+            local n
+            for n in $ONEREPO_AGENTS; do
+                bench driver "onerepo-$n" "${load[@]}" --duration "$ONEREPO_DURATION" --mode branches --projects 1 --clients "$n" --rates max --dir /work/onerepo --out "$R/onerepo-$n.json" "$@" || rc=1
+            done ;;
         api)
             bench driver api "${load[@]}" --duration "$DURATION" --mode api --projects "$LAND_PROJECTS" --clients "$LAND_CLIENTS" --rates max --dir /work/api --out "$R/api.json" "$@" || rc=1 ;;
         branches)
@@ -239,6 +255,7 @@ gate_meta() {
 gate_report() { # GATE, results directory
     case $1 in
         scaling) python3 "$GATES_DIR/scaling-table.py" "$2" > "$2/scaling.md" && cat "$2/scaling.md" ;;
+        onerepo) python3 "$GATES_DIR/onerepo-table.py" --target "$ONEREPO_TARGET" --servers "$SERVERS" --server-vcpus "${SERVER_VCPUS:-0}" "$2" > "$2/onerepo.md" && cat "$2/onerepo.md" ;;
         failover) python3 "$GATES_DIR/checks/failover-verdict.py" "$2" | tee "$2/failover-verdict.md"; return "${PIPESTATUS[0]}" ;;
         spaces) python3 "$GATES_DIR/checks/spaces-verdict.py" "$2" | tee "$2/spaces-verdict.md"; return "${PIPESTATUS[0]}" ;;
     esac

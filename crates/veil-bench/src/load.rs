@@ -316,23 +316,52 @@ impl Api {
         self.post(token, path, &serde_json::to_vec(v)?, true)
     }
 
-    /// Sign in as `id`, registering `name`; the session token.
+    /// Sign in as `id`, registering `name`; the session token. A login told
+    /// to come back later starts again from a new challenge (BUG-2435: a
+    /// challenge is single-use, so the same login is never sent twice).
     fn login(&self, id: &Identity, name: &str) -> Result<String> {
-        let ch = self.post_json(None, "/v1/auth/challenge", &json!({"key": id.verifying_hex()}))?;
-        ok(&ch, "challenge")?;
-        let ch: serde_json::Value = serde_json::from_slice(&ch.body)?;
-        let challenge = ch["challenge"].as_str().ok_or_else(|| anyhow!("no challenge"))?.to_string();
-        let sig = id.sign(veil_core::crypto::domains::SIG_CONTEXT_HUB_LOGIN, &veil_core::hub::wire::login_message(&self.authority, &challenge));
-        let r = self.post_json(
-            None,
-            "/v1/auth/login",
-            &json!({"key": id.verifying_hex(), "challenge": challenge, "hub": self.authority,
-                "signature": sig, "identity": id.public_id(), "name": name}),
-        )?;
-        ok(&r, "login")?;
-        let s: serde_json::Value = serde_json::from_slice(&r.body)?;
-        Ok(s["token"].as_str().ok_or_else(|| anyhow!("no token"))?.to_string())
+        let deadline = Instant::now() + SETUP_DEADLINE;
+        loop {
+            let ch = setup("challenge", deadline, || self.post_json(None, "/v1/auth/challenge", &json!({"key": id.verifying_hex()})))?;
+            let ch: serde_json::Value = serde_json::from_slice(&ch.body)?;
+            let challenge = ch["challenge"].as_str().ok_or_else(|| anyhow!("no challenge"))?.to_string();
+            let sig = id.sign(veil_core::crypto::domains::SIG_CONTEXT_HUB_LOGIN, &veil_core::hub::wire::login_message(&self.authority, &challenge));
+            let r = self.post_json(
+                None,
+                "/v1/auth/login",
+                &json!({"key": id.verifying_hex(), "challenge": challenge, "hub": self.authority,
+                    "signature": sig, "identity": id.public_id(), "name": name}),
+            )?;
+            if let Some(ms) = wait_asked(&r) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if !left.is_zero() {
+                    std::thread::sleep(Duration::from_millis(ms).min(left));
+                    continue;
+                }
+            }
+            ok(&r, "login")?;
+            let s: serde_json::Value = serde_json::from_slice(&r.body)?;
+            return Ok(s["token"].as_str().ok_or_else(|| anyhow!("no token"))?.to_string());
+        }
     }
+}
+
+/// How long a set-up request (a sign-in, a project, its group and members,
+/// its first snapshot) is asked again while the server answers "come back
+/// later" (BUG-2435).
+const SETUP_DEADLINE: Duration = Duration::from_secs(300);
+
+/// A set-up request: an answer asking the caller to come back later (`503
+/// busy` with `retry_after_ms`, `warming`, a `429`: [`wait_asked`]) is
+/// waited out and the request sent again until `deadline`, as `vl` does;
+/// then any answer but `200` fails the set-up (BUG-2435: on Google Cloud
+/// one driver of the 2-server scaling run lost its run to "first push:
+/// HTTP 503 busy"). Every set-up request is safe to send again: a `busy`
+/// answer is given only for work that did not commit.
+fn setup(what: &str, deadline: Instant, send: impl FnMut() -> Result<Reply>) -> Result<Reply> {
+    let r = asked_until_answered(deadline, send, || {}).with_context(|| what.to_string())?;
+    ok(&r, what)?;
+    Ok(r)
 }
 
 fn ok(r: &Reply, what: &str) -> Result<()> {
@@ -1019,6 +1048,11 @@ fn asked_until_answered(deadline: Instant, mut send: impl FnMut() -> Result<Repl
     }
 }
 
+/// Milliseconds since the Unix epoch.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
 /// Capped, jittered backoff after a busy server.
 fn backoff(attempt: u32) {
     let cap = 5u64 << attempt.min(6);
@@ -1265,12 +1299,14 @@ fn unique(prefix: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, more: &[(String, String)], seed: usize, protected: bool, mix: bool) -> Result<String> {
     let name = unique("load-");
-    ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}"), &json!({}))?, "create project")?;
-    ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}/groups/agents"), &json!({}))?, "create group")?;
-    ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}/groups/agents/members"), &json!({"people": [agent]}))?, "add agent")?;
+    let deadline = Instant::now() + SETUP_DEADLINE;
+    let post = |path: String, what: &str, body: serde_json::Value| setup(what, deadline, || api.post_json(Some(admin_token), &path, &body));
+    post(format!("/v1/projects/{name}"), "create project", json!({}))?;
+    post(format!("/v1/projects/{name}/groups/agents"), "create group", json!({}))?;
+    post(format!("/v1/projects/{name}/groups/agents/members"), "add agent", json!({"people": [agent]}))?;
     for chunk in more.chunks(50) {
         let names: Vec<&str> = chunk.iter().map(|(n, _)| n.as_str()).collect();
-        ok(&api.post_json(Some(admin_token), &format!("/v1/projects/{name}/groups/agents/members"), &json!({"people": names}))?, "add agents")?;
+        post(format!("/v1/projects/{name}/groups/agents/members"), "add agents", json!({"people": names}))?;
     }
     let mut objects = Vec::new();
     let mut put = |o: Object| {
@@ -1349,8 +1385,7 @@ fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, m
     for (id, raw) in &objects {
         put_frame(&mut frames, id, raw);
     }
-    let up = api.post(Some(admin_token), &format!("/v1/projects/{name}/objects"), &frames, false)?;
-    ok(&up, "upload")?;
+    let up = setup("upload", deadline, || api.post(Some(admin_token), &format!("/v1/projects/{name}/objects"), &frames, false))?;
     let up: serde_json::Value = serde_json::from_slice(&up.body)?;
     let receipts = objects
         .iter()
@@ -1367,8 +1402,7 @@ fn create_project(api: &Api, admin: &Identity, admin_token: &str, agent: &str, m
         receipts,
         ..Default::default()
     };
-    let r = api.post_json(Some(admin_token), &format!("/v1/projects/{name}/push"), &req)?;
-    ok(&r, "first push")?;
+    let r = setup("first push", deadline, || api.post_json(Some(admin_token), &format!("/v1/projects/{name}/push"), &req))?;
     let res: PushResult = serde_json::from_slice(&r.body)?;
     if !res.results.first().is_some_and(|b| b.ok) {
         bail!("first push refused: {}", String::from_utf8_lossy(&r.body));
@@ -1680,6 +1714,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         let (flood_ops0, flood_errors0) = (fl.ops.load(Ordering::Relaxed), fl.errors.load(Ordering::Relaxed));
         c.measuring.store(true, Ordering::Relaxed);
         let t0 = Instant::now();
+        let window_start = unix_ms();
         // The offered rate over the window: the step `at` falls in.
         let rate_at = |at: Instant| -> f64 {
             if !stepped {
@@ -1722,6 +1757,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         });
         schedule(t0 + duration, next, &rate_at);
         let elapsed = t0.elapsed().as_secs_f64();
+        let window_end = unix_ms();
         c.measuring.store(false, Ordering::Relaxed);
         series_stop.store(true, Ordering::Relaxed);
         let series = series.map(|h| h.join().unwrap_or_default());
@@ -1738,7 +1774,11 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         let (sent, received) = (BYTES_SENT.load(Ordering::Relaxed) - sent0, BYTES_RECEIVED.load(Ordering::Relaxed) - received0);
         let server_stats = cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f)).zip(before_server_stats);
         let stat = |k: &str| server_stats.as_ref().and_then(|(b, a)| Some(b[k].as_f64()? - a[k].as_f64()?));
-        let dml = cx.stats.and_then(|(rt, url)| db_writes(rt, url)).zip(before_dml).map(|((_, bw), (_, aw))| bw - aw);
+        let dml_both = cx.stats.and_then(|(rt, url)| db_writes(rt, url)).zip(before_dml);
+        let dml = dml_both.map(|((_, bw), (_, aw))| bw - aw);
+        // Explicit `COMMIT`s, counted on YugabyteDB too (it has no
+        // transaction ids to count commits by): of the node this tool asks.
+        let commit_stmts = dml_both.map(|((bc, _), (ac, _))| bc - ac);
         let commit_kinds = server_stats.as_ref().and_then(|(b, a)| CommitKinds::between(a, b));
         let requests = c.requests.load(Ordering::Relaxed) - req0;
         let cache_stats = cache.and_then(|k| self::server_stats(k.pid(), &k.dir.join("stats.json"))).zip(before_cache);
@@ -1811,6 +1851,11 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "background_landings": bg.ops.load(Ordering::Relaxed),
             "background_errors": bg.errors.load(Ordering::Relaxed),
         });
+        // The measured window's wall-clock edges, to line up samples taken
+        // elsewhere (the servers' and the database's CPU: deploy/gates.sh `onerepo`).
+        result["window_start_unix_ms"] = json!(window_start);
+        result["window_end_unix_ms"] = json!(window_end);
+        result["db_commit_statements_per_op"] = json!(commit_stmts.map(per_op));
         result["series"] = json!(series);
         result["steps"] = json!(if stepped { a.steps.clone() } else { Vec::new() });
         result["slowed"] = json!(c.slowed.load(Ordering::Relaxed));
@@ -2662,6 +2707,105 @@ mod tests {
         let t = Instant::now();
         assert!(!sleep_until(Instant::now() + Duration::from_secs(60), &stop));
         assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Every request a fake server got: its path and body, in order.
+    type Seen = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// A fake server on a local port (plain HTTP): `answer(path, body, nth)`
+    /// gives the status and JSON of the `nth` request (from 1) to `path`;
+    /// every request's path and body are kept, in order.
+    fn fake_server(answer: impl Fn(&str, &str, usize) -> (u16, serde_json::Value) + Send + Sync + 'static) -> (String, Seen) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let (answer, log) = (Arc::new(answer), seen.clone());
+        std::thread::spawn(move || {
+            for conn in l.incoming() {
+                let Ok(conn) = conn else { return };
+                let (answer, log) = (answer.clone(), log.clone());
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(conn.try_clone().unwrap());
+                    let mut w = conn;
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let mut len = 0;
+                        loop {
+                            let mut h = String::new();
+                            r.read_line(&mut h).unwrap();
+                            if h.trim().is_empty() {
+                                break;
+                            }
+                            if let Some((k, v)) = h.split_once(':') {
+                                if k.eq_ignore_ascii_case("content-length") {
+                                    len = v.trim().parse().unwrap();
+                                }
+                            }
+                        }
+                        let mut body = vec![0; len];
+                        r.read_exact(&mut body).unwrap();
+                        let body = String::from_utf8_lossy(&body).into_owned();
+                        let nth = {
+                            let mut log = log.lock().unwrap();
+                            log.push((path.clone(), body.clone()));
+                            log.iter().filter(|(p, _)| *p == path).count()
+                        };
+                        let (status, v) = answer(&path, &body, nth);
+                        let v = v.to_string();
+                        write!(w, "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{v}", v.len()).unwrap();
+                    }
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    /// BUG-2435: the set-up waits out a `503 busy` answer (with
+    /// `retry_after_ms`, as the server sends it) and asks again, for the
+    /// first push and for a sign-in (which starts again from a new
+    /// challenge); on Google Cloud one driver of the 2-server scaling run
+    /// lost its run to "first push: HTTP 503 busy". An answer that does not
+    /// ask to come back later still fails the set-up.
+    #[test]
+    fn bug_2435_the_set_up_waits_out_a_busy_answer() {
+        let busy = || (503, json!({"code": "busy", "message": "the database is busy; try again", "retry_after_ms": 5}));
+        let (base, seen) = fake_server(move |path, _, nth| match path {
+            "/v1/auth/challenge" => (200, json!({"challenge": format!("c{nth}")})),
+            "/v1/auth/login" if nth == 1 => busy(),
+            "/v1/auth/login" => (200, json!({"token": "t"})),
+            p if p.ends_with("/objects") => (200, json!({"receipts": vec!["r"; 16]})),
+            p if p.ends_with("/push") && nth <= 2 => busy(),
+            p if p.ends_with("/push") => (200, json!({"results": [{"branch": "main", "ok": true}]})),
+            _ => (200, json!({})),
+        });
+        let api = Api::new(&base, None).unwrap();
+        let admin = Identity::generate("load-admin");
+        let token = api.login(&admin, "admin-x").expect("the sign-in waits out the busy answer");
+        assert_eq!(token, "t");
+        let name = create_project(&api, &admin, &token, "agent-x", &[], 0, false, false).expect("the set-up waits out the busy first push");
+        let seen = seen.lock().unwrap();
+        let count = |end: &str| seen.iter().filter(|(p, _)| p.ends_with(end)).count();
+        assert_eq!((count("/challenge"), count("/login"), count("/push")), (2, 2, 3), "{seen:?}");
+        let logins: Vec<&String> = seen.iter().filter(|(p, _)| p == "/v1/auth/login").map(|(_, b)| b).collect();
+        assert!(logins[0].contains("\"c1\"") && logins[1].contains("\"c2\""), "each login carries a challenge of its own: {logins:?}");
+        assert!(seen.iter().any(|(p, _)| *p == format!("/v1/projects/{name}/push")));
+        drop(seen);
+
+        // A refusal that does not ask to come back later fails the set-up at once.
+        let (base, seen) = fake_server(|path, _, _| match path {
+            p if p.ends_with("/objects") => (200, json!({"receipts": vec!["r"; 16]})),
+            p if p.ends_with("/push") => (503, json!({"code": "unavailable", "message": "no"})),
+            _ => (200, json!({})),
+        });
+        let api = Api::new(&base, None).unwrap();
+        let Err(e) = create_project(&api, &admin, "t", "agent-x", &[], 0, false, false) else { panic!("a refused first push made a project") };
+        assert!(format!("{e:#}").contains("first push: HTTP 503"), "{e:#}");
+        assert_eq!(seen.lock().unwrap().iter().filter(|(p, _)| p.ends_with("/push")).count(), 1);
     }
 
     fn reply(status: u16, body: serde_json::Value) -> Reply {

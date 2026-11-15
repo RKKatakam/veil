@@ -72,14 +72,23 @@ while read -r role name size; do
 done < <(droplets)
 
 echo "== 4. database"
+# Each database machine's data: on its own persistent data disk when the
+# kit gives it one (Google Cloud, DB_DISK_GB; docs/DEPLOY.md §12.10),
+# else in a Docker volume on the machine's disk.
+if [ "${DB_DISK_GB:-0}" -gt 0 ]; then PG_DATA=/mnt/db-data/pg; YB_DATA=/mnt/db-data/yb; else PG_DATA=pgdata; YB_DATA=yb-data; fi
+db_disk() { # host: mount the data disk and make the data directory
+    [ "${DB_DISK_GB:-0}" -gt 0 ] || return 0
+    remote "$1" "$(db_disk_mount /mnt/db-data) && mkdir -p /mnt/db-data/pg /mnt/db-data/yb && echo \"   data disk: \$(df -h --output=size,avail /mnt/db-data | tail -1)\""
+}
 if [ "$YB_NODES" -gt 0 ]; then
     YB1=$(addr "$NAME-yb1")
     # YugabyteDB, one yugabyted per node, the first the seed (docs/HUB.md
     # §13.1: the Apache-2.0 core image). With three nodes yugabyted keeps
-    # three copies of every tablet. One tablet per table on each node
-    # (`ysql_num_shards_per_tserver=1`): a hash-sharded table has three,
-    # one led by each node; Veil's tables are many and mostly small
-    # (docs/DEPLOY.md §2, "YugabyteDB").
+    # three copies of every tablet. Veil's database `veil` is made below in
+    # YB_LAYOUT: colocated (every table in one tablet, the default), or
+    # hash-sharded with YB_TABLETS tablets per table on each node
+    # (`ysql_num_shards_per_tserver`; 1: a table has three, one led by each
+    # node; docs/DEPLOY.md §12.10).
     FIRST=$(paddr "$NAME-yb1")
     for i in $(seq "$YB_NODES"); do
         n=$NAME-yb$i; ip=$(addr "$n"); priv=$(paddr "$n")
@@ -89,7 +98,8 @@ if [ "$YB_NODES" -gt 0 ]; then
         # machine NAME.ZONE.c.PROJECT.internal. The machine's short name, kept
         # in /etc/hosts, works on every cloud.
         remote "$ip" "hostnamectl set-hostname $n && { grep -q ' $n\$' /etc/hosts || echo '$priv $n' >> /etc/hosts; }"
-        remote "$ip" "docker rm -f yb >/dev/null 2>&1; docker run -d --name yb --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v yb-data:/root/var $YB_IMAGE bin/yugabyted start --background=false --advertise_address=$priv $join --tserver_flags=yb_enable_read_committed_isolation=true,ysql_num_shards_per_tserver=1 --master_flags=enforce_tablet_replica_limits=false"
+        db_disk "$ip"
+        remote "$ip" "docker rm -f yb >/dev/null 2>&1; docker run -d --name yb --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v $YB_DATA:/root/var $YB_IMAGE bin/yugabyted start --background=false --advertise_address=$priv $join --tserver_flags=yb_enable_read_committed_isolation=true,ysql_num_shards_per_tserver=$YB_TABLETS --master_flags=enforce_tablet_replica_limits=false"
         remote "$ip" 'for i in $(seq 120); do docker exec yb bin/ysqlsh -h '"$priv"' -tAc "select 1" >/dev/null 2>&1 && { echo "   yb'"$i"' answers"; exit 0; }; sleep 2; done; echo "configure: yb'"$i"' did not answer in 4 minutes (docker logs yb on it)" >&2; exit 1'
     done
     remote "$YB1" 'for i in $(seq 60); do n=$(docker exec yb bin/ysqlsh -h '"$FIRST"' -tAc "select count(*) from yb_servers()" 2>/dev/null); [ "$n" = '"$YB_NODES"' ] && break; sleep 2; done; echo "   YugabyteDB nodes in the cluster: $n (expected '"$YB_NODES"')"; [ "$n" = '"$YB_NODES"' ]'
@@ -104,6 +114,12 @@ if [ "$YB_NODES" -gt 0 ]; then
         n=$NAME-yb$i
         remote "$(addr "$n")" "docker exec yb bin/yb-ts-cli --server_address=$(paddr "$n"):7100 set_flag --force enforce_tablet_replica_limits false && docker exec yb bin/yb-ts-cli --server_address=$(paddr "$n"):7100 set_flag --force tablet_replicas_per_gib_limit 100000"
     done
+    # Veil's database in the chosen layout, made once: a configure.sh run
+    # again finds it, and refuses one made in the other layout (a database's
+    # colocation is fixed when it is made).
+    if [ "$YB_LAYOUT" = colocated ]; then MAKE="CREATE DATABASE $DB_NAME WITH COLOCATION = true"; WANT=t; else MAKE="CREATE DATABASE $DB_NAME"; WANT=f; fi
+    YSQL="docker exec yb bin/ysqlsh -h $FIRST -X -tA"
+    remote "$YB1" "$YSQL -c \"select 1 from pg_database where datname = '$DB_NAME'\" | grep -qx 1 || $YSQL -c '$MAKE' >/dev/null; c=\$($YSQL -d $DB_NAME -c 'select yb_is_database_colocated()'); echo \"   database $DB_NAME: colocated=\$c (layout $YB_LAYOUT)\"; [ \"\$c\" = $WANT ] || { echo 'configure: database $DB_NAME exists in another layout than ${ENV_PREFIX}YB_LAYOUT=$YB_LAYOUT (destroy.sh, then create.sh)' >&2; exit 1; }"
 else
     DBIP=$(ip_of "$NAME-db"); DBIP=${DBIP:-DB_IP}; DBPRIV=$(priv_of "$NAME-db"); DBPRIV=${DBPRIV:-DB_PRIVATE_IP}
     # The password goes over as a root-only file, read by Docker's --env-file.
@@ -112,7 +128,10 @@ else
         copy_to "$STATE/pg.env" "$DBIP" /etc/veil/pg.env
         copy_to "$DO_ROOT/deploy/compose/init.sql" "$DBIP" /etc/veil/init.sql
     else echo "would copy the PostgreSQL env file and deploy/compose/init.sql to $DBIP" >&2; fi
-    remote "$DBIP" "docker rm -f pg >/dev/null 2>&1; docker run -d --name pg --restart unless-stopped -p $DBPRIV:5432:5432 --env-file /etc/veil/pg.env -v pgdata:/var/lib/postgresql/data -v /etc/veil/init.sql:/docker-entrypoint-initdb.d/10-veil.sql:ro --shm-size=1g $PG_IMAGE -c max_connections=1500 -c shared_preload_libraries=pg_stat_statements -c shared_buffers=4GB -c effective_cache_size=12GB -c synchronous_commit=on -c max_wal_size=16GB -c checkpoint_timeout=15min"
+    db_disk "$DBIP"
+    # Settings for a write-heavy server, sized on the machine (`m`, its
+    # memory in MiB): deploy/kit.sh pg_settings, docs/DEPLOY.md §12.10.
+    remote "$DBIP" "m=\$(awk '/MemTotal/ {print int(\$2 / 1024)}' /proc/meminfo); docker rm -f pg >/dev/null 2>&1; docker run -d --name pg --restart unless-stopped -p $DBPRIV:5432:5432 --env-file /etc/veil/pg.env -v $PG_DATA:/var/lib/postgresql/data -v /etc/veil/init.sql:/docker-entrypoint-initdb.d/10-veil.sql:ro --shm-size=1g $PG_IMAGE $(pg_settings)"
     remote "$DBIP" 'for i in $(seq 60); do docker exec pg pg_isready -U veil -d veil >/dev/null 2>&1 && docker exec pg psql -U veil -d veil -tAc "select 1" >/dev/null 2>&1 && break; sleep 2; done; echo "   postgres answers"'
 fi
 

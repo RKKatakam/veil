@@ -3,7 +3,7 @@
 # §12.2), from the topology in deploy/gcp/.env: each machine (Spot or
 # on-demand as VEIL_GCP_SPOT says), the boot disks, the storage machine's
 # local SSD and the external addresses; the hourly rate and the total for
-# VEIL_GCP_HOURS; what a teardown forgotten for a day and for a month would
+# VEIL_GCP_HOURS (and the database machines' data disks); what a teardown forgotten for a day and for a month would
 # cost; what stopped (reclaimed) Spot VMs cost a month, their disks alone;
 # and the same for all three models (on-demand, hybrid, all Spot).
 # Refuses a plan of $100 or more, and any machine type it has no price for.
@@ -25,7 +25,7 @@ done
 refuse_shared_objects estimate
 
 declare -A OD SP
-lssd_od=$LSSD_GB_MONTH; lssd_sp=$LSSD_GB_MONTH; pd=$PD_GB_MONTH; ip_od=$IP_HOUR; ip_sp=$IP_SPOT_HOUR
+lssd_od=$LSSD_GB_MONTH; lssd_sp=$LSSD_GB_MONTH; pd=$PD_GB_MONTH; pdssd=$PDSSD_GB_MONTH; ip_od=$IP_HOUR; ip_sp=$IP_SPOT_HOUR
 TYPES=$(droplets | awk '{print $3}' | sort -u)
 for t in $TYPES; do OD[$t]=$(price_of "$t" ondemand); SP[$t]=$(price_of "$t" spot); done
 SKUS_URL=https://cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus   # Compute Engine's SKUs
@@ -51,6 +51,7 @@ if [ $LIVE = 1 ]; then
                 type) OD[$a]=$b; SP[$a]=$c ;;
                 lssd_gb_month) lssd_od=$a; lssd_sp=$b ;;
                 pd_gb_month) pd=$a ;;
+                pdssd_gb_month) pdssd=$a ;;
                 ip_hour) ip_od=$a; ip_sp=$b ;;
             esac
         done < <(printf '%s' "$pages" | python3 "$GCP_HERE/prices.py" "$REGION" $TYPES)
@@ -61,6 +62,9 @@ if [ $LIVE = 1 ]; then
 fi
 
 unknown=0
+data_gb_price() { # USD per GiB a month of the database machines' data disks
+    if [ "$DB_DISK_TYPE" = pd-ssd ]; then echo "$pdssd"; else echo "$pd"; fi
+}
 price() { # type, role, model -> USD/hour or empty
     if is_spot "$2" "$3"; then echo "${SP[$1]:-}"; else echo "${OD[$1]:-}"; fi
 }
@@ -68,7 +72,7 @@ model_hourly() { # model -> USD/hour of the whole topology, or "unknown"
     local m=$1 role name size p t=0
     while read -r role name size; do
         p=$(price "$size" "$role" "$m"); [ -n "$p" ] || { echo unknown; return; }
-        t=$(echo "$t + $p + $(boot_gb "$role") * $pd / $MONTH_HOURS" | bc -l)
+        t=$(echo "$t + $p + $(boot_gb "$role") * $pd / $MONTH_HOURS + $(data_gb "$role") * $(data_gb_price) / $MONTH_HOURS" | bc -l)
         if is_spot "$role" "$m"; then t=$(echo "$t + $ip_sp" | bc -l); else t=$(echo "$t + $ip_od" | bc -l); fi
         if [ "$role" = minio ]; then
             if is_spot minio "$m"; then p=$lssd_sp; else p=$lssd_od; fi
@@ -79,7 +83,7 @@ model_hourly() { # model -> USD/hour of the whole topology, or "unknown"
 }
 disks_monthly() { # every boot disk, a month: what stopped VMs still bill
     local role name size t=0
-    while read -r role name size; do t=$(echo "$t + $(boot_gb "$role") * $pd" | bc -l); done < <(droplets)
+    while read -r role name size; do t=$(echo "$t + $(boot_gb "$role") * $pd + $(data_gb "$role") * $(data_gb_price)" | bc -l); done < <(droplets)
     echo "$t"
 }
 
@@ -93,15 +97,16 @@ line() { # label, type, model, hourly
     printf '%-26s %-16s %-9s %10.3f %12.2f\n' "$1" "$2" "$3" "$4" "$(echo "$4 * $HOURS" | bc -l)"
     total=$(echo "$total + $4" | bc -l)
 }
-disk_gb=0; ips_od=0; ips_sp=0
+disk_gb=0; data_total=0; ips_od=0; ips_sp=0
 while read -r role name size; do
     if is_spot "$role"; then m=spot; ips_sp=$((ips_sp + 1)); else m=on-demand; ips_od=$((ips_od + 1)); fi
     line "$name ($role)" "$size" "$m" "$(price "$size" "$role" "$SPOT")"
-    disk_gb=$((disk_gb + $(boot_gb "$role")))
+    disk_gb=$((disk_gb + $(boot_gb "$role"))); data_total=$((data_total + $(data_gb "$role")))
 done < <(droplets)
 if is_spot minio; then p=$lssd_sp; m=spot; else p=$lssd_od; m=on-demand; fi
 line "local SSD (MinIO's data)" "${LOCAL_SSD_GB} GiB NVMe" "$m" "$(echo "$LOCAL_SSD_GB * $p / $MONTH_HOURS" | bc -l)"
 line "boot disks (pd-balanced)" "${disk_gb} GiB" "-" "$(echo "$disk_gb * $pd / $MONTH_HOURS" | bc -l)"
+[ "$data_total" -gt 0 ] && line "database data ($DB_DISK_TYPE)" "${data_total} GiB" "-" "$(echo "$data_total * $(data_gb_price) / $MONTH_HOURS" | bc -l)"
 line "external IPv4 addresses" "$ips_od std + $ips_sp spot" "-" "$(echo "$ips_od * $ip_od + $ips_sp * $ip_sp" | bc -l)"
 printf '%-26s %-16s %-9s %10s %12s\n' "traffic" "in one zone" "-" 0 0
 echo
@@ -111,7 +116,7 @@ printf 'hourly rate:                 $%.3f  (VEIL_GCP_SPOT=%s)\n' "$total" "$SPO
 printf 'planned %s hours:            $%.2f\n' "$HOURS" "$planned"
 printf '24 hours left running:       $%.2f\n' "$(echo "$total * 24" | bc -l)"
 printf 'a whole month forgotten:     $%.2f  <- why destroy.sh and its check matter\n' "$(echo "$total * $MONTH_HOURS" | bc -l)"
-printf 'stopped VMs, a month:        $%.2f  (reclaimed Spot VMs stop: their boot disks still bill until destroy.sh)\n' "$(disks_monthly)"
+printf 'stopped VMs, a month:        $%.2f  (reclaimed Spot VMs stop: their disks still bill until destroy.sh)\n' "$(disks_monthly)"
 echo
 echo "every model (this topology; Spot prices change up to once a day):"
 printf '   %-44s %9s %9s %11s %13s\n' "model" "USD/hour" "${HOURS} h" "a day left" "a month left"

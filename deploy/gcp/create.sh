@@ -14,7 +14,9 @@
 #      optional cache), Spot or on-demand as VEIL_GCP_SPOT says, each with
 #      the label veil-run=NAME and the tag NAME, from cloud-init/docker.yaml
 #      with the run's public key, no service account, OS Login off and the
-#      project's SSH keys blocked; their boot disks get the label too;
+#      project's SSH keys blocked; their boot disks get the label too, as do
+#      the database machines' data disks (NAME-db-data, NAME-ybN-data:
+#      DB_DISK_GB of DB_DISK_TYPE, deleted with their machine);
 #   5. the state file with their addresses (the bucket is made by the server
 #      on MinIO at first start, under the name saved here).
 # Spot VMs stop when reclaimed (--instance-termination-action=STOP): a
@@ -38,6 +40,7 @@ echo "== plan: $NAME in $ZONE (project ${PROJECT:-PROJECT}), VEIL_GCP_SPOT=$SPOT
 while read -r role name size; do
     if is_spot "$role"; then m=spot; else m=on-demand; fi
     extra=""; [ "$role" = minio ] && extra=", 1 x ${LOCAL_SSD_GB} GB local NVMe SSD for MinIO's data"
+    [ "$(data_gb "$role")" -gt 0 ] && extra=", data disk $(data_gb "$role") GB $DB_DISK_TYPE"
     printf '   %-8s %-20s %-16s %-9s boot %s GB%s\n' "$role" "$name" "$size" "$m" "$(boot_gb "$role")" "$extra"
 done < <(droplets)
 BUCKET=${BUCKET:-$NAME-objects-$(openssl rand -hex 3)}
@@ -81,6 +84,7 @@ while read -r role name size; do
         extra+=(--provisioning-model=SPOT --instance-termination-action=STOP --maintenance-policy=TERMINATE --no-restart-on-failure)
     fi
     [ "$role" = minio ] && extra+=(--local-ssd=interface=NVME)
+    [ "$(data_gb "$role")" -gt 0 ] && extra+=(--create-disk="name=$name-data,size=$(data_gb "$role")GB,type=$DB_DISK_TYPE,device-name=$DB_DISK_DEVICE,auto-delete=yes")
     run_gcloud compute instances create "$name" --zone="$ZONE" --machine-type="$size" --subnet="$NAME-subnet" \
         --image-family="$IMAGE_FAMILY" --image-project="$IMAGE_PROJECT" --boot-disk-size="$(boot_gb "$role")GB" --boot-disk-type=pd-balanced \
         --labels="$LABEL=$NAME,veil-role=$role" --tags="$NAME" \
@@ -89,6 +93,7 @@ while read -r role name size; do
     MADE+=("$name")
     if [ $APPROVED = 1 ]; then save_state INSTANCES "${MADE[*]}"; fi
     run_gcloud compute disks add-labels "$name" --zone="$ZONE" --labels="$LABEL=$NAME"
+    [ "$(data_gb "$role")" = 0 ] || run_gcloud compute disks add-labels "$name-data" --zone="$ZONE" --labels="$LABEL=$NAME"
 done < <(droplets)
 
 # 5. Addresses (instances create returns once each VM runs).

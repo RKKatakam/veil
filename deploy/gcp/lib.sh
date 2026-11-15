@@ -54,6 +54,17 @@ YB_NODES=${VEIL_GCP_YB_NODES:-3}
 DRIVERS=${VEIL_GCP_DRIVERS:-2}
 WITH_CACHE=${VEIL_GCP_WITH_CACHE:-0}
 DB_CONNECTIONS=${VEIL_GCP_DB_CONNECTIONS:-64}
+# The database (docs/DEPLOY.md §12.10). YugabyteDB's layout: `colocated`,
+# every table of Veil's database in one tablet (the runs of 2026-11-14:
+# twice the merges of `hash`, no errors), or `hash`, each table
+# hash-sharded into YB_TABLETS tablets on every node. Each database machine
+# (PostgreSQL's, or every YugabyteDB node) keeps its data on a persistent
+# disk of its own, DB_DISK_GB of DB_DISK_TYPE (pd-ssd: 30 IOPS and 0.48 MB/s
+# a GB; 0: on the boot disk, pd-balanced).
+YB_LAYOUT=${VEIL_GCP_YB_LAYOUT:-colocated}
+YB_TABLETS=${VEIL_GCP_YB_TABLETS:-1}
+DB_DISK_TYPE=${VEIL_GCP_DB_DISK_TYPE:-pd-ssd}
+DB_DISK_GB=${VEIL_GCP_DB_DISK_GB:-500}
 HOURS=${VEIL_GCP_HOURS:-8}
 # Boot disks (pd-balanced, GB): the servers' and drivers' hold the images,
 # the benchmarks' working trees and the same-machine gates' data.
@@ -92,6 +103,8 @@ done
 for v in DISK_HUB DISK_DRIVER DISK_DB; do
     [[ "${!v}" =~ ^[1-9][0-9]*$ ]] && [ "${!v}" -ge 20 ] && [ "${!v}" -le 2000 ] || bad "invalid VEIL_GCP_$v '${!v}' (20 to 2000 GB)"
 done
+[[ "$DB_DISK_TYPE" =~ ^(pd-ssd|pd-balanced)$ ]] || bad "invalid VEIL_GCP_DB_DISK_TYPE '$DB_DISK_TYPE' (pd-ssd or pd-balanced)"
+[[ "$DB_DISK_GB" =~ ^(0|[1-9][0-9]*)$ ]] && { [ "$DB_DISK_GB" = 0 ] || { [ "$DB_DISK_GB" -ge 10 ] && [ "$DB_DISK_GB" -le 4000 ]; }; } || bad "invalid VEIL_GCP_DB_DISK_GB '$DB_DISK_GB' (0, or 10 to 4000 GB)"
 [[ "$SUBNET_RANGE" =~ ^10\.[0-9]+\.[0-9]+\.0/2[0-4]$ ]] || bad "invalid VEIL_GCP_SUBNET_RANGE '$SUBNET_RANGE' (a 10.x.y.0/20 to /24 range)"
 [[ "$HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ "$(echo "$HOURS > 0" | bc -l)" = 1 ] || bad "invalid VEIL_GCP_HOURS '$HOURS' (must be > 0)"
 # The storage machine needs dedicated CPUs (BUG-2431: MinIO on a shared-CPU
@@ -171,8 +184,13 @@ is_spot() { # role [model]: is this role's machine a Spot VM?
 boot_gb() { # role
     case $1 in hub) echo "$DISK_HUB" ;; driver) echo "$DISK_DRIVER" ;; yb|db) echo "$DISK_DB" ;; cache) echo "$DISK_CACHE" ;; *) echo "$DISK_SMALL" ;; esac
 }
+data_gb() { # role: its data disk's GB (the database machines'), else 0
+    case $1 in yb|db) echo "$DB_DISK_GB" ;; *) echo 0 ;; esac
+}
+# The data disk's device name on the machine (/dev/disk/by-id/google-NAME).
+DB_DISK_DEVICE=veil-db-data
 # Exactly the names the kit gives (never a prefix: NAME=veil must not reach veil-big's machines).
-OWN_RE="^$NAME-(hub[23]?|lb|db|yb[0-9]|driver[0-9]|minio|cache)\$"
+OWN_RE="^$NAME-(hub[23]?|lb|db|yb[0-9]|driver[0-9]|minio|cache)(-data)?\$"
 OWN_FILTER="labels.$LABEL=$NAME OR name~'$OWN_RE'"
 # The remote command that gives MinIO its data directory on the storage
 # machine's local NVMe SSD (configure.sh, VEIL_KIT=gcp): a file system is
@@ -180,12 +198,18 @@ OWN_FILTER="labels.$LABEL=$NAME OR name~'$OWN_RE'"
 local_ssd_mount() { # mount point
     echo "dev=/dev/disk/by-id/google-local-nvme-ssd-0; for i in \$(seq 60); do [ -e \$dev ] && break; sleep 2; done; [ -e \$dev ] || { echo 'configure: no local SSD on the storage machine' >&2; exit 1; }; mkdir -p $1 && { mountpoint -q $1 || { blkid \$dev >/dev/null 2>&1 || mkfs.ext4 -q -F -E lazy_itable_init=1,discard \$dev; mount -o discard,defaults,noatime \$dev $1; }; }"
 }
+# The remote command that mounts a database machine's data disk (configure.sh,
+# VEIL_KIT=gcp): a file system is made only on a disk that has none (a
+# persistent disk keeps its data across a stop; a second configure.sh finds it).
+db_disk_mount() { # mount point
+    echo "dev=/dev/disk/by-id/google-$DB_DISK_DEVICE; for i in \$(seq 60); do [ -e \$dev ] && break; sleep 2; done; [ -e \$dev ] || { echo 'configure: no data disk on the database machine' >&2; exit 1; }; mkdir -p $1 && { mountpoint -q $1 || { blkid \$dev >/dev/null 2>&1 || mkfs.ext4 -q -F -E lazy_itable_init=1,discard \$dev; mount -o discard,defaults,noatime \$dev $1; }; }"
+}
 # The topology beside every result: the settings without a secret (a fixed
 # list of names, so a new secret can never leak into it; the project id is
 # left out too).
 topology() {
     local v
-    for v in NAME REGION ZONE SPOT SIZE_HUB HUBS SIZE_LB SIZE_DB YB_NODES SIZE_DRIVER DRIVERS SIZE_OBJECTS LOCAL_SSD_GB WITH_CACHE SIZE_CACHE \
+    for v in NAME REGION ZONE SPOT SIZE_HUB HUBS SIZE_LB SIZE_DB YB_NODES YB_LAYOUT YB_TABLETS DB_DISK_TYPE DB_DISK_GB SIZE_DRIVER DRIVERS SIZE_OBJECTS LOCAL_SSD_GB WITH_CACHE SIZE_CACHE \
              DB_CONNECTIONS OBJECTS DISK_HUB DISK_DRIVER DISK_DB HOURS IMAGE_FAMILY PG_IMAGE YB_IMAGE HAPROXY_IMAGE MINIO_IMAGE; do
         printf '%s=%s\n' "$v" "${!v}"
     done
@@ -213,6 +237,7 @@ price_of() { # machine type, spot|ondemand
 }
 LSSD_GB_MONTH=0.08    # local SSD, USD per GiB a month (the on-demand price, also used for Spot: an upper bound)
 PD_GB_MONTH=0.10      # pd-balanced boot disks, USD per GiB a month (billed while a VM is stopped too)
+PDSSD_GB_MONTH=0.17   # pd-ssd (the database machines' data disks), USD per GiB a month
 IP_HOUR=0.005         # an external IPv4 address on a standard VM, USD an hour
 IP_SPOT_HOUR=0.0025   # on a Spot VM
 MONTH_HOURS=730       # Google bills by the second; a month is 730 hours

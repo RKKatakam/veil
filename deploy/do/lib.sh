@@ -40,6 +40,14 @@ SIZE_CACHE=${VEIL_DO_SIZE_CACHE:-s-4vcpu-8gb}
 HUBS=${VEIL_DO_HUBS:-1}
 SIZE_LB=${VEIL_DO_SIZE_LB:-c-4}
 DB_CONNECTIONS=${VEIL_DO_DB_CONNECTIONS:-64}
+# YugabyteDB's layout (docs/DEPLOY.md §12.10): `colocated`, every table of
+# Veil's database in one tablet (the Google Cloud runs: twice the merges of
+# `hash`, no errors), or `hash`, each table hash-sharded into YB_TABLETS
+# tablets on every node. PostgreSQL keeps its data on the droplet's own
+# disk (local NVMe on the CPU-Optimized sizes); its settings: deploy/kit.sh.
+YB_LAYOUT=${VEIL_DO_YB_LAYOUT:-colocated}
+YB_TABLETS=${VEIL_DO_YB_TABLETS:-1}
+DB_DISK_GB=0
 HOURS=${VEIL_DO_HOURS:-8}
 # Where the servers keep objects (owner, 2026-11-13; docs/DEPLOY.md §2.3):
 # `minio`, an S3-compatible MinIO on a storage droplet of the run (the
@@ -138,7 +146,7 @@ VOLUME_NAME=$NAME-minio-data
 # secrets (a fixed list of names, so a new secret can never leak into it).
 topology() {
     local v
-    for v in NAME REGION SIZE_HUB HUBS SIZE_LB SIZE_DB YB_NODES SIZE_DRIVER DRIVERS WITH_CACHE SIZE_CACHE DB_CONNECTIONS OBJECTS SIZE_OBJECTS OBJECTS_VOLUME_GB HOURS IMAGE PG_IMAGE YB_IMAGE HAPROXY_IMAGE MINIO_IMAGE; do
+    for v in NAME REGION SIZE_HUB HUBS SIZE_LB SIZE_DB YB_NODES YB_LAYOUT YB_TABLETS SIZE_DRIVER DRIVERS WITH_CACHE SIZE_CACHE DB_CONNECTIONS OBJECTS SIZE_OBJECTS OBJECTS_VOLUME_GB HOURS IMAGE PG_IMAGE YB_IMAGE HAPROXY_IMAGE MINIO_IMAGE; do
         printf '%s=%s\n' "$v" "${!v}"
     done
 }

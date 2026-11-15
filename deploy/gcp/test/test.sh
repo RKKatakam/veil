@@ -21,6 +21,9 @@
 #   5. configure.sh --approve through the shared steps: every machine
 #      reached, MinIO's data on the local SSD, MinIO started directly, the
 #      certificate naming localhost, no spaces.env;
+#   5b. the database: each machine's data disk, the YugabyteDB layout
+#      (colocated, or hash with VEIL_GCP_YB_TABLETS), Veil's database `veil`,
+#      PostgreSQL's settings (sized on the machine, durability on);
 #   6. bench.sh --approve and Spot reclaims: a clean gate is valid; a VM
 #      reclaimed during a gate marks it invalid, is started again and the gate
 #      rerun once (valid); reclaimed twice fails without a third run; a VM
@@ -166,8 +169,9 @@ out_c=$("$K/create.sh" --approve 2>&1); rc=$?
 S=$T/state/veil-kit
 check "create.sh --approve succeeds" '[ $rc = 0 ] && [[ "$out_c" == *"== created."* ]]'
 seq_got=$(awk '{print $2, $3, $4}' "$FAKE_GCLOUD_LOG" | tr '\n' ';')
-seq_want="compute networks create;compute networks subnets;compute firewall-rules create;compute firewall-rules create;$(for i in $(seq 10); do printf 'compute instances create;compute disks add-labels;'; done)compute instances list;"
-check "it issues exactly: network, subnet, two firewall rules, ten VMs each with its disk labelled, one address listing" '[ "$seq_got" = "$seq_want" ]'
+# The three YugabyteDB nodes (the 5th to 7th machines) have a data disk, labelled too.
+seq_want="compute networks create;compute networks subnets;compute firewall-rules create;compute firewall-rules create;$(for i in $(seq 10); do printf 'compute instances create;compute disks add-labels;'; case $i in 5|6|7) printf 'compute disks add-labels;' ;; esac; done)compute instances list;"
+check "it issues exactly: network, subnet, two firewall rules, ten VMs each with its disk labelled (and each database machine's data disk), one address listing" '[ "$seq_got" = "$seq_want" ]'
 check "every call names the project and gets credentials from the key file's path in the environment, prompts off" '[ "$(grep -vc -- "--project=veil-kit-test-1$" "$FAKE_GCLOUD_LOG")" = 0 ] && [ "$(sort -u "$FAKE_GCLOUD_DIR/env.log")" = "cred=$T/sa.json prompts=1" ]'
 check "the network is the run's own: a custom subnet in the region" 'grep -q "^gcloud compute networks create veil-kit-net --subnet-mode=custom" "$FAKE_GCLOUD_LOG" && grep -q "^gcloud compute networks subnets create veil-kit-subnet --network=veil-kit-net --region=us-central1 --range=10.42.0.0/24" "$FAKE_GCLOUD_LOG"'
 check "from outside only the operator's address, on 22 and 8443; inside, the run's tagged machines" '
@@ -190,19 +194,22 @@ check "VEIL_GCP_SPOT=none: no Spot VM; =all: all ten" '! grep -q -- "--provision
 
 echo "== 4. estimate.sh"
 out=$("$K/estimate.sh" 2>/dev/null)
-check "the hybrid plan: \$3.465 an hour, \$27.72 for 8 hours; the three models priced" '[[ "$out" == *"hourly rate:                 \$3.465"* && "$out" == *"planned 8 hours:            \$27.72"* && "$out" == *"on-demand (VEIL_GCP_SPOT=none)"*"5.110     40.88"* && "$out" == *"all Spot (all; database and storage too)"*"2.470     19.76"* ]]'
-check "it prices the local SSD, the boot disks, the addresses, a forgotten month and stopped VMs" '[[ "$out" == *"local SSD (MinIO'"'"'s data)   375 GiB NVMe     on-demand      0.041"* && "$out" == *"boot disks (pd-balanced)   1140 GiB"* && "$out" == *"4 std + 6 spot"* && "$out" == *"a whole month forgotten:     \$2529.64"* && "$out" == *"stopped VMs, a month:        \$114.00"* ]]'
-check "a plan of \$100 or more is refused (29 hours), 28 hours is not; an unknown type is refused" '! VEIL_GCP_HOURS=29 "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_HOURS=29 "$K/create.sh" >/dev/null 2>&1 && VEIL_GCP_HOURS=28 "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_SIZE_HUB=n2-standard-16 "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_SIZE_OBJECTS=e2-standard-8 "$K/estimate.sh" >/dev/null 2>&1'
+check "the hybrid plan: \$3.815 an hour, \$30.52 for 8 hours; the three models priced" '[[ "$out" == *"hourly rate:                 \$3.815"* && "$out" == *"planned 8 hours:            \$30.52"* && "$out" == *"on-demand (VEIL_GCP_SPOT=none)"*"5.460     43.68"* && "$out" == *"all Spot (all; database and storage too)"*"2.820     22.56"* ]]'
+check "it prices the local SSD, the boot disks, the addresses, a forgotten month and stopped VMs" '[[ "$out" == *"local SSD (MinIO'"'"'s data)   375 GiB NVMe     on-demand      0.041"* && "$out" == *"boot disks (pd-balanced)   1140 GiB"* && "$out" == *"database data (pd-ssd)     1500 GiB         -              0.349"* && "$out" == *"4 std + 6 spot"* && "$out" == *"a whole month forgotten:     \$2784.64"* && "$out" == *"stopped VMs, a month:        \$369.00"* ]]'
+out0=$(VEIL_GCP_DB_DISK_GB=0 "$K/estimate.sh" 2>/dev/null)
+check "without data disks (VEIL_GCP_DB_DISK_GB=0) the plan is the boot disks alone: \$3.465 an hour" '[[ "$out0" == *"hourly rate:                 \$3.465"* && "$out0" != *"database data"* && "$out0" == *"stopped VMs, a month:        \$114.00"* ]]'
+check "a database disk of another type or size is refused" '! VEIL_GCP_DB_DISK_TYPE=hyperdisk-extreme "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_DB_DISK_GB=5 "$K/estimate.sh" >/dev/null 2>&1 && [[ "$(VEIL_GCP_DB_DISK_TYPE=pd-balanced "$K/estimate.sh" 2>/dev/null)" == *"database data (pd-balanced) 1500 GiB"* ]]'
+check "a plan of \$100 or more is refused (27 hours), 26 hours is not; an unknown type is refused" '! VEIL_GCP_HOURS=27 "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_HOURS=27 "$K/create.sh" >/dev/null 2>&1 && VEIL_GCP_HOURS=26 "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_SIZE_HUB=n2-standard-16 "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_SIZE_OBJECTS=e2-standard-8 "$K/estimate.sh" >/dev/null 2>&1'
 sku() { printf '{"description":"%s","serviceRegions":["us-central1"],"pricingInfo":[{"pricingExpression":{"tieredRates":[{"unitPrice":{"units":"0","nanos":%s}}]}}]}' "$1" "$2"; }
 { printf '{"skus":['; sku "C2D AMD Instance Core running in Americas" 30000000; printf ,; sku "C2D AMD Instance Ram running in Americas" 4000000; printf ,
   sku "Spot Preemptible C2D AMD Instance Core running in Americas" 10000000; printf ,; sku "Spot Preemptible C2D AMD Instance Ram running in Americas" 1000000; printf ,
   sku "E2 Instance Core running in Americas" 20000000; printf '],"nextPageToken":"page2"}\n'; } > "$T/skus1.json"
 { printf '{"skus":['; sku "E2 Instance Ram running in Americas" 3000000; printf ,; sku "Spot Preemptible E2 Instance Core running in Americas" 10000000; printf ,
   sku "Spot Preemptible E2 Instance Ram running in Americas" 1000000; printf ,; sku "SSD backed Local Storage" 80000000; printf ,
-  sku "Balanced PD Capacity" 100000000; printf ,; sku "External IP Charge on a Standard VM" 5000000; printf ,; sku "External IP Charge on a Spot Preemptible VM" 2500000; printf ']}\n'; } > "$T/skus2.json"
+  sku "Balanced PD Capacity" 100000000; printf ,; sku "SSD backed PD Capacity" 200000000; printf ,; sku "External IP Charge on a Standard VM" 5000000; printf ,; sku "External IP Charge on a Spot Preemptible VM" 2500000; printf ']}\n'; } > "$T/skus2.json"
 : > "$FAKE_GCLOUD_LOG"
 out=$(FAKE_SKUS=$T/skus1.json FAKE_SKUS2=$T/skus2.json "$K/estimate.sh" --live --approve 2>&1); rc=$?
-check "--live --approve prices from the Billing Catalog's two pages (\$3.024 an hour with the made-up SKUs)" '[ $rc = 0 ] && [[ "$out" == *"hourly rate:                 \$3.024"* && "$out" == *"planned 8 hours:            \$24.19"* ]] && [ "$(grep -c "cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus" "$FAKE_CURL_LOG")" = 2 ]'
+check "--live --approve prices from the Billing Catalog's two pages (\$3.435 an hour with the made-up SKUs, the data disks at their \$0.20 a GiB)" '[ $rc = 0 ] && [[ "$out" == *"hourly rate:                 \$3.435"* && "$out" == *"planned 8 hours:            \$27.48"* && "$out" == *"database data (pd-ssd)     1500 GiB         -              0.411"* ]] && [ "$(grep -c "cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus" "$FAKE_CURL_LOG")" = 2 ]'
 check "the access token went to curl on stdin only: in no command line and no output" '! grep -q "fake-access-token" "$FAKE_CURL_LOG" "$FAKE_GCLOUD_LOG" && [[ "$out" != *"fake-access-token"* ]] && [ "$(grep -c "^gcloud auth print-access-token" "$FAKE_GCLOUD_LOG")" = 1 ]'
 out=$(FAKE_SKUS=$T/skus2.json FAKE_SKUS2=$T/skus2.json "$K/estimate.sh" --live --approve 2>&1 || true)
 check "a live price that is missing (no C2D SKUs) is unknown, and the estimate refuses" '[[ "$out" == *"unknown"* && "$out" == *"cannot bound the total cost"* ]]'
@@ -218,6 +225,15 @@ check "MinIO is started directly (the server binary, never the image's setup scr
 check "the certificate names the storage machine, and localhost (BUG-2432)" 'openssl x509 -in "$S/tls/server.pem" -noout -text | grep -q "DNS:veil-kit-minio" && openssl x509 -in "$S/tls/server.pem" -noout -text | grep -q "DNS:localhost" && openssl x509 -in "$S/tls/server.pem" -noout -text | grep -q "IP Address:10.42.0.10"'
 check "three YugabyteDB nodes, three servers, the balancer; no spaces.env (no Spaces here)" '[ "$(grep -c "bin/yugabyted start" "$FAKE_SSH_LOG")" = 3 ] && [ "$(grep -c "docker run -d --name veil-server" "$FAKE_SSH_LOG")" = 3 ] && grep -q "docker run -d --name veil-lb" "$FAKE_SSH_LOG" && ! grep -q spaces.env "$FAKE_SSH_LOG" && [ ! -e "$S/spaces.env" ]'
 check "configure.sh called no gcloud" '[ "$(wc -l < "$FAKE_GCLOUD_LOG")" = "$g_before" ]'
+check "each YugabyteDB node keeps its data on its own data disk (a file system made only when it has none)" '[ "$(grep -c "dev=/dev/disk/by-id/google-veil-db-data;.*blkid \$dev >/dev/null 2>&1 || mkfs.ext4 .*mount -o discard,defaults,noatime \$dev /mnt/db-data" "$FAKE_SSH_LOG")" = 3 ] && [ "$(grep -c "docker run -d --name yb .*-v /mnt/db-data/yb:/root/var .*ysql_num_shards_per_tserver=1 " "$FAKE_SSH_LOG")" = 3 ]'
+check "Veil's database veil, colocated by default: made once, its layout checked; the servers' URLs name it" '[ "$(grep -c "CREATE DATABASE veil WITH COLOCATION = true" "$FAKE_SSH_LOG")" = 1 ] && grep -q "select yb_is_database_colocated()" "$FAKE_SSH_LOG" && grep -q "^VEIL_DATABASE_URL=postgres://yugabyte@10.42.0.5:5433/veil$" "$S/hub1.env" && grep -q "^VEIL_DATABASE_URL=postgres://yugabyte@10.42.0.7:5433/veil$" "$S/hub3.env"'
+: > "$FAKE_SSH_LOG"
+out=$(VEIL_GCP_YB_LAYOUT=hash VEIL_GCP_YB_TABLETS=4 "$K/configure.sh" --approve gcpkit-test 2>&1 </dev/null); rc=$?
+check "the hash layout: VEIL_GCP_YB_TABLETS tablets a table on each node, and the database made without colocation" '[ $rc = 0 ] && [ "$(grep -c "ysql_num_shards_per_tserver=4 " "$FAKE_SSH_LOG")" = 3 ] && grep -q "CREATE DATABASE veil'"'"'" "$FAKE_SSH_LOG" && ! grep -q COLOCATION "$FAKE_SSH_LOG"'
+check "an unknown layout, or tablets with a colocated database, is refused" '! VEIL_GCP_YB_LAYOUT=sharded "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_YB_TABLETS=4 "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_YB_LAYOUT=hash VEIL_GCP_YB_TABLETS=0 "$K/estimate.sh" >/dev/null 2>&1'
+out=$(VEIL_GCP_YB_NODES=0 "$K/configure.sh" gcpkit-test 2>&1 </dev/null); rc=$?
+pg_run=$(grep "docker run -d --name pg " <<<"$out")
+check "PostgreSQL (dry run): on its data disk, sized on the machine, connections for the three servers' pools, durability on" '[ $rc = 0 ] && [[ "$out" == *"dev=/dev/disk/by-id/google-veil-db-data;"* ]] && [[ "$pg_run" == *"-v /mnt/db-data/pg:/var/lib/postgresql/data "* && "$pg_run" == *"m=\$(awk '"'"'/MemTotal/"* && "$pg_run" == *"-c max_connections=356 "* && "$pg_run" == *"-c shared_buffers=\$((m / 4))MB "* && "$pg_run" == *"-c shared_preload_libraries=pg_stat_statements "* && "$pg_run" == *"-c synchronous_commit=on -c fsync=on -c full_page_writes=on"* ]] && [[ "$pg_run" != *"=off"* ]]'
 MIN_P=$(sed -n 's/^MINIO_ROOT_PASSWORD=//p' "$S/minio.env"); MIN_U=$(sed -n 's/^MINIO_ROOT_USER=//p' "$S/minio.env")
 
 echo "== 6. bench.sh --approve and Spot reclaims"
@@ -261,13 +277,28 @@ mapfile -t rr < <(res pull)
 check "VEIL_GCP_SPOT=all, the storage machine reclaimed: configure.sh again (MinIO's SSD is blank), then the rerun" '[ $rc = 0 ] && [ "${#rr[@]}" = 2 ] && grep -qx "spot_reclaimed_during=veil-kit-minio" "${rr[0]}/run.txt" && grep -qx "spot_reconfigured=yes" "${rr[1]}/run.txt" && grep -q "docker run -d --name minio" "$FAKE_SSH_LOG" && grep -qx "result_valid=yes" "${rr[1]}/run.txt"'
 rm -rf "$T/results"
 
+# The onerepo gate: one project, 1,000 then 5,000 agents on one driver, the
+# database machines sampled, and its table against GitHub's figure.
+rm -rf "$T/results"; : > "$FAKE_SSH_LOG"
+rc=0; out=$("$K/bench.sh" --approve onerepo 2>&1 </dev/null) || rc=$?
+r1=$(res onerepo)
+check "onerepo: one project, 1,000 and 5,000 agents each on a branch of its own, on one driver; the database machines sampled; its table states the target" '[ $rc = 0 ] && [ "$(grep -c "root@[0-9.]* .*--mode branches --projects 1 --clients 1000 --rates max .*onerepo-1000.json" "$FAKE_SSH_LOG")" = 1 ] && [ "$(grep -c "root@[0-9.]* .*--mode branches --projects 1 --clients 5000 --rates max .*onerepo-5000.json" "$FAKE_SSH_LOG")" = 1 ] && grep -q "/srv/metrics/.*-onerepo.stats .*/db3-docker-stats.log$" "$FAKE_SSH_LOG" && grep -q "/srv/metrics/.*-onerepo.stats .*/minio-docker-stats.log$" "$FAKE_SSH_LOG" && grep -q "against 7,200 pushes a second" "$r1/onerepo.md" && grep -q "GitHub" "$r1/onerepo.md" && grep -qx "ONEREPO_AGENTS=1000 5000" "$r1/run.txt"'
+# The table on made-up results: 3,600 pushes a second, the three servers at
+# 9 cores each and the database at 6 inside the window (samples outside it ignored).
+mk=$T/onerepo-made; mkdir -p "$mk"
+printf '{"profile": "load", "runs": [{"mode": "branches", "clients": 5000, "ops_per_s": 3600.0, "p50_ms": 900, "p99_ms": 2100, "errors": 3, "busy": 7, "db_per_op": 40.1, "db_writes_per_op": 11.0, "db_commits_per_op": 1.02, "load_tool_cores": 5.5, "window_start_unix_ms": 1794000000000, "window_end_unix_ms": 1794000120000}]}\n' > "$mk/onerepo-5000.json"
+for i in 1 2 3; do printf '2026-11-06T21:19:50Z veil-server cpu=1600.00%% mem=1GiB / 64GiB;\n2026-11-06T21:20:10Z veil-server cpu=900.00%% mem=1GiB / 64GiB;\n2026-11-06T21:21:10Z veil-server cpu=900.00%% mem=1GiB / 64GiB;\n' > "$mk/hub$i-docker-stats.log"; done
+printf '2026-11-06T21:20:30Z pg cpu=600.00%% mem=8GiB / 32GiB;\n2026-11-06T21:23:00Z pg cpu=100.00%% mem=8GiB / 32GiB;\n' > "$mk/db1-docker-stats.log"
+tab=$(python3 "$ROOT/deploy/onerepo-table.py" --target 7200 --servers 3 --server-vcpus 16 "$mk")
+check "onerepo's table: 50.0 % of the target, 27 server cores (7.50 ms a push), 6 database cores (1.67 ms), and what 7,200 a second needs" '[[ "$tab" == *"| 5,000 | 3,600.0 | 50.0 % | 900 / 2,100 | 3 | 7 | 40.1 | 11.0 | 1.02 | 27.0 | 7.50 | 6.0 | 1.67 | 5.5 |"* && "$tab" == *"54 server cores (5 servers of 16 vCPUs at 70% busy)"* && "$tab" == *"12 database cores (at 70% busy: 18)"* && "$tab" == *"288,720 statements a second"* ]]'
+
 echo "== 7. destroy.sh and its check"
 awk '$1 == "veil-kit-driver2" {$3 = "TERMINATED"} {print}' "$FAKE_GCLOUD_DIR/instances" > "$T/i"; mv "$T/i" "$FAKE_GCLOUD_DIR/instances"
 : > "$FAKE_GCLOUD_LOG"
 out=$("$K/destroy.sh" --check --approve 2>&1 || true)
-check "the check counts every VM, a stopped Spot VM among them, their disks, the firewall rules, subnet and network" '[[ "$out" == *"VMs (any state): 10 (of which stopped, e.g. reclaimed Spot VMs, still billing their disks: 1)"* && "$out" == *"disks: 10"* && "$out" == *"firewall rules: 2"* && "$out" == *"subnets: 1"* && "$out" == *"networks: 1"* && "$out" == *"SOMETHING IS LEFT"* ]]'
+check "the check counts every VM, a stopped Spot VM among them, their disks, the firewall rules, subnet and network" '[[ "$out" == *"VMs (any state): 10 (of which stopped, e.g. reclaimed Spot VMs, still billing their disks: 1)"* && "$out" == *"disks: 13"* && "$out" == *"firewall rules: 2"* && "$out" == *"subnets: 1"* && "$out" == *"networks: 1"* && "$out" == *"SOMETHING IS LEFT"* ]]'
 check "the check only reads" '! grep -qE "^gcloud compute [a-z -]+ (delete|create|start|stop)" "$FAKE_GCLOUD_LOG"'
-check "it looks by the label or the kit's exact names (never a bare prefix), whatever the VMs' state" 'grep -q "^gcloud compute instances list --filter=labels.veil-run=veil-kit OR name~'"'"'^veil-kit-(hub\[23\]?|lb|db|yb\[0-9\]|driver\[0-9\]|minio|cache)\$'"'"' --format=value(name,zone.basename(),status) " "$FAKE_GCLOUD_LOG" && ! grep -q "name~'"'"'^veil-kit-'"'"'" "$FAKE_GCLOUD_LOG"'
+check "it looks by the label or the kit's exact names (never a bare prefix), whatever the VMs' state" 'grep -q "^gcloud compute instances list --filter=labels.veil-run=veil-kit OR name~'"'"'^veil-kit-(hub\[23\]?|lb|db|yb\[0-9\]|driver\[0-9\]|minio|cache)(-data)?\$'"'"' --format=value(name,zone.basename(),status) " "$FAKE_GCLOUD_LOG" && ! grep -q "name~'"'"'^veil-kit-'"'"'" "$FAKE_GCLOUD_LOG"'
 check "the check fails when gcloud itself fails" '! FAKE_GCLOUD_FAIL=1 "$K/destroy.sh" --check --approve >/dev/null 2>&1'
 cp "$FAKE_GCLOUD_DIR/instances" "$T/instances.bak"
 : > "$FAKE_GCLOUD_LOG"
@@ -302,12 +333,12 @@ q() { # metric=limit... -> quota JSON
 }
 q CPUS=24 C2D_CPUS=24 PREEMPTIBLE_CPUS=0 LOCAL_SSD_TOTAL_GB=6000 SSD_TOTAL_GB=500 IN_USE_ADDRESSES=8 INSTANCES=24 > "$T/region-short.json"
 q CPUS_ALL_REGIONS=32 > "$T/project-short.json"
-q CPUS=24 C2D_CPUS=128 PREEMPTIBLE_CPUS=0 LOCAL_SSD_TOTAL_GB=6000 SSD_TOTAL_GB=2048 IN_USE_ADDRESSES=16 INSTANCES=24 > "$T/region-ok.json"
+q CPUS=24 C2D_CPUS=128 PREEMPTIBLE_CPUS=0 LOCAL_SSD_TOTAL_GB=6000 SSD_TOTAL_GB=4096 IN_USE_ADDRESSES=16 INSTANCES=24 > "$T/region-ok.json"
 q CPUS_ALL_REGIONS=128 > "$T/project-ok.json"
-q CPUS=24 C2D_CPUS=48 PREEMPTIBLE_CPUS=96 LOCAL_SSD_TOTAL_GB=6000 SSD_TOTAL_GB=2048 IN_USE_ADDRESSES=16 INSTANCES=24 > "$T/region-pre.json"
+q CPUS=24 C2D_CPUS=48 PREEMPTIBLE_CPUS=96 LOCAL_SSD_TOTAL_GB=6000 SSD_TOTAL_GB=4096 IN_USE_ADDRESSES=16 INSTANCES=24 > "$T/region-pre.json"
 : > "$FAKE_GCLOUD_LOG"
 rc=0; out=$(FAKE_REGION_JSON=$T/region-short.json FAKE_PROJECT_JSON=$T/project-short.json "$K/preflight.sh" --approve 2>&1) || rc=$?
-check "short quotas: exit 1, and exactly what to request, where" '[ $rc = 1 ] && [[ "$out" == *"- C2D CPUs (C2D_CPUS), region us-central1: new limit >= 104"* && "$out" == *"- Persistent Disk SSD (GB) (SSD_TOTAL_GB), region us-central1: new limit >= 1140"* && "$out" == *"- In-use regional external IPv4 addresses (IN_USE_ADDRESSES), region us-central1: new limit >= 10"* && "$out" == *"- CPUs (all regions) (CPUS_ALL_REGIONS), global: new limit >= 108"* && "$out" == *"IAM & Admin > Quotas & System Limits"* ]] && [[ "$out" != *"(LOCAL_SSD_TOTAL_GB)"* && "$out" != *"(INSTANCES)"* ]]'
+check "short quotas: exit 1, and exactly what to request, where" '[ $rc = 1 ] && [[ "$out" == *"- C2D CPUs (C2D_CPUS), region us-central1: new limit >= 104"* && "$out" == *"- Persistent Disk SSD (GB) (SSD_TOTAL_GB), region us-central1: new limit >= 2640"* && "$out" == *"- In-use regional external IPv4 addresses (IN_USE_ADDRESSES), region us-central1: new limit >= 10"* && "$out" == *"- CPUs (all regions) (CPUS_ALL_REGIONS), global: new limit >= 108"* && "$out" == *"IAM & Admin > Quotas & System Limits"* ]] && [[ "$out" != *"(LOCAL_SSD_TOTAL_GB)"* && "$out" != *"(INSTANCES)"* ]]'
 check "preflight only reads" '! grep -qE "^gcloud [a-z -]+ (create|delete|start|stop|enable|update|link)" "$FAKE_GCLOUD_LOG"'
 rc=0; out=$(FAKE_REGION_JSON=$T/region-ok.json FAKE_PROJECT_JSON=$T/project-ok.json "$K/preflight.sh" --approve 2>&1) || rc=$?
 check "enough quota, billing on, the API on, the types offered: ready" '[ $rc = 0 ] && [[ "$out" == *"preflight: ready."* && "$out" == *"C2D_CPUS                   us-central1      128       0     128     104  ok"* ]]'

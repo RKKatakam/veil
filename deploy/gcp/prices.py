@@ -10,6 +10,7 @@ line each, USD an hour:
     type MACHINE_TYPE ONDEMAND SPOT
     lssd_gb_month ONDEMAND SPOT
     pd_gb_month PRICE
+    pdssd_gb_month PRICE
     ip_hour ONDEMAND SPOT
 
 A machine type is priced from its family's per-vCPU and per-GiB SKUs in
@@ -76,6 +77,9 @@ def main():
     pd = find(r"^Balanced PD Capacity")
     if pd is not None:
         print(f"pd_gb_month {pd:.6f}")
+    pdssd = find(r"^SSD backed PD Capacity")
+    if pdssd is not None:
+        print(f"pdssd_gb_month {pdssd:.6f}")
     ip = find(r"^External IP Charge on a Standard VM")
     ip_spot = find(r"^External IP Charge on a Spot Preemptible VM")
     if ip is not None:
