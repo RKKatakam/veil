@@ -212,6 +212,53 @@ fn revocation_under_load_refuses_every_later_request() {
     eprintln!("revocation under load: {} requests, {} after the removal, all refused", seen.len(), seen.iter().filter(|s| s.1 > revoked).count());
 }
 
+/// BUG-2459: the tips notice is sent after the push's commit, not in it, so
+/// nothing in the push's own answer shows it went out: a listener on the
+/// channel hears the project's id. (The other tests of tips on two servers
+/// pass on the 100 ms expiry alone.) PostgreSQL only: YugabyteDB 2025.2
+/// does not deliver notices by default, and the server then sends none.
+#[test]
+fn bug_2459_a_push_notifies_every_server_after_its_commit() {
+    let a = TestHub::start();
+    let h = a.hub();
+    let version: String = a.rt.block_on(sqlx::query_scalar("SELECT version()").fetch_one(&h.db)).unwrap();
+    if version.contains("-YB-") {
+        eprintln!("YugabyteDB: notices are not delivered by default; nothing to hear");
+        return;
+    }
+    // The server checks at start, by a notice to itself, that they arrive.
+    let t = Instant::now();
+    while !h.caches.notices.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(h.caches.notices.load(Ordering::SeqCst), "PostgreSQL delivers notices, and the server found it does");
+    let p = setup_project(&a);
+    let pid: i64 = a.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&h.db)).unwrap();
+    let mut listener = a
+        .rt
+        .block_on(async {
+            let mut l = sqlx::postgres::PgListener::connect_with(&h.db).await?;
+            l.listen(veil_server::caches::TIPS_CHANNEL).await?;
+            Ok::<_, sqlx::Error>(l)
+        })
+        .unwrap();
+    write_files(&p.dir, &[("src/notice.txt", "heard")]);
+    p.admin.commit_main(&p.dir, "a push to hear");
+    p.admin.ok(&p.dir, &["push"]);
+    // Moved in: the listener is dropped inside the runtime.
+    let heard = a.rt.block_on(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout_at(deadline, listener.recv()).await {
+                Ok(Ok(n)) if n.payload() == pid.to_string() => return true,
+                Ok(Ok(_)) => continue,
+                _ => return false,
+            }
+        }
+    });
+    assert!(heard, "no notice for project {pid} after its push");
+}
+
 /// A push through one server: the other server's tips follow within the
 /// tips' expiry (at once where the database delivers notices); a push is
 /// never decided by a cached tip.
@@ -359,7 +406,7 @@ fn a_view_carries_the_epochs_it_was_built_under() {
 
 /// A commit through the API (S10) that moves `main` is one database commit
 /// too (branch, snapshot, memo, change ref, audit), and every server's tips
-/// follow it: its notice is sent in that commit.
+/// follow it: its notice follows that commit (BUG-2459).
 #[test]
 fn an_api_commit_is_one_commit_and_moves_every_servers_tips() {
     let a = TestHub::start();

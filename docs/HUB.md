@@ -1734,7 +1734,8 @@ and GC that exist (BUG-1885).
 `phase-2-thin-clients.md` §5.1 allows; rows read before a push's notice are
 never kept after it. A push never trusts the cache: it reads the branches
 and compares and swaps in the database. Notices: PostgreSQL delivers
-`NOTIFY` (another server saw a push within 5–15 ms in the tests);
+`NOTIFY` (another server saw a push within 5–15 ms in the tests, measured
+while the notice was still sent in the push's transaction);
 **YugabyteDB 2025.2 does not by default** (`ysql_yb_enable_listen_notify`
 is off), which the server detects at start (it sends itself a notice), and
 tips then expire after 100 ms only. Its change feed is not used. **The
@@ -2735,8 +2736,8 @@ for 5 s gives the lease back. Its loop:
   transaction: the lease (its holder and epoch: **fencing**), the branch's
   compare-and-swap, an accepted policy, the queue rows (each must still be
   `queued`, else nothing commits: an entry never lands twice), the
-  snapshot, `landings` and memo rows, an audit row and the tips notice.
-  A batch that lands nothing still compares the tip and lineage it judged
+  snapshot, `landings` and memo rows and an audit row; the tips notice
+  follows the commit (BUG-2459). A batch that lands nothing still compares the tip and lineage it judged
   on (BUG-1304): if the branch moved by another route, its entries are built
   again on the database's tip.
 * **Retention, also while busy** (BUG-1303): every 5 s the service deletes

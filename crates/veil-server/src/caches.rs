@@ -691,6 +691,7 @@ pub async fn listen(hub: Arc<crate::Hub>, mut stop: tokio::sync::watch::Receiver
 /// lost (a stopping server, or a database crash before its asynchronous
 /// commit reached the disk) costs only the wait for [`TIPS_TTL`].
 pub async fn send_notices(hub: Arc<crate::Hub>, mut stop: tokio::sync::watch::Receiver<bool>) {
+    let mut failing = false;
     loop {
         tokio::select! {
             _ = hub.caches.notice_wake.notified() => {}
@@ -701,26 +702,37 @@ pub async fn send_notices(hub: Arc<crate::Hub>, mut stop: tokio::sync::watch::Re
         if projects.is_empty() {
             continue;
         }
-        if send(&hub.db, &projects).await.is_ok() {
-            hub.commits.count(crate::db::Commit::Notice);
-        } else {
-            hub.caches.pending_notices.lock().unwrap().extend(projects);
-            hub.caches.notice_wake.notify_one();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        match send(&hub.db, &projects).await {
+            Ok(()) => {
+                failing = false;
+                hub.commits.count(crate::db::Commit::Notice);
+            }
+            Err(e) => {
+                // Once a run of failures: other servers' tips now wait for
+                // their expiry, which no answer shows.
+                if !failing {
+                    eprintln!("veil-server: sending branch-tip notices failed (tips expire after {TIPS_TTL:?} meanwhile; retrying): {e}");
+                }
+                failing = true;
+                hub.caches.pending_notices.lock().unwrap().extend(projects);
+                hub.caches.notice_wake.notify_one();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
         tokio::time::sleep(NOTICE_EVERY.saturating_sub(started.elapsed())).await;
     }
 }
 
+/// One statement, its own transaction: `synchronous_commit` off for it
+/// alone (`set_config(…, true)` is local to the transaction), then a notice
+/// for each project.
 async fn send(db: &sqlx::PgPool, projects: &[i64]) -> std::result::Result<(), sqlx::Error> {
-    let mut tx = db.begin().await?;
-    sqlx::query("SET LOCAL synchronous_commit = off").execute(&mut *tx).await?;
-    sqlx::query("SELECT pg_notify($1, p::text) FROM UNNEST($2::bigint[]) AS t(p)")
+    sqlx::query("SELECT pg_notify($1, p::text) FROM (SELECT set_config('synchronous_commit', 'off', true)) s, UNNEST($2::bigint[]) AS t(p)")
         .bind(TIPS_CHANNEL)
         .bind(projects)
-        .execute(&mut *tx)
+        .execute(db)
         .await?;
-    tx.commit().await
+    Ok(())
 }
 
 async fn start_listener(hub: &crate::Hub) -> Option<sqlx::postgres::PgListener> {
