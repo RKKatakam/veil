@@ -1429,7 +1429,7 @@ found nothing left after each run.
 **What the runs found** (next steps, in order):
 1. **The branch-tips answer costs more with every branch.** Every push asks for the tips first, and the server signs a grant for every branch. Database statements per operation grew from 25 to 140 to 570 as branches piled up. This is the limit at 3,000 or more agents, on every database layout.
 2. **An agent can't delete a branch it merged into another branch** (403: only admins may delete a branch whose work isn't all on `main`). Subagent branches pile up.
-3. **The 1 GB project's full clone peaks at 1,042 MiB on the server.**
+3. **The 1 GB project's full clone peaks at 1,042 MiB on the server.** Fixed on the development machine: BUG-2456 (the allocator returns freed pages sooner and gives the small classes one-page slabs), 962 to 976 MiB there, from 1,001 to 1,026; not yet run on Google Cloud.
 4. **The benchmark's set-up gives up on a `busy` answer** (the 2-server scaling run lost one driver). Fixed: BUG-2435.
 5. **The colocated layout should be the kit's default for YugabyteDB:** it doubled the merge rate and removed the errors. PostgreSQL on its own machine is already a kit option (`VEIL_GCP_YB_NODES=0`); these runs switched by hand only to keep the same machines. Done: the kit's default since 2026-11-15 (§12.10).
 6. **The 10-minute landing mix** is still to run across machines.

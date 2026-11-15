@@ -2473,6 +2473,8 @@ clone's peak was 1,048 MiB (allocated 786, active 938, resident 1,054),
 no lower. So the gate's margin is about the allocator's timing, not
 this branch's live memory: the full clone sits at the gate on every
 build (the cloud run saw 1,042 MiB there). Chunking was not kept.
+Fixed since (BUG-2456): see "The full clone's memory, by the allocator"
+below.
 
 Commits stay 1.00 a push of its own (3.1 to 3.3 in all: the upload's and
 the push's own pack's staged rows, the deriver's). What bounds the rate
@@ -2483,6 +2485,101 @@ own pack is still recorded staged in a commit before it is written
 (BUG-1155, the database knows every upload in storage), the GC guard is
 the transaction's first statement, the review gate its last, every
 compare-and-swap and check as before.
+
+## The full clone's memory, by the allocator (BUG-2456, 2026-11-15)
+
+The 1 GB profile's full clone sat at the server's 1 GB gate
+(`scripts/bench-server.sh 1g`, "clone, full") with live memory that had
+not changed. Measured on `integration` @ `f2ea7734`, with a
+measuring-only build (not committed) that sampled jemalloc every 250 ms
+(`stats.allocated`, `active`, `resident`, the dirty pages of every
+arena, `VmRSS`), the weight of each server cache every 500 ms, and every
+2 s the bytes in use and free in the slabs of each small size class.
+
+**Where the peak comes from** (one run: 1,031 MiB of RSS at the highest sample, the gate read 1,025; MiB):
+
+| | clone starts | at the RSS peak |
+|---|---:|---:|
+| live (`allocated`) | 690 | 771 |
+| of it, the caches' weights (objects 192 + 64 decoded, trees 256, pack indexes 15, others 2) | 529 | 520 |
+| slabs' free space (`active` − `allocated`) | 45 | 157 |
+| freed pages not yet returned (dirty) | 7 | 68 |
+| jemalloc's metadata | 22 | 24 |
+
+* **Live memory** rises about 80 MiB during the clone: its answers in
+  flight. The caches stay at their budgets throughout.
+* **Slabs left part empty: about 110 MiB.** In the clone's first 10 s
+  the object cache fills with the history's small encodings (its entries
+  rise from 109,000 to 218,000, about 920 bytes each). It then takes the
+  larger file objects, its weight held at 192 MiB, and falls to 44,000
+  entries of about 4.5 KiB. jemalloc frees a slab only when all its
+  regions are free, and the 448- to 1,280-byte classes, whose slabs hold
+  16 to 64 regions, were left with 100 MiB free in them: 640 bytes 6 in
+  use and 27 free, 768 bytes 11 and 23, 1,280 bytes 58 and 27. That
+  space stays resident, and the size classes above 3 KiB grow beside it.
+* **Dirty pages: 7 to 92 MiB**, in bursts: what the clone frees, held
+  for up to `dirty_decay_ms` (1,000) before being returned.
+
+Answers built in pieces of one allocation each (an answer's 1 MiB pieces
+grew from empty, each held 2 MiB) lowered the clone's live peak by about
+10 MiB in one run (781 → 770), within the noise. It was not kept.
+
+**The settings tried** (set through `_RJEM_MALLOC_CONF`; one run each,
+with the measuring build, which from the third run on also had the
+pieces above; the clone's server peak, then at the RSS peak its free
+slab space and dirty pages):
+
+| Settings | Clone peak | Slabs free | Dirty | Clone time |
+|---|---:|---:|---:|---:|
+| `dirty_decay_ms:1000` (before) | 1,016, 1,025; with the pieces 1,027, 1,017 | 149 to 158 | 68 to 92 | 32.6 to 35.4 s |
+| `dirty_decay_ms:250` | 999 | 149 | 44 | 33.9 s |
+| `dirty_decay_ms:250,slab_sizes:1-1280:1` | 965 | 120 | 43 | 33.5 s |
+| `dirty_decay_ms:100,slab_sizes:1-1280:1` | 951 | 117 | 37 | 33.8 s |
+
+`slab_sizes:1-1280:1` gives the classes up to 1,280 bytes slabs of one
+page (3 to 9 regions each), so more of them empty out entirely. The
+classes above keep their own sizes: one page holds a single 2,560-byte
+region and wastes 37 % of it.
+
+**Pulls**, through `veil-bench load --mode pull` (the `load` profile's
+quiet and background curves, 15 s a point), each setting alternating with
+the others twice, one binary (the measuring build without the pieces).
+The second round, as pulls a second and server CPU in ms per pull (the
+first round's results were overwritten by the second's):
+
+| Curve, clients | `1000` (before) | `250` + slabs | `100` + slabs |
+|---|---|---|---|
+| quiet, 100 | 48,432/s, 0.17 | 47,657/s, 0.17 | 47,269/s, 0.17 |
+| quiet, 1,000 | 48,122/s, 0.18 | 48,261/s, 0.18 | 46,155/s, 0.18 |
+| background 20, 100 | 32,754/s, 0.24 | 32,550/s, 0.24 | 32,608/s, 0.24 |
+| background 20, 1,000 | 2,598/s, 2.72 | 2,586/s, 2.76 | 2,578/s, 2.77 |
+
+The 10-client points varied 6,000 to 16,500/s between runs of one
+setting (the first second of a curve), so they say nothing either way.
+
+**Chosen: `dirty_decay_ms:250` and `slab_sizes:1-1280:1`**
+(`crates/veil-server/src/main.rs`; the rest as BUG-864 chose them). Of
+the two that cleared the gate it is the smaller step from BUG-864's
+measured choice; 100 ms was 14 MiB lower in one run each, within the
+noise. A unit test reads each setting back from jemalloc
+(`bug_2456_the_allocators_settings_take`), since jemalloc only warns at
+start about a setting it cannot read.
+
+**The gate, before and after**, the release build with no measuring
+code, alternating runs, before set through `_RJEM_MALLOC_CONF` (the old
+string, `slab_sizes:default`) on the same binary:
+
+| | Clone, full: server peak | Clone time | Initial push: peak, time |
+|---|---|---|---|
+| before | 1,001, 1,010, **1,026** (over) | 33.4, 32.9, 35.0 s | 858 to 864 MiB, 104 to 108 s |
+| after | **962, 963, 976** | 33.3, 35.0, 34.4 s | 865 to 868 MiB, 92 to 106 s |
+
+The margin under the gate is now 48 to 62 MiB; before, over every run
+here, it was −3 to 23 (the cloud run measured 1,042 MiB before; not run
+there since).
+What is left: the caches' budgets (objects 256, trees 256 MiB), their
+entries' overhead, and the slab space a cache's turnover leaves, which
+smaller slabs reduce but do not end.
 
 ## What would raise each ceiling (not built)
 

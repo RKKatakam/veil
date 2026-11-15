@@ -162,15 +162,25 @@ fn database_url(given: Option<String>) -> anyhow::Result<String> {
 /// returns little of it, so a 1 GB push left the server at 2.4 GB for under
 /// 1 GB of data. Two arenas (each thread keeps a small cache in
 /// front of them) and background threads returning memory unused for a
-/// second keep it near what it holds (`docs/design/scale/BASELINE.md`,
+/// moment keep it near what it holds (`docs/design/scale/BASELINE.md`,
 /// "The server's allocator"). `_RJEM_MALLOC_CONF` overrides these settings.
+///
+/// BUG-2456 (`docs/design/scale/LOAD.md`, "The full clone's memory, by
+/// the allocator"): a full clone of the 1 GB project sat at the 1 GB gate
+/// with the same live memory. What its peak had besides live memory:
+/// pages freed and not yet returned (up to 90 MiB with a second's decay,
+/// about 40 at 250 ms), and slabs left part empty when the object cache
+/// swapped its small entries for the clone's larger ones (about 110 MiB, in
+/// the 448- to 1,280-byte classes, whose slabs hold 16 to 64 regions; with
+/// slabs of one page, 3 to 9, more of them empty out whole). Pulls' rate
+/// and CPU and the clone's time were unchanged.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// jemalloc reads its settings from this symbol at start (a C string).
 #[used]
 #[export_name = "_rjem_malloc_conf"]
-static MALLOC_CONF: &[u8; 70] = b"narenas:2,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+static MALLOC_CONF: &[u8; 89] = b"narenas:2,background_thread:true,dirty_decay_ms:250,muzzy_decay_ms:0,slab_sizes:1-1280:1\0";
 
 fn main() -> anyhow::Result<()> {
     // Deep trees recurse on every server thread (BUG-1052).
@@ -352,4 +362,49 @@ fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
         "landing_walks": hub.landing.stats.walks.load(Relaxed),
         "landing_graph_reads": hub.landing.stats.graph_reads.load(Relaxed),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::{c_char, c_int, c_void, CString};
+
+    extern "C" {
+        // jemalloc's own (tikv-jemalloc-sys, prefixed): read a setting.
+        fn _rjem_mallctl(name: *const c_char, oldp: *mut c_void, oldlenp: *mut usize, newp: *mut c_void, newlen: usize) -> c_int;
+    }
+
+    fn read<T: Default>(name: &str) -> T {
+        let n = CString::new(name).unwrap();
+        let mut v = T::default();
+        let mut len = std::mem::size_of::<T>();
+        // SAFETY: `v` is a `T` of `len` bytes, the size jemalloc's setting has.
+        let r = unsafe { _rjem_mallctl(n.as_ptr(), &mut v as *mut T as *mut c_void, &mut len, std::ptr::null_mut(), 0) };
+        assert_eq!((r, len), (0, std::mem::size_of::<T>()), "reading {name}");
+        v
+    }
+
+    /// BUG-2456: every one of [`super::MALLOC_CONF`]'s settings took (a
+    /// setting jemalloc cannot read is only warned about at start).
+    #[test]
+    fn bug_2456_the_allocators_settings_take() {
+        assert!(std::env::var_os("_RJEM_MALLOC_CONF").is_none(), "the settings under test are the compiled ones");
+        assert_eq!(read::<u32>("opt.narenas"), 2);
+        assert!(read::<bool>("opt.background_thread"));
+        assert_eq!(read::<isize>("opt.dirty_decay_ms"), 250);
+        assert_eq!(read::<isize>("opt.muzzy_decay_ms"), 0);
+        // One page a slab for the classes up to 1,280 bytes, the default above.
+        let (classes, page) = (read::<u32>("arenas.nbins"), read::<usize>("arenas.page"));
+        let (mut small, mut above) = (0, 0);
+        for j in 0..classes {
+            let (size, slab) = (read::<usize>(&format!("arenas.bin.{j}.size")), read::<usize>(&format!("arenas.bin.{j}.slab_size")));
+            if size <= 1280 {
+                assert_eq!(slab, page, "the {size}-byte class's slab");
+                small += 1;
+            } else if size == 1536 {
+                assert!(slab > page, "the {size}-byte class keeps its default slab ({slab})");
+                above += 1;
+            }
+        }
+        assert!(small >= 20 && above == 1, "{small} classes up to 1,280 bytes, {above} at 1,536");
+    }
 }
