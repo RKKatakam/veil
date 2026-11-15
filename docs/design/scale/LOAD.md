@@ -2443,6 +2443,17 @@ one run each):
 | 300 | 830.3 → **915.9** | 350 → 318 | 488 → 555 | 19.44 → 19.50 | 1.65 → 1.08 | 8.33 → **5.66** | 43.7 → **26.0** | 5.99 → 3.29 | 0 |
 | 1,000 | 353.0 → 356.6 | 3,123 → 3,084 | 4,428 → 4,631 | 56.4 → 54.9 | 2.46 → 1.37 | 8.33 → **6.86** | 46.7 → **31.2** | 4.72 → 3.71 | 0 |
 
+**p99 rose at every point of this table** (167 → 210, 488 → 555, 4,428 →
+4,631 ms), one run each. The 300-agent point was run twice more each
+way, alternating, without the profiler (`bench-quiet.sh`, load 4.9
+before, 28 after): before 891.1 and 852.1/s at p99 702 and 465 ms, after
+915.0 and 937.5/s at p99 533 and 524 ms. So over three runs each p99 is
+465 to 702 ms before and 524 to 555 ms after: the after runs lie inside
+the before runs' spread but above two of the three, and three runs do not
+tell a rise from noise; 100 and 1,000 agents were not run again. Pushes
+a second were higher after in all six (915.0 to 937.5 against 830.3 to
+891.1 at 300 agents).
+
 Commits stay 1.00 a push of its own (3.1 to 3.3 in all: the upload's and
 the push's own pack's staged rows, the deriver's). What bounds the rate
 here is the tips request each operation makes (13.7 ms at 300 agents,
