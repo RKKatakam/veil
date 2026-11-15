@@ -70,3 +70,4 @@ mod branch_landing;
 mod pack_merge_bg;
 mod conflict_retry;
 mod commits;
+mod branch_count;

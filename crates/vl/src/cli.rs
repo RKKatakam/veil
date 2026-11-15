@@ -775,6 +775,12 @@ pub enum Cmd {
         /// --no-wait).
         #[arg(long, value_name = "TICKET", conflicts_with_all = ["rev", "onto"])]
         status: Option<String>,
+        /// Once it landed, delete the branch REV names, on the server and
+        /// here, if its work is all on --onto then (a subagent's branch
+        /// merged into its agent's). Never the default branch, a protected
+        /// one or an embargo's line.
+        #[arg(long, conflicts_with_all = ["no_wait", "status"])]
+        delete: bool,
     },
     /// Fetch tags and history from the Veil server: what you may see.
     Pull {

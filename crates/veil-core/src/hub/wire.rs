@@ -47,10 +47,31 @@ pub const PROTOCOL: u32 = 1;
 /// ([`HistoryRequest::limit`]), for thin clones; 5, `q/resolve` names the
 /// snapshots of the caller's history by id prefix ([`Resolved`]); 6,
 /// `q/generations` gives their generations ([`Generations`]); 7,
-/// `subtree` answers the trees of a folder, every level, in one request.
-pub const REVISION: u32 = 7;
+/// `subtree` answers the trees of a folder, every level, in one request;
+/// 8, `tips?branches=` answers for the branches named only
+/// ([`TIPS_BRANCHES`]), and a landing deletes the branch it merged when
+/// asked (`super::land::LandRequest::delete_branch`).
+pub const REVISION: u32 = 8;
 /// The revision that answers `subtree` (see [`REVISION`]).
 pub const SUBTREE_REVISION: u32 = 7;
+/// The revision that answers `tips?branches=` and takes a landing's
+/// `delete_branch` (see [`REVISION`]).
+pub const NAMED_TIPS_REVISION: u32 = 8;
+/// The query parameter of `GET …/tips` naming, separated by commas, the
+/// branches the caller needs (`docs/HUB.md` §13.41): the answer holds those
+/// and the default branch only, each exactly as the full answer has it.
+/// Without it, every branch. A server before [`NAMED_TIPS_REVISION`]
+/// ignores it and answers in full.
+pub const TIPS_BRANCHES: &str = "branches";
+/// Most branches one `tips?branches=` names.
+pub const MAX_TIPS_BRANCHES: usize = 64;
+
+/// The path and query of `GET …/tips` for `branches` (and the default
+/// branch): `/tips?branches=a,b`. Branch names are valid tag names, which
+/// need no escaping in a query.
+pub fn tips_query(branches: &[String]) -> String {
+    format!("/tips?{TIPS_BRANCHES}={}", branches.join(","))
+}
 
 /// The request header in which `vl` says the newest repository format it
 /// reads (`repo::REPO_FORMAT`). A client that sends none is taken to read

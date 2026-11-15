@@ -48,6 +48,12 @@ pub struct LandRequest {
     /// `queued`.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub wait: bool,
+    /// With an uploaded `snapshot` (revision 8, `docs/HUB.md` §13.41): once
+    /// the stack landed in this request, delete this branch (the one the
+    /// snapshot was pushed to) if its work is all on `onto` then. Never the
+    /// default branch, a protected one or an embargo's line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_branch: Option<String>,
 }
 
 fn yes() -> bool {
@@ -122,9 +128,13 @@ pub struct LandResult {
     /// How many times a merge worker cleanly merged and re-queued this ticket.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub merges: u32,
-    /// What an admin's change of access lines made visible to whom.
+    /// What an admin's change of access lines made visible to whom; why
+    /// `delete_branch` was not deleted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// `landed`: the request's `delete_branch`, deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_branch: Option<String>,
 }
 
 #[cfg(test)]
@@ -152,6 +162,7 @@ mod tests {
             landed_since: vec![],
             merges: 0,
             warnings: vec![],
+            deleted_branch: None,
         };
         let v = serde_json::to_value(&out).unwrap();
         assert_eq!(v["state"], "conflict");

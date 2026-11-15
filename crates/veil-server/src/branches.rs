@@ -179,3 +179,91 @@ pub(crate) async fn delete_landed_pr_branch(hub: &Arc<Hub>, project: &Project, p
     }
     Ok(())
 }
+
+/// What a landing's `delete_branch` that was not deleted is told, whatever
+/// the reason (`docs/HUB.md` §13.41): deleted or not is the one bit it
+/// learns, the bit a push's deletion gives about the default branch.
+pub(crate) fn not_deleted(branch: &str, onto: &str) -> String {
+    format!(
+        "'{branch}' was not deleted: only a branch whose work is all on '{onto}' is, and never the default branch, a protected branch or an embargo's line"
+    )
+}
+
+/// A landing onto `onto` landed (`LandRequest::delete_branch`): delete
+/// `branch` if its tip is contained in `onto` now ([`contained`], as a
+/// push's deletion of a branch merged into the default branch), in one
+/// compare-and-swap on its tip and on `onto`'s lineage. Never the default
+/// branch, a protected one or an embargo's line; only for someone who may
+/// write; for an agent session, only a branch it may move
+/// ([`agent_may_delete`]). `Ok(None)`: deleted; else why not, for the
+/// caller.
+pub(crate) async fn delete_merged_into(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    branch: &str,
+    onto: &str,
+    actor: i64,
+) -> Result<Option<String>> {
+    let no = || Ok(Some(not_deleted(branch, onto)));
+    if branch == onto || !project.view(viewer).writes_anything() {
+        return no();
+    }
+    let default_tip = tip_of(hub, project.id, &project.default_branch).await?.map(|(t, _)| t);
+    let rules = blocking_staged(hub, project.id, None, move |src| crate::landing::rules(src, default_tip)).await?;
+    if kept(branch, &project.default_branch, &rules.protected) {
+        return no();
+    }
+    // An embargo's hidden line is not there, as for a name that is not.
+    let (Some((tip, _)), Some((onto_tip, lineage))) = (tip_of(hub, project.id, branch).await?, tip_of(hub, project.id, onto).await?) else {
+        return no();
+    };
+    let mut anc = Ancestry::new_staged(hub.clone(), project.id, onto, onto_tip, lineage, None);
+    if !contained(hub, project.id, &mut anc, onto_tip, tip).await? {
+        return no();
+    }
+    match agent_may_delete(hub, project, viewer, tip, None).await? {
+        Some(AgentTip::Narrowed) => return Ok(Some(crate::sync::NARROWED_MOVE.to_string())),
+        Some(AgentTip::Access) => return Ok(Some(crate::sync::AGENT_ACCESS_MOVE.to_string())),
+        Some(AgentTip::DefaultBranch) | None => {}
+    }
+    let notify = hub.caches.notices.load(Ordering::SeqCst);
+    let pid = project.id;
+    let (b, o, t) = (branch.to_string(), onto.to_string(), tip.hex());
+    let deleted = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
+        let (b, o, t) = (b.clone(), o.clone(), t.clone());
+        Box::pin(async move {
+            let n = sqlx::query(
+                "DELETE FROM branches WHERE project_id = $1 AND name = $2 AND target = $3 AND hidden_for_embargo IS NULL \
+                 AND EXISTS (SELECT 1 FROM branches WHERE project_id = $1 AND name = $4 AND lineage = $5)",
+            )
+            .bind(pid)
+            .bind(&b)
+            .bind(&t)
+            .bind(&o)
+            .bind(lineage)
+            .execute(&mut *c)
+            .await?
+            .rows_affected();
+            if n == 1 {
+                sqlx::query("INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $2, $3, 'push', $4)")
+                    .bind(pid)
+                    .bind(veil_core::now_millis())
+                    .bind(actor)
+                    .bind(format!("deleted the branch {b:?}: it landed on {o:?}"))
+                    .execute(&mut *c)
+                    .await?;
+                if notify {
+                    sqlx::query("SELECT pg_notify($1, $2)").bind(crate::caches::TIPS_CHANNEL).bind(pid.to_string()).execute(&mut *c).await?;
+                }
+            }
+            Ok(n == 1)
+        })
+    })
+    .await?;
+    if !deleted {
+        return no();
+    }
+    hub.caches.tips_changed(pid);
+    Ok(None)
+}

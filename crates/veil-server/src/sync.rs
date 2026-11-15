@@ -953,10 +953,12 @@ async fn resolve_for_mode(
 /// as a line; past it, the change they stand on.
 pub const NEWEST_BOUND: usize = 4_096;
 
-/// Branch tips as `viewer` sees them. The branch rows come from this
-/// server's memory for at most `caches::TIPS_TTL`, dropped at every push's
-/// notice; each viewer's projection is of their current view.
-pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<Vec<(String, ObjectId)>> {
+/// Branch tips as `viewer` sees them: every branch, or (`only`) those of
+/// them named (`tips?branches=`, `docs/HUB.md` §13.41), each projected as
+/// in the full answer. The branch rows come from this server's memory for
+/// at most `caches::TIPS_TTL`, dropped at every push's notice; each
+/// viewer's projection is of their current view.
+pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, only: Option<&std::collections::BTreeSet<String>>) -> Result<Vec<(String, ObjectId)>> {
     use crate::caches::TipsLookup;
     let rows = loop {
         match hub.caches.tips(project.id) {
@@ -991,7 +993,15 @@ pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer) -> Result<
             }
         }
     };
-    let rows = crate::embargo::filter_branches(hub, project, viewer, &rows).await?;
+    let named: Vec<(String, String)>;
+    let rows: &[(String, String)] = match only {
+        Some(only) => {
+            named = rows.iter().filter(|(name, _)| only.contains(name)).cloned().collect();
+            &named
+        }
+        None => rows.as_slice(),
+    };
+    let rows = crate::embargo::filter_branches(hub, project, viewer, rows).await?;
     let mut out = Vec::new();
     for (name, target) in rows.iter() {
         let real = ObjectId::from_hex(target).map_err(|e| Error::Other(e.into()))?;
@@ -1038,7 +1048,7 @@ pub async fn history(
         // the branches reach (`q/resolve`, BUG-1268).
         // (Branch tips, as a clone and a pull ask for, are in it: no
         // viewer graph is needed for them.)
-        let branch_tips: HashSet<ObjectId> = self::tips(hub, project, viewer).await?.into_iter().map(|(_, t)| t).collect();
+        let branch_tips: HashSet<ObjectId> = self::tips(hub, project, viewer, None).await?.into_iter().map(|(_, t)| t).collect();
         let starts = match starts.iter().all(|s| branch_tips.contains(s)) {
             true => starts,
             false => {

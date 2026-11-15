@@ -398,8 +398,22 @@ pub fn move_before_push(ctx: &mut Ctx, remote: &str, only_tags: &[String]) -> Re
     // request a tag (BUG-1575). They are the server's own tips, each
     // asked for once: one request, whatever the number of branches that
     // moved (BUG-1625).
+    // The branches it pushes and the default branch: what the work stands
+    // on, at a cost that does not grow with the project's branches
+    // (`docs/HUB.md` §13.41).
+    let pushed: Vec<String> = v
+        .tags
+        .iter()
+        .filter(|(n, _)| only_tags.is_empty() || only_tags.contains(n))
+        .filter(|(n, t)| v.remote_tags.get(&format!("{remote}/{n}")) != Some(&t.target))
+        .map(|(n, _)| n.clone())
+        .collect();
     let (client, _) = client_for(ctx, remote)?;
-    let mut current: Vec<veil_core::ObjectId> = client.tips()?.map(|t| t.branches.values().copied().collect()).unwrap_or_default();
+    let tips = match pushed.len() <= veil_core::hub::wire::MAX_TIPS_BRANCHES {
+        true => client.tips_of(&pushed)?,
+        false => client.tips()?,
+    };
+    let mut current: Vec<veil_core::ObjectId> = tips.map(|t| t.branches.values().copied().collect()).unwrap_or_default();
     current.sort();
     current.dedup();
     let unheld: Vec<veil_core::ObjectId> = current.iter().copied().filter(|t| !store.has(t)).collect();
@@ -487,18 +501,24 @@ pub fn push(ctx: &mut Ctx, remote: &str, tags: &[String], force: bool, verify: &
 }
 
 /// `vl land` (`docs/HUB.md` §13.19).
-pub fn land(ctx: &mut Ctx, remote: &str, rev: Option<&str>, onto: Option<&str>, wait: bool, status: Option<&str>) -> Result<ExitCode> {
+pub fn land(ctx: &mut Ctx, remote: &str, rev: Option<&str>, onto: Option<&str>, wait: bool, status: Option<&str>, delete: bool) -> Result<ExitCode> {
     use veil_core::hub::land::LandState;
     let (client, _) = client_for(ctx, remote)?;
     let (result, uploaded) = match status {
         Some(ticket) => (client.land_status(ticket, wait)?, None),
         None => {
+            // `--delete` deletes the branch named: REV must be one.
+            let delete = match (delete, rev) {
+                (false, _) => None,
+                (true, Some(b)) if ctx.repo.view().tags.contains_key(b) => Some(b),
+                (true, _) => bail!("--delete deletes the branch REV names: `vl land BRANCH --onto B --delete`"),
+            };
             let id = ctx.rev(rev.unwrap_or("@-"))?;
             let onto = match onto {
                 Some(b) => b.to_string(),
-                None => client.tips()?.ok_or_else(|| anyhow!("no project '{}' that you can see", client.url.project))?.default_branch,
+                None => client.tips_of(&[])?.ok_or_else(|| anyhow!("no project '{}' that you can see", client.url.project))?.default_branch,
             };
-            let out = hub::land(&mut ctx.repo, remote, &client, id, &onto, wait)?;
+            let out = hub::land(&mut ctx.repo, remote, &client, id, &onto, wait, delete)?;
             (out.result, Some((out.uploaded, onto)))
         }
     };
@@ -509,6 +529,9 @@ pub fn land(ctx: &mut Ctx, remote: &str, rev: Option<&str>, onto: Option<&str>, 
             println!("  {} {} → {} ({} change(s))", green("landed"), cyan(&safe(onto)), tip, result.landed.len());
             for w in &result.warnings {
                 println!("  {} {}", dim("note:"), safe(w));
+            }
+            if let Some(b) = &result.deleted_branch {
+                println!("Deleted the branch '{}' on {remote}: its work is on {}", safe(b), safe(onto));
             }
         }
         LandState::Queued => println!("  {} as {} (`vl land --status {}`)", yellow("queued"), bold(&result.ticket), result.ticket),

@@ -721,8 +721,8 @@ fn dispatch(ctx: &mut Ctx, cli: &Cli) -> Result<ExitCode> {
                 false => code,
             });
         }
-        Cmd::Land { rev, onto, remote, no_wait, status } => {
-            let code = hub_cmd::land(ctx, remote, rev.as_deref(), onto.as_deref(), !*no_wait, status.as_deref())?;
+        Cmd::Land { rev, onto, remote, no_wait, status, delete } => {
+            let code = hub_cmd::land(ctx, remote, rev.as_deref(), onto.as_deref(), !*no_wait, status.as_deref(), *delete)?;
             // Sent, as `vl push` sends (BUG-2170): the change landed (or
             // queued) without a quarantined file is not a plain success
             // either. `--status` sends nothing.
