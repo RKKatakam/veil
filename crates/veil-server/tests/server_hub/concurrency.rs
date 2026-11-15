@@ -379,3 +379,216 @@ fn bug_1593_a_landing_is_one_database_commit() {
     // database's own maintenance.
     assert!(committed <= (2 * LANDINGS + 20) as i64, "{committed} transactions committed for {LANDINGS} landings ({per_landing:.2} per landing; the gate is 1, the deriver's aside)");
 }
+
+/// The person id of `name`.
+fn person_id(hub: &TestHub, name: &str) -> i64 {
+    hub.rt
+        .block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(name).fetch_one(&hub.hub().db))
+        .unwrap()
+}
+
+/// The push's rows are written in one statement of its transaction (its
+/// snapshot, origin, the pusher's memo, its audit row and the tips notice)
+/// and its packs listed in one (`packs::` races those with discards):
+/// under pushes racing on one branch and on branches of their own, every
+/// push that landed wrote exactly its rows, and one that lost wrote none.
+#[test]
+fn racing_pushes_write_exactly_the_rows_of_those_that_landed() {
+    let hub = TestHub::start();
+    let (p, ws) = workers_project(&hub);
+    let api = Arc::new(hub.api());
+    // (worker, the tip shown back) of every push that landed.
+    let landed = Arc::new(std::sync::Mutex::new(Vec::<(usize, ObjectId)>::new()));
+    std::thread::scope(|s| {
+        for (i, w) in ws.iter().enumerate() {
+            let (api, landed, project) = (api.clone(), landed.clone(), p.name.clone());
+            s.spawn(move || {
+                let mine = format!("own-{i}");
+                let mut expected: Option<ObjectId> = None;
+                for k in 0..PUSHES {
+                    // Its own branch: never raced, always lands.
+                    let mut c = Craft::with(&api, w.token.clone(), w.identity.clone(), &project, "main");
+                    if let Some(e) = expected {
+                        c.tip = e;
+                        c.root = c.tree_of(e);
+                    }
+                    c.file(&format!("w/{i}/own{k}"), "mine");
+                    let r = c.push_to(&mine, expected);
+                    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                    let res = &r.json()["results"][0];
+                    assert_eq!(res["ok"], json!(true), "{res}");
+                    let tip = ObjectId::from_hex(res["tip"].as_str().unwrap()).unwrap();
+                    landed.lock().unwrap().push((i, tip));
+                    expected = Some(tip);
+                    // `main`, raced by everyone: once each, lands or loses.
+                    let mut c = Craft::with(&api, w.token.clone(), w.identity.clone(), &project, "main");
+                    c.file(&format!("w/{i}/main{k}"), "shared");
+                    let r = c.push("main", &format!("w{i}-{k}"));
+                    assert!(matches!(r.status, 200 | 409 | 503), "{}: {}", r.status, String::from_utf8_lossy(&r.body));
+                    if r.status == 200 && r.json()["results"][0]["ok"] == json!(true) {
+                        let tip = ObjectId::from_hex(r.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
+                        landed.lock().unwrap().push((i, tip));
+                    }
+                }
+            });
+        }
+    });
+    let landed = landed.lock().unwrap().clone();
+    assert!(landed.len() > WORKERS * PUSHES, "every own-branch push and at least one push to main landed: {}", landed.len());
+    let h = hub.hub();
+    let pid: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&h.db)).unwrap();
+    let mut audit_want: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for (i, shown) in &landed {
+        let person = person_id(&hub, &ws[*i].name);
+        *audit_want.entry(person).or_default() += 1;
+        // The worker cannot see everything: the server completed their
+        // snapshot (a real one, its origin theirs) and showed them their own.
+        let reals: Vec<String> = hub
+            .rt
+            .block_on(sqlx::query_scalar("SELECT real_id FROM origins WHERE project_id = $1 AND origin_id = $2").bind(pid).bind(shown.hex()).fetch_all(&h.db))
+            .unwrap();
+        assert_eq!(reals.len(), 1, "one completed snapshot of {}", shown.short());
+        let author: i64 = hub
+            .rt
+            .block_on(sqlx::query_scalar("SELECT author FROM snapshots WHERE project_id = $1 AND id = $2").bind(pid).bind(&reals[0]).fetch_one(&h.db))
+            .unwrap();
+        assert_eq!(author, person, "the snapshot's author is its pusher");
+        let memos: Vec<String> = hub
+            .rt
+            .block_on(
+                sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND real_id = $2 AND view_key <> 'admin'")
+                    .bind(pid)
+                    .bind(&reals[0])
+                    .fetch_all(&h.db),
+            )
+            .unwrap();
+        assert!(memos.contains(&shown.hex()), "the pusher's memo of {} is their own snapshot: {memos:?}", shown.short());
+    }
+    for (person, want) in audit_want {
+        let n: i64 = hub
+            .rt
+            .block_on(
+                sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE project_id = $1 AND actor = $2 AND action = 'push'")
+                    .bind(pid)
+                    .bind(person)
+                    .fetch_one(&h.db),
+            )
+            .unwrap();
+        assert_eq!(n, want, "one audit row for each push of person {person} that landed, none for one that lost");
+    }
+}
+
+/// A push and an admin's deletion of the same branch, both on its tip, at
+/// once, round after round: exactly one of them wins each time, and the
+/// branch is then where the winner left it.
+#[test]
+fn a_push_racing_a_branch_deletion_one_wins() {
+    const ROUNDS: usize = 8;
+    let hub = TestHub::start();
+    let (p, ws) = workers_project(&hub);
+    let api = hub.api();
+    let w = &ws[0];
+    let branch = unique("doomed");
+    let admin_token = p.admin.token();
+    let push_path = format!("/v1/projects/{}/push", p.name);
+    for round in 0..ROUNDS {
+        // The branch, (re)made by the worker on main.
+        let mut c = Craft::with(&api, w.token.clone(), w.identity.clone(), &p.name, "main");
+        c.file(&format!("w/0/r{round}"), "x");
+        let r = c.push_to(&branch, None);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", r.json());
+        let shown = ObjectId::from_hex(r.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
+        let real = api.tips(Some(&admin_token), &p.name).unwrap().branches[&branch];
+        // The worker's next push on it, crafted before the race.
+        let mut next = Craft::with(&api, w.token.clone(), w.identity.clone(), &p.name, "main");
+        next.tip = shown;
+        next.root = next.tree_of(shown);
+        next.file(&format!("w/0/r{round}b"), "y");
+        let barrier = std::sync::Barrier::new(2);
+        let (pushed, deleted) = std::thread::scope(|s| {
+            let pushed = s.spawn(|| {
+                barrier.wait();
+                next.push_to(&branch, Some(shown))
+            });
+            let deleted = s.spawn(|| {
+                barrier.wait();
+                api.post_json(Some(&admin_token), &push_path, &json!({"updates": [{"branch": branch, "expected": real.hex(), "new": null}], "receipts": {}}))
+            });
+            (pushed.join().unwrap(), deleted.join().unwrap())
+        });
+        let won = |r: &Reply| r.status == 200 && r.json()["results"][0]["ok"] == json!(true);
+        for r in [&pushed, &deleted] {
+            assert!(matches!(r.status, 200 | 409 | 503), "{}: {}", r.status, String::from_utf8_lossy(&r.body));
+        }
+        let tips = api.tips(Some(&admin_token), &p.name).unwrap();
+        match (won(&pushed), won(&deleted)) {
+            (true, false) => {
+                let tip = tips.branches.get(&branch).copied();
+                assert!(tip.is_some() && tip != Some(real), "round {round}: the push won and the branch moved");
+                // Gone for the next round.
+                let r = api.post_json(Some(&admin_token), &push_path, &json!({"updates": [{"branch": branch, "expected": tip.unwrap().hex(), "new": null}], "receipts": {}}));
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", r.json());
+            }
+            (false, true) => assert!(!tips.branches.contains_key(&branch), "round {round}: the deletion won and the branch is gone"),
+            other => panic!("round {round}: exactly one wins, not {other:?}: push {} {}, delete {} {}", pushed.status, String::from_utf8_lossy(&pushed.body), deleted.status, String::from_utf8_lossy(&deleted.body)),
+        }
+    }
+}
+
+/// Pushes racing an admin's removal of the pushers from the group that
+/// may write `w/`: each push is either landed or refused, a push that began
+/// after the removal was in never lands, and one does get refused.
+#[test]
+fn pushes_racing_an_access_change_land_only_before_it() {
+    const PUSHERS: usize = 4;
+    let hub = TestHub::start();
+    let (p, ws) = workers_project(&hub);
+    let api = hub.api();
+    let removed_at = std::sync::Mutex::new(None::<std::time::Instant>);
+    let results = std::sync::Mutex::new(Vec::<(std::time::Instant, bool)>::new());
+    std::thread::scope(|s| {
+        for (i, w) in ws.iter().enumerate().take(PUSHERS) {
+            let (api, results, removed_at) = (&api, &results, &removed_at);
+            let project = p.name.clone();
+            s.spawn(move || {
+                let mine = format!("acc-{i}");
+                // Crafted once while they may read; each next push carries the
+                // trees its last one made, so it reads nothing.
+                let mut c = Craft::with(api, w.token.clone(), w.identity.clone(), &project, "main");
+                let mut expected: Option<ObjectId> = None;
+                for k in 0.. {
+                    c.file(&format!("w/{i}/acc{k}"), "z");
+                    let (root, objects) = (c.root, c.objects.clone());
+                    let started = std::time::Instant::now();
+                    // Refused at the upload or at the push.
+                    let (r, _) = c.try_push_to(&mine, expected);
+                    let ok = r.status == 200 && r.json()["results"][0]["ok"] == json!(true);
+                    assert!(ok || matches!(r.status, 400 | 403 | 404), "landed or refused, not {}: {}", r.status, String::from_utf8_lossy(&r.body));
+                    results.lock().unwrap().push((started, ok));
+                    if !ok {
+                        break;
+                    }
+                    let tip = ObjectId::from_hex(r.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
+                    expected = Some(tip);
+                    c = Craft { api, token: w.token.clone(), identity: w.identity.clone(), project: project.clone(), tip, root, objects };
+                    let done = removed_at.lock().unwrap().is_some_and(|t: std::time::Instant| t.elapsed() > std::time::Duration::from_secs(5));
+                    assert!(!done, "pusher {i} still landing 5 s after the removal");
+                }
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let mut args = vec!["group", "remove", "w"];
+        args.extend(ws.iter().take(PUSHERS).map(|w| w.name.as_str()));
+        p.admin.ok(&p.dir, &args);
+        *removed_at.lock().unwrap() = Some(std::time::Instant::now());
+    });
+    let removed_at = removed_at.lock().unwrap().unwrap();
+    let results = results.lock().unwrap();
+    assert!(results.iter().any(|(started, ok)| *ok && *started < removed_at), "pushes landed before the removal");
+    assert!(results.iter().any(|(_, ok)| !*ok), "the removal refused their pushes");
+    for (started, ok) in results.iter() {
+        assert!(!(*ok && *started > removed_at), "a push that began after the removal was in landed");
+    }
+}
