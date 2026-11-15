@@ -627,6 +627,24 @@ pub async fn read_gc_epoch(hub: &Hub, project: i64) -> Result<i64> {
     Ok(epoch)
 }
 
+/// [`read_gc_epoch`] for a push, which carries the epoch its request read
+/// (`read`: the session check's `access_epochs (project, -1)`, read before
+/// anything the push checks, as `read_gc_epoch` would be): taken as it is
+/// once this server saw the row exist (rows are never deleted; the request
+/// read 0 for a missing one, which [`guard_root_write`] would refuse), so a
+/// push does not read it twice. A switch after that read fails the push's
+/// guard (`GcEpochChanged`), and the request runs again, as before.
+pub async fn push_gc_epoch(hub: &Hub, project: i64, read: Option<(i64, i64)>) -> Result<i64> {
+    if let Some((p, epoch)) = read {
+        if p == project && hub.caches.gc_row_known(project) {
+            return Ok(epoch);
+        }
+    }
+    let epoch = read_gc_epoch(hub, project).await?;
+    hub.caches.know_gc_row(project);
+    Ok(epoch)
+}
+
 /// The advisory lock that queues a project's root-adding transactions and
 /// GC's switch in arrival order (`"veilgcgt"` ^ `project_id`). The epoch row's
 /// lock alone is what makes the switch safe, but PostgreSQL lets a new

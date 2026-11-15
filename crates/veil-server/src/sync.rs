@@ -2619,7 +2619,7 @@ async fn push_staged(
     if req.force && viewer.agent {
         return Err(agent_refusal("an agent session never forces a branch move"));
     }
-    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
+    let gc_epoch = crate::pack_gc::push_gc_epoch(hub, project.id, who.epochs.gc).await?;
     if req.updates.len() > MAX_PUSH_UPDATES {
         return Err(Error::bad_request(format!("at most {MAX_PUSH_UPDATES} branch updates per push")));
     }
