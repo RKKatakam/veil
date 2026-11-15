@@ -1501,7 +1501,25 @@ asks for the tips first, and the answer names (and signs a grant for) every
 branch of the project (§12.9, first finding). At 5,000 agents the server
 sheds load ("come back later"), and the retried uploads add their pack
 rows' commits. The database is not the limit there: it used 1.2 cores at
-5,000 agents.
+5,000 agents (16.2 ms of its CPU a push). With few branches it is: a second
+64-agent run counting the PostgreSQL container's CPU alone measured 925
+pushes a second with the database at 10.0 cores, **10.8 ms of database CPU
+a push** (about 0.27 ms a statement), the server at 7.1 ms.
+
+**What 7,200 pushes a second would need** (an estimate from the costs
+above, not a measurement across machines; at 70 % of each machine's cores):
+
+| Cost per push | Server cores | Database cores | Database load | Balancer |
+|---|---:|---:|---|---|
+| today, 5,000 branches (251 ms server, 16.2 ms database, 69 statements, 7.3 commits, 3.5 MB tips) | about 2,600 | about 170 | 497,000 statements and 52,000 commits a second | 25 GB/s of tips: not possible |
+| today, few branches (7.1 ms, 10.8 ms, 40 statements, 3 commits, 11.6 KB WAL) | about 73: 7 servers of 16 vCPUs | about 111 | 290,000 statements and 22,000 commits a second, 84 MB/s of WAL | small |
+| the tips' cost no longer growing with branches, and 15 statements and 1 commit a push | about 73 | about 42 (at 0.27 ms a statement) | 108,000 statements and 7,200 commits a second | small |
+
+Database cores scale with statements per push, server cores with the
+server's CPU per push; both are what the work on the tips and on the push
+path (statements, commits) changes. One PostgreSQL machine of 48 to 64
+vCPUs on a fast persistent disk covers the last row; YugabyteDB does not
+help one repository past one node (above).
 
 **Why more tablets do not spread one repository.** Every table's primary
 key starts with `project_id`, and YugabyteDB hashes a key's first column:
