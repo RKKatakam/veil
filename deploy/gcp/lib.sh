@@ -227,11 +227,13 @@ price_of() { # machine type, spot|ondemand
         c2d-standard-8/ondemand) echo 0.364 ;;  c2d-standard-8/spot) echo 0.167 ;;
         c2d-standard-16/ondemand) echo 0.727 ;; c2d-standard-16/spot) echo 0.333 ;;
         c2d-standard-32/ondemand) echo 1.453 ;; c2d-standard-32/spot) echo 0.666 ;;
+        c2d-standard-56/ondemand) echo 2.543 ;; c2d-standard-56/spot) echo 1.165 ;;
         n2d-standard-8/ondemand) echo 0.338 ;;  n2d-standard-8/spot) echo 0.180 ;;
         n2d-standard-16/ondemand) echo 0.676 ;; n2d-standard-16/spot) echo 0.360 ;;
         e2-standard-2/ondemand) echo 0.068 ;;   e2-standard-2/spot) echo 0.041 ;;
         e2-standard-4/ondemand) echo 0.135 ;;   e2-standard-4/spot) echo 0.081 ;;
         e2-standard-8/ondemand) echo 0.269 ;;   e2-standard-8/spot) echo 0.161 ;;
+        e2-standard-32/ondemand) echo 1.073 ;;  e2-standard-32/spot) echo 0.643 ;;
         *) echo "" ;;
     esac
 }
