@@ -270,9 +270,9 @@ fn bug_2446_a_landing_deletes_only_a_branch_whose_work_is_all_on_the_branch_land
     }
     let all = api.tips(Some(&admin), &p.name).unwrap().branches;
     assert!(all.contains_key("main") && all.contains_key(LINE), "{all:?}");
-    // A narrowed agent session (src/api/) lands its own work; the branch it
-    // names holds the person's work outside its paths, all on `u/top`
-    // already: not one it may move, so kept, in the session's own words.
+    // A narrowed agent session (src/api/) lands its own work and names the
+    // person's branch (work outside its paths, all on `u/top` already): not
+    // the branch it landed from, so kept (BUG-2448).
     let outside = change_on(&api, &dev, &p.name, base, "src/outside.rs");
     set_branch(&api, &dev, &p.name, "u/person", None, outside);
     land(&api, &dev, &p.name, &json!({"onto": "u/top", "snapshot": outside.hex()}));
@@ -281,11 +281,7 @@ fn bug_2446_a_landing_deletes_only_a_branch_whose_work_is_all_on_the_branch_land
     let inside = change_on(&api, &narrowed, &p.name, base, "src/api/inside.rs");
     set_branch(&api, &narrowed, &p.name, "u/agent", None, inside);
     let v = land(&api, &narrowed, &p.name, &json!({"onto": "u/top", "snapshot": inside.hex(), "delete_branch": "u/person"}));
-    assert_eq!(
-        (v.get("deleted_branch"), v["warnings"].clone()),
-        (None, json!(["this agent session is narrowed: this would change files outside its paths"])),
-        "{v}"
-    );
+    assert_eq!((v.get("deleted_branch"), v["warnings"].clone()), (None, json!([not_deleted("u/person", "u/top")])), "{v}");
     assert!(api.tips(Some(&dev), &p.name).unwrap().branches.contains_key("u/person"));
     // Malformed requests: refused before anything lands.
     for (req, message) in [
@@ -323,4 +319,247 @@ fn bug_2446_vl_land_delete_deletes_the_merged_branch_and_its_tag() {
     p.dev.ok(&dir, &["push"]);
     let branches = hub.api().tips(Some(&p.dev.token()), &p.name).unwrap().branches;
     assert!(!branches.contains_key("w-sub") && branches.contains_key("w-top"), "{branches:?}");
+}
+
+/// Run `statements` (one or several) on the test server's database.
+fn sql(hub: &TestHub, statements: &str) {
+    let h = hub.hub();
+    hub.rt.block_on(sqlx::raw_sql(statements).execute(&h.db)).unwrap();
+}
+
+/// A server on a database of its own: the triggers a test adds to hold a
+/// transaction open, or to make a statement fail, are nobody else's.
+fn own_hub() -> TestHub {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build().unwrap();
+    TestHub::start_on(&crate::grants::fresh_database(&rt), std::time::Duration::from_secs(3600))
+}
+
+/// The land request's answer, whatever its status.
+fn land_reply(api: &Api, token: &str, project: &str, req: &Value) -> Reply {
+    api.post_json(Some(token), &format!("/v1/projects/{project}/land"), req)
+}
+
+/// BUG-2447: two landings, each of the same snapshot onto one of two
+/// branches and each asking to delete the other, never both delete, and the
+/// work is on a branch left; four pairs at once, six times, every deletion's
+/// transaction held open 0.5 s by a trigger. (Since BUG-2448 a deletion
+/// needs the deleted branch's tip to be the snapshot landed, which the other
+/// landing moves away from: neither passes. The lock itself is shown by
+/// `bug_2447_two_crossed_deletions_never_both_commit`.)
+#[test]
+fn bug_2447_two_crossed_landings_never_delete_both_branches() {
+    let hub = own_hub();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev = p.dev.token();
+    sql(
+        &hub,
+        "CREATE FUNCTION t2447_slow() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.5); RETURN NULL; END $$; \
+         CREATE TRIGGER t2447_slow AFTER DELETE ON branches FOR EACH ROW WHEN (OLD.name LIKE 'x/%') EXECUTE PROCEDURE t2447_slow();",
+    );
+    let (mut rounds, mut one_deleted) = (0, 0);
+    for round in 0..6 {
+        let main = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+        // Per pair: A and B at S (S on no other branch), T a change on S.
+        let pairs: Vec<(String, String, ObjectId)> = (0..4)
+            .map(|k| {
+                let (a, b) = (format!("x/a{round}-{k}"), format!("x/b{round}-{k}"));
+                let s = change_on(&api, &dev, &p.name, main, &format!("src/x{round}-{k}-s.rs"));
+                set_branch(&api, &dev, &p.name, &a, None, s);
+                set_branch(&api, &dev, &p.name, &b, None, s);
+                (a, b, change_on(&api, &dev, &p.name, s, &format!("src/x{round}-{k}-t.rs")))
+            })
+            .collect();
+        let start = std::sync::Barrier::new(8);
+        let answers: Vec<Vec<Reply>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = pairs
+                .iter()
+                .map(|(a, b, t)| {
+                    let one = |onto: &str, del: &str| {
+                        let (api, dev, name, start) = (hub.api(), dev.clone(), p.name.clone(), &start);
+                        let req = json!({"onto": onto, "snapshot": t.hex(), "delete_branch": del});
+                        sc.spawn(move || {
+                            start.wait();
+                            land_reply(&api, &dev, &name, &req)
+                        })
+                    };
+                    (one(a, b), one(b, a))
+                })
+                .collect();
+            handles.into_iter().map(|(x, y)| vec![x.join().unwrap(), y.join().unwrap()]).collect()
+        });
+        let tips = api.tips(Some(&dev), &p.name).unwrap().branches;
+        for ((a, b, t), replies) in pairs.iter().zip(answers) {
+            let mut deleted = 0;
+            for r in &replies {
+                assert_eq!(r.status, 200, "{}", body(r));
+                assert_eq!(r.json()["state"], "landed", "{}", body(r));
+                deleted += r.json().get("deleted_branch").is_some() as usize;
+            }
+            let left: Vec<&String> = [a, b].into_iter().filter(|n| tips.contains_key(*n)).collect();
+            assert!(!left.is_empty(), "round {round}: both {a} and {b} were deleted: {:?}", replies.iter().map(body).collect::<Vec<_>>());
+            assert_eq!(deleted + left.len(), 2, "round {round}: the answers say what happened");
+            for (n, r) in [a, b].into_iter().zip(&replies) {
+                if let Some(tip) = tips.get(n) {
+                    let landed: ObjectId = serde_json::from_value(r.json()["landed"].as_array().unwrap().last().unwrap().clone()).unwrap();
+                    assert_eq!(*tip, landed, "round {round}: the work ({}) is on {n}", t.short());
+                }
+            }
+            rounds += 1;
+            one_deleted += deleted;
+        }
+    }
+    assert_eq!(rounds, 24);
+    eprintln!("bug_2447: {one_deleted} of {rounds} pairs deleted one branch");
+}
+
+/// BUG-2450, the push's deletion (BUG-1885): a member's deletion of a branch
+/// whose work is on `main` only, while an admin's forced rewind of `main`
+/// is in flight, is refused once the rewind commits; the branch, and its
+/// work, stay. A trigger holds the rewind's transaction open for 1 s.
+#[test]
+fn bug_2450_a_merged_branchs_deletion_never_races_a_forced_rewind_of_main() {
+    let hub = own_hub();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let (admin, dev) = (p.admin.token(), p.dev.token());
+    let before = api.tips(Some(&admin), &p.name).unwrap().branches["main"];
+    // The dev's change lands on `main`, and a branch of theirs is at it.
+    let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let s = change_on(&api, &dev, &p.name, base, "src/rewound.rs");
+    set_branch(&api, &dev, &p.name, "main", Some(base), s);
+    set_branch(&api, &dev, &p.name, "y/merged", None, s);
+    let now = api.tips(Some(&admin), &p.name).unwrap().branches["main"];
+    sql(
+        &hub,
+        "CREATE FUNCTION t2450_rewind() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NULL; END $$; \
+         CREATE TRIGGER t2450_rewind AFTER UPDATE ON branches FOR EACH ROW WHEN (NEW.name = 'main' AND NEW.lineage <> OLD.lineage) \
+         EXECUTE PROCEDURE t2450_rewind();",
+    );
+    let (rewind, delete) = std::thread::scope(|sc| {
+        let (a, name) = (hub.api(), p.name.clone());
+        let admin = admin.clone();
+        let rewind = sc.spawn(move || {
+            a.post_json(
+                Some(&admin),
+                &format!("/v1/projects/{name}/push"),
+                &json!({"updates": [{"branch": "main", "expected": now.hex(), "new": before.hex()}], "force": true}),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let delete = api.post_json(
+            Some(&dev),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({"updates": [{"branch": "y/merged", "expected": s.hex(), "new": null}]}),
+        );
+        (rewind.join().unwrap(), delete)
+    });
+    assert_eq!(rewind.status, 200, "{}", body(&rewind));
+    assert_eq!(rewind.json()["results"][0]["ok"], true, "{}", body(&rewind));
+    assert_eq!(api.tips(Some(&admin), &p.name).unwrap().branches["main"], before, "rewound");
+    assert_eq!(
+        (delete.status, delete.json()["message"].clone()),
+        (409, json!("branch 'y/merged' moved during the push; pull, then push again")),
+        "{}",
+        body(&delete)
+    );
+    assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches.get("y/merged"), Some(&s), "the branch and its work stay");
+}
+
+/// BUG-2448: a landing deletes only the branch it came from (whose tip is
+/// the snapshot landed): naming another branch whose work is on `onto` too
+/// (made there by the caller) is refused in the one sentence.
+#[test]
+fn bug_2448_a_landing_deletes_only_the_branch_it_landed_from() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let (admin, dev) = (p.admin.token(), p.dev.token());
+    let main_real = api.tips(Some(&admin), &p.name).unwrap().branches["main"];
+    let alice = change_on(&api, &admin, &p.name, main_real, "src/alice.rs");
+    set_branch(&api, &admin, &p.name, "alice/work", None, alice);
+    // The dev makes `m` at the admin's branch, lands a change onto it, and
+    // names the admin's branch.
+    let at = api.tips(Some(&dev), &p.name).unwrap().branches["alice/work"];
+    set_branch(&api, &dev, &p.name, "m/mine", None, at);
+    let t = change_on(&api, &dev, &p.name, at, "src/trivial.rs");
+    set_branch(&api, &dev, &p.name, "m/child", None, t);
+    let v = land(&api, &dev, &p.name, &json!({"onto": "m/mine", "snapshot": t.hex(), "delete_branch": "alice/work"}));
+    assert_eq!((v.get("deleted_branch"), v["warnings"].clone()), (None, json!([not_deleted("alice/work", "m/mine")])), "{v}");
+    assert_eq!(api.tips(Some(&admin), &p.name).unwrap().branches.get("alice/work"), Some(&alice), "kept");
+    // The branch it came from is deleted as before.
+    let t2 = change_on(&api, &dev, &p.name, t, "src/trivial2.rs");
+    set_branch(&api, &dev, &p.name, "m/child", Some(t), t2);
+    let v = land(&api, &dev, &p.name, &json!({"onto": "m/mine", "snapshot": t2.hex(), "delete_branch": "m/child"}));
+    assert_eq!(v["deleted_branch"], "m/child", "{v}");
+}
+
+/// BUG-2449: a deletion that fails after its landing committed (here a
+/// trigger makes the delete fail) leaves the answer `landed`, with the one
+/// sentence; the branch stays.
+#[test]
+fn bug_2449_a_failed_deletion_after_the_landing_still_answers_landed() {
+    let hub = own_hub();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let dev = p.dev.token();
+    sql(
+        &hub,
+        "CREATE FUNCTION t2449_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'a forced failure'; END $$; \
+         CREATE TRIGGER t2449_fail BEFORE DELETE ON branches FOR EACH ROW WHEN (OLD.name = 'u/boom') EXECUTE PROCEDURE t2449_fail();",
+    );
+    let main = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let top = change_on(&api, &dev, &p.name, main, "src/top.rs");
+    set_branch(&api, &dev, &p.name, "u/top", None, top);
+    let t = change_on(&api, &dev, &p.name, top, "src/boom.rs");
+    set_branch(&api, &dev, &p.name, "u/boom", None, t);
+    let v = land(&api, &dev, &p.name, &json!({"onto": "u/top", "snapshot": t.hex(), "delete_branch": "u/boom"}));
+    assert_eq!(v["landed"].as_array().map(Vec::len), Some(1), "{v}");
+    assert_eq!((v.get("deleted_branch"), v["warnings"].clone()), (None, json!([not_deleted("u/boom", "u/top")])), "{v}");
+    let landed: ObjectId = serde_json::from_value(v["landed"][0].clone()).unwrap();
+    let tips = api.tips(Some(&dev), &p.name).unwrap().branches;
+    assert_eq!((tips.get("u/top"), tips.get("u/boom")), (Some(&landed), Some(&t)), "landed, and the branch stays");
+}
+
+/// BUG-2447, the lock itself: two deletions, each of a branch whose work is
+/// on the other (`branches::delete_held`, as two crossed landings would
+/// call it), run at once with every deletion's transaction held open 0.5 s
+/// after its delete: exactly one commits, ten times. Without the lock on
+/// `onto` both did, and the work was on no branch.
+#[test]
+fn bug_2447_two_crossed_deletions_never_both_commit() {
+    let hub = own_hub();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let admin = p.admin.token();
+    let pid = project_id_of(&hub, &p.name);
+    sql(
+        &hub,
+        "CREATE FUNCTION t2447_hold() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.5); RETURN NULL; END $$; \
+         CREATE TRIGGER t2447_hold AFTER DELETE ON branches FOR EACH ROW WHEN (OLD.name LIKE 'z/%') EXECUTE PROCEDURE t2447_hold();",
+    );
+    let main = api.tips(Some(&admin), &p.name).unwrap().branches["main"];
+    let h = hub.hub();
+    for round in 0..10 {
+        let (a, b) = (format!("z/a{round}"), format!("z/b{round}"));
+        let t = change_on(&api, &admin, &p.name, main, &format!("src/z{round}.rs"));
+        set_branch(&api, &admin, &p.name, &a, None, t);
+        set_branch(&api, &admin, &p.name, &b, None, t);
+        let lineage = |n: &str| -> i64 {
+            hub.rt
+                .block_on(sqlx::query_scalar("SELECT lineage FROM branches WHERE project_id = $1 AND name = $2").bind(pid).bind(n).fetch_one(&h.db))
+                .unwrap()
+        };
+        let (la, lb) = (lineage(&a), lineage(&b));
+        let (x, y) = hub.rt.block_on(async {
+            let one = veil_server::branches::delete_held(&h, pid, &b, t, &a, la, 0, format!("test: {b} into {a}"));
+            let two = veil_server::branches::delete_held(&h, pid, &a, t, &b, lb, 0, format!("test: {a} into {b}"));
+            tokio::join!(one, two)
+        });
+        let (x, y) = (x.expect("the first deletion answers"), y.expect("the second deletion answers"));
+        let tips = api.tips(Some(&admin), &p.name).unwrap().branches;
+        let left: Vec<&String> = [&a, &b].into_iter().filter(|n| tips.contains_key(*n)).collect();
+        assert_eq!((x as usize + y as usize, left.len()), (1, 1), "round {round}: exactly one deleted ({x}, {y}); left {left:?}");
+        assert_eq!(tips[left[0]], t, "round {round}: the work is on the branch left");
+    }
 }

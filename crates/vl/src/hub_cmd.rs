@@ -398,16 +398,42 @@ pub fn move_before_push(ctx: &mut Ctx, remote: &str, only_tags: &[String]) -> Re
     // request a tag (BUG-1575). They are the server's own tips, each
     // asked for once: one request, whatever the number of branches that
     // moved (BUG-1625).
-    // The branches it pushes and the default branch: what the work stands
-    // on, at a cost that does not grow with the project's branches
-    // (`docs/HUB.md` §13.41).
-    let pushed: Vec<String> = v
+    // The branches it pushes, those they were forked from (the remote's
+    // branches their held history meets first, within FORK_WALK
+    // snapshots) and the default branch: what the work stands on, at a cost
+    // that does not grow with the project's branches (`docs/HUB.md` §13.41).
+    const FORK_WALK: usize = 1_024;
+    let mut pushed: Vec<String> = v
         .tags
         .iter()
         .filter(|(n, _)| only_tags.is_empty() || only_tags.contains(n))
         .filter(|(n, t)| v.remote_tags.get(&format!("{remote}/{n}")) != Some(&t.target))
         .map(|(n, _)| n.clone())
         .collect();
+    let prefix = format!("{remote}/");
+    let mut forked_from: std::collections::HashMap<veil_core::ObjectId, Vec<String>> = std::collections::HashMap::new();
+    for (n, t) in &v.remote_tags {
+        if let Some(b) = n.strip_prefix(&prefix) {
+            forked_from.entry(*t).or_default().push(b.to_string());
+        }
+    }
+    let (mut walk, mut walked) = (stack.clone(), std::collections::HashSet::new());
+    while let Some(id) = walk.pop() {
+        if walked.len() >= FORK_WALK || !walked.insert(id) {
+            continue;
+        }
+        if let Some(names) = forked_from.get(&id) {
+            pushed.extend(names.iter().cloned());
+            continue;
+        }
+        if store.has(&id) {
+            if let Ok(s) = ctx.repo.snapshot(&id) {
+                walk.extend(s.parents.iter().copied());
+            }
+        }
+    }
+    pushed.sort();
+    pushed.dedup();
     let (client, _) = client_for(ctx, remote)?;
     let tips = match pushed.len() <= veil_core::hub::wire::MAX_TIPS_BRANCHES {
         true => client.tips_of(&pushed)?,
@@ -504,11 +530,12 @@ pub fn push(ctx: &mut Ctx, remote: &str, tags: &[String], force: bool, verify: &
 pub fn land(ctx: &mut Ctx, remote: &str, rev: Option<&str>, onto: Option<&str>, wait: bool, status: Option<&str>, delete: bool) -> Result<ExitCode> {
     use veil_core::hub::land::LandState;
     let (client, _) = client_for(ctx, remote)?;
+    let mut delete_asked = None;
     let (result, uploaded) = match status {
         Some(ticket) => (client.land_status(ticket, wait)?, None),
         None => {
             // `--delete` deletes the branch named: REV must be one.
-            let delete = match (delete, rev) {
+            delete_asked = match (delete, rev) {
                 (false, _) => None,
                 (true, Some(b)) if ctx.repo.view().tags.contains_key(b) => Some(b),
                 (true, _) => bail!("--delete deletes the branch REV names: `vl land BRANCH --onto B --delete`"),
@@ -518,7 +545,7 @@ pub fn land(ctx: &mut Ctx, remote: &str, rev: Option<&str>, onto: Option<&str>, 
                 Some(b) => b.to_string(),
                 None => client.tips_of(&[])?.ok_or_else(|| anyhow!("no project '{}' that you can see", client.url.project))?.default_branch,
             };
-            let out = hub::land(&mut ctx.repo, remote, &client, id, &onto, wait, delete)?;
+            let out = hub::land(&mut ctx.repo, remote, &client, id, &onto, wait, delete_asked)?;
             (out.result, Some((out.uploaded, onto)))
         }
     };
@@ -534,7 +561,12 @@ pub fn land(ctx: &mut Ctx, remote: &str, rev: Option<&str>, onto: Option<&str>, 
                 println!("Deleted the branch '{}' on {remote}: its work is on {}", safe(b), safe(onto));
             }
         }
-        LandState::Queued => println!("  {} as {} (`vl land --status {}`)", yellow("queued"), bold(&result.ticket), result.ticket),
+        LandState::Queued => {
+            println!("  {} as {} (`vl land --status {}`)", yellow("queued"), bold(&result.ticket), result.ticket);
+            if let Some(b) = delete_asked {
+                println!("  {} '{}' was not deleted: the landing had not landed when the server answered", dim("note:"), safe(b));
+            }
+        }
         LandState::Conflict => {
             println!("  {} {}", yellow("conflict"), safe(result.message.as_deref().unwrap_or("")));
             for p in &result.paths {

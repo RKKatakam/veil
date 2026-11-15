@@ -991,12 +991,18 @@ pub async fn submit(
             match landings.pop() {
                 // Projected for the pusher by `push_with`. Landed: the
                 // branch it came from goes, when asked and its work is all
-                // on `onto` (`docs/HUB.md` §13.41).
+                // on `onto` (`docs/HUB.md` §13.41). Best effort: the landing
+                // is committed, so a failure here (`warming`, `busy`) is a
+                // warning on its answer, never the answer (BUG-2449).
                 Some(mut l) => {
                     if let (Some(b), LandState::Landed) = (&req.delete_branch, l.state) {
-                        match crate::branches::delete_merged_into(hub, project, viewer, b, &onto, who.person.id).await? {
-                            None => l.deleted_branch = Some(b.clone()),
-                            Some(why) => l.warnings.push(why),
+                        match crate::branches::delete_merged_into(hub, project, viewer, b, snapshot, &onto, who.person.id).await {
+                            Ok(None) => l.deleted_branch = Some(b.clone()),
+                            Ok(Some(why)) => l.warnings.push(why),
+                            Err(e) => {
+                                eprintln!("veil-server: deleting a branch landed onto in project {}: {e:?}", project.id);
+                                l.warnings.push(crate::branches::not_deleted(b, &onto));
+                            }
                         }
                     }
                     Ok(Ok(l))

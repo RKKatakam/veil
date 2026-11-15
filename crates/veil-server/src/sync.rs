@@ -3395,6 +3395,17 @@ async fn push_staged(
                             lineages.push((branch.clone(), lineage));
                             1
                         }),
+                    // A deletion of a merged branch locks the default
+                    // branch's row at the lineage it was judged in first:
+                    // a forced move of it in flight is not raced (BUG-2450).
+                    (Some(_), None) if !admin_delete
+                        && sqlx::query_scalar::<_, i32>("SELECT 1 FROM branches WHERE project_id = $1 AND name = $2 AND lineage = $3 FOR SHARE")
+                            .bind(pid)
+                            .bind(&default_branch)
+                            .bind(merged_lineage)
+                            .fetch_optional(&mut *c)
+                            .await?
+                            .is_none() => 0,
                     (Some(c0), None) => sqlx::query(
                         "DELETE FROM branches WHERE project_id = $1 AND name = $2 AND target = $3 \
                          AND ($4 OR EXISTS (SELECT 1 FROM branches WHERE project_id = $1 AND name = $5 AND lineage = $6))",

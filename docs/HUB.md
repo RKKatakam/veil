@@ -6016,8 +6016,15 @@ about 1.2 MB received per operation at 1,000 agents. Two causes:
 * A deletion never loses work: the branch is deleted only when its tip is
   contained in the branch the landing landed on (the same check as
   BUG-1885's, `branches::contained`, against that branch instead of the
-  default one), in one compare-and-swap on the deleted branch's tip and
-  the target's lineage (a forced move of the target in between voids it).
+  default one), in one transaction that locks the target's row at the
+  lineage the check was made in (`FOR SHARE`) before it deletes the branch
+  at its tip (`branches::delete_held`): a forced move of the target, or a
+  deletion of the target by the same path (two crossed landings, BUG-2447),
+  in flight waits or voids it. BUG-1885's push deletion and the PR
+  source-branch deletion lock the same way (BUG-2450).
+* Only the branch the landing came from: its tip, as the caller sees it, is
+  the snapshot the request landed (BUG-2448); any other deletion stays an
+  admin's, as BUG-1885 has it.
 * Never the default branch, a protected branch or an embargo's line; only by
   someone who may write (`writes_anything`); an agent session only a branch
   it may move (S11's `agent_may_delete`, as a push's deletion), and only
@@ -6049,7 +6056,9 @@ the merged branch when asked.
   `snapshot` only): once the stack landed in this request, delete that
   branch under the guarantees above; `LandResult::deleted_branch` names it,
   or a warning says why not. A landing still queued when the request
-  answers deletes nothing. An older server refuses the field (`422`):
+  answers deletes nothing. Best effort: the landing is committed, so a
+  failure of the deletion (`warming`, `busy`) is a warning on the `landed`
+  answer, never the answer (BUG-2449). An older server refuses the field (`422`):
   `vl` asks only a server of revision 8.
 * **`vl`**: `vl push` and `vl land` ask for the default branch alone (they
   need the revision); the push's look for a view change asks for the
