@@ -2721,13 +2721,24 @@ async fn push_staged(
         k.dedup();
         k
     };
-    let signers: HashMap<String, i64> =
-        sqlx::query_as::<_, (String, i64)>("SELECT signing_key, person_id FROM devices WHERE signing_key = ANY($1) AND removed_at IS NULL AND NOT pending")
-            .bind(&keys)
-            .fetch_all(&hub.db)
-            .await?
-            .into_iter()
-            .collect();
+    // Read with them: whether the project has any unreleased embargo line.
+    // After every resolution above, so each snapshot the push names was
+    // committed when this was read; with none, every embargo check below
+    // (`active_embargoes_of`, which reads the unreleased lines first and
+    // answers nothing without one) answers nothing as of this one read.
+    let (signers, embargoes): (HashMap<String, i64>, bool) = {
+        let rows: Vec<(Option<String>, Option<i64>, bool)> = sqlx::query_as(
+            "SELECT d.signing_key, d.person_id, e.active \
+             FROM (SELECT EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $2 AND released_at IS NULL) AS active) e \
+             LEFT JOIN devices d ON d.signing_key = ANY($1) AND d.removed_at IS NULL AND NOT d.pending",
+        )
+        .bind(&keys)
+        .bind(project.id)
+        .fetch_all(&hub.db)
+        .await?;
+        let embargoes = rows.iter().any(|r| r.2);
+        (rows.into_iter().filter_map(|(k, p, _)| Some((k?, p?))).collect(), embargoes)
+    };
     let mut real_of: HashMap<ObjectId, ObjectId> = HashMap::new();
     real_of.insert(root, root);
     for (id, reals) in &known {
@@ -2737,7 +2748,8 @@ async fn push_staged(
     // Validate embargoes (`req.embargoes` and `n.embargo`) and divert embargoed
     // branch updates to their hidden `embargo/<id>` line (S22).
     let (embargo_upserts, embargo_releases, embargo_diverted) =
-        crate::embargo::prepare_push(hub, project, viewer, &who.person.device_key, &mut req, &parents_of, &order, &real_of, Some(st.clone()), !land_all).await?;
+        crate::embargo::prepare_push(hub, project, viewer, &who.person.device_key, &mut req, &parents_of, &order, &real_of, Some(st.clone()), !land_all, embargoes)
+            .await?;
     // An update diverted to its embargo's hidden line (`embargo/<id>`) moves
     // a branch not read above.
     let diverted: Vec<String> = req.updates.iter().filter(|u| !tip_names.contains(&u.branch)).map(|u| u.branch.clone()).collect();
@@ -3179,7 +3191,7 @@ async fn push_staged(
                 }
             }
         }
-        if !is_embargo_branch {
+        if !is_embargo_branch && embargoes {
             if let Some(n) = new_real {
                 let eids = crate::embargo::active_embargoes_of(hub, project.id, &[n], &real_parents_of, Some(st.clone())).await?;
                 if let Some(eid) = eids.into_iter().next() {
