@@ -362,7 +362,7 @@ offline, and everything shared goes through the server.
 ([DEPLOY.md §12.9](docs/DEPLOY.md#129-the-runs-on-google-cloud-2026-11-14-and-15)):
 1. **Make the branch-tips answer cost the same however many branches there are.** It is the limit at 3,000 or more agents.
 2. **Let an agent delete a branch it has merged into another branch,** so subagent branches don't pile up.
-3. **Bring the 1 GB project's full clone under 1 GB of server memory** (1,042 MiB now).
+3. **Bring the 1 GB project's full clone under 1 GB of server memory** (1,042 MiB on Google Cloud). Fixed on the development machine (BUG-2456: 962 to 976 MiB, from 1,001 to 1,026); not yet run on the cloud.
 4. **Make the colocated layout the default for YugabyteDB.**
 5. **Benchmark fix:** its set-up should wait out `busy` answers.
 6. **Run again:** the 10-minute landing mix across machines, and projects much bigger than 1 GB.
