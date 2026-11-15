@@ -2365,6 +2365,94 @@ in (BUG-2363). What would move them: objects in an object store rather
 than `fsync`ed files (the paid run's MinIO), the load tool on machines of
 its own.
 
+## A push to a branch of one's own: its statements (BUG-2440, 2026-11-15, `t3/server-push-cost-reduction`)
+
+The goal: one repository taking thousands of pushes a second across
+several servers (GitHub's internal test: 7,200 a second on one
+repository), every guarantee kept. At 7,200 a second on three servers of
+16 cores a push may cost about 6 ms of server CPU, and the database must
+take 7,200 commits a second.
+
+**How it was measured.** `veil-bench load --mode branches --projects 1
+--rates max --duration 40 --clients N`, no `--merge-every`, objects in a
+local directory, its own PostgreSQL 17 container (`pg_stat_statements`,
+the deployment's memory settings), one server, one run at a time
+(`bench-quiet.sh`; load 25 to 30 after: the 32-thread machine is shared by
+the load tool, the server and the database). Each operation is what an
+agent does: its tips (`GET …/tips`), an upload and a push. The server's
+CPU sampled at 199 Hz for 25 s by a profiling-only build (pprof, not
+committed: `perf` is not allowed here); `pg_stat_statements` sampled every
+5 s; the statements of one push read from PostgreSQL's statement log in a
+one-agent run.
+
+**The profile before** (`30815e26`, 300 agents, 19.4 ms of server CPU an
+operation): the tips request is 68.7 % of it (13.4 ms, of which signing
+each branch's read grant, `Grant::issue`, 48 %; with 1,000 agents 42 ms
+an operation, 75 %); the push itself 1.65 ms (its request 1.26, its
+blocking work 0.39), the upload 0.18 ms. The push's CPU is within the
+budget; the tips are not (another stream's work: the branch-tips cost).
+What a push cost was its database work: **30 statements a push request**
+(the request's epochs; 16 reads before its transaction; its own pack's
+staged row, a commit of its own; 12 in the transaction):
+
+| Statements | Before | After |
+|---|---:|---:|
+| the request's epochs (session check) | 1 | 1 |
+| its GC epoch again (`read_gc_epoch`) | 1 | 0 |
+| every branch of the project (300 or 1,000 rows) | 1 | 0 |
+| the moved and default branches (`resolve_for`, twice) | 2 | 1 (with "any embargo unreleased") |
+| a new snapshot: committed? its view's projections? any projection? | 3 | 1 |
+| the parent tip withheld? (the pusher's id, the real tip) | 2 | 0 (no unreleased line, read with the tip) |
+| the signers | 1 | 1 (with "any embargo unreleased") |
+| unreleased embargo lines (`active_embargoes_of`, twice) | 2 | 0 (none unreleased) |
+| the receipts' packs usable; the parent's graph row | 2 | 2 |
+| bisect: queued reverts, reverted twice | 2 | 1 |
+| its own pack's staged row (a commit) | 1 | 1 |
+| transaction: `BEGIN`, GC guard, branch CAS, `landed_changes`, packs lock + upsert, snapshot, origin, memo, audit, notify, `COMMIT` | 12 | 5 (`BEGIN`, guard, CAS with its changes, packs with every row and the notice, `COMMIT`) |
+| **a push request** | **30** | **13** |
+
+**Each fix, one commit each, measured after it** (300 agents, 40 s; per
+operation, so the tips and upload included; one run each):
+
+| Commit | Fix | Ops/s | Server CPU (ms/op) | DB CPU (ms/op) | DB statements/op | DB writes/op |
+|---|---|---:|---:|---:|---:|---:|
+| `30815e26` | before | 841.9 | 19.50 | 8.15 | 43.5 | 9.4 |
+| `fbc3996b` | the moved and default branches read once (not every branch, then twice more) | 898.7 | 19.70 | 5.64 | 42.4 | 9.6 |
+| `5802b5f0` | a new snapshot found new in one statement | 898.6 | 19.63 | 5.54 | 40.2 | 9.5 |
+| `1c1ae02e` | the request's GC epoch | 916.9 | 19.57 | 5.43 | 39.4 | 9.6 |
+| `1d839446` | "any embargo unreleased" with the signers | 913.5 | 19.68 | 5.35 | 37.3 | 9.6 |
+| `6e7678ca` | bisect's two reads as one | 932.6 | 19.53 | 5.23 | 36.2 | 9.6 |
+| `d6cc98c8` | the transaction 12 → 7 | 928.9 | 18.86 | 6.00 | 28.7 | 5.3 |
+| `98ae0e19`, `2d916800` | the tip's withheld checks with the tips; the transaction 7 → 5 | below | | | | |
+
+Reading every branch was most of the database's CPU (8.15 → 5.64 ms an
+operation at 300 branches; it grows with the branch count). In the
+`d6cc98c8` run two projection-memo reads of the tips and the deriver (not
+the push's) averaged 0.8 ms instead of 0.03 (as in the base run, 0.4 ms;
+their generic plans use the primary key), which is why its database CPU
+rose; the push's merged statement costs what the five it replaced did
+(0.25 ms).
+
+**Before and after, final** (`30815e26` and `2d916800`, the same harness,
+one run each):
+
+| Agents | Pushes/s before → after | p50 (ms) | p99 (ms) | Server CPU (ms/op) | of it, the push (request + blocking) | DB CPU (ms/op) | DB statements/op (all) | DB statement time a push (ms) | Errors |
+|---:|---|---|---|---|---|---|---|---|---:|
+| 1 | 50.1 → 48.9 | 22.8 → 20.9 | 33.4 → 27.8 | 18.8 → 20.1 | | 18.4 → 18.2 | 86.6 → 61.8 | | 0 |
+| 100 | 1,119.9 → **1,199.3** | 85 → 79 | 167 → 210 | 9.68 → 9.37 | 1.85 → 1.60 | 8.80 → **6.20** | 40.5 → **23.7** | 7.39 → 5.01 | 0 |
+| 300 | 830.3 → **915.9** | 350 → 318 | 488 → 555 | 19.44 → 19.50 | 1.65 → 1.08 | 8.33 → **5.66** | 43.7 → **26.0** | 5.99 → 3.29 | 0 |
+| 1,000 | 353.0 → 356.6 | 3,123 → 3,084 | 4,428 → 4,631 | 56.4 → 54.9 | 2.46 → 1.37 | 8.33 → **6.86** | 46.7 → **31.2** | 4.72 → 3.71 | 0 |
+
+Commits stay 1.00 a push of its own (3.1 to 3.3 in all: the upload's and
+the push's own pack's staged rows, the deriver's). What bounds the rate
+here is the tips request each operation makes (13.7 ms at 300 agents,
+42 ms at 1,000: it signs a read grant per branch, and the branches grow
+with the agents), then the one machine. Not changed, and kept: the push's
+own pack is still recorded staged in a commit before it is written
+(BUG-1155, the database knows every upload in storage), the GC guard is
+the transaction's first statement, the review gate its last, every
+compare-and-swap and check as before.
+
 ## What would raise each ceiling (not built)
 
 | Ceiling | Bound by | What raises it |
