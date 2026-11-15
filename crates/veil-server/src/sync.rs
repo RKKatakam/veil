@@ -3562,13 +3562,18 @@ async fn push_staged(
             // those this one stored come back), its audit row, and the notice
             // delivered at commit to every server: drop your tips.
             let mut authors: Vec<(String, i64)> = Vec::with_capacity(new_reals.len());
+            let mut author_at: HashMap<&str, usize> = HashMap::with_capacity(new_reals.len());
             for (r, author) in &new_reals {
                 // Each id once (one statement cannot update a row twice): the
                 // first author that is not 0, as one insert after another.
-                match authors.iter_mut().find(|(x, _)| x == r) {
-                    Some((_, a)) if *a == 0 => *a = *author,
+                // Found by a map: a push may hold `MAX_PUSH_SNAPSHOTS`.
+                match author_at.get(r.as_str()) {
+                    Some(&i) if authors[i].1 == 0 => authors[i].1 = *author,
                     Some(_) => {}
-                    None => authors.push((r.clone(), *author)),
+                    None => {
+                        author_at.insert(r.as_str(), authors.len());
+                        authors.push((r.clone(), *author));
+                    }
                 }
             }
             let (snap_ids, snap_authors): (Vec<String>, Vec<i64>) = authors.into_iter().unzip();
