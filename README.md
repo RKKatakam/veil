@@ -286,8 +286,9 @@ the same machine (the tables above).
 Veil gives up some things on purpose. What each choice costs, and what it
 buys:
 
-**Always connected, no offline mode.**
-- *Costs:* nothing shared works without the server.
+**Sharing goes through the server.**
+- *Works offline:* editing, `vl status`, committing, splitting, squashing, `vl undo` and `vl redo`, and secret scanning. Local commits wait until you reconnect.
+- *Costs:* sharing (push, pull, `vl land`, pull requests), cloning, files a thin clone hasn't fetched yet, and history, blame and search across the whole project need the server. Unlike Git, a clone isn't a full standalone copy.
 - *Buys:* the server enforces every permission in every answer, does merges, history, blame and search for thin clients, and lands changes without anyone pulling or retrying.
 
 **Durable commits.**
@@ -349,9 +350,9 @@ it, the open ones included.
 Not proven yet: projects far bigger than 1 GB, more than one zone or region,
 the gates that have no benchmark yet (bisect over 10,000 candidates,
 workspaces of a million files), and the sandbox on macOS,
-where commands run unconfined for now. By design there is no offline mode:
-`vl` commits, splits, squashes and undoes locally, and everything shared
-goes through the server.
+where commands run unconfined for now. By design, a clone is not a full
+standalone copy as in Git: you can edit, commit, split, squash and undo
+offline, and everything shared goes through the server.
 
 **Next steps**, from the Google Cloud runs
 ([DEPLOY.md §12.9](docs/DEPLOY.md#129-the-runs-on-google-cloud-2026-11-14-and-15)):
