@@ -2517,11 +2517,11 @@ channels) and timing each step of a request (temporary probes, not kept):
    every project shares (BUG-2461, fixed).** `pack::Packs::evict` asked each
    project's lookup map its weight, which walked its packs: 16 ms of a push's
    26 ms, waiting on that lock, with 147,000 packs listed (item 4).
-4. **Packs pile up faster than they merge (BUG-2462, open).** A push lists
-   about two packs; merges take at most 64 a run, checked every 500 ms, so
-   at 1,500 pushes a second one project's lookup map grew to 147,000 packs
-   in a minute and a half, and a lookup walks them newest first. The next
-   ceiling.
+4. **Packs pile up faster than they merge (BUG-2462, fixed: below).** A
+   push lists about two packs; merges take at most 64 a run, checked every
+   500 ms, so at 1,500 pushes a second one project's lookup map grew to
+   147,000 packs in a minute and a half, and a lookup walks them newest
+   first. The next ceiling.
 5. **The disk's flushes, here.** With MinIO and PostgreSQL on one drive,
    2,842 flushes a second (2.4 a push, 0.30 ms each) kept it flushing 85% of
    the time: about 1,390 pushes a second is this machine's limit for durable
@@ -2546,3 +2546,44 @@ in the server (its checks 4, its own pack stored 2.4, its transaction 4,
 listing its packs 7), an upload 12, a read of the tips 4.5; a read waits in
 the project's bulkhead (§13.25: three quarters of the server's database
 connections) behind the writes, which go first.
+
+**Item 4, BUG-2462: merges that keep up.** The same test, MinIO on a RAM
+disk of its own and PostgreSQL on the drive (the shared container, a
+database of the run's), each server with timing probes in its merge
+passes (not kept). The listed packs were counted every 5 s.
+
+| Server | Pushes/s | p50 / p99 ms | Most packs listed | Packs listed at the end | Errors |
+|---|---:|---|---:|---:|---:|
+| before (`f2ea7734`) | 1,496 | 639 / 1,427 | 186,640 | 186,640 | 0 |
+| before, again | 1,482 | 775 / 1,280 | 187,184 | 187,184 | 0 |
+| requests 16 at a time, 1,024 packs a pass | 1,731 | 518 / 1,052 | 92,899 | 92,899 | 0 |
+| and the class with the most packs | 1,899 | 475 / 870 | 51,143 | 119 (15 s after) | 0 |
+| and one request a small pack, listed rows indexed | 2,296 | 407 / 722 | 66,729 | — | 0 |
+| and 32 at a time | 2,585 | 373 / 568 | 29,803 | — | 0 |
+| and 4,096 packs a pass | 2,615 | 405 / 556 | 3,229 | 78 (5 s after) | 0 |
+
+What the probes showed, before: passes did run back to back, but a pass
+of 64 packs took 110 ms, nearly all of it its storage requests one after
+another (an index read, then a range read, for each pack); each pass also
+listed every listed pack by the primary key, which walked the rows of the
+packs merges had replaced too (130 ms at 180,000), and swept up to 512
+replaced packs one delete at a time (up to 1 s). About 180 packs a second
+were merged against 3,000 to 5,600 listed. With the requests made 16 at a
+time a second cause showed: a pass took the smallest size class with 16
+packs, which the pushes refilled within every pass, so the class above
+it, where the other pack of each push falls, was never merged (passes of
+about 400 packs, while 90,000 waited in the next class). Each step then
+moved the limit: pushes got faster, so packs were listed faster (2 a
+push), and a pass's fixed costs (its listing, its switch and its sweep,
+about 100 ms together) were spread over more packs by larger passes.
+With 4,096 packs a pass the listed packs stayed at most 3,229 through the
+run, at 5,200 listed a second.
+
+The runs with the shared PostgreSQL container's 64 MB `/dev/shm` (not the
+1 GB `scripts/bench-server.sh` gives its own) failed some passes with
+"could not resize shared memory segment" once 300,000 replaced rows waited
+out their 60 s grace period: statements over them were planned in
+parallel. The last two runs set `max_parallel_workers_per_gather = 0` on
+the run's database ("before, again" and the last row); a pass's sweep no
+longer sorts every due row to take a few.
+

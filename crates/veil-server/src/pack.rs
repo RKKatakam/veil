@@ -581,6 +581,22 @@ impl Held {
 /// index bytes, the parsed index and the parse's working copy of the slots;
 /// kept, once parsed, for the index alone.
 pub async fn read_index(store: &dyn BlobStore, key: &str, bound: &Bound) -> Result<Option<Held>> {
+    Ok(read(store, key, bound, false).await?.map(|(held, _)| held))
+}
+
+/// [`read_index`] of a pack whole in the first read (at most
+/// [`FIRST_READ`] long), with the pack's bytes: one request for both (a
+/// merge copies the entries from them, BUG-2462). The bytes are not part
+/// of the share. `None` if it is not stored.
+pub async fn read_whole(store: &dyn BlobStore, key: &str, bound: &Bound) -> Result<Option<(Held, Bytes)>> {
+    match read(store, key, bound, true).await? {
+        Some((held, Some(bytes))) => Ok(Some((held, bytes))),
+        Some((_, None)) => bail!("pack {key} is longer than one read"),
+        None => Ok(None),
+    }
+}
+
+async fn read(store: &dyn BlobStore, key: &str, bound: &Bound, whole_bytes: bool) -> Result<Option<(Held, Option<Bytes>)>> {
     let project = project_of_key(key);
     let first_share = bound.take_for(project, FIRST_READ.min(bound.most as u64)).await?;
     let Some((first, size)) = store.get_range(key, 0, FIRST_READ - 1).await? else { return Ok(None) };
@@ -603,8 +619,8 @@ pub async fn read_index(store: &dyn BlobStore, key: &str, bound: &Bound) -> Resu
         },
     };
     let index = parse_index(&first, Some(size)).with_context(|| format!("reading pack {key}"))?;
-    drop(first);
-    Ok(Some(Held::new(Arc::new(index), size, share)))
+    let bytes = (whole_bytes && first.len() as u64 == size).then_some(first);
+    Ok(Some((Held::new(Arc::new(index), size, share), bytes)))
 }
 
 /// The lookup structures' own memory: a project's entry, and each listed
@@ -1003,11 +1019,16 @@ impl Packs {
     /// the entries of projects used least recently, never `keep`'s (the
     /// one in use: its listing stays, so its lookups read what they need
     /// from storage, BUG-1395).
+    ///
+    /// Once past `budget` it frees down to seven eighths of it (BUG-2462:
+    /// freeing only down to the budget made every later listing, each
+    /// push's, sort every index loaded on the server again).
     fn evict(g: &mut HashMap<i64, Arc<ProjectPacks>>, keep: i64, budget: usize) {
         let mut total: usize = g.values().map(|p| p.map.read().unwrap().weight()).sum();
         if total <= budget {
             return;
         }
+        let budget = budget - budget / 8;
         let mut loaded: Vec<(u64, i64, Arc<str>)> = Vec::new();
         for (k, p) in g.iter() {
             for l in p.map.read().unwrap().packs.iter().filter(|l| l.index.is_some()) {
@@ -1063,9 +1084,12 @@ impl Packs {
             *last = Some(began);
             return Ok(());
         };
-        let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = $2 ORDER BY created_at, name")
+        // `state = 1` (LISTED) written literally, so the partial index
+        // `packs_listed` (migration 41) serves it under a generic plan too:
+        // the rows of packs merges replaced are not read (BUG-2462).
+        const _: () = assert!(LISTED == 1);
+        let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = 1 ORDER BY created_at, name")
             .bind(project)
-            .bind(LISTED)
             .fetch_all(db)
             .await?;
         {
