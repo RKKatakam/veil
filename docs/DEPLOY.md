@@ -1512,7 +1512,7 @@ above, not a measurement across machines; at 70 % of each machine's cores):
 | Cost per push | Server cores | Database cores | Database load | Balancer |
 |---|---:|---:|---|---|
 | today, 5,000 branches (251 ms server, 16.2 ms database, 69 statements, 7.3 commits, 3.5 MB tips) | about 2,600 | about 170 | 497,000 statements and 52,000 commits a second | 25 GB/s of tips: not possible |
-| today, few branches (7.1 ms, 10.8 ms, 40 statements, 3 commits, 11.6 KB WAL) | about 73: 7 servers of 16 vCPUs | about 111 | 290,000 statements and 22,000 commits a second, 84 MB/s of WAL | small |
+| today, few branches (7.1 ms, 10.8 ms, 40 statements, 3 commits, 11.6 KB WAL) | about 73: 5 servers of 16 vCPUs | about 111 | 290,000 statements and 22,000 commits a second, 84 MB/s of WAL | small |
 | the tips' cost no longer growing with branches, and 15 statements and 1 commit a push | about 73 | about 42 (at 0.27 ms a statement) | 108,000 statements and 7,200 commits a second | small |
 
 Database cores scale with statements per push, server cores with the
