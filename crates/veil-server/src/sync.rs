@@ -3435,11 +3435,31 @@ async fn push_staged(
                     // The branch's changes stay all recorded (BUG-1524) only
                     // when this move's are (in a new lineage: the whole
                     // history), in the lineage the held ones were read under.
-                    (Some(c0), Some(n)) => sqlx::query_scalar::<_, i64>(
-                        "UPDATE branches SET target = $1, lineage = CASE WHEN $5 THEN nextval('branch_lineages') ELSE lineage END, \
-                         changes_recorded = $6 AND ($5 OR (changes_recorded AND ($7::BIGINT IS NULL OR lineage = $7))) \
-                         WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage",
-                    )
+                    (Some(c0), Some(n)) => {
+                        // The changes it brings (`landed_changes`, below for
+                        // the rest) recorded in the same statement, in the
+                        // lineage it returns, for a branch other than the
+                        // default one (whose review rules are recorded
+                        // first) and its embargo lines (never recorded).
+                        let with_changes = branch != default_branch && veil_core::embargo::embargo_id_of_branch(&branch).is_none();
+                        let none = (Vec::new(), Vec::new(), Vec::new());
+                        let (cs, aus, ls) = match with_changes {
+                            true => plan_changes.get(&branch).unwrap_or(&none),
+                            false => &none,
+                        };
+                        sqlx::query_scalar::<_, i64>(
+                            "WITH u AS (UPDATE branches SET target = $1, lineage = CASE WHEN $5 THEN nextval('branch_lineages') ELSE lineage END, \
+                             changes_recorded = $6 AND ($5 OR (changes_recorded AND ($7::BIGINT IS NULL OR lineage = $7))) \
+                             WHERE project_id = $2 AND name = $3 AND target = $4 RETURNING lineage), \
+                             rec AS (INSERT INTO landed_changes (project_id, branch, lineage, change_id, author, landed) \
+                             SELECT DISTINCT ON (ch, au) $2, $3, u.lineage, ch, au, ld \
+                             FROM u, unnest($8::TEXT[], $9::BIGINT[], $10::TEXT[]) WITH ORDINALITY AS v(ch, au, ld, ord) \
+                             ORDER BY ch, au, ord \
+                             ON CONFLICT (project_id, branch, lineage, change_id, author) DO UPDATE SET landed = EXCLUDED.landed \
+                             WHERE EXISTS (SELECT 1 FROM bisect_reverts br WHERE br.project_id = landed_changes.project_id AND br.branch = landed_changes.branch \
+                             AND br.lineage = landed_changes.lineage AND br.culprit = landed_changes.landed AND br.state = 'reverted')) \
+                             SELECT lineage FROM u",
+                        )
                         .bind(n.hex())
                         .bind(pid)
                         .bind(&branch)
@@ -3447,12 +3467,18 @@ async fn push_staged(
                         .bind(force)
                         .bind(recorded)
                         .bind(read_under)
+                        .bind(cs)
+                        .bind(aus)
+                        .bind(ls)
                         .fetch_optional(&mut *c)
                         .await?
                         .map_or(0, |lineage| {
-                            lineages.push((branch.clone(), lineage));
+                            if !with_changes {
+                                lineages.push((branch.clone(), lineage));
+                            }
                             1
-                        }),
+                        })
+                    }
                     (None, Some(n)) => sqlx::query_scalar::<_, i64>(
                         "INSERT INTO branches (project_id, name, target, changes_recorded) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING lineage",
                     )
@@ -3518,42 +3544,22 @@ async fn push_staged(
                     }
                 }
             }
+            crate::embargo::record_in_tx(&mut *c, pid, &embargo_upserts, &embargo_snaps).await?;
             // The packs that hold what this push stored (S28): an upload's
             // staged pack, or the push's own. A pack a refused push of the
             // same person discarded first cannot be listed: nothing lands,
-            // and `vl` uploads again.
-            if !packs.0.is_empty() {
-                // Every pack was recorded staged before it was written; a
-                // row gone was discarded and then deleted with its storage
-                // object (a sweep of an upload past its grace period, by a
-                // server without this push's index in hand: BUG-2310).
-                // Locked: a racing discard or delete waits, then finds it
-                // listed.
-                // One statement: the rows' locks are the update's, and a row
-                // missing is one fewer state back (no row is ever made here).
-                let states: Vec<i16> = sqlx::query_scalar(
-                    "UPDATE packs SET state = CASE WHEN state = $4 THEN state ELSE $3 END \
-                     WHERE project_id = $1 AND name = ANY($2) RETURNING state",
-                )
-                .bind(pid)
-                .bind(&packs.0)
-                .bind(crate::pack::LISTED)
-                .bind(crate::pack::DISCARDED)
-                .fetch_all(&mut *c)
-                .await?;
-                if states.len() != packs.0.len() {
-                    return Err(Error::conflict("an upload this push names was discarded; push again"));
-                }
-                if states.contains(&crate::pack::DISCARDED) {
-                    return Err(Error::conflict("an upload this push names was discarded; push again"));
-                }
-            }
-            crate::embargo::record_in_tx(&mut *c, pid, &embargo_upserts, &embargo_snaps).await?;
-            // The push's rows in one statement: its snapshots (a row stored
-            // first by another push keeps its author unless it had none),
-            // their origins, its memos (a row stored first by another request
-            // wins, and is not cached here from this push's answer: those
-            // this one stored come back), its audit row, and the notice
+            // and `vl` uploads again. Every pack was recorded staged before
+            // it was written; a row gone was discarded and then deleted with
+            // its storage object (a sweep of an upload past its grace period,
+            // by a server without this push's index in hand: BUG-2310). The
+            // update locks them: a racing discard or delete waits, then finds
+            // them listed. A row missing is one state fewer back (no row is
+            // ever made here); a discarded one stays discarded.
+            // In the same statement, the push's rows: its snapshots (a row
+            // stored first by another push keeps its author unless it had
+            // none), their origins, its memos (a row stored first by another
+            // request wins, and is not cached here from this push's answer:
+            // those this one stored come back), its audit row, and the notice
             // delivered at commit to every server: drop your tips.
             let mut authors: Vec<(String, i64)> = Vec::with_capacity(new_reals.len());
             for (r, author) in &new_reals {
@@ -3572,8 +3578,10 @@ async fn push_staged(
             let memo_projected: Vec<String> = memos.iter().map(|m| m.2.clone()).collect();
             let memo_collapsed: Vec<bool> = memos.iter().map(|m| m.3).collect();
             let notifies = notify && (!moved.is_empty() || !embargo_upserts.is_empty());
-            let (_, stored_keys, stored_reals): (i64, Vec<String>, Vec<String>) = sqlx::query_as(
-                "WITH s AS (INSERT INTO snapshots (project_id, id, author) SELECT $1, i, a FROM UNNEST($2::text[], $3::bigint[]) AS t(i, a) \
+            let (_, stored_keys, stored_reals, pack_states): (i64, Vec<String>, Vec<String>, Vec<i16>) = sqlx::query_as(
+                "WITH k AS (UPDATE packs SET state = CASE WHEN state = $17 THEN state ELSE $16 END \
+                   WHERE project_id = $1 AND name = ANY($18) RETURNING state), \
+                 s AS (INSERT INTO snapshots (project_id, id, author) SELECT $1, i, a FROM UNNEST($2::text[], $3::bigint[]) AS t(i, a) \
                    ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0), \
                  o AS (INSERT INTO origins (project_id, real_id, origin_id) SELECT $1, r, g FROM UNNEST($4::text[], $5::text[]) AS t(r, g) \
                    ON CONFLICT DO NOTHING), \
@@ -3582,7 +3590,7 @@ async fn push_staged(
                    ON CONFLICT DO NOTHING RETURNING view_key, real_id), \
                  l AS (INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $6, $11, 'push', $12)), \
                  n AS (SELECT pg_notify($13, $14) WHERE $15) \
-                 SELECT n.c, x.k, x.r FROM (SELECT count(*) AS c FROM n) n, \
+                 SELECT n.c, x.k, x.r, COALESCE((SELECT array_agg(state) FROM k), '{}') FROM (SELECT count(*) AS c FROM n) n, \
                    (SELECT COALESCE(array_agg(view_key), '{}') AS k, COALESCE(array_agg(real_id), '{}') AS r FROM m) x",
             )
             .bind(pid)
@@ -3600,8 +3608,14 @@ async fn push_staged(
             .bind(crate::caches::TIPS_CHANNEL)
             .bind(pid.to_string())
             .bind(notifies)
+            .bind(crate::pack::LISTED)
+            .bind(crate::pack::DISCARDED)
+            .bind(&packs.0)
             .fetch_one(&mut *c)
             .await?;
+            if pack_states.len() != packs.0.len() || pack_states.contains(&crate::pack::DISCARDED) {
+                return Err(Error::conflict("an upload this push names was discarded; push again"));
+            }
             let stored: HashSet<(&str, &str)> = stored_keys.iter().map(|k| k.as_str()).zip(stored_reals.iter().map(|r| r.as_str())).collect();
             let memo_stored: Vec<bool> = memos.iter().map(|m| stored.contains(&(m.0.as_str(), m.1.as_str()))).collect();
             // New review rules, or a new access policy (an approval counts
