@@ -788,7 +788,10 @@ pub(crate) async fn resolve_for(
 /// [`resolve_for`] with the branch rows of `branches` and the default
 /// branch already read from the database by the caller in this request
 /// (`tips`, as `branches` stores them; rows of other branches are ignored):
-/// a push reads them once for all its resolutions.
+/// a push reads them once for all its resolutions. `no_embargo`: the same
+/// statement found no unreleased embargo line, so no tip it read is
+/// withheld from anyone (as of that statement, which read the tip).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_for_in(
     hub: &Arc<Hub>,
     project: &Project,
@@ -797,8 +800,9 @@ pub(crate) async fn resolve_for_in(
     branches: &[&str],
     landing: bool,
     tips: &[(String, String)],
+    no_embargo: bool,
 ) -> Result<Option<ObjectId>> {
-    resolve_for_mode(hub, project, viewer, id, branches, landing, false, Some(tips)).await
+    resolve_for_mode(hub, project, viewer, id, branches, landing, false, Some((tips, no_embargo))).await
 }
 
 /// As [`resolve_for`], preferring the uncollapsed commit `id` stands for over a
@@ -823,7 +827,7 @@ async fn resolve_for_mode(
     branches: &[&str],
     landing: bool,
     prefer_own: bool,
-    read: Option<&[(String, String)]>,
+    read: Option<(&[(String, String)], bool)>,
 ) -> Result<Option<ObjectId>> {
     if *id == root_snapshot_id() {
         return Ok(Some(*id));
@@ -846,7 +850,7 @@ async fn resolve_for_mode(
     let mut names: Vec<&str> = branches.to_vec();
     names.push(&project.default_branch);
     let tips: Vec<(String, String)> = match read {
-        Some(rows) => rows.iter().filter(|(n, _)| names.contains(&n.as_str())).cloned().collect(),
+        Some((rows, _)) => rows.iter().filter(|(n, _)| names.contains(&n.as_str())).cloned().collect(),
         None => sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND name = ANY($2)")
             .bind(project.id)
             .bind(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
@@ -854,9 +858,16 @@ async fn resolve_for_mode(
             .await?,
     };
     let tips = crate::embargo::filter_branches(hub, project, viewer, &tips).await?;
+    // No embargo line was unreleased when the tips were read (in that one
+    // statement): no tip is withheld.
+    let tips_free = read.is_some_and(|(_, free)| free);
     for name in &names {
         if let Some(t) = tips.iter().find(|(n, _)| n == name).and_then(|(_, t)| ObjectId::from_hex(t).ok()) {
-            if seen(t).await? {
+            let ok = match tips_free {
+                true => projected(hub, project, viewer, t).await? == *id,
+                false => seen(t).await?,
+            };
+            if ok {
                 return Ok(Some(t));
             }
         }
@@ -2633,7 +2644,7 @@ async fn push_staged(
     tip_names.push(project.default_branch.clone());
     tip_names.sort();
     tip_names.dedup();
-    let current_rows = branch_rows(hub, project.id, &tip_names).await?;
+    let (current_rows, tips_embargo_free) = branch_rows_unembargoed(hub, project.id, &tip_names).await?;
     let mut current: HashMap<String, ObjectId> =
         current_rows.iter().filter_map(|(n, t)| ObjectId::from_hex(t).ok().map(|t| (n.clone(), t))).collect();
     // An agent session never creates or recreates the default branch
@@ -2673,7 +2684,7 @@ async fn push_staged(
             known.insert(id, vec![root]);
             continue;
         }
-        if let Some(r) = resolve_for_in(hub, project, viewer, &id, &moved_refs, lands_only, &current_rows).await? {
+        if let Some(r) = resolve_for_in(hub, project, viewer, &id, &moved_refs, lands_only, &current_rows, tips_embargo_free).await? {
             known.insert(id, vec![r]);
             continue;
         }
@@ -3777,6 +3788,22 @@ async fn branch_rows(hub: &Hub, project: i64, names: &[String]) -> Result<Vec<(S
         .bind(names)
         .fetch_all(&hub.db)
         .await?)
+}
+
+/// [`branch_rows`], and whether no embargo line of `project` is unreleased,
+/// in one statement (so as of the moment the rows were read).
+async fn branch_rows_unembargoed(hub: &Hub, project: i64, names: &[String]) -> Result<(Vec<(String, String)>, bool)> {
+    let rows: Vec<(Option<String>, Option<String>, bool)> = sqlx::query_as(
+        "SELECT b.name, b.target, e.active \
+         FROM (SELECT EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $1 AND released_at IS NULL) AS active) e \
+         LEFT JOIN branches b ON b.project_id = $1 AND b.name = ANY($2)",
+    )
+    .bind(project)
+    .bind(names)
+    .fetch_all(&hub.db)
+    .await?;
+    let free = !rows.iter().any(|r| r.2);
+    Ok((rows.into_iter().filter_map(|(n, t, _)| Some((n?, t?))).collect(), free))
 }
 
 /// How many branches `project` has, read once (`count`) for a push.
