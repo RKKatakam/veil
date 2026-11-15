@@ -166,6 +166,8 @@ fn bug_2445_a_named_tips_answer_is_the_full_answer_cut_to_the_names_for_every_vi
     let b = change_on(&api, &admin, &p.name, main, &format!("{BILL_DIR}/acme/more.txt"));
     set_branch(&api, &admin, &p.name, "t/bill", None, b);
     add_embargo_line(&hub, &p.name);
+    // And one that is not named: left out of every named answer.
+    set_branch(&api, &dev, &p.name, "t/other", None, d);
     let agent = agent_token(&hub, &dev, &p.name, &["src/"]);
     let names = ["t/dev", "t/bill", LINE, "no-such-branch-x"];
     for (who, token) in [("anyone", None), ("dev", Some(dev.as_str())), ("fin", Some(fin.as_str())), ("admin", Some(admin.as_str())), ("agent", Some(agent.as_str()))] {
@@ -184,7 +186,8 @@ fn bug_2445_a_named_tips_answer_is_the_full_answer_cut_to_the_names_for_every_vi
             "{who}"
         );
         assert_eq!(serde_json::to_value(&cut.embargoes).unwrap(), serde_json::to_value(&full.embargoes).unwrap(), "{who}: embargoes");
-        assert!(!cut.branches.contains_key("no-such-branch-x"), "{who}");
+        assert!(!cut.branches.contains_key("no-such-branch-x") && !cut.branches.contains_key("t/other"), "{who}");
+        assert!(who == "anyone" || full.branches.contains_key("t/other"), "{who}: the full answer has it");
         // Only an admin sees the embargo's line, in either answer.
         assert_eq!(cut.branches.contains_key(LINE), who == "admin", "{who}: {:?}", cut.branches);
     }
