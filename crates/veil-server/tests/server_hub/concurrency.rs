@@ -571,10 +571,20 @@ fn pushes_racing_an_access_change_land_only_before_it() {
                 for k in 1.. {
                     let (root, objects) = (c.root, c.objects.clone());
                     let started = std::time::Instant::now();
-                    // Refused at the upload or at the push.
-                    let (r, _) = c.try_push_to(&mine, expected);
+                    // Landed, or refused at the upload or at the push, either
+                    // way by the participant check: out of every group, they
+                    // still see the public `src/`, so the project is found and
+                    // they are told they are not in it.
+                    let (r, _at_upload) = c.try_push_to(&mine, expected);
                     let ok = r.status == 200 && r.json()["results"][0]["ok"] == json!(true);
-                    assert!(ok || matches!(r.status, 400 | 403 | 404), "landed or refused, not {}: {}", r.status, String::from_utf8_lossy(&r.body));
+                    if !ok {
+                        assert_eq!(r.status, 403, "pusher {i}: landed or refused, not: {}", String::from_utf8_lossy(&r.body));
+                        assert_eq!(
+                            r.json(),
+                            json!({"code": "forbidden", "message": "you are not in this project"}),
+                            "pusher {i}: refused by the participant check (at the upload: {_at_upload})"
+                        );
+                    }
                     results.lock().unwrap().push((started, ok));
                     if !ok {
                         break;
