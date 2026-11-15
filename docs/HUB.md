@@ -6058,3 +6058,19 @@ the merged branch when asked.
 * **`veil-bench load`** asks for what the agent needs (its branch and the
   one it started from), and `--mode agents` deletes a subagent's branch
   with its merge.
+
+**Measured** (2026-11-15, one 32-thread machine, server, PostgreSQL 17
+and the load tool together, local object store; `veil-bench load --mode
+agents --think 120 --time-scale 20 --subagents 3 --merge-every 20
+--duration 180`; before: `30815e26`, the tree this change starts from):
+
+| Agents | | Pushes (/s) | Push p50 / p99 (ms) | Errors | Told to come back | DB statements per op | KiB received per op |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1,000 | before | 125.4 | 1,302 / 10,185 | 0 | 23,944 | 59.0 | 1,536.6 |
+| 1,000 | after | 175.5 | 18 / 95 | 0 | 0 | 60.9 | 4.6 |
+| 3,000 | before | 68.3 | 14,726 / 67,651 | 2,950 | 456,758 | 339.7 | 2,692.5 |
+| 3,000 | after | 406.0 | 1,103 / 7,054 | 0 | 17,109 | 70.3 | 16.2 |
+
+All operations together: 160.9 → 222.4 a second at 1,000 agents, 84.3 →
+520.2 at 3,000; server CPU 116.9 → 12.7 ms an operation at 1,000, 201.7 →
+12.7 at 3,000.
