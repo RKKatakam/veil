@@ -860,7 +860,6 @@ async fn record_embargo_status_inner(
     let Ok(new_json) = serde_json::to_string(&rec) else {
         return Ok(());
     };
-    let notify = hub.caches.notices.load(Ordering::SeqCst);
     let eid = embargo_id.to_string();
     let changed = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let new_json = new_json.clone();
@@ -881,19 +880,13 @@ async fn record_embargo_status_inner(
             .execute(&mut *c)
             .await?
             .rows_affected();
-            if n > 0 && notify {
-                sqlx::query("SELECT pg_notify($1, $2)")
-                    .bind(crate::caches::TIPS_CHANNEL)
-                    .bind(project_id.to_string())
-                    .execute(&mut *c)
-                    .await?;
-            }
             Ok(n > 0)
         })
     })
     .await?;
+    // Every server's copy too, by a notice after the commit (BUG-2459).
     if changed {
-        hub.caches.tips_changed(project_id);
+        hub.caches.tips_moved(project_id);
         hub.embargo.wake();
     }
     Ok(())

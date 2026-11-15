@@ -1316,7 +1316,6 @@ impl Service {
             })
             .collect();
         let tx_landed_prs = landed_prs.clone();
-        let notify = hub.caches.notices.load(Ordering::SeqCst);
         let active_agents: Vec<(i64, String, (i64, i64))> = b
             .rows
             .iter()
@@ -1656,13 +1655,6 @@ impl Service {
                     .bind(format!("{landed} of {} landed on {branch}", seqs.len()))
                     .execute(&mut *c)
                     .await?;
-                if notify && moved {
-                    sqlx::query("SELECT pg_notify($1, $2)")
-                        .bind(crate::caches::TIPS_CHANNEL)
-                        .bind(pid.to_string())
-                        .execute(&mut *c)
-                        .await?;
-                }
                 // What the batch made is stored before the branch names it:
                 // waited for here a little only, so that a slow store never
                 // holds the lease's row (and the branch's other servers)
@@ -1713,8 +1705,9 @@ impl Service {
         for (k, real, proj, _) in &b.memos {
             hub.caches.put_memo(self.project, k, real, proj);
         }
+        // Every server's copy too, by a notice after the commit (BUG-2459).
         if moved {
-            hub.caches.tips_changed(self.project);
+            hub.caches.tips_moved(self.project);
             crate::derive::landed(hub, self.project, vec![self.branch.clone()]);
         }
         let st = &hub.landing.stats;

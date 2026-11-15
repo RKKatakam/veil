@@ -36,6 +36,17 @@
 //! database delivers notices) that makes every server drop its copy, so a
 //! pull may see a tip at most that old. A push never trusts the cache: it
 //! compares and swaps against the database.
+//!
+//! The notices are sent after the commit, never inside the write's own
+//! transaction ([`Caches::tips_moved`], [`send_notices`]): PostgreSQL commits
+//! the transactions that notify one at a time, under one lock for the whole
+//! database held through the commit's flush, so a notice in every push
+//! capped every push and landing of every project at one per disk flush
+//! (BUG-2459). One transaction now carries every project id the server's
+//! commits queued since the last one, at most one every [`NOTICE_EVERY`].
+//! A notice is only a hint: tips expire after [`TIPS_TTL`] without it, so
+//! its transaction, which stores nothing, does not wait for the disk
+//! (`synchronous_commit = off` for it alone; every data commit still does).
 
 use std::{
     collections::HashMap,
@@ -57,6 +68,10 @@ use crate::{
 /// How long a server serves a project's branch rows without reading them
 /// again, when no notice of a push arrived (`phase-2-thin-clients.md` §5.1).
 pub const TIPS_TTL: Duration = Duration::from_millis(100);
+/// The shortest time between two of a server's notice transactions
+/// ([`send_notices`]): far below [`TIPS_TTL`], and at any load at most this
+/// many commits a second for all the notices of a server.
+pub const NOTICE_EVERY: Duration = Duration::from_millis(5);
 /// The notice channel every push notifies, with the project's id.
 pub const TIPS_CHANNEL: &str = "veil_tips";
 
@@ -104,15 +119,44 @@ struct TipsSlot {
     /// The read in flight, if one started within [`TIPS_TTL`]: others wait
     /// for it instead of reading too (under load, a herd of readers made
     /// every read slower than the expiry, so nothing was ever kept).
-    reading: Option<(Instant, Arc<tokio::sync::Notify>)>,
+    reading: Option<Arc<ReadInFlight>>,
+}
+
+/// One read of a project's branch rows, and whoever waits for it.
+pub struct ReadInFlight {
+    started: Instant,
+    woken: tokio::sync::Notify,
+    rows: std::sync::OnceLock<BranchRows>,
+}
+
+impl ReadInFlight {
+    /// Woken when the read ends.
+    pub fn woken(&self) -> &tokio::sync::Notify {
+        &self.woken
+    }
+
+    /// The rows it read, for a request that asked at `asked`, if the read
+    /// started after: they then hold every commit made before that request,
+    /// kept or not. Under a stream of pushes no read is kept (a push lands
+    /// during each), and its waiters used to ask again one by one, one read
+    /// each: every request of the project took its turn behind the others
+    /// (BUG-2460). Now one read answers every request it started after.
+    pub fn rows_for(&self, asked: Instant) -> Option<BranchRows> {
+        if self.started >= asked {
+            self.rows.get().cloned()
+        } else {
+            None
+        }
+    }
 }
 
 /// What [`Caches::tips`] says to do.
 pub enum TipsLookup {
     /// The rows, read within [`TIPS_TTL`] and no notice since.
     Hit(BranchRows),
-    /// Another request is reading them: wait for its notice, then ask again.
-    Wait(Arc<tokio::sync::Notify>),
+    /// Another request is reading them: wait for its end, then take its rows
+    /// ([`ReadInFlight::rows_for`]) or ask again.
+    Wait(Arc<ReadInFlight>),
     /// Read them, then [`Caches::put_tips`] (or [`Caches::tips_failed`]).
     Read(TipsRead),
 }
@@ -120,7 +164,7 @@ pub enum TipsLookup {
 /// One read of a project's branch rows, in flight.
 pub struct TipsRead {
     generation: (u64, u64),
-    done: Arc<tokio::sync::Notify>,
+    done: Arc<ReadInFlight>,
 }
 
 #[derive(Default)]
@@ -246,6 +290,10 @@ pub struct Caches {
     /// Whether the database delivers this server's notices (checked when the
     /// listener starts); without them, tips expire after [`TIPS_TTL`] only.
     pub notices: AtomicBool,
+    /// Projects whose branch rows this server's commits changed, for the
+    /// next notice ([`send_notices`]).
+    pending_notices: Mutex<std::collections::BTreeSet<i64>>,
+    notice_wake: tokio::sync::Notify,
     /// Request-path counters, for the benchmarks.
     pub stats: Stats,
 }
@@ -285,6 +333,8 @@ impl Default for Caches {
             gc_rows: RwLock::new(std::collections::HashSet::new()),
             tips: Mutex::new(Tips::default()),
             notices: AtomicBool::new(false),
+            pending_notices: Mutex::new(std::collections::BTreeSet::new()),
+            notice_wake: tokio::sync::Notify::new(),
             stats: Stats::default(),
         }
     }
@@ -465,15 +515,15 @@ impl Caches {
                 return TipsLookup::Hit(rows.clone());
             }
         }
-        if let Some((started, done)) = &slot.reading {
-            if started.elapsed() < TIPS_TTL {
+        if let Some(done) = &slot.reading {
+            if done.started.elapsed() < TIPS_TTL {
                 return TipsLookup::Wait(done.clone());
             }
         }
         self.stats.tips_misses.fetch_add(1, Ordering::Relaxed);
         crate::limits::health::hit(crate::limits::health::Layer::Tips, false);
-        let done = Arc::new(tokio::sync::Notify::new());
-        slot.reading = Some((Instant::now(), done.clone()));
+        let done = Arc::new(ReadInFlight { started: Instant::now(), woken: tokio::sync::Notify::new(), rows: std::sync::OnceLock::new() });
+        slot.reading = Some(done.clone());
         TipsLookup::Read(TipsRead {
             generation: (global, slot.generation),
             done,
@@ -481,15 +531,16 @@ impl Caches {
     }
 
     /// Is `done`'s read of `project` still in flight?
-    pub fn tips_reading(&self, project: i64, done: &Arc<tokio::sync::Notify>) -> bool {
+    pub fn tips_reading(&self, project: i64, done: &Arc<ReadInFlight>) -> bool {
         let t = self.tips.lock().unwrap();
-        t.slots.get(&project).and_then(|s| s.reading.as_ref()).is_some_and(|(_, d)| Arc::ptr_eq(d, done))
+        t.slots.get(&project).and_then(|s| s.reading.as_ref()).is_some_and(|d| Arc::ptr_eq(d, done))
     }
 
     /// Keep rows read from the database (the read started at `read_at`)
     /// unless a notice for the project came since the read was handed out;
-    /// wake whoever waits for it.
-    pub fn put_tips(&self, project: i64, read: TipsRead, read_at: Instant, rows: Vec<(String, String)>) {
+    /// hand them to whoever waits for it, and back.
+    pub fn put_tips(&self, project: i64, read: TipsRead, read_at: Instant, rows: Vec<(String, String)>) -> BranchRows {
+        let rows = Arc::new(rows);
         let mut t = self.tips.lock().unwrap();
         let fits = t.generation == read.generation.0 && t.slots.len() <= MAX_TIP_PROJECTS;
         if t.slots.len() > MAX_TIP_PROJECTS {
@@ -502,12 +553,14 @@ impl Caches {
             t.free(project, None);
             t.sweep(weight);
             // Its age counts from before the read: never older than TIPS_TTL.
-            t.slots.entry(project).or_default().rows = Some((read_at, Arc::new(rows), weight));
+            t.slots.entry(project).or_default().rows = Some((read_at, rows.clone(), weight));
             t.bytes += weight;
             t.order.push_back((read_at, project));
         }
+        let _ = read.done.rows.set(rows.clone());
         let slot = t.slots.entry(project).or_default();
         Self::finish(slot, &read.done);
+        rows
     }
 
     /// The read failed: wake whoever waits for it (one of them reads again).
@@ -517,17 +570,17 @@ impl Caches {
         Self::finish(slot, &read.done);
     }
 
-    fn finish(slot: &mut TipsSlot, done: &Arc<tokio::sync::Notify>) {
-        if slot.reading.as_ref().is_some_and(|(_, d)| Arc::ptr_eq(d, done)) {
+    fn finish(slot: &mut TipsSlot, done: &Arc<ReadInFlight>) {
+        if slot.reading.as_ref().is_some_and(|d| Arc::ptr_eq(d, done)) {
             slot.reading = None;
         }
-        done.notify_waiters();
+        done.woken.notify_waiters();
     }
 
     fn drop_slots(t: &mut Tips) {
         for slot in t.slots.values() {
-            if let Some((_, d)) = &slot.reading {
-                d.notify_waiters();
+            if let Some(d) = &slot.reading {
+                d.woken.notify_waiters();
             }
         }
         t.slots.clear();
@@ -541,6 +594,17 @@ impl Caches {
         let mut t = self.tips.lock().unwrap();
         t.free(project, None);
         t.slots.entry(project).or_default().generation += 1;
+    }
+
+    /// This server committed a change to `project`'s branch rows: its own
+    /// copy goes now, and every server's with the next notice (sent after
+    /// the commit by [`send_notices`], when the database delivers them).
+    pub fn tips_moved(&self, project: i64) {
+        self.tips_changed(project);
+        if self.notices.load(Ordering::SeqCst) {
+            self.pending_notices.lock().unwrap().insert(project);
+            self.notice_wake.notify_one();
+        }
     }
 
     /// Notices may have been missed (the listener's connection was lost).
@@ -618,6 +682,45 @@ pub async fn listen(hub: Arc<crate::Hub>, mut stop: tokio::sync::watch::Receiver
             }
         }
     }
+}
+
+/// Send the notices [`Caches::tips_moved`] queued, until `stop`: each time,
+/// one transaction for every project queued since the last, at most one
+/// every [`NOTICE_EVERY`], so the database's notice lock is taken once for
+/// all of them (BUG-2459). A failed send is tried again shortly; a notice
+/// lost (a stopping server, or a database crash before its asynchronous
+/// commit reached the disk) costs only the wait for [`TIPS_TTL`].
+pub async fn send_notices(hub: Arc<crate::Hub>, mut stop: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            _ = hub.caches.notice_wake.notified() => {}
+            _ = stop.changed() => return,
+        }
+        let started = Instant::now();
+        let projects: Vec<i64> = std::mem::take(&mut *hub.caches.pending_notices.lock().unwrap()).into_iter().collect();
+        if projects.is_empty() {
+            continue;
+        }
+        if send(&hub.db, &projects).await.is_ok() {
+            hub.commits.count(crate::db::Commit::Notice);
+        } else {
+            hub.caches.pending_notices.lock().unwrap().extend(projects);
+            hub.caches.notice_wake.notify_one();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(NOTICE_EVERY.saturating_sub(started.elapsed())).await;
+    }
+}
+
+async fn send(db: &sqlx::PgPool, projects: &[i64]) -> std::result::Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SET LOCAL synchronous_commit = off").execute(&mut *tx).await?;
+    sqlx::query("SELECT pg_notify($1, p::text) FROM UNNEST($2::bigint[]) AS t(p)")
+        .bind(TIPS_CHANNEL)
+        .bind(projects)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
 }
 
 async fn start_listener(hub: &crate::Hub) -> Option<sqlx::postgres::PgListener> {
@@ -732,5 +835,29 @@ mod tests {
         let r = read(&c, 1);
         c.tips_failed(1, r);
         assert!(matches!(c.tips(1), TipsLookup::Read(_)), "after a failed read, the next asker reads");
+    }
+
+    /// BUG-2460: a push during every read kept none, and each waiter then
+    /// read on its own, one at a time. A read answers every request that
+    /// asked before it started, kept or not, and never one that asked after.
+    #[test]
+    fn bug_2460_one_read_answers_every_request_that_asked_before_it_started() {
+        let c = Caches::default();
+        let before = Instant::now();
+        let r = read(&c, 1);
+        std::thread::sleep(Duration::from_millis(2));
+        let after = Instant::now();
+        let TipsLookup::Wait(done) = c.tips(1) else { panic!("a second asker waits") };
+        c.tips_changed(1);
+        let got = c.put_tips(1, r, Instant::now(), vec![("main".into(), "new".into())]);
+        assert_eq!(got[0].1, "new", "the reader gets its rows");
+        assert!(rows(&c, 1).is_none(), "rows read across a notice are not kept");
+        assert_eq!(done.rows_for(before).expect("a request that asked before the read started takes its rows")[0].1, "new");
+        assert!(done.rows_for(after).is_none(), "a request that asked after the read started reads again: a push before it may be missing");
+        // A failed read hands nothing to anyone.
+        let r = read(&c, 2);
+        let TipsLookup::Wait(done) = c.tips(2) else { panic!("a second asker waits") };
+        c.tips_failed(2, r);
+        assert!(done.rows_for(before).is_none());
     }
 }

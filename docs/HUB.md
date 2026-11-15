@@ -1737,13 +1737,24 @@ and compares and swaps in the database. Notices: PostgreSQL delivers
 `NOTIFY` (another server saw a push within 5–15 ms in the tests);
 **YugabyteDB 2025.2 does not by default** (`ysql_yb_enable_listen_notify`
 is off), which the server detects at start (it sends itself a notice), and
-tips then expire after 100 ms only. Its change feed is not used.
+tips then expire after 100 ms only. Its change feed is not used. **The
+notice is sent after the commit, never in the write's transaction**
+(BUG-2459): PostgreSQL commits the transactions that notify one at a time,
+under one lock for the whole database held through the commit's flush, so
+a notice in every push capped every push and landing of every project at
+one per disk flush. Each server queues the project ids its commits changed
+and sends them all in one transaction, at most one every 5 ms
+(`caches::NOTICE_EVERY`); that transaction stores nothing and does not wait
+for the disk (`synchronous_commit = off` for it alone). A lost notice costs
+only the 100 ms expiry. A request waiting for another's read of a project's
+branch rows takes that read's rows when the read started after the request
+did, kept or not (BUG-2460).
 
 **One database commit per push.** The push's transaction writes the branch
 compare-and-swaps, the accepted policy, the snapshot and origin rows, the
 pusher's projection memo of what it moved (worked out before the
-transaction, as it will read after the commit) and the audit row, and sends
-the notice. A push whose every update is refused commits nothing
+transaction, as it will read after the commit) and the audit row; the
+notice follows the commit (BUG-2459). A push whose every update is refused commits nothing
 (BUG-910), and a push records only the snapshots of the updates that land
 (BUG-914). Other viewers' projections are worked out when they first ask,
 as before; a reader never gets an unprojected answer. A push reads only the
@@ -5252,8 +5263,8 @@ vl embargo release ID
   * **Clearing the embargo:** in one transaction after the landing succeeds,
     `release_one` sets `embargo_lines.released_at` and updates
     `record_json.released_at`, deletes `branches WHERE name = 'embargo/<id>'`,
-    deletes the embargo's `embargo_snapshots` rows, notifies `pg_notify` on
-    `TIPS_CHANNEL`, and wakes `derive::landed` so derived history and search
+    deletes the embargo's `embargo_snapshots` rows, queues the notice on
+    `TIPS_CHANNEL` (sent after the commit, BUG-2459), and wakes `derive::landed` so derived history and search
     catch up on `main`.
   * **Retries and conflicts:** each due embargo is released on its own (BUG-1857). If a release attempt fails
     before finalizing or hits a content conflict on `target_branch`, `released_at` remains `NULL` and the

@@ -264,6 +264,8 @@ pub async fn start(config: Config) -> Result<Running> {
     let app = api::router(hub.clone());
     // Push notices drop other servers' cached tips (`caches::listen`).
     tokio::spawn(caches::listen(hub.clone(), rx.clone()));
+    // ... sent after each commit, many projects in one (BUG-2459).
+    tokio::spawn(caches::send_notices(hub.clone(), rx.clone()));
     // Scheduled embargo releases (S22).
     tokio::spawn(embargo::run_loop(hub.clone(), rx.clone()));
     let pace = cache::deadline::Pace { stall: ANSWER_STALL, grace: ANSWER_STALL, min_rate: limits::body::MIN_RATE };
