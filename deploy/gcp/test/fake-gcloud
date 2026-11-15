@@ -53,6 +53,7 @@ case "$*" in
         name=$(names 3 | head -1); zone=$(flag --zone)
         echo "$name $zone RUNNING 203.0.113.$n 10.42.0.$n" >> "$D/instances"
         echo "$name $zone" >> "$D/disks"
+        d=$(flag --create-disk || true); [ -n "$d" ] && { d=${d#name=}; echo "${d%%,*} $zone" >> "$D/disks"; }
         echo "$name" ;;
     "compute instances start"*)
         for name in $(names 3); do
@@ -68,7 +69,9 @@ case "$*" in
         esac ;;
     "compute instances delete"*)
         drop instances $(names 3)
-        [[ " $* " == *" --delete-disks=all "* ]] && drop disks $(names 3); true ;;
+        # --delete-disks=all: the boot disk; a data disk made with auto-delete=yes goes with its VM anyway.
+        [[ " $* " == *" --delete-disks=all "* ]] && drop disks $(names 3)
+        drop disks $(for n in $(names 3); do echo "$n-data"; done); true ;;
     "compute disks add-labels"*) ;;
     "compute disks list"*) cat "$D/disks" ;;
     "compute disks delete"*) drop disks $(names 3) ;;

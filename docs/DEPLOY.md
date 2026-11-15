@@ -165,9 +165,15 @@ What `configure.sh` sets up, and why:
 - `yugabyted start --advertise_address=<private address>`, the second and
   third with `--join=<the first's>`: three masters and three tablet
   servers, three copies of every tablet.
-- `--tserver_flags=ysql_num_shards_per_tserver=1`: each hash-sharded table
-  gets one tablet per node (three), led one by each node, so a hot table's
-  writes are spread over the cluster. Veil's schema (migrations 1 to 39) is
+- **Veil's database `veil`, colocated by default** (`VEIL_DO_YB_LAYOUT`,
+  `VEIL_GCP_YB_LAYOUT`; §12.10): `CREATE DATABASE veil WITH COLOCATION =
+  true`, made once by `configure.sh`, which checks the layout of one it
+  finds (`yb_is_database_colocated()`) and refuses the other. Every table
+  of a colocated database is in one tablet (one leader, three copies).
+  With `YB_LAYOUT=hash` the tables are hash-sharded:
+  `--tserver_flags=ysql_num_shards_per_tserver=YB_TABLETS` (default 1)
+  gives each table that many tablets per node, led in turn by each node.
+  Veil's schema (migrations 1 to 40) is
   many small tables and indexes: a node holds a replica of every tablet,
   about three times the number of tables and indexes in all. The
   rehearsal's count is in §9.2 (124 on `yb1` at one tablet per table;
@@ -185,7 +191,7 @@ What `configure.sh` sets up, and why:
   three servers of 64 database connections each spread over the nodes, and
   the drivers' counters, a node serves under 100 YSQL connections, well
   within its default `ysql_max_connections` (300).
-- The database is the cluster's own `yugabyte`, user `yugabyte`, no
+- The database is `veil` (not the cluster's default `yugabyte`), user `yugabyte`, no
   password, no TLS: it listens on the VPC's private addresses only, and the
   firewall lets only the run's own droplets in (§11).
 
@@ -531,6 +537,7 @@ reach the balancer (or the only server) over the VPC.
 | `land` | driver 1 | `load --mode land`, 1/10/100 projects, 1 and 50 agents, `max` rate | phase 2 §8: 100/s into one `main` (p99 under 500 ms), 4,000/s across projects; 1 database commit per landing |
 | `api` | driver 1 | `load --mode api`, commits through `POST …/changes` | `docs/HUB.md` §13.13 (S10): as `land` |
 | `branches` | driver 1 | `load --mode branches`, 1/10/100 agents on branches of their own (the cost curve); then **the headline**: 300, 1,000 and 3,000 agents (`HEADLINE_AGENTS`) each on its branch, landing it on `main` through the landing service after every 5th push (`--merge-every 5`), 300 s each, `max` rate | `storage-and-cost.md` §9: 1 commit per push, at most 2 storage writes; the headline has no fixed target: it is the owner's realistic workload, reported as pushes/s, merges/s and latency |
+| `onerepo` | driver 1 | `load --mode branches`, **one busy repository**: 1,000 and 5,000 agents (`ONEREPO_AGENTS`) each pushing to a branch of its own in one project, as fast as answered, 120 s each (`ONEREPO_DURATION`); the database machines are sampled with the servers (`db<N>-docker-stats.log`) | 7,200 pushes a second (`ONEREPO_TARGET`), the figure of GitHub's internal test (7,200 pushes a second, 5,000 agents on one repository); `onerepo.md` (`deploy/onerepo-table.py`): pushes a second and their share of the target, statements, writes and commits per push, the servers' and the database's CPU per push (their samples inside the measured window), the driver's own cores, and the cores the target would need at those costs (§12.10) |
 | `landing` | driver 1 | `load --mode landing --people 100`, 10,000 agents into one `main`, 1,000 landings/s offered; `plain`, `--protected` (review rules at 0 approvals), and `--protected --mix` (3 % overlapping, 2 % conflicting changes); 180 s and 600 s each | phase 4 §7 (G4): 1,000 landings/s sustained, p50 150 ms, p99 1 s; at most 1.5 commits per landing |
 | `agents` | driver 1 | `load --mode agents`, 1,000 and 10,000 agents (`AGENTS_COUNTS`), 180 s each: coding agents at their pace, a think time between operations (120 s of agent time on average, exponential, compressed 20 times: `AGENTS_THINK`, `AGENTS_TIME_SCALE`), 3 subagents forked once a cycle on branches off the agent's, 3 pushes each, merged into its branch through the landing service (`onto` it; their branches stay: only admins may delete a branch whose work is not on `main`), and its branch landed on `main` every 20 pushes (about every 45 minutes of agent time) | no fixed target: reported per kind of operation (push, subagent merge, landing on `main`, pull or workspace start) as rate, uncompressed rate, p50/p99, errors and answers to come back, with commits per push and per landing |
 | `scaling` | both drivers at once → the one address | `pull` (1,000 agents), `branches` (1,000 agents) and `landing` across 100 projects (1,000 agents), 60 s each, with 1, 2 and 3 servers running (the others stopped; the balancer drops them within 2 s) | throughput rises with servers; `scaling.md` (`deploy/scaling-table.py`) sums the drivers and gives each count's ratio to one server's |
@@ -1124,7 +1131,7 @@ VPC network:
 |---|---|---|---|---|
 | `NAME-hub`, `-hub2`, `-hub3` | `c2d-standard-16` (16 vCPUs, 64 GB) | **Spot** | 200 GB | `veil-server`, one each, on the one database and bucket |
 | `NAME-lb` | `e2-standard-4` (4 vCPUs, 16 GB) | **Spot** | 20 GB | HAProxy 3.0, TLS passed through: the one address |
-| `NAME-yb1` to `-yb3` | `c2d-standard-8` (8 vCPUs, 32 GB) | on-demand | 100 GB | YugabyteDB, one node each |
+| `NAME-yb1` to `-yb3` | `c2d-standard-8` (8 vCPUs, 32 GB) | on-demand | 100 GB, and a 500 GB `pd-ssd` data disk | YugabyteDB, one node each, its data on the data disk; Veil's database colocated (§12.10) |
 | `NAME-driver1`, `-driver2` | `c2d-standard-8` | **Spot** | 100 GB | `veil-bench`, the simulated agents |
 | `NAME-minio` | `c2d-standard-16` + 1 × 375 GB local NVMe SSD | on-demand | 20 GB | MinIO, its data on the local SSD |
 
@@ -1205,17 +1212,22 @@ price for. The default topology, hybrid:
 | storage, `c2d-standard-16`, on-demand | 0.727 |
 | its local SSD, 375 GiB | 0.041 |
 | boot disks, 1,140 GiB pd-balanced | 0.156 |
+| database data disks, 3 × 500 GiB pd-ssd ($0.17 a GiB a month) | 0.349 |
 | 10 external IPv4 addresses (4 standard, 6 Spot) | 0.035 |
-| **total** | **3.465** |
+| **total** | **3.815** |
 
 | Model | USD/hour | 8 hours | A day forgotten | A month forgotten |
 |---|---:|---:|---:|---:|
-| on-demand (`VEIL_GCP_SPOT=none`) | 5.110 | 40.88 | 122.65 | 3,730.49 |
-| **hybrid Spot (the default)** | **3.465** | **27.72** | **83.17** | **2,529.64** |
-| all Spot | 2.470 | 19.76 | 59.29 | 1,803.29 |
+| on-demand (`VEIL_GCP_SPOT=none`) | 5.460 | 43.68 | 131.03 | 3,985.49 |
+| **hybrid Spot (the default)** | **3.815** | **30.52** | **91.55** | **2,784.64** |
+| all Spot | 2.820 | 22.56 | 67.67 | 2,058.29 |
+
+Without the data disks (`VEIL_GCP_DB_DISK_GB=0`, the database on the boot
+disk, as on the runs of 2026-11-14) the hybrid plan is $3.465 an hour.
 
 Stopped VMs (reclaimed and never started, or a teardown that deleted
-nothing but stopped everything) still bill their disks: $114 a month.
+nothing but stopped everything) still bill their disks: $369 a month
+($114 of boot disks, $255 of data disks).
 Traffic between the machines is free (one zone, internal addresses); the
 images go in free; the results that come out are a few megabytes.
 
@@ -1234,7 +1246,7 @@ in the region:
 | `PREEMPTIBLE_CPUS` | 68 | only where granted: Spot VMs count there, else against the on-demand quotas |
 | `CPUS` | 4 | the E2 balancer |
 | `LOCAL_SSD_TOTAL_GB` | 375 | MinIO's SSD |
-| `SSD_TOTAL_GB` | 1,140 | the pd-balanced boot disks |
+| `SSD_TOTAL_GB` | 2,640 | the pd-balanced boot disks (1,140) and the database machines' pd-ssd data disks (1,500) |
 | `IN_USE_ADDRESSES` | 10 | one external address per VM (SSH from the operator) |
 | `INSTANCES` | 10 | |
 | `CPUS_ALL_REGIONS` (global) | 108 | every vCPU of the run |
@@ -1319,7 +1331,7 @@ all are gone. Glance at Billing > Reports in the console the next day.
 
 ### 12.7 Testing the kit
 
-`bash deploy/gcp/test/test.sh` (76 checks) runs every script against a
+`bash deploy/gcp/test/test.sh` (85 checks) runs every script against a
 fake gcloud (`deploy/gcp/test/fake-gcloud`), a made-up project that
 remembers what was created, stopped and deleted, with fake ssh, scp,
 docker and curl. It checks that the dry runs of the full topology exit 0,
@@ -1332,7 +1344,11 @@ machine, no service account, only the run's public key in the metadata);
 the estimate (the three models, $100 refused, unknown and E2 storage types
 refused, live prices with the token on stdin only); `configure.sh` through
 the shared steps (MinIO on the local SSD and started directly, `localhost`
-in the certificate, no `spaces.env`); the Spot watch (a clean gate valid; a
+in the certificate, no `spaces.env`; each database machine's data disk;
+Veil's database colocated by default, the hash layout with its tablets,
+PostgreSQL's settings sized on the machine with durability on); the
+`onerepo` gate (one project, 1,000 and 5,000 agents, the database machines
+sampled) and its table on made-up results; the Spot watch (a clean gate valid; a
 reclaim during a gate marks it invalid, starts the VM and reruns once; a
 second reclaim fails without a third run; a VM down before a gate is
 started first; a reclaimed storage machine with `all` reconfigures);
@@ -1414,6 +1430,154 @@ found nothing left after each run.
 1. **The branch-tips answer costs more with every branch.** Every push asks for the tips first, and the server signs a grant for every branch. Database statements per operation grew from 25 to 140 to 570 as branches piled up. This is the limit at 3,000 or more agents, on every database layout.
 2. **An agent can't delete a branch it merged into another branch** (403: only admins may delete a branch whose work isn't all on `main`). Subagent branches pile up.
 3. **The 1 GB project's full clone peaks at 1,042 MiB on the server.**
-4. **The benchmark's set-up gives up on a `busy` answer** (the 2-server scaling run lost one driver).
-5. **The colocated layout should be the kit's default for YugabyteDB:** it doubled the merge rate and removed the errors. PostgreSQL on its own machine is already a kit option (`VEIL_GCP_YB_NODES=0`); these runs switched by hand only to keep the same machines.
+4. **The benchmark's set-up gives up on a `busy` answer** (the 2-server scaling run lost one driver). Fixed: BUG-2435.
+5. **The colocated layout should be the kit's default for YugabyteDB:** it doubled the merge rate and removed the errors. PostgreSQL on its own machine is already a kit option (`VEIL_GCP_YB_NODES=0`); these runs switched by hand only to keep the same machines. Done: the kit's default since 2026-11-15 (§12.10).
 6. **The 10-minute landing mix** is still to run across machines.
+
+### 12.10 The database for one busy repository (2026-11-15)
+
+The target: one repository taking thousands of pushes a second from
+thousands of agents, across machines (GitHub's internal test: 7,200 pushes
+a second, 5,000 agents on one repository), without weakening durability or
+permissions. The settings below are both kits' (`deploy/kit.sh`,
+`deploy/do/configure.sh`), with defaults picked from the Google Cloud runs
+(§12.9) and the local measurements below.
+
+| Setting | Default | Choices |
+|---|---|---|
+| `VEIL_GCP_YB_LAYOUT`, `VEIL_DO_YB_LAYOUT` | `colocated` | `colocated`: every table of Veil's database `veil` in one tablet; `hash`: each table hash-sharded |
+| `VEIL_GCP_YB_TABLETS`, `VEIL_DO_YB_TABLETS` | 1 | `hash` only: tablets per table on each node (1 to 99) |
+| `VEIL_GCP_DB_DISK_TYPE` | `pd-ssd` | `pd-ssd`, `pd-balanced`: each database machine's data disk |
+| `VEIL_GCP_DB_DISK_GB` | 500 | 0 (the data on the boot disk, as on the runs of §12.9), or 10 to 4,000 |
+
+PostgreSQL alone is `VEIL_GCP_YB_NODES=0` (`VEIL_DO_YB_NODES=0`, the
+DigitalOcean default), as before.
+
+**Why colocated is YugabyteDB's default.** Measured on Google Cloud (§12.9),
+the layout as deployed then (`hash`, one tablet per table on each node):
+6.7 and 8.1 merges a second at 300 and 1,000 agents, with 55 errors at
+1,000; the same machines with a colocated database: 15.6 and 12.5, no
+errors. PostgreSQL on one of those machines did better than both (30.6 and
+25.2).
+
+**What a push writes**, measured on this machine (one YugabyteDB node,
+`yugabytedb/yugabyte:2025.2.8.1-b8`, and a PostgreSQL 17 container with the
+kit's settings; release build; `veil-bench load --mode branches`, one
+project, 64 agents each pushing to a branch of its own, 30 s; the
+statements from `pg_stat_statements` of the run's database only):
+
+| | YugabyteDB, `hash` | YugabyteDB, colocated | PostgreSQL |
+|---|---:|---:|---:|
+| pushes a second (one machine for all: relative, not a capacity) | 561 | 585 | 899 |
+| statements per push | 40.1 | 39.8 | 40.1 |
+| of which reads | 28.9 | 28.7 | 29.0 |
+| writes per push | 9.1 | 9.1 | 9.1 |
+| commits per push | 3.05 distributed transactions | 3.05 distributed transactions | 3.04 |
+| rows written per push (tables and their indexes, DocDB) | 34.9 | 34.5 | – |
+| tablets written over the run | 43 | 1 | – |
+| WAL per push | 15.5 KB (DocDB) | 10.6 KB (DocDB) | 11.5 KB |
+| server CPU per push | 7.8 ms | 7.9 ms | 7.2 ms |
+
+A push is one transaction of seven writes (a row each into `snapshots`,
+`origins`, `projections`, `landed_changes`, `audit_log` and `packs`, and
+its branch's row in `branches` updated), beside two `packs` rows committed
+before it (the upload's pack and the push's own, recorded before they are
+written: S28), so three commits. The reads are mostly the tips
+(every agent asks for them before it pushes) and the permission and pack
+lookups. With `hash`, every table and index a push writes is a tablet of
+its own: about 20 tablets in one push's transaction, on up to three nodes.
+
+**The same push with more branches** (PostgreSQL with the kit's settings,
+one project, 60 s, this machine of 32 threads shared with the load tool):
+
+| Agents (branches) | Pushes a second | p50 / p99 | Server CPU per push | Server cores | Statements per push | Commits per push | WAL per push | Received per push (the tips) | Errors, "come back" answers |
+|---:|---:|---|---:|---:|---:|---:|---:|---:|---|
+| 64 | 899 | 66 ms / 144 ms | 7.2 ms | 6.4 | 40.1 | 3.04 | 11.5 KB | – | 0, 0 |
+| 1,000 | 333 | 3.2 s / 4.3 s | 53.8 ms | 17.9 | 46.2 | 3.19 | 13.8 KB | 746 KB | 0, 0 |
+| 5,000 | 76 | 30 s / 57 s | 251 ms | 19.0 | 69.0 | 7.25 | 15.0 KB | 3.5 MB | 57, 414,401 |
+
+The server's CPU per push grows with the number of branches: every push
+asks for the tips first, and the answer names (and signs a grant for) every
+branch of the project (§12.9, first finding). At 5,000 agents the server
+sheds load ("come back later"), and the retried uploads add their pack
+rows' commits. The database is not the limit there: it used 1.2 cores at
+5,000 agents.
+
+**Why more tablets do not spread one repository.** Every table's primary
+key starts with `project_id`, and YugabyteDB hashes a key's first column:
+`PRIMARY KEY (project_id, name)` is `((project_id) HASH, name ASC)`. All of
+one project's rows of a table have the same hash, so they are in one tablet
+whatever the number of tablets, and automatic tablet splitting cannot
+separate them either. Measured on the run's rows (`yb_hash_code`, the hash
+range split evenly as YugabyteDB splits it):
+
+| Table (rows of the one project) | Tablets it is in with 3 a table | with 24 | hashed on the whole key: 3 | 24 |
+|---|---:|---:|---:|---:|
+| `branches` (65) | 1 | 1 | 3 | 22 |
+| `snapshots` (19,396) | 1 | 1 | 3 | 24 |
+| `packs` (38,924) | 1 | 1 | 3 | 24 |
+| `graph` (19,396) | 1 | 1 | 3 | 24 |
+
+So `YB_TABLETS` spreads many projects over the nodes, never one. With
+`hash`, one project's writes are spread over the nodes only table by
+table, and every push is a transaction across several of them; colocated,
+they are all on one tablet's leader, one node, in a transaction of one
+tablet. That is why colocated measured faster, and why its ceiling for one
+busy repository is one node's write rate.
+
+**Why no schema change.** Hashing `branches` and `packs` on their whole key
+would spread one project's rows, but their hot reads are range scans of
+one project: the tips (`WHERE project_id = $1 AND hidden_for_embargo IS
+NULL`, in ten queries) and the pack listings (`WHERE project_id = $1 AND
+state = $2`, in eight). Hashed on the whole key, each would read every
+tablet of the table; an index on `project_id` to avoid that is itself
+hashed on `project_id` (one tablet a project again, `packs_unlisted`
+already is one), and an index covering the tips would be written by every
+push. A push would still be a transaction across several tablets. So no
+migration is proposed: for one busy repository the database is PostgreSQL,
+or a colocated YugabyteDB up to one node's write rate.
+
+**PostgreSQL's settings** (`deploy/kit.sh` `pg_settings`), for a
+write-heavy server, sized on the machine at start (its memory, `m` MiB):
+
+- `max_connections` = servers × `--db-connections` + 64 (a same-machine
+  gate's own server) + 100 (the drivers' counters, migrations, psql): 356
+  for the default three servers, not the 1,500 of before (every connection
+  is a process);
+- `shared_buffers` a quarter of the memory (8 GB on a `c2d-standard-8`, as
+  on the run of §12.9), `effective_cache_size` three quarters,
+  `maintenance_work_mem=1GB`;
+- `wal_buffers=64MB`, `max_wal_size=16GB`, `min_wal_size=4GB`,
+  `checkpoint_timeout=15min`, `checkpoint_completion_target=0.9`: few
+  checkpoints, so few full-page images in the WAL (11.5 KB a push);
+- `random_page_cost=1.1`, `effective_io_concurrency=200` (an SSD);
+  `autovacuum_vacuum_cost_limit=2000` (`branches` rows are updated by every
+  push);
+- `shared_preload_libraries=pg_stat_statements` (`pg_stat_statements.max`
+  10,000, `track_io_timing=on`): the benchmark's per-push counts;
+- **`synchronous_commit=on`, `fsync=on`, `full_page_writes=on`**, stated:
+  a push answered `ok` is on disk (owner's rule: never trade durability for
+  speed). `commit_delay`, which batches commits' flushes without losing
+  any, is left at its default: not measured.
+
+The kit's tests check that no setting is `off`. The same settings started
+a `postgres:17-alpine` container of the pinned digest here (the measurement
+above ran on it).
+
+**The data disk** (Google Cloud): each database machine has a persistent
+disk of its own for its data (`NAME-db-data`, `NAME-ybN-data`, deleted with
+its machine and labelled like it), mounted at `/mnt/db-data`, a file system
+made only when it has none. `pd-ssd` (30 IOPS and 0.48 MB/s a GB, up to the
+machine's own limits) rather than the `pd-balanced` boot disk of §12.9:
+the WAL of 7,200 pushes a second at 11.5 KB is about 83 MB/s, flushed at
+every commit. 500 GB adds $0.116 an hour a machine (§12.2). On DigitalOcean
+the data stays on the droplet's own disk (local NVMe on the CPU-Optimized
+sizes).
+
+**The `onerepo` gate** (§6) measures one project at 1,000 and 5,000 agents
+against the target. It runs from one driver (the agents of one project sign
+in as one person, so one tool drives them all): its table shows the
+driver's own cores, and a driver near its vCPUs was the limit, not Veil.
+Statements on YugabyteDB are counted on the node the driver's URL names
+(`pg_stat_statements` is per node): with three servers spread over three
+nodes, about a third of them.

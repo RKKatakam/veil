@@ -191,13 +191,14 @@ The gates, in order (each one line, sizes from `deploy/gates.sh`):
 | 2 | `deploy/do/bench.sh --approve land` | pushes to `main` from 1 and 50 agents in 1, 10 and 100 projects; database commits per landing | 4 min |
 | 3 | `deploy/do/bench.sh --approve api` | the same through `POST …/changes` (the server rebases) | 4 min |
 | 4 | `deploy/do/bench.sh --approve branches` | the cost curve (1, 10, 100 agents pushing to branches of their own), then **the headline**: 300, 1,000 and 3,000 agents each on its branch, landing it on `main` through the landing service after every 5th push, 5 minutes each | 20 min |
-| 5 | `deploy/do/bench.sh --approve landing` | 10,000 agents of 100 people landing into one `main`, 1,000 a second offered: plain, protected (review rules at 0 approvals), and protected with 3 % overlapping and 2 % conflicting changes; 3 and 10 minutes each | 45 min |
-| 6 | `deploy/do/bench.sh --approve scaling` | pulls, pushes to one's own branch and landings across 100 projects with 1, 2 and 3 servers running, from both drivers at once: does throughput rise with servers? | 15 min |
-| 7 | `deploy/do/bench.sh --approve failover` | 1,000 agents landing 300 a second into one `main`; 45 s in, the server holding `main`'s landing lease is stopped: another takes over, how long landings paused, every change landed exactly once | 6 min |
-| 8 | `deploy/do/bench.sh --approve objects` | fresh thin workspaces reading objects through a server and a regional cache the tool starts on `NAME-hub` | 4 min |
-| 9 | `deploy/do/bench.sh --approve openscion` | the OpenScion speed gates, Veil against Git on `NAME-hub`, 1,000 and 10,000 files, 5 runs | 15 min |
-| 10 | `deploy/do/bench.sh --approve scale` | the 1 GB profile through a server on `NAME-hub`: push, clone, pull, one directory, gc; the server's peak memory | 40 min |
-| 11 | `deploy/do/bench.sh --approve spaces` | **Veil on a real Spaces bucket**: a server on `NAME-hub` with its objects on Spaces, 100 agents on branches merging every 5th push, 20 pushes a second (19.6 storage requests a push: about 390 a second, half the bucket's 800), 5 minutes; passes with no error and no storage request given up; the store's `503 Slow Down` answers recorded | 7 min |
+| 5 | `deploy/do/bench.sh --approve onerepo` | **one busy repository**: 1,000 then 5,000 agents each pushing to a branch of its own in one project, as fast as they are answered, 2 minutes each, against 7,200 pushes a second (GitHub's internal test: 7,200 pushes a second, 5,000 agents on one repository); `onerepo.md` gives pushes a second, statements and commits per push, the servers' and the database's CPU per push, and what the target would need at those costs | 6 min |
+| 6 | `deploy/do/bench.sh --approve landing` | 10,000 agents of 100 people landing into one `main`, 1,000 a second offered: plain, protected (review rules at 0 approvals), and protected with 3 % overlapping and 2 % conflicting changes; 3 and 10 minutes each | 45 min |
+| 7 | `deploy/do/bench.sh --approve scaling` | pulls, pushes to one's own branch and landings across 100 projects with 1, 2 and 3 servers running, from both drivers at once: does throughput rise with servers? | 15 min |
+| 8 | `deploy/do/bench.sh --approve failover` | 1,000 agents landing 300 a second into one `main`; 45 s in, the server holding `main`'s landing lease is stopped: another takes over, how long landings paused, every change landed exactly once | 6 min |
+| 9 | `deploy/do/bench.sh --approve objects` | fresh thin workspaces reading objects through a server and a regional cache the tool starts on `NAME-hub` | 4 min |
+| 10 | `deploy/do/bench.sh --approve openscion` | the OpenScion speed gates, Veil against Git on `NAME-hub`, 1,000 and 10,000 files, 5 runs | 15 min |
+| 11 | `deploy/do/bench.sh --approve scale` | the 1 GB profile through a server on `NAME-hub`: push, clone, pull, one directory, gc; the server's peak memory | 40 min |
+| 12 | `deploy/do/bench.sh --approve spaces` | **Veil on a real Spaces bucket**: a server on `NAME-hub` with its objects on Spaces, 100 agents on branches merging every 5th push, 20 pushes a second (19.6 storage requests a push: about 390 a second, half the bucket's 800), 5 minutes; passes with no error and no storage request given up; the store's `503 Slow Down` answers recorded | 7 min |
 
 The PR speed gate (100,000 PRs) is a server test (`prs::pr_speed`), not a
 benchmark that can run against a deployed server; it is measured locally
@@ -373,7 +374,7 @@ limit, and give a reason ("a performance test of a version control server,
 | Preemptible CPUs (`PREEMPTIBLE_CPUS`), if the region has it | us-central1 | 68 |
 | CPUs (`CPUS`) | us-central1 | 4 |
 | Local SSD (`LOCAL_SSD_TOTAL_GB`) | us-central1 | 375 |
-| Persistent Disk SSD (`SSD_TOTAL_GB`) | us-central1 | 1,140 |
+| Persistent Disk SSD (`SSD_TOTAL_GB`) | us-central1 | 2,640 (the boot disks, and the three database machines' 500 GB `pd-ssd` data disks; 1,140 with `VEIL_GCP_DB_DISK_GB=0`) |
 | In-use regional external IPv4 addresses (`IN_USE_ADDRESSES`) | us-central1 | 10 |
 | VM instances (`INSTANCES`) | us-central1 | 10 |
 | CPUs, all regions (`CPUS_ALL_REGIONS`) | global | 108 |

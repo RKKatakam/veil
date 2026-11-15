@@ -29,7 +29,7 @@ while read -r role name size; do
     v=${size##*-}; m=$(quota_of "$size")
     if is_spot "$role"; then k=spot_cpus_$m; else k=od_cpus_$m; fi
     NEED[$k]=$(( ${NEED[$k]:-0} + v ))
-    disk=$((disk + $(boot_gb "$role"))); n=$((n + 1))
+    disk=$((disk + $(boot_gb "$role") + $(data_gb "$role"))); n=$((n + 1))
     [[ " ${types[*]-} " == *" $size "* ]] || types+=("$size")
     if [ "$role" = minio ]; then
         if is_spot minio; then NEED[spot_lssd_gb]=$LOCAL_SSD_GB; else NEED[od_lssd_gb]=$LOCAL_SSD_GB; fi

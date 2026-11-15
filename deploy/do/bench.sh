@@ -8,13 +8,14 @@
 #   commands.txt   every veil-bench command line, and on which machine
 #   *.json, *.md   the tool's raw results and its tables; LABEL.log its output
 #   hub<N>-stats.json, hub<N>-docker-stats.log   each server's counters and samples
+#   db<N>-docker-stats.log   each database machine's samples (PostgreSQL's, or YugabyteDB's nodes)
 #   minio-docker-stats.log   the MinIO storage droplet's samples (VEIL_DO_OBJECTS=minio)
 #   minio-restarts.txt       MinIO's restart count before and after the gate (a change fails it)
-#   scaling.md, failover-verdict.md, failover-*.txt     the gates' own tables and checks
+#   scaling.md, onerepo.md, failover-verdict.md, failover-*.txt     the gates' own tables and checks
 #
 #   bench.sh [--approve] GATE [veil-bench flags...]
 #
-# GATE (deploy/gates.sh): pull land branches api landing agents scaling failover   (drivers,
+# GATE (deploy/gates.sh): pull land branches onerepo api landing agents scaling failover   (drivers,
 #   against the one address)   objects openscion scale   (the first server's machine,
 #   with a server the tool starts itself)   spaces   (the same, its server on a
 #   Spaces bucket, BUCKET-spaces, with /etc/veil/spaces.env's keys, at a rate
@@ -109,7 +110,7 @@ hub_stats() { # server number
 db_sql() { # SQL on stdin -> rows, | between columns
     if [ $APPROVED = 0 ]; then cat >/dev/null; fi
     if [ "$YB_NODES" -gt 0 ]; then
-        remote_stdin "$(addr "$NAME-yb1")" "docker exec -i yb bin/ysqlsh -h $(paddr "$NAME-yb1") -U yugabyte -d yugabyte -X -q -tA -F'|' -v ON_ERROR_STOP=1"
+        remote_stdin "$(addr "$NAME-yb1")" "docker exec -i yb bin/ysqlsh -h $(paddr "$NAME-yb1") -U yugabyte -d $DB_NAME -X -q -tA -F'|' -v ON_ERROR_STOP=1"
     else
         remote_stdin "$(addr "$NAME-db")" "docker exec -i pg psql -U veil -d veil -X -q -tA -F'|' -v ON_ERROR_STOP=1"
     fi
@@ -135,9 +136,15 @@ for h in "${HUB_IPS[@]}" "${DRIVER_IPS[@]}"; do
     else remote "$h" "docker image inspect veil-server:$TAG veil-bench:$TAG; docker ps"; fi
 done
 
-# Metrics on every server (and the MinIO droplet) while the gate runs:
-# docker stats every 5 s.
-SAMPLED=("${HUB_IPS[@]}"); [ "$OBJECTS" = minio ] && SAMPLED+=("$(addr "$NAME-minio")")
+# Metrics on every server, the database machines (YugabyteDB's nodes or
+# PostgreSQL's) and the MinIO droplet while the gate runs: docker stats
+# every 5 s, kept as LABEL-docker-stats.log (hub<N>, db<N>, minio).
+SAMPLED=("${HUB_IPS[@]}"); LABELS=(); for i in $(seq "$HUBS"); do LABELS+=("hub$i"); done
+if [ "$YB_NODES" -gt 0 ]; then for i in $(seq "$YB_NODES"); do SAMPLED+=("$(addr "$NAME-yb$i")"); LABELS+=("db$i"); done
+else SAMPLED+=("$(addr "$NAME-db")"); LABELS+=(db1); fi
+[ "$OBJECTS" = minio ] && { SAMPLED+=("$(addr "$NAME-minio")"); LABELS+=(minio); }
+# One server's vCPUs, for the onerepo gate's sizing (0: unknown).
+SERVER_VCPUS=$(vcpus_of "$SIZE_HUB")
 for h in "${SAMPLED[@]}"; do
     remote "$h" "mkdir -p /srv/metrics; rm -f /srv/metrics/$STAMP-$GATE.stats; nohup sh -c 'while true; do echo \"\$(date -u +%FT%TZ) \$(docker stats --no-stream --format \"{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} net={{.NetIO}} blk={{.BlockIO}}\" | tr \"\\n\" \";\")\"; sleep 5; done' > /srv/metrics/$STAMP-$GATE.stats 2>/dev/null & echo \$! > /srv/metrics/$STAMP-$GATE.pid"
 done
@@ -161,11 +168,11 @@ if [ $WATCH_MINIO = 1 ]; then
 fi
 
 for i in $(seq "${#SAMPLED[@]}"); do
-    h=${SAMPLED[$((i - 1))]}; label=hub$i; [ "$i" -gt "$HUBS" ] && label=minio
+    h=${SAMPLED[$((i - 1))]}; label=${LABELS[$((i - 1))]}
     if [ $APPROVED = 1 ]; then
-        [ "$label" = minio ] || hub_stats "$i" > "$OUT/hub$i-stats.json" || true
+        [ "$i" -gt "$HUBS" ] || hub_stats "$i" > "$OUT/hub$i-stats.json" || true
         remote "$h" "kill \$(cat /srv/metrics/$STAMP-$GATE.pid) 2>/dev/null" || true
-    else [ "$label" = minio ] || hub_stats "$i"; remote "$h" "kill \$(cat /srv/metrics/$STAMP-$GATE.pid)"; fi
+    else [ "$i" -gt "$HUBS" ] || hub_stats "$i"; remote "$h" "kill \$(cat /srv/metrics/$STAMP-$GATE.pid)"; fi
     copy_from "$h" "/srv/metrics/$STAMP-$GATE.stats" "$OUT/$label-docker-stats.log" || true
 done
 case $GATE in objects|openscion|scale|spaces) SRC=("$HUB1") ;; *) SRC=("${DRIVER_IPS[@]}") ;; esac
