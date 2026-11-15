@@ -55,8 +55,9 @@
 //! `--subagents` subagents, each on a branch made off its own
 //! (`a/NNNN-sF-J`), which push [`SUB_PUSHES`] times, thinking between, and
 //! are then merged into the parent's branch through the landing service
-//! (`onto` the parent's branch); the parent pulls the merged branch and
-//! goes on. After every `--merge-every` pushes of its own it lands its
+//! (`onto` the parent's branch); their branches stay (only admins may
+//! delete a branch whose work is not on `main`), so a run's branches grow
+//! with it. The parent pulls the merged branch and goes on. After every `--merge-every` pushes of its own it lands its
 //! branch on `main` through the landing service. Each agent starts at a
 //! random point of its cycle. Reported per kind of operation (a push to
 //! one's branch, a subagent's merge into its parent's, a landing on
@@ -400,6 +401,8 @@ struct KindCount {
     errors: u64,
     /// "Come back later" answers waited out on the way.
     came_back: u64,
+    /// Changes the landing service answered landed (merges, landings).
+    changes: u64,
     latencies: Vec<f64>,
 }
 
@@ -421,8 +424,8 @@ impl Counters {
 
     /// `agents`: an operation of `kind` by agent `agent`, scheduled at
     /// `scheduled` (latency counts from then), that waited out `came_back`
-    /// answers telling it to come back later.
-    fn record(&self, kind: &'static str, agent: usize, scheduled: Instant, came_back: u64, r: Result<()>) {
+    /// answers telling it to come back later; `Ok`: the changes it landed.
+    fn record(&self, kind: &'static str, agent: usize, scheduled: Instant, came_back: u64, r: Result<u64>) {
         if !self.measuring.load(Ordering::Relaxed) {
             return;
         }
@@ -431,8 +434,9 @@ impl Counters {
         let k = kinds.entry(kind).or_default();
         k.came_back += came_back;
         match r {
-            Ok(()) => {
+            Ok(changes) => {
                 k.ops += 1;
+                k.changes += changes;
                 k.latencies.push(ms);
                 drop(kinds);
                 self.ops.fetch_add(1, Ordering::Relaxed);
@@ -1892,6 +1896,8 @@ fn agents_result(result: &mut serde_json::Value, a: &Args, clients: usize, elaps
                 "p99_ms": percentile(&k.latencies, 0.99),
                 "errors": k.errors,
                 "came_back": k.came_back,
+                // Merges and landings: changes the landing service landed per operation.
+                "changes_per_op": k.changes as f64 / k.ops.max(1) as f64,
             }),
         );
     }
@@ -1982,15 +1988,16 @@ const OP_DEADLINE: Duration = Duration::from_secs(60);
 
 impl<'a> Agent<'a> {
     /// `agents`: run `op` as an operation of `kind`, recorded for agent `me`.
-    fn timed(&mut self, kind: &'static str, me: usize, scheduled: Instant, op: impl FnOnce(&mut Self) -> Result<()>) {
+    fn timed(&mut self, kind: &'static str, me: usize, scheduled: Instant, op: impl FnOnce(&mut Self) -> Result<u64>) {
         let before = self.came_back.get();
         let r = op(self);
         self.c.record(kind, me, scheduled, self.came_back.get() - before, r);
     }
 
     /// Land this agent's tip onto `onto` through the landing service, as
-    /// `vl land --onto` does, waiting out answers to come back later.
-    fn land_on(&self, onto: &str, deadline: Instant) -> Result<()> {
+    /// `vl land --onto` does, waiting out answers to come back later; the
+    /// changes landed.
+    fn land_on(&self, onto: &str, deadline: Instant) -> Result<u64> {
         let (snap, _) = self.clone.tip.ok_or_else(|| anyhow!("nothing to land"))?;
         let body = json!({"onto": onto, "snapshot": snap.hex()});
         let path = self.path("/land");
@@ -2007,7 +2014,7 @@ impl<'a> Agent<'a> {
         if v["state"].as_str() != Some("landed") {
             bail!("did not land onto {onto}: {v}");
         }
-        Ok(())
+        Ok(v["landed"].as_array().map_or(0, |l| l.len() as u64))
     }
 
     /// `agents`: one agent's life until `stop` (the module's comment).
@@ -2024,8 +2031,8 @@ impl<'a> Agent<'a> {
             match cycle[at] {
                 // Before its branch exists (a run starts anywhere in the
                 // cycle) there is nothing to branch off or to land: a push.
-                Step::Fork | Step::Land if !self.exists => self.timed("push", me, scheduled, |a| a.land(deadline).map(|_| ())),
-                Step::Push => self.timed("push", me, scheduled, |a| a.land(deadline).map(|_| ())),
+                Step::Fork | Step::Land if !self.exists => self.timed("push", me, scheduled, |a| a.land(deadline).map(|_| 0)),
+                Step::Push => self.timed("push", me, scheduled, |a| a.land(deadline).map(|_| 0)),
                 Step::Land => self.timed("landing", me, scheduled, |a| a.land_on("main", deadline)),
                 Step::Fork => {
                     forks += 1;
@@ -2068,7 +2075,7 @@ impl<'a> Agent<'a> {
                     }
                     // Its branch, with the subagents' work merged in.
                     let now = Instant::now();
-                    self.timed("pull", me, now, |a| a.pull_by(Some(now + OP_DEADLINE)).map(|_| ()));
+                    self.timed("pull", me, now, |a| a.pull_by(Some(now + OP_DEADLINE)).map(|_| 0));
                 }
             }
             at = (at + 1) % cycle.len();
@@ -2080,19 +2087,22 @@ impl<'a> Agent<'a> {
     /// `parent` through the landing service.
     fn sub_life(&mut self, me: usize, plan: &Plan, parent: &str, stop: &AtomicBool) {
         let now = Instant::now();
-        self.timed("pull", me, now, |a| a.pull_by(Some(now + OP_DEADLINE)).map(|_| ()));
+        self.timed("pull", me, now, |a| a.pull_by(Some(now + OP_DEADLINE)).map(|_| 0));
         for _ in 0..SUB_PUSHES {
             let scheduled = Instant::now() + think_time(plan.think_s, uniform());
             if !sleep_until(scheduled, stop) {
                 return;
             }
-            self.timed("push", me, scheduled, |a| a.land(scheduled + OP_DEADLINE).map(|_| ()));
+            self.timed("push", me, scheduled, |a| a.land(scheduled + OP_DEADLINE).map(|_| 0));
         }
         let scheduled = Instant::now() + think_time(plan.think_s, uniform());
         if !sleep_until(scheduled, stop) {
             return;
         }
         self.timed("merge", me, scheduled, |a| a.land_on(parent, scheduled + OP_DEADLINE));
+        // Its branch stays: Veil lets only admins delete a branch whose
+        // work is not all on `main` (the parent's branch is not), so the
+        // project's branches grow with the run, as they do for agents today.
     }
 }
 
@@ -2239,7 +2249,7 @@ fn agents_text(r: &serde_json::Value) -> String {
          (so {} s real); each forks {} subagents a cycle ({} pushes each, then merged into its branch) and lands its branch on \
          `main` every {} pushes. {} s measured stand for {} agent-hours: {} landings on `main` per agent-hour. \
          Database commits per push {}, per landing (merges and landings on `main`) {}; statements per operation {}.\n\n\
-         | Operation | Done (/s) | Uncompressed (/s) | p50 (ms) | p99 (ms) | Errors | Told to come back |\n|---|---:|---:|---:|---:|---:|---:|\n",
+         | Operation | Done (/s) | Uncompressed (/s) | p50 (ms) | p99 (ms) | Changes landed per op | Errors | Told to come back |\n|---|---:|---:|---:|---:|---:|---:|---:|\n",
         r["clients"],
         f(&r["think_s"], 0),
         f(&r["time_scale"], 0),
@@ -2257,11 +2267,15 @@ fn agents_text(r: &serde_json::Value) -> String {
     for (k, name) in AGENT_KINDS {
         let x = &r["kinds"][k];
         out.push_str(&format!(
-            "| {name} | {} | {} | {} | {} | {} | {} |\n",
+            "| {name} | {} | {} | {} | {} | {} | {} | {} |\n",
             f(&x["per_s"], 1),
             f(&x["per_s_uncompressed"], 2),
             f(&x["p50_ms"], 1),
             f(&x["p99_ms"], 1),
+            match k {
+                "merge" | "landing" => f(&x["changes_per_op"], 1),
+                _ => "–".into(),
+            },
             x["errors"].as_u64().unwrap_or(0),
             x["came_back"].as_u64().unwrap_or(0),
         ));
@@ -2614,16 +2628,18 @@ mod tests {
     #[test]
     fn agents_operations_are_counted_by_kind() {
         let c = Counters::default();
-        c.record("push", 1, Instant::now(), 2, Ok(()));
+        c.record("push", 1, Instant::now(), 2, Ok(0));
         assert!(c.kinds.lock().unwrap().is_empty(), "not measuring yet");
         c.measuring.store(true, Ordering::Relaxed);
-        c.record("push", 1, Instant::now(), 2, Ok(()));
-        c.record("push", 2, Instant::now(), 0, Ok(()));
+        c.record("push", 1, Instant::now(), 2, Ok(0));
+        c.record("push", 2, Instant::now(), 0, Ok(0));
+        c.record("landing", 2, Instant::now(), 0, Ok(29));
         c.record("merge", 1, Instant::now(), 1, Err(anyhow!("refused")));
         let k = c.kinds.lock().unwrap();
         assert_eq!((k["push"].ops, k["push"].came_back, k["push"].errors, k["push"].latencies.len()), (2, 2, 0, 2));
         assert_eq!((k["merge"].ops, k["merge"].came_back, k["merge"].errors), (0, 1, 1));
-        assert_eq!((c.ops.load(Ordering::Relaxed), c.errors.load(Ordering::Relaxed)), (2, 1));
+        assert_eq!((k["landing"].ops, k["landing"].changes), (1, 29));
+        assert_eq!((c.ops.load(Ordering::Relaxed), c.errors.load(Ordering::Relaxed)), (3, 1));
         assert_eq!(c.finished_agents.lock().unwrap().len(), 2);
     }
 
