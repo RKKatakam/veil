@@ -18,7 +18,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     time::Instant,
 };
 
@@ -784,8 +784,6 @@ pub async fn finish_release(
     let etip2 = etip.map(str::to_string);
     let landed_set = landed_prs.clone();
     let closed_set = closed_prs.clone();
-    let notify = hub.caches.notices.load(Ordering::SeqCst);
-
     let (updated, transitioned): (bool, Vec<(String, &'static str)>) =
         transaction(&hub.db, Isolation::ReadCommitted, move |c| {
             let policy = policy.clone();
@@ -919,19 +917,17 @@ pub async fn finish_release(
                     .bind(&eid)
                     .execute(&mut *c)
                     .await?;
-                if notify {
-                    sqlx::query("SELECT pg_notify($1, $2)")
-                        .bind(crate::caches::TIPS_CHANNEL)
-                        .bind(pid.to_string())
-                        .execute(&mut *c)
-                        .await?;
-                }
                 Ok((true, done))
             })
         })
         .await?;
 
-    hub.caches.tips_changed(project.id);
+    // Every server's copy too, by a notice after the commit (BUG-2459).
+    if updated {
+        hub.caches.tips_moved(project.id);
+    } else {
+        hub.caches.tips_changed(project.id);
+    }
     crate::derive::landed(hub, project.id, touched_branches.into_iter().collect());
     if updated {
         crate::events::emit_embargo_released(hub, project.id, embargo_id).await;

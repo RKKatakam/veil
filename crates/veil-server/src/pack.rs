@@ -640,13 +640,52 @@ struct Map {
     /// The project's listing was read at least once.
     loaded: bool,
     names: HashSet<Arc<str>>,
-    /// Oldest first.
+    /// Oldest first. Changed only through [`Map::push`], [`Map::retain`],
+    /// [`Map::set_index`] and [`Map::take_index`], which keep `held`.
     packs: Vec<Listed>,
+    /// What `packs` weighs, kept as they change: every push and landing
+    /// asks every project's weight ([`Packs::evict`]), under the lock all
+    /// projects share, and summing it pack by pack made each of them walk
+    /// every pack the server lists, one at a time (BUG-2461).
+    held: usize,
 }
 
 impl Map {
     fn weight(&self) -> usize {
-        PROJECT_WEIGHT + self.packs.len() * PACK_WEIGHT + self.packs.iter().filter_map(|l| l.index.as_ref()).map(|i| i.weight()).sum::<usize>()
+        debug_assert_eq!(self.held, Self::weigh(&self.packs), "a change to the packs bypassed `held`");
+        PROJECT_WEIGHT + self.held
+    }
+
+    fn weigh(packs: &[Listed]) -> usize {
+        packs.iter().map(Self::weight_of).sum()
+    }
+
+    fn weight_of(l: &Listed) -> usize {
+        PACK_WEIGHT + l.index.as_ref().map_or(0, |i| i.weight())
+    }
+
+    fn push(&mut self, l: Listed) {
+        self.held += Self::weight_of(&l);
+        self.packs.push(l);
+    }
+
+    fn retain(&mut self, keep: impl Fn(&Listed) -> bool) {
+        self.packs.retain(keep);
+        self.held = Self::weigh(&self.packs);
+    }
+
+    fn set_index(&mut self, at: usize, index: Arc<Index>) {
+        let l = &mut self.packs[at];
+        if l.index.is_none() {
+            self.held += index.weight();
+            l.index = Some(index);
+        }
+    }
+
+    fn take_index(&mut self, at: usize) -> Option<Arc<Index>> {
+        let i = self.packs[at].index.take()?;
+        self.held -= i.weight();
+        Some(i)
     }
 }
 
@@ -895,11 +934,9 @@ impl Packs {
             let mut m = p.map.write().unwrap();
             // Newest first: a listing's new packs are at the end (names are
             // unique in the map), so loading them does not walk every pack.
-            if let Some(l) = m.packs.iter_mut().rev().find(|l| &*l.name == name) {
-                if l.index.is_none() {
-                    l.index = Some(index.clone());
-                }
-                l.used.store(self.now(), Ordering::Relaxed);
+            if let Some(at) = m.packs.iter().rposition(|l| &*l.name == name) {
+                m.set_index(at, index.clone());
+                m.packs[at].used.store(self.now(), Ordering::Relaxed);
             }
         }
         self.evict_now(project);
@@ -915,7 +952,7 @@ impl Packs {
                 if !m.names.insert(name.clone()) {
                     continue;
                 }
-                m.packs.push(Listed { name, index, used: AtomicU64::new(self.now()) });
+                m.push(Listed { name, index, used: AtomicU64::new(self.now()) });
             }
             m.loaded |= loaded;
         }
@@ -941,8 +978,9 @@ impl Packs {
         for n in names {
             m.names.remove(n);
         }
-        let Map { names, packs, .. } = &mut *m;
-        packs.retain(|l| names.contains(&l.name));
+        let names = std::mem::take(&mut m.names);
+        m.retain(|l| names.contains(&l.name));
+        m.names = names;
     }
 
     /// Drop `project`'s cached pack listing when a cross-server GC epoch
@@ -983,8 +1021,8 @@ impl Packs {
             }
             let p = &g[&k];
             let mut m = p.map.write().unwrap();
-            if let Some(l) = m.packs.iter_mut().find(|l| l.name == name) {
-                if let Some(i) = l.index.take() {
+            if let Some(at) = m.packs.iter().position(|l| l.name == name) {
+                if let Some(i) = m.take_index(at) {
                     total -= i.weight();
                 }
             }
@@ -1034,7 +1072,7 @@ impl Packs {
             let mut m = p.map.write().unwrap();
             let current: HashSet<Arc<str>> = rows.iter().map(|n| Arc::<str>::from(n.as_str())).collect();
             m.names.retain(|n| current.contains(n));
-            m.packs.retain(|l| current.contains(&l.name));
+            m.retain(|l| current.contains(&l.name));
         }
         self.load_listed(p, store, project, rows, reads).await?;
         *last = Some(began);
@@ -1055,7 +1093,7 @@ impl Packs {
             for n in names {
                 let n: Arc<str> = n.into();
                 if m.names.insert(n.clone()) {
-                    m.packs.push(Listed { name: n.clone(), index: None, used: AtomicU64::new(self.now()) });
+                    m.push(Listed { name: n.clone(), index: None, used: AtomicU64::new(self.now()) });
                     new.push(n);
                 }
             }

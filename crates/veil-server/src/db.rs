@@ -305,10 +305,13 @@ pub enum Commit {
     Search,
     /// Pack merges and garbage collection (S29).
     PackGc,
+    /// The notices that drop every server's cached tips, sent after the
+    /// commits that moved them (`caches::send_notices`, BUG-2459).
+    Notice,
 }
 
 impl Commit {
-    const ALL: [Commit; 9] = [
+    const ALL: [Commit; 10] = [
         Commit::Push,
         Commit::LandSubmit,
         Commit::LandBatch,
@@ -318,6 +321,7 @@ impl Commit {
         Commit::Memo,
         Commit::Search,
         Commit::PackGc,
+        Commit::Notice,
     ];
 
     fn name(self) -> &'static str {
@@ -331,6 +335,7 @@ impl Commit {
             Commit::Memo => "memo",
             Commit::Search => "search",
             Commit::PackGc => "pack_gc",
+            Commit::Notice => "notice",
         }
     }
 }

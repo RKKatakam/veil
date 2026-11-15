@@ -628,7 +628,6 @@ async fn commit(
     let below: Vec<ObjectId> = mv.iter().filter(|m| m.below != m.cur && !restacked.iter().any(|(n, _, _)| *n == m.below)).map(|m| m.below).collect();
     let moved_from = mv.as_ref().map(|m| m.cur);
     let mv = mv.map(|m| (m.branch, m.cur.hex(), m.keep_on_loss));
-    let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let committed: Vec<ObjectId> = restacked.iter().map(|(n, _, _)| *n).chain(std::iter::once(built.real)).collect();
     // What a move puts on the branch, by change id and author
     // (`landed_changes`, BUG-1522, BUG-1527): the caller's restacked changes
@@ -862,14 +861,6 @@ async fn commit(
                 .bind(&what)
                 .execute(&mut *c)
                 .await?;
-            // Delivered at commit, to every server: drop your tips.
-            if notify && moved == Some(true) {
-                sqlx::query("SELECT pg_notify($1, $2)")
-                    .bind(crate::caches::TIPS_CHANNEL)
-                    .bind(pid.to_string())
-                    .execute(&mut *c)
-                    .await?;
-            }
             Ok((moved, memos))
         })
     })
@@ -884,8 +875,9 @@ async fn commit(
             hub.caches.put_memo(pid, &k, &real, &mine);
         }
     }
+    // Every server's copy too, by a notice after the commit (BUG-2459).
     if r == Some(true) {
-        hub.caches.tips_changed(pid);
+        hub.caches.tips_moved(pid);
     }
     Ok(r)
 }

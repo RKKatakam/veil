@@ -1004,17 +1004,23 @@ pub const NEWEST_BOUND: usize = 4_096;
 /// viewer's projection is of their current view.
 pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, only: Option<&std::collections::BTreeSet<String>>) -> Result<Vec<(String, ObjectId)>> {
     use crate::caches::TipsLookup;
+    let asked = std::time::Instant::now();
     let rows = loop {
         match hub.caches.tips(project.id) {
             TipsLookup::Hit(rows) => break rows,
             TipsLookup::Wait(done) => {
-                let woken = done.notified();
+                let woken = done.woken().notified();
                 tokio::pin!(woken);
                 woken.as_mut().enable();
                 if hub.caches.tips_reading(project.id, &done) {
                     // A read whose request was dropped never wakes anyone:
                     // after TIPS_TTL the next asker reads.
                     let _ = tokio::time::timeout(crate::caches::TIPS_TTL, woken).await;
+                }
+                // A read that started after this request answers it, kept
+                // or not (BUG-2460).
+                if let Some(rows) = done.rows_for(asked) {
+                    break rows;
                 }
             }
             TipsLookup::Read(read) => {
@@ -1025,10 +1031,7 @@ pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, only: Opti
                         .fetch_all(&hub.db)
                         .await;
                 match r {
-                    Ok(rows) => {
-                        hub.caches.put_tips(project.id, read, at, rows.clone());
-                        break Arc::new(rows);
-                    }
+                    Ok(rows) => break hub.caches.put_tips(project.id, read, at, rows),
                     Err(e) => {
                         hub.caches.tips_failed(project.id, read);
                         return Err(e.into());
@@ -3381,7 +3384,6 @@ async fn push_staged(
         };
         plan_recorded.insert(branch.clone(), recorded);
     }
-    let notify = hub.caches.notices.load(std::sync::atomic::Ordering::SeqCst);
     let pid = project.id;
     let plans2 = plans.clone();
     let force = req.force;
@@ -3559,8 +3561,8 @@ async fn push_staged(
             // stored first by another push keeps its author unless it had
             // none), their origins, its memos (a row stored first by another
             // request wins, and is not cached here from this push's answer:
-            // those this one stored come back), its audit row, and the notice
-            // delivered at commit to every server: drop your tips.
+            // those this one stored come back) and its audit row. The notice
+            // to every server (drop your tips) goes after the commit.
             let mut authors: Vec<(String, i64)> = Vec::with_capacity(new_reals.len());
             let mut author_at: HashMap<&str, usize> = HashMap::with_capacity(new_reals.len());
             for (r, author) in &new_reals {
@@ -3582,10 +3584,9 @@ async fn push_staged(
             let memo_reals: Vec<String> = memos.iter().map(|m| m.1.clone()).collect();
             let memo_projected: Vec<String> = memos.iter().map(|m| m.2.clone()).collect();
             let memo_collapsed: Vec<bool> = memos.iter().map(|m| m.3).collect();
-            let notifies = notify && (!moved.is_empty() || !embargo_upserts.is_empty());
-            let (_, stored_keys, stored_reals, pack_states): (i64, Vec<String>, Vec<String>, Vec<i16>) = sqlx::query_as(
-                "WITH k AS (UPDATE packs SET state = CASE WHEN state = $17 THEN state ELSE $16 END \
-                   WHERE project_id = $1 AND name = ANY($18) RETURNING state), \
+            let (stored_keys, stored_reals, pack_states): (Vec<String>, Vec<String>, Vec<i16>) = sqlx::query_as(
+                "WITH k AS (UPDATE packs SET state = CASE WHEN state = $14 THEN state ELSE $13 END \
+                   WHERE project_id = $1 AND name = ANY($15) RETURNING state), \
                  s AS (INSERT INTO snapshots (project_id, id, author) SELECT $1, i, a FROM UNNEST($2::text[], $3::bigint[]) AS t(i, a) \
                    ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0), \
                  o AS (INSERT INTO origins (project_id, real_id, origin_id) SELECT $1, r, g FROM UNNEST($4::text[], $5::text[]) AS t(r, g) \
@@ -3593,9 +3594,8 @@ async fn push_staged(
                  m AS (INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
                    SELECT $1, k, r, p, $6, c FROM UNNEST($7::text[], $8::text[], $9::text[], $10::bool[]) AS t(k, r, p, c) \
                    ON CONFLICT DO NOTHING RETURNING view_key, real_id), \
-                 l AS (INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $6, $11, 'push', $12)), \
-                 n AS (SELECT pg_notify($13, $14) WHERE $15) \
-                 SELECT n.c, x.k, x.r, COALESCE((SELECT array_agg(state) FROM k), '{}') FROM (SELECT count(*) AS c FROM n) n, \
+                 l AS (INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $6, $11, 'push', $12)) \
+                 SELECT x.k, x.r, COALESCE((SELECT array_agg(state) FROM k), '{}') FROM \
                    (SELECT COALESCE(array_agg(view_key), '{}') AS k, COALESCE(array_agg(real_id), '{}') AS r FROM m) x",
             )
             .bind(pid)
@@ -3610,9 +3610,6 @@ async fn push_staged(
             .bind(&memo_collapsed)
             .bind(person)
             .bind(format!("moved {moved:?}"))
-            .bind(crate::caches::TIPS_CHANNEL)
-            .bind(pid.to_string())
-            .bind(notifies)
             .bind(crate::pack::LISTED)
             .bind(crate::pack::DISCARDED)
             .bind(&packs.0)
@@ -3676,8 +3673,10 @@ async fn push_staged(
         if listed_any {
             crate::pack_gc::maybe_schedule(hub, project.id);
         }
+        // Every server's copy too, by a notice sent after the commit
+        // (never in the push's transaction: BUG-2459).
         if !moved.is_empty() || !embargo_upserts.is_empty() {
-            hub.caches.tips_changed(project.id);
+            hub.caches.tips_moved(project.id);
         }
         for c in &completed {
             hub.caches.put_committed(project.id, &c.real);

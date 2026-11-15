@@ -388,7 +388,8 @@ fn person_id(hub: &TestHub, name: &str) -> i64 {
 }
 
 /// The push's rows are written in one statement of its transaction (its
-/// snapshot, origin, the pusher's memo, its audit row and the tips notice)
+/// snapshot, origin, the pusher's memo and its audit row; the tips notice
+/// follows the commit, BUG-2459)
 /// and its packs listed in one (`packs::` races those with discards):
 /// under pushes racing on one branch and on branches of their own, every
 /// push that landed wrote exactly its rows, and one that lost wrote none.

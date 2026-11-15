@@ -1203,7 +1203,8 @@ struct CommitKinds {
     /// The landings' own: their submits and batches.
     landing: f64,
     /// Work beside the requests: the deriver's, the view keys' fills', the
-    /// search index's own, pack merges' and the landing service's leases.
+    /// search index's own, pack merges', the landing service's leases and
+    /// the servers' notices (BUG-2459).
     background: f64,
 }
 
@@ -1214,7 +1215,7 @@ impl CommitKinds {
         let sum = |ks: &[&str]| by_kind.iter().filter(|(k, _)| ks.contains(&k.as_str())).map(|(_, v)| v).sum::<f64>();
         Some(CommitKinds {
             landing: sum(&["land_submit", "land_batch"]),
-            background: sum(&["derive", "fill", "search", "pack_gc", "land_service"]),
+            background: sum(&["derive", "fill", "search", "pack_gc", "land_service", "notice"]),
             by_kind,
         })
     }

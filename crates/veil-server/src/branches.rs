@@ -6,7 +6,7 @@
 //! are left to the purges and GC that exist, and its objects stay while
 //! anything else reaches them: the tip is on the target, or what it landed as.
 
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::Arc;
 
 use veil_core::{hub::access::AccessPolicy, ObjectId};
 
@@ -176,7 +176,6 @@ async fn merged_into(hub: &Arc<Hub>, project: i64, onto: &str, tip: ObjectId) ->
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn delete_held(hub: &Arc<Hub>, pid: i64, branch: &str, tip: ObjectId, onto: &str, lineage: i64, actor: i64, details: String) -> Result<bool> {
-    let notify = hub.caches.notices.load(Ordering::SeqCst);
     let (b, o, t) = (branch.to_string(), onto.to_string(), tip.hex());
     let deleted = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
         let (b, o, t, details) = (b.clone(), o.clone(), t.clone(), details.clone());
@@ -205,16 +204,14 @@ pub async fn delete_held(hub: &Arc<Hub>, pid: i64, branch: &str, tip: ObjectId, 
                     .bind(&details)
                     .execute(&mut *c)
                     .await?;
-                if notify {
-                    sqlx::query("SELECT pg_notify($1, $2)").bind(crate::caches::TIPS_CHANNEL).bind(pid.to_string()).execute(&mut *c).await?;
-                }
             }
             Ok(n == 1)
         })
     })
     .await?;
+    // Every server's copy too, by a notice after the commit (BUG-2459).
     if deleted {
-        hub.caches.tips_changed(pid);
+        hub.caches.tips_moved(pid);
     }
     Ok(deleted)
 }

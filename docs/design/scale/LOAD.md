@@ -2491,3 +2491,58 @@ compare-and-swap and check as before.
 | Pulls, about 2,500/s here | CPU per pull: 46 statements, mostly per-request permission lookups and per-snapshot resolution | **built (S4):** permission, session and resolution caches; 1 statement per request. Next: fewer requests per pull (S3) |
 | Merges across projects, about 2,000/s here | the database's WAL: about 8 commits per landing | **built (S4):** 1 commit for the push; S12's deriver adds about 4 in the background, and holds the pool at 100 projects (BUG-911) |
 | One project's `main`, 20–30/s with many agents | collisions: a catch-up pull is longer than the gap between landings | **built (S17):** batched landing, 1,084/s here (above); next: packs (S28), since the object store's synced writes are its limit |
+
+## One busy repository: what held it at about 1,200 pushes a second (2026-11-15)
+
+GCP run 3 (`deploy/results/veil-test/20261115T124654Z-onerepo`) measured
+1,144 pushes a second to branches of one project at 1,000 agents, with the
+servers at 6.7 of 96 cores and the database at 6.6 of 56. Here (i9-13900KF,
+32 threads, one NVMe drive for PostgreSQL 17 and MinIO) the same test
+(`veil-bench load --mode branches --projects 1 --rates max`) gave 1,139/s
+at 50 agents and 1,184/s at 1,000: throughput flat in the agents, the
+machines idle, so the pushes took turns somewhere. What was found, by
+sampling `pg_stat_activity`, the server's threads (`ps -L`, kernel wait
+channels) and timing each step of a request (temporary probes, not kept):
+
+1. **`NOTIFY` in every push's transaction (BUG-2459, fixed).** Half of
+   PostgreSQL's busy samples were `Lock:object`: PostgreSQL commits the
+   transactions that notify one at a time, under one lock for the whole
+   database held through the flush. A cap on every project's pushes and
+   landings together. Now sent after the commit, batched (HUB.md §13.14's
+   branch tips). After: no `Lock:object` sample.
+2. **Waiters for a project's branch rows read them again one by one
+   (BUG-2460, fixed).** With a push during every read, no read was kept and
+   each waiter made a read of its own in turn.
+3. **Every push summed every pack's weight on the server, under the lock
+   every project shares (BUG-2461, fixed).** `pack::Packs::evict` asked each
+   project's lookup map its weight, which walked its packs: 16 ms of a push's
+   26 ms, waiting on that lock, with 147,000 packs listed (item 4).
+4. **Packs pile up faster than they merge (BUG-2462, open).** A push lists
+   about two packs; merges take at most 64 a run, checked every 500 ms, so
+   at 1,500 pushes a second one project's lookup map grew to 147,000 packs
+   in a minute and a half, and a lookup walks them newest first. The next
+   ceiling.
+5. **The disk's flushes, here.** With MinIO and PostgreSQL on one drive,
+   2,842 flushes a second (2.4 a push, 0.30 ms each) kept it flushing 85% of
+   the time: about 1,390 pushes a second is this machine's limit for durable
+   pushes, whatever the code. Every push is on disk before it is answered,
+   and stays so. Locally the server's own file store (no `--s3-endpoint`)
+   adds two flushes an object and queues on ext4's journal.
+
+**Before and after, 1,000 agents, one project.** To see past item 5,
+MinIO ran on a RAM disk for these runs only (a diagnosis, not a result:
+nothing here is published as a durable number); PostgreSQL stayed on the
+drive, durable.
+
+| Server | Pushes/s | p50 / p99 ms | Errors |
+|---|---:|---|---:|
+| before (`eaf6b3d7`) | 1,231 | 582 / 1,773 | 0 |
+| items 1 and 2 fixed | 1,222 | 482 / 1,649 | 0 |
+| items 1 to 3 fixed | 1,488 | 737 / 1,286 | 0 |
+
+Items 1 and 2 removed real waits, but item 3 sat behind them; item 4 is now
+the limit. Where a request's time went, items 1 to 3 fixed: a push 17 ms
+in the server (its checks 4, its own pack stored 2.4, its transaction 4,
+listing its packs 7), an upload 12, a read of the tips 4.5; a read waits in
+the project's bulkhead (§13.25: three quarters of the server's database
+connections) behind the writes, which go first.
