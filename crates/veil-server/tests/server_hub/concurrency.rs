@@ -546,20 +546,29 @@ fn pushes_racing_an_access_change_land_only_before_it() {
     let hub = TestHub::start();
     let (p, ws) = workers_project(&hub);
     let api = hub.api();
+    // Each pusher's first push, crafted while they may read (each next one
+    // carries the trees its last one made, so it reads nothing).
+    let crafts: Vec<Craft> = ws
+        .iter()
+        .take(PUSHERS)
+        .enumerate()
+        .map(|(i, w)| {
+            let mut c = Craft::with(&api, w.token.clone(), w.identity.clone(), &p.name, "main");
+            c.file(&format!("w/{i}/acc0"), "z");
+            c
+        })
+        .collect();
+    let landed_once = AtomicUsize::new(0);
     let removed_at = std::sync::Mutex::new(None::<std::time::Instant>);
     let results = std::sync::Mutex::new(Vec::<(std::time::Instant, bool)>::new());
     std::thread::scope(|s| {
-        for (i, w) in ws.iter().enumerate().take(PUSHERS) {
-            let (api, results, removed_at) = (&api, &results, &removed_at);
+        for (i, (w, mut c)) in ws.iter().zip(crafts).enumerate() {
+            let (api, results, removed_at, landed_once) = (&api, &results, &removed_at, &landed_once);
             let project = p.name.clone();
             s.spawn(move || {
                 let mine = format!("acc-{i}");
-                // Crafted once while they may read; each next push carries the
-                // trees its last one made, so it reads nothing.
-                let mut c = Craft::with(api, w.token.clone(), w.identity.clone(), &project, "main");
                 let mut expected: Option<ObjectId> = None;
-                for k in 0.. {
-                    c.file(&format!("w/{i}/acc{k}"), "z");
+                for k in 1.. {
                     let (root, objects) = (c.root, c.objects.clone());
                     let started = std::time::Instant::now();
                     // Refused at the upload or at the push.
@@ -570,15 +579,24 @@ fn pushes_racing_an_access_change_land_only_before_it() {
                     if !ok {
                         break;
                     }
+                    if k == 1 {
+                        landed_once.fetch_add(1, Ordering::SeqCst);
+                    }
                     let tip = ObjectId::from_hex(r.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
                     expected = Some(tip);
                     c = Craft { api, token: w.token.clone(), identity: w.identity.clone(), project: project.clone(), tip, root, objects };
-                    let done = removed_at.lock().unwrap().is_some_and(|t: std::time::Instant| t.elapsed() > std::time::Duration::from_secs(5));
-                    assert!(!done, "pusher {i} still landing 5 s after the removal");
+                    c.file(&format!("w/{i}/acc{k}"), "z");
+                    let late = removed_at.lock().unwrap().is_some_and(|t: std::time::Instant| t.elapsed() > std::time::Duration::from_secs(10));
+                    assert!(!late, "pusher {i} still landing 10 s after the removal");
                 }
             });
         }
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        // Every pusher landed once; then the removal, while they push.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while landed_once.load(Ordering::SeqCst) < PUSHERS {
+            assert!(std::time::Instant::now() < until, "every pusher lands a first push");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let mut args = vec!["group", "remove", "w"];
         args.extend(ws.iter().take(PUSHERS).map(|w| w.name.as_str()));
         p.admin.ok(&p.dir, &args);
@@ -586,8 +604,8 @@ fn pushes_racing_an_access_change_land_only_before_it() {
     });
     let removed_at = removed_at.lock().unwrap().unwrap();
     let results = results.lock().unwrap();
-    assert!(results.iter().any(|(started, ok)| *ok && *started < removed_at), "pushes landed before the removal");
-    assert!(results.iter().any(|(_, ok)| !*ok), "the removal refused their pushes");
+    assert!(results.iter().filter(|(started, ok)| *ok && *started < removed_at).count() >= PUSHERS, "every pusher landed before the removal");
+    assert_eq!(results.iter().filter(|(_, ok)| !*ok).count(), PUSHERS, "the removal refused each pusher");
     for (started, ok) in results.iter() {
         assert!(!(*ok && *started > removed_at), "a push that began after the removal was in landed");
     }
