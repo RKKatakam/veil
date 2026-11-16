@@ -1875,6 +1875,66 @@ fn bug_2531_an_answer_before_the_body_arrived_says_the_connection_closes() {
     assert!(head.lines().any(|l| l.trim() == "connection: close"), "an answer before the body was read must say the connection closes: {head}");
 }
 
+/// BUG-2531's `Connection: close` costs no connection on a request whose
+/// body is read whole: through a proxy that counts connections, one client
+/// keeps one connection for a push (its objects' upload, a pack, and the
+/// branch update), an API commit, a landing that waits, and an upload of
+/// unknown length (chunked) at the server; and for an object, a batch the
+/// cache answers and a batch it forwards (larger than it decides itself) at
+/// the cache. Every answer starts after its body ended: the server's
+/// `limits::admit` reads each body to its end before any route runs, and the
+/// cache's batch route reads it, or passes it whole to the server, first.
+#[test]
+fn bug_2531_answers_to_whole_bodies_keep_their_connection() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let server = hub.api();
+    let connections = |x: &Proxy| x.conns.lock().unwrap().len() / 2;
+    let sp = Proxy::start(hub.authority());
+    let api = Api::at(&sp.addr, &hub.cert_pem);
+    let dev = p.dev.token();
+    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+    c.file("src/keep.rs", "keep\n");
+    let r = c.push_to("keep-alive", None);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+    let tip = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let change = |path: &str| serde_json::json!({"base": tip.hex(), "description": "keep the connection", "edits": [{"path": path, "put": {"text": "k\n"}}]});
+    let r = api.post_json(Some(&dev), &format!("/v1/projects/{}/changes", p.name), &change("src/keep2.rs"));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/land", p.name),
+        &serde_json::json!({"onto": "main", "base": tip.hex(), "edits": [{"path": "src/keep3.rs", "put": {"text": "k\n"}}], "description": "a landing", "wait": true}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+    let mut more = Craft::new(&api, &p.dev, &p.name, "main");
+    more.file("src/keep4.rs", "chunked\n");
+    let mut chunked = Vec::new();
+    for (id, raw) in &more.objects {
+        veil_core::hub::wire::put_frame(&mut chunked, id, raw);
+    }
+    let r = api.post_reader_as(Some(&dev), &format!("/v1/projects/{}/objects", p.name), std::io::Cursor::new(chunked)).unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    r.into_body().read_to_vec().unwrap();
+    assert_eq!(connections(&sp), 1, "the server's answers to whole bodies closed a connection");
+
+    let cache = TestCache::start(&hub, &hub.authority(), 1 << 30);
+    let cp = Proxy::start(cache.running.addr.to_string());
+    let via = Api::at(&cp.addr, &cache.running.cert_pem);
+    let reader = Reader::new(&server, &via, Some(&p.dev), &p.name);
+    let root = reader.root();
+    assert_eq!(reader.get(&[], &root).status, 200);
+    assert_eq!(reader.batch(&[(Vec::new(), root)]).len(), 1);
+    let forwarded = cache.stat("forwarded");
+    let many: Vec<(Vec<ObjectId>, ObjectId)> = (0..60_000).map(|_| (Vec::new(), root)).collect();
+    let frames = reader.batch(&many);
+    assert_eq!(frames.iter().map(|f| f.0).collect::<HashSet<_>>(), HashSet::from([root]), "the root, once");
+    assert_eq!(cache.stat("forwarded"), forwarded + 1, "the large batch went to the server as it arrived");
+    assert_eq!(connections(&cp), 1, "the cache's answers to whole bodies closed a connection");
+}
+
 /// BUG-1332 (S24): what a regional cache forwards counted against the
 /// cache's own address at the server, as one client's. Fixed: the cache
 /// says it is one (the caches' token) and whose request it passes on (its
