@@ -305,7 +305,7 @@ pub const CHECK_GAP: std::time::Duration = std::time::Duration::from_millis(500)
 /// waits for, or holds up, a push or a landing's transaction) by size
 /// class ([`Options::size_tiers`]: the class with the most packs of those
 /// with at least [`TIER_MIN_PACKS`], at most [`BACKGROUND_PACKS_PER_RUN`]
-/// of them a pass, their storage requests [`AT_ONCE`] at a time),
+/// of them a pass, their storage requests `AT_ONCE` at a time),
 /// one after another while one merged, each under the project's advisory
 /// lock (one server at a time; another server's run makes this one's a
 /// skip), a derive worker permit and S24's shedding (`derive_turn` before
