@@ -400,7 +400,8 @@ fn guarantee_1_merging_never_loses_or_changes_an_object_across_servers_and_crash
 ///   once the retention window passes.
 #[test]
 fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_and_racing_push() {
-    let hub = TestHub::start();
+    // A database of its own: it creates the `tags` table (BUG-2532).
+    let hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
@@ -1395,7 +1396,10 @@ fn bug_1782_every_schema_column_is_registered_and_root_tables_are_stamped() {
         audit_schema_columns, stamped_root_tables, SchemaColumnRole, OBJECT_SCHEMA_COLUMNS,
     };
 
-    let hub = TestHub::start();
+    // A database of its own (BUG-2532): its `ALTER TABLE bisects`, though
+    // rolled back, answered the GC tests' statements on `bisects` in the
+    // shared database `40001` on YugabyteDB.
+    let hub = TestHub::start_own();
     let db = hub.hub().db.clone();
 
     // 1. Live migrated schema matches `pack_gc`'s column registry 1-to-1.

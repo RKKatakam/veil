@@ -50,6 +50,15 @@ impl TestHub {
         TestHub::start_with_ttl(Duration::from_secs(3600))
     }
 
+    /// A server on a new database of its own, for a test that changes the
+    /// schema (DDL, triggers): on YugabyteDB a table's change answers other
+    /// tests' statements on that table in the suite's shared database
+    /// `40001` "schema version mismatch" (BUG-2532), even one rolled back.
+    pub fn start_own() -> TestHub {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        TestHub::start_on(&crate::grants::fresh_database(&rt), Duration::from_secs(3600))
+    }
+
     pub fn start_with_ttl(ttl: Duration) -> TestHub {
         TestHub::start_on(&std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)"), ttl)
     }

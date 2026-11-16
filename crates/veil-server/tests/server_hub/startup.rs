@@ -289,6 +289,7 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
         "migrating {rows} viewer graph rows under a {timeout:?} statement timeout did not finish within 60 s ({took:?}): {:?}",
         migrated.map(|r| r.map_err(|e| e.to_string()))
     );
+    eprintln!("migrated {rows} viewer graph rows under a {timeout:?} statement timeout in {took:?}");
     rt.block_on(async {
         let db = veil_server::db::connect(&url, 1).await.unwrap();
         assert!(veil_server::db::schema_current(&db).await.unwrap());

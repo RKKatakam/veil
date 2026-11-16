@@ -217,7 +217,8 @@ fn bug_2350_a_memo_stored_first_wins_over_a_fills_batch() {
 /// time (`sync::projected`), which works the child out on the stored parent.
 #[test]
 fn bug_2390_a_childs_memo_is_built_on_its_parents_stored_memo() {
-    let th = TestHub::start();
+    // A database of its own: it puts a trigger on `projections` (BUG-2532).
+    let th = TestHub::start_own();
     let (text, bindings) = policy(900_003);
     let mut h = Hist::new(&th, &text, &bindings);
     let base = h.commit(&th, &[root_snapshot_id()], Files::from([("pub/a.txt".to_string(), b"a\n".to_vec())]), [1; 16], 1, None);
