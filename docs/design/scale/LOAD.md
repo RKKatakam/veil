@@ -2552,15 +2552,24 @@ disk of its own and PostgreSQL on the drive (the shared container, a
 database of the run's), each server with timing probes in its merge
 passes (not kept). The listed packs were counted every 5 s.
 
-| Server | Pushes/s | p50 / p99 ms | Most packs listed | Packs listed at the end | Errors |
-|---|---:|---|---:|---:|---:|
-| before (`f2ea7734`) | 1,496 | 639 / 1,427 | 186,640 | 186,640 | 0 |
-| before, again | 1,482 | 775 / 1,280 | 187,184 | 187,184 | 0 |
-| requests 16 at a time, 1,024 packs a pass | 1,731 | 518 / 1,052 | 92,899 | 92,899 | 0 |
-| and the class with the most packs | 1,899 | 475 / 870 | 51,143 | 119 (15 s after) | 0 |
-| and one request a small pack, listed rows indexed | 2,296 | 407 / 722 | 66,729 | — | 0 |
-| and 32 at a time | 2,585 | 373 / 568 | 29,803 | — | 0 |
-| and 4,096 packs a pass | 2,615 | 405 / 556 | 3,229 | 78 (5 s after) | 0 |
+| Server | Pushes/s | p50 / p99 ms | Most packs listed | Listed after the run | Passes failed | Deriver done after |
+|---|---:|---|---:|---:|---:|---:|
+| before (`f2ea7734`) | 1,496 | 639 / 1,427 | 186,640 | 186,640 | 0 | 0.3 s |
+| before, again (no parallel plans) | 1,482 | 775 / 1,280 | 187,184 | 187,184 | 0 | 0.3 s |
+| requests 16 at a time, 1,024 packs a pass | 1,731 | 518 / 1,052 | 92,899 | 92,899 | 4 | 0.3 s |
+| and the class with the most packs | 1,899 | 475 / 870 | 51,143 | 119 | 6 | 131 s |
+| and one request a small pack, listed rows indexed | 2,296 | 407 / 722 | 76,594 | 76,594 | 22 | 0.3 s |
+| and 32 at a time | 2,585 | 373 / 568 | 35,480 | 35,480 | 0 | 0.3 s |
+| and 4,096 packs a pass | 2,615 | 405 / 556 | 3,229 | 78 | 0 | 233 s |
+| **final** (and the sweep unsorted; no parallel plans) | **2,584** | **356 / 586** | **4,048** | **88** | **0** | 197 s |
+| final with 1,024 packs a pass (no parallel plans) | 2,419 | 413 / 761 | 13,250 | 53 | 0 | 167 s |
+
+No push failed in any run. "Passes failed" are background merge passes
+that ended in an error: four unknown (the first probe did not print
+them), four that waited 10 s for the index bound (`IndexesFull`, all in
+the two-request path; none since) and the rest PostgreSQL's "could not
+resize shared memory segment" (below). "Deriver done after" is
+the load tool's lag of the deriver once the agents stopped (BUG-2480).
 
 What the probes showed, before: passes did run back to back, but a pass
 of 64 packs took 110 ms, nearly all of it its storage requests one after
@@ -2583,7 +2592,21 @@ The runs with the shared PostgreSQL container's 64 MB `/dev/shm` (not the
 1 GB `scripts/bench-server.sh` gives its own) failed some passes with
 "could not resize shared memory segment" once 300,000 replaced rows waited
 out their 60 s grace period: statements over them were planned in
-parallel. The last two runs set `max_parallel_workers_per_gather = 0` on
-the run's database ("before, again" and the last row); a pass's sweep no
-longer sorts every due row to take a few.
+parallel. The runs marked "no parallel plans" set
+`max_parallel_workers_per_gather = 0` on the run's database; a pass's
+sweep no longer sorts every due row to take a few.
+
+**What keeping up costs here (BUG-2480, open).** Where merges kept up for
+most of the run the deriver finished 167 to 233 s after the agents
+stopped (0.3 s before, and in the runs where merges fell behind early);
+it always caught up. On S3 the deriver reads each object it has not
+cached with one request at a time, waiting for each (`Objects::get_blocking`
+through the runtime), and a merge that keeps up adds about two MinIO
+requests a pack, 10,000 a second at 5,000 packs listed a second, on one
+machine already at its limit: its reads wait longer, it falls behind, and
+its object cache hits fall (0.99 to 0.96), which slows it more. Derive
+work is shed second by design (§4.11: it lags, it does not stop), but the
+lag is new. Two runs were void and are not in the table: another
+worktree's test suite on the shared PostgreSQL during them (856 and 503
+pushes a second, 26 and 34 statements a push instead of 15).
 
