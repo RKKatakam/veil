@@ -706,12 +706,14 @@ async fn listed_with_and_without_the_index(url: &str, project: i64) -> (Vec<Stri
 /// on a large table that other connections keep writing, and under a
 /// statement timeout shorter than its build (250 ms, against the build of
 /// 4,000,000 rows on PostgreSQL, about 600 ms, or 300,000 on YugabyteDB,
-/// about 4 s: the pool's is 15 s, and a large table's build takes longer). Built in the migration's
-/// transaction, on PostgreSQL the build held every write off and passed the
+/// about 4 s: the pool's is 15 s, and a large table's build takes longer).
+/// Built in the migration's transaction, on PostgreSQL the build held every write off and passed the
 /// timeout, so the migration was run again until its deadline and never
 /// finished; on YugabyteDB it did not hold writes off, and rows written
 /// during the build could be missing from it with no error. Built online:
-/// both starts succeed, it is applied once, the writes went on during it,
+/// both starts succeed, it is applied once, writes were made during the
+/// build (begun once the index existed, done while it was not yet valid)
+/// and are in it,
 /// it holds every listed row (read through it, the plan checked), and the
 /// connection's own timeouts are back afterwards.
 #[test]
@@ -725,21 +727,32 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
     });
     let rows = std::env::var("VEIL_TEST_PACK_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(if yb { 300_000 } else { 4_000_000 });
     let (url, name, project, _) = before_migration_41(&rt, rows);
-    let migrating = AtomicBool::new(true);
     let stop = AtomicBool::new(false);
-    let during = AtomicUsize::new(0);
+    let during = std::sync::Mutex::new(Vec::<String>::new());
     let (results, written) = std::thread::scope(|s| {
         let writers: Vec<_> = (0..4)
             .map(|w| {
-                let (url, migrating, stop, during, rt) = (&url, &migrating, &stop, &during, &rt);
+                let (url, stop, during, rt) = (&url, &stop, &during, &rt);
                 s.spawn(move || {
                     rt.block_on(async {
                         let db = veil_server::db::connect(url, 1).await.unwrap();
                         let mut written = Vec::new();
                         let mut n = 0u64;
+                        // The index's state as this connection reads it:
+                        // `None` when it does not exist (or the read lost a
+                        // race with DDL on YugabyteDB).
+                        let pool = &db;
+                        let state = move || async move {
+                            sqlx::query_scalar::<_, bool>("SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass('packs_listed')")
+                                .fetch_optional(pool)
+                                .await
+                                .ok()
+                                .flatten()
+                        };
                         while !stop.load(Ordering::Relaxed) {
                             n += 1;
                             let name = format!("w{w}-{n}");
+                            let before = state().await;
                             let r = sqlx::query("INSERT INTO packs (project_id, name, state, size, objects, created_at) VALUES ($1, $2, 1, 1, 1, $3)")
                                 .bind(project)
                                 .bind(&name)
@@ -748,8 +761,11 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
                                 .await;
                             match r {
                                 Ok(_) => {
-                                    if migrating.load(Ordering::Relaxed) {
-                                        during.fetch_add(1, Ordering::Relaxed);
+                                    // Begun once the build had made the
+                                    // index, done while it was not valid
+                                    // yet: a write during the build.
+                                    if before == Some(false) && state().await == Some(false) {
+                                        during.lock().unwrap().push(name.clone());
                                     }
                                     written.push(name);
                                 }
@@ -786,7 +802,6 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
             })
             .collect();
         let results: Vec<_> = starts.into_iter().map(|h| h.join().unwrap()).collect();
-        migrating.store(false, Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(300));
         stop.store(true, Ordering::Relaxed);
         let written: Vec<String> = writers.into_iter().flat_map(|h| h.join().unwrap()).collect();
@@ -796,8 +811,8 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
         assert!(matches!(r, Ok(Ok(()))), "a start migrating beside writes under a 250 ms statement timeout: {r:?}");
         assert_eq!(after.as_deref(), Some("250ms"), "the migrating connection's statement timeout is its own again");
     }
-    let during = during.load(Ordering::Relaxed);
-    assert!(during > 0, "rows were written while the index was built");
+    let during = during.into_inner().unwrap();
+    assert!(!during.is_empty(), "rows were written while the index was built (begun after it existed, done before it was valid)");
     rt.block_on(async {
         let db = veil_server::db::connect(&url, 1).await.unwrap();
         let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
@@ -808,9 +823,10 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
     let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
     let missing: Vec<&String> = written.iter().filter(|n| with.binary_search(n).is_err()).collect();
     assert!(missing.is_empty(), "{} of {} rows written beside the build are missing from packs_listed: {:?}", missing.len(), written.len(), &missing[..missing.len().min(10)]);
+    assert!(during.iter().all(|n| with.binary_search(n).is_ok()), "every row written during the build is in packs_listed");
     assert_eq!(with.len(), without.len(), "packs_listed holds every listed row");
     assert!(with == without, "packs_listed holds exactly the listed rows");
-    eprintln!("{rows} packs; {} written beside the migration, {during} while it ran", written.len());
+    eprintln!("{rows} packs; {} written beside the migration, {} during the build", written.len(), during.len());
     drop_database(&rt, &name);
 }
 
@@ -895,7 +911,36 @@ fn bug_2482_every_index_on_an_existing_table_is_built_online() {
                 );
             }
         }
+        // A migration with an online section commits its transactional part
+        // before the steps, unrecorded: a step that fails runs it all again.
+        if !parts.online.is_empty() {
+            if let Some(stmt) = not_safe_to_run_again(parts.transactional) {
+                panic!("migration {version} ({name}) has an online indexes section, and its transactional part is not safe to run again: {stmt}");
+            }
+        }
         online.extend(parts.online.into_iter().map(|s| (*version, s)));
+    }
+    // What the check above refuses, and what it lets through.
+    for good in [
+        "ALTER TABLE t ADD COLUMN IF NOT EXISTS a INT, ADD COLUMN IF NOT EXISTS b INT;",
+        "CREATE TABLE IF NOT EXISTS t (a INT); CREATE UNIQUE INDEX IF NOT EXISTS t_a ON t (a); CREATE SEQUENCE IF NOT EXISTS s;",
+        "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING; DROP INDEX IF EXISTS t_old; -- UPDATE t SET a = 1;",
+    ] {
+        assert_eq!(not_safe_to_run_again(good), None, "{good}");
+    }
+    for bad in [
+        "INSERT INTO t VALUES (1);",
+        "UPDATE t SET a = 1;",
+        "ALTER TABLE t ADD COLUMN a INT;",
+        "ALTER TABLE t ADD COLUMN IF NOT EXISTS a INT, ADD COLUMN b INT;",
+        "ALTER TABLE t ADD a INT;",
+        "CREATE TABLE t (a INT);",
+        "CREATE INDEX t_a ON t (a);",
+        "CREATE UNIQUE INDEX t_a ON t (a);",
+        "CREATE SEQUENCE s;",
+        "DROP INDEX t_a;",
+    ] {
+        assert!(not_safe_to_run_again(bad).is_some(), "refused: {bad}");
     }
     let created: Vec<(i64, &str)> = online
         .iter()
@@ -932,4 +977,32 @@ fn bug_2482_every_index_on_an_existing_table_is_built_online() {
     ] {
         assert!(migration_parts(&section(bad)).is_err(), "refused: {bad}");
     }
+}
+
+/// The first statement of `sql` that would not do the same when run again
+/// on what it made (BUG-2482 review): an `INSERT` without `ON CONFLICT`, an
+/// `UPDATE`, an `ADD COLUMN`, `CREATE TABLE`, `CREATE INDEX` or `CREATE
+/// SEQUENCE` without `IF NOT EXISTS`, a `DROP` without `IF EXISTS`.
+fn not_safe_to_run_again(sql: &str) -> Option<String> {
+    let text: String = sql.lines().map(|l| l.split("--").next().unwrap()).collect::<Vec<_>>().join(" ");
+    for stmt in text.split(';') {
+        let w: Vec<String> = stmt.split_whitespace().map(|x| x.to_ascii_uppercase()).collect();
+        let at = |i: usize, want: &[&str]| w.len() >= i + want.len() && w[i..i + want.len()].iter().zip(want).all(|(a, b)| a == b);
+        let refused = match w.first().map(String::as_str) {
+            None => false,
+            Some("INSERT") => !w.windows(2).any(|x| x[0] == "ON" && x[1] == "CONFLICT"),
+            Some("UPDATE") => true,
+            Some("DROP") => !at(2, &["IF", "EXISTS"]),
+            Some("CREATE") => {
+                let what = if at(1, &["UNIQUE"]) { 2 } else { 1 };
+                ["TABLE", "INDEX", "SEQUENCE"].contains(&w[what].as_str()) && !at(what + 1, &["IF", "NOT", "EXISTS"])
+            }
+            Some("ALTER") => (0..w.len()).any(|i| w[i] == "ADD" && !(at(i + 1, &["COLUMN", "IF", "NOT", "EXISTS"]))),
+            Some(_) => false,
+        };
+        if refused {
+            return Some(stmt.trim().to_string());
+        }
+    }
+    None
 }

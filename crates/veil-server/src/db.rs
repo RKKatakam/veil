@@ -294,7 +294,20 @@ async fn migrate_once(c: &mut PgConnection, deadline: tokio::time::Instant) -> R
             Some(yb) => yb,
             None => {
                 let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&mut *c).await?;
-                *yugabyte.insert(is_yugabyte(&version))
+                let yb = is_yugabyte(&version);
+                if yb {
+                    // YugabyteDB's online build holds every row only while it
+                    // waits for every backend to see each stage of the index.
+                    let off: Option<String> =
+                        sqlx::query_scalar("SELECT current_setting('yb_disable_wait_for_backends_catalog_version', true)").fetch_one(&mut *c).await?;
+                    if off.as_deref() == Some("on") {
+                        return Err(Error::Other(anyhow::anyhow!(
+                            "this YugabyteDB runs with yb_disable_wait_for_backends_catalog_version on, so an index built online \
+                             could miss rows written during its build: set it off (its default) to migrate"
+                        )));
+                    }
+                }
+                *yugabyte.insert(yb)
             }
         };
         for step in &parts.online {
@@ -326,14 +339,16 @@ async fn migrate_once(c: &mut PgConnection, deadline: tokio::time::Instant) -> R
 /// * An index a failed build left invalid (`pg_index.indisvalid` false:
 ///   `IF NOT EXISTS` would keep it, and the database would never use it,
 ///   or a unique one would refuse rows while not serving reads) is dropped
-///   before the build; after it the index must read valid (within
-///   `VALID_WAIT`: on YugabyteDB, under load, a build returned about 200 ms
-///   before its session read the index valid), or the migration
+///   before the build; after it the index must read existing and valid
+///   (within `VALID_WAIT`: on YugabyteDB, under load, a build returned
+///   about 200 ms before its session read the index valid), or the migration
 ///   fails and is not recorded.
 /// * An index step runs under statement and lock timeouts of what is left
 ///   of the migrations' deadline (at least [`STATEMENT_TIMEOUT`]), not the
 ///   pool's: a large table's build takes longer than 15 s, and the
-///   concurrent build waits for the transactions already running.
+///   concurrent build waits for the transactions already running. A build
+///   that needs longer than is left fails, saying how to build the index by
+///   hand (BUG-2520: it would time out at every start).
 ///
 /// An index on a table created by the same migration needs none of this
 /// (no server writes a table it does not know): it stays in the transaction.
@@ -467,11 +482,23 @@ async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &Inde
         if let Ok(Some(Some(false))) = index_valid(&mut *c, name).await {
             let _ = drop_index(&mut *c, yugabyte, name).await;
         }
+        // Its timeouts are what was left of the migrations' deadline: a
+        // build that needs longer would time out at every start, dropped
+        // and begun again (BUG-2520). Say how to build it by hand instead.
+        let timed_out = e.as_database_error().and_then(|d| d.code()).is_some_and(|code| code == "57014" || code == "55P03");
+        if timed_out {
+            return Err(Error::Other(anyhow::anyhow!(
+                "building index {name} did not finish within what was left of the migrations' {MIGRATION_DEADLINE:?} ({e}): \
+                 build it by hand, as long as it takes, with `{sql}` (if that build fails, first drop the invalid index it \
+                 leaves with `DROP INDEX IF EXISTS {name}`), then start the server again: it finds the index built and \
+                 records the migration"
+            )));
+        }
         return Err(e.into());
     }
     // On YugabyteDB, under load, the build can return before this session
-    // reads its index valid (seen in `verify-server.sh`): read again, for
-    // at most `VALID_WAIT`.
+    // reads its index valid (seen in `verify-server.sh`), or reads it at
+    // all: read again, for at most `VALID_WAIT`.
     let began = tokio::time::Instant::now();
     let until = began + VALID_WAIT;
     let mut looks = 0u32;
@@ -484,15 +511,16 @@ async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &Inde
                 }
                 return Ok(());
             }
-            Some(Some(false)) if tokio::time::Instant::now() < until => tokio::time::sleep(Duration::from_millis(200)).await,
+            Some(Some(false)) | None if tokio::time::Instant::now() < until => tokio::time::sleep(Duration::from_millis(200)).await,
             Some(Some(false)) => return Err(Error::Other(anyhow::anyhow!("index {name} is not valid {VALID_WAIT:?} after its build"))),
             Some(None) => return Err(Error::Other(anyhow::anyhow!("{name} is not an index, so the index of that name was not built"))),
-            None => return Err(Error::Other(anyhow::anyhow!("index {name} does not exist after its build"))),
+            None => return Err(Error::Other(anyhow::anyhow!("index {name} does not exist {VALID_WAIT:?} after its build"))),
         }
     }
 }
 
-/// How long an index that its build returned from may take to read valid.
+/// How long an index that its build returned from may take to read
+/// existing and valid.
 const VALID_WAIT: Duration = Duration::from_secs(60);
 
 pub type TxFuture<'t, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>;
