@@ -1375,8 +1375,6 @@ impl<'a> Batch<'a> {
 /// below them.
 type TreeChanges = (Vec<Change>, Vec<String>);
 
-/// What snapshot `id` (with `parents`) changed against its first parent
-/// ([`changes::diff`]).
 /// The first parent of each of `ids` (`None` for a first snapshot), their
 /// snapshots read on up to [`AHEAD_THREADS`] threads.
 fn first_parents(src: &Source, ids: &[ObjectId]) -> Result<Vec<Option<ObjectId>>> {
@@ -1397,6 +1395,8 @@ fn first_parents(src: &Source, ids: &[ObjectId]) -> Result<Vec<Option<ObjectId>>
     })
 }
 
+/// What snapshot `id` (with `parents`) changed against its first parent
+/// ([`changes::diff`]).
 fn tree_changes(src: &Source, id: ObjectId, parents: &[ObjectId]) -> Result<TreeChanges> {
     let tree = src.snapshot(&id)?.tree;
     let base = match parents.first() {
