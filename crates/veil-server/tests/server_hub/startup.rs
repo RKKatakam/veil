@@ -169,6 +169,11 @@ fn requests_survive_a_schema_change() {
     assert!(changes.load(Ordering::Relaxed) >= 4 && done.load(Ordering::Relaxed) > 0);
 }
 
+/// The statement and lock timeout `s3rd3_migration_21_…` migrates under on
+/// YugabyteDB (BUG-2521): above what its DDL costs on a loaded cluster,
+/// far below what a clear growing with the table takes there.
+const YB_MIGRATION_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// BUG-1383 (S3 redesign, cycle 3; property 4: the migration's cache clear
 /// runs in bounded time on large tables). Migration 21 (19 when it was
 /// filed) cleared the viewer graph with `DELETE FROM view_graph`, one
@@ -184,13 +189,25 @@ fn requests_survive_a_schema_change() {
 /// 2,000,000) and a statement timeout of 250 ms, the same ratio of rows to
 /// time as 120 million rows in 15 s, or fewer on a slower disk. A clear
 /// whose time does not grow with the table (`TRUNCATE`) finishes.
+///
+/// On YugabyteDB the timeout is [`YB_MIGRATION_TIMEOUT`] (BUG-2521): every
+/// DDL statement there has a fixed cost, the catalog change, whatever its
+/// table's size (on empty tables of the shared cluster, `CREATE TABLE` 100
+/// to 840 ms, `ALTER TABLE` up to 400 ms, under load), and a migration
+/// whose transaction times out is rolled back whole: under 250 ms the
+/// migrations after 21 were begun again and again on statements that do
+/// not grow with any table, and did not finish. 3 s still separates the
+/// two clears: with `DELETE FROM view_graph` in migration 21 the test fails
+/// there (checked), the delete of the 2,000,000 rows taking 22.7 s.
 #[test]
 fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
     let rt = runtime();
     let (url, name) = fresh_database(&rt);
     let rows: i64 = std::env::var("VEIL_TEST_GRAPH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
-    rt.block_on(async {
+    let timeout = rt.block_on(async {
         let db = veil_server::db::connect(&url, 1).await.unwrap();
+        let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
+        let timeout = if veil_server::db::is_yugabyte(&version) { YB_MIGRATION_TIMEOUT } else { Duration::from_millis(250) };
         // The schema before migration 21, applied and recorded as `migrate` does.
         sqlx::raw_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)")
             .execute(&db)
@@ -254,11 +271,13 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM view_graph").fetch_one(&db).await.unwrap();
         assert_eq!(n, rows);
         db.close().await;
+        timeout
     });
     let started = std::time::Instant::now();
     let migrated = rt.block_on(async {
         let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
-        let opts = opts.options([("statement_timeout", "250"), ("lock_timeout", "250")]);
+        let ms = timeout.as_millis().to_string();
+        let opts = opts.options([("statement_timeout", ms.as_str()), ("lock_timeout", ms.as_str())]);
         let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
         let r = tokio::time::timeout(Duration::from_secs(60), veil_server::db::migrate(&pool)).await;
         pool.close().await;
@@ -267,7 +286,7 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
     let took = started.elapsed();
     assert!(
         matches!(migrated, Ok(Ok(()))),
-        "migrating {rows} viewer graph rows under a 250 ms statement timeout did not finish within 60 s ({took:?}): {:?}",
+        "migrating {rows} viewer graph rows under a {timeout:?} statement timeout did not finish within 60 s ({took:?}): {:?}",
         migrated.map(|r| r.map_err(|e| e.to_string()))
     );
     rt.block_on(async {
