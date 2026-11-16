@@ -326,7 +326,9 @@ async fn migrate_once(c: &mut PgConnection, deadline: tokio::time::Instant) -> R
 /// * An index a failed build left invalid (`pg_index.indisvalid` false:
 ///   `IF NOT EXISTS` would keep it, and the database would never use it,
 ///   or a unique one would refuse rows while not serving reads) is dropped
-///   before the build; after it the index must be valid, or the migration
+///   before the build; after it the index must read valid (within
+///   `VALID_WAIT`: on YugabyteDB, under load, a build returned about 200 ms
+///   before its session read the index valid), or the migration
 ///   fails and is not recorded.
 /// * An index step runs under statement and lock timeouts of what is left
 ///   of the migrations' deadline (at least [`STATEMENT_TIMEOUT`]), not the
@@ -467,13 +469,31 @@ async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &Inde
         }
         return Err(e.into());
     }
-    match index_valid(&mut *c, name).await? {
-        Some(Some(true)) => Ok(()),
-        Some(Some(false)) => Err(Error::Other(anyhow::anyhow!("index {name} is not valid after its build"))),
-        Some(None) => Err(Error::Other(anyhow::anyhow!("{name} is not an index, so the index of that name was not built"))),
-        None => Err(Error::Other(anyhow::anyhow!("index {name} does not exist after its build"))),
+    // On YugabyteDB, under load, the build can return before this session
+    // reads its index valid (seen in `verify-server.sh`): read again, for
+    // at most `VALID_WAIT`.
+    let began = tokio::time::Instant::now();
+    let until = began + VALID_WAIT;
+    let mut looks = 0u32;
+    loop {
+        looks += 1;
+        match index_valid(&mut *c, name).await? {
+            Some(Some(true)) => {
+                if looks > 1 {
+                    eprintln!("veil-server: index {name} read valid {:?} after its build returned", began.elapsed());
+                }
+                return Ok(());
+            }
+            Some(Some(false)) if tokio::time::Instant::now() < until => tokio::time::sleep(Duration::from_millis(200)).await,
+            Some(Some(false)) => return Err(Error::Other(anyhow::anyhow!("index {name} is not valid {VALID_WAIT:?} after its build"))),
+            Some(None) => return Err(Error::Other(anyhow::anyhow!("{name} is not an index, so the index of that name was not built"))),
+            None => return Err(Error::Other(anyhow::anyhow!("index {name} does not exist after its build"))),
+        }
     }
 }
+
+/// How long an index that its build returned from may take to read valid.
+const VALID_WAIT: Duration = Duration::from_secs(60);
 
 pub type TxFuture<'t, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>;
 
