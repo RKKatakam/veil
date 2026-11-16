@@ -5685,7 +5685,17 @@ transaction per landing instead of 23.
    (`derived::bug_2361_*`, `derived::derived_graph_matches_direct_walks`).
    Measured: 0.2 to 5.5 s behind at the end of three minutes at 1,000 a
    second (77 to 103 s before), runs of about 100 snapshots ten times a
-   second.
+   second. **The moved branches' lines are asked about together**
+   (`Batch::ask_rows`, BUG-2480): a run asked once for each root (each
+   branch moved), walking its line one snapshot read after another, so
+   2,700 pushes a second to 1,000 branches made about 1,000 statements a
+   run; the deriver fell a few seconds behind, past what the object cache
+   held, and then read down each line one storage round trip at a time:
+   222 to 277 s behind after a 60 s burst. Now it walks every root's line
+   together, a snapshot of each at a time, read 8 at once, and asks about
+   512 snapshots a statement once 512 are waiting (a line stops at a row
+   just found): 0.04 s behind after the same burst
+   (`derived::bug_2480_*`).
 17. **The database checkpoints every 16 GB of WAL or 15 minutes**
    (`deploy/do/configure.sh`, `scripts/bench-server.sh`, BUG-2360). With
    PostgreSQL's default `max_wal_size` of 1 GB, 1,000 landings a second

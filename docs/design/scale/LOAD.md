@@ -2569,7 +2569,8 @@ that ended in an error: four unknown (the first probe did not print
 them), four that waited 10 s for the index bound (`IndexesFull`, all in
 the two-request path; none since) and the rest PostgreSQL's "could not
 resize shared memory segment" (below). "Deriver done after" is
-the load tool's lag of the deriver once the agents stopped (BUG-2480).
+the load tool's lag of the deriver once the agents stopped (BUG-2480,
+fixed: below).
 
 What the probes showed, before: passes did run back to back, but a pass
 of 64 packs took 110 ms, nearly all of it its storage requests one after
@@ -2596,17 +2597,48 @@ parallel. The runs marked "no parallel plans" set
 `max_parallel_workers_per_gather = 0` on the run's database; a pass's
 sweep no longer sorts every due row to take a few.
 
-**What keeping up costs here (BUG-2480, open).** Where merges kept up for
-most of the run the deriver finished 167 to 233 s after the agents
+**The deriver's lag (BUG-2480, fixed 2026-11-16).** Where merges kept up
+for most of the run the deriver finished 167 to 233 s after the agents
 stopped (0.3 s before, and in the runs where merges fell behind early);
-it always caught up. On S3 the deriver reads each object it has not
-cached with one request at a time, waiting for each (`Objects::get_blocking`
-through the runtime), and a merge that keeps up adds about two MinIO
-requests a pack, 10,000 a second at 5,000 packs listed a second, on one
-machine already at its limit: its reads wait longer, it falls behind, and
-its object cache hits fall (0.99 to 0.96), which slows it more. Derive
-work is shed second by design (§4.11: it lags, it does not stop), but the
-lag is new. Two runs were void and are not in the table: another
+it always caught up. Supposed at first: on S3 the deriver reads each object
+it has not cached with one request at a time, and merges that keep up add
+about two MinIO requests a pack. Timing probes in the deriver, the store
+and the merges (not kept) showed otherwise: no wait for a derive worker
+permit (under 1 ms a run), for S24's shedding or for the deriver's pool,
+and a storage read took 1.1 to 1.5 ms during the burst against 0.9 to 1.0
+after it. The deriver's time went to its own round trips, one after
+another. Each run asked the database whether each moved branch's new
+snapshots were derived in a statement of its own: about 1,000 a run at
+1,000 branches, 0.8 ms each at first and 2 to 12 ms once the burst loaded
+the database, so a run took 2 to 13 s and the deriver fell a few seconds
+behind. The object cache (256 MiB) holds only a few seconds of this
+burst's objects, so from then on nearly every snapshot it read was a
+storage read, made down each branch's line one at a time: one run's walk
+took 51.7 s, and after the burst its read-ahead (8 threads, about 9 reads a
+snapshot) derived about 900 snapshots a second. BUG-2462's faster merges
+only brought the push rate past what those asks kept up with. Now a run
+walks every moved branch's line together, a snapshot of each at a time,
+read 8 at once, and asks about 512 snapshots a statement: about 22
+statements a run of 1,000 branches, the walk 20 ms, and the deriver stays
+within the object cache. Same test, two runs of each, MinIO on a RAM disk
+of its own, a database of the run's (no parallel plans):
+
+| Server | Pushes/s | p50 / p99 ms | Most packs listed | Object cache hits | Deriver done after |
+|---|---:|---|---:|---:|---:|
+| before (`b5682a59`) | 2,661 | 368 / 523 | 3,520 | 0.96 | 222.4 s |
+| before, again | 2,704 | 356 / 531 | 3,785 | 0.97 | 223.0 s |
+| after | 2,766 | 358 / 448 | 4,886 | 0.99 | 0.04 s |
+| after, again | 2,725 | 363 / 460 | 4,668 | 0.99 | 0.04 s |
+
+The packs listed climb through the burst in every run, before and after
+(merges run back to back, one pass at a time, and a pass grew from about
+30 to 450 ms as more packs waited), and fall to tens once it stops; with
+the deriver doing its work during the burst, on the machine the merges
+share, about 1,000 more were listed at its end. The deriver is now busy
+most of the time at this rate (runs of about 0.5 s, most of it its own
+batched statements of about 28 ms); one that falls past the object cache
+still reads trees 8 at a time, about 900 snapshots a second on MinIO.
+Two runs were void and are not in the table: another
 worktree's test suite on the shared PostgreSQL during them (856 and 503
 pushes a second, 26 and 34 statements a push instead of 15).
 
