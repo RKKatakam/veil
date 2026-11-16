@@ -898,6 +898,144 @@ fn bug_2482_an_interrupted_index_build_is_built_again_on_the_next_start() {
     drop_database(&rt, &name);
 }
 
+/// BUG-2571: set `flag` of index `index` false in `pg_index` (in database
+/// `url`, a session of its own), as YugabyteDB left an index whose build lost
+/// a stage and returned success (there `indisvalid`, the last stage's).
+async fn lose_stage(url: &str, index: &str, flag: &str, yb: bool) {
+    let db = veil_server::db::connect(url, 1).await.unwrap();
+    // YugabyteDB writes its catalog by hand only when asked to. (`index`
+    // and `flag` are the tests' own lower-case names.)
+    let update = format!("UPDATE pg_index SET {flag} = false WHERE indexrelid = to_regclass('{index}')");
+    let q = if yb { format!("SET yb_non_ddl_txn_for_sys_tables_allowed = on; {update}; RESET yb_non_ddl_txn_for_sys_tables_allowed") } else { update };
+    let mut tries = 0;
+    loop {
+        match sqlx::raw_sql(&q).execute(&db).await {
+            Ok(done) => {
+                assert_eq!(done.rows_affected(), 1, "index {index}'s {flag} set false");
+                break;
+            }
+            Err(e) if retryable(&e) && tries < 50 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("setting {index}'s {flag} false: {e}"),
+        }
+    }
+    db.close().await;
+}
+
+/// BUG-2571: index `name`'s `pg_index` stages (live, ready, valid), read in
+/// a session of its own; `None` when there is no such index.
+async fn index_stages(url: &str, name: &str) -> Option<(bool, bool, bool)> {
+    let db = veil_server::db::connect(url, 1).await.unwrap();
+    let r = sqlx::query_as("SELECT i.indislive, i.indisready, i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass($1)")
+        .bind(name)
+        .fetch_optional(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    r
+}
+
+/// BUG-2571: on YugabyteDB an online build returned success and its index
+/// stayed invalid for good (`indisvalid` false minutes later, in new
+/// sessions): the last stage's catalog version increment lost a race with
+/// another database's DDL, and its write was lost with no error. The runner
+/// waited for the index to read valid, then failed the migration, and with
+/// it the server's start. Each build of migration 41's index here returns
+/// with a stage lost (the first `indisvalid`, the second `indisready`, which
+/// the runner did not read at all: an index made valid with `indisready`
+/// lost is read while writes leave it out); the third is left whole. The
+/// start succeeds, the index was built three times, and only then was the
+/// migration recorded: once, with its index live, ready and valid, holding
+/// every listed row.
+#[test]
+fn bug_2571_an_index_whose_build_returned_it_incomplete_is_built_again_before_the_migration_is_recorded() {
+    let rt = runtime();
+    let (url, name, project, yb) = before_migration_41(&rt, 30_000);
+    let builds = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = builds.clone();
+    let at = url.clone();
+    let hook: Box<veil_server::db::AfterBuild> = Box::new(move |index: String| {
+        let n = if index == "packs_listed" { counted.fetch_add(1, Ordering::SeqCst) } else { usize::MAX };
+        let at = at.clone();
+        Box::pin(async move {
+            if let Some(flag) = ["indisvalid", "indisready"].get(n) {
+                lose_stage(&at, &index, flag, yb).await;
+            }
+        })
+    });
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate_with(&db, Some(&*hook)).await.expect("the start migrates");
+        assert!(veil_server::db::schema_current(&db).await.unwrap(), "every migration is applied");
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
+        assert_eq!(applied, 1, "migration 41 is recorded once");
+        db.close().await;
+    });
+    assert_eq!(builds.load(Ordering::SeqCst), 3, "packs_listed was built three times: two builds lost a stage");
+    assert_eq!(rt.block_on(index_stages(&url, "packs_listed")), Some((true, true, true)), "packs_listed is live, ready and valid");
+    let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
+    assert_eq!(with.len(), 20_000, "two thirds of the 30,000 packs are listed");
+    assert!(with == without, "the index built again holds exactly the listed rows");
+    drop_database(&rt, &name);
+}
+
+/// BUG-2571: a build that loses a stage every time fails the start after a
+/// bounded number of builds, and the migration is not recorded; the
+/// incomplete index it leaves is what the next start finds (a start that
+/// died, or failed, part-way): that start drops it and builds it again,
+/// and records the migration with its index live, ready and valid, holding
+/// every listed row.
+#[test]
+fn bug_2571_an_index_no_build_made_whole_fails_the_start_unrecorded_and_the_next_start_builds_it() {
+    let rt = runtime();
+    let (url, name, project, yb) = before_migration_41(&rt, 30_000);
+    let builds = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = builds.clone();
+    let at = url.clone();
+    let hook: Box<veil_server::db::AfterBuild> = Box::new(move |index: String| {
+        let lost = index == "packs_listed";
+        if lost {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+        let at = at.clone();
+        Box::pin(async move {
+            if lost {
+                lose_stage(&at, &index, "indisvalid", yb).await;
+            }
+        })
+    });
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        let e = veil_server::db::migrate_with(&db, Some(&*hook)).await.expect_err("no build made packs_listed whole: the start fails");
+        assert_eq!(
+            e.to_string(),
+            "index packs_listed is not built (live, ready and valid) 15s after its build, in 5 builds: \
+             the migration is not recorded, and the next start drops the index and builds it again"
+        );
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "migration 41 is not applied");
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
+        assert_eq!(applied, 0, "migration 41 is not recorded");
+        db.close().await;
+    });
+    assert_eq!(builds.load(Ordering::SeqCst), 5, "packs_listed was built five times");
+    assert_eq!(rt.block_on(index_stages(&url, "packs_listed")), Some((true, true, false)), "the failed start left packs_listed invalid");
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate(&db).await.expect("the next start migrates");
+        assert!(veil_server::db::schema_current(&db).await.unwrap(), "every migration is applied");
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
+        assert_eq!(applied, 1, "migration 41 is recorded once");
+        db.close().await;
+    });
+    assert_eq!(rt.block_on(index_stages(&url, "packs_listed")), Some((true, true, true)), "packs_listed is live, ready and valid");
+    let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
+    assert_eq!(with.len(), 20_000, "two thirds of the 30,000 packs are listed");
+    assert!(with == without, "the index built again holds exactly the listed rows");
+    drop_database(&rt, &name);
+}
+
 /// BUG-2482, the class: every index a migration builds on a table that
 /// existed before it is built online (in its `db::ONLINE_INDEXES`
 /// section); an index in a migration's transaction is on a table the same
