@@ -349,6 +349,144 @@ fn a_reader_finds_an_object_gc_moves_between_its_listing_and_its_open() {
     assert_fsck_clean(inner, &id, "after the gc runs");
 }
 
+/// A disk that runs `on_pack_listing` (once) just before the next listing
+/// of the pack directory, and fails the next `fail_entry_reads` reads of a
+/// pack entry (not a pack's header or trailer, which opening it reads) as
+/// not found: a pack gone at that moment, and back (gc wrote the same
+/// data, so the same name, again) by the next listing.
+struct Interleave {
+    inner: Arc<MemoryBackend>,
+    on_pack_listing: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    fail_entry_reads: AtomicUsize,
+}
+
+impl std::fmt::Debug for Interleave {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Interleave")
+    }
+}
+
+impl StorageBackend for Interleave {
+    fn kind(&self) -> &'static str {
+        "interleave"
+    }
+    fn read(&self, path: &VPath) -> Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
+        if path.as_str().starts_with(".veil/objects/pack/") && path.as_str().ends_with(".pack") && offset != 0 {
+            let size = self.inner.metadata(path)?.map_or(0, |m| m.len);
+            let trailer = offset + len as u64 == size && len == 32;
+            if !trailer && self.fail_entry_reads.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                return Err(VeilError::NotFound(format!("{path} (removed meanwhile)")));
+            }
+        }
+        self.inner.read_range(path, offset, len)
+    }
+    fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
+        self.inner.write(path, data)
+    }
+    fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+        self.inner.create_new(path, data)
+    }
+    fn remove_file(&self, path: &VPath) -> Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &VPath) -> Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn create_dir_all(&self, path: &VPath) -> Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &VPath) -> Result<Vec<DirEntry>> {
+        if path.as_str() == ".veil/objects/pack" {
+            let hook = self.on_pack_listing.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        self.inner.list_dir(path)
+    }
+    fn metadata(&self, path: &VPath) -> Result<Option<Metadata>> {
+        self.inner.metadata(path)
+    }
+    fn set_executable(&self, path: &VPath, x: bool) -> Result<()> {
+        self.inner.set_executable(path, x)
+    }
+}
+
+fn interleave(inner: &Arc<MemoryBackend>) -> Arc<Interleave> {
+    Arc::new(Interleave {
+        inner: inner.clone(),
+        on_pack_listing: Mutex::new(None),
+        fail_entry_reads: AtomicUsize::new(0),
+    })
+}
+
+/// BUG-2470 (review): two threads of one process share a store (a
+/// checkout reads with 8). Another process's gc packs two new objects
+/// into a new pack. Thread A misses the first in the packs it knows; just
+/// before A lists the pack directory again, thread B looks the second up,
+/// lists the directory and installs the new pack set. A's listing then
+/// equals the set B installed, which is not the set A searched: A searches
+/// again and finds its object (`get_raw` and `has`), never `Missing`.
+#[test]
+fn a_lookup_settles_only_on_the_pack_set_it_searched() {
+    let (mut writer, inner, id) = new_repo("alice");
+    let disk = interleave(&inner);
+    let fs: Arc<dyn StorageBackend> = disk.clone();
+    let reader = Repo::open(fs, Some(id.clone()), "alice").unwrap();
+    let store = reader.store().clone();
+    for (round, ask) in ["get_raw", "has"].into_iter().enumerate() {
+        let s1 = commit_files(&mut writer, &*inner, &[(&format!("a{round}.txt"), "first\n")], "c1");
+        let s2 = commit_files(&mut writer, &*inner, &[(&format!("b{round}.txt"), "second\n")], "c2");
+        let (x1, x2) = (writer.snapshot(&s1).unwrap().tree, writer.snapshot(&s2).unwrap().tree);
+        gc(&mut writer, &GcOptions::default()).unwrap();
+        assert_eq!(loose_count(&*inner), 0, "round {round}: packed, so only a pack can answer");
+        let b_store = store.clone();
+        *disk.on_pack_listing.lock().unwrap() = Some(Box::new(move || {
+            std::thread::spawn(move || {
+                let raw = b_store.get_raw(&x2).unwrap_or_else(|e| panic!("thread B: read as {e:?}"));
+                assert_eq!(ObjectId::hash(&raw), x2);
+            })
+            .join()
+            .unwrap();
+        }));
+        match ask {
+            "get_raw" => {
+                let raw = store.get_raw(&x1).unwrap_or_else(|e| panic!("round {round}: read as {e:?}"));
+                assert_eq!(ObjectId::hash(&raw), x1);
+            }
+            _ => assert!(store.has(&x1), "round {round}: has() said no"),
+        }
+        assert!(disk.on_pack_listing.lock().unwrap().is_none(), "round {round}: thread B never ran between A's search and its listing");
+    }
+    drop(reader);
+    assert_fsck_clean(inner, &id, "after the lookups");
+}
+
+/// BUG-2470 (review): a pack is named by its data, so gc can remove a
+/// pack and write it again under the same name. A read from an opened
+/// pack that finds its data gone, with the next listing naming the same
+/// packs, searches again rather than settling on "absent".
+#[test]
+fn a_lookup_does_not_settle_when_a_pack_vanishes_under_it() {
+    let (mut writer, inner, id) = new_repo("alice");
+    let disk = interleave(&inner);
+    let fs: Arc<dyn StorageBackend> = disk.clone();
+    let reader = Repo::open(fs, Some(id.clone()), "alice").unwrap();
+    let s = commit_files(&mut writer, &*inner, &[("a.txt", "the object read\n")], "c");
+    let tree = writer.snapshot(&s).unwrap().tree;
+    gc(&mut writer, &GcOptions::default()).unwrap();
+    assert_eq!(loose_count(&*inner), 0, "packed, so only a pack can answer");
+    disk.fail_entry_reads.store(1, Ordering::SeqCst);
+    let raw = reader.store().get_raw(&tree).unwrap_or_else(|e| panic!("read as {e:?}"));
+    assert_eq!(ObjectId::hash(&raw), tree);
+    assert_eq!(disk.fail_entry_reads.load(Ordering::SeqCst), 0, "the pack's data never read as gone");
+    drop(reader);
+    assert_fsck_clean(inner, &id, "after the lookup");
+}
+
 // ---- threat 3: prune beside lock-free writers, with the clock stepping --------------
 
 /// Random lock-free commits, abandons and gc runs (default grace, with

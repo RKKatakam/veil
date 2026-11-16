@@ -27,7 +27,7 @@ use std::{
     collections::HashSet,
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
     time::Duration,
@@ -124,6 +124,11 @@ pub struct ObjectStore {
     snapshots: LruCache<Arc<Snapshot>>,
     bases: LruCache<Arc<Vec<u8>>>,
     packs: RwLock<PackSet>,
+    /// Bumped by every reload that changes `packs` (whichever thread runs
+    /// it): a lookup settles on "absent" only if the set it searched is
+    /// still the current one, not one another thread installed meanwhile
+    /// (BUG-2470).
+    pack_gen: AtomicU64,
     gc: GcHints,
     /// Open [`ObjectStore::begin_unsynced`] scopes (see there).
     unsynced: AtomicUsize,
@@ -294,6 +299,7 @@ impl ObjectStore {
             snapshots: LruCache::new(limits.snapshots),
             bases: LruCache::new(limits.delta_base_bytes),
             packs: RwLock::new(PackSet::default()),
+            pack_gen: AtomicU64::new(0),
             gc: GcHints {
                 enabled: AtomicBool::new(true),
                 pending: RwLock::new(None),
@@ -905,7 +911,16 @@ impl ObjectStore {
             broken: Vec::new(),
             pending,
         };
+        self.pack_gen.fetch_add(1, Ordering::SeqCst);
         Ok(true)
+    }
+
+    /// Is a search of the packs that started at generation `searched`
+    /// final? Lists the pack directory again: final only if that listing
+    /// is the current set and no reload (by this lookup or another thread)
+    /// changed the set since the search started.
+    fn search_settled(&self, searched: u64) -> Result<bool> {
+        Ok(!self.reload_packs()? && self.pack_gen.load(Ordering::SeqCst) == searched)
     }
 
     /// Open the packs not opened yet, one after another, until one holds
@@ -975,15 +990,19 @@ impl ObjectStore {
     /// changed: a concurrent gc may have replaced a pack before this
     /// lookup opened or read it, and its replacement (written before the
     /// old one went) is in the new listing. The answer "absent" comes only
-    /// from a listing that stayed the same while it was searched (BUG-2470:
-    /// one rescan lost to back-to-back gc runs, and an object that never
-    /// left the store read as `Missing`).
+    /// from a search of the set a reload then found current
+    /// ([`ObjectStore::search_settled`]), in which no pack holding `id`
+    /// vanished (a pack is named by its data, so gc may write one again
+    /// under the same name). BUG-2470: one rescan lost to back-to-back gc
+    /// runs, and an object that never left the store read as `Missing`.
     fn read_packed(&self, id: &ObjectId) -> Result<Option<Vec<u8>>> {
         self.ensure_packs()?;
         let mut corrupt = None;
         let mut settled = false;
         for _ in 0..PACK_RESCANS {
             corrupt = None;
+            let searched = self.pack_gen.load(Ordering::SeqCst);
+            let mut vanished = false;
             // Opened until one holds `id` (all, if none does).
             if !self.packs.read().unwrap().packs.iter().any(|p| p.contains(id)) {
                 self.open_pending(Some(id));
@@ -993,11 +1012,11 @@ impl ObjectStore {
                 match p.get(&*self.backend, id, &self.bases) {
                     Ok(Some(raw)) => return Ok(Some(raw)),
                     Ok(None) => {}
-                    Err(e) if e.is_not_found() => {}
+                    Err(e) if e.is_not_found() => vanished = true,
                     Err(e) => corrupt = Some(e),
                 }
             }
-            if !self.reload_packs()? {
+            if self.search_settled(searched)? && !vanished {
                 settled = true;
                 break;
             }
@@ -1044,16 +1063,16 @@ impl ObjectStore {
         if self.ensure_packs().is_err() {
             return false;
         }
-        if self.in_loaded_packs(id) {
-            return true;
-        }
-        // As in `read_packed`: searched again while the listing changes.
+        // As in `read_packed`: searched again until the set searched is
+        // current. Only a yes or a no to give: after `PACK_RESCANS` changes,
+        // the second loose probe answers.
         for _ in 0..PACK_RESCANS {
-            if !self.reload_packs().unwrap_or(false) {
-                break;
-            }
+            let searched = self.pack_gen.load(Ordering::SeqCst);
             if self.in_loaded_packs(id) {
                 return true;
+            }
+            if self.search_settled(searched).unwrap_or(true) {
+                break;
             }
         }
         self.loose_exists(id)
@@ -1110,7 +1129,9 @@ impl ObjectStore {
         // In a pack already open, on a local disk: no probe for a loose
         // copy first (a clone's checkout reads ten thousand packed files;
         // over a network a loose copy is the cheaper read). Anything but a
-        // good copy takes the full path below.
+        // good copy takes the full path below (also `packs_kept_changing`:
+        // the path below searches again, so a lookup lists the packs at
+        // most `2 * PACK_RESCANS` times).
         if !self.backend.is_network() {
             self.ensure_packs()?;
             if self.packs.read().unwrap().packs.iter().any(|p| p.contains(id)) {
