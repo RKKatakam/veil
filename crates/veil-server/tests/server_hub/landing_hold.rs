@@ -428,7 +428,7 @@ fn bug_1956_overlapping_landings_are_answered_as_landing_them_one_by_one_in_orde
 
 /// A proxy in front of the test's S3 store that holds every `PUT` while
 /// `stall` is set (reads go through): object writes that hang.
-fn stalling_s3(stall: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
+pub(crate) fn stalling_s3(stall: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},

@@ -373,7 +373,11 @@ pub struct Stats {
     pub pick_rows: AtomicU64,
     /// Times a batch asked the database whether its entries meet the review
     /// rules (`prs::verify_landing_reviews`, BUG-1942): one statement for
-    /// all of a batch's entries, or one entry asked alone.
+    /// all of a batch's entries, or one entry asked alone. Of the batches
+    /// that committed, when they were read and in the transaction's run
+    /// that committed: a run rolled back and run again (a store slower than
+    /// `STORE_IN_TRANSACTION`, a lost race) or a batch built again counts
+    /// once, as in `batches` (BUG-2465).
     pub review_asks: AtomicU64,
     /// Submits whose stack asked the derived graph, or walked, whether a
     /// change is on the branch: neither its tip nor a landing (BUG-1275).

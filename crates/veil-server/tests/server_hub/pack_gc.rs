@@ -989,7 +989,15 @@ fn guarantee_4_merge_and_gc_are_bounded_and_yield_to_landings_and_pushes() {
 /// history of 10,000 small pushes, and the storage requests a merge makes.
 #[test]
 fn guarantee_5_cost_of_merging_10000_small_pushes() {
-    let hub = TestHub::start();
+    // A database and an object store of its own (BUG-2457): every test of a
+    // run shares one database, and this server's embargo release loop
+    // (`embargo::run_loop`) releases the other tests' embargoes that are
+    // due, reading their objects in this server's storage counters (63 to
+    // 441 reads in the merge's window under load). The store too: a new
+    // database numbers its projects from 1 again, and the run's bucket holds
+    // other such tests' `p/1/` keys, which the counts below would include.
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let hub = TestHub::start_with_s3(&crate::grants::fresh_database(&rt), Duration::from_secs(3600), None);
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
