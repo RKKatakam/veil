@@ -5,6 +5,8 @@
 -- outstanding landings, each person at 1,000, and each batch takes a fair
 -- share across people and across each person's sessions.
 ALTER TABLE landing_queue ADD COLUMN IF NOT EXISTS session TEXT NOT NULL DEFAULT '';
-CREATE INDEX IF NOT EXISTS landing_queue_queued_who
+
+-- veil: online indexes (outside the transaction, `db::ONLINE_INDEXES`: on a table servers already write)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS landing_queue_queued_who
     ON landing_queue (project_id, person_id, session)
     WHERE state IN ('queued', 'merging');

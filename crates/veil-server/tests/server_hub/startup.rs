@@ -197,14 +197,23 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
             .await
             .unwrap();
         for (version, name, sql) in veil_server::db::MIGRATIONS.iter().filter(|m| m.0 < 21) {
-            // YugabyteDB's catalog is shared: DDL can lose a race with
-            // another database's, and is run again (as `migrate` does).
-            let mut tries = 0;
-            while let Err(e) = sqlx::raw_sql(sql).execute(&db).await {
-                tries += 1;
-                let retryable = e.as_database_error().and_then(|d| d.code()).is_some_and(|c| c == "40001" || c == "40P01");
-                assert!(retryable && tries < 50, "migration {version}: {e}");
-                tokio::time::sleep(Duration::from_millis(200)).await;
+            // Its statements, then its online index steps one by one
+            // (BUG-2482), on an empty database.
+            let parts = veil_server::db::migration_parts(sql).unwrap();
+            let steps = parts.online.iter().map(|s| match s {
+                veil_server::db::IndexStep::Create { sql, .. } => sql.clone(),
+                veil_server::db::IndexStep::Drop { name } => format!("DROP INDEX IF EXISTS {name}"),
+            });
+            for sql in std::iter::once(parts.transactional.to_string()).chain(steps) {
+                // YugabyteDB's catalog is shared: DDL can lose a race with
+                // another database's, and is run again (as `migrate` does).
+                let mut tries = 0;
+                while let Err(e) = sqlx::raw_sql(&sql).execute(&db).await {
+                    tries += 1;
+                    let retryable = e.as_database_error().and_then(|d| d.code()).is_some_and(|c| c == "40001" || c == "40P01");
+                    assert!(retryable && tries < 50, "migration {version}: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
             }
             sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, 0)")
                 .bind(version)
@@ -597,4 +606,330 @@ fn bug_2135_a_yugabytedb_without_read_committed_is_refused_at_start() {
         }
         db.close().await;
     });
+}
+
+/// Whether `e` is a database error that is run again (the codes and texts
+/// of `Error::is_retryable`): on YugabyteDB other tests' DDL changes the
+/// shared catalog.
+fn retryable(e: &sqlx::Error) -> bool {
+    e.as_database_error().is_some_and(|d| {
+            matches!(d.code().as_deref(), Some("40001" | "40P01" | "55P03" | "57014"))
+                || ["Restart read required", "Try again", "catalog snapshot", "catalog version", "schema version mismatch"].iter().any(|m| d.message().contains(m))
+        })
+}
+
+/// `q` on `db`, run again while it fails retryably (50 tries).
+async fn exec_retrying(db: &sqlx::PgPool, q: &str) {
+    let mut tries = 0;
+    loop {
+        match sqlx::raw_sql(q).execute(db).await {
+            Ok(_) => return,
+            Err(e) if retryable(&e) && tries < 50 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("{q}: {e}"),
+        }
+    }
+}
+
+/// BUG-2482: a fresh database migrated to the current schema, then put back
+/// to before migration 41 (its index dropped and its record removed), with
+/// one project of `rows` packs (two thirds listed). Returns the database's
+/// URL and name, the project and whether it is YugabyteDB.
+fn before_migration_41(rt: &tokio::runtime::Runtime, rows: i64) -> (String, String, i64, bool) {
+    let (url, name) = fresh_database(rt);
+    let (project, yb) = rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate(&db).await.expect("migrates");
+        let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
+        exec_retrying(&db, "DROP INDEX packs_listed").await;
+        exec_retrying(&db, "DELETE FROM schema_migrations WHERE version = 41").await;
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "migration 41 is to apply");
+        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('bug2482', 0)").await;
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'bug2482', id, 0, 'main', '', '{}', 0 FROM people WHERE name = 'bug2482'",
+        )
+        .await;
+        let project: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'bug2482'").fetch_one(&db).await.unwrap();
+        let batch = 100_000i64;
+        let mut lo = 0;
+        while lo < rows {
+            let hi = (lo + batch).min(rows);
+            exec_retrying(
+                &db,
+                &format!(
+                    "INSERT INTO packs (project_id, name, state, size, objects, created_at) \
+                     SELECT {project}, 'p' || i, CASE WHEN i % 3 = 0 THEN 2 ELSE 1 END, i, 1, i FROM generate_series({lo}, {hi} - 1) i"
+                ),
+            )
+            .await;
+            lo = hi;
+        }
+        db.close().await;
+        (project, veil_server::db::is_yugabyte(&version))
+    });
+    (url, name, project, yb)
+}
+
+/// Whether index `name` is valid (`None`: no such index).
+async fn index_valid(c: &mut sqlx::PgConnection, name: &str) -> Option<bool> {
+    sqlx::query_scalar("SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass($1)").bind(name).fetch_optional(&mut *c).await.unwrap()
+}
+
+/// The project's listed packs read through `packs_listed` (the listing's
+/// statement, `pack::Packs::refresh_in`, with every other plan made dearer,
+/// and the plan checked), and read without it (`state + 0 = 1` is no
+/// predicate of the partial index).
+async fn listed_with_and_without_the_index(url: &str, project: i64) -> (Vec<String>, Vec<String>) {
+    let db = veil_server::db::connect(url, 1).await.unwrap();
+    let mut c = db.acquire().await.unwrap();
+    assert_eq!(index_valid(&mut c, "packs_listed").await, Some(true), "packs_listed is built and valid");
+    sqlx::raw_sql("SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off").execute(&mut *c).await.unwrap();
+    let listing = "SELECT name FROM packs WHERE project_id = $1 AND state = 1 ORDER BY created_at, name";
+    let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {}", listing.replace("$1", &project.to_string()))).fetch_all(&mut *c).await.unwrap();
+    assert!(plan.iter().any(|l| l.contains("packs_listed")), "the listing reads packs_listed: {plan:#?}");
+    let mut with: Vec<String> = sqlx::query_scalar(listing).bind(project).fetch_all(&mut *c).await.unwrap();
+    sqlx::raw_sql("RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort").execute(&mut *c).await.unwrap();
+    let mut without: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state + 0 = 1").bind(project).fetch_all(&mut *c).await.unwrap();
+    drop(c);
+    db.close().await;
+    with.sort();
+    without.sort();
+    (with, without)
+}
+
+/// BUG-2482: migration 41's index, applied by two servers starting at once
+/// on a large table that other connections keep writing, and under a
+/// statement timeout shorter than its build (250 ms, against the build of
+/// 4,000,000 rows on PostgreSQL, about 600 ms, or 300,000 on YugabyteDB,
+/// about 4 s: the pool's is 15 s, and a large table's build takes longer). Built in the migration's
+/// transaction, on PostgreSQL the build held every write off and passed the
+/// timeout, so the migration was run again until its deadline and never
+/// finished; on YugabyteDB it did not hold writes off, and rows written
+/// during the build could be missing from it with no error. Built online:
+/// both starts succeed, it is applied once, the writes went on during it,
+/// it holds every listed row (read through it, the plan checked), and the
+/// connection's own timeouts are back afterwards.
+#[test]
+fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_row() {
+    let rt = runtime();
+    let yb = rt.block_on(async {
+        let db = veil_server::db::connect(&std::env::var("VEIL_TEST_DATABASE_URL").unwrap(), 1).await.unwrap();
+        let v: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
+        db.close().await;
+        veil_server::db::is_yugabyte(&v)
+    });
+    let rows = std::env::var("VEIL_TEST_PACK_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(if yb { 300_000 } else { 4_000_000 });
+    let (url, name, project, _) = before_migration_41(&rt, rows);
+    let migrating = AtomicBool::new(true);
+    let stop = AtomicBool::new(false);
+    let during = AtomicUsize::new(0);
+    let (results, written) = std::thread::scope(|s| {
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let (url, migrating, stop, during, rt) = (&url, &migrating, &stop, &during, &rt);
+                s.spawn(move || {
+                    rt.block_on(async {
+                        let db = veil_server::db::connect(url, 1).await.unwrap();
+                        let mut written = Vec::new();
+                        let mut n = 0u64;
+                        while !stop.load(Ordering::Relaxed) {
+                            n += 1;
+                            let name = format!("w{w}-{n}");
+                            let r = sqlx::query("INSERT INTO packs (project_id, name, state, size, objects, created_at) VALUES ($1, $2, 1, 1, 1, $3)")
+                                .bind(project)
+                                .bind(&name)
+                                .bind(rows + n as i64)
+                                .execute(&db)
+                                .await;
+                            match r {
+                                Ok(_) => {
+                                    if migrating.load(Ordering::Relaxed) {
+                                        during.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    written.push(name);
+                                }
+                                Err(e) => assert!(retryable(&e), "a write beside the migration failed: {e}"),
+                            }
+                        }
+                        db.close().await;
+                        written
+                    })
+                })
+            })
+            .collect();
+        // Two servers' starts at once, each with a 250 ms statement and
+        // lock timeout, as `veil-server` runs `migrate` (one connection).
+        std::thread::sleep(Duration::from_millis(300));
+        let starts: Vec<_> = (0..2)
+            .map(|_| {
+                let (url, rt) = (&url, &rt);
+                s.spawn(move || {
+                    rt.block_on(async {
+                        let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+                        let opts = opts.options([("statement_timeout", "250"), ("lock_timeout", "250")]);
+                        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+                        let r = tokio::time::timeout(Duration::from_secs(180), veil_server::db::migrate(&pool)).await;
+                        // The connection `migrate` used keeps its own timeouts.
+                        let after: Option<String> = match r {
+                            Ok(Ok(())) => Some(sqlx::query_scalar("SHOW statement_timeout").fetch_one(&pool).await.unwrap()),
+                            _ => None,
+                        };
+                        pool.close().await;
+                        (r.map(|r| r.map_err(|e| format!("{e:#}"))), after)
+                    })
+                })
+            })
+            .collect();
+        let results: Vec<_> = starts.into_iter().map(|h| h.join().unwrap()).collect();
+        migrating.store(false, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::Relaxed);
+        let written: Vec<String> = writers.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        (results, written)
+    });
+    for (r, after) in &results {
+        assert!(matches!(r, Ok(Ok(()))), "a start migrating beside writes under a 250 ms statement timeout: {r:?}");
+        assert_eq!(after.as_deref(), Some("250ms"), "the migrating connection's statement timeout is its own again");
+    }
+    let during = during.load(Ordering::Relaxed);
+    assert!(during > 0, "rows were written while the index was built");
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 1).await.unwrap();
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
+        assert_eq!(applied, 1, "migration 41 is recorded once");
+        assert!(veil_server::db::schema_current(&db).await.unwrap());
+        db.close().await;
+    });
+    let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
+    let missing: Vec<&String> = written.iter().filter(|n| with.binary_search(n).is_err()).collect();
+    assert!(missing.is_empty(), "{} of {} rows written beside the build are missing from packs_listed: {:?}", missing.len(), written.len(), &missing[..missing.len().min(10)]);
+    assert_eq!(with.len(), without.len(), "packs_listed holds every listed row");
+    assert!(with == without, "packs_listed holds exactly the listed rows");
+    eprintln!("{rows} packs; {} written beside the migration, {during} while it ran", written.len());
+    drop_database(&rt, &name);
+}
+
+/// BUG-2482: a concurrent build that did not finish (cancelled here by its
+/// statement timeout, as a stopped server's would be) leaves its index
+/// INVALID: never used, but written, and `IF NOT EXISTS` would keep it.
+/// The next start drops it and builds it again: valid, holding every listed
+/// row.
+#[test]
+fn bug_2482_an_interrupted_index_build_is_built_again_on_the_next_start() {
+    let rt = runtime();
+    let (url, name, project, yb) = before_migration_41(&rt, 300_000);
+    let build = veil_server::db::migration_parts(veil_server::db::MIGRATIONS.iter().find(|m| m.0 == 41).unwrap().2).unwrap().online;
+    let veil_server::db::IndexStep::Create { sql, .. } = &build[0] else { panic!("migration 41 builds packs_listed: {build:?}") };
+    let left_invalid = rt.block_on(async {
+        let db = veil_server::db::connect(&url, 1).await.unwrap();
+        let mut c = db.acquire().await.unwrap();
+        let mut left = None;
+        for ms in [5, 10, 20, 50, 100, 200, 500, 1000, 2000] {
+            sqlx::raw_sql(&format!("SET statement_timeout = {ms}")).execute(&mut *c).await.unwrap();
+            let r = sqlx::raw_sql(sql).execute(&mut *c).await;
+            sqlx::raw_sql("RESET statement_timeout").execute(&mut *c).await.unwrap();
+            match index_valid(&mut c, "packs_listed").await {
+                Some(false) => {
+                    assert!(r.is_err(), "a build that left its index invalid failed");
+                    left = Some(ms);
+                    break;
+                }
+                Some(true) => panic!("the build finished within {ms} ms: no build to interrupt (more rows)"),
+                None => {}
+            }
+        }
+        drop(c);
+        db.close().await;
+        left
+    });
+    assert!(left_invalid.is_some(), "a cancelled build left packs_listed invalid (yugabyte: {yb})");
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate(&db).await.expect("the next start migrates");
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
+        assert_eq!(applied, 1);
+        db.close().await;
+    });
+    let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
+    assert_eq!(with.len(), 200_000, "two thirds of the 300,000 packs are listed");
+    assert!(with == without, "the index built again holds exactly the listed rows");
+    drop_database(&rt, &name);
+}
+
+/// BUG-2482, the class: every index a migration builds on a table that
+/// existed before it is built online (in its `db::ONLINE_INDEXES`
+/// section); an index in a migration's transaction is on a table the same
+/// migration creates, which no running server writes. Every online section
+/// holds only index steps, and the section's own checks refuse what is not
+/// one.
+#[test]
+fn bug_2482_every_index_on_an_existing_table_is_built_online() {
+    use veil_server::db::{migration_parts, IndexStep, ONLINE_INDEXES, MIGRATIONS};
+    let words = |sql: &str| -> Vec<String> {
+        sql.lines().map(|l| l.split("--").next().unwrap()).collect::<Vec<_>>().join(" ").split_whitespace().map(str::to_string).collect()
+    };
+    let mut online = Vec::new();
+    for (version, name, sql) in MIGRATIONS {
+        let parts = migration_parts(sql).unwrap_or_else(|e| panic!("migration {version} ({name}): {e}"));
+        let w = words(parts.transactional);
+        let created: Vec<&str> = w
+            .windows(6)
+            .filter(|x| x[..5] == ["CREATE", "TABLE", "IF", "NOT", "EXISTS"])
+            .map(|x| x[5].trim_end_matches('('))
+            .collect();
+        for (i, word) in w.iter().enumerate() {
+            if word == "INDEX" && i > 0 && (w[i - 1] == "CREATE" || (w[i - 1] == "UNIQUE" && i > 1 && w[i - 2] == "CREATE")) {
+                let on = w[i..].iter().position(|x| x == "ON").map(|p| w[i + p + 1].as_str()).unwrap_or_else(|| panic!("migration {version}: an index on nothing"));
+                assert!(created.contains(&on), "migration {version} ({name}) builds an index on {on}, a table it did not create, in its transaction");
+            }
+            if word == "ALTER" {
+                let stmt: Vec<&String> = w[i..].iter().take_while(|x| !x.ends_with(';')).collect();
+                assert!(
+                    !stmt.iter().any(|x| ["UNIQUE", "PRIMARY", "EXCLUDE"].contains(&x.trim_matches(|c: char| !c.is_ascii_alphabetic()))),
+                    "migration {version} ({name}) adds an index-backed constraint in its transaction: {stmt:?}"
+                );
+            }
+        }
+        online.extend(parts.online.into_iter().map(|s| (*version, s)));
+    }
+    let created: Vec<(i64, &str)> = online
+        .iter()
+        .filter_map(|(v, s)| match s {
+            IndexStep::Create { name, .. } => Some((*v, name.as_str())),
+            IndexStep::Drop { .. } => None,
+        })
+        .collect();
+    for want in [(3, "devices_by_fingerprint"), (11, "projections_own"), (36, "landing_queue_person_slot"), (40, "packs_unlisted"), (41, "packs_listed")] {
+        assert!(created.contains(&want), "{want:?} is built online: {created:?}");
+    }
+    // What an online section may hold, and what it may not.
+    let section = |body: &str| format!("ALTER TABLE t ADD COLUMN IF NOT EXISTS a INT;\n{ONLINE_INDEXES}\n{body}");
+    let ok = section("-- a comment\nCREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS t_a\n    ON t (a) WHERE a > 0;\nDROP INDEX CONCURRENTLY IF EXISTS t_old;\n");
+    let parts = migration_parts(&ok).expect("a well-formed section");
+    assert_eq!(parts.transactional, "ALTER TABLE t ADD COLUMN IF NOT EXISTS a INT;\n");
+    assert_eq!(
+        parts.online,
+        vec![
+            IndexStep::Create { name: "t_a".into(), sql: "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS t_a\n    ON t (a) WHERE a > 0".into() },
+            IndexStep::Drop { name: "t_old".into() },
+        ]
+    );
+    for bad in [
+        "CREATE INDEX IF NOT EXISTS t_a ON t (a);",
+        "CREATE INDEX CONCURRENTLY t_a ON t (a);",
+        "ALTER TABLE t ADD COLUMN b INT;",
+        "DROP INDEX IF EXISTS t_a;",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS T_A ON t (a);",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS t_a ON t (a) -- why\n;",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS t_a ON t (a)",
+        "-- nothing\n",
+        &format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS t_a ON t (a);\n{ONLINE_INDEXES}\n"),
+    ] {
+        assert!(migration_parts(&section(bad)).is_err(), "refused: {bad}");
+    }
 }

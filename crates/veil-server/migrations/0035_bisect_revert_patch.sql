@@ -4,6 +4,8 @@
 -- Idempotent (IF NOT EXISTS). Rows from before have '' and count by change
 -- id only.
 ALTER TABLE bisect_reverts ADD COLUMN IF NOT EXISTS culprit_patch TEXT NOT NULL DEFAULT '';
-CREATE INDEX IF NOT EXISTS bisect_reverts_patch
+
+-- veil: online indexes (outside the transaction, `db::ONLINE_INDEXES`: on a table servers already write)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS bisect_reverts_patch
     ON bisect_reverts (project_id, culprit_patch)
     WHERE state = 'reverted';
