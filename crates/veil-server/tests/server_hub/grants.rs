@@ -662,17 +662,11 @@ fn bug_1081_the_epoch_feed_shows_anyone_a_project_with_nothing_public() {
     assert_eq!((g2.epoch, g2.person_epoch), (g.epoch, g.person_epoch));
 }
 
-/// A new, empty database on the test server, as a URL; dropped with the
-/// run's (`VEIL_TEST_DB_PREFIX`).
-pub(crate) fn fresh_database(rt: &tokio::runtime::Runtime) -> String {
-    let admin = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
-    let name = format!("{}{}", crate::support::test_db_prefix(), unique("veil_epochs_"));
-    rt.block_on(async {
-        let db = veil_server::db::connect(&admin, 1).await.unwrap();
-        sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
-        db.close().await;
-    });
-    format!("{}/{name}", admin.rsplit_once('/').unwrap().0)
+/// A new database on the test server, migrated, as a URL; dropped with the
+/// run's (`VEIL_TEST_DB_PREFIX`): [`crate::support::own_database`], one at
+/// a time (BUG-2582).
+pub(crate) fn fresh_database(_rt: &tokio::runtime::Runtime) -> String {
+    crate::support::own_database("veil_epochs_")
 }
 
 /// BUG-1082. The feed paged over a log keeping one row per key, and passed

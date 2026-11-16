@@ -1015,13 +1015,9 @@ fn bug_1066_a_pass_in_flight_never_brings_back_an_unshare() {
     // in a database of this test's own, so no other test sees them.
     let admin_url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let name = format!("{}{}", crate::support::test_db_prefix(), unique("veil_fresh_"));
     let yugabyte = rt.block_on(async {
         let db = veil_server::db::connect(&admin_url, 1).await.unwrap();
         let v: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
-        if !v.contains("-YB-") {
-            sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
-        }
         db.close().await;
         v.contains("-YB-")
     });
@@ -1029,8 +1025,7 @@ fn bug_1066_a_pass_in_flight_never_brings_back_an_unshare() {
         eprintln!("bug_1066: the gate uses PostgreSQL's advisory locks; it runs on PostgreSQL only");
         return;
     }
-    let (base, _) = admin_url.rsplit_once('/').unwrap();
-    let hub = TestHub::start_on(&format!("{base}/{name}"), std::time::Duration::from_secs(3600));
+    let hub = TestHub::start_on(&crate::support::own_database("veil_fresh_"), std::time::Duration::from_secs(3600));
     let p = setup_project(&hub);
     let (f, _d) = shared(&hub, &p);
     let env = env_path();

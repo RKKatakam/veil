@@ -25,6 +25,34 @@ pub fn test_db_prefix() -> String {
     std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_else(|_| format!("r{}x", std::process::id()))
 }
 
+/// A new database of the test's own on the run's database server, made and
+/// migrated before any server starts on it (which then runs no DDL); its
+/// name starts with the run's prefix, so it is dropped with the run's.
+///
+/// **One at a time in a test process** (BUG-2582): migrations of several
+/// new databases at once on the shared YugabyteDB (about 80 online index
+/// builds each) stalled it for ten minutes, every test's statements with it.
+/// The lock is held while the database is made and migrated, never while a
+/// test runs. (`startup.rs`'s and `blame.rs`'s tests of migrating itself
+/// make theirs as they need.)
+pub fn own_database(tag: &str) -> String {
+    static MIGRATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let admin = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
+    let name = format!("{}{}", test_db_prefix(), unique(tag));
+    let url = format!("{}/{name}", admin.rsplit_once('/').unwrap().0);
+    let _one = MIGRATING.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let db = veil_server::db::connect(&admin, 1).await.unwrap();
+        sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
+        db.close().await;
+        let db = veil_server::db::connect(&url, 1).await.unwrap();
+        veil_server::db::migrate(&db).await.unwrap();
+        db.close().await;
+    });
+    url
+}
+
 /// `prefix` and a suffix no other call of this process returns (BUG-2211:
 /// every test of a run shares one database, and 4 random bytes alone gave
 /// two of a run's people one name). The count comes first; the random
@@ -96,17 +124,11 @@ impl TestHub {
         // objects missing from its empty store, and recorded them `failed`
         // (`embargo_prs::guarantee_3`, 4 in 459 runs beside the `prs::`
         // module, whose `merge_check_past_underived_bound_answers_busy` starts
-        // such a server). It gets a database of its own, as BUG-2457's did.
+        // such a server). It gets a database of its own, as BUG-2457's did
+        // ([`own_database`]: made and migrated one at a time).
         let shared = std::env::var("VEIL_TEST_DATABASE_URL").ok();
         let database_url = if matches!(storage, Storage::Dir(_)) && std::env::var("VEIL_TEST_S3_ENDPOINT").is_ok() && shared.as_deref() == Some(database_url) {
-            let name = format!("{}{}", test_db_prefix(), unique("veil_own_store_"));
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            rt.block_on(async {
-                let db = veil_server::db::connect(database_url, 1).await.unwrap();
-                sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
-                db.close().await;
-            });
-            format!("{}/{name}", database_url.rsplit_once('/').unwrap().0)
+            own_database("veil_own_store_")
         } else {
             database_url.to_string()
         };

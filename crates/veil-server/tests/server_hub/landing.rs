@@ -3125,9 +3125,8 @@ fn hidden_run(extra: i64) -> HiddenRun {
     // other tests' statements (whose plans change on a table this size)
     // are none of this one's.
     let admin_url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
-    let db_name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_run_"));
-    sql_at(&admin_url, format!("CREATE DATABASE {db_name}"));
-    let url = format!("{}/{db_name}", admin_url.rsplit_once('/').unwrap().0);
+    let url = crate::support::own_database("veil_run_");
+    let db_name = url.rsplit_once('/').unwrap().1.to_string();
     let hub = TestHub::start_on(&url, Duration::from_secs(3600));
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
