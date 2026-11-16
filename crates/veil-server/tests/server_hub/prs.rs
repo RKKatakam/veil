@@ -970,7 +970,7 @@ fn pr_rules_from_veilrules() {
     // A broken file keeps the last valid rules (normal needs 2, never 1);
     // only admins read why.
     let mut broken = base.clone();
-    broken.insert(".veilrules".into(), b"[review]\nlow = { approvals = 0 }\nsecret-key-name-77c1 = 3\nnormal = \"oops 5d2e\n".to_vec());
+    broken.insert(".veilrules".into(), b"[review]\nlow = { approvals = 0 }\nsecret-key-name-77c1 = 3\nnormal = \"oops 5kqw\n".to_vec());
     let b2 = h.commit(&th, &[b], broken.clone(), [3; 16], 5_000, None);
     // Two later changes that keep it broken (the walk passes over them).
     let mut b3 = b2;
@@ -988,8 +988,10 @@ fn pr_rules_from_veilrules() {
     let n = th.rt.block_on(prs::show(&hub, &dev, &normal_id)).unwrap();
     assert_eq!(n["review"]["needs"], json!({"approvals": 2, "people_only": true}), "never lowered to one: {n}");
     assert!(a["review"]["reasons"].to_string().contains(".veilrules"), "{a}");
+    // Markers that are not hex: a random id (the PR's, `pr-bfbf5d2e`)
+    // may hold any hex run (BUG-2471: `5d2e`).
     let shown = d.to_string();
-    assert!(!shown.contains("oops") && !shown.contains("5d2e") && !shown.contains("secret-key-name"), "{shown}");
+    assert!(!shown.contains("oops") && !shown.contains("5kqw") && !shown.contains("secret-key-name"), "{shown}");
     assert!(shown.contains("need an admin's attention"), "{shown}");
     // A project whose only .veilrules is broken: the strictest rules.
     let mut h2 = Hist::new(&th, &policy_text, &bindings);

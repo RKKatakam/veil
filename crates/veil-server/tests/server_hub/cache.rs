@@ -115,6 +115,7 @@ impl<'a> Reader<'a> {
         self.id.as_ref().map(|i| sign_request(i, &g, ts, ids))
     }
 
+    #[track_caller]
     fn batch_as(&self, grant: &str, wants: &[(Vec<ObjectId>, ObjectId)], skip: Vec<ObjectId>) -> Reply {
         let ids: Vec<ObjectId> = wants.iter().map(|w| w.1).collect();
         let ts = veil_core::now_millis();
@@ -128,10 +129,12 @@ impl<'a> Reader<'a> {
         self.via.post(None, &format!("/v1/objects/{}:batch", self.project), &serde_json::to_vec(&req).unwrap(), true)
     }
 
+    #[track_caller]
     fn batch(&self, wants: &[(Vec<ObjectId>, ObjectId)]) -> Vec<(ObjectId, Vec<u8>)> {
         self.batch_as(&self.grant, wants, Vec::new()).frames()
     }
 
+    #[track_caller]
     fn get_as(&self, grant: &str, chain: &[ObjectId], id: &ObjectId, sig: Option<(i64, String)>, extra: &[(&str, &str)]) -> Reply {
         let sig = sig.or_else(|| {
             let ts = veil_core::now_millis();
@@ -148,6 +151,7 @@ impl<'a> Reader<'a> {
         self.via.get_with(&format!("/v1/objects/{}/{}", self.project, id.hex()), &h)
     }
 
+    #[track_caller]
     fn get(&self, chain: &[ObjectId], id: &ObjectId) -> Reply {
         self.get_as(&self.grant, chain, id, None, &[])
     }
