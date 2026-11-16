@@ -94,6 +94,18 @@ struct PackSet {
     pending: Vec<String>,
 }
 
+/// How many times one lookup lists the pack directory again while it keeps
+/// changing (each time, a concurrent gc replaced or added packs meanwhile)
+/// before it gives up with [`packs_kept_changing`], never `Missing`.
+const PACK_RESCANS: usize = 64;
+
+fn packs_kept_changing(id: &ObjectId) -> VeilError {
+    VeilError::repo(format!(
+        "object {}: the packs kept changing while it was looked up (a gc is running); run the command again",
+        id.short()
+    ))
+}
+
 /// How long a loaded copy of the gc pending list is trusted before re-reading.
 const PENDING_TTL: Duration = Duration::from_secs(30);
 
@@ -958,12 +970,20 @@ impl ObjectStore {
         opened || self.open_pending(Some(id))
     }
 
-    /// Look `id` up in the packs. A pack that vanished (a concurrent gc
-    /// replaced it) triggers one rescan.
+    /// Look `id` up in the packs. Not found in the packs as listed, the
+    /// pack directory is listed again, and searched again as long as it
+    /// changed: a concurrent gc may have replaced a pack before this
+    /// lookup opened or read it, and its replacement (written before the
+    /// old one went) is in the new listing. The answer "absent" comes only
+    /// from a listing that stayed the same while it was searched (BUG-2470:
+    /// one rescan lost to back-to-back gc runs, and an object that never
+    /// left the store read as `Missing`).
     fn read_packed(&self, id: &ObjectId) -> Result<Option<Vec<u8>>> {
         self.ensure_packs()?;
         let mut corrupt = None;
-        for attempt in 0..2 {
+        let mut settled = false;
+        for _ in 0..PACK_RESCANS {
+            corrupt = None;
             // Opened until one holds `id` (all, if none does).
             if !self.packs.read().unwrap().packs.iter().any(|p| p.contains(id)) {
                 self.open_pending(Some(id));
@@ -977,12 +997,16 @@ impl ObjectStore {
                     Err(e) => corrupt = Some(e),
                 }
             }
-            if attempt == 0 && !self.reload_packs()? {
+            if !self.reload_packs()? {
+                settled = true;
                 break;
             }
         }
         if let Some(e) = corrupt {
             return Err(e);
+        }
+        if !settled {
+            return Err(packs_kept_changing(id));
         }
         // Not found: every pack listed was opened looking for it.
         if let Some((name, why)) = self.packs.read().unwrap().broken.first() {
@@ -1020,9 +1044,19 @@ impl ObjectStore {
         if self.ensure_packs().is_err() {
             return false;
         }
-        self.in_loaded_packs(id)
-            || (self.reload_packs().unwrap_or(false) && self.in_loaded_packs(id))
-            || self.loose_exists(id)
+        if self.in_loaded_packs(id) {
+            return true;
+        }
+        // As in `read_packed`: searched again while the listing changes.
+        for _ in 0..PACK_RESCANS {
+            if !self.reload_packs().unwrap_or(false) {
+                break;
+            }
+            if self.in_loaded_packs(id) {
+                return true;
+            }
+        }
+        self.loose_exists(id)
     }
 
     /// [`ObjectStore::has`], freshening `id` for gc even if this process
