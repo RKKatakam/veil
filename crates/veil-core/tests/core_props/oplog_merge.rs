@@ -2275,11 +2275,12 @@ fn bug_1534_rewrites_follow_with_undo_restore_and_concurrent_describes_replayed(
 /// snapshots `W1` (`W2`). The final merge has two rewrites of `W1`: the
 /// merge's rebase and the snapshot. Taken for a divergent change, nothing
 /// followed either: `W1'` stayed visible beside `W2`, two versions of the
-/// working copy's change. The snapshot's rewrite stands, `W2` moves onto
-/// `X'`, and `W1'` follows it. (Today the merge before that also warns of
-/// a conflict on `w` that is not one: `W1'` counted as a change.)
+/// working copy's change, and the merge warned of a conflict on `w` that
+/// is not one (`W1'` counted as a change). A merge's rebase is no change
+/// and no version of one: the snapshot's rewrite stands and wins, `W2`
+/// moves onto `X'` (with `C`), and `W1'`, the rebase of the head `W1` the
+/// snapshot dropped, goes.
 #[test]
-#[ignore = "BUG-2464: a settler's rebase of a working copy and a concurrent snapshot of it are taken for a divergent change"]
 fn bug_2464_a_merge_rebase_gives_way_to_a_concurrent_snapshot() {
     let me = Identity::generate("alice");
     let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
@@ -2289,41 +2290,59 @@ fn bug_2464_a_merge_rebase_gives_way_to_a_concurrent_snapshot() {
         ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
         repo.snapshot_workspace("w", &ov).unwrap();
     };
-    let truth = Device::new(false);
-    let x = {
-        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
-        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
-        write(&mut repo, "x");
-        repo.commit_working_copy("w", "x").unwrap().0
+    // The describe also rebases the working copy the commit snapshots (a
+    // write of `w` by each command), so the settler warns of a conflict and
+    // keeps one side's working copy by the order of the operation ids. This
+    // reproduction is the order where it keeps the commit's (`W1'`, its
+    // rebase); in the other it keeps the describe's rebase of the old one,
+    // a write of `w` the later snapshot is concurrent with, and the final
+    // merge warns of that real conflict. Built again with fresh ids until
+    // the settler kept the commit's.
+    let mut tries = 0;
+    let (truth, x2, w1_rebased, m_dev, h2, s_dev, h1) = loop {
+        tries += 1;
+        assert!(tries <= 64, "the settler kept the describe's working copy 64 times");
+        let truth = Device::new(false);
+        let x = {
+            let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+            write(&mut repo, "x");
+            repo.commit_working_copy("w", "x").unwrap().0
+        };
+        let h0 = op_heads(&*truth.fs);
+        // The describe, concurrent with the commit.
+        let d_dev = truth.fork(&h0);
+        let x2 = open(&d_dev).describe(x, "x, described").unwrap();
+        {
+            let mut repo = open(&truth);
+            write(&mut repo, "c");
+            repo.commit_working_copy("w", "c").unwrap();
+        }
+        let w1 = open(&truth).view().workspaces["w"].wc;
+        let h1 = op_heads(&*truth.fs);
+        // The command that saw the commit, not the describe.
+        let s_dev = truth.fork(&h1);
+        {
+            let mut repo = open(&s_dev);
+            write(&mut repo, "s");
+        }
+        // A settler merges the commit and the describe, and lands first.
+        truth.land(&d_dev, &h0);
+        let h2 = op_heads(&*truth.fs);
+        assert_eq!(h2.len(), 2, "the commit and the describe");
+        let m_dev = truth.fork(&h2);
+        let (w1_rebased, kept_commit) = {
+            let repo = open(&m_dev);
+            assert_eq!(repo.heads().len(), 1, "the settler merged");
+            let wc = repo.view().workspaces["w"].wc;
+            (wc, repo.snapshot(&wc).unwrap().change_id == repo.snapshot(&w1).unwrap().change_id)
+        };
+        if !kept_commit {
+            continue;
+        }
+        assert_ne!(w1_rebased, w1, "the settler rebased the working copy");
+        break (truth, x2, w1_rebased, m_dev, h2, s_dev, h1);
     };
-    let h0 = op_heads(&*truth.fs);
-    // The describe, concurrent with the commit.
-    let d_dev = truth.fork(&h0);
-    let x2 = open(&d_dev).describe(x, "x, described").unwrap();
-    {
-        let mut repo = open(&truth);
-        write(&mut repo, "c");
-        repo.commit_working_copy("w", "c").unwrap();
-    }
-    let w1 = open(&truth).view().workspaces["w"].wc;
-    let h1 = op_heads(&*truth.fs);
-    // The command that saw the commit, not the describe.
-    let s_dev = truth.fork(&h1);
-    {
-        let mut repo = open(&s_dev);
-        write(&mut repo, "s");
-    }
-    // A settler merges the commit and the describe, and lands first.
-    truth.land(&d_dev, &h0);
-    let h2 = op_heads(&*truth.fs);
-    assert_eq!(h2.len(), 2, "the commit and the describe");
-    let m_dev = truth.fork(&h2);
-    let w1_rebased = {
-        let repo = open(&m_dev);
-        assert_eq!(repo.heads().len(), 1, "the settler merged");
-        repo.view().workspaces["w"].wc
-    };
-    assert_ne!(w1_rebased, w1, "the settler rebased the working copy");
     truth.land(&m_dev, &h2);
     truth.land(&s_dev, &h1);
     let mut repo = open(&truth);
@@ -2347,11 +2366,11 @@ fn bug_2464_a_merge_rebase_gives_way_to_a_concurrent_snapshot() {
 /// Two rebases of `C`, by merges alone: taken for a divergent change,
 /// nothing followed either, and `C1` kept `X1` visible below it. The second
 /// merge merged everything the first did, so its rebase supersedes: `C`
-/// and `C1` follow `C2`. (The describes also rebase the working copy the
-/// commit snapshots: two commands' rewrites of it, a divergent change, not
-/// decided here.)
+/// and `C1` follow `C2`. (Judged by the result: `C1`'s parent `X1` is now
+/// `X2`, `C2`'s, so the two are one rebase, and `C2`, on it, stands.) (The
+/// describes also rebase the working copy the commit snapshots: two
+/// commands' rewrites of it, a divergent change, not decided here.)
 #[test]
-#[ignore = "BUG-2466: two settlers' rebases of one commit are taken for a divergent change, though one merged everything the other did"]
 fn bug_2466_the_rebase_of_a_merge_that_merged_more_supersedes() {
     let me = Identity::generate("alice");
     let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
@@ -2416,9 +2435,9 @@ fn bug_2466_the_rebase_of_a_merge_that_merged_more_supersedes() {
 /// copy), and that rebase and the commit's rewrite of the same working copy
 /// made a divergent change nothing followed, so the old working copy stayed
 /// visible on the version the describe replaced. Replayed 100 times (it
-/// fails at least once in nearly every run), it must pass every time.
+/// failed at least once in nearly every run of the unfixed engine), it
+/// must pass every time.
 #[test]
-#[ignore = "BUG-2464: a settler's rebase taken for a change: a describe's old version still visible after the merges"]
 fn bug_2464_rewrites_follow_in_long_runs_replayed() {
     let steps: Vec<u16> = vec![
         43865, 25173, 53776, 43947, 28641, 31713, 13004, 61295, 31429, 13303, 36445, 26051, 53352, 39121, 50952, 14650, 27771, 35681, 47413, 14012, 4098, 17930,

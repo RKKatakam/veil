@@ -2513,7 +2513,28 @@ take no lock:
   a side still holding the shared history's older value never wins
   against a newer commit (BUG-1294); a key both sides introduced a value
   for has no base value, so the two are merged as two changes, even when
-  one is a write back to the common operation's value (BUG-1296). The
+  one is a write back to the common operation's value (BUG-1296).
+  **A merge's rebase is no change** (BUG-2464, BUG-2466): what a merge
+  made of a snapshot by rebasing it onto the rewrites of the commands it
+  merged is an effect derived from those commands, never a change or a
+  version of its own. As a value: a working copy, tag or head that a
+  merge's rebase made of a value its side's own operations did not
+  introduce is the shared history's value, moved, so where both sides
+  introduced a value the other side's change wins (two settlers that
+  made the same rebase, one side then committed: the commit's working
+  copy wins); a head so moved, whose original the other side dropped, is
+  dropped. As a rewrite: one that only merges recorded and that the fold
+  step's shared history does not show (made after the sides split; a
+  command's rewrite from the shared history, recorded again by merges, is
+  shown there). Of the rewrites of one snapshot, one version (a command's,
+  or one from the shared history) stands and the rebases stay where they
+  are (a ref left on the old version deliberately may be on one); of
+  rebases alone, decided parents first, they are one rebase when each
+  one's parents are now (through the merge's rewrites) where one of them
+  is: equal inputs make equal rebases, and one made from older parents is
+  superseded by one made from what they became, which stands, the other
+  copies following it; anything else is a divergent change. All of it is
+  read from what the op log records. The
   walk that finds the operations only one side reaches ends only below
   every operation it walked as one side's: a merge has its newest parent's
   timestamp, and a common descendant of the same timestamp must still mark

@@ -399,6 +399,30 @@ pub(crate) fn retracted_commands(retractors: &BTreeMap<ObjectId, Retractor>) -> 
     out
 }
 
+/// For each rewrite of `keys`, what it made and what the rewrites of
+/// `seen` made of that in turn (at most 64 snapshots).
+fn made_of(seen: &BTreeMap<Rewritten, Recorded>, keys: &[Rewritten]) -> Vec<Vec<ObjectId>> {
+    let mut next: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    for (o, ns) in seen.keys() {
+        next.entry(*o).or_default().extend(ns.iter().copied());
+    }
+    keys.iter()
+        .map(|k| {
+            let mut chain = k.1.clone();
+            let mut i = 0;
+            while i < chain.len() && chain.len() < 64 {
+                for n in next.get(&chain[i]).into_iter().flatten() {
+                    if !chain.contains(n) {
+                        chain.push(*n);
+                    }
+                }
+                i += 1;
+            }
+            chain
+        })
+        .collect()
+}
+
 /// See `Repo::merge_plan`.
 pub(crate) struct MergePlan {
     pub(crate) view: View,
@@ -1008,6 +1032,9 @@ impl Repo {
         // (a side that dropped it, unaware of the losing write) never hides
         // one (BUG-1298).
         let mut losers: Vec<ObjectId> = Vec::new();
+        // The rewrites that are merges' rebases (BUG-2464, BUG-2466): see
+        // below, where a step collects them.
+        let mut rebases: std::collections::HashSet<Rewritten> = Default::default();
         for h in &heads[1..] {
             let op = self.ops.get(h)?;
             timestamp = timestamp.max(op.timestamp);
@@ -1018,8 +1045,10 @@ impl Repo {
             };
             // What the two sides' shared history holds beyond `base`
             // (BUG-1294).
-            let shared = crate::oplog::shared_base(&base, &acc, &split.introduced(&split.only_a), &op.view, &split.introduced(&split.only_b));
+            let (ia, ib) = (split.introduced(&split.only_a), split.introduced(&split.only_b));
+            let shared = crate::oplog::shared_base_with(&base, &acc, &ia, &op.view, &ib, false);
             if rewrites {
+                let known: std::collections::HashSet<Rewritten> = seen.keys().cloned().collect();
                 for (ids, sides) in [(&split.only_a, &head_views[..]), (&split.only_b, std::slice::from_ref(&op.view))] {
                     // Each rewrite with the operations that recorded it (and
                     // those that are commands, not merges recording what
@@ -1100,6 +1129,25 @@ impl Repo {
                         }
                     }
                 }
+                // A merge's rebase: a rewrite this step collected that only
+                // merges recorded and that the shared history does not show
+                // (what it made, or what the rewrites seen made of that):
+                // made since the sides split, by a merge's rebase of a
+                // descendant of what the commands it merged rewrote. Not a
+                // version of a change, but derived from those commands. A
+                // command's rewrite from the shared history, recorded again
+                // by merges, is shown by the shared history.
+                let fresh: Vec<Rewritten> = seen.iter().filter(|(k, r)| !known.contains(*k) && r.commands.is_empty() && !k.1.is_empty()).map(|(k, _)| k.clone()).collect();
+                if !fresh.is_empty() {
+                    let made = made_of(&seen, &fresh);
+                    let all: Vec<ObjectId> = made.iter().flatten().copied().collect();
+                    let in_shared = self.shown(&shared, &all)?;
+                    for (k, chain) in fresh.into_iter().zip(&made) {
+                        if !chain.iter().any(|n| in_shared.contains(n)) {
+                            rebases.insert(k);
+                        }
+                    }
+                }
                 // A rewrite only merges recorded (the op log does not say
                 // which command it is, so not what took it back), undone by
                 // a head merged after the step that collected it (BUG-1295):
@@ -1124,26 +1172,7 @@ impl Repo {
                     // history shows what it made (or what the rewrites seen
                     // made of that in turn), or when it made nothing (an
                     // abandon).
-                    let mut next: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-                    for (o, ns) in seen.keys() {
-                        next.entry(*o).or_default().extend(ns.iter().copied());
-                    }
-                    let made: Vec<Vec<ObjectId>> = live
-                        .iter()
-                        .map(|k| {
-                            let mut chain = k.1.clone();
-                            let mut i = 0;
-                            while i < chain.len() && chain.len() < 64 {
-                                for n in next.get(&chain[i]).into_iter().flatten() {
-                                    if !chain.contains(n) {
-                                        chain.push(*n);
-                                    }
-                                }
-                                i += 1;
-                            }
-                            chain
-                        })
-                        .collect();
+                    let made = made_of(&seen, &live);
                     let all: Vec<ObjectId> = made.iter().flatten().copied().collect();
                     let made_in_shared = self.shown(&shared, &all)?;
                     let from_shared: std::collections::HashSet<&Rewritten> =
@@ -1164,7 +1193,10 @@ impl Repo {
                 before.push(op.view.clone());
             }
             let mut descends = |a: &ObjectId, b: &ObjectId| self.is_ancestor(b, a).unwrap_or(false);
-            let merged = crate::oplog::merge_views(&shared, &[&acc, &op.view], &mut descends);
+            // The base of the merge of the values: a merge's rebase is no
+            // change of its side's (BUG-2464).
+            let merge_base = crate::oplog::shared_base(&base, &acc, &ia, &op.view, &ib);
+            let merged = crate::oplog::merge_views(&merge_base, &[&acc, &op.view], &mut descends);
             warnings.extend(merged.warnings);
             losers.extend(merged.losers);
             acc = merged.view;
@@ -1192,19 +1224,68 @@ impl Repo {
         let mut divergent: std::collections::BTreeSet<ObjectId> = Default::default();
         let mut commands_of: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
         let applied: Vec<(Rewritten, Recorded)> = seen.into_iter().filter(|(k, r)| stands(k, r)).collect();
-        for ((old, new), r) in applied {
-            commands_of.entry(old).or_default().extend(r.commands.iter().filter(|o| !retracted.contains(o)).copied());
-            match rewritten.get(&old) {
-                Some(prev) if *prev != new => {
-                    divergent.insert(old);
+        for ((old, new), r) in &applied {
+            commands_of.entry(*old).or_default().extend(r.commands.iter().filter(|o| !retracted.contains(o)).copied());
+            match rewritten.get(old) {
+                Some(prev) if prev != new => {
+                    divergent.insert(*old);
                 }
                 _ => {
-                    rewritten.insert(old, new);
+                    rewritten.insert(*old, new.clone());
                 }
             }
         }
         for d in &divergent {
             rewritten.remove(d);
+        }
+        // A merge's rebase is no version of a change (BUG-2464, BUG-2466).
+        // Of the rewrites of one snapshot, the versions (a command's, or one
+        // from the shared history) and the merges' rebases:
+        // * one version stands. A rebase is what a merge made of the old
+        //   snapshot from the commands it merged, and stays where it is (a
+        //   settler rebased a working copy onto a describe while a command
+        //   that had not seen the describe snapshotted it; a ref a command
+        //   left on the old version deliberately may be on the rebase);
+        // * rebases alone are one rebase when each one's parents are now
+        //   (through these rewrites) where one of them is: equal inputs make
+        //   equal rebases, and one made from older parents gives way to one
+        //   made from what they became. That one stands, and the other
+        //   rebased copies follow it (two settlers merged a commit with one
+        //   describe and with two). Judged by the result, not by which
+        //   merge merged more: a settler's rebase recorded again from an
+        //   older settler can sit on a parent rebased since;
+        // * anything else is a divergent change, as above.
+        // Parents first, so that where they are now is decided.
+        let mut order: Vec<(crate::graph_index::Gen, ObjectId)> = Vec::new();
+        for d in &divergent {
+            order.push((self.graph.generation(self, d)?.unwrap_or(crate::graph_index::Gen::MAX), *d));
+        }
+        order.sort();
+        for (_, d) in order {
+            let (rebased, versions): (Vec<_>, Vec<_>) =
+                applied.iter().filter(|(k, _)| k.0 == d).partition(|(k, r)| r.commands.is_empty() && rebases.contains(k));
+            let mut versions: Vec<&Vec<ObjectId>> = versions.iter().map(|(k, _)| &k.1).collect();
+            versions.sort();
+            versions.dedup();
+            let new = match versions[..] {
+                [one] => one.clone(),
+                [] => match self.one_rebase(&rebased, &rewritten)? {
+                    Some(new) => {
+                        for ((_, n), _) in &rebased {
+                            if let [copy] = n[..] {
+                                if copy != new && !divergent.contains(&copy) {
+                                    rewritten.entry(copy).or_insert(vec![new]);
+                                }
+                            }
+                        }
+                        vec![new]
+                    }
+                    None => continue,
+                },
+                _ => continue,
+            };
+            divergent.remove(&d);
+            rewritten.insert(d, new);
         }
         // Refs on an old snapshot that a command which saw each rewrite of
         // what they show set stay where they are (BUG-1434: a tag on the old
@@ -1239,6 +1320,39 @@ impl Repo {
             timestamp,
             warnings,
         })
+    }
+
+    /// Of merges' rebases of one snapshot, the one rebase they all are:
+    /// each one's parents are, through `rewritten`, where one of them is
+    /// (equal inputs make equal rebases; one made from older parents is
+    /// superseded by one made from what they became). That one, already on
+    /// those parents; `None` when they differ (merges of concurrent
+    /// rewrites of the parents), or none is there yet.
+    fn one_rebase(&self, rebases: &[&(Rewritten, Recorded)], rewritten: &BTreeMap<ObjectId, Vec<ObjectId>>) -> Result<Option<ObjectId>> {
+        let resolve = |mut x: ObjectId| {
+            for _ in 0..64 {
+                match rewritten.get(&x).map(Vec::as_slice) {
+                    Some([n]) if *n != x => x = *n,
+                    _ => break,
+                }
+            }
+            x
+        };
+        let mut now: Option<Vec<ObjectId>> = None;
+        let mut there = None;
+        for ((_, n), _) in rebases {
+            let [copy] = n[..] else { return Ok(None) };
+            let Some(snap) = self.exact().snapshot(&copy)? else { return Ok(None) };
+            let at: Vec<ObjectId> = snap.parents.iter().map(|p| resolve(*p)).collect();
+            match &now {
+                Some(a) if *a != at => return Ok(None),
+                _ => now = Some(at.clone()),
+            }
+            if there.is_none() && at == snap.parents {
+                there = Some(copy);
+            }
+        }
+        Ok(there)
     }
 
     /// Did one of `introducers` (the operations that set a ref value)
