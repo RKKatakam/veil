@@ -62,6 +62,7 @@ pub struct State {
     fail_next: AtomicU64,
     retried_failures: AtomicU64,
     wake: tokio::sync::Notify,
+    before_review: std::sync::Mutex<Option<crate::pack_gc::SwitchHook>>,
 }
 
 impl State {
@@ -75,6 +76,12 @@ impl State {
 
     pub fn fail_next_releases(&self, count: u64) {
         self.fail_next.store(count, Ordering::SeqCst);
+    }
+
+    /// A hook a release awaits once it has judged its line's stack, before
+    /// it checks the review rules (for deterministic race tests).
+    pub fn set_before_review(&self, hook: Option<crate::pack_gc::SwitchHook>) {
+        *self.before_review.lock().unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
     pub fn retried_failures(&self) -> u64 {
@@ -1281,6 +1288,18 @@ pub async fn release_one(
             Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // Another server released it while this one judged the line
+            // (BUG-2560): its review check then found the approved PR landed,
+            // no longer open, and counted no approval. Released is released.
+            Err(e @ Error::Api { code: "not_ready" | "conflict", .. }) => {
+                let released: Option<bool> =
+                    sqlx::query_scalar("SELECT released_at IS NOT NULL FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2")
+                        .bind(project_id)
+                        .bind(embargo_id)
+                        .fetch_optional(&hub.db)
+                        .await?;
+                return if released == Some(true) { Ok(false) } else { Err(e) };
+            }
             other => return other,
         }
     }
@@ -1401,6 +1420,10 @@ async fn release_one_once(
             // The review rules of a protected branch (BUG-1861); on any branch,
             // a change the server reverted twice needs a person (BUG-1884).
             let protected = is_protected_branch(hub, project_id, &project.default_branch, &target_branch).await?;
+            let hook = hub.embargo.before_review.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(hook) = hook {
+                (hook.0)().await;
+            }
             let waits = |message: &str| {
                 Error::new(
                     axum::http::StatusCode::CONFLICT,

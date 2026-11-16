@@ -1203,6 +1203,100 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     assert!(rec_after.is_none_or(|r| r.released_at.is_some() && r.state.is_none()), "{rec_after:?}");
 }
 
+/// BUG-2560: of two servers releasing one embargo, the one that judged the
+/// line's stack before the other landed it, and checked the review rules
+/// after the other had finished (the approved PR landed, so no longer open),
+/// answered `409 not_ready` ("it has 0" approvals) for an embargo released
+/// already. It answers "released by another" (`false`), as a release that
+/// starts after the other finished does.
+#[test]
+fn bug_2560_a_release_another_server_finished_meanwhile_is_not_refused() {
+    let hub1 = TestHub::start();
+    let hub2 = TestHub::beside(&hub1);
+    let p = setup_project(&hub1);
+    let api1 = hub1.api();
+
+    let rev1 = hub1.person("rev1");
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    p.admin.ok(&p.dir, &["group", "add", "security", &rev1.name]);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &rev1.name]);
+    set_main_file(
+        &hub1,
+        &p,
+        ".veilrules",
+        "[branches.main]\nprotected = true\n\n[review]\nlow = { approvals = 1, people_only = true }\nnormal = { approvals = 1, people_only = true }\nhigh = { approvals = 1, people_only = true }\n",
+        "protect main for BUG-2560",
+    );
+    let sec_tok = p.sec.token();
+    let rev1_tok = rev1.token();
+    let dev_tok = p.dev.token();
+
+    let main_before = api1.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let pid: i64 = hub1.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub1.hub().db)).unwrap();
+    let (eid, _, _, _) = push_embargo(
+        &hub1,
+        &p.name,
+        &p.sec,
+        "b2560",
+        "security",
+        Some(veil_core::now_millis() + 60_000),
+        &[("src/b2560.rs", "pub const B2560: &str = \"B2560-RELEASED\";\n")],
+        "BUG-2560 embargo",
+    );
+    let pr = api1.post_json(
+        Some(&sec_tok),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"head": format!("embargo/{eid}"), "title": "BUG-2560 embargo PR"}),
+    );
+    assert_eq!(pr.status, 200, "{}", body_str(&pr));
+    let pr_id = pr.json()["id"].as_str().unwrap().to_string();
+    let patch = pr.json()["patch"].as_str().unwrap().to_string();
+    let sig = sign_review(&rev1, &p.name, &pr_id, &patch, "approve");
+    let app = api1.post_json(
+        Some(&rev1_tok),
+        &format!("/v1/projects/{}/prs/{pr_id}/reviews", p.name),
+        &json!({"patch": patch, "verdict": "approve", "signature": sig}),
+    );
+    assert_eq!(app.status, 200, "{}", body_str(&app));
+    assert_eq!(app.json()["review"]["ready"], true);
+
+    // The second server stops once it has judged the line (against `main`
+    // before the release), until the first has released it whole.
+    let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+    let go = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (r, g) = (reached.clone(), go.clone());
+    hub2.hub().embargo.set_before_review(Some(veil_server::pack_gc::SwitchHook(std::sync::Arc::new(move || {
+        let (r, g) = (r.clone(), g.clone());
+        Box::pin(async move {
+            r.notify_one();
+            g.notified().await;
+        })
+    }))));
+    let (first, second) = std::thread::scope(|s| {
+        let t2 = s.spawn(|| hub2.rt.block_on(veil_server::embargo::release_one(&hub2.hub(), pid, &eid, None, None)));
+        hub1.rt.block_on(reached.notified());
+        let first = hub1.rt.block_on(veil_server::embargo::release_one(&hub1.hub(), pid, &eid, None, None));
+        go.notify_one();
+        (first, t2.join().unwrap())
+    });
+    hub2.hub().embargo.set_before_review(None);
+    assert!(matches!(first, Ok(true)), "the first server releases it: {first:?}");
+    assert!(matches!(second, Ok(false)), "the second finds it released, not waiting for approval: {second:?}");
+
+    // Released once, landed on `main`, and no record of a wait for approval.
+    let (rel, record): (Option<i64>, String) = hub1
+        .rt
+        .block_on(sqlx::query_as("SELECT released_at, record_json FROM embargo_lines WHERE embargo_id = $1").bind(&eid).fetch_one(&hub1.hub().db))
+        .unwrap();
+    assert!(rel.is_some(), "{eid} must be marked released");
+    assert!(!record.contains("waiting_for_approval"), "{record}");
+    let main_after = api1.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_ne!(main_after, main_before, "the released line must land on main");
+    let file = api1.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/b2560.rs", p.name));
+    assert_eq!(file.status, 200, "{}", body_str(&file));
+    assert!(body_str(&file).contains("B2560-RELEASED"));
+}
+
 /// Guarantee 4: Nothing about it leaks into public search, blame, history or
 /// the landing queue's visible state before release.
 #[test]
