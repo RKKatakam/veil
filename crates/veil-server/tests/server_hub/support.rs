@@ -89,9 +89,30 @@ impl TestHub {
             },
             None => Storage::Dir(dir.path().join("objects")),
         };
+        // A server whose objects are in a directory of its own never shares
+        // the run's database while the run's objects are in S3 (BUG-2580):
+        // its background loops are the whole database's, and its embargo
+        // release loop tried the other tests' due embargoes, found their
+        // objects missing from its empty store, and recorded them `failed`
+        // (`embargo_prs::guarantee_3`, 4 in 459 runs beside the `prs::`
+        // module, whose `merge_check_past_underived_bound_answers_busy` starts
+        // such a server). It gets a database of its own, as BUG-2457's did.
+        let shared = std::env::var("VEIL_TEST_DATABASE_URL").ok();
+        let database_url = if matches!(storage, Storage::Dir(_)) && std::env::var("VEIL_TEST_S3_ENDPOINT").is_ok() && shared.as_deref() == Some(database_url) {
+            let name = format!("{}{}", test_db_prefix(), unique("veil_own_store_"));
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let db = veil_server::db::connect(database_url, 1).await.unwrap();
+                sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
+                db.close().await;
+            });
+            format!("{}/{name}", database_url.rsplit_once('/').unwrap().0)
+        } else {
+            database_url.to_string()
+        };
         let config = Config {
             listen,
-            database_url: database_url.to_string(),
+            database_url,
             storage,
             tls: TlsSource::SelfSigned,
             data_dir: dir.path().join("data"),

@@ -1297,6 +1297,56 @@ fn bug_2560_a_release_another_server_finished_meanwhile_is_not_refused() {
     assert!(body_str(&file).contains("B2560-RELEASED"));
 }
 
+/// BUG-2580: a server whose objects are in a directory of its own, started
+/// on the run's database (as `prs::…::merge_check_past_underived_bound_answers_busy`
+/// and two other tests start one), ran its embargo release loop over the
+/// whole database: it tried the other tests' due embargoes, found their
+/// objects missing from its empty store, and recorded them `failed`
+/// (`missing object …`), which `guarantee_3`'s case C then read where it
+/// expects `waiting_for_approval`. Such a server gets a database of its own:
+/// the run's due embargo is never recorded failed, and the run's servers
+/// release it.
+#[test]
+fn bug_2580_a_server_with_a_store_of_its_own_never_touches_the_runs_embargoes() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let pid: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.hub().db)).unwrap();
+    let (eid, _, _, _) = push_embargo(
+        &hub,
+        &p.name,
+        &p.sec,
+        "b2580",
+        "security",
+        Some(veil_core::now_millis() + 600_000),
+        &[("src/b2580.rs", "pub const B2580: &str = \"B2580-RELEASED\";\n")],
+        "BUG-2580 embargo",
+    );
+    let record = |h: &TestHub| -> (Option<i64>, String) {
+        h.rt.block_on(sqlx::query_as("SELECT released_at, record_json FROM embargo_lines WHERE embargo_id = $1").bind(&eid).fetch_one(&hub.hub().db)).unwrap()
+    };
+    // A server with a store of its own on the run's database; the embargo
+    // due; that server's release pass (its loop would, at its next tick).
+    let own = TestHub::start_with_s3(&std::env::var("VEIL_TEST_DATABASE_URL").unwrap(), Duration::from_secs(3600), None);
+    hub.rt.block_on(
+        sqlx::query("UPDATE embargo_lines SET until_ms = (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT - 10 WHERE embargo_id = $1")
+            .bind(&eid)
+            .execute(&hub.hub().db),
+    )
+    .unwrap();
+    own.rt.block_on(veil_server::embargo::release_due(&own.hub())).unwrap();
+    let (_, json) = record(&hub);
+    assert!(!json.contains("failed"), "recorded failed by a server with a store of its own: {json}");
+    // Released by the run's servers (this call, or `hub`'s own loop first).
+    let r = hub.rt.block_on(veil_server::embargo::release_one(&hub.hub(), pid, &eid, None, None));
+    assert!(r.is_ok(), "{r:?}");
+    let (released, json) = record(&hub);
+    assert!(released.is_some(), "{json}");
+    let file = hub.api().get(Some(&p.dev.token()), &format!("/v1/projects/{}/q/file?rev=main&path=src/b2580.rs", p.name));
+    assert_eq!(file.status, 200, "{}", body_str(&file));
+    assert!(body_str(&file).contains("B2580-RELEASED"));
+}
+
 /// Guarantee 4: Nothing about it leaks into public search, blame, history or
 /// the landing queue's visible state before release.
 #[test]
