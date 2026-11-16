@@ -32,6 +32,7 @@ use veil_server::{
     pack_gc::{self, Options},
 };
 
+use crate::pack_gc::gc_pass;
 use crate::support::*;
 
 // ---- shared helpers ----------------------------------------------------------------
@@ -920,22 +921,21 @@ fn g5_pack_gc_retains_thin_window_staged_uploads_prs_embargoes_landings_and_ci()
     assert_eq!(r_in.loose_objects_deleted, 0);
     assert!(hub.rt.block_on(fresh_objects().exists(pid, &dead_id)).unwrap());
 
-    // Past retention window (`now_offset_ms = 120_000`), while staged upload is still within `staged_ttl_ms` (1 h):
-    let r_out = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &hub.hub(),
-            pid,
-            &Options {
-                min_packs_to_merge: 2,
-                run_gc: true,
-                retention_window_ms: 60_000,
-                pack_grace_ms: 0,
-                now_offset_ms: 120_000,
-                ..Options::default()
-            },
-        ))
-        .unwrap();
+    // Past retention window (`now_offset_ms = 120_000`), while staged upload is still within `staged_ttl_ms` (1 h).
+    // Run again if it gave way to the server's search index, still writing
+    // what the pushes above started (BUG-2590), as the server would.
+    let r_out = gc_pass(
+        &hub,
+        pid,
+        &Options {
+            min_packs_to_merge: 2,
+            run_gc: true,
+            retention_window_ms: 60_000,
+            pack_grace_ms: 0,
+            now_offset_ms: 120_000,
+            ..Options::default()
+        },
+    );
     assert!(r_out.loose_objects_deleted >= 1, "dead loose object collected: {r_out:?}");
     let store_after = fresh_objects();
     assert!(!hub.rt.block_on(store_after.exists(pid, &dead_id)).unwrap(), "dead loose gone from persistent storage");
@@ -1008,22 +1008,21 @@ fn run_full_gc(hub: &TestHub, pid: i64) -> pack_gc::Report {
     // writing what the test's pushes started, so that is finished first.
     hub.rt.block_on(veil_server::derive::catch_up_project(&hub.hub(), pid)).unwrap();
     hub.rt.block_on(veil_server::search::index::catch_up_project(&hub.hub(), pid)).unwrap();
+    // A background index update already running can still write after the
+    // catch-up: a pass that gave way to it is run again (BUG-2590).
     for off in [0i64, 120_000, 120_001] {
-        let rep = hub
-            .rt
-            .block_on(pack_gc::run_project(
-                &hub.hub(),
-                pid,
-                &Options {
-                    min_packs_to_merge: 1,
-                    run_gc: true,
-                    retention_window_ms: 60_000,
-                    pack_grace_ms: 0,
-                    now_offset_ms: off,
-                    ..Options::default()
-                },
-            ))
-            .unwrap();
+        let rep = gc_pass(
+            hub,
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: off,
+                ..Options::default()
+            },
+        );
         if off == 120_000 {
             let _ = hub
                 .rt

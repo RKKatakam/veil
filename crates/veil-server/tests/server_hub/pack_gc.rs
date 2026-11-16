@@ -702,7 +702,7 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
         now_offset_ms: 120_000,
         ..Options::default()
     };
-    let r2 = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts_after_window)).unwrap();
+    let r2 = gc_pass(&hub, pid, &opts_after_window);
     assert!(r2.packed_objects_deleted >= 1, "expected unreferenced packed object to be deleted: {r2:?}");
     assert!(r2.loose_objects_deleted >= 2, "expected unreferenced loose object and dead search segment to be deleted: {r2:?}");
 
@@ -852,7 +852,7 @@ fn guarantee_3_embargoed_objects_never_deleted_before_release() {
         now_offset_ms: 180_000,
         ..Options::default()
     };
-    let r2 = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts2)).unwrap();
+    let r2 = gc_pass(&hub, pid, &opts2);
     assert!(r2.packed_objects_deleted >= 1, "unreferenced object deleted: {r2:?}");
 
     let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
@@ -1123,21 +1123,37 @@ fn guarantee_5_cost_of_merging_10000_small_pushes() {
     }
 }
 
-/// A GC pass by hand, run again if it lost a race with another database's
-/// schema change on a shared YugabyteDB (40001), as the server's own GC
-/// loop runs it at its next tick (BUG-2212: every pass of the test, not
-/// only some).
-fn gc_pass(hub: &TestHub, pid: i64, opts: &Options) -> pack_gc::Report {
+/// A GC pass by hand, run again as the server's own GC loop would run it at
+/// its next tick when it did not do its work: it lost a race with another
+/// database's schema change on a shared YugabyteDB (40001; BUG-2212: every
+/// pass of the test, not only some), another server's pass held the
+/// project's lock (`skipped`), or it deleted nothing because the project's
+/// references moved while it ran and it gave way (BUG-2590: the server's
+/// search index still writing what the test's pushes started, under the
+/// suite's load; `search_shards` is in the reference stamp, BUG-1923). The
+/// stamp is read before and after each pass: a pass that deleted nothing
+/// while it stood still is final, and what the test checks is unchanged.
+pub(crate) fn gc_pass(hub: &TestHub, pid: i64, opts: &Options) -> pack_gc::Report {
+    let h = hub.hub();
+    let stamp = || hub.rt.block_on(pack_gc::project_ref_stamp(&h.db, pid)).ok();
     let mut tries = 0;
     loop {
-        match hub.rt.block_on(pack_gc::run_project(&hub.hub(), pid, opts)) {
-            Ok(r) => return r,
-            Err(e) if e.is_retryable() && tries < 20 => {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(200));
+        let before = stamp();
+        match hub.rt.block_on(pack_gc::run_project(&h, pid, opts)) {
+            Ok(r) => {
+                let gave_way = r.packed_objects_deleted + r.loose_objects_deleted == 0 && {
+                    let after = stamp();
+                    before.is_none() || after != before
+                };
+                if !(r.skipped || gave_way) || tries >= 20 {
+                    return r;
+                }
             }
+            Err(e) if e.is_retryable() && tries < 20 => {}
             Err(e) => panic!("GC pass at offset {}: {e:?}", opts.now_offset_ms),
         }
+        tries += 1;
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
@@ -1471,6 +1487,76 @@ fn bug_1782_every_schema_column_is_registered_and_root_tables_are_stamped() {
             .any(|(t, c, _)| t == "bisects" && c == "unregistered_extra_snapshot"),
         "audit_schema_columns must fail when an unregistered column is added to an existing table: {unreg_after_ddl:?}"
     );
+}
+
+/// BUG-2590: a pass past the retention window that gives way to a root
+/// written during it (here, once, by the switch hook: a `change_refs` row
+/// naming `main`, which moves the reference stamp; in the suite, the
+/// server's search index finishing what a push started) deletes nothing,
+/// and the next pass collects what fell out of the window: a give-way loses
+/// one pass, never the object's expiry. `gc_pass` runs the pass again as the
+/// server would; a test that ran one pass and expected the deletion failed.
+#[test]
+fn bug_2590_a_pass_that_gave_way_to_a_root_write_is_followed_by_one_that_collects() {
+    use veil_server::pack_gc::SwitchHook;
+
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let main0 = hub.api().tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"];
+    let admin_pid: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
+        .unwrap();
+
+    let (dead_id, dead_raw) = make_blob("DEAD-LOOSE-2590\n");
+    hub.rt.block_on(h.objects.put(pid, &dead_id, dead_raw)).unwrap();
+    // Marked unreferenced now; inside the window, nothing is deleted.
+    let marked = gc_pass(
+        &hub,
+        pid,
+        &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() },
+    );
+    assert_eq!(marked.loose_objects_deleted, 0, "inside the window: {marked:?}");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (db, hook_calls) = (h.db.clone(), calls.clone());
+    let main_hex = main0.hex();
+    let rep = gc_pass(
+        &hub,
+        pid,
+        &Options {
+            min_packs_to_merge: 99,
+            run_gc: true,
+            retention_window_ms: 60_000,
+            pack_grace_ms: 0,
+            now_offset_ms: 120_000,
+            before_switch: Some(SwitchHook(Arc::new(move || {
+                let (db, hook_calls, main_hex) = (db.clone(), hook_calls.clone(), main_hex.clone());
+                Box::pin(async move {
+                    if hook_calls.fetch_add(1, Relaxed) == 0 {
+                        sqlx::query(
+                            "INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) \
+                             VALUES ($1, 'chg-2590', $2, $3, 1000)",
+                        )
+                        .bind(pid)
+                        .bind(&main_hex)
+                        .bind(admin_pid)
+                        .execute(&db)
+                        .await
+                        .unwrap();
+                    }
+                })
+            }))),
+            ..Options::default()
+        },
+    );
+    assert!(rep.loose_objects_deleted >= 1, "the pass after the give-way collects what fell out of the window: {rep:?}");
+    assert!(calls.load(Relaxed) >= 2, "the first pass reached its switch and gave way, and another ran");
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    assert!(!hub.rt.block_on(fresh.exists(pid, &dead_id)).unwrap(), "dead loose object deleted from storage");
+    assert!(hub.rt.block_on(fresh.exists(pid, &main0)).unwrap(), "main's snapshot kept");
 }
 
 /// BUG-1782: Concurrent in-place `change_refs` target updates (`COUNT(*)`
