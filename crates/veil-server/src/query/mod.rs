@@ -228,6 +228,8 @@ pub async fn resolve_real(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instan
                 // Only an id this viewer was given: a projection memoised
                 // under their view key.
                 sqlx::query_scalar("SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 LIMIT 1")
+                    // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
+                    .persistent(false)
                     .bind(project)
                     .bind(&vk)
                     .bind(id.hex())

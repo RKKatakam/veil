@@ -224,6 +224,8 @@ pub async fn is_withheld_for_query(hub: &Hub, project: i64, snapshot: &ObjectId)
            AND (s.snapshot = $2 OR s.snapshot IN (SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2)) \
            AND l.released_at IS NULL LIMIT 1",
     )
+    // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
+    .persistent(false)
     .bind(project)
     .bind(&hex)
     .fetch_optional(&hub.db)
@@ -246,6 +248,8 @@ pub async fn is_withheld_from_viewer(hub: &Hub, project: &Project, viewer: &View
            AND (s.snapshot = $2 OR s.snapshot IN (SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2)) \
            AND l.released_at IS NULL LIMIT 1",
     )
+    // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
+    .persistent(false)
     .bind(project.id)
     .bind(&hex)
     .fetch_optional(&hub.db)

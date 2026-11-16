@@ -3097,32 +3097,36 @@ fn bug_1467_a_base_shared_by_many_underived_hidden_only_changes_resolves_to_the_
     assert_eq!(got, newest, "the dev's change, made on what they see below w's tip, is on {at} of 200");
 }
 
-/// BUG-1468: the "one indexed statement" that steps over a hidden run
-/// (`Ancestry::below_hidden`: the lowest real snapshot with the run's
-/// projection by the derived graph) reads every real snapshot with that
-/// projection, and looks each up in `graph`, to find the lowest: its cost
-/// grows with the run (and `sync::resolve_newest`'s three statements read
-/// the same range, of every view). A viewer who sees only a quiet folder
-/// sees a day of other folders' landings as one snapshot: here a run of
-/// 1,500,000 (their `projections` and `graph` rows, written directly), and
-/// the dev's one change on it, which lands in milliseconds with a run of
-/// 50 (`bug_1409_…`'s shape).
-#[test]
-fn bug_1468_stepping_over_a_hidden_run_costs_the_same_however_long_the_run() {
+/// A project on a database of its own with a run of `50 + extra` billing
+/// changes hidden from the dev on top of main (the rest of the run's
+/// `projections` and `graph` rows written directly, as the services and
+/// the deriver store them), and the dev's view of its tip.
+struct HiddenRun {
+    hub: TestHub,
+    p: Project,
+    seen: ObjectId,
+    admin_url: String,
+    db_name: String,
+    url: String,
+}
+
+/// A statement on the database at `url` (a pool of its own).
+fn sql_at(url: &str, q: String) {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let db = veil_server::db::connect(url, 1).await.unwrap();
+        sqlx::raw_sql(&q).execute(&db).await.unwrap();
+        db.close().await;
+    });
+}
+
+fn hidden_run(extra: i64) -> HiddenRun {
     // A database of its own: the rows read are counted per database, and
     // other tests' statements (whose plans change on a table this size)
-    // are none of this submit's.
+    // are none of this one's.
     let admin_url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
     let db_name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_run_"));
-    let sql = |url: &str, q: String| {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(async {
-            let db = veil_server::db::connect(url, 1).await.unwrap();
-            sqlx::raw_sql(&q).execute(&db).await.unwrap();
-            db.close().await;
-        });
-    };
-    sql(&admin_url, format!("CREATE DATABASE {db_name}"));
+    sql_at(&admin_url, format!("CREATE DATABASE {db_name}"));
     let url = format!("{}/{db_name}", admin_url.rsplit_once('/').unwrap().0);
     let hub = TestHub::start_on(&url, Duration::from_secs(3600));
     let p = setup_project(&hub);
@@ -3147,20 +3151,22 @@ fn bug_1468_stepping_over_a_hidden_run_costs_the_same_however_long_the_run() {
         sqlx::query("SET LOCAL statement_timeout = 0").execute(&mut *tx).await.unwrap();
         sqlx::query(
             "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) \
-             SELECT $1, $2, md5('r' || i) || md5('s' || i), $3, 0 FROM generate_series(1, 1500000) i",
+             SELECT $1, $2, md5('r' || i) || md5('s' || i), $3, 0 FROM generate_series(1, $4) i",
         )
         .bind(pid)
         .bind(&key)
         .bind(seen.hex())
+        .bind(extra)
         .execute(&mut *tx)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO graph (project_id, snapshot, generation, depth, parents, change_id, flags, skip, changed) \
              SELECT $1, md5('r' || i) || md5('s' || i), 9000000000000000 + i, 100000 + i, '[]', md5('c' || i), 0, '[]', 'none' \
-             FROM generate_series(1, 1500000) i",
+             FROM generate_series(1, $2) i",
         )
         .bind(pid)
+        .bind(extra)
         .execute(&mut *tx)
         .await
         .unwrap();
@@ -3168,35 +3174,82 @@ fn bug_1468_stepping_over_a_hidden_run_costs_the_same_however_long_the_run() {
         sqlx::query("ANALYZE projections").execute(&h.db).await.unwrap();
         sqlx::query("ANALYZE graph").execute(&h.db).await.unwrap();
     });
+    drop(h);
+    HiddenRun { hub, p, seen, admin_url, db_name, url }
+}
+
+/// Rows read from `tables` of `hub`'s database (its statistics, flushed
+/// within about 10 s of a connection's last statement).
+fn rows_read(hub: &TestHub, tables: &[&str]) -> i64 {
+    std::thread::sleep(Duration::from_secs(12));
+    let tables: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
+    hub.rt
+        .block_on(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT (sum(coalesce(seq_tup_read, 0)) + sum(coalesce(idx_tup_fetch, 0)))::BIGINT FROM pg_stat_user_tables \
+                 WHERE relname = ANY($1)",
+            )
+            .bind(&tables)
+            .fetch_one(&hub.hub().db),
+        )
+        .unwrap()
+}
+
+/// BUG-1468: the "one indexed statement" that steps over a hidden run
+/// (`Ancestry::below_hidden`: the lowest real snapshot with the run's
+/// projection by the derived graph) reads every real snapshot with that
+/// projection, and looks each up in `graph`, to find the lowest: its cost
+/// grows with the run (and `sync::resolve_newest`'s three statements read
+/// the same range, of every view). A viewer who sees only a quiet folder
+/// sees a day of other folders' landings as one snapshot: here a run of
+/// 1,500,000 (their `projections` and `graph` rows, written directly), and
+/// the dev's one change on it, which lands in milliseconds with a run of
+/// 50 (`bug_1409_…`'s shape).
+#[test]
+fn bug_1468_stepping_over_a_hidden_run_costs_the_same_however_long_the_run() {
+    let HiddenRun { hub, p, seen, admin_url, db_name, .. } = hidden_run(1_500_000);
+    let api = hub.api();
+    let token = p.dev.token();
     let mut c = Craft::new(&api, &p.dev, &p.name, "billing-run");
     c.file("src/run.rs", "the dev's\n");
     let r = c.push_to("billing-run", Some(seen));
     assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
     let mine = api.tips(Some(&token), &p.name).unwrap().branches["billing-run"];
-    // Rows read from `graph` and `projections` (the database's statistics,
-    // flushed within about 10 s of a connection's last statement).
-    let read = || -> i64 {
-        std::thread::sleep(Duration::from_secs(12));
-        hub.rt
-            .block_on(
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT (sum(coalesce(seq_tup_read, 0)) + sum(coalesce(idx_tup_fetch, 0)))::BIGINT FROM pg_stat_user_tables \
-                     WHERE relname IN ('graph', 'projections')",
-                )
-                .fetch_one(&h.db),
-            )
-            .unwrap()
-    };
-    let before = read();
+    let before = rows_read(&hub, &["graph", "projections"]);
     let r = land_held(&api, &token, &p.name, mine, false);
     let body = String::from_utf8_lossy(&r.body).to_string();
     assert_eq!(r.status, 200, "{body}");
     assert_eq!(r.json()["state"], "queued", "{body}");
-    let rows = read() - before;
+    let rows = rows_read(&hub, &["graph", "projections"]) - before;
     // (The rows go with the database.)
     drop(hub);
-    sql(&admin_url, format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"));
+    sql_at(&admin_url, format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"));
     assert!(rows < 100_000, "the submit of one change on a hidden run of 1,500,050 read {rows} rows of graph and projections");
+}
+
+/// BUG-2510: a server that has not yet cached that a snapshot is committed
+/// (another server than the one that stored it, one restarted, or any
+/// server after a GC epoch) resolves it by `sync::resolve_stored`, whose one
+/// statement reads, with the snapshot's own row, every real snapshot whose
+/// projection it is, of every view, to sort them, though a committed id
+/// stands for itself alone. Main's tip under a run hidden from the dev is
+/// what the dev sees at its tip: their first `history` of it on such a
+/// server reads the whole run (200,000 rows here).
+#[test]
+#[ignore = "BUG-2510: resolving a committed snapshot on a server new to it reads every snapshot projected to it"]
+fn bug_2510_a_server_new_to_a_committed_snapshot_resolves_it_without_reading_the_run_on_it() {
+    let HiddenRun { hub, p, seen, admin_url, db_name, url, .. } = hidden_run(200_000);
+    let token = p.dev.token();
+    // Another server on the same database and store, its start-up work done.
+    let other = TestHub::start_on(&url, Duration::from_secs(3600));
+    let before = rows_read(&other, &["projections"]);
+    let r = other.api().history(&token, &p.name, &[seen]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let rows = rows_read(&other, &["projections"]) - before;
+    drop(other);
+    drop(hub);
+    sql_at(&admin_url, format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"));
+    assert!(rows < 20_000, "the dev's history of main's tip, under a hidden run of 200,050, read {rows} rows of projections");
 }
 
 /// BUG-1467, another view's candidates first (why `changes::resolve_base`

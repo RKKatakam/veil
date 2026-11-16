@@ -734,6 +734,8 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<Ob
          UNION ALL SELECT real_id, 1, created_at FROM projections WHERE project_id = $1 AND projected_id = $2 \
          ORDER BY 2, 3 DESC",
     )
+    // Planned for its own id (`resolve_for_mode`, BUG-2467).
+    .persistent(false)
     .bind(project)
     .bind(id.hex())
     .fetch_all(&hub.db)
@@ -884,6 +886,14 @@ async fn resolve_for_mode(
             "SELECT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2), \
              EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND projected_id = $2)",
         )
+        // Planned for its own id, never by a cached generic plan (an unnamed
+        // statement, BUG-2467): a run hidden from a view is one projected id
+        // for millions of rows, so a generic plan, built for any id, reckons
+        // that every id matches millions and scans the table, which for a
+        // new snapshot's id (a push's, a landing's) reads every row of it.
+        // So for each lookup of `projections` by `projected_id` (those by
+        // `projections_own`, `NOT collapsed`, excepted: few rows for any id).
+        .persistent(false)
         .bind(project.id)
         .bind(id.hex())
         .fetch_one(&hub.db)
@@ -902,6 +912,8 @@ async fn resolve_for_mode(
         "SELECT p.real_id, g.parents FROM projections p LEFT JOIN graph g ON g.project_id = p.project_id AND g.snapshot = p.real_id \
          WHERE p.project_id = $1 AND p.view_key = $2 AND p.projected_id = $3 LIMIT $4",
     )
+    // Planned for its own id (above, BUG-2467).
+    .persistent(false)
     .bind(project.id)
     .bind(&key)
     .bind(id.hex())
