@@ -194,9 +194,10 @@ const YB_MIGRATION_TIMEOUT: Duration = Duration::from_secs(3);
 /// DDL statement there has a fixed cost, the catalog change, whatever its
 /// table's size (on empty tables of the shared cluster, `CREATE TABLE` 100
 /// to 840 ms, `ALTER TABLE` up to 400 ms, under load), and a migration
-/// whose transaction times out is rolled back whole: under 250 ms the
-/// migrations after 21 were begun again and again on statements that do
-/// not grow with any table, and did not finish. 3 s still separates the
+/// with a statement that times out is applied again from the start (its
+/// trigger, `TRUNCATE` and timed-out statement are real DDL again): under
+/// 250 ms the migrations after 21 were begun again and again on statements
+/// that do not grow with any table, and did not finish. 3 s still separates the
 /// two clears: with `DELETE FROM view_graph` in migration 21 the test fails
 /// there (checked), the delete of the 2,000,000 rows taking 22.7 s.
 #[test]
@@ -931,12 +932,18 @@ fn bug_2482_every_index_on_an_existing_table_is_built_online() {
                 );
             }
         }
-        // A migration with an online section commits its transactional part
-        // before the steps, unrecorded: a step that fails runs it all again.
-        if !parts.online.is_empty() {
-            if let Some(stmt) = not_safe_to_run_again(parts.transactional) {
-                panic!("migration {version} ({name}) has an online indexes section, and its transactional part is not safe to run again: {stmt}");
-            }
+        // Every migration's transactional part runs again on what it made
+        // (BUG-2570): one with an online section commits it before the
+        // steps, unrecorded, and a step that fails runs it all again; and on
+        // YugabyteDB, DDL in a transaction block commits statement by
+        // statement (`yb_ddl_transaction_block_enabled` is off by default),
+        // so a migration that fails part-way keeps its DDL and is applied
+        // again on top of it. Statements checked by hand are named below.
+        if let Some(stmt) = not_safe_to_run_again(parts.transactional) {
+            assert!(
+                RUN_AGAIN_CHECKED.iter().any(|(v, s, _)| v == version && s.split_whitespace().eq(stmt.split_whitespace())),
+                "migration {version} ({name}): its transactional part is not safe to run again: {stmt}"
+            );
         }
         online.extend(parts.online.into_iter().map(|s| (*version, s)));
     }
@@ -998,6 +1005,14 @@ fn bug_2482_every_index_on_an_existing_table_is_built_online() {
         assert!(migration_parts(&section(bad)).is_err(), "refused: {bad}");
     }
 }
+
+/// Statements `not_safe_to_run_again` refuses that do the same when run
+/// again, checked by hand: (migration, statement, why).
+const RUN_AGAIN_CHECKED: &[(i64, &str, &str)] = &[(
+    29,
+    "UPDATE checks SET run_count = 1 WHERE run_count = 0 AND state IN ('pass', 'fail')",
+    "it sets run_count only where it is 0, to 1: run again, it changes nothing",
+)];
 
 /// The first statement of `sql` that would not do the same when run again
 /// on what it made (BUG-2482 review): an `INSERT` without `ON CONFLICT`, an
