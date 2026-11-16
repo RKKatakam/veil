@@ -35,7 +35,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -231,6 +234,9 @@ struct BatchReviewGuard {
     /// The server has reverted some change of the project twice: such a
     /// change needs a person's approval on any branch (BUG-1884).
     reverted_twice: bool,
+    /// The batch's asks of the review rules when it was read: counted in
+    /// `Stats::review_asks` once it commits (BUG-2465).
+    asks: u64,
 }
 
 /// Metadata of a row in a built batch.
@@ -991,6 +997,7 @@ impl Service {
         // names the embargo whose PRs may carry the approvals). Only the
         // server's own reverts are exempt.
         let is_user_entry = |ticket: &str| !ticket.starts_with("revert-");
+        let asks = AtomicU64::new(0);
         let review_guard = if let Some(first_proj) = entries
             .iter()
             .find(|e| is_user_entry(&e.row.ticket))
@@ -1050,7 +1057,7 @@ impl Service {
                             &items,
                             is_protected,
                             reverted_twice,
-                            &hub.landing.stats.review_asks,
+                            &asks,
                         )
                         .await?
                     };
@@ -1079,6 +1086,7 @@ impl Service {
                 project_epoch,
                 protected: is_protected,
                 reverted_twice,
+                asks: asks.load(Ordering::Relaxed),
             })
         } else {
             None
@@ -1342,7 +1350,10 @@ impl Service {
         let review_guard = b.review_guard.clone();
         let old_tip_id = b.old_tip;
         let tx_results = results.clone();
-        let tx_hub = hub.clone();
+        // The review rules' asks of the transaction's run that commits: a
+        // run rolled back and run again asks again (BUG-2465).
+        let tx_asks = Arc::new(AtomicU64::new(0));
+        let run_asks = tx_asks.clone();
         let stored_outside = stored.clone();
         // The review gate's writers found announced, and whether they were
         // waited for (then those announced since are not looked at: they
@@ -1378,10 +1389,11 @@ impl Service {
                 tx_results.clone(),
             );
             let landed_prs = tx_landed_prs.clone();
-            let tx_hub = tx_hub.clone();
+            let run_asks = run_asks.clone();
             let stored = stored.clone();
             let writers_seen = tx_writers.clone();
             Box::pin(async move {
+                run_asks.store(0, Ordering::Relaxed);
                 crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 // Fencing: only the lease's current holder moves the branch.
                 // (And the entries it has served: what a submit reads the
@@ -1521,7 +1533,7 @@ impl Service {
                                 &items,
                                 guard.protected,
                                 guard.reverted_twice,
-                                &tx_hub.landing.stats.review_asks,
+                                &run_asks,
                             )
                             .await?;
                             if answers.iter().any(|a| a.is_err()) {
@@ -1681,6 +1693,8 @@ impl Service {
         let (results, marked_prs) = match r {
             Ok(r) => {
                 hub.commits.count(crate::db::Commit::LandBatch);
+                let read = b.review_guard.as_ref().map_or(0, |g| g.asks);
+                hub.landing.stats.review_asks.fetch_add(read + tx_asks.load(Ordering::Relaxed), Ordering::Relaxed);
                 r
             }
             Err(Error::Api { code: "conflict", message, .. }) if message == LEASE_LOST => {

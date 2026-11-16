@@ -426,3 +426,65 @@ fn bug_1942_a_protected_branchs_batch_asks_the_review_rules_a_bounded_number_of_
     assert!(batches >= 1, "{batches}");
     assert!(asks >= 2 && asks <= 4 * batches + 2, "{asks} asks of the review rules in {batches} batches");
 }
+
+/// BUG-2465: a batch whose transaction runs again counts the review rules'
+/// asks of the run that committed, not of each run. Its objects' store is
+/// held 3 s, past `STORE_IN_TRANSACTION` (1 s): the first run gives up
+/// waiting and rolls back, and the transaction runs again once they are
+/// stored (BUG-1982). Before, the asks of both runs counted: 6 for a
+/// batch of 8 changes that asks 4 times (2 when it is read, 2 in its
+/// transaction), what the bound of BUG-1942's test counted under a loaded
+/// machine (7 in 1 batch).
+#[test]
+fn bug_2465_a_batch_whose_transaction_runs_again_counts_the_asks_of_the_run_that_committed() {
+    use std::sync::{atomic::AtomicBool, Arc};
+    // A database of its own: no other test's server takes the branch over
+    // while its store is held.
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let stall = Arc::new(AtomicBool::new(false));
+    let hub = TestHub::start_with_s3(&crate::grants::fresh_database(&rt), Duration::from_secs(3600), Some(crate::landing_hold::stalling_s3(stall.clone())));
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let dev = p.dev.token();
+    write_files(
+        &p.dir,
+        &[(".veilrules", "[branches.main]\nprotected = true\n\n[review]\nlow = { approvals = 0 }\nnormal = { approvals = 0 }\nhigh = { approvals = 0 }\n")],
+    );
+    p.admin.commit_main(&p.dir, "protect main, no approvals needed");
+    p.admin.ok(&p.dir, &["push"]);
+    let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+
+    hold_branch(&hub, pid, "main");
+    let mut tickets = Vec::new();
+    for i in 0..8 {
+        let r = land_edit(&api, &dev, &p.name, base, &format!("src/slow/f{i}.rs"), "x\n", false);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    let stats = &hub.hub().landing.stats;
+    let (asks, batches, landed) = (stats.review_asks.load(Ordering::SeqCst), stats.batches.load(Ordering::SeqCst), stats.landed.load(Ordering::SeqCst));
+    stall.store(true, Ordering::SeqCst);
+    release_branch(&hub, pid, "main");
+    // The batch is read, built and its transaction run; its objects' store
+    // is held well past what the transaction waits for.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(stats.landed.load(Ordering::SeqCst), landed, "a batch whose objects were not stored landed");
+    stall.store(false, Ordering::SeqCst);
+    let until = Instant::now() + Duration::from_secs(60);
+    for t in &tickets {
+        let v = loop {
+            let r = api.get(Some(&dev), &format!("/v1/projects/{}/land/{t}", p.name));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let v = r.json();
+            if (v["state"] != "queued" && v["state"] != "merging") || Instant::now() > until {
+                break v;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert_eq!(v["state"], "landed", "{v}");
+    }
+    let (asks, batches) = (stats.review_asks.load(Ordering::SeqCst) - asks, stats.batches.load(Ordering::SeqCst) - batches);
+    assert_eq!(batches, 1, "the 8 changes land in one batch");
+    assert_eq!(asks, 4, "{asks} asks of the review rules in the one batch");
+}
