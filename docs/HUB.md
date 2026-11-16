@@ -1711,8 +1711,15 @@ stands for a real snapshot whose projection *for that viewer's view key*
 is that id (any of them gives that viewer the same tree and history);
 another view's real snapshot for the same id is never used, since the
 same projected id can stand for different real snapshots in different
-views (BUG-915). Without one for the asker's view, the database lists every
-real snapshot the id stands for. A push resolves parents from the database
+views (BUG-915). Without one for the asker's view, the database answers
+in one statement: an id that is committed history stands for itself, and
+no projection is read; any other id, the real snapshots of every view it
+stands for, newest first, read in that order (`projections_by_projected_at`,
+migration 42) and only as many as the caller takes: one for history,
+fetch, subtrees and queries; a grant reads the rest only when the newest
+does not give the root it grants (BUG-2510: a run hidden from a view is
+one projected id for every real snapshot of it, and reading them all to
+sort them read the whole run). A push resolves parents from the database
 (newest first) or from the branch tips it reads.
 
 **Bounded by bytes, and by limits** (BUG-913). Every entry is weighed by

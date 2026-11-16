@@ -713,31 +713,54 @@ pub(crate) fn project_one(
 /// Callers project what they get for the asker's current view, so the
 /// answer grants nothing.
 pub async fn resolve(hub: &Hub, project: i64, view_key: &str, id: &ObjectId) -> Result<Vec<ObjectId>> {
+    resolve_at_most(hub, project, view_key, id, None).await
+}
+
+/// The first of [`resolve`]'s answer, reading no more of the database's
+/// list than it (BUG-2510: a run hidden from a view is one projected id
+/// for every real snapshot of it).
+pub async fn resolve_first(hub: &Hub, project: i64, view_key: &str, id: &ObjectId) -> Result<Option<ObjectId>> {
+    Ok(resolve_at_most(hub, project, view_key, id, Some(1)).await?.into_iter().next())
+}
+
+/// [`resolve`]'s answer, its first `limit` only when given.
+async fn resolve_at_most(hub: &Hub, project: i64, view_key: &str, id: &ObjectId, limit: Option<i64>) -> Result<Vec<ObjectId>> {
     if *id == root_snapshot_id() || hub.caches.committed(project, id) {
         return Ok(vec![*id]);
     }
     if let Some(real) = hub.caches.resolved(project, view_key, id) {
         return Ok(vec![real]);
     }
-    resolve_stored(hub, project, id).await
+    resolve_stored(hub, project, id, limit).await
 }
 
-/// [`resolve`] as the database answers it now, newest first (a push picks
-/// the real parent it grafts on from it), in one statement.
-async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId) -> Result<Vec<ObjectId>> {
+/// [`resolve`] as the database answers it now, newest first, in one
+/// statement: the first `limit` of it when given (all when `None`).
+async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId, limit: Option<i64>) -> Result<Vec<ObjectId>> {
     if *id == root_snapshot_id() || hub.caches.committed(project, id) {
         return Ok(vec![*id]);
     }
     let gce = hub.caches.gc_epoch(project);
+    // Read no more than the answer (BUG-2510): a run hidden from a view is
+    // projected to one id, so reading every row with that id to sort them
+    // read the whole run. The projections are read only for an id that is
+    // no committed snapshot (the `NOT EXISTS`, uncorrelated: decided once,
+    // before any of them is read; a committed id stands for itself alone),
+    // and newest first by `projections_by_projected_at`, so a limit stops
+    // the read (`LIMIT NULL` is none). The same rows, in the same order, as
+    // reading them all and taking the first `limit`.
     let rows: Vec<(String, i32, i64)> = sqlx::query_as(
         "SELECT id, 0, 0::BIGINT FROM snapshots WHERE project_id = $1 AND id = $2 \
-         UNION ALL SELECT real_id, 1, created_at FROM projections WHERE project_id = $1 AND projected_id = $2 \
+         UNION ALL (SELECT real_id, 1, created_at FROM projections WHERE project_id = $1 AND projected_id = $2 \
+         AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
+         ORDER BY created_at DESC LIMIT $3) \
          ORDER BY 2, 3 DESC",
     )
     // Planned for its own id (`resolve_for_mode`, BUG-2467).
     .persistent(false)
     .bind(project)
     .bind(id.hex())
+    .bind(limit)
     .fetch_all(&hub.db)
     .await?;
     if rows.first().is_some_and(|r| r.1 == 0) {
@@ -1089,7 +1112,7 @@ pub async fn history(
         if crate::embargo::is_withheld_from_viewer(hub, project, viewer, t).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         }
-        let Some(real) = resolve(hub, project.id, &project.view(viewer).key(), t).await?.into_iter().next() else {
+        let Some(real) = resolve_first(hub, project.id, &project.view(viewer).key(), t).await? else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         };
         if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
@@ -1245,7 +1268,7 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &snap).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         }
-        let Some(real) = resolve(hub, project.id, &project.view(viewer).key(), &snap).await?.into_iter().next() else {
+        let Some(real) = resolve_first(hub, project.id, &project.view(viewer).key(), &snap).await? else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         };
         if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {

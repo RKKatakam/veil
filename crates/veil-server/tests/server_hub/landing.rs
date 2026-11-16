@@ -3227,17 +3227,16 @@ fn bug_1468_stepping_over_a_hidden_run_costs_the_same_however_long_the_run() {
     assert!(rows < 100_000, "the submit of one change on a hidden run of 1,500,050 read {rows} rows of graph and projections");
 }
 
-/// BUG-2510: a server that has not yet cached that a snapshot is committed
-/// (another server than the one that stored it, one restarted, or any
-/// server after a GC epoch) resolves it by `sync::resolve_stored`, whose one
-/// statement reads, with the snapshot's own row, every real snapshot whose
-/// projection it is, of every view, to sort them, though a committed id
-/// stands for itself alone. Main's tip under a run hidden from the dev is
-/// what the dev sees at its tip: their first `history` of it on such a
-/// server reads the whole run (200,000 rows here).
+/// BUG-2510: a server that has not projected a snapshot id for a view (another
+/// server than the one that did, one restarted, or any server after a GC
+/// epoch) resolves it by `sync::resolve_stored`, to the real snapshots
+/// projected to it, newest first, of which `history` takes the first. Main's
+/// tip, under a run hidden from the dev, is what the dev sees at the run's
+/// tip: their own projection of main's tip (it holds billing files they do
+/// not see), no committed snapshot; their first `history` of it on such a
+/// server read the whole run (200,053 rows) to sort it.
 #[test]
-#[ignore = "BUG-2510: resolving a committed snapshot on a server new to it reads every snapshot projected to it"]
-fn bug_2510_a_server_new_to_a_committed_snapshot_resolves_it_without_reading_the_run_on_it() {
+fn bug_2510_a_server_new_to_a_projected_snapshot_resolves_it_without_reading_the_run_on_it() {
     let HiddenRun { hub, p, seen, admin_url, db_name, url, .. } = hidden_run(200_000);
     let token = p.dev.token();
     // Another server on the same database and store, its start-up work done.
@@ -3250,6 +3249,47 @@ fn bug_2510_a_server_new_to_a_committed_snapshot_resolves_it_without_reading_the
     drop(hub);
     sql_at(&admin_url, format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"));
     assert!(rows < 20_000, "the dev's history of main's tip, under a hidden run of 200,050, read {rows} rows of projections");
+}
+
+/// BUG-2510, for a committed snapshot: an id that is committed history
+/// stands for itself alone, but the statement also read, to sort them after
+/// it, every real snapshot projected to it, which for a snapshot a view
+/// sees whole under a run hidden from it is the whole run. Here 200,000
+/// rows of such a view (written directly, as the deriver stores them) are
+/// projected to main's real tip, and the admin's first `history` of it on
+/// a server new to it reads none of them.
+#[test]
+fn bug_2510_a_server_new_to_a_committed_snapshot_resolves_it_without_reading_the_run_on_it() {
+    let HiddenRun { hub, p, admin_url, db_name, url, .. } = hidden_run(0);
+    let pid = project_id(&hub, &p.name);
+    let tip = real_tip(&hub, pid);
+    let h = hub.hub();
+    hub.rt.block_on(async {
+        let mut tx = h.db.begin().await.unwrap();
+        sqlx::query("SET LOCAL statement_timeout = 0").execute(&mut *tx).await.unwrap();
+        sqlx::query(
+            "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at) \
+             SELECT $1, 'a view that sees main whole', md5('r' || i) || md5('s' || i), $2, i FROM generate_series(1, 200000) i",
+        )
+        .bind(pid)
+        .bind(tip.hex())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query("ANALYZE projections").execute(&h.db).await.unwrap();
+    });
+    drop(h);
+    let token = p.admin.token();
+    let other = TestHub::start_on(&url, Duration::from_secs(3600));
+    let before = rows_read(&other, &["projections"]);
+    let r = other.api().history(&token, &p.name, &[tip]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let rows = rows_read(&other, &["projections"]) - before;
+    drop(other);
+    drop(hub);
+    sql_at(&admin_url, format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"));
+    assert!(rows < 20_000, "the admin's history of main's tip, with 200,000 snapshots projected to it, read {rows} rows of projections");
 }
 
 /// BUG-1467, another view's candidates first (why `changes::resolve_base`
