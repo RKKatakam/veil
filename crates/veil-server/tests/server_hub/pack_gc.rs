@@ -1559,6 +1559,98 @@ fn bug_2590_a_pass_that_gave_way_to_a_root_write_is_followed_by_one_that_collect
     assert!(hub.rt.block_on(fresh.exists(pid, &main0)).unwrap(), "main's snapshot kept");
 }
 
+/// BUG-2602: a GC pass gives way to any root write made while it runs (the
+/// reference stamp, compared whole at the switch), so on a project pushed to
+/// steadily no pass ever collects. A pusher moves one branch back and forth
+/// between two stored snapshots, one push after another (each a root write
+/// GC must see: `branches`), while passes past the retention window run one
+/// after another: one of them should delete the dead loose object, which no
+/// push names. Each pass is counted: collected, gave way (nothing deleted,
+/// the stamp moved), or nothing.
+#[test]
+#[ignore = "BUG-2602: steady pushes make every GC pass give way; GC never collects for a busy project"]
+fn bug_2602_gc_collects_while_a_project_is_pushed_to_steadily() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/busy.rs", "BUSY-2602\n");
+    let (_, r) = c.push_edited("busy", None, |_| {});
+    assert_eq!(r.status, 200, "push busy: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "push busy ok");
+    let snap_a = ObjectId::from_hex(r.json()["results"][0]["tip"].as_str().unwrap()).unwrap();
+
+    let (dead_id, dead_raw) = make_blob("DEAD-LOOSE-2602\n");
+    hub.rt.block_on(h.objects.put(pid, &dead_id, dead_raw)).unwrap();
+    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    assert_eq!(marked.loose_objects_deleted, 0, "inside the window: {marked:?}");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let pushes = Arc::new(AtomicUsize::new(0));
+    let pusher = {
+        let (authority, cert, tok, name) = (hub.authority(), hub.cert_pem.clone(), admin_tok.clone(), p.name.clone());
+        let (stop, pushes) = (stop.clone(), pushes.clone());
+        std::thread::spawn(move || {
+            let api = Api::at(&authority, &cert);
+            let (mut cur, mut other) = (snap_a, main0);
+            while !stop.load(Relaxed) {
+                let r = api.post_json(
+                    Some(&tok),
+                    &format!("/v1/projects/{name}/push"),
+                    &json!({"updates": [{"branch": "busy", "expected": cur.hex(), "new": other.hex()}], "force": true}),
+                );
+                assert_eq!(r.status, 200, "steady push: {}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["results"][0]["ok"], json!(true), "steady push ok: {}", String::from_utf8_lossy(&r.body));
+                std::mem::swap(&mut cur, &mut other);
+                pushes.fetch_add(1, Relaxed);
+            }
+        })
+    };
+    while pushes.load(Relaxed) < 5 {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let opts = Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, now_offset_ms: 120_000, ..Options::default() };
+    let (mut collected, mut gave_way, mut nothing, mut skipped) = (0, 0, 0, 0);
+    let started = Instant::now();
+    let pushes_at_start = pushes.load(Relaxed);
+    let mut pass_ms = Vec::new();
+    for _ in 0..30 {
+        let before = hub.rt.block_on(pack_gc::project_ref_stamp(&h.db, pid)).unwrap();
+        let t = Instant::now();
+        let r = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).unwrap();
+        pass_ms.push(t.elapsed().as_millis());
+        let after = hub.rt.block_on(pack_gc::project_ref_stamp(&h.db, pid)).unwrap();
+        if r.skipped {
+            skipped += 1;
+        } else if r.loose_objects_deleted + r.packed_objects_deleted > 0 {
+            collected += 1;
+            break;
+        } else if after != before {
+            gave_way += 1;
+        } else {
+            nothing += 1;
+        }
+    }
+    let secs = started.elapsed().as_secs_f64();
+    let during = pushes.load(Relaxed) - pushes_at_start;
+    stop.store(true, Relaxed);
+    pusher.join().expect("the pusher's pushes all succeeded");
+    eprintln!(
+        "BUG-2602: passes collected {collected}, gave way {gave_way}, nothing {nothing}, skipped {skipped}; \
+         {during} pushes in {secs:.1} s ({:.0}/s); pass times (ms) {pass_ms:?}",
+        during as f64 / secs
+    );
+    assert!(during > 0, "pushes ran while GC passed");
+    assert_eq!(collected, 1, "a pass collects the dead object while the project is pushed to (gave way {gave_way} times)");
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    assert!(!hub.rt.block_on(fresh.exists(pid, &dead_id)).unwrap(), "dead loose object deleted from storage");
+}
+
 /// BUG-1782: Concurrent in-place `change_refs` target updates (`COUNT(*)`
 /// unchanged), `pr_revisions` inserts/updates, and `bisects` / `bisect_reverts`
 /// writes during a GC switch are detected by `read_ref_stamp`, aborting the
