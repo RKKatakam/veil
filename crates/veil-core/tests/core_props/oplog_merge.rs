@@ -2267,3 +2267,263 @@ fn bug_1534_rewrites_follow_with_undo_restore_and_concurrent_describes_replayed(
     }
     assert!(failed.is_empty(), "{} replays in 60 failed; the first: {:?}", failed.len(), failed.first());
 }
+
+/// BUG-2464, the second way: a describe of `X` runs concurrently with a
+/// commit on `X` (its new working copy `W1`); a settler merges the two and
+/// rebases `C` and `W1` onto `X'` (`W1'`, a rebase only that merge
+/// records); meanwhile a command that saw the commit and not the describe
+/// snapshots `W1` (`W2`). The final merge has two rewrites of `W1`: the
+/// merge's rebase and the snapshot. Taken for a divergent change, nothing
+/// followed either: `W1'` stayed visible beside `W2`, two versions of the
+/// working copy's change. The snapshot's rewrite stands, `W2` moves onto
+/// `X'`, and `W1'` follows it. (Today the merge before that also warns of
+/// a conflict on `w` that is not one: `W1'` counted as a change.)
+#[test]
+#[ignore = "BUG-2464: a settler's rebase of a working copy and a concurrent snapshot of it are taken for a divergent change"]
+fn bug_2464_a_merge_rebase_gives_way_to_a_concurrent_snapshot() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let write = |repo: &mut Repo, file: &str| {
+        repo.set_command_workspace(Some("w".into()));
+        let ov = repo.workspace_overlay("w").unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace("w", &ov).unwrap();
+    };
+    let truth = Device::new(false);
+    let x = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        write(&mut repo, "x");
+        repo.commit_working_copy("w", "x").unwrap().0
+    };
+    let h0 = op_heads(&*truth.fs);
+    // The describe, concurrent with the commit.
+    let d_dev = truth.fork(&h0);
+    let x2 = open(&d_dev).describe(x, "x, described").unwrap();
+    {
+        let mut repo = open(&truth);
+        write(&mut repo, "c");
+        repo.commit_working_copy("w", "c").unwrap();
+    }
+    let w1 = open(&truth).view().workspaces["w"].wc;
+    let h1 = op_heads(&*truth.fs);
+    // The command that saw the commit, not the describe.
+    let s_dev = truth.fork(&h1);
+    {
+        let mut repo = open(&s_dev);
+        write(&mut repo, "s");
+    }
+    // A settler merges the commit and the describe, and lands first.
+    truth.land(&d_dev, &h0);
+    let h2 = op_heads(&*truth.fs);
+    assert_eq!(h2.len(), 2, "the commit and the describe");
+    let m_dev = truth.fork(&h2);
+    let w1_rebased = {
+        let repo = open(&m_dev);
+        assert_eq!(repo.heads().len(), 1, "the settler merged");
+        repo.view().workspaces["w"].wc
+    };
+    assert_ne!(w1_rebased, w1, "the settler rebased the working copy");
+    truth.land(&m_dev, &h2);
+    truth.land(&s_dev, &h1);
+    let mut repo = open(&truth);
+    assert_eq!(repo.heads().len(), 1, "settled");
+    assert!(repo.take_warnings().is_empty(), "no conflict");
+    let wc = repo.view().workspaces["w"].wc;
+    assert_eq!(files_of(&repo, &wc), vec!["c", "s", "x"], "the snapshot's working copy");
+    let below: Vec<String> = repo.exact().visible().unwrap().into_iter().map(|s| repo.snapshot(&s).unwrap().description.as_str().to_string()).collect();
+    assert!(below.contains(&"x, described".to_string()) && !below.contains(&"x".to_string()), "on the described x ({}): {:?}", x2.short(), below);
+    // One version of the working copy's change: the rebased copy followed.
+    let change = repo.snapshot(&wc).unwrap().change_id;
+    let versions: Vec<String> = repo.exact().visible().unwrap().into_iter().filter(|s| repo.snapshot(s).unwrap().change_id == change).map(|s| s.short()).collect();
+    assert_eq!(versions, vec![wc.short()], "the rebased copy {} still visible", w1_rebased.short());
+}
+
+/// BUG-2466 (found while fixing BUG-2464): a commit `C` (on `X`) runs
+/// concurrently with a describe of `X` (`X1`) and a second describe that
+/// saw the first (`X1` into `X2`). One settler merges the commit and the
+/// first describe (`C` onto `X1`, `C1`); another merges the commit and the
+/// second describe, whose history holds the first (`C` onto `X2`, `C2`).
+/// Two rebases of `C`, by merges alone: taken for a divergent change,
+/// nothing followed either, and `C1` kept `X1` visible below it. The second
+/// merge merged everything the first did, so its rebase supersedes: `C`
+/// and `C1` follow `C2`. (The describes also rebase the working copy the
+/// commit snapshots: two commands' rewrites of it, a divergent change, not
+/// decided here.)
+#[test]
+#[ignore = "BUG-2466: two settlers' rebases of one commit are taken for a divergent change, though one merged everything the other did"]
+fn bug_2466_the_rebase_of_a_merge_that_merged_more_supersedes() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let write = |repo: &mut Repo, file: &str| {
+        repo.set_command_workspace(Some("w".into()));
+        let ov = repo.workspace_overlay("w").unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace("w", &ov).unwrap();
+    };
+    let truth = Device::new(false);
+    let x = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        write(&mut repo, "x");
+        repo.commit_working_copy("w", "x").unwrap().0
+    };
+    let h0 = op_heads(&*truth.fs);
+    let d1_dev = truth.fork(&h0);
+    let x1 = open(&d1_dev).describe(x, "x1").unwrap();
+    let k_dev = truth.fork(&h0);
+    {
+        let mut repo = open(&k_dev);
+        write(&mut repo, "c");
+        repo.commit_working_copy("w", "c").unwrap();
+    }
+    truth.land(&d1_dev, &h0);
+    let h1 = op_heads(&*truth.fs);
+    let d2_dev = truth.fork(&h1);
+    open(&d2_dev).describe(x1, "x2").unwrap();
+    truth.land(&k_dev, &h0);
+    let h2 = op_heads(&*truth.fs);
+    assert_eq!(h2.len(), 2, "the first describe and the commit");
+    let m1_dev = truth.fork(&h2);
+    assert_eq!(open(&m1_dev).heads().len(), 1, "the first settler merged");
+    truth.land(&d2_dev, &h1);
+    let h3 = op_heads(&*truth.fs);
+    assert_eq!(h3.len(), 2, "the second describe and the commit");
+    let m2_dev = truth.fork(&h3);
+    assert_eq!(open(&m2_dev).heads().len(), 1, "the second settler merged");
+    truth.land(&m1_dev, &h2);
+    truth.land(&m2_dev, &h3);
+    assert_eq!(op_heads(&*truth.fs).len(), 2, "the two settlers' merges");
+    let mut repo = open(&truth);
+    assert_eq!(repo.heads().len(), 1, "settled");
+    let warnings = repo.take_warnings();
+    let descs: Vec<String> = repo.exact().visible().unwrap().into_iter().map(|s| repo.snapshot(&s).unwrap().description.as_str().to_string()).collect();
+    assert!(descs.contains(&"x2".to_string()), "{descs:?}");
+    assert!(!descs.contains(&"x".to_string()) && !descs.contains(&"x1".to_string()), "an old version of x still visible: {descs:?} ({warnings:?})");
+    assert_eq!(descs.iter().filter(|d| *d == "c").count(), 1, "one version of the commit: {descs:?}");
+    let c: Vec<ObjectId> = repo.exact().visible().unwrap().into_iter().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "c").collect();
+    assert_eq!(repo.snapshot(&repo.snapshot(&c[0]).unwrap().parents[0]).unwrap().description.as_str(), "x2", "the commit on x2");
+}
+
+/// BUG-2464: the input BUG-1503's long-run check shrank to when it failed
+/// once under the whole suite's load (three writers, tags and workspaces on
+/// old versions). Not the load: the random ids within a case decide which
+/// settler merges what first: 4 to 6 replays in 100 fail. Two ways, both a
+/// settler's rebase taken for a change: a value two settlers rebased alike,
+/// or one settler's rebase of a working copy onto a describe while the
+/// other side committed it, counted as a change that conflicted with the
+/// commit (the workspace moved onto the commit, or left on the rebased
+/// copy), and that rebase and the commit's rewrite of the same working copy
+/// made a divergent change nothing followed, so the old working copy stayed
+/// visible on the version the describe replaced. Replayed 100 times (it
+/// fails at least once in nearly every run), it must pass every time.
+#[test]
+#[ignore = "BUG-2464: a settler's rebase taken for a change: a describe's old version still visible after the merges"]
+fn bug_2464_rewrites_follow_in_long_runs_replayed() {
+    let steps: Vec<u16> = vec![
+        43865, 25173, 53776, 43947, 28641, 31713, 13004, 61295, 31429, 13303, 36445, 26051, 53352, 39121, 50952, 14650, 27771, 35681, 47413, 14012, 4098, 17930,
+        61895, 64483, 43151, 26629, 59351, 37198, 46956, 43996, 45557, 31069, 28194, 22747, 50520, 2969, 18661, 46354, 64274, 46954, 60953, 13705, 61706, 15539,
+        54169, 62031, 19777, 7836, 14546, 42542, 61108, 41671, 22277, 3480, 33507, 39845, 60242, 36732, 64655, 56747, 50761, 22230, 28607, 30067, 16142, 36787,
+        47861, 60663, 19400, 5811, 8522, 40867, 34569, 5785, 2334, 59303, 12882, 32692, 59720, 43783, 28927, 30047, 26336, 57949, 36710, 48480, 108, 18855, 36343,
+        18679, 49142, 26539, 58224, 52839, 9535, 59258, 37651, 53663, 4981, 11864, 42327, 59553, 6347, 48191, 31483, 58880, 27797, 18084, 39910, 55301, 52384,
+        18402, 11348, 53287, 21920, 60211, 52571, 44770, 11710, 26730, 33259, 23736, 31926, 62726, 37286, 49661, 28863, 35247, 42613, 4761, 33695, 21616, 54186,
+        25408, 32778, 4841, 34787, 54331, 20847, 56309, 64769, 59235, 1522, 46695, 4113, 4213, 32694, 62755, 46203, 25764, 15395, 45453, 54598, 12305, 39597, 13251,
+        13086, 60797, 44418, 15172, 16065, 1077, 22344, 10766, 54407, 49425, 21153, 13386, 962, 18735, 45805, 48148, 61945, 63424, 21451, 32697, 14465, 904, 4985,
+        53126, 17039, 11127, 31627, 32247, 60919, 44009, 63451, 44970,
+    ];
+    let mut failed = Vec::new();
+    for i in 0..100 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 3, false, true, &steps) {
+            failed.push((i, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 100 failed; the first: {:?}", failed.len(), failed.first());
+}
+
+/// A guard for a fix of BUG-2464: an input of BUG-1503's long-run check
+/// (three writers, no refs to old versions) that passes today and that
+/// attempts at that fix broke (2 to 37 replays in 160 failed): with the
+/// workspaces merged differently, two settlers merged a commit with one
+/// describe and with two, and their two rebases of it are taken for a
+/// divergent change (BUG-2466). Replayed, it must pass every time.
+#[test]
+fn bug_2464_guard_two_settlers_rebase_one_commit_replayed() {
+    let steps: Vec<u16> = vec![
+        9298, 33168, 24058, 11979, 38173, 33704, 57601, 25004, 24807, 64909, 35742, 58067, 8202, 43915, 6728, 32665, 12535, 60130, 13404, 34866, 42224, 2989, 27781,
+        18614, 46937, 41191, 50988, 49313, 33363, 13330, 34785, 7199, 22829, 46859, 39981, 24002, 6569, 17727, 38915, 4667, 14417, 18231, 25828, 31805, 65531, 36162,
+        41028, 14257, 46532, 1511, 30871, 18963, 42384, 56780, 29840, 196, 42447, 18774, 46122, 6861, 49924, 43960, 48165, 12883, 40784, 6691, 6286, 10287, 4463,
+        34738, 32509, 16456, 38084, 24708, 5387, 12677, 31823, 57275, 5582, 12025, 21870, 39681, 60183, 4681, 19328, 23297, 25180, 37683, 64224, 20251, 33463, 3478,
+        44411, 54223, 37795, 47541, 15066, 16033, 30703, 48362, 27430, 25314, 30050, 36204, 42021, 44025, 5103, 16592, 34958, 56739, 24329, 18000, 25256, 52427, 3216,
+        35218, 30800, 21349, 51303, 45538, 32775, 57599, 40602, 1943, 61475, 33345, 31164, 54331, 24904, 12615, 64596, 22725, 53591, 23058, 15968, 19225, 57368, 44082,
+        52678, 47563, 63056, 12930, 25348, 33344, 47256, 60984, 32901, 63299, 30494, 20995, 60049, 52105, 13210, 44093, 30729, 53283, 10615, 17230, 58077, 9580, 12138,
+        43744, 49888, 28503, 41359, 43310, 49647, 3620, 7009, 28752, 20179, 62147, 36481, 51831, 54443, 17848, 37693, 48804, 18918, 52822, 36652, 57343, 53926, 54938,
+        633, 19588, 48807, 2428, 46676, 25456, 46500, 5077, 28034, 51210, 1170, 23323, 17418, 3933, 1053, 62813, 41357, 45138, 16084, 31502, 46678, 53362, 23124,
+        61328, 36740, 56921, 52167, 2018, 58650, 8383, 19771, 48839, 20873, 21213, 14502, 40472, 48332, 51134, 1014, 55539, 51289, 48703, 23509, 39320, 36295, 24757,
+        34589, 64825, 28960, 10952, 5623, 29165, 19845, 24621, 24544, 16489, 23175, 1940, 54856, 14540, 49244, 45814, 37546, 28143, 22823, 23452, 59455, 26479, 15779,
+        55254, 11192, 23073, 20501, 36288, 22887, 4527, 17457, 58873, 35012, 28459, 23676, 25808, 58229, 14046, 22932, 22041, 53504, 22707, 48098, 52247, 26145, 61848,
+        27096, 60854, 46130, 38688, 54764, 51779, 19044, 16446, 48833, 51840, 44599, 23747, 63083, 20688, 10950, 29643, 37100, 20768, 41465, 51306, 39495,
+    ];
+    let mut failed = Vec::new();
+    for i in 0..20 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 3, false, false, &steps) {
+            failed.push((i, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 20 failed; the first: {:?}", failed.len(), failed.first());
+}
+
+/// A guard for a fix of BUG-2464: an input of the long run of
+/// `rewrites_follow_with_refs_to_old_versions_memory` (two writers, tags
+/// and workspaces on old versions) that passes today and that an attempt
+/// broke (14 replays in 160 failed): it took a describe's rebase of a
+/// working copy, from the shared history and recorded again by merges, for
+/// a merge's own, and let it give way to a concurrent commit of that
+/// working copy; two commands' rewrites, a divergent change. Replayed, it
+/// must pass every time.
+#[test]
+fn bug_2464_guard_a_describe_s_rebase_from_the_shared_history_replayed() {
+    let steps: Vec<u16> = vec![
+        26924, 1310, 51560, 53233, 3462, 40367, 37372, 36139, 48236, 6871, 29283, 61260, 40674, 14075, 21369, 60301, 15256, 4192, 57718, 33349, 53417, 9061, 35632,
+        3632, 31911, 48592, 41838, 24946, 20298, 17748, 19184, 8029, 9076, 3142, 65321, 31267, 10206, 19767, 17511, 61207, 42355, 39062, 33149, 61780, 489, 11070,
+        61384, 41096, 28291, 39830, 41740, 43222, 9439, 42982, 63687, 41273, 24496, 18246, 63135, 16364, 13370, 62813, 20759, 48350, 49358, 28756, 52678, 9769, 18819,
+        22825, 39177, 47040, 47201, 64207, 48866, 49848, 11951, 6440, 58444, 55071, 65234, 7449, 4118, 26370, 30285, 5877, 28445, 32135, 27221, 51279, 45686, 37346,
+        65191, 15835, 8540, 16170, 23048, 20059, 6914, 51390, 11227, 17782, 44925, 26238, 44844, 24233, 52659, 46041, 63004, 13770, 16848, 4950, 63962, 26350, 34571,
+        23186, 41118, 7040, 46435, 36843, 12874, 1229, 41169, 49284, 32058, 49346, 2260, 44296, 5042, 24430, 2506, 33438, 38637, 63025, 57976, 45961, 19695, 54581,
+        34259, 57034, 40417, 4373, 2291, 61231, 62557, 63084, 12024, 30368, 61082, 47692, 13858, 47986, 5846, 34664, 61189, 34668, 41392, 13082, 11162, 31849, 9050,
+        1078, 55953, 25148, 62817, 36428, 23732, 49801, 27745, 34154, 28329, 44262, 47119, 15110, 132, 5437, 42640, 56314, 18374, 56979, 28208, 24306, 51714, 36018,
+        43905, 57052, 47439, 13747, 30099, 19749, 12786, 43314, 15250, 35508, 62402, 29228, 20081, 64797, 6162,
+    ];
+    let mut failed = Vec::new();
+    for i in 0..20 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 2, false, true, &steps) {
+            failed.push((i, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 20 failed; the first: {:?}", failed.len(), failed.first());
+}
+
+/// A guard for a fix of BUG-2464: an input of the long run of
+/// `rewrites_follow_with_refs_to_old_versions_memory` (4 writers, tags and
+/// workspaces on old versions) that passes today and that the most
+/// complete attempt broke (14 and 15 replays in 20 failed): rules that let
+/// settlers' rebases give way to other rewrites of a snapshot, and refs on
+/// the rebased copies follow, left old versions visible here. Replayed, it
+/// must pass every time.
+#[test]
+fn bug_2464_guard_rebased_copies_left_where_they_are_replayed() {
+    let steps: Vec<u16> = vec![
+        15285, 16720, 27493, 3823, 34777, 62217, 15319, 54568, 7437, 11373, 24684, 36780, 39077, 10708, 45698, 31526, 52898, 55019, 27081, 32612, 38547, 454, 56051,
+        60083, 59055, 14758, 33795, 57653, 2417, 30996, 64160, 38965, 33937, 15352, 45977, 40069, 5670, 14043, 3600, 18064, 52004, 19505, 15466, 26874, 39776, 51864,
+        13180, 15312, 1298, 32241, 24708, 33298, 62737, 64190, 6785, 43421, 10687, 4083, 5795, 30396, 62354, 4928, 17365, 32839, 57331, 960, 38394, 49810, 4429,
+        32056, 902, 42289, 42976, 53980, 44256, 44286, 63185, 42612, 20470, 38033, 36785, 50271, 1596, 37362, 48246, 59669, 17721, 52420, 23926, 4690, 32718, 26439,
+        26292, 18322, 57410, 5348, 21523, 24853, 58153, 26459, 15033, 52187, 15506, 18850, 28294, 13307, 19483, 5436, 15064, 40490, 11995, 50807, 10701, 15922, 13314,
+        2881, 38814, 474, 1439, 45004, 16211,
+    ];
+    let mut failed = Vec::new();
+    for i in 0..10 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 4, false, true, &steps) {
+            failed.push((i, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 10 failed; the first: {:?}", failed.len(), failed.first());
+}
