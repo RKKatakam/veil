@@ -1825,6 +1825,56 @@ fn bug_2469_the_longest_valid_head_is_read_however_it_arrives() {
     }
 }
 
+/// BUG-2531: an answer given before its request's body arrived said nothing
+/// of the connection, which the cache then closed (hyper does, as the unread
+/// rest of the body cannot be told from the next request): the client kept it
+/// for its next request and found it closed (`Broken pipe`, or the end of the
+/// stream; `grants_at_the_cache_hold_only_for_their_device_and_time`, 1 in
+/// 935 runs under load, on the request after a two-byte POST the batch route
+/// refuses unread). The answer says `Connection: close`.
+#[test]
+fn bug_2531_an_answer_before_the_body_arrived_says_the_connection_closes() {
+    use rustls::pki_types::pem::PemObject;
+    use std::io::{Read as _, Write as _};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(c.running.cert_pem.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+    let mut conn = rustls::ClientConnection::new(config, name).unwrap();
+    let mut tcp = std::net::TcpStream::connect(c.running.addr).unwrap();
+    tcp.set_nodelay(true).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+    // The head (a route the batch route refuses without reading the body),
+    // and its two-byte body only once the cache has answered.
+    let head = format!(
+        "POST /v1/objects/{} HTTP/1.1\r\nHost: {}\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n",
+        p.name, c.running.addr
+    );
+    tls.write_all(head.as_bytes()).unwrap();
+    tls.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    tls.write_all(b"{}").unwrap();
+    tls.flush().unwrap();
+    let mut answer = Vec::new();
+    let _ = tls.read_to_end(&mut answer);
+    let answer = String::from_utf8_lossy(&answer).to_ascii_lowercase();
+    let head = answer.split("\r\n\r\n").next().unwrap_or("");
+    assert!(head.starts_with("http/1.1 404"), "{head}");
+    assert!(head.lines().any(|l| l.trim() == "connection: close"), "an answer before the body was read must say the connection closes: {head}");
+}
+
 /// BUG-1332 (S24): what a regional cache forwards counted against the
 /// cache's own address at the server, as one client's. Fixed: the cache
 /// says it is one (the caches' token) and whose request it passes on (its

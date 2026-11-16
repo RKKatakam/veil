@@ -403,6 +403,55 @@ impl hyper::body::Body for Answering {
     }
 }
 
+/// A request's body that records whether it was read to its end.
+struct Tracked {
+    body: axum::body::Body,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl hyper::body::Body for Tracked {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, axum::Error>>> {
+        let r = std::pin::Pin::new(&mut self.body).poll_frame(cx);
+        if matches!(r, std::task::Poll::Ready(None)) || self.body.is_end_stream() {
+            self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// An HTTP/1.1 answer given before its request's body was read to its end
+/// says `Connection: close` (BUG-2531). hyper closes such a connection once
+/// the answer is written, as the unread rest of the body cannot be told from
+/// the next request, but it decides only after the answer's head is sent:
+/// the client kept the connection for its next request and found it closed
+/// (`Broken pipe`, or the end of the stream), when the body (two bytes to a
+/// cache route that refuses before reading) arrived after its head.
+async fn close_if_unread(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use hyper::body::Body as _;
+    if req.version() >= axum::http::Version::HTTP_2 || req.body().is_end_stream() {
+        return next.run(req).await;
+    }
+    let (parts, body) = req.into_parts();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tracked = Tracked { body, done: done.clone() };
+    let mut resp = next.run(axum::extract::Request::from_parts(parts, axum::body::Body::new(tracked))).await;
+    if !done.load(std::sync::atomic::Ordering::Relaxed) {
+        resp.headers_mut().insert(axum::http::header::CONNECTION, axum::http::HeaderValue::from_static("close"));
+    }
+    resp
+}
+
 /// Serve `app` over TLS until `stop`. With `limits`: at most
 /// `max_connections` open, bounded buffers, answers that must keep the
 /// minimum rate, and a connection with no request in flight for
@@ -431,6 +480,7 @@ pub(crate) async fn serve(
             Arc::new(only)
         }
     };
+    let app = app.layer(axum::middleware::from_fn(close_if_unread));
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
     let open = limits.map(|l| Arc::new(tokio::sync::Semaphore::new(l.max_connections.max(1))));
     loop {
