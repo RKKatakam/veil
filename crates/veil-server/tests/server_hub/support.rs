@@ -442,6 +442,10 @@ impl Api {
         }
     }
 
+    /// A request that fails (a connection cut, say) panics at the test's own
+    /// line, which names the request: every method that ends here, and the
+    /// tests' wrappers of them, are `#[track_caller]` (BUG-2531).
+    #[track_caller]
     fn finish(r: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Reply {
         let r = r.unwrap();
         let status = r.status().as_u16();
@@ -449,6 +453,7 @@ impl Api {
         Reply { status, body }
     }
 
+    #[track_caller]
     pub fn get(&self, token: Option<&str>, path: &str) -> Reply {
         let mut r = self.agent.get(format!("{}{path}", self.base));
         if let Some(t) = token {
@@ -458,6 +463,7 @@ impl Api {
     }
 
     /// GET with extra headers (the object routes' `Veil-Grant`, …).
+    #[track_caller]
     pub fn get_with(&self, path: &str, headers: &[(&str, &str)]) -> Reply {
         let mut r = self.agent.get(format!("{}{path}", self.base));
         for (k, v) in headers {
@@ -466,6 +472,7 @@ impl Api {
         Self::finish(r.call())
     }
 
+    #[track_caller]
     pub fn delete(&self, token: Option<&str>, path: &str) -> Reply {
         let mut r = self.agent.delete(format!("{}{path}", self.base));
         if let Some(t) = token {
@@ -474,10 +481,12 @@ impl Api {
         Self::finish(r.call())
     }
 
+    #[track_caller]
     pub fn agent_delete(&self, token: &str, path: &str) -> Reply {
         Self::finish(self.agent.delete(format!("{}{path}", self.base)).header("authorization", &format!("Bearer {token}")).call())
     }
 
+    #[track_caller]
     pub fn post(&self, token: Option<&str>, path: &str, body: &[u8], json: bool) -> Reply {
         let mut r = self.agent.post(format!("{}{path}", self.base));
         if let Some(t) = token {
@@ -488,6 +497,7 @@ impl Api {
     }
 
     /// POST JSON with extra headers (a cache's token, …).
+    #[track_caller]
     pub fn post_with(&self, path: &str, body: &[u8], headers: &[(&str, &str)]) -> Reply {
         let mut r = self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json");
         for (k, v) in headers {
@@ -498,6 +508,7 @@ impl Api {
 
     /// `POST …/history` as this release's `vl` asks it: saying which
     /// repository format it reads (BUG-1379).
+    #[track_caller]
     pub fn history(&self, token: &str, project: &str, tips: &[ObjectId]) -> Reply {
         let body = serde_json::to_vec(&serde_json::json!({"tips": tips.iter().map(|t| t.hex()).collect::<Vec<_>>()})).unwrap();
         let auth = format!("Bearer {token}");
@@ -509,6 +520,7 @@ impl Api {
         )
     }
 
+    #[track_caller]
     pub fn post_json(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> Reply {
         self.post(token, path, &serde_json::to_vec(v).unwrap(), true)
     }
@@ -516,6 +528,7 @@ impl Api {
     /// POST JSON, failing the test only after `limit` (instead of the
     /// agent's 120 s): for requests whose duration a test scales from a
     /// baseline measured in the same run.
+    #[track_caller]
     pub fn post_json_within(&self, token: &str, path: &str, v: &serde_json::Value, limit: std::time::Duration) -> Reply {
         let r = self.agent.post(format!("{}{path}", self.base)).header("authorization", &format!("Bearer {token}")).header("content-type", "application/json");
         Self::finish(r.config().timeout_global(Some(limit)).build().send(&serde_json::to_vec(v).unwrap()[..]))
@@ -562,6 +575,7 @@ impl Api {
     }
 
     /// POST JSON as a `vl` that reads encoded frames (compressed objects).
+    #[track_caller]
     pub fn post_json_encoded(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> (Reply, Option<String>) {
         let mut r = self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").header("accept", encoding::FRAMES);
         if let Some(t) = token {
@@ -573,6 +587,7 @@ impl Api {
     }
 
     /// POST object frames as they are (encoded or not, well formed or not).
+    #[track_caller]
     pub fn upload_body(&self, token: &str, project: &str, body: &[u8]) -> Reply {
         self.post(Some(token), &format!("/v1/projects/{project}/objects"), body, false)
     }
@@ -580,6 +595,7 @@ impl Api {
     /// POST encoded object frames (S27), under the encoded frames' media
     /// type (which the server does not need: it reads every upload as
     /// encoded frames).
+    #[track_caller]
     pub fn upload_encoded_body(&self, token: &str, project: &str, body: &[u8]) -> Reply {
         let r = self
             .agent
@@ -590,6 +606,7 @@ impl Api {
     }
 
     /// POST JSON with the `Host` header a relaying server would send.
+    #[track_caller]
     pub fn post_json_host(&self, path: &str, v: &serde_json::Value, host: &str) -> Reply {
         let r = self
             .agent

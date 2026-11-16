@@ -115,6 +115,7 @@ impl<'a> Reader<'a> {
         self.id.as_ref().map(|i| sign_request(i, &g, ts, ids))
     }
 
+    #[track_caller]
     fn batch_as(&self, grant: &str, wants: &[(Vec<ObjectId>, ObjectId)], skip: Vec<ObjectId>) -> Reply {
         let ids: Vec<ObjectId> = wants.iter().map(|w| w.1).collect();
         let ts = veil_core::now_millis();
@@ -128,10 +129,12 @@ impl<'a> Reader<'a> {
         self.via.post(None, &format!("/v1/objects/{}:batch", self.project), &serde_json::to_vec(&req).unwrap(), true)
     }
 
+    #[track_caller]
     fn batch(&self, wants: &[(Vec<ObjectId>, ObjectId)]) -> Vec<(ObjectId, Vec<u8>)> {
         self.batch_as(&self.grant, wants, Vec::new()).frames()
     }
 
+    #[track_caller]
     fn get_as(&self, grant: &str, chain: &[ObjectId], id: &ObjectId, sig: Option<(i64, String)>, extra: &[(&str, &str)]) -> Reply {
         let sig = sig.or_else(|| {
             let ts = veil_core::now_millis();
@@ -148,6 +151,7 @@ impl<'a> Reader<'a> {
         self.via.get_with(&format!("/v1/objects/{}/{}", self.project, id.hex()), &h)
     }
 
+    #[track_caller]
     fn get(&self, chain: &[ObjectId], id: &ObjectId) -> Reply {
         self.get_as(&self.grant, chain, id, None, &[])
     }
@@ -1076,7 +1080,7 @@ mod s9_cycle2 {
 
     const MIB: usize = 1 << 20;
     /// What one connection may hold outside `--memory` (`docs/HUB.md` §13.18).
-    const PER_CONNECTION_KIB: usize = 352;
+    const PER_CONNECTION_KIB: usize = 368;
 
     fn tree(r: &Reader, chain: &[ObjectId], id: &ObjectId) -> Tree {
         let g = r.get(chain, id);
@@ -1754,6 +1758,71 @@ fn bug_1592_the_cache_offers_only_the_protocol_it_serves() {
     let _ = tls.read_to_end(&mut answer);
     let answer = String::from_utf8_lossy(&answer);
     assert!(answer.starts_with("HTTP/1.1 4"), "{answer}");
+}
+
+/// BUG-1415, BUG-1420, BUG-2469: the cache's HTTP buffer was one slice
+/// (64 KiB), shorter than the longest valid request head (a `Veil-Chain` of
+/// `MAX_CHAIN` ids, about 67 KB), and hyper refuses a head that is not whole
+/// when its buffer is full: the same request was answered (when one read
+/// took it whole), refused `431`, or its connection closed while the client
+/// was still writing it (`Broken pipe`), depending on how its bytes
+/// arrived. Fixed: the buffer holds the longest valid head with room. Here
+/// the head arrives in 1 KiB TLS records, each flushed before the next
+/// (with a pause of a millisecond, so that the cache reads them one by
+/// one, as it did when the test failed under load), and is answered
+/// exactly as it is in one piece: for the longest valid chain and for one
+/// 5 ids longer.
+#[test]
+fn bug_2469_the_longest_valid_head_is_read_however_it_arrives() {
+    use rustls::pki_types::pem::PemObject;
+    use std::io::{Read as _, Write as _};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let server = hub.api();
+    let c = TestCache::start(&hub, &hub.authority(), 1 << 30);
+    let dev = Reader::new(&server, &c.api, Some(&p.dev), &p.name);
+    let root = dev.root();
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(c.running.cert_pem.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    for n in [MAX_CHAIN, MAX_CHAIN + 5] {
+        let chain = vec![root; n];
+        let whole = dev.get(&chain, &root);
+        assert_eq!(whole.status, 404, "{n} ids in one piece: {}", String::from_utf8_lossy(&whole.body));
+        let ts = veil_core::now_millis();
+        let sig = dev.signature(&dev.grant, ts, &[root]).expect("a device's signature");
+        let ids = chain.iter().map(|c| c.hex()).collect::<Vec<_>>().join(",");
+        let head = format!(
+            "GET /v1/objects/{}/{} HTTP/1.1\r\nHost: {}\r\nveil-grant: {}\r\nveil-chain: {ids}\r\nveil-signature: {ts}.{sig}\r\nConnection: close\r\n\r\n",
+            p.name,
+            root.hex(),
+            c.running.addr,
+            dev.grant
+        );
+        assert!(head.len() > 64 << 10, "{n} ids: a head of {} bytes, longer than the old buffer", head.len());
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        let mut conn = rustls::ClientConnection::new(config.clone(), name).unwrap();
+        let mut tcp = std::net::TcpStream::connect(c.running.addr).unwrap();
+        tcp.set_nodelay(true).unwrap();
+        let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+        for piece in head.as_bytes().chunks(1 << 10) {
+            tls.write_all(piece).unwrap_or_else(|e| panic!("{n} ids: the cache closed the connection while the head was being written: {e}"));
+            tls.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut answer = Vec::new();
+        let _ = tls.read_to_end(&mut answer);
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 404"), "{n} ids in 1 KiB pieces: {}", answer.lines().next().unwrap_or(""));
+    }
 }
 
 /// BUG-1332 (S24): what a regional cache forwards counted against the
