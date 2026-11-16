@@ -2518,8 +2518,11 @@ take no lock:
   made of a snapshot by rebasing it onto the rewrites of the commands it
   merged is an effect derived from those commands, never a change or a
   version of its own. As a value: a working copy, tag or head that a
-  merge's rebase made of a value its side's own operations did not
-  introduce is the shared history's value, moved, so where both sides
+  merge's rebase made (a value no parent of the merge has for that key:
+  a merge's `rewritten` also holds the rewrites of the commands it
+  merged, and what those set is theirs, BUG-2550) of a value its side's
+  own operations did not introduce is the shared history's value, moved,
+  so where both sides
   introduced a value the other side's change wins (two settlers that
   made the same rebase, one side then committed: the commit's working
   copy wins); a head so moved, whose original the other side dropped, is

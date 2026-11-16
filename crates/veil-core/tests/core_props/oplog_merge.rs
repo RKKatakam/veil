@@ -608,10 +608,41 @@ fn check_model(cmds: &[Cmd], repo: &Repo, losers: &std::collections::HashSet<Obj
         }
         false
     };
+    // Rewritten, through one rewrite or several (a merge's rebase, then a
+    // `ws remove` of the rebased copy), into nothing: abandoned.
+    let abandoned = |v: &ObjectId| {
+        let mut todo = vec![*v];
+        let mut seen: std::collections::HashSet<ObjectId> = Default::default();
+        while let Some(x) = todo.pop() {
+            if !seen.insert(x) || seen.len() > 256 {
+                continue;
+            }
+            for n in rewrites.get(&x).into_iter().flatten() {
+                if n.is_empty() {
+                    return true;
+                }
+                todo.extend(n.iter().copied());
+            }
+        }
+        false
+    };
+    // Through the rewrites the op log records, one or several (a describe
+    // of what a value is on rebases it, and a later one again).
     let moved = |v: &ObjectId, g: &ObjectId| {
-        rewrites.get(v).is_some_and(|news| {
-            news.iter().any(|n| n.contains(g) || (n.is_empty() && repo.snapshot(g).unwrap().parents == repo.snapshot(v).unwrap().parents))
-        })
+        let mut todo = vec![*v];
+        let mut seen: std::collections::HashSet<ObjectId> = Default::default();
+        while let Some(x) = todo.pop() {
+            if !seen.insert(x) || seen.len() > 256 {
+                continue;
+            }
+            for n in rewrites.get(&x).into_iter().flatten() {
+                if n.contains(g) || (n.is_empty() && repo.snapshot(g).unwrap().parents == repo.snapshot(&x).unwrap().parents) {
+                    return true;
+                }
+                todo.extend(n.iter().copied());
+            }
+        }
+        false
     };
     let mut keys: std::collections::BTreeSet<Key> = Default::default();
     for c in cmds.iter().filter(|c| c.landed.is_some()) {
@@ -646,8 +677,10 @@ fn check_model(cmds: &[Cmd], repo: &Repo, losers: &std::collections::HashSet<Obj
         let ok = match &k {
             // A head the model keeps must stay visible (a head, or below
             // one: a merge drops a head another ref now covers).
-            Key::Head(h) if vals.contains(&Some((*h, None))) => got.is_some() || visible(h) || rewrites.get(h).is_some_and(|news| news.iter().any(|n| n.is_empty() || n.iter().any(&visible))),
-            Key::Head(h) => vals.contains(&got) || losers.contains(h),
+            Key::Head(h) if vals.contains(&Some((*h, None))) => got.is_some() || visible(h) || abandoned(h),
+            // A head two rewrites replaced differently (a divergent change:
+            // nothing follows either, and it stays where it was).
+            Key::Head(h) => vals.contains(&got) || losers.contains(h) || rewrites.get(h).is_some_and(|news| news.iter().any(|n| *n != news[0])),
             _ => vals.contains(&got) || vals.iter().flatten().any(|v| got.is_some_and(|g| moved(&v.0, &g.0))),
         };
         let whats: Vec<&str> = by.iter().map(|i| cmds[*i].what.as_str()).collect();
@@ -674,6 +707,16 @@ type Pending = (Device, Vec<String>, Option<usize>, Vec<String>);
 /// visible). No warning unless two writes of a key were concurrent, and a
 /// warning for every conflict still open at the end.
 fn check_every_write_survives(disk: bool, nw: usize, undo: bool, aba: bool, steps: &[u16]) -> Result<(), TestCaseError> {
+    check_every_write_survives_with(disk, nw, undo, aba, false, steps)
+}
+
+/// [`check_every_write_survives`], with `describes`: some tag moves turn
+/// into describes of a visible commit, whose rewrite moves the tags on it
+/// and rebases what is built on it (working copies), and which settlers
+/// record again when they merge it (BUG-2550: a command's rewrite recorded
+/// again by a settler was read as the settler's own rebase, and a
+/// concurrent move of the same tag or workspace won silently).
+fn check_every_write_survives_with(disk: bool, nw: usize, undo: bool, aba: bool, describes: bool, steps: &[u16]) -> Result<(), TestCaseError> {
     let me = Identity::generate("alice");
     let truth = Device::new(disk);
     let mut cmds: Vec<Cmd> = Vec::new();
@@ -735,11 +778,21 @@ fn check_every_write_survives(disk: bool, nw: usize, undo: bool, aba: bool, step
             (false, 10 | 11) => 9,
             (_, k) => k,
         };
+        // With `describes`, every other two-tag move is a describe (kind 16).
+        let kind = match (describes, kind) {
+            (true, 9) if arg.is_multiple_of(2) => 16,
+            (_, k) => k,
+        };
         let w = arg % nw;
         let x = format!("x{}", arg % 2);
         let slots: Vec<String> = match kind {
             0..=3 | 10 => vec![format!("w{w}")],
             8 => vec![x.clone()],
+            // One describe at a time (two concurrent describes of a commit
+            // are a divergent change, which the per-key model does not
+            // judge; `check_rewrites_followed` does), and none concurrent
+            // with a workspace made or removed on what it rebases.
+            16 => vec!["describe".to_string(), "x0".to_string(), "x1".to_string()],
             11 => (0..nw).map(|w| format!("w{w}")).chain(["x0".to_string(), "x1".to_string()]).collect(),
             _ => Vec::new(),
         };
@@ -834,6 +887,18 @@ fn check_every_write_survives(disk: bool, nw: usize, undo: bool, aba: bool, step
                     (Some(t), Some(u)) => repo.set_tag(&tag, t, true).and_then(|_| repo.set_tag(&other, u, true)),
                     _ => continue,
                 }
+            }
+            16 => {
+                // A visible commit (not a working copy).
+                let wcs: Vec<ObjectId> = repo.view().workspaces.values().map(|w| w.wc).collect();
+                let visible = repo.exact().visible().unwrap();
+                let cands: Vec<ObjectId> = commits.iter().copied().filter(|c| *c != repo.root_id() && !wcs.contains(c) && visible.contains(c)).collect();
+                if cands.is_empty() {
+                    continue;
+                }
+                let target = cands[arg % cands.len()];
+                what = format!("describe {}", target.short());
+                repo.describe(target, &format!("described {clock}")).map(|c| new_commit = Some(c))
             }
             10 => {
                 let ws = format!("w{w}");
@@ -1246,6 +1311,18 @@ proptest! {
     #[test]
     fn every_write_survives_concurrent_merges_memory(nw in 2usize..6, steps in prop::collection::vec(any::<u16>(), steps(20, 120))) {
         check_every_write_survives(false, nw, false, false, &steps)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: review_cases(64), failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// Guarantee 1 and 3 with describes among the commands (BUG-2550):
+    /// settlers record a describe's rewrite again when they merge it, and
+    /// it moves tags and working copies that other commands move too.
+    #[test]
+    fn every_write_survives_concurrent_merges_with_describes_memory(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), steps(20, 120))) {
+        check_every_write_survives_with(false, nw, false, false, true, &steps)?;
     }
 }
 
@@ -2296,8 +2373,8 @@ fn bug_2464_a_merge_rebase_gives_way_to_a_concurrent_snapshot() {
     // reproduction is the order where it keeps the commit's (`W1'`, its
     // rebase); in the other it keeps the describe's rebase of the old one,
     // a write of `w` the later snapshot is concurrent with, and the final
-    // merge warns of that real conflict. Built again with fresh ids until
-    // the settler kept the commit's.
+    // merge warns of that real conflict (checked too). Built again with
+    // fresh ids until the settler kept the commit's.
     let mut tries = 0;
     let (truth, x2, w1_rebased, m_dev, h2, s_dev, h1) = loop {
         tries += 1;
@@ -2338,6 +2415,21 @@ fn bug_2464_a_merge_rebase_gives_way_to_a_concurrent_snapshot() {
             (wc, repo.snapshot(&wc).unwrap().change_id == repo.snapshot(&w1).unwrap().change_id)
         };
         if !kept_commit {
+            // The other order: the settler kept the describe's rebase of the
+            // old working copy (`W0'`), a write of `w` the snapshot is
+            // concurrent with. A real conflict: a warning, both working
+            // copies visible, on the described x.
+            truth.land(&m_dev, &h2);
+            truth.land(&s_dev, &h1);
+            let mut repo = open(&truth);
+            assert_eq!(repo.heads().len(), 1, "settled");
+            let warnings = repo.take_warnings();
+            assert!(warnings.iter().any(|w| w.starts_with("workspace 'w' was moved by concurrent commands")), "a conflict on w: {warnings:?}");
+            let visible: Vec<ObjectId> = repo.exact().visible().unwrap();
+            assert!(visible.contains(&w1_rebased), "the describe's working copy {} still visible", w1_rebased.short());
+            assert!(visible.iter().any(|s| files_of(&repo, s) == vec!["c", "s", "x"]), "the snapshot's working copy still visible");
+            let below: Vec<String> = visible.iter().map(|s| repo.snapshot(s).unwrap().description.as_str().to_string()).collect();
+            assert!(below.contains(&"x, described".to_string()) && !below.contains(&"x".to_string()), "on the described x ({}): {:?}", x2.short(), below);
             continue;
         }
         assert_ne!(w1_rebased, w1, "the settler rebased the working copy");
@@ -2545,4 +2637,163 @@ fn bug_2464_guard_rebased_copies_left_where_they_are_replayed() {
         }
     }
     assert!(failed.is_empty(), "{} replays in 10 failed; the first: {:?}", failed.len(), failed.first());
+}
+
+/// BUG-2550 (review of the BUG-2464 fix): a command's rewrite, recorded
+/// again by a settler that merged it with an unrelated operation, was read
+/// as that settler's own rebase. `C` is a commit only a head shows; one
+/// command describes it (`C1`), another, concurrently, too (`C2`); a
+/// settler merges the first with an unrelated command whose view still
+/// shows `C`. The settler did not make `C1` (its parent did), but `C1`
+/// counted as its rebase of `C`, a value of the shared history, moved,
+/// which the second describe dropped: `C1` left the heads, and the
+/// divergent change kept nothing that showed it. Both versions stay
+/// visible.
+#[test]
+fn bug_2550_a_command_s_rewrite_a_settler_recorded_again_is_no_rebase_of_its() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let truth = Device::new(false);
+    let c = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        repo.create_workspace("v", vec![repo.root_id()]).unwrap();
+        repo.set_command_workspace(Some("w".into()));
+        let ov = repo.workspace_overlay("w").unwrap();
+        ov.write(&VPath::new("c").unwrap(), b"c\n").unwrap();
+        repo.snapshot_workspace("w", &ov).unwrap();
+        let c = repo.commit_working_copy("w", "c").unwrap().0;
+        repo.remove_workspace("w").unwrap();
+        c
+    };
+    let h0 = op_heads(&*truth.fs);
+    assert_eq!(open(&truth).view().heads.iter().filter(|h| **h == c).count(), 1, "c is a head");
+    assert!(!open(&truth).view().workspaces.values().any(|w| w.wc == c), "and no workspace's");
+    let d1 = truth.fork(&h0);
+    let c1 = open(&d1).describe(c, "c, first").unwrap();
+    let d2 = truth.fork(&h0);
+    let c2 = open(&d2).describe(c, "c, second").unwrap();
+    let b0 = truth.fork(&h0);
+    open(&b0).create_workspace("u", vec![open(&b0).root_id()]).unwrap();
+    truth.land(&d1, &h0);
+    truth.land(&b0, &h0);
+    let h1 = op_heads(&*truth.fs);
+    assert_eq!(h1.len(), 2, "the first describe and the unrelated command");
+    let m = truth.fork(&h1);
+    assert_eq!(open(&m).heads().len(), 1, "the settler merged");
+    truth.land(&m, &h1);
+    truth.land(&d2, &h0);
+    let repo = open(&truth);
+    assert_eq!(repo.heads().len(), 1, "settled");
+    let shown = |s: &ObjectId| repo.view().refs().iter().any(|r| r == s || repo.is_ancestor(s, r).unwrap());
+    assert!(shown(&c1), "the first version {} still visible", c1.short());
+    assert!(shown(&c2), "the second version {} still visible", c2.short());
+}
+
+/// BUG-2550, a working copy: a describe of `@` (`W` into `W'`), merged by a
+/// settler with an unrelated command, runs concurrently with a snapshot of
+/// `W` elsewhere (`W2`). Two commands moved the workspace: a conflict, with
+/// a warning, and both working copies visible. `W'` counted as the
+/// settler's rebase of `W`, so the snapshot won silently and `W'` went.
+#[test]
+fn bug_2550_a_describe_of_the_working_copy_a_settler_recorded_again_still_conflicts() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let write = |repo: &mut Repo, file: &str| {
+        repo.set_command_workspace(Some("w".into()));
+        let ov = repo.workspace_overlay("w").unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace("w", &ov).unwrap();
+    };
+    let truth = Device::new(false);
+    let w = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        write(&mut repo, "a");
+        repo.view().workspaces["w"].wc
+    };
+    let h0 = op_heads(&*truth.fs);
+    let d = truth.fork(&h0);
+    let w1 = {
+        let mut repo = open(&d);
+        repo.set_command_workspace(Some("w".into()));
+        repo.describe(w, "w, described").unwrap()
+    };
+    let s = truth.fork(&h0);
+    let w2 = {
+        let mut repo = open(&s);
+        write(&mut repo, "b");
+        repo.view().workspaces["w"].wc
+    };
+    assert_ne!(w2, w, "the snapshot moved the working copy");
+    let b0 = truth.fork(&h0);
+    open(&b0).create_workspace("u", vec![open(&b0).root_id()]).unwrap();
+    truth.land(&d, &h0);
+    truth.land(&b0, &h0);
+    let h1 = op_heads(&*truth.fs);
+    assert_eq!(h1.len(), 2, "the describe and the unrelated command");
+    let m = truth.fork(&h1);
+    assert_eq!(open(&m).heads().len(), 1, "the settler merged");
+    truth.land(&m, &h1);
+    truth.land(&s, &h0);
+    let mut repo = open(&truth);
+    assert_eq!(repo.heads().len(), 1, "settled");
+    let warnings = repo.take_warnings();
+    assert!(warnings.iter().any(|x| x.starts_with("workspace 'w' was moved by concurrent commands")), "a conflict on w: {warnings:?}");
+    let shown = |s: &ObjectId| repo.view().refs().iter().any(|r| r == s || repo.is_ancestor(s, r).unwrap());
+    assert!(shown(&w1), "the described working copy {} still visible", w1.short());
+    assert!(shown(&w2), "the snapshot {} still visible", w2.short());
+}
+
+/// BUG-2550, a tag: a describe of `X` moves the tag `t` on it to `X'`; a
+/// settler merges it with an unrelated command; concurrently a command
+/// moves `t` to `Y`. Two commands moved the tag: a conflict, with a
+/// warning (guarantee 3). `X'` counted as the settler's rebase of `X`, and
+/// `Y` won silently.
+#[test]
+fn bug_2550_a_tag_a_describe_moved_and_a_settler_recorded_again_still_conflicts() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let truth = Device::new(false);
+    let (x, y) = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        repo.set_command_workspace(Some("w".into()));
+        let ov = repo.workspace_overlay("w").unwrap();
+        ov.write(&VPath::new("x").unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace("w", &ov).unwrap();
+        let x = repo.commit_working_copy("w", "x").unwrap().0;
+        let ov = repo.workspace_overlay("w").unwrap();
+        ov.write(&VPath::new("y").unwrap(), b"y\n").unwrap();
+        repo.snapshot_workspace("w", &ov).unwrap();
+        let y = repo.commit_working_copy("w", "y").unwrap().0;
+        repo.set_tag("t", x, true).unwrap();
+        (x, y)
+    };
+    let h0 = op_heads(&*truth.fs);
+    let d = truth.fork(&h0);
+    let x1 = open(&d).describe(x, "x, described").unwrap();
+    assert_eq!(open(&d).view().tags["t"].target, x1, "the describe moved the tag");
+    let t = truth.fork(&h0);
+    open(&t).set_tag("t", y, true).unwrap();
+    let b0 = truth.fork(&h0);
+    open(&b0).create_workspace("u", vec![open(&b0).root_id()]).unwrap();
+    truth.land(&d, &h0);
+    truth.land(&b0, &h0);
+    let h1 = op_heads(&*truth.fs);
+    assert_eq!(h1.len(), 2, "the describe and the unrelated command");
+    let m = truth.fork(&h1);
+    assert_eq!(open(&m).heads().len(), 1, "the settler merged");
+    truth.land(&m, &h1);
+    truth.land(&t, &h0);
+    let mut repo = open(&truth);
+    assert_eq!(repo.heads().len(), 1, "settled");
+    let warnings = repo.take_warnings();
+    assert!(warnings.iter().any(|w| w.starts_with("tag 't' was moved by concurrent commands")), "a conflict on t: {warnings:?}");
+    let target = repo.view().tags["t"].target;
+    let y_now: Vec<ObjectId> = repo.exact().visible().unwrap().into_iter().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "y").collect();
+    assert_eq!(y_now.len(), 1, "one y");
+    assert!(target == x1 || target == y_now[0], "the tag on one of the two moves: {}", target.short());
+    let shown = |s: &ObjectId| repo.view().refs().iter().any(|r| r == s || repo.is_ancestor(s, r).unwrap());
+    assert!(shown(&x1), "the described x {} still visible", x1.short());
 }

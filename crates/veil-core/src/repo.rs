@@ -1262,8 +1262,10 @@ impl Repo {
         }
         order.sort();
         for (_, d) in order {
-            let (rebased, versions): (Vec<_>, Vec<_>) =
-                applied.iter().filter(|(k, _)| k.0 == d).partition(|(k, r)| r.commands.is_empty() && rebases.contains(k));
+            // `applied` is sorted by old snapshot: `d`'s rewrites are a range.
+            let from = applied.partition_point(|(k, _)| k.0 < d);
+            let to = from + applied[from..].partition_point(|(k, _)| k.0 == d);
+            let (rebased, versions): (Vec<_>, Vec<_>) = applied[from..to].iter().partition(|(k, r)| r.commands.is_empty() && rebases.contains(k));
             let mut versions: Vec<&Vec<ObjectId>> = versions.iter().map(|(k, _)| &k.1).collect();
             versions.sort();
             versions.dedup();

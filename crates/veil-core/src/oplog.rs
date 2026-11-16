@@ -723,6 +723,10 @@ impl Split {
 /// A tag's target and annotation, merged as one unit.
 type TagUnit = (ObjectId, Option<ObjectId>);
 
+/// What merges' rebases made: (a ref's name, the value made) to the values
+/// it was made from. See [`Introduced::add_rebases`].
+type Rebased<T> = HashMap<(String, T), Vec<T>>;
+
 /// The values some operations introduced: a key's value in an operation's
 /// view that none of its parents' views has (a new snapshot of a
 /// workspace, a tag set or removed, a head added or dropped). A merge of
@@ -736,10 +740,11 @@ pub struct Introduced {
     heads: std::collections::HashSet<(ObjectId, bool)>,
     /// What a merge's rebase made of a parent's working copy or tag (the
     /// value it made, the parent's value): see [`Introduced::add_rebases`].
-    rebased_workspaces: std::collections::HashSet<(String, ObjectId, ObjectId)>,
-    rebased_tags: std::collections::HashSet<(String, TagUnit, TagUnit)>,
+    /// (Keyed by the name and the value made, to the parents' values.)
+    rebased_workspaces: Rebased<ObjectId>,
+    rebased_tags: Rebased<TagUnit>,
     /// A head a merge's rebase made of a parent's head (made, the parent's).
-    rebased_heads: std::collections::HashSet<(ObjectId, ObjectId)>,
+    rebased_heads: HashMap<ObjectId, Vec<ObjectId>>,
 }
 
 impl Introduced {
@@ -760,21 +765,28 @@ impl Introduced {
             x
         };
         let follows = |from: ObjectId, to: ObjectId| from != to && follow(from) == to;
+        // Only a value the merge itself made: one no parent has for that
+        // key. Its `rewritten` also holds the rewrites of the commands it
+        // merged, and a value one of those set (a describe's new version
+        // as a head, its working copy, a tag it moved) is that command's
+        // change, not a rebase (BUG-2550).
         for p in parents {
             for h in p.heads.iter().filter(|h| !view.heads.contains(*h)) {
                 let n = follow(*h);
-                if n != *h && view.heads.contains(&n) && !p.heads.contains(&n) {
-                    self.rebased_heads.insert((n, *h));
+                if follows(*h, n) && view.heads.contains(&n) && !parents.iter().any(|q| q.heads.contains(&n)) {
+                    self.rebased_heads.entry(n).or_default().push(*h);
                 }
             }
             for (n, w) in &view.workspaces {
-                if let Some(pw) = p.workspaces.get(n).filter(|pw| pw.wc != w.wc && follows(pw.wc, w.wc)) {
-                    self.rebased_workspaces.insert((n.clone(), w.wc, pw.wc));
+                let made = !parents.iter().any(|q| q.workspaces.get(n).is_some_and(|qw| qw.wc == w.wc));
+                if let Some(pw) = p.workspaces.get(n).filter(|pw| made && follows(pw.wc, w.wc)) {
+                    self.rebased_workspaces.entry((n.clone(), w.wc)).or_default().push(pw.wc);
                 }
             }
             for (n, t) in &view.tags {
-                if let Some(pt) = p.tags.get(n).filter(|pt| pt.target != t.target && pt.annotation == t.annotation && follows(pt.target, t.target)) {
-                    self.rebased_tags.insert((n.clone(), (t.target, t.annotation), (pt.target, pt.annotation)));
+                let made = !parents.iter().any(|q| q.tags.get(n).is_some_and(|qt| qt.target == t.target && qt.annotation == t.annotation));
+                if let Some(pt) = p.tags.get(n).filter(|pt| made && pt.annotation == t.annotation && follows(pt.target, t.target)) {
+                    self.rebased_tags.entry((n.clone(), (t.target, t.annotation))).or_default().push((pt.target, pt.annotation));
                 }
             }
         }
@@ -847,7 +859,6 @@ pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introd
 /// history, or made since the sides split?).
 pub(crate) fn shared_base_with(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introduced, rebases: bool) -> View {
     type Set<T> = std::collections::HashSet<(String, Option<T>)>;
-    type Rebased<T> = std::collections::HashSet<(String, T, T)>;
     fn key<T: Copy + PartialEq + Eq + std::hash::Hash, V: Clone>(
         name: &str,
         va: Option<&V>,
@@ -864,7 +875,9 @@ pub(crate) fn shared_base_with(base: &View, a: &View, ia: &Introduced, b: &View,
         // A merge's rebase of a value the side's own operations did not
         // introduce (one of the shared history, moved): no change of that
         // side's (BUG-2464).
-        let rebased = |u: Option<T>, i: &Set<T>, r: &Rebased<T>| u.is_some_and(|u| r.iter().any(|(n, made, from)| n == name && *made == u && !i.contains(&(name.to_string(), Some(*from)))));
+        let rebased = |u: Option<T>, i: &Set<T>, r: &Rebased<T>| {
+            u.is_some_and(|u| r.get(&(name.to_string(), u)).is_some_and(|from| from.iter().any(|f| !i.contains(&(name.to_string(), Some(*f))))))
+        };
         match (ia.contains(&(name.to_string(), ua)), ib.contains(&(name.to_string(), ub))) {
             (false, true) => va.cloned(),
             (true, false) => vb.cloned(),
@@ -905,7 +918,7 @@ pub(crate) fn shared_base_with(base: &View, a: &View, ia: &Introduced, b: &View,
     // where the other side's own operations dropped that head: the shared
     // history's head, moved, which the other side dropped (BUG-2464).
     let moved = |h: &ObjectId, i: &Introduced, other: &Introduced| {
-        rebases && i.rebased_heads.iter().any(|(made, from)| made == h && !i.heads.contains(&(*from, true)) && other.heads.contains(&(*from, false)))
+        rebases && i.rebased_heads.get(h).is_some_and(|from| from.iter().any(|f| !i.heads.contains(&(*f, true)) && other.heads.contains(&(*f, false))))
     };
     for h in heads {
         let (pa, pb) = (a.heads.contains(h), b.heads.contains(h));
