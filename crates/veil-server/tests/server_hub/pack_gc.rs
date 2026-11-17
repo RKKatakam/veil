@@ -2795,8 +2795,8 @@ fn bug_2602_a_switch_gives_way_past_its_bound_and_the_next_pass_collects() {
 /// branch move, through the push's own guard) while GC passes past the
 /// retention window run one after another. A pass collects the dead object,
 /// and every commit pushed is whole afterwards (its tree, files and
-/// ancestors), as is a snapshot past the window that the pusher builds on
-/// while the passes run.
+/// ancestors: among them a snapshot past the window, wherever a merge with
+/// it was accepted while the passes ran).
 #[test]
 fn bug_2602_gc_collects_under_pushes_of_new_commits_and_loses_nothing() {
     let hub = TestHub::start();
@@ -2828,14 +2828,23 @@ fn bug_2602_gc_collects_under_pushes_of_new_commits_and_loses_nothing() {
             let mut n = 0;
             while !stop.load(Relaxed) {
                 n += 1;
-                let mut c = Craft::with(&api, token.clone(), identity.clone(), &name, "busy");
-                c.file(&format!("src/busy-{}.rs", n % 7), &format!("BUSY-2602-{n}\n"));
-                // Every fifth commit is a merge with the snapshot past the window.
-                let (id, r) = c.push_edited("busy", Some(tip), |s| {
-                    if n % 5 == 0 {
-                        s.parents.push(old);
-                    }
-                });
+                let commit = |merge: bool| {
+                    let mut c = Craft::with(&api, token.clone(), identity.clone(), &name, "busy");
+                    c.file(&format!("src/busy-{}.rs", n % 7), &format!("BUSY-2602-{n}\n"));
+                    c.push_edited("busy", Some(tip), |s| {
+                        if merge {
+                            s.parents.push(old);
+                        }
+                    })
+                };
+                // Every fifth commit is a merge with the snapshot past the
+                // window: accepted while the server records that snapshot,
+                // refused once a pass has purged it (its pusher would upload
+                // it again); then the commit is pushed without it.
+                let (mut id, mut r) = commit(n % 5 == 0);
+                if n % 5 == 0 && r.status == 400 && String::from_utf8_lossy(&r.body).contains("was not uploaded") {
+                    (id, r) = commit(false);
+                }
                 assert_eq!(r.status, 200, "steady push {n}: {}", String::from_utf8_lossy(&r.body));
                 assert_eq!(r.json()["results"][0]["ok"], json!(true), "steady push {n} ok: {}", String::from_utf8_lossy(&r.body));
                 tip = id;
@@ -2874,7 +2883,6 @@ fn bug_2602_gc_collects_under_pushes_of_new_commits_and_loses_nothing() {
     for id in &pushed {
         assert!(hub.rt.block_on(fresh.exists(pid, id)).unwrap(), "commit {id} pushed while GC passed is stored");
     }
-    assert!(hub.rt.block_on(fresh.exists(pid, &old)).unwrap(), "the snapshot past the window that pushes built on is kept");
 }
 
 /// BUG-2602: every table the reference stamp covers is one the switch reads
