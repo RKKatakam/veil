@@ -6,7 +6,6 @@
 -- person's `vl identity confirm` looks it up by it, so no number of other
 -- pending devices under the name can hide it.
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS fingerprint TEXT;
-CREATE INDEX IF NOT EXISTS devices_by_fingerprint ON devices (person_id, fingerprint);
 -- An invite: the public key of a secret only the invite link holds. The
 -- join is the joining device's signature under it; key rings hold the
 -- admin-signed record of the same key, and are the authority for keys.
@@ -49,3 +48,6 @@ CREATE TABLE IF NOT EXISTS device_expected (
     expires_at BIGINT NOT NULL,
     PRIMARY KEY (person_id, fingerprint)
 );
+
+-- veil: online indexes (outside the transaction, `db::ONLINE_INDEXES`: on a table servers already write)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS devices_by_fingerprint ON devices (person_id, fingerprint);

@@ -13,8 +13,9 @@
 //!   statement waits forever, on PostgreSQL or YugabyteDB.
 //! * Migrations ([`migrate`]) run once, by one process holding an
 //!   advisory lock, in order, each in its own transaction, recorded in
-//!   `schema_migrations`. A server that finds the schema current runs no
-//!   DDL (BUG-838).
+//!   `schema_migrations`; an index on a table servers already write is
+//!   built online, outside the transaction ([`ONLINE_INDEXES`], BUG-2482).
+//!   A server that finds the schema current runs no DDL (BUG-838).
 //! * Every request runs again, within [`TRANSACTION_DEADLINE`], when it
 //!   fails on a retryable database error (a lost race, a restarted read, a
 //!   catalog changed by a migration) before anything it did was committed
@@ -41,7 +42,12 @@ use sqlx::{postgres::PgPoolOptions, PgConnection, PgPool};
 
 use crate::error::{Error, Result};
 
-/// The migrations, in order. Never edit one that shipped: add a new one.
+/// The migrations, in order. Never change what one that shipped makes: add
+/// a new one. (Migrations 3, 11, 23, 24, 26, 28, 30, 35, 36 and 40 moved
+/// their indexes on tables that existed before them into an
+/// [`ONLINE_INDEXES`] section, BUG-2482: the
+/// same indexes, built online; the runner keeps no checksums, and a
+/// database that applied one never applies it again.)
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
     (2, "device_vouches", include_str!("../migrations/0002_device_vouches.sql")),
@@ -198,6 +204,19 @@ pub async fn schema_current(pool: &PgPool) -> anyhow::Result<bool> {
 ///
 /// `veil-server migrate` runs it on its own, before servers start.
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+    migrate_with(pool, None).await
+}
+
+/// What [`migrate_with`] runs after each online index build returns, before
+/// the index is read, given the index's name.
+#[doc(hidden)]
+pub type AfterBuild = dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
+
+/// [`migrate`], with `after_build` run after each online index build. For
+/// tests only (`startup::bug_2571_…`): a build that returns with its index
+/// left incomplete, as YugabyteDB's did (BUG-2571), made at will.
+#[doc(hidden)]
+pub async fn migrate_with(pool: &PgPool, after_build: Option<&AfterBuild>) -> anyhow::Result<()> {
     if schema_current(pool).await? {
         return Ok(());
     }
@@ -213,11 +232,14 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "another server's migrations did not finish within {MIGRATION_DEADLINE:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let r = migrate_locked(&mut c, deadline).await;
-    // The lock is the session's: release it, or close the connection so
-    // that the lock never goes back into the pool.
+    let r = migrate_locked(&mut c, deadline, after_build).await;
+    // The lock is the session's: release it, and reset the online index
+    // steps' timeouts in case a step's own reset failed
+    // (`online_index_step`), or close the connection so that neither goes
+    // back into the pool.
+    let reset = sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout").execute(&mut *c).await;
     let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)").bind(MIGRATION_LOCK).fetch_one(&mut *c).await;
-    if !matches!(unlocked, Ok(true)) {
+    if reset.is_err() || !matches!(unlocked, Ok(true)) {
         let _ = sqlx::Connection::close(c.detach()).await;
     }
     r
@@ -227,11 +249,11 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
 /// DDL can still lose a race with other databases' catalog changes on
 /// YugabyteDB (the catalog is shared): each step runs again, within the
 /// deadline, on a retryable error.
-async fn migrate_locked(c: &mut PgConnection, deadline: tokio::time::Instant) -> anyhow::Result<()> {
+async fn migrate_locked(c: &mut PgConnection, deadline: tokio::time::Instant, after_build: Option<&AfterBuild>) -> anyhow::Result<()> {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match migrate_once(&mut *c).await {
+        match migrate_once(&mut *c, deadline, after_build).await {
             Ok(()) => return Ok(()),
             Err(e) if e.is_retryable() && tokio::time::Instant::now() < deadline => {
                 eprintln!("veil-server: migrating, retrying: {e:?}");
@@ -244,7 +266,7 @@ async fn migrate_locked(c: &mut PgConnection, deadline: tokio::time::Instant) ->
     }
 }
 
-async fn migrate_once(c: &mut PgConnection) -> Result<()> {
+async fn migrate_once(c: &mut PgConnection, deadline: tokio::time::Instant, after_build: Option<&AfterBuild>) -> Result<()> {
     let table: Option<String> = sqlx::query_scalar("SELECT to_regclass('schema_migrations')::text").fetch_one(&mut *c).await?;
     if table.is_none() {
         sqlx::raw_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)")
@@ -252,28 +274,312 @@ async fn migrate_once(c: &mut PgConnection) -> Result<()> {
             .await?;
     }
     let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM schema_migrations").fetch_all(&mut *c).await?;
+    let mut yugabyte = None;
     for &(version, name, sql) in MIGRATIONS {
         if applied.contains(&version) {
             continue;
         }
         eprintln!("veil-server: applying migration {version} ({name})");
-        // Each migration in its own transaction. Migration files are
-        // idempotent (`IF NOT EXISTS`): YugabyteDB applies DDL in a
-        // transaction block statement by statement unless transactional
-        // DDL is enabled, so a migration interrupted half-way is applied
-        // again from the start.
-        let mut tx = sqlx::Connection::begin(&mut *c).await?;
-        sqlx::raw_sql(sql).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)")
-            .bind(version)
-            .bind(name)
-            .bind(veil_core::now_millis())
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+        let parts = migration_parts(sql).map_err(|e| Error::Other(anyhow::anyhow!("migration {version} ({name}): {e}")))?;
+        let record = "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)";
+        if parts.online.is_empty() {
+            // Each migration in its own transaction. Migration files are
+            // idempotent (`IF NOT EXISTS`): YugabyteDB applies DDL in a
+            // transaction block statement by statement unless transactional
+            // DDL is enabled, so a migration interrupted half-way is applied
+            // again from the start.
+            let mut tx = sqlx::Connection::begin(&mut *c).await?;
+            sqlx::raw_sql(sql).execute(&mut *tx).await?;
+            sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *tx).await?;
+            tx.commit().await?;
+            continue;
+        }
+        // The statements before the online section in one transaction, not
+        // recorded; then the online index steps one by one; then the
+        // record. A migration that fails anywhere is not recorded and is
+        // applied again from the start (both parts are idempotent).
+        if has_statements(parts.transactional) {
+            let mut tx = sqlx::Connection::begin(&mut *c).await?;
+            sqlx::raw_sql(parts.transactional).execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
+        let yb = match yugabyte {
+            Some(yb) => yb,
+            None => {
+                let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&mut *c).await?;
+                let yb = is_yugabyte(&version);
+                if yb {
+                    // YugabyteDB's online build holds every row only while it
+                    // waits for every backend to see each stage of the index.
+                    let off: Option<String> =
+                        sqlx::query_scalar("SELECT current_setting('yb_disable_wait_for_backends_catalog_version', true)").fetch_one(&mut *c).await?;
+                    if off.as_deref() == Some("on") {
+                        return Err(Error::Other(anyhow::anyhow!(
+                            "this YugabyteDB runs with yb_disable_wait_for_backends_catalog_version on, so an index built online \
+                             could miss rows written during its build: set it off (its default) to migrate"
+                        )));
+                    }
+                }
+                *yugabyte.insert(yb)
+            }
+        };
+        for step in &parts.online {
+            online_index_step(&mut *c, yb, step, deadline, after_build).await?;
+        }
+        sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
     }
     Ok(())
 }
+
+/// The line of a migration after which its statements are index steps
+/// applied online, one by one, outside its transaction (BUG-2482): every
+/// index on a table that servers already write (a rolling upgrade's
+/// running servers write it while the index is built).
+///
+/// * Built in a transaction block, an index holds every write to its table
+///   off for the whole build on PostgreSQL (a large table's stalls every
+///   push, and the build can pass the 15 s statement timeout, so the
+///   migration never finishes); on YugabyteDB it is built without holding
+///   writes off, and rows written during the build can be missing from it
+///   with no error.
+/// * Outside one, `CREATE INDEX CONCURRENTLY` is PostgreSQL's online build
+///   and YugabyteDB's (its default outside a transaction block: the index
+///   takes writes before its backfill, then is made valid).
+/// * A step is `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS <name> …;`
+///   or `DROP INDEX CONCURRENTLY IF EXISTS <name>;` (the runner drops with
+///   `DROP INDEX IF EXISTS` on YugabyteDB, which has no concurrent drop);
+///   whole-line `--` comments only, no other statement ([`migration_parts`]).
+/// * An index is built when `pg_index` reads it live, ready and valid
+///   (`indislive`, `indisready`, `indisvalid`; `index_built`). One that
+///   is not (a failed build left it invalid: `IF NOT EXISTS` would keep it,
+///   and the database would never use it, or a unique one would refuse
+///   rows while not serving reads) is dropped before the build. After the
+///   build the index must read built within `VALID_WAIT` (on YugabyteDB,
+///   under load, a build returned about 200 ms before its session read the
+///   index valid, BUG-2482); if it does not, it is dropped and built again,
+///   up to `BUILD_ATTEMPTS` builds: on YugabyteDB a build can return
+///   success with a stage of its index lost for good (BUG-2571: its last
+///   step's catalog version increment lost a race with another database's
+///   DDL, and `indisvalid` stayed false). An index that no build made
+///   built fails the migration, which is not recorded.
+/// * An index step runs under statement and lock timeouts of what is left
+///   of the migrations' deadline (at least [`STATEMENT_TIMEOUT`]), not the
+///   pool's: a large table's build takes longer than 15 s, and the
+///   concurrent build waits for the transactions already running. A build
+///   that needs longer than is left fails, saying how to build the index by
+///   hand (BUG-2520: it would time out at every start).
+///
+/// An index on a table created by the same migration needs none of this
+/// (no server writes a table it does not know): it stays in the transaction.
+pub const ONLINE_INDEXES: &str = "-- veil: online indexes";
+
+/// A migration's statements: those applied in one transaction, then its
+/// [`ONLINE_INDEXES`] steps.
+#[derive(Debug)]
+pub struct MigrationParts<'a> {
+    pub transactional: &'a str,
+    pub online: Vec<IndexStep>,
+}
+
+/// One step of a migration's [`ONLINE_INDEXES`] section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexStep {
+    /// Build index `name` with `sql` (`CREATE … INDEX CONCURRENTLY IF NOT EXISTS`).
+    Create { name: String, sql: String },
+    /// Drop index `name`, if it exists.
+    Drop { name: String },
+}
+
+/// Split a migration at its [`ONLINE_INDEXES`] line, and read its steps;
+/// what the section holds that is not a step is refused.
+pub fn migration_parts(sql: &str) -> std::result::Result<MigrationParts<'_>, String> {
+    let at = sql.match_indices(ONLINE_INDEXES).map(|(i, _)| i).find(|&i| i == 0 || sql.as_bytes()[i - 1] == b'\n');
+    let Some(at) = at else {
+        return Ok(MigrationParts { transactional: sql, online: Vec::new() });
+    };
+    let rest = &sql[at..];
+    let section = rest.split_once('\n').map_or("", |(_, after)| after);
+    if section.lines().any(|l| l.trim_start().starts_with(ONLINE_INDEXES)) {
+        return Err("more than one online indexes section".into());
+    }
+    let text: String = section.lines().filter(|l| !l.trim_start().starts_with("--")).collect::<Vec<_>>().join("\n");
+    if !text.trim_end().is_empty() && !text.trim_end().ends_with(';') {
+        return Err("the online indexes section's last statement does not end with ';'".into());
+    }
+    let mut online = Vec::new();
+    for stmt in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        if stmt.contains("--") || stmt.contains("/*") || stmt.contains('$') {
+            return Err(format!("an online index step may hold no comment or dollar quote: {stmt}"));
+        }
+        let words: Vec<&str> = stmt.split_whitespace().collect();
+        let identifier = |w: &str| {
+            !w.is_empty()
+                && w.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                && !w.as_bytes()[0].is_ascii_digit()
+        };
+        let create = match words.as_slice() {
+            ["CREATE", "INDEX", "CONCURRENTLY", "IF", "NOT", "EXISTS", name, "ON", _, ..] => Some(*name),
+            ["CREATE", "UNIQUE", "INDEX", "CONCURRENTLY", "IF", "NOT", "EXISTS", name, "ON", _, ..] => Some(*name),
+            _ => None,
+        };
+        match (create, words.as_slice()) {
+            (Some(name), _) if identifier(name) => online.push(IndexStep::Create { name: name.to_string(), sql: stmt.to_string() }),
+            (None, ["DROP", "INDEX", "CONCURRENTLY", "IF", "EXISTS", name]) if identifier(name) => {
+                online.push(IndexStep::Drop { name: name.to_string() })
+            }
+            _ => {
+                return Err(format!(
+                    "an online index step is `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS <name> ON …` or \
+                     `DROP INDEX CONCURRENTLY IF EXISTS <name>` (a lower-case name): {stmt}"
+                ))
+            }
+        }
+    }
+    if online.is_empty() {
+        return Err("an online indexes section with no step".into());
+    }
+    Ok(MigrationParts { transactional: &sql[..at], online })
+}
+
+/// Whether `sql` holds anything but blank lines and `--` comments.
+fn has_statements(sql: &str) -> bool {
+    sql.lines().any(|l| {
+        let l = l.trim();
+        !l.is_empty() && !l.starts_with("--")
+    })
+}
+
+/// Whether index `name` exists, and if so whether it is built: live,
+/// ready and valid in `pg_index`, each stage of an online build. `None`
+/// when no relation has the name, `Some(None)` when one does that is not
+/// an index.
+///
+/// Valid alone is not enough on YugabyteDB: a stage's catalog write can be
+/// lost while its build returns success (BUG-2571, where `indisvalid` was
+/// lost), and an index made valid with `indisready` lost would be read
+/// while writes leave it out.
+async fn index_built(c: &mut PgConnection, name: &str) -> Result<Option<Option<bool>>> {
+    let row: Option<(Option<bool>,)> = sqlx::query_as(
+        "SELECT (SELECT i.indislive AND i.indisready AND i.indisvalid FROM pg_index i WHERE i.indexrelid = r.oid) \
+         FROM (SELECT to_regclass($1) AS oid) r WHERE r.oid IS NOT NULL",
+    )
+    .bind(name)
+    .fetch_optional(&mut *c)
+    .await?;
+    Ok(row.map(|(v,)| v))
+}
+
+/// Drop index `name` if it exists, online where the database can.
+async fn drop_index(c: &mut PgConnection, yugabyte: bool, name: &str) -> Result<()> {
+    // `name` is a checked lower-case identifier (`migration_parts`).
+    let q = if yugabyte { format!("DROP INDEX IF EXISTS {name}") } else { format!("DROP INDEX CONCURRENTLY IF EXISTS {name}") };
+    sqlx::raw_sql(&q).execute(&mut *c).await?;
+    Ok(())
+}
+
+/// Apply one [`ONLINE_INDEXES`] step, outside any transaction, under
+/// statement and lock timeouts of what is left of the migrations' deadline
+/// (at least the pool's own statement timeout), then the connection's own
+/// again (`migrate` resets them too, or closes the connection). An index
+/// that does not read built after its build is built again, up to
+/// `BUILD_ATTEMPTS` builds, while the deadline lasts (BUG-2571).
+async fn online_index_step(
+    c: &mut PgConnection,
+    yugabyte: bool,
+    step: &IndexStep,
+    deadline: tokio::time::Instant,
+    after_build: Option<&AfterBuild>,
+) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(STATEMENT_TIMEOUT);
+        let ms = left.as_millis();
+        sqlx::raw_sql(&format!("SET statement_timeout = {ms}; SET lock_timeout = {ms}")).execute(&mut *c).await?;
+        let r = online_index_step_now(&mut *c, yugabyte, step, after_build).await;
+        let reset = sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout").execute(&mut *c).await;
+        let built = r?;
+        reset?;
+        let name = match (built, step) {
+            (true, _) | (_, IndexStep::Drop { .. }) => return Ok(()),
+            (false, IndexStep::Create { name, .. }) => name,
+        };
+        if attempt >= BUILD_ATTEMPTS || tokio::time::Instant::now() >= deadline {
+            return Err(Error::Other(anyhow::anyhow!(
+                "index {name} is not built (live, ready and valid) {VALID_WAIT:?} after its build, in {attempt} builds: \
+                 the migration is not recorded, and the next start drops the index and builds it again"
+            )));
+        }
+        // Dropped by the next build, before it begins.
+        eprintln!("veil-server: index {name} is not built (live, ready and valid) {VALID_WAIT:?} after build {attempt} returned: building it again");
+    }
+}
+
+/// One try at a step: `false` when a build returned and its index did not
+/// read built within `VALID_WAIT`.
+async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &IndexStep, after_build: Option<&AfterBuild>) -> Result<bool> {
+    let (name, sql) = match step {
+        IndexStep::Drop { name } => return drop_index(&mut *c, yugabyte, name).await.map(|()| true),
+        IndexStep::Create { name, sql } => (name, sql),
+    };
+    if index_built(&mut *c, name).await? == Some(Some(false)) {
+        eprintln!("veil-server: index {name} was left incomplete by a build that did not finish: dropping it to build it again");
+        drop_index(&mut *c, yugabyte, name).await?;
+    }
+    if let Err(e) = sqlx::raw_sql(sql).execute(&mut *c).await {
+        // A failed build leaves its index invalid: not used, but written
+        // (and a unique one refusing rows). Dropped now when it can be, or
+        // before the build is tried again.
+        if let Ok(Some(Some(false))) = index_built(&mut *c, name).await {
+            let _ = drop_index(&mut *c, yugabyte, name).await;
+        }
+        // Its timeouts are what was left of the migrations' deadline: a
+        // build that needs longer would time out at every start, dropped
+        // and begun again (BUG-2520). Say how to build it by hand instead.
+        let timed_out = e.as_database_error().and_then(|d| d.code()).is_some_and(|code| code == "57014" || code == "55P03");
+        if timed_out {
+            return Err(Error::Other(anyhow::anyhow!(
+                "building index {name} did not finish within what was left of the migrations' {MIGRATION_DEADLINE:?} ({e}): \
+                 build it by hand, as long as it takes, with `{sql}` (if that build fails, first drop the invalid index it \
+                 leaves with `DROP INDEX IF EXISTS {name}`), then start the server again: it finds the index built and \
+                 records the migration"
+            )));
+        }
+        return Err(e.into());
+    }
+    if let Some(after_build) = after_build {
+        after_build(name.clone()).await;
+    }
+    // On YugabyteDB, under load, the build can return before this session
+    // reads its index valid (seen in `verify-server.sh`), or reads it at
+    // all: read again, for at most `VALID_WAIT`.
+    let began = tokio::time::Instant::now();
+    let until = began + VALID_WAIT;
+    let mut looks = 0u32;
+    loop {
+        looks += 1;
+        match index_built(&mut *c, name).await? {
+            Some(Some(true)) => {
+                if looks > 1 {
+                    eprintln!("veil-server: index {name} read built {:?} after its build returned", began.elapsed());
+                }
+                return Ok(true);
+            }
+            Some(Some(false)) | None if tokio::time::Instant::now() < until => tokio::time::sleep(Duration::from_millis(200)).await,
+            Some(Some(false)) | None => return Ok(false),
+            Some(None) => return Err(Error::Other(anyhow::anyhow!("{name} is not an index, so the index of that name was not built"))),
+        }
+    }
+}
+
+/// How long an index that its build returned from may take to read built
+/// (live, ready and valid) before it is built again. The lag seen was about
+/// 200 ms (BUG-2482); a build whose stage was lost (BUG-2571) read invalid
+/// minutes later, in new sessions, and is not waited for longer.
+const VALID_WAIT: Duration = Duration::from_secs(15);
+/// How many times one migration step builds an index that does not read
+/// built after its build (BUG-2571), within the migrations' deadline.
+const BUILD_ATTEMPTS: u32 = 5;
 
 pub type TxFuture<'t, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>;
 

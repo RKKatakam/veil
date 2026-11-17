@@ -9,10 +9,6 @@ ALTER TABLE prs
 ALTER TABLE prs
     ADD COLUMN IF NOT EXISTS land_at_release BOOLEAN NOT NULL DEFAULT FALSE;
 
-CREATE INDEX IF NOT EXISTS prs_by_embargo
-    ON prs (project_id, embargo)
-    WHERE embargo <> '';
-
 ALTER TABLE embargo_lines
     ADD COLUMN IF NOT EXISTS has_pr BOOLEAN NOT NULL DEFAULT FALSE;
 
@@ -32,3 +28,8 @@ CREATE TABLE IF NOT EXISTS pr_embargo_holds (
 
 CREATE INDEX IF NOT EXISTS pr_embargo_holds_by_path
     ON pr_embargo_holds (project_id, embargo, path);
+
+-- veil: online indexes (outside the transaction, `db::ONLINE_INDEXES`: on a table servers already write)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS prs_by_embargo
+    ON prs (project_id, embargo)
+    WHERE embargo <> '';

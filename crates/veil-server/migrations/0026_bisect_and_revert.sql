@@ -15,8 +15,6 @@
 --   the revert ticket (`revert_ticket`) so a revert lands at most once.
 -- Idempotent (IF NOT EXISTS).
 ALTER TABLE landing_queue ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 0;
-DROP INDEX IF EXISTS landing_queue_ready;
-CREATE INDEX IF NOT EXISTS landing_queue_ready ON landing_queue (project_id, branch, state, priority DESC, created_at, seq);
 
 CREATE TABLE IF NOT EXISTS bisect_leases (
     project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -69,3 +67,8 @@ CREATE TABLE IF NOT EXISTS bisect_reverts (
     created_at BIGINT NOT NULL,
     PRIMARY KEY (project_id, branch, lineage, culprit)
 );
+
+-- veil: online indexes (outside the transaction, `db::ONLINE_INDEXES`: on a table servers already write)
+-- The queue's order, reverts first: made again with `priority`.
+DROP INDEX CONCURRENTLY IF EXISTS landing_queue_ready;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS landing_queue_ready ON landing_queue (project_id, branch, state, priority DESC, created_at, seq);

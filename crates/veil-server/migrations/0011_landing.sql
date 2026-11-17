@@ -94,12 +94,6 @@ CREATE INDEX IF NOT EXISTS landings_at ON landings (project_id, at);
 -- Is a snapshot one the service landed on a branch?
 CREATE INDEX IF NOT EXISTS landings_landed ON landings (project_id, branch, lineage, landed);
 
--- The real snapshots of one view's projected id (`landing::Ancestry::
--- below_hidden`: a run of changes hidden from a submitter stepped over in
--- one statement; `sync::resolve_newest`: a branch tip, or the newest, among
--- them), by one index range.
-CREATE INDEX IF NOT EXISTS projections_by_view ON projections (project_id, view_key, projected_id);
-
 -- What each landing was made from (BUG-1465, BUG-1466): one row for each
 -- snapshot the landing service landed (as `snapshots`, never deleted), the
 -- submitted snapshot it was made from as `source`. "Already landed" asks
@@ -118,7 +112,6 @@ CREATE TABLE IF NOT EXISTS landed_from (
 -- row (`projections_own`), however long the run. Rows written before this
 -- column count as collapsed (the step then reads the run itself, bounded).
 ALTER TABLE projections ADD COLUMN IF NOT EXISTS collapsed BOOLEAN NOT NULL DEFAULT TRUE;
-CREATE INDEX IF NOT EXISTS projections_own ON projections (project_id, view_key, projected_id) WHERE NOT collapsed;
 
 -- Each change landed on a branch, by its change id and author (the person
 -- whose signature is on the change), within the branch's lineage then, and
@@ -141,3 +134,11 @@ CREATE TABLE IF NOT EXISTS landed_changes (
 );
 CREATE INDEX IF NOT EXISTS landed_changes_by_author ON landed_changes (project_id, branch, change_id, author);
 
+-- veil: online indexes (outside the transaction, `db::ONLINE_INDEXES`: on a table servers already write)
+-- The real snapshots of one view's projected id (`landing::Ancestry::
+-- below_hidden`: a run of changes hidden from a submitter stepped over in
+-- one statement; `sync::resolve_newest`: a branch tip, or the newest, among
+-- them), by one index range.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS projections_by_view ON projections (project_id, view_key, projected_id);
+-- A view's changes not collapsed (`projections_own`: `projections.collapsed` above).
+CREATE INDEX CONCURRENTLY IF NOT EXISTS projections_own ON projections (project_id, view_key, projected_id) WHERE NOT collapsed;

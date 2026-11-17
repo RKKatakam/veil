@@ -9,10 +9,6 @@
 ALTER TABLE branches
     ADD COLUMN IF NOT EXISTS hidden_for_embargo TEXT;
 
-CREATE INDEX IF NOT EXISTS branches_hidden_embargo
-    ON branches (project_id, hidden_for_embargo)
-    WHERE hidden_for_embargo IS NOT NULL;
-
 CREATE TABLE IF NOT EXISTS embargo_lines (
     project_id      BIGINT  NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     embargo_id      TEXT    NOT NULL,
@@ -40,3 +36,8 @@ CREATE TABLE IF NOT EXISTS embargo_snapshots (
 
 CREATE INDEX IF NOT EXISTS embargo_snapshots_by_embargo
     ON embargo_snapshots (project_id, embargo_id);
+
+-- veil: online indexes (outside the transaction, `db::ONLINE_INDEXES`: on a table servers already write)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS branches_hidden_embargo
+    ON branches (project_id, hidden_for_embargo)
+    WHERE hidden_for_embargo IS NOT NULL;
