@@ -2999,9 +2999,23 @@ Nothing changes for `vl` or on the wire.
   them (§13.37, BUG-2462). Weights are read from the maps under one lock, so
   eviction and additions never miscount. Such a lookup searches the loaded
   indexes and names the unloaded ones **under one read of the map**, then
-  reads those from storage, so together they cover every listed pack and
+  searches those in storage, so together they cover every listed pack and
   **no lookup answers "missing" for a stored object**, whatever other
-  lookups page in or out meanwhile (BUG-1495). **Every pack index held in
+  lookups page in or out meanwhile (BUG-1495). **An unloaded index is
+  searched where it is stored** (BUG-2631, 2026-11-17): its first 64 KiB,
+  then a bisection by ranged reads of that size under one share of that
+  size, as a staged pack's index is (`Packs::stored_slots`); only the index
+  that holds the object is then read whole and loaded. Before, every
+  unloaded index was read whole and loaded, each unloading another, also
+  for an object none of them held: a project whose packed objects outgrew
+  the budget (2.7 million, at 48 bytes a slot), asked for such objects some
+  fifty times a second, spent all its time there (the landing benchmark
+  with every landing's objects in packs: 190,000 to 310,000 index reads
+  every 10 s from the fourth minute, and 100 landings a second where it
+  held 1,000). A lookup for an object in no pack still costs a few ranged
+  reads for every unloaded index, which grows with the project: what would
+  bound it (a filter of each unloaded index kept in memory, or the
+  objects' packs in the database) is not built. **Every pack index held in
   memory outside the lookup maps holds a share of one server-wide bound**
   (`pack::INDEXES_HELD`, 96 MiB for every request together, of which the
   staged-index cache may hold 32 MiB), taken before the first bytes are

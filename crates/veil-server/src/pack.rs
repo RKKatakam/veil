@@ -43,7 +43,10 @@
 //! **Lookups.** Each server keeps, per project, the indexes of the listed
 //! packs it has read ([`Packs`]), bounded by bytes across projects
 //! ([`LOOKUP_BUDGET`]); past it an index is unloaded, and a lookup that
-//! needs it reads it again. A miss there and among loose objects reads the
+//! finds its object in no loaded index searches the unloaded ones where
+//! they are stored, by ranged reads, and loads the one that holds it
+//! (BUG-2631: each was read whole and loaded, for an object none of them
+//! held too). A miss there and among loose objects reads the
 //! project's listing again (one statement) and the indexes of packs it
 //! does not know. **Every other index held in memory** (one being read, a
 //! push's staged uploads', the staged-index cache's) holds a share of one
