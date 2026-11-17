@@ -493,7 +493,7 @@ impl Storing {
             };
         }
         match &*s {
-            Storing::Failed(e) => Err(Error::Other(anyhow::anyhow!("storing the batch's objects: {e}"))),
+            Storing::Failed(e) => Err(Error::Other(anyhow::anyhow!("{STORE_FAILED}: {e}"))),
             Storing::Stored(packs) => Ok(packs.iter().map(|(n, _)| n.clone()).collect()),
             Storing::Running(_) => unreachable!("waited for above"),
         }
@@ -840,7 +840,14 @@ impl Service {
                     eprintln!("veil-server: a landing batch of project {} failed: {e:?}", self.project);
                 }
                 *state = self.load().await?;
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // A store that fails is tried again less often: each try
+                // records a pack before it writes it (a row an hour's sweep
+                // removes), and the store is the same for the next one.
+                let pause = match &e {
+                    Error::Other(a) if a.to_string().starts_with(STORE_FAILED) => STORE_RETRY,
+                    _ => Duration::from_millis(50),
+                };
+                tokio::time::sleep(pause).await;
                 Ok(true)
             }
         }
@@ -1950,6 +1957,10 @@ const REVIEW_WRITERS: &str = "the review gate's writers come first";
 const STORE_IN_TRANSACTION: Duration = Duration::from_millis(LEASE_MS as u64 / 2);
 /// An entry whose stack was judged under another lineage of the branch.
 const RESET: &str = "the branch was reset since this change was submitted (a forced push, or deleted and made again): submit it again";
+/// The batch's objects could not be stored (the start of the error), and
+/// how long the service waits before it builds the batch again.
+const STORE_FAILED: &str = "storing the batch's objects";
+const STORE_RETRY: Duration = Duration::from_millis(250);
 /// A pack of the batch's objects was no longer staged when its transaction
 /// came to list it.
 const PACK_GONE: &str = "a pack of the batch's objects was discarded before it was listed";
