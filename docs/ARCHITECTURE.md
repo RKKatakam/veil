@@ -2776,7 +2776,8 @@ pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
   BLAKE3's tree has at any length, and the two are merged at the end), so
   nothing is read back. Sync keeps the last version seen at each path as
   the next one's delta base, 64 MiB of them at most. A reader whose pack disappears (a concurrent gc replaced it)
-  rescans the pack directory and retries.
+  rescans the pack directory and retries, for as long as the listing keeps
+  changing (BUG-2470).
 
 ### Caches
 
@@ -2919,9 +2920,18 @@ is removed. **Geometric merging** then merges the smallest packs so that
 each remaining one is at least twice the next smaller one (Git's
 `repack --geometric=2`), copying entries as stored; the big old pack is
 not rewritten. Readers never take an object for missing meanwhile: a miss
-is `Missing` only after a loose probe, a reload of the pack list and a
-second loose probe, and a pack whose index vanished while it was being
-opened counts as removed, not broken. **Crash debris** is removed by every
+is `Missing` (and `has` says no) only after a loose probe, a search of the
+packs, a reload of the pack list that found the set searched still current
+(neither this lookup's reload nor another thread's on the same store
+changed it since the search began; a changed set is searched again: gc
+runs back to back can replace a pack between a reader's listing and its
+opening it, more than once, BUG-2470) with no pack holding the object
+vanishing under the search (gc may write a pack again under the same
+name), and a second loose probe. A pack whose index vanished while it was
+being opened counts as removed, not broken. A read that finds the set
+still changing after 64 rescans fails with "run the command again", never
+`Missing`; `has`, which can only say yes or no, then answers from its
+second loose probe. **Crash debris** is removed by every
 run: stream temp files (`.stream-<owner>.vltmp…`, which name their
 process) whose owner is provably gone, owner-less temp files a day old,
 and dead transactions' staging, spools and registrations.
