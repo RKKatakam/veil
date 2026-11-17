@@ -1567,16 +1567,15 @@ fn bug_2590_a_pass_that_gave_way_to_a_root_write_is_followed_by_one_that_collect
     assert!(hub.rt.block_on(fresh.exists(pid, &main0)).unwrap(), "main's snapshot kept");
 }
 
-/// BUG-2602: a GC pass gives way to any root write made while it runs (the
+/// BUG-2602: a GC pass gave way to any root write made while it ran (the
 /// reference stamp, compared whole at the switch), so on a project pushed to
-/// steadily no pass ever collects. A pusher moves one branch back and forth
-/// between two stored snapshots, one push after another (each a root write
-/// GC must see: `branches`), while passes past the retention window run one
-/// after another: one of them should delete the dead loose object, which no
-/// push names. Each pass is counted: collected, gave way (nothing deleted,
-/// the stamp moved), or nothing.
+/// steadily no pass ever collected (0 of 90). A pusher moves one branch back
+/// and forth between two stored snapshots, one push after another (each a
+/// root write GC must see: `branches`), while passes past the retention
+/// window run one after another: one of them deletes the dead loose object,
+/// which no push names. Each pass is counted: collected, gave way (nothing
+/// deleted, the stamp moved), or nothing.
 #[test]
-#[ignore = "BUG-2602: steady pushes make every GC pass give way; GC never collects for a busy project"]
 fn bug_2602_gc_collects_while_a_project_is_pushed_to_steadily() {
     let hub = TestHub::start();
     let p = setup_project(&hub);
@@ -1657,6 +1656,638 @@ fn bug_2602_gc_collects_while_a_project_is_pushed_to_steadily() {
     assert_eq!(collected, 1, "a pass collects the dead object while the project is pushed to (gave way {gave_way} times)");
     let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     assert!(!hub.rt.block_on(fresh.exists(pid, &dead_id)).unwrap(), "dead loose object deleted from storage");
+}
+
+/// Every object `tip` reaches (its tree and files, its ancestors and
+/// theirs) is stored, read by a store that shares no cache with the hub.
+fn assert_closure_stored(hub: &TestHub, pid: i64, tip: ObjectId, what: &str) {
+    let h = hub.hub();
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    // The universal root and its empty tree, which no project stores.
+    let empty = ObjectId::hash(&Object::Tree(Tree::default()).encode());
+    let builtin = [veil_server::sync::root_snapshot_id(), empty];
+    let mut queue = vec![tip];
+    let mut seen = HashSet::new();
+    while let Some(id) = queue.pop() {
+        if builtin.contains(&id) || !seen.insert(id) {
+            continue;
+        }
+        let raw = hub.rt.block_on(fresh.get(pid, &id)).unwrap().unwrap_or_else(|| panic!("{what}: object {id} reached from {tip} is gone"));
+        match Object::decode(&raw).unwrap() {
+            Object::Snapshot(s) => {
+                queue.push(s.tree);
+                queue.extend(s.parents);
+            }
+            Object::Tree(t) => queue.extend(t.entries.iter().map(|e| e.id)),
+            _ => {}
+        }
+    }
+}
+
+/// A snapshot on `branch` with a file of its own, the branch deleted, and a
+/// pass at `mark_at` that marks its objects unreferenced: past the
+/// retention window (60 s) at `mark_at + 120_000`. The snapshot and the
+/// file's blob.
+fn expiring_snapshot(hub: &TestHub, p: &Project, pid: i64, branch: &str, mark_at: i64) -> (ObjectId, ObjectId) {
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    let content = format!("EXPIRING-2602-{branch}\n");
+    let (blob, _) = make_blob(&content);
+    c.file(&format!("src/{branch}.txt"), &content);
+    let (snap, r) = c.push_edited(branch, None, |_| {});
+    assert_eq!(r.status, 200, "push {branch}: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "push {branch} ok");
+    let del = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": branch, "expected": snap.hex(), "new": null}], "force": true}),
+    );
+    assert_eq!(del.status, 200, "delete {branch}: {}", String::from_utf8_lossy(&del.body));
+    assert_eq!(del.json()["results"][0]["ok"], json!(true), "delete {branch} ok");
+    let marked = gc_pass(
+        hub,
+        pid,
+        &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, now_offset_ms: mark_at, ..Options::default() },
+    );
+    assert!(!marked.skipped, "the marking pass ran: {marked:?}");
+    (snap, blob)
+}
+
+/// One GC pass (no second try) past the retention window at `at`, whose
+/// switch hook runs `racing` once, right before the pass's first switch
+/// that drops objects: after everything the pass reads outside its
+/// transaction, so only the switch itself can see what `racing` wrote.
+fn pass_with_a_racing_write<F, Fut>(hub: &TestHub, pid: i64, at: i64, racing: F) -> pack_gc::Report
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    use veil_server::pack_gc::SwitchHook;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls = calls.clone();
+    let racing = Arc::new(racing);
+    let rep = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &hub.hub(),
+            pid,
+            &Options {
+                min_packs_to_merge: 99,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: at,
+                before_switch: Some(SwitchHook(Arc::new(move || {
+                    let (hook_calls, racing) = (hook_calls.clone(), racing.clone());
+                    Box::pin(async move {
+                        if hook_calls.fetch_add(1, Relaxed) == 0 {
+                            racing().await;
+                        }
+                    })
+                }))),
+                ..Options::default()
+            },
+        ))
+        .unwrap();
+    assert!(!rep.skipped, "the pass ran: {rep:?}");
+    assert!(calls.load(Relaxed) >= 1, "the pass reached a switch that drops objects, and the racing write was made");
+    rep
+}
+
+/// BUG-2602: a root written as a GC pass reaches its switch keeps every
+/// object it names, and the pass still collects what nothing names (before,
+/// it gave way: nothing was collected). One case for every table the
+/// reference stamp covers: the walk roots (`branches`, `change_refs`, the
+/// landing queue's stack and its result, `landings`, `embargo_snapshots`,
+/// `embargo_lines`, `checks`, `tested`, `pr_revisions`, `pr_review_rules`,
+/// `bisects`, `bisect_reverts`), a `snapshots` row (BUG-1780: a row that
+/// stays keeps its closure), a search segment (`search_shards`), and a
+/// client upload staged in `packs`. Each case: a snapshot (or object) past
+/// the retention window that the racing write names, and a dead loose
+/// object that nothing names; in one pass the dead one is deleted and the
+/// named ones stay, with their `snapshots` row.
+#[test]
+fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collects_the_rest() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"].hex();
+    let admin_pid: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    let exists = |id: &ObjectId| {
+        let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+        hub.rt.block_on(fresh.exists(pid, id)).unwrap()
+    };
+    let snapshot_rows = |id: &ObjectId| -> i64 {
+        hub.rt
+            .block_on(sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE project_id = $1 AND id = $2").bind(pid).bind(id.hex()).fetch_one(&h.db))
+            .unwrap()
+    };
+
+    // The walk roots: one statement each, naming the snapshot `{s}`.
+    type RootWrite = Box<dyn Fn(&str) -> String>;
+    let m = main0.clone();
+    let roots: Vec<(&str, RootWrite)> = vec![
+        ("branches", Box::new(move |s| format!("INSERT INTO branches (project_id, name, target) VALUES ({pid}, 'racing-2602', '{s}')"))),
+        (
+            "change_refs",
+            Box::new(move |s| {
+                format!("INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) VALUES ({pid}, 'chg-2602', '{s}', {admin_pid}, 1000)")
+            }),
+        ),
+        ("landing_queue.stack", {
+            let m = m.clone();
+            Box::new(move |s| {
+                format!(
+                    "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch, state, created_at) \
+                     VALUES ({pid}, 'main', 't-2602-stack', {admin_pid}, 'admin', 'k', '[[\"{s}\", \"{m}\"]]', 0, 0, 0, 'queued', 1000)"
+                )
+            })
+        }),
+        ("landing_queue.result", {
+            Box::new(move |s| {
+                format!(
+                    "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, result, lineage, person_epoch, project_epoch, state, created_at) \
+                     VALUES ({pid}, 'main', 't-2602-result', {admin_pid}, 'admin', 'k', '[]', '{{\"landed\": \"{s}\"}}', 0, 0, 0, 'landed', 1000)"
+                )
+            })
+        }),
+        ("landings", {
+            let m = m.clone();
+            Box::new(move |s| format!("INSERT INTO landings (project_id, branch, lineage, submitted, landed, at) VALUES ({pid}, 'main', 0, '{m}', '{s}', 1000)"))
+        }),
+        ("embargo_snapshots", Box::new(move |s| format!("INSERT INTO embargo_snapshots (project_id, snapshot, embargo_id) VALUES ({pid}, '{s}', 'e2602snap')"))),
+        (
+            "embargo_lines",
+            Box::new(move |s| {
+                format!(
+                    "INSERT INTO embargo_lines (project_id, embargo_id, group_names, target_branch, embargo_branch, until_ms, released_at, record_json, created_by, created_at) \
+                     VALUES ({pid}, 'e2602line', ARRAY['g'], 'main', 'embargo/e2602line', NULL, NULL, '{{\"tip\": \"{s}\"}}', 'admin', 1000)"
+                )
+            }),
+        ),
+        (
+            "checks",
+            Box::new(move |s| {
+                format!(
+                    "INSERT INTO checks (project_id, snapshot, name, state, summary, runner_id, runner_name, updated_at) \
+                     VALUES ({pid}, '{s}', 'build-2602', 'pass', 'ok', {admin_pid}, 'admin', 1000)"
+                )
+            }),
+        ),
+        ("tested", Box::new(move |s| format!("INSERT INTO tested (project_id, branch, lineage, snapshot, depth, updated_at) VALUES ({pid}, 'racing-tested-2602', 0, '{s}', 1, 1000)"))),
+        ("pr_revisions", {
+            let m = m.clone();
+            Box::new(move |s| {
+                format!(
+                    "INSERT INTO pr_revisions (project_id, pr, n, base, head, changes, patch, files, risk, reasons, rules_key, files_count, pushed_by, at) \
+                     VALUES ({pid}, 'pr-2602', 1, '{m}', '{s}', '[]', 'p', '[]', 'low', '[]', 'rk', 1, {admin_pid}, 2000)"
+                )
+            })
+        }),
+        (
+            "pr_review_rules",
+            Box::new(move |s| {
+                format!(
+                    "INSERT INTO pr_review_rules (project_id, checked, state) VALUES ({pid}, '{s}', 'ok') \
+                     ON CONFLICT (project_id) DO UPDATE SET checked = EXCLUDED.checked"
+                )
+            }),
+        ),
+        ("bisects", {
+            let m = m.clone();
+            Box::new(move |s| {
+                format!(
+                    "INSERT INTO bisects (project_id, branch, lineage, check_name, good, bad, candidates, lo, hi, phase, probes, culprit, culprit_parent, session_paths, revert_snapshot, created_at, updated_at) \
+                     VALUES ({pid}, 'main', 0, 'ci/2602', '{m}', '{s}', '[]', 0, 0, 'searching', '[]', NULL, NULL, '[]', NULL, 3000, 3000)"
+                )
+            })
+        }),
+        ("bisect_reverts", {
+            let m = m.clone();
+            Box::new(move |s| {
+                format!(
+                    "INSERT INTO bisect_reverts (project_id, branch, lineage, culprit, check_name, ticket, revert_snapshot, state, created_at) \
+                     VALUES ({pid}, 'main', 0, '{m}', 'ci/2602', 'tkt-2602', '{s}', 'reverted', 3000)"
+                )
+            })
+        }),
+    ];
+
+    let mut at = 0i64;
+    for (i, (kind, write)) in roots.iter().enumerate() {
+        let (dead, dead_raw) = make_blob(&format!("DEAD-LOOSE-2602-{kind}\n"));
+        hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
+        let (snap, blob) = expiring_snapshot(&hub, &p, pid, &format!("exp-{i}"), at);
+        let (db, sql) = (h.db.clone(), write(&snap.hex()));
+        let rep = pass_with_a_racing_write(&hub, pid, at + 120_000, move || {
+            let (db, sql) = (db.clone(), sql.clone());
+            async move {
+                sqlx::query(&sql).execute(&db).await.unwrap();
+            }
+        });
+        assert!(!exists(&dead), "{kind}: the pass collects what nothing names, though a root was written as it switched: {rep:?}");
+        assert!(rep.loose_objects_deleted >= 1, "{kind}: {rep:?}");
+        assert!(exists(&snap), "{kind}: the snapshot the racing root names is kept: {rep:?}");
+        assert!(exists(&blob), "{kind}: its file is kept: {rep:?}");
+        assert_eq!(snapshot_rows(&snap), 1, "{kind}: its `snapshots` row is kept");
+        assert_closure_stored(&hub, pid, snap, kind);
+        at += 400_000;
+    }
+
+    // A `snapshots` row (BUG-1780): `child`'s row is written as the pass
+    // switches; its parent is past the window, and stays with it.
+    {
+        let (dead, dead_raw) = make_blob("DEAD-LOOSE-2602-snapshots\n");
+        hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
+        let (parent, parent_blob) = expiring_snapshot(&hub, &p, pid, "exp-row-parent", at);
+        // The child is stored and unreferenced, with no row yet (as a push
+        // that has stored it and not yet recorded it): made here and stored
+        // directly, so that nothing of the server names it (a push would
+        // leave the review rules' pointer on it, a root of its own).
+        let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+        c.file("src/exp-row-child.txt", "EXPIRING-2602-child\n");
+        let mut s = Snapshot {
+            parents: vec![parent],
+            change_id: ChangeId::random(),
+            tree: c.root,
+            description: Text::Plain("child".into()),
+            author: "crafter".into(),
+            timestamp: veil_core::now_millis(),
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
+            signature: None,
+        };
+        s.sign(&c.identity);
+        let child_raw = Object::Snapshot(s).encode();
+        let child = ObjectId::hash(&child_raw);
+        for (id, raw) in c.objects.iter().cloned().chain([(child, child_raw)]) {
+            hub.rt.block_on(h.objects.put(pid, &id, Bytes::from(raw))).unwrap();
+        }
+        let author = admin_pid;
+        let (db, child_hex) = (h.db.clone(), child.hex());
+        let rep = pass_with_a_racing_write(&hub, pid, at + 120_000, move || {
+            let (db, child_hex) = (db.clone(), child_hex.clone());
+            async move {
+                sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3)").bind(pid).bind(&child_hex).bind(author).execute(&db).await.unwrap();
+            }
+        });
+        assert!(!exists(&dead), "snapshots: the pass collects what nothing names: {rep:?}");
+        assert_eq!(snapshot_rows(&child), 1, "snapshots: the row written as the pass switched stays");
+        assert!(exists(&parent) && exists(&parent_blob), "snapshots: the parent of a snapshot whose row stays is kept: {rep:?}");
+        assert_eq!(snapshot_rows(&parent), 1, "snapshots: the parent's row is kept");
+        assert_closure_stored(&hub, pid, child, "snapshots");
+        at += 400_000;
+    }
+
+    // A search segment and a staged client upload: each names a loose
+    // object past the window.
+    for kind in ["search_shards", "packs"] {
+        let (dead, dead_raw) = make_blob(&format!("DEAD-LOOSE-2602-{kind}\n"));
+        hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
+        let (named, named_raw) = make_blob(&format!("NAMED-LOOSE-2602-{kind}\n"));
+        hub.rt.block_on(h.objects.put(pid, &named, named_raw.clone())).unwrap();
+        let marked = gc_pass(
+            &hub,
+            pid,
+            &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, now_offset_ms: at, ..Options::default() },
+        );
+        assert!(!marked.skipped, "{kind}: the marking pass ran");
+        let (db, hub2) = (h.db.clone(), h.clone());
+        let rep = pass_with_a_racing_write(&hub, pid, at + 120_000, move || {
+            let (db, hub2, named_raw) = (db.clone(), hub2.clone(), named_raw.clone());
+            async move {
+                if kind == "search_shards" {
+                    sqlx::query(
+                        "INSERT INTO search_shards (project_id, kind, branch, line_key, segments, docs, text_docs, text_bytes, dead) \
+                         VALUES ($1, 'names', '', 'k2602', $2, 0, 0, 0, 0)",
+                    )
+                    .bind(pid)
+                    .bind(json!([named.hex()]).to_string())
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                } else {
+                    hub2.objects.stage(pid, admin_pid, vec![(named, veil_server::store::encode(named_raw))]).await.unwrap();
+                }
+            }
+        });
+        assert!(!exists(&dead), "{kind}: the pass collects what nothing names: {rep:?}");
+        let loose = hub.rt.block_on(h.objects.blob_store().exists(&veil_server::store::object_key(pid, &named))).unwrap();
+        assert!(loose, "{kind}: the object named as the pass switched is kept: {rep:?}");
+        at += 400_000;
+    }
+
+    // Later passes, far past every window: the roots written keep what they name.
+    for off in [at + 1_000_000, at + 2_000_000] {
+        let rep = gc_pass(
+            &hub,
+            pid,
+            &Options { min_packs_to_merge: 1, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: off, ..Options::default() },
+        );
+        assert!(!rep.skipped, "a later pass ran: {rep:?}");
+    }
+    let named: Vec<String> = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar(
+                "SELECT target FROM branches WHERE project_id = $1 AND name = 'racing-2602' \
+                 UNION ALL SELECT snapshot FROM change_refs WHERE project_id = $1 AND change_id = 'chg-2602' \
+                 UNION ALL SELECT snapshot FROM checks WHERE project_id = $1 AND name = 'build-2602' \
+                 UNION ALL SELECT snapshot FROM tested WHERE project_id = $1 AND branch = 'racing-tested-2602' \
+                 UNION ALL SELECT head FROM pr_revisions WHERE project_id = $1 AND pr = 'pr-2602' \
+                 UNION ALL SELECT snapshot FROM embargo_snapshots WHERE project_id = $1 AND embargo_id = 'e2602snap' \
+                 UNION ALL SELECT landed FROM landings WHERE project_id = $1 AND landed <> submitted AND at = 1000",
+            )
+            .bind(pid)
+            .fetch_all(&h.db),
+        )
+        .unwrap();
+    assert_eq!(named.len(), 7, "the roots written are still there: {named:?}");
+    for s in named {
+        assert_closure_stored(&hub, pid, ObjectId::from_hex(&s).unwrap(), "after later passes");
+    }
+}
+
+/// BUG-2602: a pass does not read again what it found absent (a project
+/// names many objects it does not store: predecessors never pushed, the
+/// trees of signed origins), unless a client upload made since holds it. A
+/// snapshot that stays names a predecessor the server does not store; the
+/// predecessor's tree and file are stored, unreferenced and past the
+/// window. As the pass switches, a push stores the predecessor (an upload,
+/// listed) and writes a root: the predecessor is read then, and its tree
+/// and file are kept; the pass collects what nothing names.
+#[test]
+fn bug_2602_an_object_stored_as_gc_switches_that_others_already_named_keeps_what_it_names() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+    let admin_pid: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    let exists = |id: &ObjectId| {
+        let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+        hub.rt.block_on(fresh.exists(pid, id)).unwrap()
+    };
+
+    // The predecessor: made here, its tree and file stored (loose,
+    // unreferenced), the snapshot itself not stored.
+    let mut old = Craft::new(&api, &p.admin, &p.name, "main");
+    old.file("src/old-version.txt", "OLD-VERSION-2602\n");
+    let (old_blob, _) = make_blob("OLD-VERSION-2602\n");
+    let old_tree = old.root;
+    let mut s = Snapshot {
+        parents: vec![old.tip],
+        change_id: ChangeId::random(),
+        tree: old_tree,
+        description: Text::Plain("old version".into()),
+        author: "crafter".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s.sign(&old.identity);
+    let (change_id, old_raw) = (s.change_id, Bytes::from(Object::Snapshot(s).encode()));
+    let old_snap = ObjectId::hash(&old_raw);
+    for (id, raw) in old.objects.iter().cloned() {
+        hub.rt.block_on(h.objects.put(pid, &id, Bytes::from(raw))).unwrap();
+    }
+    assert!(exists(&old_tree) && exists(&old_blob) && !exists(&old_snap), "the old version's tree and file are stored, the snapshot is not");
+
+    // The snapshot that stays: the new version, naming the old one.
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/new-version.txt", "NEW-VERSION-2602\n");
+    let (kept, r) = c.push_edited("kept-2602", None, |s| {
+        s.change_id = change_id;
+        s.predecessors = vec![old_snap];
+    });
+    assert_eq!(r.status, 200, "push the new version: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "push the new version ok: {}", String::from_utf8_lossy(&r.body));
+
+    let (dead, dead_raw) = make_blob("DEAD-LOOSE-2602-upload\n");
+    hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
+    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    assert!(!marked.skipped, "the marking pass ran");
+
+    let (db, hub2, kept_hex) = (h.db.clone(), h.clone(), kept.hex());
+    let rep = pass_with_a_racing_write(&hub, pid, 120_000, move || {
+        let (db, hub2, kept_hex, old_raw) = (db.clone(), hub2.clone(), kept_hex.clone(), old_raw.clone());
+        async move {
+            let pack = hub2.objects.stage(pid, admin_pid, vec![(old_snap, veil_server::store::encode(old_raw))]).await.unwrap();
+            sqlx::query("UPDATE packs SET state = $3 WHERE project_id = $1 AND name = $2").bind(pid).bind(&*pack).bind(LISTED).execute(&db).await.unwrap();
+            sqlx::query("INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) VALUES ($1, 'chg-2602-upload', $2, $3, 1000)")
+                .bind(pid)
+                .bind(&kept_hex)
+                .bind(admin_pid)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+    });
+    assert!(!exists(&dead), "the pass collects what nothing names: {rep:?}");
+    assert!(exists(&old_snap), "the predecessor the push stored is there: {rep:?}");
+    assert!(exists(&old_tree) && exists(&old_blob), "the tree and file of a predecessor stored as the pass switched are kept: {rep:?}");
+    assert_closure_stored(&hub, pid, old_snap, "the predecessor");
+    assert_closure_stored(&hub, pid, kept, "the snapshot that stays");
+}
+
+/// BUG-2602: what a switch reads from the store while root writers wait is
+/// bounded (`SWITCH_WALK_MAX` objects). A root written as the pass switches
+/// that names more than that gives the switch way, as any root write did
+/// before: the pass deletes nothing and everything stays; the next pass
+/// (which walks the root outside its switch) collects.
+#[test]
+fn bug_2602_a_switch_gives_way_past_its_bound_and_the_next_pass_collects() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let admin_pid: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    let exists = |id: &ObjectId| {
+        let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+        hub.rt.block_on(fresh.exists(pid, id)).unwrap()
+    };
+
+    // A snapshot of more folders than the bound (a tree each to read).
+    let folders = pack_gc::SWITCH_WALK_MAX + 40;
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    for i in 0..folders {
+        c.file(&format!("wide/d{i}/f.txt"), &format!("WIDE-2602-{i}\n"));
+    }
+    let (wide, r) = c.push_edited("wide", None, |_| {});
+    assert_eq!(r.status, 200, "push wide: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "push wide ok");
+    let del = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "wide", "expected": wide.hex(), "new": null}], "force": true}),
+    );
+    assert_eq!(del.status, 200, "delete wide: {}", String::from_utf8_lossy(&del.body));
+    assert_eq!(del.json()["results"][0]["ok"], json!(true), "delete wide ok");
+    let (dead, dead_raw) = make_blob("DEAD-LOOSE-2602-bound\n");
+    hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
+    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    assert!(!marked.skipped, "the marking pass ran");
+
+    let (db, wide_hex) = (h.db.clone(), wide.hex());
+    let rep = pass_with_a_racing_write(&hub, pid, 120_000, move || {
+        let (db, wide_hex) = (db.clone(), wide_hex.clone());
+        async move {
+            sqlx::query("INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) VALUES ($1, 'chg-2602-wide', $2, $3, 1000)")
+                .bind(pid)
+                .bind(&wide_hex)
+                .bind(admin_pid)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+    });
+    assert_eq!(rep.loose_objects_deleted + rep.packed_objects_deleted, 0, "past its bound the switch gives way: nothing is deleted: {rep:?}");
+    assert!(exists(&dead), "nothing is deleted by a pass that gave way");
+    assert_closure_stored(&hub, pid, wide, "after the give-way");
+
+    let next = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 240_000, ..Options::default() },
+        ))
+        .unwrap();
+    assert!(!next.skipped, "the next pass ran: {next:?}");
+    assert!(!exists(&dead), "the next pass collects what nothing names: {next:?}");
+    assert_closure_stored(&hub, pid, wide, "after the next pass");
+}
+
+/// BUG-2602, with real writers: one thread pushes commit after commit to a
+/// branch (each a staged upload, new objects, a `snapshots` row and a
+/// branch move, through the push's own guard) while GC passes past the
+/// retention window run one after another. A pass collects the dead object,
+/// and every commit pushed is whole afterwards (its tree, files and
+/// ancestors), as is a snapshot past the window that the pusher builds on
+/// while the passes run.
+#[test]
+fn bug_2602_gc_collects_under_pushes_of_new_commits_and_loses_nothing() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/busy.rs", "BUSY-2602-0\n");
+    let (first, r) = c.push_edited("busy", None, |_| {});
+    assert_eq!(r.status, 200, "push busy: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "push busy ok");
+
+    let (dead, dead_raw) = make_blob("DEAD-LOOSE-2602-commits\n");
+    hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
+    // Past the window when the passes run: the pusher's commits build on it.
+    let (old, _) = expiring_snapshot(&hub, &p, pid, "old-2602", 0);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let pushed = Arc::new(std::sync::Mutex::new(vec![first]));
+    let pusher = {
+        let (authority, cert, name) = (hub.authority(), hub.cert_pem.clone(), p.name.clone());
+        let (token, identity) = (admin_tok.clone(), p.admin.identity());
+        let (stop, pushed) = (stop.clone(), pushed.clone());
+        std::thread::spawn(move || {
+            let api = Api::at(&authority, &cert);
+            let mut tip = first;
+            let mut n = 0;
+            while !stop.load(Relaxed) {
+                n += 1;
+                let mut c = Craft::with(&api, token.clone(), identity.clone(), &name, "busy");
+                c.file(&format!("src/busy-{}.rs", n % 7), &format!("BUSY-2602-{n}\n"));
+                // Every fifth commit is a merge with the snapshot past the window.
+                let (id, r) = c.push_edited("busy", Some(tip), |s| {
+                    if n % 5 == 0 {
+                        s.parents.push(old);
+                    }
+                });
+                assert_eq!(r.status, 200, "steady push {n}: {}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["results"][0]["ok"], json!(true), "steady push {n} ok: {}", String::from_utf8_lossy(&r.body));
+                tip = id;
+                pushed.lock().unwrap().push(id);
+            }
+        })
+    };
+    while pushed.lock().unwrap().len() < 4 {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let opts = Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, ..Options::default() };
+    let (mut collected, mut passes) = (0, 0);
+    let at_start = pushed.lock().unwrap().len();
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    for _ in 0..30 {
+        let r = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).unwrap();
+        passes += 1;
+        if !r.skipped && !hub.rt.block_on(fresh.exists(pid, &dead)).unwrap() {
+            collected += 1;
+            break;
+        }
+    }
+    // More passes while the pushes go on, now with nothing to collect.
+    for _ in 0..5 {
+        hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).unwrap();
+    }
+    let during = pushed.lock().unwrap().len() - at_start;
+    stop.store(true, Relaxed);
+    pusher.join().expect("the pusher's pushes all succeeded");
+    eprintln!("BUG-2602 (new commits): collected after {passes} passes; {during} pushes while GC passed");
+    assert!(during > 0, "pushes ran while GC passed");
+    assert_eq!(collected, 1, "a pass collects the dead object while commits are pushed");
+    let pushed = pushed.lock().unwrap().clone();
+    assert_closure_stored(&hub, pid, *pushed.last().unwrap(), "the last commit pushed");
+    for id in &pushed {
+        assert!(hub.rt.block_on(fresh.exists(pid, id)).unwrap(), "commit {id} pushed while GC passed is stored");
+    }
+    assert!(hub.rt.block_on(fresh.exists(pid, &old)).unwrap(), "the snapshot past the window that pushes built on is kept");
+}
+
+/// BUG-2602: every table the reference stamp covers is one the switch reads
+/// again: the tables of the walk roots (`collect_db_roots`' union, built
+/// from the registry), and `snapshots`, `packs` (staged uploads) and
+/// `search_shards`, which it reads by name. A table stamped later must be
+/// read by the switch too, or a row written as GC switches would be seen
+/// (the stamp moves) and not kept.
+#[test]
+fn bug_2602_every_stamped_table_is_read_again_by_the_switch() {
+    let mut read: Vec<&str> = pack_gc::OBJECT_SCHEMA_COLUMNS
+        .iter()
+        .filter(|(_, _, role)| *role == pack_gc::SchemaColumnRole::GcRoot)
+        .map(|(table, _, _)| *table)
+        .collect();
+    read.extend(["snapshots", "packs", "search_shards"]);
+    read.sort();
+    read.dedup();
+    let mut stamped = pack_gc::stamped_root_tables();
+    stamped.sort();
+    assert_eq!(stamped, read);
 }
 
 /// BUG-1782: Concurrent in-place `change_refs` target updates (`COUNT(*)`
