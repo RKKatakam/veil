@@ -2644,8 +2644,7 @@ async fn push_to_its_end(
     r.map(|(res, landings, _)| (res, landings))
 }
 
-/// What a push wrote, and whether its transaction began (or it lost its
-/// race just before it, `packs_to_list`).
+/// What a push wrote, and whether its transaction began.
 #[derive(Default)]
 pub(crate) struct Progress {
     /// Its own packs (fresh names, in no receipt).
@@ -3324,13 +3323,7 @@ async fn push_staged(
     let commits = !plans.is_empty() || !queued.is_empty() || !embargo_upserts.is_empty();
     let listed = match commits {
         false => Vec::new(),
-        true => {
-            // The branches its transaction will compare and swap (a
-            // deletion of a branch that is not there swaps nothing).
-            let tips: Vec<(String, Option<String>)> =
-                plans.iter().filter(|p| p.1.is_some() || p.2.is_some()).map(|p| (p.0.clone(), p.1.map(|c| c.hex()))).collect();
-            packs_to_list(hub, project.id, person, &st, &touched, &made, &tips, progress).await?
-        }
+        true => packs_to_list(hub, project.id, person, &st, &touched, &made, progress).await?,
     };
     let new_reals: Vec<(String, i64)> = completed
         .iter()
@@ -3947,16 +3940,6 @@ async fn complete_one(
 /// it read from any other staged pack and those the server made for it
 /// (`made`). Nothing a check did not read is kept. `progress` records the
 /// pack it writes.
-///
-/// Its own pack is recorded and written only while the branches the push
-/// moves (`tips`: each with the target its compare-and-swap expects; `None`:
-/// no such branch) are still there, decided in the statement that records
-/// the pack (`Objects::put_pack_on`): a push that has lost its race already
-/// is answered as its transaction would answer it (409: pull, then push
-/// again), with no pack row, no storage write and no discard (BUG-2370:
-/// past capacity each such push cost two commits and two storage
-/// requests). Its uploads stay for the next try, as after a race lost in
-/// the transaction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn packs_to_list(
     hub: &Arc<Hub>,
@@ -3965,7 +3948,6 @@ pub(crate) async fn packs_to_list(
     st: &Staged,
     touched: &HashSet<ObjectId>,
     made: &[ObjectId],
-    tips: &[(String, Option<String>)],
     progress: &Mutex<Progress>,
 ) -> Result<Vec<ListedPack>> {
     let mut listed = Vec::new();
@@ -4011,15 +3993,7 @@ pub(crate) async fn packs_to_list(
         } else {
             Vec::new()
         };
-        let Some((name, mut held)) = hub.objects.put_pack_on(project, person, own, tips).await.map_err(Error::Other)? else {
-            // Lost already: as a race lost in its transaction (the uploads
-            // stay; what it wrote so far goes).
-            progress.lock().unwrap().transaction = true;
-            return Err(Error::conflict(match tips {
-                [(branch, _)] => format!("branch '{branch}' moved during the push; pull, then push again"),
-                _ => "a branch moved during the push; pull, then push again".to_string(),
-            }));
-        };
+        let (name, mut held) = hub.objects.put_pack(project, person, own).await.map_err(Error::Other)?;
         held.unproject();
         progress.lock().unwrap().written.push(name.clone());
         listed.push(ListedPack { name, size: held.size, objects: held.index.len(), held: Some(held) });
