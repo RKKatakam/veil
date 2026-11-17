@@ -2532,6 +2532,141 @@ fn bug_2623_a_memo_whose_snapshot_gc_deleted_is_derived_again() {
     assert!(r.frames().iter().any(|(id, _)| *id == projected), "the member's history holds main's tip");
 }
 
+/// BUG-2621's review, settled: the loose switch purges the rows of every
+/// candidate (`snapshots`, the derived ones) before its deletes, and a
+/// snapshot named again after that purge keeps its objects. No writer can
+/// name it then without recording it again: a snapshot is named by
+/// resolving its id through `snapshots` (or a memo), which the purge took.
+/// Between the purge and the deletes: a push of a branch to the snapshot
+/// that uploads nothing, an API commit on it, and a push of a child of it
+/// are each refused; a push that uploads it again is accepted, its row is
+/// there again, and the pass keeps what it names.
+#[test]
+fn bug_2621_a_snapshot_purged_by_the_switch_is_named_again_only_by_uploading_it_again() {
+    use veil_server::pack_gc::SwitchHook;
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    let rows = |id: &ObjectId| -> i64 {
+        hub.rt
+            .block_on(sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE project_id = $1 AND id = $2").bind(pid).bind(id.hex()).fetch_one(&h.db))
+            .unwrap()
+    };
+
+    // A loose candidate (so the pass has a loose switch), and a snapshot
+    // past the window with its objects, as its pusher holds them.
+    let (dead, dead_raw) = make_blob("DEAD-LOOSE-2621-rows\n");
+    hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/purged-2621.txt", "PURGED-2621-CONTENT\n");
+    let held = c.objects.clone();
+    let (snap, r) = c.push_edited("purged-2621", None, |_| {});
+    assert_eq!(r.status, 200, "push: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "push ok");
+    let mut held: Vec<(ObjectId, Vec<u8>)> = held;
+    held.push((snap, hub.rt.block_on(h.objects.get(pid, &snap)).unwrap().expect("stored").to_vec()));
+    let del = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({"updates": [{"branch": "purged-2621", "expected": snap.hex(), "new": null}], "force": true}),
+    );
+    assert_eq!(del.json()["results"][0]["ok"], json!(true), "delete the branch: {}", String::from_utf8_lossy(&del.body));
+    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    assert!(!marked.skipped, "the marking pass ran");
+    assert_eq!(rows(&snap), 1, "the snapshot is recorded before the pass");
+
+    // After the switch's purge, before the deletes.
+    type Tried = (&'static str, u16, String);
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<Tried>>();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = {
+        let (authority, cert, name, token, identity, calls) = (hub.authority(), hub.cert_pem.clone(), p.name.clone(), admin_tok.clone(), p.admin.identity(), calls.clone());
+        let (db, held) = (h.db.clone(), held.clone());
+        SwitchHook(Arc::new(move || {
+            let (authority, cert, name, token, identity, tx, db, held) = (authority.clone(), cert.clone(), name.clone(), token.clone(), identity.clone(), tx.clone(), db.clone(), held.clone());
+            let first = calls.fetch_add(1, Relaxed) == 0;
+            Box::pin(async move {
+                if !first {
+                    return;
+                }
+                let purged: i64 = sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE project_id = $1 AND id = $2").bind(pid).bind(snap.hex()).fetch_one(&db).await.unwrap();
+                let (done, tried) = tokio::sync::oneshot::channel();
+                std::thread::spawn(move || {
+                    let api = Api::at(&authority, &cert);
+                    let push = format!("/v1/projects/{name}/push");
+                    let said = |what: &'static str, r: Reply| (what, r.status, String::from_utf8_lossy(&r.body).to_string());
+                    let mut out: Vec<Tried> = vec![("rows of the snapshot after the purge", purged as u16, String::new())];
+                    // A branch to it, nothing uploaded.
+                    out.push(said("a push naming it", api.post_json(Some(&token), &push, &json!({"updates": [{"branch": "again-a", "expected": null, "new": snap.hex()}]}))));
+                    // An API commit on it.
+                    out.push(said(
+                        "an API commit on it",
+                        api.post_json(Some(&token), &format!("/v1/projects/{name}/changes"), &json!({"base": snap.hex(), "edits": [{"path": "src/on-purged.txt", "put": {"text": "x\n"}}]})),
+                    ));
+                    // A child of it, the child alone uploaded.
+                    let mut child = Craft::with(&api, token.clone(), identity, &name, "main");
+                    child.file("src/child-of-purged.txt", "CHILD-2621\n");
+                    let (_, r) = child.push_edited("again-c", None, |s| s.parents = vec![snap]);
+                    out.push(said("a push of a child of it", r));
+                    // It, uploaded again.
+                    let up = api.upload(&token, &name, &held);
+                    let receipts: serde_json::Map<String, Value> = match up.status {
+                        200 => held.iter().zip(up.json()["receipts"].as_array().unwrap().clone()).map(|((id, _), r)| (id.hex(), r)).collect(),
+                        _ => Default::default(),
+                    };
+                    out.push(said("its upload", up));
+                    out.push(said(
+                        "a push of it, uploaded again",
+                        api.post_json(Some(&token), &push, &json!({"updates": [{"branch": "again-d", "expected": null, "new": snap.hex()}], "receipts": receipts})),
+                    ));
+                    let _ = tx.send(out);
+                    let _ = done.send(());
+                });
+                let _ = tried.await;
+            })
+        }))
+    };
+    let rep = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options { min_packs_to_merge: 1, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, before_loose_delete: Some(hook), ..Options::default() },
+        ))
+        .unwrap();
+    assert!(!rep.skipped, "the pass ran: {rep:?}");
+    assert_eq!(calls.load(Relaxed), 1, "the pass committed its loose switch and reached its deletes once");
+    let tried = rx.recv_timeout(Duration::from_secs(60)).expect("the writers answered");
+    let of = |what: &str| tried.iter().find(|t| t.0 == what).unwrap_or_else(|| panic!("no {what}: {tried:?}")).clone();
+    assert_eq!(of("rows of the snapshot after the purge").1, 0, "the switch purged the snapshot's row: {tried:?}");
+    let branches = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    // Refused, each: nothing names the snapshot without recording it.
+    let (_, status, body) = of("a push naming it");
+    assert!(status == 400 || (status == 200 && body.contains("\"ok\":false")), "a push naming the purged snapshot without uploading it is refused: {status} {body}");
+    assert!(!branches.contains_key("again-a"), "no branch was made: {body}");
+    let (_, status, body) = of("an API commit on it");
+    assert!((400..500).contains(&status), "an API commit on the purged snapshot is refused: {status} {body}");
+    let (_, status, body) = of("a push of a child of it");
+    assert!(status == 400 || (status == 200 && body.contains("\"ok\":false")), "a push of a child of the purged snapshot, the parent not uploaded, is refused: {status} {body}");
+    assert!(!branches.contains_key("again-c"), "no branch was made: {body}");
+    // Uploaded again: accepted, recorded again, and kept by the pass.
+    let (_, status, body) = of("its upload");
+    assert_eq!(status, 200, "the upload: {body}");
+    let (_, status, body) = of("a push of it, uploaded again");
+    assert_eq!(status, 200, "a push of the snapshot, uploaded again: {body}");
+    assert!(body.contains("\"ok\":true"), "is accepted: {body}");
+    assert_eq!(branches.get("again-d"), Some(&snap), "its branch is at the snapshot");
+    assert_eq!(rows(&snap), 1, "the snapshot is recorded again");
+    assert!(!hub.rt.block_on(fresh.exists(pid, &dead)).unwrap(), "the pass collected what nothing names: {rep:?}");
+    assert_closure_stored(&hub, pid, snap, "the snapshot named again after the purge");
+    let r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev=again-d&path=src/purged-2621.txt", p.name));
+    assert_eq!(r.status, 200, "its file: {}", String::from_utf8_lossy(&r.body).chars().take(300).collect::<String>());
+}
+
 /// BUG-2602: what a switch reads from the store while root writers wait is
 /// bounded (`SWITCH_WALK_MAX` objects). A root written as the pass switches
 /// that names more than that gives the switch way, as any root write did
