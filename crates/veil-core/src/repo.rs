@@ -427,6 +427,9 @@ fn made_of(seen: &BTreeMap<Rewritten, Recorded>, keys: &[Rewritten]) -> Vec<Vec<
 pub(crate) struct MergePlan {
     pub(crate) view: View,
     pub(crate) rewritten: BTreeMap<ObjectId, Vec<ObjectId>>,
+    /// Snapshots with two versions that stand and differ (a divergent
+    /// change): the rebase leaves them where they are (BUG-1488).
+    pub(crate) divergent: std::collections::BTreeSet<ObjectId>,
     /// Refs the rebase leaves where they are: set on an old snapshot by an
     /// operation that saw its rewrite (BUG-1434).
     pub(crate) pinned: std::collections::BTreeSet<RefKey>,
@@ -1052,35 +1055,22 @@ impl Repo {
                 for (ids, sides) in [(&split.only_a, &head_views[..]), (&split.only_b, std::slice::from_ref(&op.view))] {
                     // Each rewrite with the operations that recorded it (and
                     // those that are commands, not merges recording what
-                    // they applied). A rewrite of a snapshot by an operation
-                    // that descends from another's rewrite of it replaces
-                    // that one; concurrent ones (merged on that side as a
-                    // divergent change) all stay. One an earlier step
+                    // they applied). Two rewrites of one snapshot that
+                    // differ both stay, a divergent change, whether their
+                    // operations were concurrent or one saw the other (a
+                    // second version of an old version, BUG-1488): one
+                    // that was taken back is dropped by what the op log
+                    // says took it back, below. One an earlier step
                     // collected is decided already.
-                    let mut by_old: BTreeMap<ObjectId, Vec<(Vec<ObjectId>, ObjectId, bool)>> = BTreeMap::new();
+                    let mut side_map: BTreeMap<Rewritten, Recorded> = BTreeMap::new();
                     for id in ids.iter() {
                         if let Some(o) = split.ops.get(id) {
                             for (old, new) in &o.rewritten {
-                                by_old.entry(*old).or_default().push((new.clone(), *id, !o.is_merge()));
-                            }
-                        }
-                    }
-                    let mut side_map: BTreeMap<Rewritten, Recorded> = BTreeMap::new();
-                    let mut below: Option<HashMap<ObjectId, std::collections::HashSet<ObjectId>>> = None;
-                    for (old, entries) in by_old {
-                        let differ = entries.iter().any(|(n, _, _)| *n != entries[0].0);
-                        for (new, id, command) in &entries {
-                            let replaced = differ && {
-                                let below = below.get_or_insert_with(|| split.ancestors_within(ids));
-                                entries.iter().any(|(n2, id2, _)| n2 != new && below.get(id2).is_some_and(|b| b.contains(id)))
-                            };
-                            if replaced {
-                                continue;
-                            }
-                            let r = side_map.entry((old, new.clone())).or_default();
-                            r.ops.push(*id);
-                            if *command {
-                                r.commands.push(*id);
+                                let r = side_map.entry((*old, new.clone())).or_default();
+                                r.ops.push(*id);
+                                if !o.is_merge() {
+                                    r.commands.push(*id);
+                                }
                             }
                         }
                     }
@@ -1238,6 +1228,12 @@ impl Repo {
         for d in &divergent {
             rewritten.remove(d);
         }
+        // A snapshot with two versions that stand and differ stays where it
+        // is, with what is on it: nothing follows either version, and the
+        // merge's rebase does not move it through an ancestor's rewrite
+        // either (that made a third version, which followed neither,
+        // BUG-1488).
+        let mut versioned: std::collections::BTreeSet<ObjectId> = Default::default();
         // A merge's rebase is no version of a change (BUG-2464, BUG-2466).
         // Of the rewrites of one snapshot, the versions (a command's, or one
         // from the shared history) and the merges' rebases:
@@ -1269,6 +1265,17 @@ impl Repo {
             let mut versions: Vec<&Vec<ObjectId>> = versions.iter().map(|(k, _)| &k.1).collect();
             versions.sort();
             versions.dedup();
+            // Two versions the op log shows commands made, neither taken
+            // back. A rewrite only merges recorded is not known that way
+            // (it may be one a restore took back, or a merge's rebase from
+            // the shared history): such a snapshot is rebased like any.
+            let mut made: Vec<&Vec<ObjectId>> =
+                applied[from..to].iter().filter(|(_, r)| r.commands.iter().any(|o| !retracted.contains(o))).map(|(k, _)| &k.1).collect();
+            made.sort();
+            made.dedup();
+            if made.len() > 1 {
+                versioned.insert(d);
+            }
             let new = match versions[..] {
                 [one] => one.clone(),
                 [] => match self.one_rebase(&rebased, &rewritten)? {
@@ -1317,6 +1324,7 @@ impl Repo {
         Ok(MergePlan {
             view: acc,
             rewritten,
+            divergent: versioned,
             pinned,
             before,
             timestamp,
