@@ -219,8 +219,10 @@ async fn grant_root(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snap: Ob
         eprintln!("veil-server: projected root {} of project {} not reproduced; no grant", root.short(), project.id);
         return Ok(None);
     };
+    // Stored loose, unless this server holds it or it is stored loose
+    // already (never a search of the packs for trees just made, BUG-2631).
     for (id, raw) in created {
-        if !hub.objects.exists(project.id, &id).await? {
+        if !hub.objects.exists_loose(project.id, &id).await? {
             hub.objects.put(project.id, &id, Bytes::from(raw)).await?;
         }
     }

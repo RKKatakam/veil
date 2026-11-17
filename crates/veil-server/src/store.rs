@@ -1391,6 +1391,23 @@ impl Objects {
         }
         self.stored(project, id).await
     }
+
+    /// Is `id` of `project` in this server's cache, or stored under its
+    /// own key? Never a search of the packs: for a caller that stores an
+    /// object loose unless it is there already ([`Objects::put`] after it
+    /// is right whatever the packs hold, and writes a copy of an object
+    /// only a pack holds). [`Objects::exists`] for an object stored
+    /// nowhere searches every listed pack, the unloaded indexes in
+    /// storage (BUG-2631): the read grants asked it of every projected
+    /// tree they made for a new tip, some fifty times a second in the
+    /// landing benchmark.
+    pub async fn exists_loose(&self, project: i64, id: &ObjectId) -> Result<bool> {
+        if self.cache.get(&self.cache_key(project, id)).is_some() {
+            return Ok(true);
+        }
+        bump(&self.reads);
+        self.store.exists(&object_key(project, id)).await
+    }
 }
 
 #[cfg(test)]
@@ -1513,6 +1530,44 @@ mod tests {
     /// project's), a listed one is read by range, entry by entry, checked
     /// against the ids; a `Range` of a packed object is of the object; a
     /// discarded pack is gone and can never be listed after.
+    /// BUG-2631: [`Objects::exists_loose`] answers from this server's
+    /// cache and the object's own key, with one question to the store at
+    /// most, and never searches a pack: an object stored nowhere, and one
+    /// only a listed pack holds, are both "not loose" (the caller then
+    /// stores it loose, which is right either way), where
+    /// [`Objects::exists`] finds the packed one.
+    #[tokio::test]
+    async fn bug_2631_exists_loose_asks_the_cache_and_the_objects_own_key_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        let blob = |s: &str| {
+            let raw = Bytes::from(format!("veil:blob\n{s}"));
+            (ObjectId::hash(&raw), raw)
+        };
+        let (loose, loose_raw) = blob("stored loose");
+        let (packed, packed_raw) = blob("in a listed pack only");
+        let (nowhere, _) = blob("stored nowhere");
+        objects.put(1, &loose, loose_raw).await.unwrap();
+        let name = objects.stage(1, 7, vec![(packed, encode(packed_raw))]).await.unwrap();
+        let index = objects.staged_index(1, &name).await.unwrap().unwrap().index.clone();
+        // A server with nothing cached, which knows the listed pack.
+        let fresh = Objects::new(Arc::new(FsStore::new(dir.path())), 1 << 20);
+        fresh.listed_here(1, vec![(name, index)]);
+        let reads = || fresh.reads.load(Ordering::Relaxed);
+        let before = reads();
+        assert!(fresh.exists_loose(1, &loose).await.unwrap(), "stored under its own key");
+        assert!(!fresh.exists_loose(1, &nowhere).await.unwrap(), "stored nowhere");
+        assert!(!fresh.exists_loose(1, &packed).await.unwrap(), "only a pack holds it: not loose");
+        assert!(!fresh.exists_loose(2, &loose).await.unwrap(), "another project's object");
+        assert_eq!(reads() - before, 4, "one question to the store each, no pack searched");
+        assert!(fresh.exists(1, &packed).await.unwrap(), "the whole store holds it");
+        // Cached here (it was read): no question to the store.
+        assert!(fresh.get(1, &loose).await.unwrap().is_some());
+        let before = reads();
+        assert!(fresh.exists_loose(1, &loose).await.unwrap());
+        assert_eq!(reads(), before, "answered from the cache");
+    }
+
     #[tokio::test]
     async fn packs_are_read_by_range_and_staged_ones_are_nobodys() {
         let dir = tempfile::tempdir().unwrap();
