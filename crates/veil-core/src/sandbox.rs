@@ -267,7 +267,8 @@ pub struct ShutDir {
     pub dir: String,
     /// The `--only` paths of the run whose command shut it: what that run
     /// held below the directory is its sandbox's, not output outside its
-    /// paths.
+    /// paths. They never change while the entry lasts: no run with other
+    /// paths below the directory starts ([`ShutDir::refuses`]).
     pub only: Vec<String>,
 }
 
@@ -284,14 +285,24 @@ impl ShutDir {
         VPath::new(&self.dir).is_ok_and(|d| path.starts_with(&d)) && !self.only_set().is_some_and(|o| o.contains(path))
     }
 
-    /// Would a run with the paths `set` (`None`: the whole tree) hold, and
-    /// so record, something at or below the directory that the run that
-    /// shut it did not hold?
-    pub fn reached_by(&self, set: Option<&SparseSet>) -> bool {
+    /// Does a run with the paths `set` (`None`: the whole tree) hold, at or
+    /// below the directory, anything but exactly what the run that shut it
+    /// held there? Such a run does not start while the directory exists
+    /// (BUG-2651): one that held more would record what the command wrote
+    /// there outside its paths; one that held less, or other paths naming
+    /// the same files, could write there itself, outside its own paths and
+    /// inside this entry's, where nothing would take it for a stray. So an
+    /// entry's paths never change, and the only run that starts with the
+    /// directory in its way is one with the same paths below it, which
+    /// removes what was written there.
+    pub fn refuses(&self, set: Option<&SparseSet>) -> bool {
         let Ok(d) = VPath::new(&self.dir) else { return false };
+        let below = |s: Option<&SparseSet>| -> Vec<VPath> {
+            s.map(|s| s.paths().iter().filter(|p| p.starts_with(&d)).cloned().collect()).unwrap_or_default()
+        };
         match set {
             None => true,
-            Some(s) => s.contains(&d) || s.paths().iter().any(|p| self.covers(p)),
+            Some(s) => s.contains(&d) || below(Some(s)) != below(self.only_set().as_ref()),
         }
     }
 }

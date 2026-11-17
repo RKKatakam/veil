@@ -1834,22 +1834,24 @@ A workspace is only a named pointer in the view. It owns no directory.
   (`ShutDir::covers`; what that set held below it stays the sandbox's).
   The listing before a later command names nothing of it as "there
   before", so the first sparse run that can list it removes it as
-  written outside the set. A run whose set reaches into the directory
-  further than the shutting run's did (`ShutDir::reached_by`: the whole
-  tree, a set holding the directory, or a path below it that the
-  shutting run's set did not hold), which would record it as the
-  workspace's, does not start while the directory exists, and says how
-  to go on (the shutting run's paths once more); a run with those paths,
-  or narrower ones, starts. A rebuild does not bring it over, and names
-  it. **Known residue (BUG-2651, open):** an entry that stays, or a
-  directory shut again at or below one, keeps the paths of the *first*
-  run that shut it, though a later, narrower run (allowed to start) may
-  be the one that wrote there: what that run wrote outside its own
-  paths but inside the first run's then counts as held, and a run with
-  the first run's paths records it; and when the narrower run shut a
-  directory the first run held whole, the refusal's own way on is
-  refused. So the rule "what a command writes outside `--only` is never
-  recorded" does not hold for that sequence yet. A directory no command shut
+  written outside the set. While the directory exists, only a run whose
+  set has, at or below it, exactly the paths the shutting run's set had
+  there starts (`ShutDir::refuses`, BUG-2651; for a directory on no
+  path's way, any run that names nothing below it). Every other is
+  refused before anything is written, and told how to go on (make the
+  directory listable, run once with the shutting run's paths, given as a
+  command to run as written, or delete it): the whole tree or a set
+  holding more of the directory would record that output as the
+  workspace's; a set holding less, or naming the same files by other
+  paths, could have its own command write there outside its paths and
+  inside the entry's, where nothing would take it for a stray (a command
+  owns its directories: it can open one, write, and shut it again within
+  a run, unseen, and a sync between two sets of the same files touches
+  nothing). So an entry never changes its paths, no run takes a shut
+  directory over, and nothing a person or the shutting run left inside
+  that run's paths is removed as another run's stray. The cost is one
+  cleaning run before a run with other paths there. A rebuild does not
+  bring the output over, and names it. A directory no command shut
   (unlistable at the listing before a command, and not in
   `shut_by_command`: made so by hand) is kept in `pending` (`unlisted`),
   and files found below it later stay, as files the command did not

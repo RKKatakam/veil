@@ -139,6 +139,21 @@ fn show_set(set: Option<&SparseSet>) -> String {
     }
 }
 
+/// `word` as a shell takes it for one argument: as it is when it holds
+/// nothing a shell reads, in single quotes otherwise.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty() && word.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./-@%+=:,".contains(&b));
+    match plain {
+        true => word.to_string(),
+        false => format!("'{}'", safe(word).replace('\'', "'\\''")),
+    }
+}
+
+/// A sparse set as `--only` takes it on a command line: `src tests/unit.rs`.
+fn set_args(set: Option<&SparseSet>) -> String {
+    set.map(|s| s.paths().iter().map(|p| shell_word(p.as_str())).collect::<Vec<_>>().join(" ")).unwrap_or_default()
+}
+
 /// Say which files the command wrote outside the `--only` paths (they are
 /// not recorded).
 fn warn_strays(set: &SparseSet, strays: &[VPath], removed: bool) {
@@ -507,21 +522,22 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     let set = sparse_set(ctx, a.only, &synced, &format!("workspace '{}'", safe(name)))?;
     // What an earlier command left in a directory it made unlistable
     // outside its `--only` paths is not the workspace's, and could not be
-    // removed (BUG-2200). A run whose paths reach into the directory
-    // further than those of the run that shut it (the whole tree, above
-    // all) would record it: it does not start. A run with that run's paths
-    // does, and removes what it can list there.
+    // removed (BUG-2200). Beside such a directory only a run with exactly
+    // the paths that run had at or below it starts (BUG-2651): it removes
+    // what it can list there. Any other would record that output, or
+    // could add its own where nothing tells it from the sandbox's.
     m.shut_by_command.retain(|d| VPath::new(&d.dir).is_ok_and(|p| !matches!(fs.metadata(&p), Ok(None))));
-    if let Some(shut) = m.shut_by_command.iter().find(|d| d.reached_by(set.as_ref())) {
-        let (d, was) = (&shut.dir, show_set(shut.only_set().as_ref()));
+    if let Some(shut) = m.shut_by_command.iter().find(|d| d.refuses(set.as_ref())) {
+        let (d, was) = (&shut.dir, set_args(shut.only_set().as_ref()));
         bail!(
             "the sandbox of workspace '{n}' holds {d}, which a command of an earlier `--only {was}` run made unlistable: what is \
-             in it was written outside those paths and is not the workspace's, so this run, whose paths reach into it, would \
-             record it. Make it listable (`chmod u+rwx {at}`) and run `vl ws exec {n} --only {was} -- true`, which removes \
-             what was written there; or delete it. Then run again",
+             in it outside those paths was written outside `--only` and is not the workspace's. Until it is removed, only a \
+             run with exactly those paths at or below {d} starts. Make the directory listable (`chmod u+rwx {at}`) and run \
+             `vl ws exec {n} --only {was} -- true`, which removes what was written there; or delete the directory. Then run \
+             again",
             n = safe(name),
             d = safe(d),
-            at = paths.files.join(d).display(),
+            at = shell_word(&paths.files.join(d).display().to_string()),
         );
     }
     let run_id = hex::encode(veil_core::crypto::random_bytes::<8>());
@@ -1093,18 +1109,15 @@ fn finish_recording(
         warn_unlisted(set, &found.unlisted, "stays in the sandbox");
         // The directories a command left unlistable, this one or an
         // earlier one: the next sparse run removes what it can list there.
-        // One already known (or below one) keeps the paths of the run
-        // that shut it.
+        // An entry that stays keeps its paths (this run's are the same at
+        // or below it, or it had not started); a new one takes this run's.
         m.shut_by_command = found
             .unlisted
             .iter()
             .filter(|(u, _)| !unlisted_before.iter().any(|d| u.starts_with(d)))
-            .map(|(u, _)| core::ShutDir {
-                dir: u.as_str().to_string(),
-                only: match m.shut_by_command.iter().find(|d| VPath::new(&d.dir).is_ok_and(|d| u.starts_with(&d))) {
-                    Some(d) => d.only.clone(),
-                    None => set.to_strings(),
-                },
+            .map(|(u, _)| match m.shut_by_command.iter().find(|d| d.dir == u.as_str()) {
+                Some(d) => d.clone(),
+                None => core::ShutDir { dir: u.as_str().to_string(), only: set.to_strings() },
             })
             .collect();
         for (q, why) in &failed {
