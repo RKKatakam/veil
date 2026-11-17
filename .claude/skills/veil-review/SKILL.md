@@ -174,19 +174,26 @@ Anthropic once saw an agent author and an agent reviewer cycle more than fifty t
 
 ## Step 6: decide and merge (orchestrator)
 
-1. Merge without committing: `git merge --no-commit --no-ff <branch>` on `integration`.
+Read this skill and the guard scripts from `integration` (the base), never from the branch under review (`git show integration:.claude/skills/veil-review/SKILL.md`): a branch must not modify the rules or scripts that judge it (`docs/VERIFICATION.md`).
+
+1. **Guard the checks before merging:** run `integration`'s guard on the branch range:
+   ```sh
+   git show integration:scripts/check-guard.sh | bash -s -- integration...<branch>
+   ```
+   Inspect every flagged hunk (removed/weakened assertions, `#[ignore]`, retries/sleeps/wider timeouts in existing tests, `proptest` models/oracles such as `check_*` in `core_props`, benchmark gates, check scripts, lint config and `#[allow(…)]`). In `enforce` mode (`CHECK_GUARD=enforce`), an intentional check change requires a `Check-change-approved: <reason>` trailer after review.
+2. Merge without committing: `git merge --no-commit --no-ff <branch>` on `integration`.
    - **On a conflict in real code, abort and have the branch's agent rebase.** Don't hand-resolve it; a hand merge once dropped `verified_visibility` from `change()`. If you must resolve one by hand, that resolution is a new, untrusted commit: re-review it.
-2. Check disk space with `df -h /` (8 GB or more free), then run `bash ~/.cache/veil-orch/verify-fast.sh <tag>` in the background (about 5 minutes). It covers:
+3. Check disk space with `df -h /` (8 GB or more free), then run `bash ~/.cache/veil-orch/verify-fast.sh <tag>` in the background (about 5 minutes). It covers:
    - nextest;
    - clippy and the doc build;
    - WASM, which runs after the tests;
    - ignored tests.
-3. **Interpret the result.**
+4. **Interpret the result.**
    - The proptest seed is pinned (`PROPTEST_RNG_SEED`), so red means this merge broke something.
    - In the ignored-tests step, only the known open bugs may fail.
    - An ignored test that now passes means its bug is fixed. Un-ignore it and mark the BUGS.md row.
-4. **Green, with no open blocking finding:** commit `Merge <stream>: <summary> (BUG-…)` ending with the attribution line, then delete the branch worktree's `target/`.
-5. **Otherwise,** send the findings back to the **same** agent's thread (this counts as a cycle). Fix small findings yourself; don't start a new agent for them.
+5. **Green, with no open blocking finding:** stamp the merge commit message with `Verified-by:` from the checks actually run (`git show integration:scripts/verify-stamp.sh | bash -s -- --fast-tag <tag>` — plus `--server-log`, `gate-1g=pass` or `load=pass` when run, or `--none --reason "…"` for docs/scripts-only merges), commit `Merge <stream>: <summary> (BUG-…)` ending with `Verified-by: …` and the attribution line, then delete the branch worktree's `target/`.
+6. **Otherwise,** send the findings back to the **same** agent's thread (this counts as a cycle). Fix small findings yourself; don't start a new agent for them.
 
 ## Make the reviewer better (every round)
 
