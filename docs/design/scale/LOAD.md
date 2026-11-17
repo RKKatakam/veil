@@ -2756,9 +2756,10 @@ names all of them in each of its fetches.
 The statement that reads a request's epochs now also reads whether its
 project has an unreleased embargo line (`caches::read_epochs`,
 `Epochs::embargo_free`). With none, nothing of the project is withheld from
-anyone, and `history`, `fetch` and `subtree` ask nothing more
-(`embargo::is_withheld_in`); with one, each snapshot is asked about as
-before. Nothing is cached: it is the database's answer at the moment of the
+anyone, and `history`, `fetch` and `subtree` ask about no snapshot
+(`embargo::is_withheld_in`; in this first form they asked nothing more at
+all, which its review corrected: the end of this section); with one, each
+snapshot is asked about as before. Nothing is cached: it is the database's answer at the moment of the
 request, as its epochs are (`docs/HUB.md` §13.14), so an embargo committed
 before a request starts is withheld by that request, on every server
 (`embargo::bug_1947_…`: the next request of a second server with
@@ -2792,10 +2793,11 @@ sources, runs alternated (before, after, before, after), each after
 turn: 20,346, 17,824 and 1,058 pulls a second, 3.3, 5.1 and 65.9
 statements.) With 1,000 agents: 5.2 times the pulls, a seventh of the
 statements, a sixteenth of the database's CPU a pull. A pull's statements
-are now one a request (the session's) and two more for its `tips` (the
+are now one a request (the session's; a second for each `history` and
+`fetch` as corrected, below) and two more for its `tips` (the
 tested pointers and the embargo records of the caller, each read every
 time). **The gate (10,000 pulls a second while `main` moves) is met with 10
-and 100 agents and not with 1,000** (5,616 to 5,729): what bounds it there
+and 100 agents and not with 1,000** (5,616 to 5,729 in this first form; 5,736 to 5,799 as corrected, below): what bounds it there
 was not traced; the machine is not out of CPU (19 of 32 threads: server 6,
 database 6, load tool 7), and each of a pull's 6.7 requests takes about
 26 ms at the median. It is not the project's request gate (three quarters
@@ -2803,6 +2805,51 @@ of the server's database connections, 48 of 64 here): the same run with
 `--db-connections 128` gave 6,245 pulls a second (p50 165 ms, 8.5
 statements), a tenth more. A thin pull (the tip, not every snapshot since)
 still has no benchmark.
+
+**The fix's review found a leak in it, and closing it costs a statement a
+request** (`ce1fff86`, 2026-11-17). "No unreleased embargo line", read with
+the request's epochs, was trusted for a snapshot the request found
+afterwards: an id a request names is resolved to the real snapshot behind
+it later (a projected id to the newest snapshot any view projects to it),
+and an embargoed snapshot committed in between, seen as that id by an
+embargo member of another view, was served as the caller sees it. Each of
+`history`, `fetch` and `subtree` now reads the line once more after its
+last resolution and before anything it found is read or projected
+(`embargo::withheld_since`, `docs/HUB.md` §13.14); with a line there every
+snapshot is asked about, as before the fix. The same curve, the reviewed
+head (`bb5d744b`) against the corrected one (`f4dc93e6`), release builds
+from clean worktrees of those commits, the same load tool, alternated
+twice, each through `bench-quiet.sh` (load before 6.8, 15.1, 14.3, 15.7;
+after 48.1, 64.2, 49.4, 62.5, the runs' own agents), 20:09 to 20:17 UTC:
+
+| Server | Agents | Pulls/s | p50 / p99 (ms) | Requests per pull | Statements per pull | Server CPU (ms/pull) | Database CPU (ms/pull) | Cores: server / database / load tool |
+|---|---:|---:|---|---:|---:|---:|---:|---|
+| reviewed | 10 | 9,739 | 1 / 6 | 1.13 | 3.3 | 0.49 | 0.52 | 4.7 / 5.1 / 1.9 |
+| reviewed | 100 | 32,409 | 2 / 18 | 1.37 | 3.4 | 0.24 | 0.30 | 7.7 / 9.8 / 5.7 |
+| reviewed | 1,000 | 6,107 | 164 / 301 | 6.77 | 8.9 | 1.09 | 1.03 | 6.6 / 6.3 / 8.6 |
+| corrected | 10 | 7,481 | 1 / 10 | 1.16 | 3.6 | 0.64 | 0.69 | 4.8 / 5.2 / 1.9 |
+| corrected | 100 | 31,555 | 2 / 17 | 1.38 | 3.8 | 0.25 | 0.32 | 7.9 / 10.2 / 4.9 |
+| corrected | 1,000 | **5,799** | **172 / 312** | 6.82 | **14.8** | **1.28** | **1.36** | 7.4 / 7.9 / 7.6 |
+| reviewed, again | 10 | 8,275 | 1 / 7 | 1.15 | 3.4 | 0.58 | 0.61 | 4.8 / 5.1 / 1.9 |
+| reviewed, again | 100 | 31,861 | 2 / 18 | 1.38 | 3.4 | 0.24 | 0.30 | 7.6 / 9.6 / 5.6 |
+| reviewed, again | 1,000 | 6,706 | 154 / 298 | 6.45 | 8.6 | 1.00 | 0.98 | 6.7 / 6.6 / 8.3 |
+| corrected, again | 10 | 7,693 | 1 / 9 | 1.16 | 3.5 | 0.62 | 0.67 | 4.8 / 5.2 / 1.9 |
+| corrected, again | 100 | 31,051 | 2 / 18 | 1.39 | 3.8 | 0.25 | 0.32 | 7.8 / 10.0 / 5.3 |
+| corrected, again | 1,000 | **5,736** | **172 / 310** | 6.85 | **14.9** | **1.30** | **1.39** | 7.4 / 8.0 / 7.6 |
+
+With 1,000 agents the corrected server makes 14.8 to 14.9 statements a pull
+(8.6 to 8.9 on the reviewed head, 65.3 to 65.8 before the fix): six more,
+one for each of a catching-up pull's `history` and `fetch` requests. Pulls
+are 5,736 to 5,799 a second against 6,107 to 6,706 (5 to 14 % fewer; the
+reviewed head's two runs differ by 10 %), the database's CPU a pull 1.36 to
+1.39 ms against 0.98 to 1.03 (17.3 before the fix). With 100 agents: 3.8
+statements against 3.4, 31,051 to 31,555 pulls a second against 31,861 to
+32,409. Against `integration` @ `ff29db9b` the corrected fix is still 5.2
+times the pulls with 1,000 agents and under a quarter of the statements.
+A statement could be spared for a request whose every id is a committed
+snapshot's own (it resolves to itself; only someone who holds an embargoed
+snapshot can name its id before it is committed): not done, the check is
+the same for every request.
 
 ## A landing batch's objects as one pack (BUG-1955, 2026-11-17, `t3/fable-speed`)
 
