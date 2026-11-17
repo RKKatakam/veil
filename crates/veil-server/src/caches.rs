@@ -25,13 +25,18 @@
 //! * **Embargoes** are read the same way, and nothing of them is cached:
 //!   the statement that reads a request's epochs also reads whether its
 //!   project has an unreleased embargo line ([`Epochs::embargo_free`]). With
-//!   none, no snapshot of the project is withheld from anyone, so the routes
-//!   a pull makes (`history`, `fetch`, `subtree`) ask nothing more
-//!   (`embargo::is_withheld_in`; they asked once or twice for every snapshot
-//!   named: BUG-1947); with one, they ask about each snapshot as before.
-//!   The answer is the database's at the moment of the request, as for
-//!   permissions: an embargo committed before a request starts is seen by
-//!   that request, on every server.
+//!   none, no snapshot of the project was withheld from anyone then, so
+//!   the routes a pull makes (`history`, `fetch`, `subtree`) do not ask
+//!   about each snapshot they name (`embargo::is_withheld_in`; they asked
+//!   once or twice for every one: BUG-1947); with one, they ask about each
+//!   as before. The answer is the database's at the moment of the request,
+//!   as for permissions: an embargo committed before a request starts is
+//!   seen by that request, on every server. **It says nothing of what a
+//!   request finds later**: those routes resolve the ids they are given
+//!   after it was read, and an embargoed snapshot committed in between can
+//!   be what an id then stands for. So each of them reads it once more
+//!   after its last resolution, one statement a request, and with a line
+//!   there asks about every snapshot (`embargo::withheld_since`).
 //!
 //! **Snapshot resolution** caches only facts that never change: that a
 //! snapshot is committed history (rows are never deleted), a viewer's

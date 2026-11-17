@@ -1118,6 +1118,7 @@ pub async fn history(
 ) -> Result<Vec<u8>> {
     let mut starts = Vec::new();
     let mut reals = Vec::new();
+    let mut resolved = Vec::with_capacity(tips.len());
     for t in tips {
         if crate::embargo::is_withheld_in(hub, project, viewer, epochs, t).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
@@ -1128,6 +1129,14 @@ pub async fn history(
         if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         }
+        resolved.push((*t, real));
+    }
+    // An embargo made while this request resolved its tips (BUG-1947's
+    // review): asked before any of them is projected.
+    if let Some(t) = crate::embargo::withheld_since(hub, project, viewer, epochs, &resolved).await? {
+        return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
+    }
+    for (_, real) in resolved {
         starts.push(projected(hub, project, viewer, real).await?);
         reals.push(real);
     }
@@ -1293,6 +1302,12 @@ pub async fn fetch(
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         }
         reals.insert(snap, real);
+    }
+    // An embargo made while this request resolved its snapshots (BUG-1947's
+    // review).
+    let resolved: Vec<(ObjectId, ObjectId)> = reals.iter().map(|(named, real)| (*named, *real)).collect();
+    if let Some(snap) = crate::embargo::withheld_since(hub, project, viewer, epochs, &resolved).await? {
+        return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
     }
     let (policy_text, bindings, viewer) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
     let wants = Arc::new(wants);

@@ -251,12 +251,55 @@ pub async fn is_withheld_for_query(hub: &Hub, project: i64, snapshot: &ObjectId)
 /// server. A pull asked once or twice for every snapshot it named, in
 /// projects with no embargo at all (BUG-1947). With an unreleased line, or
 /// for a request that did not read the project's (`Epochs::embargo_free`),
-/// each snapshot is asked about, as before.
+/// each snapshot is asked about, as before. **The answer covers only what
+/// existed when the request read it**: a route that resolves an id
+/// afterwards calls [`withheld_since`] after its last resolution.
 pub async fn is_withheld_in(hub: &Hub, project: &Project, viewer: &Viewer, epochs: &crate::caches::Epochs, snapshot: &ObjectId) -> Result<bool> {
     if epochs.embargo_free(project.id) {
         return Ok(false);
     }
     is_withheld_from_viewer(hub, project, viewer, snapshot).await
+}
+
+/// What [`is_withheld_in`]'s "no embargo" cannot answer for: the snapshots a
+/// request found **after** it read that. `resolved` is every snapshot the
+/// request named with the real snapshot the server then found behind it
+/// (`sync::resolve_first`: for a projected id, the newest snapshot any view
+/// projects to it), and this is called after the last of them was found,
+/// before anything of them is read or projected. An embargoed snapshot
+/// committed in between can be what a named id now stands for (an embargo
+/// member of another view sees it as the id the request named), and the
+/// flag read before it says nothing of it: the routes served it (BUG-1947's
+/// review). So a request that read "no unreleased line" reads it once more
+/// here, one statement for the request: still none, and nothing it found is
+/// withheld (a line and its snapshots commit together, `record_in_tx`, so
+/// one committed before the snapshot was found is seen); with one, every
+/// snapshot is asked about, named and real, as a request that read the line
+/// asks. A request that read a line, or none for `project`, asked about
+/// each already. The id named, of the first that is withheld.
+pub async fn withheld_since(
+    hub: &Hub,
+    project: &Project,
+    viewer: &Viewer,
+    epochs: &crate::caches::Epochs,
+    resolved: &[(ObjectId, ObjectId)],
+) -> Result<Option<ObjectId>> {
+    if viewer.admin || resolved.is_empty() || !epochs.embargo_free(project.id) {
+        return Ok(None);
+    }
+    let unreleased: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $1 AND released_at IS NULL)")
+        .bind(project.id)
+        .fetch_one(&hub.db)
+        .await?;
+    if !unreleased {
+        return Ok(None);
+    }
+    for (named, real) in resolved {
+        if is_withheld_from_viewer(hub, project, viewer, named).await? || (real != named && is_withheld_from_viewer(hub, project, viewer, real).await?) {
+            return Ok(Some(*named));
+        }
+    }
+    Ok(None)
 }
 
 /// Is `snapshot` (real or projected) withheld from `viewer` in sync routes

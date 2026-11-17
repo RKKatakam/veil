@@ -1620,8 +1620,10 @@ fn s24b_consolidated_derive_pass_never_derives_memoizes_or_indexes_hidden_embarg
 /// unreleased embargo withholds it, in projects with no embargo at all
 /// (59.8 statements a pull with 1,000 agents). A request now reads, in the
 /// statement that reads its epochs, whether its project has an unreleased
-/// embargo line: with none, those routes ask nothing more (the server's
-/// `embargo_asks` stays where it was); and an embargo is withheld by the
+/// embargo line: with none, those routes ask about no snapshot (the
+/// server's `embargo_asks` stays where it was; each reads the line once
+/// more after it resolved its ids, the test below); and an embargo is
+/// withheld by the
 /// very next request, on the server its push went through and on another
 /// one with everything cached, by each of those routes, each of which asks
 /// about every snapshot again.
@@ -1711,5 +1713,133 @@ fn bug_1947_a_pull_asks_about_embargoes_only_when_there_is_one_and_then_at_once_
         let r = history(h, &sec, merge_id);
         assert_eq!(r.status, 200, "{name}: {}", String::from_utf8_lossy(&r.body));
         assert!(r.frames().iter().any(|(id, _)| *id == fix_id), "{name}: the embargoed fix is in its member's history");
+    }
+}
+
+/// BUG-1947, found by its review: the routes of a pull trusted "this project
+/// has no unreleased embargo", read with the request's epochs, for a
+/// snapshot the request found afterwards. A request names the id it sees
+/// `main`'s tip as (a projected id: the tip hides folders from it), and the
+/// server finds the real snapshot behind it only after the session check:
+/// the newest snapshot any view projects to that id. An embargoed snapshot
+/// pushed between the two, which an embargo member of another view sees as
+/// that same id (their pull stores the row), was then served to someone
+/// outside the embargo, as they see it: its description, its tree, its
+/// files. A request that read "no embargo" now reads it once more after the
+/// last snapshot it resolves, and with an embargo there asks about each, as
+/// before the fast path: here it answers exactly as for an id it never
+/// heard of, by every route, and someone in the embargo is still served.
+#[test]
+fn bug_1947_an_embargo_made_after_a_request_read_its_epochs_withholds_what_the_request_then_resolves() {
+    use veil_server::{auth, caches, error::Error, perm, subtree, sync};
+    const FIX_MARK: &str = "EMBARGO-SECRET-RACE-1947";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let other = TestHub::beside(&hub);
+    let (dev, sec) = (p.dev.token(), p.sec.token());
+    let history = |h: &TestHub, tok: &str, id: ObjectId| h.api().post_json(Some(tok), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [id.hex()], "stop": []}));
+
+    // What `dev` names: `main`'s tip as they see it. Not a committed id (the
+    // tip holds folders they may not see), so the server resolves it.
+    let named = hub.api().tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let real_tip = hub.api().tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"];
+    assert_ne!(named, real_tip, "dev names a projected id");
+    let first = history(&hub, &dev, named);
+    assert_eq!(first.status, 200, "{}", String::from_utf8_lossy(&first.body));
+    let raw = first.frames().into_iter().find(|(id, _)| *id == named).expect("the tip is in its history").1;
+    let veil_core::object::Object::Snapshot(tip) = veil_core::object::Object::decode(&raw).unwrap() else { panic!("the tip is a snapshot") };
+
+    // A request of `who`'s on server `h`, as far as its session check: the
+    // epochs it read (and with them, whether the project has an unreleased
+    // embargo), the project and the view it was given.
+    let begin = |h: &TestHub, who: &Person| {
+        let hb = h.hub();
+        h.rt.block_on(async {
+            let person: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&who.name).fetch_one(&hb.db).await.unwrap();
+            let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hb.db).await.unwrap();
+            let epochs = caches::read_epochs(&hb.db, person, Some(pid)).await.unwrap();
+            let caller = auth::Caller { person: Some(auth::Person { id: person, name: who.name.clone(), device_key: who.identity().verifying_hex(), agent: None }), epochs };
+            let (project, viewer, _) = perm::open_at(&hb, &p.name, &caller).await.unwrap();
+            (caller, project, viewer)
+        })
+    };
+    // The rest of that request, by each route of a pull, naming `id`.
+    let finish = |h: &TestHub, (caller, project, viewer): &(auth::Caller, perm::Project, perm::Viewer), id: ObjectId| -> Vec<(&'static str, Result<(), Error>)> {
+        let hb = h.hub();
+        let want = veil_core::hub::wire::Want { path: String::new(), id: tip.tree, snapshot: None };
+        h.rt.block_on(async {
+            vec![
+                ("history", sync::history(&hb, project, viewer, &caller.epochs, &[id], &[], None, false, veil_core::repo::REPO_FORMAT).await.map(|_| ())),
+                ("fetch", sync::fetch(&hb, project, viewer, &caller.epochs, id, vec![want], false).await.map(|_| ())),
+                // (The route's own part, before the fetch it answers through.)
+                ("subtree", subtree::wants(&hb, project, viewer, &caller.epochs, id, String::new()).await.map(|_| ())),
+            ]
+        })
+    };
+
+    // 1. With no embargo, such a request is answered, by every route (on the
+    //    first server: the second must not have resolved the id before).
+    let early = begin(&hub, &p.dev);
+    assert!(early.0.epochs.embargo_free(early.1.id), "the project has no embargo yet");
+    for (what, r) in finish(&hub, &early, named) {
+        assert!(r.is_ok(), "{what} of main's tip, no embargo: {:?}", r.err());
+    }
+
+    // 2. Two requests on the second server pass their session check: dev's
+    //    and one of someone in `security`. Both read "no unreleased embargo".
+    let (stale_dev, stale_sec) = (begin(&other, &p.dev), begin(&other, &p.sec));
+    assert!(stale_dev.0.epochs.embargo_free(stale_dev.1.id) && stale_sec.0.epochs.embargo_free(stale_sec.1.id));
+
+    // 3. Meanwhile someone in `security` pushes an embargoed fix (through
+    //    the first server)...
+    let sec_dir = p.sec.dir("work");
+    p.sec.ok(p.sec.home.path(), &["clone", &hub.url(&p.name), sec_dir.to_str().unwrap()]);
+    write_files(&sec_dir, &[("src/embargo_race_1947.rs", &format!("pub const FIX: &str = \"{FIX_MARK}\";\n"))]);
+    p.sec.ok(&sec_dir, &["commit", "--no-advance", "-m", "an embargoed fix"]);
+    let until = iso_utc(veil_core::now_millis() + 3_600_000);
+    let merge_out = p.sec.ok(&sec_dir, &["merge", "@-", "--into", "main", "--embargo-for", "security", "--until", &until, "-m", "an embargoed merge"]);
+    let eid = parse_embargo_id(&merge_out);
+    let out = p.sec.ok(&sec_dir, &["log", "-r", "main", "-n", "1", "--json"]);
+    let embargoed = ObjectId::from_hex(serde_json::from_str::<Value>(&out).unwrap()["entries"][0]["snapshot_id"].as_str().unwrap()).unwrap();
+    p.sec.ok(&sec_dir, &["push"]);
+    let (r_dev, r_sec) = (history(&hub, &dev, embargoed), history(&hub, &sec, embargoed));
+    assert_eq!(r_dev.status, 404, "the embargo is there: {}", String::from_utf8_lossy(&r_dev.body));
+    assert_eq!(r_sec.status, 200, "and its member reads it: {}", String::from_utf8_lossy(&r_sec.body));
+    //    ...and an embargo member of another view pulls it, who sees it as
+    //    the id dev named (the fix is in a folder that view may not see):
+    //    the row their pull stores.
+    let ho = other.hub();
+    let stored = other.rt.block_on(
+        sqlx::query("INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, 'another-view', $2, $3, $4, TRUE)")
+            .bind(stale_dev.1.id)
+            .bind(embargoed.hex())
+            .bind(named.hex())
+            .bind(veil_core::now_millis() + 3_600_000)
+            .execute(&ho.db),
+    );
+    assert_eq!(stored.unwrap().rows_affected(), 1, "the other view's row");
+
+    // 4. dev's request goes on: the id it named now stands for the embargoed
+    //    snapshot. Every route answers as for an id nobody ever had.
+    for (what, r) in finish(&other, &stale_dev, named) {
+        match r {
+            Err(Error::Api { status, code, message }) => {
+                assert_eq!((status.as_u16(), code), (404, "not_found"), "{what}: {message}");
+                assert_eq!(message, format!("no snapshot {} that you can see", named.short()), "{what}");
+                assert_no_str(&message, &[FIX_MARK, &eid], what);
+            }
+            Ok(()) => panic!("{what}: a request that began before the embargo was served the embargoed snapshot"),
+            Err(e) => panic!("{what}: {e:?}"),
+        }
+    }
+    //    Someone in the embargo, whose request began as early, is served it.
+    for (what, r) in finish(&other, &stale_sec, embargoed) {
+        // (Their tree is not the one this fetch names: only the snapshot's
+        // check is under test.)
+        match (what, r) {
+            ("fetch", Err(Error::Api { status, message, .. })) => assert!(status.as_u16() == 404 && message.contains("no such object"), "{what}: {message}"),
+            (_, r) => assert!(r.is_ok(), "{what} by a member of the embargo: {:?}", r.err()),
+        }
     }
 }

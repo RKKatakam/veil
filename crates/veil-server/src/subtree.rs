@@ -65,8 +65,9 @@ pub async fn subtree(State(hub): State<HubState>, caller: Caller, Path(p): Path<
 }
 
 /// The trees the answer names: the root, the folders down to `path`, and
-/// the trees below it, as `viewer` sees snapshot `snapshot`.
-async fn wants(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, epochs: &crate::caches::Epochs, snapshot: ObjectId, path: String) -> Result<Vec<Want>> {
+/// the trees below it, as `viewer` sees snapshot `snapshot`. (Public for
+/// the tests: the route's own part, before the fetch it answers through.)
+pub async fn wants(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, epochs: &crate::caches::Epochs, snapshot: ObjectId, path: String) -> Result<Vec<Want>> {
     // Refused as `fetch` refuses it (which checks it again).
     let gone = || Error::not_found(format!("no snapshot {} that you can see", snapshot.short()));
     if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &snapshot).await? {
@@ -76,6 +77,12 @@ async fn wants(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, epochs: &crat
         return Err(gone());
     };
     if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {
+        return Err(gone());
+    }
+    // An embargo made while this request resolved the snapshot (BUG-1947's
+    // review): what the walk below would say of its tree, the refusals
+    // told apart, is the embargo's too.
+    if crate::embargo::withheld_since(hub, project, viewer, epochs, &[(snapshot, real)]).await?.is_some() {
         return Err(gone());
     }
     let (policy_text, bindings, viewer) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());

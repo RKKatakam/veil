@@ -1695,13 +1695,33 @@ never tagged with an epoch set after what it holds was read.
 line** (BUG-1947; `caches::Epochs::embargo_free`). With none, no snapshot
 of the project is withheld from anyone (`embargo::is_withheld_from_viewer`
 joins an unreleased line), so the routes a pull makes (`history`, `fetch`,
-`subtree`) ask nothing more (`embargo::is_withheld_in`); with one, or for a
-request that did not read it (the first of a session or of a project on a
-server), each snapshot named is asked about, as before. Nothing of it is
-cached: it is the database's answer at the moment of the request, as the
-epochs are, so an embargo committed before a request starts is seen by that
-request on every server; what a request serves it named, or reached from
-what it named, when it started. Every other caller of
+`subtree`) do not ask about each snapshot they name
+(`embargo::is_withheld_in`); with one, or for a request that did not read
+it (the first of a session or of a project on a server), each snapshot
+named is asked about, as before. Nothing of it is cached: it is the
+database's answer at the moment of the request, as the epochs are, so an
+embargo committed before a request starts is seen by that request on every
+server.
+
+**That answer covers only what existed when it was read, and those routes
+find snapshots afterwards**: an id a request names is resolved to the real
+snapshot behind it later in the request (for a projected id, the newest
+snapshot any view projects to it, `sync::resolve_first`), and an embargoed
+snapshot committed in between can be that snapshot (an embargo member of
+another view sees it as the same id, and their pull stores the row). So a
+request that read "none" reads it **once more after its last resolution**
+and before anything of what it found is read or projected
+(`embargo::withheld_since`: one statement a request). Still none: nothing
+it found is withheld (a line commits in the transaction of its snapshots).
+One is there: every snapshot is asked about, named and real, exactly as a
+request that read the line asks. The first form of BUG-1947's fix did not
+do this, and its review found the leak: a request begun before an embargo
+was served the embargoed snapshot as its caller sees it
+(`embargo::bug_1947_an_embargo_made_after_a_request_read_its_epochs_…`).
+The rule for any flag of this kind: **a fact read with the request's epochs
+may spare a check only on what the request named and the server already
+held then; what the request resolves, reads or reaches afterwards is
+checked after it is found.** Every other caller of
 `is_withheld_from_viewer` (events, CI, bisect, the routes that resolve a
 snapshot for a push or a commit) asks the database each time, unchanged.
 
