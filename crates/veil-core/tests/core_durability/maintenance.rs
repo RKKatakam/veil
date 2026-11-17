@@ -243,6 +243,20 @@ fn readers_never_take_an_object_for_missing_during_maintenance() {
     assert_fsck_clean(fs, &id, "after reading through maintenance");
 }
 
+/// One of `n`'s remaining counts taken, if any is left (a compare-exchange
+/// loop: `AtomicUsize::try_update` is past the workspace's MSRV, 1.88, and
+/// `fetch_update`, its old name, is deprecated).
+fn take_one(n: &AtomicUsize) -> bool {
+    let mut cur = n.load(Ordering::SeqCst);
+    while cur > 0 {
+        match n.compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+    false
+}
+
 /// A disk on which a whole gc run (a commit, then `gc`: its loose objects
 /// packed, and the small packs merged into one) happens just before each
 /// of the first `left` pack indexes the reader opens: every listing the
@@ -280,7 +294,7 @@ impl StorageBackend for GcBetweenListAndOpen {
     }
     fn read(&self, path: &VPath) -> Result<Vec<u8>> {
         let idx = path.as_str().starts_with(".veil/objects/pack/") && path.as_str().ends_with(".idx");
-        if idx && self.left.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+        if idx && take_one(&self.left) {
             self.gc_run();
         }
         self.inner.read(path)
@@ -377,7 +391,7 @@ impl StorageBackend for Interleave {
         if path.as_str().starts_with(".veil/objects/pack/") && path.as_str().ends_with(".pack") && offset != 0 {
             let size = self.inner.metadata(path)?.map_or(0, |m| m.len);
             let trailer = offset + len as u64 == size && len == 32;
-            if !trailer && self.fail_entry_reads.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+            if !trailer && take_one(&self.fail_entry_reads) {
                 return Err(VeilError::NotFound(format!("{path} (removed meanwhile)")));
             }
         }
