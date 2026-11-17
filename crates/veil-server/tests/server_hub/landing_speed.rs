@@ -42,7 +42,7 @@ fn bug_1940_one_persons_submits_do_not_wait_for_one_another() {
         let person: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.dev.name).fetch_one(&db).await.unwrap();
         let who = Submitter {
             person: Person { id: person, name: p.dev.name.clone(), device_key: format!("key-{run}"), agent: None },
-            epochs: Epochs { person: 0, project: Some((pid, 0)), gc: None },
+            epochs: Epochs { person: 0, project: Some((pid, 0)), gc: None, embargoes: None },
         };
         let queued = |n: usize| Queued {
             ticket: format!("land-{run}-{n}"),

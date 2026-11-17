@@ -819,7 +819,7 @@ async fn history(
     caller.not_web()?;
     let encoded = reads_encoded(&headers);
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
-    let body = sync::history(&hub, &project, &viewer, &req.tips, &req.stop, req.limit, encoded, reads_format(&headers)).await?;
+    let body = sync::history(&hub, &project, &viewer, &caller.epochs, &req.tips, &req.stop, req.limit, encoded, reads_format(&headers)).await?;
     Ok(([(header::CONTENT_TYPE, frames_type(encoded))], body).into_response())
 }
 
@@ -830,7 +830,7 @@ async fn fetch(State(hub): State<HubState>, caller: Caller, Path(p): Path<String
     }
     let encoded = reads_encoded(&headers);
     let (project, viewer) = perm::open(&hub, &p, &caller).await?;
-    let stream = sync::fetch(&hub, &project, &viewer, req.snapshot, req.objects, encoded).await?;
+    let stream = sync::fetch(&hub, &project, &viewer, &caller.epochs, req.snapshot, req.objects, encoded).await?;
     Ok(([(header::CONTENT_TYPE, frames_type(encoded))], axum::body::Body::new(stream)).into_response())
 }
 

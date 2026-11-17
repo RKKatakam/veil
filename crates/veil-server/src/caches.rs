@@ -22,6 +22,16 @@
 //!   starts is seen by that request, on every server.
 //! * Expired sessions are refused from the cache by their expiry; nothing is
 //!   cached for an unknown token, a missing project or a refused device.
+//! * **Embargoes** are read the same way, and nothing of them is cached:
+//!   the statement that reads a request's epochs also reads whether its
+//!   project has an unreleased embargo line ([`Epochs::embargo_free`]). With
+//!   none, no snapshot of the project is withheld from anyone, so the routes
+//!   a pull makes (`history`, `fetch`, `subtree`) ask nothing more
+//!   (`embargo::is_withheld_in`; they asked once or twice for every snapshot
+//!   named: BUG-1947); with one, they ask about each snapshot as before.
+//!   The answer is the database's at the moment of the request, as for
+//!   permissions: an embargo committed before a request starts is seen by
+//!   that request, on every server.
 //!
 //! **Snapshot resolution** caches only facts that never change: that a
 //! snapshot is committed history (rows are never deleted), a viewer's
@@ -87,6 +97,19 @@ pub struct Epochs {
     pub project: Option<(i64, i64)>,
     /// The project's GC epoch (`access_epochs (project, -1)`), when read.
     pub gc: Option<(i64, i64)>,
+    /// The project, and whether it had an unreleased embargo line, when
+    /// that was read with the epochs ([`read_epochs`]).
+    pub embargoes: Option<(i64, bool)>,
+}
+
+impl Epochs {
+    /// Did this request read, with its epochs, that `project` has no
+    /// unreleased embargo line? Then nothing of it is withheld from anyone
+    /// (`embargo::is_withheld_from_viewer` joins an unreleased line). A
+    /// request that did not read it for `project` knows nothing: `false`.
+    pub fn embargo_free(&self, project: i64) -> bool {
+        self.embargoes == Some((project, false))
+    }
 }
 
 pub struct SessionEntry {
@@ -310,6 +333,9 @@ pub struct Stats {
     pub permission_misses: AtomicU64,
     pub tips_hits: AtomicU64,
     pub tips_misses: AtomicU64,
+    /// Statements that asked whether a snapshot is withheld from a viewer
+    /// by an unreleased embargo (`embargo::is_withheld_from_viewer`).
+    pub embargo_asks: AtomicU64,
 }
 
 /// A cache key: a hash of a tag and length-prefixed parts, so keys of
@@ -621,13 +647,15 @@ fn viewer_key(project: i64, person: &Person) -> ObjectId {
 }
 
 /// The access epochs of `person` (0: anyone on Earth) and of `project`
-/// (including its GC epoch at `person_id = -1`), in one statement. Rows that
-/// do not exist yet read as 0.
+/// (including its GC epoch at `person_id = -1`), and whether `project` has
+/// an unreleased embargo line (its lines by their primary key's prefix: a
+/// project has few), in one statement. Rows that do not exist yet read as 0.
 pub async fn read_epochs(db: &sqlx::PgPool, person: i64, project: Option<i64>) -> Result<Epochs> {
-    let (pe, je, ge): (i64, i64, i64) = sqlx::query_as(
+    let (pe, je, ge, embargoed): (i64, i64, i64, bool) = sqlx::query_as(
         "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1), 0), \
          COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = 0), 0), \
-         COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = -1), 0)",
+         COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = -1), 0), \
+         EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $2 AND released_at IS NULL)",
     )
     .bind(person)
     .bind(project.unwrap_or(-1))
@@ -637,6 +665,7 @@ pub async fn read_epochs(db: &sqlx::PgPool, person: i64, project: Option<i64>) -
         person: pe,
         project: project.map(|p| (p, je)),
         gc: project.map(|p| (p, ge)),
+        embargoes: project.map(|p| (p, embargoed)),
     })
 }
 

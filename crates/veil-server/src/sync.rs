@@ -1100,6 +1100,7 @@ pub async fn history(
     hub: &Arc<Hub>,
     project: &Project,
     viewer: &Viewer,
+    epochs: &crate::caches::Epochs,
     tips: &[ObjectId],
     stop: &[ObjectId],
     limit: Option<usize>,
@@ -1109,13 +1110,13 @@ pub async fn history(
     let mut starts = Vec::new();
     let mut reals = Vec::new();
     for t in tips {
-        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, t).await? {
+        if crate::embargo::is_withheld_in(hub, project, viewer, epochs, t).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         }
         let Some(real) = resolve_first(hub, project.id, &project.view(viewer).key(), t).await? else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         };
-        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+        if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         }
         starts.push(projected(hub, project, viewer, real).await?);
@@ -1257,7 +1258,15 @@ fn history_page(src: &Source, starts: Vec<ObjectId>, stop: &HashSet<ObjectId>, l
 /// is read and sent a few objects ahead of the caller (`FETCH_WINDOW`);
 /// a failure while sending ends the stream with an error, so it is never
 /// taken as whole.
-pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>, encoded: bool) -> Result<FrameStream> {
+pub async fn fetch(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    epochs: &crate::caches::Epochs,
+    snapshot: ObjectId,
+    wants: Vec<Want>,
+    encoded: bool,
+) -> Result<FrameStream> {
     // Each want is checked in its own snapshot (revision 1), as the viewer
     // sees it.
     let mut reals: HashMap<ObjectId, ObjectId> = HashMap::new();
@@ -1265,13 +1274,13 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         if reals.contains_key(&snap) {
             continue;
         }
-        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &snap).await? {
+        if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &snap).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         }
         let Some(real) = resolve_first(hub, project.id, &project.view(viewer).key(), &snap).await? else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         };
-        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+        if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         }
         reals.insert(snap, real);

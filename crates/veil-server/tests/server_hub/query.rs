@@ -2240,7 +2240,7 @@ fn s3rd2_names_keep_to_the_branches_and_pages_to_the_viewer_graph() {
         let x = ask(&th, &h, &viewer);
         let project = h.project(&th);
         let ids = |tip: ObjectId| -> Vec<ObjectId> {
-            let page = th.rt.block_on(veil_server::sync::history(&h.hub, &project, &viewer, &[tip], &[], Some(10), false, veil_core::repo::REPO_FORMAT));
+            let page = th.rt.block_on(veil_server::sync::history(&h.hub, &project, &viewer, &Default::default(), &[tip], &[], Some(10), false, veil_core::repo::REPO_FORMAT));
             veil_core::hub::wire::read_frames(&page.unwrap()).unwrap().into_iter().map(|(id, _)| id).collect()
         };
         // Admins' ids are the real ones; anyone's are their projections.

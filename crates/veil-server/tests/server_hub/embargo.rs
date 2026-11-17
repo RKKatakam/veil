@@ -1614,3 +1614,102 @@ fn s24b_consolidated_derive_pass_never_derives_memoizes_or_indexes_hidden_embarg
 }
 
 
+
+/// BUG-1947: a pull's routes (`history`, `fetch`, `subtree`) asked the
+/// database once or twice about every snapshot they named whether an
+/// unreleased embargo withholds it, in projects with no embargo at all
+/// (59.8 statements a pull with 1,000 agents). A request now reads, in the
+/// statement that reads its epochs, whether its project has an unreleased
+/// embargo line: with none, those routes ask nothing more (the server's
+/// `embargo_asks` stays where it was); and an embargo is withheld by the
+/// very next request, on the server its push went through and on another
+/// one with everything cached, by each of those routes, each of which asks
+/// about every snapshot again.
+#[test]
+fn bug_1947_a_pull_asks_about_embargoes_only_when_there_is_one_and_then_at_once_on_every_server() {
+    use std::sync::atomic::Ordering::Relaxed;
+    const FIX_MARK: &str = "EMBARGO-SECRET-FIX-1947";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let other = TestHub::beside(&hub);
+    let (dev, sec) = (p.dev.token(), p.sec.token());
+    let asks = |h: &TestHub| h.hub().caches.stats.embargo_asks.load(Relaxed);
+    let history = |h: &TestHub, tok: &str, id: ObjectId| h.api().post_json(Some(tok), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [id.hex()], "stop": []}));
+    let fetch = |h: &TestHub, tok: &str, snapshot: ObjectId, tree: ObjectId, named: Option<ObjectId>| {
+        let mut want = json!({"path": "", "id": tree.hex()});
+        if let Some(n) = named {
+            want["snapshot"] = json!(n.hex());
+        }
+        h.api().post_json(Some(tok), &format!("/v1/projects/{}/fetch", p.name), &json!({"snapshot": snapshot.hex(), "objects": [want]}))
+    };
+    let subtree = |h: &TestHub, tok: &str, snapshot: ObjectId| h.api().get(Some(tok), &format!("/v1/projects/{}/subtree?snapshot={}&path=", p.name, snapshot.hex()));
+
+    // 1. No embargo: once a server has seen the session and the project, a
+    //    pull's requests ask nothing about embargoes, on either server.
+    let mut main = None;
+    for (name, h) in [("the first server", &hub), ("the second server", &other)] {
+        let tip = h.api().tips(Some(&dev), &p.name).unwrap().branches["main"];
+        let first = history(h, &dev, tip);
+        assert_eq!(first.status, 200, "{name}: {}", String::from_utf8_lossy(&first.body));
+        let raw = first.frames().into_iter().find(|(id, _)| *id == tip).expect("the tip is in its history").1;
+        let veil_core::object::Object::Snapshot(s) = veil_core::object::Object::decode(&raw).unwrap() else { panic!("the tip is a snapshot") };
+        let before = asks(h);
+        for round in 0..3 {
+            for (what, r) in [
+                ("history", history(h, &dev, tip)),
+                ("fetch", fetch(h, &dev, tip, s.tree, None)),
+                ("fetch of a want in a named snapshot", fetch(h, &dev, tip, s.tree, Some(tip))),
+                ("subtree", subtree(h, &dev, tip)),
+            ] {
+                assert_eq!(r.status, 200, "{name}, round {round}, {what}: {}", String::from_utf8_lossy(&r.body));
+            }
+        }
+        assert_eq!(asks(h) - before, 0, "{name}: a pull asked about embargoes in a project that has none");
+        main = Some((tip, s.tree));
+    }
+    let (tip, tree) = main.expect("read above");
+
+    // 2. Someone in `security` makes an embargoed fix and pushes it, through
+    //    the first server.
+    let sec_dir = p.sec.dir("work");
+    p.sec.ok(p.sec.home.path(), &["clone", &hub.url(&p.name), sec_dir.to_str().unwrap()]);
+    write_files(&sec_dir, &[("src/embargo_1947.rs", &format!("pub const FIX: &str = \"{FIX_MARK}\";\n"))]);
+    p.sec.ok(&sec_dir, &["commit", "--no-advance", "-m", "an embargoed fix"]);
+    let id_of = |rev: &str| {
+        let out = p.sec.ok(&sec_dir, &["log", "-r", rev, "-n", "1", "--json"]);
+        ObjectId::from_hex(serde_json::from_str::<Value>(&out).unwrap()["entries"][0]["snapshot_id"].as_str().unwrap()).unwrap()
+    };
+    let fix_id = id_of("@-");
+    let until = iso_utc(veil_core::now_millis() + 3_600_000);
+    let merge_out = p.sec.ok(&sec_dir, &["merge", "@-", "--into", "main", "--embargo-for", "security", "--until", &until, "-m", "an embargoed merge"]);
+    let eid = parse_embargo_id(&merge_out);
+    let merge_id = id_of("main");
+    p.sec.ok(&sec_dir, &["push"]);
+
+    // 3. At once, nothing waited for: someone outside is refused both
+    //    snapshots by every route of a pull, on both servers (the second
+    //    first: it took no part in the push), and each refusal asked.
+    for (name, h) in [("the second server", &other), ("the first server", &hub)] {
+        let before = asks(h);
+        for id in [fix_id, merge_id] {
+            for (what, r) in [
+                ("history", history(h, &dev, id)),
+                ("fetch", fetch(h, &dev, id, tree, None)),
+                ("fetch of a want in the embargoed snapshot", fetch(h, &dev, tip, tree, Some(id))),
+                ("subtree", subtree(h, &dev, id)),
+            ] {
+                assert_eq!(r.status, 404, "{name}, {what} of {}: {}", id.short(), String::from_utf8_lossy(&r.body));
+                assert_no_str(&String::from_utf8_lossy(&r.body), &[FIX_MARK, &eid], name);
+            }
+        }
+        assert!(asks(h) - before >= 8, "{name}: with an unreleased embargo every snapshot named is asked about ({} asks)", asks(h) - before);
+        // What is not embargoed is still theirs to pull.
+        let r = history(h, &dev, tip);
+        assert_eq!(r.status, 200, "{name}: {}", String::from_utf8_lossy(&r.body));
+        // And someone in the embargo reads it.
+        let r = history(h, &sec, merge_id);
+        assert_eq!(r.status, 200, "{name}: {}", String::from_utf8_lossy(&r.body));
+        assert!(r.frames().iter().any(|(id, _)| *id == fix_id), "{name}: the embargoed fix is in its member's history");
+    }
+}

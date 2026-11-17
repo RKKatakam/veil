@@ -240,6 +240,25 @@ pub async fn is_withheld_for_query(hub: &Hub, project: i64, snapshot: &ObjectId)
     Ok(eid.is_some())
 }
 
+/// [`is_withheld_from_viewer`], for a request that read, with its epochs,
+/// whether `project` has an unreleased embargo line (`caches::read_epochs`:
+/// the request's one statement, before anything it answers). With none,
+/// nothing of the project is withheld from anyone, and no statement is
+/// made: the answer the database gave at the moment of the request, as
+/// every permission is answered (`caches`). What such a request then serves
+/// it named, or reached from what it named, when no embargo was unreleased;
+/// an embargo committed before a request starts is seen by it, on every
+/// server. A pull asked once or twice for every snapshot it named, in
+/// projects with no embargo at all (BUG-1947). With an unreleased line, or
+/// for a request that did not read the project's (`Epochs::embargo_free`),
+/// each snapshot is asked about, as before.
+pub async fn is_withheld_in(hub: &Hub, project: &Project, viewer: &Viewer, epochs: &crate::caches::Epochs, snapshot: &ObjectId) -> Result<bool> {
+    if epochs.embargo_free(project.id) {
+        return Ok(false);
+    }
+    is_withheld_from_viewer(hub, project, viewer, snapshot).await
+}
+
 /// Is `snapshot` (real or projected) withheld from `viewer` in sync routes
 /// (`history`, `fetch`, `resolve_for`) because it belongs to an unreleased
 /// embargo that `viewer` is not in?
@@ -247,6 +266,7 @@ pub async fn is_withheld_from_viewer(hub: &Hub, project: &Project, viewer: &View
     if viewer.admin {
         return Ok(false);
     }
+    hub.caches.stats.embargo_asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let hex = snapshot.hex();
     let groups: Option<Vec<String>> = sqlx::query_scalar(
         "SELECT l.group_names FROM embargo_snapshots s \

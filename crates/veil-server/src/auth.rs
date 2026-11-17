@@ -540,6 +540,8 @@ pub(crate) async fn authenticate_parts(parts: &mut Parts, hub: &HubState, enforc
                         person: person_epoch,
                         project: project.map(|p| (p, project_epoch)),
                         gc: project.map(|p| (p, gc_epoch)),
+                        // Not read here: the routes ask (`embargo::is_withheld_in`).
+                        embargoes: None,
                     },
                 }
             }

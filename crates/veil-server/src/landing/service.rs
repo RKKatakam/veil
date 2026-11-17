@@ -1031,6 +1031,7 @@ impl Service {
                             person: person_epoch(row.person.id),
                             project: Some((self.project, project_epoch)),
                             gc: Some((self.project, gc_epoch)),
+                            embargoes: None,
                         },
                     };
                     match crate::perm::open(hub, &self.name, &caller).await {

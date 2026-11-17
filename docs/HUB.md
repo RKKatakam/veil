@@ -1691,6 +1691,20 @@ was built under exactly those epochs. An entry is built by reading the
 epochs first and the records after, or both in one statement, so it is
 never tagged with an epoch set after what it holds was read.
 
+**The same statement reads whether the project has an unreleased embargo
+line** (BUG-1947; `caches::Epochs::embargo_free`). With none, no snapshot
+of the project is withheld from anyone (`embargo::is_withheld_from_viewer`
+joins an unreleased line), so the routes a pull makes (`history`, `fetch`,
+`subtree`) ask nothing more (`embargo::is_withheld_in`); with one, or for a
+request that did not read it (the first of a session or of a project on a
+server), each snapshot named is asked about, as before. Nothing of it is
+cached: it is the database's answer at the moment of the request, as the
+epochs are, so an embargo committed before a request starts is seen by that
+request on every server; what a request serves it named, or reached from
+what it named, when it started. Every other caller of
+`is_withheld_from_viewer` (events, CI, bisect, the routes that resolve a
+snapshot for a push or a commit) asks the database each time, unchanged.
+
 *What a read grant can rely on (S5):* (1) an entry records the epochs read
 before its rows, and `perm::open_at` returns them with the view, so a grant
 made from it carries those, never a later read of the epochs; (2) an entry
