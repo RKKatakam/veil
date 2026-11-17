@@ -1985,6 +1985,23 @@ fn bug_1885_writers_may_delete_merged_branches_only() {
     assert!(branches_end.contains_key("embargo/e1a2b3c4d5e6f708"));
 }
 
+/// The project's branches once `branch` is not among them, or as they are
+/// after a minute (BUG-2601): a landed PR's source branch is deleted by a
+/// task of its own after the landing is committed, and the land's answer
+/// waits for it for two seconds at most (`landing::service`
+/// `PR_CLEANUP_WAIT`: under load the answer came first, and the branches
+/// read at once still listed it).
+fn branches_once_gone(api: &Api, token: &str, project: &str, branch: &str) -> std::collections::BTreeMap<String, ObjectId> {
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        let branches = api.tips(Some(token), project).expect("the project's tips").branches;
+        if !branches.contains_key(branch) || Instant::now() >= end {
+            return branches;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// BUG-1885 Guarantee 2: landing a PR deletes its source branch if its tip is
 /// now contained in the PR's target (including rebased landings onto a moved
 /// protected branch and PRs onto non-default branches), leaves the source
@@ -2032,7 +2049,7 @@ fn bug_1885_pr_landing_deletes_merged_source_branch_unless_disabled() {
 
     p.admin.ok(&p.dir, &["pr", "review", pr1_id, "--approve"]);
     p.dev.ok(&dev_dir, &["pr", "land", pr1_id]);
-    let tips_after_pr1 = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    let tips_after_pr1 = branches_once_gone(&api, &admin_tok, &p.name, "task-pr-1");
     assert!(!tips_after_pr1.contains_key("task-pr-1"), "PR source branch must be deleted on land: {tips_after_pr1:?}");
     assert_eq!(
         api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?path=src/pr_del1.rs", p.name)).status,
@@ -2082,7 +2099,7 @@ fn bug_1885_pr_landing_deletes_merged_source_branch_unless_disabled() {
     );
     let r_land_sub = api.post_json(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_sub_id}/land", p.name), &json!({}));
     assert_eq!(r_land_sub.status, 200, "{}", String::from_utf8_lossy(&r_land_sub.body));
-    let tips_after_sub = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
+    let tips_after_sub = branches_once_gone(&api, &admin_tok, &p.name, "task-sub-1");
     assert!(!tips_after_sub.contains_key("task-sub-1"), "sub-branch deleted when landed into feature target: {tips_after_sub:?}");
     assert!(tips_after_sub.contains_key("feat-umb-1"));
 

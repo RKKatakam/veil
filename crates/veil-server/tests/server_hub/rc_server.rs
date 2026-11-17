@@ -662,12 +662,20 @@ fn bug_1924_a_pr_that_lands_after_its_request_was_answered_queued_is_landed() {
     assert_eq!(file.status, 200, "the PR's change is on main: {}", body(&file));
 
     // The PR is landed, and its source branch is cleaned up, as when the
-    // landing ends within the request (`rv_core2::bug_1885_pr_landing_…`).
-    std::thread::sleep(Duration::from_secs(2));
+    // landing ends within the request (`rv_core2::bug_1885_pr_landing_…`):
+    // by a task of its own after the landing is committed, so it is waited
+    // for (BUG-2601: two seconds were slept, which under load is not enough).
     let shown = api.get(Some(&dev), &format!("/v1/projects/{}/prs/{id}", p.name));
     assert_eq!(shown.status, 200, "{}", body(&shown));
     assert_eq!(shown.json()["state"], "landed", "the PR's change is on main and the PR is still {}", shown.json()["state"]);
-    let tips = api.tips(Some(&dev), &p.name).unwrap();
+    let until = Instant::now() + Duration::from_secs(60);
+    let tips = loop {
+        let tips = api.tips(Some(&dev), &p.name).unwrap();
+        if !tips.branches.contains_key("topic-late") || Instant::now() > until {
+            break tips;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert!(!tips.branches.contains_key("topic-late"), "the landed PR's source branch is left");
 }
 
