@@ -570,3 +570,134 @@ fn a_sealed_object_at_a_path_that_is_not_a_secret_is_refused() {
     assert!(String::from_utf8_lossy(&r.body).contains("only secret files are encrypted"));
     assert_eq!(tip_for(&hub, &token, &p.name), base);
 }
+
+/// BUG-1948: an API commit stores what it made (its blob, the trees above
+/// it, the server's snapshot and the caller's projection) as one pack, one
+/// storage write of its own, which its transaction lists; it stored them
+/// one object at a time (some seven writes where a push makes one), before
+/// its checks. Nothing is left staged, the snapshot is no object of its
+/// own, a second server reads the whole tree, and the file reads back.
+#[test]
+fn bug_1948_an_api_commit_stores_what_it_made_as_one_pack_its_commit_lists() {
+    use crate::landing_hold::{packs_in, whole_tree_beside};
+    use std::sync::atomic::Ordering::Relaxed;
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let token = p.dev.token();
+    let base = tip_for(&hub, &token, &p.name);
+    let h = hub.hub();
+    let (listed_before, staged_before, own_before) = (packs_in(&hub, pid, 1), packs_in(&hub, pid, 0), h.objects.own_writes.load(Relaxed));
+    let r = change(
+        &hub,
+        &token,
+        &p.name,
+        &json!({"base": base.hex(), "description": "packed", "edits": [put("src/api_pack/deep/new.rs", "packed\n")], "onto": {"branch": "main", "expected": base.hex()}}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let v = r.json();
+    assert_eq!(v["branch"]["status"], "ok", "{v}");
+    let mine: ObjectId = serde_json::from_value(v["snapshot"].clone()).unwrap();
+    assert_eq!(h.objects.own_writes.load(Relaxed) - own_before, 1, "the commit's own storage writes");
+    let listed: Vec<String> = packs_in(&hub, pid, 1).into_iter().filter(|n| !listed_before.contains(n)).collect();
+    assert_eq!(listed.len(), 1, "the commit listed one pack of what it made: {listed:?}");
+    assert_eq!(packs_in(&hub, pid, 0), staged_before, "nothing is left staged");
+    let store = h.objects.blob_store();
+    assert!(hub.rt.block_on(store.exists(&veil_server::pack::key(pid, &listed[0]))).unwrap(), "the listed pack is stored");
+    assert!(!hub.rt.block_on(store.exists(&veil_server::store::object_key(pid, &mine))).unwrap(), "the caller's snapshot is stored as an object of its own");
+    assert!(stored(&hub, pid, &mine), "and it is read from the pack");
+    let real = tip_for(&hub, &p.admin.token(), &p.name);
+    assert!(whole_tree_beside(&hub, pid, real) >= 4, "the root, src/, src/api_pack/ and deep/");
+    let f = hub.api().get(Some(&token), &format!("/v1/projects/{}/q/file?rev={}&path=src/api_pack/deep/new.rs", p.name, mine.hex()));
+    assert_eq!((f.status, String::from_utf8_lossy(&f.body).to_string()), (200, "packed\n".to_string()));
+}
+
+/// BUG-1948, BUG-2370: a pack is recorded and written only while the
+/// branches its transaction will compare and swap are where it expects
+/// them (`Objects::put_pack_on`): with a branch elsewhere, or one that
+/// should not exist, nothing is recorded and nothing written; with every
+/// branch as given, the pack is staged and stored.
+#[test]
+fn bug_1948_a_pack_is_written_only_while_the_branches_it_depends_on_hold() {
+    use crate::landing_hold::packs_in;
+    use std::sync::atomic::Ordering::Relaxed;
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let target: String = hub.rt.block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(pid).fetch_one(&h.db)).unwrap();
+    let person: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT person_id FROM project_admins WHERE project_id = $1 LIMIT 1").bind(pid).fetch_one(&h.db)).unwrap();
+    let raw = bytes::Bytes::from(O::Blob(b"guarded pack".to_vec()).encode());
+    let objects = || vec![(ObjectId::hash(&raw), veil_server::store::encode(raw.clone()))];
+    let elsewhere = ObjectId::hash(b"another tip").hex();
+    let (staged_before, writes_before) = (packs_in(&hub, pid, 0), h.objects.writes.load(Relaxed));
+    for (what, tips) in [
+        ("main elsewhere", vec![("main".to_string(), Some(elsewhere.clone()))]),
+        ("main, which exists, expected not to", vec![("main".to_string(), None)]),
+        ("a branch that does not exist expected at a tip", vec![("no-such-branch".to_string(), Some(target.clone()))]),
+        ("one of two elsewhere", vec![("main".to_string(), Some(target.clone())), ("no-such-branch".to_string(), Some(elsewhere.clone()))]),
+    ] {
+        let r = hub.rt.block_on(h.objects.put_pack_on(pid, person, objects(), &tips)).unwrap();
+        assert!(r.is_none(), "{what}: a pack was written");
+        assert_eq!(packs_in(&hub, pid, 0), staged_before, "{what}: a pack was recorded");
+        assert_eq!(h.objects.writes.load(Relaxed), writes_before, "{what}: something was written");
+    }
+    for (what, tips) in [
+        ("main where it is", vec![("main".to_string(), Some(target.clone()))]),
+        ("main where it is and a branch that is not there", vec![("main".to_string(), Some(target.clone())), ("no-such-branch".to_string(), None)]),
+        ("no branch named", vec![]),
+    ] {
+        let (name, _held) = hub.rt.block_on(h.objects.put_pack_on(pid, person, objects(), &tips)).unwrap().unwrap_or_else(|| panic!("{what}: no pack written"));
+        assert!(packs_in(&hub, pid, 0).iter().any(|n| **n == *name), "{what}: the pack is recorded staged");
+        assert!(hub.rt.block_on(h.objects.blob_store().exists(&veil_server::pack::key(pid, &name))).unwrap(), "{what}: the pack is stored");
+        hub.rt.block_on(h.objects.discard(pid, &[name])).unwrap();
+    }
+    assert_eq!(packs_in(&hub, pid, 0), staged_before, "the packs written here were discarded");
+}
+
+/// BUG-1948: twenty API commits race onto one branch, the server rebasing
+/// each: every one lands, each attempt that lost its race either wrote no
+/// pack or had it discarded and deleted (none is left staged, and every
+/// discarded pack's storage object is gone), and the tip a second server
+/// reads holds every file.
+#[test]
+fn bug_1948_racing_api_commits_leave_no_pack_behind() {
+    use crate::landing_hold::{packs_in, whole_tree_beside};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let token = p.dev.token();
+    let start = tip_for(&hub, &token, &p.name);
+    let staged_before = packs_in(&hub, pid, 0);
+    const AGENTS: usize = 20;
+    std::thread::scope(|s| {
+        for i in 0..AGENTS {
+            let (hub, token, name) = (&hub, &token, &p.name);
+            s.spawn(move || {
+                let mut base = start;
+                for _ in 0..40 {
+                    let r = change(hub, token, name, &json!({"base": base.hex(), "description": format!("racer {i}"),
+                        "edits": [put(&format!("src/racers/r{i:02}.txt"), &format!("racer {i}\n"))], "onto": {"branch": "main", "expected": "rebase"}}));
+                    assert_eq!(r.status, 200, "racer {i}: {}", String::from_utf8_lossy(&r.body));
+                    if r.json()["branch"]["status"] == "ok" {
+                        return;
+                    }
+                    base = tip_for(hub, token, name);
+                }
+                panic!("racer {i} never landed");
+            });
+        }
+    });
+    let tip = tip_for(&hub, &token, &p.name);
+    for i in 0..AGENTS {
+        let f = hub.api().get(Some(&token), &format!("/v1/projects/{}/q/file?rev={}&path=src/racers/r{i:02}.txt", p.name, tip.hex()));
+        assert_eq!((f.status, String::from_utf8_lossy(&f.body).to_string()), (200, format!("racer {i}\n")), "racer {i}'s file at the tip");
+    }
+    assert_eq!(packs_in(&hub, pid, 0), staged_before, "a pack of an attempt was left staged");
+    let h = hub.hub();
+    for n in packs_in(&hub, pid, 2) {
+        assert!(!hub.rt.block_on(h.objects.blob_store().exists(&veil_server::pack::key(pid, &n))).unwrap(), "discarded pack {n} is still stored");
+    }
+    let real = tip_for(&hub, &p.admin.token(), &p.name);
+    assert!(whole_tree_beside(&hub, pid, real) >= 3, "the root, src/ and src/racers/");
+}

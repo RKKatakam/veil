@@ -171,6 +171,15 @@ impl Staged {
         })
     }
 
+    /// [`Staged::held`], holding `objects` (canonical encodings) from the
+    /// start: what an API commit made, read by its checks before it is
+    /// stored (BUG-1948).
+    pub(crate) fn holding(objects: impl IntoIterator<Item = (ObjectId, Bytes)>) -> Arc<Staged> {
+        let st = Staged::held();
+        st.made.lock().unwrap().extend(objects);
+        st
+    }
+
     /// What the checks made and hold (never stored by them).
     pub(crate) fn made(&self) -> Vec<(ObjectId, Bytes)> {
         let mut v: Vec<(ObjectId, Bytes)> = self.made.lock().unwrap().iter().map(|(k, v)| (*k, v.clone())).collect();

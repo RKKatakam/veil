@@ -1243,7 +1243,7 @@ fn bug_2362_a_submits_grafted_trees_are_stored_with_its_objects() {
 }
 
 /// Packs of project `pid` in `state` (0 staged, 1 listed, 2 discarded).
-fn packs_in(hub: &TestHub, pid: i64, state: i16) -> Vec<String> {
+pub(crate) fn packs_in(hub: &TestHub, pid: i64, state: i16) -> Vec<String> {
     hub.rt
         .block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = $2 ORDER BY name").bind(pid).bind(state).fetch_all(&hub.hub().db))
         .unwrap()
@@ -1267,7 +1267,7 @@ fn wait_landed(api: &Api, token: &str, project: &str, ticket: &str) {
 /// Every tree and blob of snapshot `tip`, read by a second server beside
 /// `hub` (the same database and object storage, nothing of its memory):
 /// how many trees.
-fn whole_tree_beside(hub: &TestHub, pid: i64, tip: veil_core::ObjectId) -> usize {
+pub(crate) fn whole_tree_beside(hub: &TestHub, pid: i64, tip: veil_core::ObjectId) -> usize {
     let other = TestHub::beside(hub);
     let objects = &other.hub().objects;
     let read = |id: &veil_core::ObjectId| {

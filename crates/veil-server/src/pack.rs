@@ -1167,24 +1167,41 @@ impl Packs {
     /// Record staged pack `name` of `project`, uploaded by `person`, before
     /// it is written: the database knows every upload in storage.
     pub async fn record_staged(&self, project: i64, person: i64, name: &str, size: u64, objects: usize) -> Result<()> {
-        self.record_staged_by(project, Some(person), name, size, objects).await
+        self.record_staged_by(project, Some(person), name, size, objects, &[]).await?;
+        Ok(())
     }
 
     /// Record staged pack `name` of `project` (`person` `None`: written by
-    /// a merge or garbage-collection pass, S29) before it is written.
-    pub async fn record_staged_by(&self, project: i64, person: Option<i64>, name: &str, size: u64, objects: usize) -> Result<()> {
-        let Some(db) = &self.db else { return Ok(()) };
-        sqlx::query("INSERT INTO packs (project_id, name, state, person_id, size, objects, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-            .bind(project)
-            .bind(name)
-            .bind(STAGED)
-            .bind(person)
-            .bind(size as i64)
-            .bind(objects as i64)
-            .bind(veil_core::now_millis())
-            .execute(db)
-            .await?;
-        Ok(())
+    /// a merge or garbage-collection pass, S29) before it is written:
+    /// whether it was recorded. With `tips` (branches of the project, each
+    /// with its target; `None`: no such branch), only while every one of
+    /// them is as given, decided in the statement that records it: `false`,
+    /// and nothing recorded, once one of them moved (BUG-1948, BUG-2370: a
+    /// transaction that would list the pack only by a compare-and-swap of
+    /// those branches has lost already, and its pack is not written).
+    pub async fn record_staged_by(&self, project: i64, person: Option<i64>, name: &str, size: u64, objects: usize, tips: &[(String, Option<String>)]) -> Result<bool> {
+        let Some(db) = &self.db else { return Ok(true) };
+        let (branches, targets): (Vec<&str>, Vec<Option<&str>>) = tips.iter().map(|(b, t)| (b.as_str(), t.as_deref())).unzip();
+        let recorded = sqlx::query(
+            "INSERT INTO packs (project_id, name, state, person_id, size, objects, created_at) \
+             SELECT $1::BIGINT, $2::TEXT, $3::SMALLINT, $4::BIGINT, $5::BIGINT, $6::BIGINT, $7::BIGINT \
+             WHERE NOT EXISTS (SELECT 1 FROM UNNEST($8::TEXT[], $9::TEXT[]) AS w(branch, target) \
+               LEFT JOIN branches b ON b.project_id = $1::BIGINT AND b.name = w.branch \
+               WHERE b.target IS DISTINCT FROM w.target)",
+        )
+        .bind(project)
+        .bind(name)
+        .bind(STAGED)
+        .bind(person)
+        .bind(size as i64)
+        .bind(objects as i64)
+        .bind(veil_core::now_millis())
+        .bind(&branches)
+        .bind(&targets)
+        .execute(db)
+        .await?
+        .rows_affected();
+        Ok(recorded == 1)
     }
 
     /// Remember the index of a pack staged here, by `person`, with its

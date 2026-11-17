@@ -1278,16 +1278,15 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
         if let Some(c) = r["db_branch_landing_commits_per_landing"].as_f64().filter(|c| c * merges > GATE_COMMITS_PER_BRANCH_LANDING * merges * 1.02 + 20.0) {
             out.push(format!("{mode}: {c:.2} database commits per branch landing (gate: {GATE_COMMITS_PER_BRANCH_LANDING})"));
         }
-        // Pushes only: an API commit stores its objects loose (S10).
-        if mode != "api" {
-            let tries = 1.0 + r["collisions_per_op"].as_f64().unwrap_or(0.0);
-            let over = |w: f64| w * ops > GATE_STORAGE_WRITES_PER_PUSH * tries * ops * 1.02 + 20.0;
-            if let Some(w) = r["storage_push_writes_per_op"].as_f64().filter(|w| over(*w)) {
-                out.push(format!(
-                    "{mode}: {:.2} storage writes per push ({w:.2} per landing of {tries:.2} pushes), the deriver's aside (gate: {GATE_STORAGE_WRITES_PER_PUSH})",
-                    w / tries
-                ));
-            }
+        // An API commit too: it stores what it made as one pack (BUG-1948;
+        // stored loose, as S10 did, its writes were only reported).
+        let tries = 1.0 + r["collisions_per_op"].as_f64().unwrap_or(0.0);
+        let over = |w: f64| w * ops > GATE_STORAGE_WRITES_PER_PUSH * tries * ops * 1.02 + 20.0;
+        if let Some(w) = r["storage_push_writes_per_op"].as_f64().filter(|w| over(*w)) {
+            out.push(format!(
+                "{mode}: {:.2} storage writes per push ({w:.2} per landing of {tries:.2} pushes), the deriver's aside (gate: {GATE_STORAGE_WRITES_PER_PUSH})",
+                w / tries
+            ));
         }
     }
     if mode == "objects" && r["via"] == "cache" {
@@ -2726,7 +2725,8 @@ mod tests {
     use super::*;
 
     /// S28's gate: a landing's own storage writes (the deriver's aside), for
-    /// pushes; an API commit's are reported only.
+    /// pushes and, since it stores what it made as one pack (BUG-1948), for
+    /// an API commit.
     #[test]
     fn storage_writes_per_push_are_gated() {
         let run = |mode: &str, push_writes: f64| json!({"mode": mode, "ops": 1000.0, "storage_push_writes_per_op": push_writes});
@@ -2734,7 +2734,8 @@ mod tests {
         assert!(missed_gates(&run("land", 2.0), 0.0).is_empty());
         assert_eq!(missed_gates(&run("land", 6.0), 0.0).len(), 1);
         assert_eq!(missed_gates(&run("branches", 2.5), 0.0).len(), 1);
-        assert!(missed_gates(&run("api", 6.0), 0.0).is_empty());
+        assert!(missed_gates(&run("api", 1.0), 0.0).is_empty());
+        assert_eq!(missed_gates(&run("api", 6.0), 0.0).len(), 1, "an API commit's own writes are gated as a push's");
         // Per push: a landing that lost 4 races pushed 5 times.
         let raced = |w: f64| json!({"mode": "land", "ops": 1000.0, "collisions_per_op": 4.0, "storage_push_writes_per_op": w});
         assert!(missed_gates(&raced(9.0), 0.0).is_empty());
