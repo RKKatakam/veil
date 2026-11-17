@@ -188,19 +188,33 @@ async fn grant_root(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snap: Ob
     if hub.grants.stored.get(&memo).is_some() {
         return Ok(Some(root));
     }
-    let reals = sync::resolve(hub, project.id, &project.view(viewer).key(), &snap).await?;
-    let (p, v) = (project.clone(), viewer.clone());
-    let created = sync::blocking(hub, project.id, move |src| {
-        let view = p.view(&v);
-        for real in reals {
-            let mut pr = Projector::new(src, &view);
-            if pr.root(src.snapshot(&real)?.tree)? == root {
-                return Ok(Some(pr.created.into_iter().map(|(id, (_, raw))| (id, raw)).collect::<Vec<_>>()));
+    // The first real snapshot, newest first, whose projection for them has
+    // this root: the newest alone first, the rest read only if it has not
+    // (BUG-2510: a run hidden from them is every one of them).
+    let key = project.view(viewer).key();
+    let first: Vec<ObjectId> = sync::resolve_first(hub, project.id, &key, &snap).await?.into_iter().collect();
+    let mut created = None;
+    for reals in [Some(first), None] {
+        let reals = match reals {
+            Some(r) => r,
+            None => sync::resolve(hub, project.id, &key, &snap).await?,
+        };
+        let (p, v) = (project.clone(), viewer.clone());
+        created = sync::blocking(hub, project.id, move |src| {
+            let view = p.view(&v);
+            for real in reals {
+                let mut pr = Projector::new(src, &view);
+                if pr.root(src.snapshot(&real)?.tree)? == root {
+                    return Ok(Some(pr.created.into_iter().map(|(id, (_, raw))| (id, raw)).collect::<Vec<_>>()));
+                }
             }
+            Ok(None)
+        })
+        .await?;
+        if created.is_some() {
+            break;
         }
-        Ok(None)
-    })
-    .await?;
+    }
     let Some(created) = created else {
         eprintln!("veil-server: projected root {} of project {} not reproduced; no grant", root.short(), project.id);
         return Ok(None);

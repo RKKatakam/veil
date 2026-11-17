@@ -1,0 +1,13 @@
+-- BUG-2510: a snapshot id that is no committed snapshot is resolved to the
+-- real snapshots projected to it, newest first, and nearly every caller
+-- takes the first (`sync::resolve_first`). A run hidden from a view is one
+-- projected id for every real snapshot of it, so by `projections_by_projected`
+-- the newest was found by reading and sorting the whole run (200,053 rows
+-- for a run of 200,050). In this order the first is read alone.
+-- Idempotent (IF NOT EXISTS). `projections_by_projected` is kept.
+--
+-- Built online (BUG-2482): `projections` is a large table servers already
+-- write, and on YugabyteDB an index made in a transaction block can miss
+-- rows other servers write during its build.
+-- veil: online indexes (outside the transaction, `db::ONLINE_INDEXES`: on a table servers already write)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS projections_by_projected_at ON projections (project_id, projected_id, created_at DESC);

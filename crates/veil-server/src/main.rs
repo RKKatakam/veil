@@ -127,8 +127,8 @@ enum Command {
         #[arg(long, default_value = "128M", value_parser = bytes)]
         memory: u64,
         /// Most client connections open at once (the next waits until one
-        /// closes): each may hold about 352 KiB beyond --memory (its TLS and
-        /// HTTP buffers), so the defaults bound the cache at about 480 MiB.
+        /// closes): each may hold about 368 KiB beyond --memory (its TLS and
+        /// HTTP buffers), so the defaults bound the cache at about 496 MiB.
         #[arg(long, default_value_t = 1024)]
         max_connections: usize,
         /// TLS certificate chain (PEM); without it, a self-signed certificate.

@@ -84,6 +84,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (39, "lease_locks", include_str!("../migrations/0039_lease_locks.sql")),
     (40, "packs_unlisted", include_str!("../migrations/0040_packs_unlisted.sql")),
     (41, "packs_listed", include_str!("../migrations/0041_packs_listed.sql")),
+    (42, "projections_by_projected_at", include_str!("../migrations/0042_projections_by_projected_at.sql")),
 ];
 
 pub async fn connect(url: &str, max: u32) -> anyhow::Result<PgPool> {

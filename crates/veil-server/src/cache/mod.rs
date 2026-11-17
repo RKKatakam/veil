@@ -61,7 +61,7 @@ use axum::{
 use veil_core::{
     cache::LruCache,
     hub::{
-        grant::{request_signed, BatchRequest, ChainSource, ChainWant, Chains, Grant},
+        grant::{request_signed, BatchRequest, ChainSource, ChainWant, Chains, Grant, MAX_CHAIN},
         wire::{put_frame, MAX_WANTS},
     },
     object::{Object, Tree},
@@ -80,6 +80,16 @@ pub const MAX_OBJECT: u64 = 16 << 20;
 /// each connection's write buffer: a connection holds about two of them
 /// outside `--memory` (BUG-1181).
 const SLICE: usize = 64 << 10;
+/// Each connection's HTTP/1.1 read buffer, which is also the longest
+/// request head the cache reads: the longest valid one (a `Veil-Chain` of
+/// `MAX_CHAIN` ids, 66,689 bytes, with its grant and signature) fits with
+/// room. hyper refuses a head only if it is not whole by this many bytes,
+/// so a valid head is always read, however its bytes arrive (BUG-1415,
+/// BUG-1420, BUG-2469: at one slice, 64 KiB, the same head was read, or
+/// refused `431`, or its connection closed while it was being written,
+/// depending on whether one read took it past the buffer).
+const HTTP_BUFFER: usize = 80 << 10;
+const _: () = assert!(MAX_CHAIN * 65 + (8 << 10) <= HTTP_BUFFER);
 /// How long a poll of the feed may take.
 const POLL_TIMEOUT: Duration = Duration::from_secs(3);
 /// Most objects being fetched from the server at once that later requests
@@ -128,7 +138,7 @@ pub struct Config {
     pub memory: u64,
     /// Most connections open at once; the next waits until one closes.
     /// Each may hold its TLS and HTTP buffers outside `memory` (about
-    /// 352 KiB, `docs/HUB.md` §13.18).
+    /// 368 KiB, `docs/HUB.md` §13.18).
     pub max_connections: usize,
 }
 
@@ -274,7 +284,7 @@ pub async fn start(c: Config) -> anyhow::Result<Running> {
         .with_state(cache.clone());
     tokio::spawn(poll(cache.clone(), rx.clone()));
     let pace = deadline::Pace { stall: WRITE_DEADLINE, grace: WRITE_DEADLINE, min_rate: MIN_RATE };
-    let limits = crate::ConnectionLimits { pace, max_connections: c.max_connections, buffer: SLICE };
+    let limits = crate::ConnectionLimits { pace, max_connections: c.max_connections, buffer: HTTP_BUFFER };
     let task = tokio::spawn(crate::serve_tls(listener, tls, app, rx, Some(limits)));
     Ok(Running {
         addr,

@@ -1924,7 +1924,6 @@ fn s3rd3_a_thin_clone_names_its_old_versions_after_the_viewer_graph_is_cleared()
     // test's viewer graph, whose hubs keep its rows in memory and would
     // never fill them again.
     let admin_url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
-    let db_name = format!("{}{}", std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_default(), unique("veil_cleared_"));
     let sql = |url: &str, q: String| {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
@@ -1933,8 +1932,8 @@ fn s3rd3_a_thin_clone_names_its_old_versions_after_the_viewer_graph_is_cleared()
             db.close().await;
         });
     };
-    sql(&admin_url, format!("CREATE DATABASE {db_name}"));
-    let url = format!("{}/{db_name}", admin_url.rsplit_once('/').unwrap().0);
+    let url = crate::support::own_database("veil_cleared_");
+    let db_name = url.rsplit_once('/').unwrap().1.to_string();
     let hub = TestHub::start_on(&url, std::time::Duration::from_secs(3600));
     let (admin, dir, name) = project_with_history(&hub, 6, 10);
     let full = admin.dir("full");

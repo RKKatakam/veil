@@ -347,11 +347,16 @@ fn guarantee_2_release_happens_at_the_deadline_and_never_before() {
 
     // 3. Restart the server before the deadline: state survives restart and still does not release early.
     catch_up(&hub, &p.name);
+    // The stopped server's fill leases go with it: this project's only. The
+    // run's database is every test's: a delete of every lease (as this was)
+    // let other tests' servers fill a view key another server was holding
+    // (BUG-2530: `warm::rows_without_file_history_answer_exactly_as_the_viewers_copy`).
+    let pid = crate::limits::project_id_of(&hub, &p.name);
     hub = hub.restart(|url| {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let db = veil_server::db::connect(url, 1).await.unwrap();
-            let _ = sqlx::query("DELETE FROM view_fills").execute(&db).await;
+            let _ = sqlx::query("DELETE FROM view_fills WHERE project_id = $1").bind(pid).execute(&db).await;
             db.close().await;
         });
     });

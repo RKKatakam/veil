@@ -1114,7 +1114,7 @@ fn bug_2482_every_index_on_an_existing_table_is_built_online() {
             IndexStep::Drop { .. } => None,
         })
         .collect();
-    for want in [(3, "devices_by_fingerprint"), (11, "projections_own"), (36, "landing_queue_person_slot"), (40, "packs_unlisted"), (41, "packs_listed")] {
+    for want in [(3, "devices_by_fingerprint"), (11, "projections_own"), (36, "landing_queue_person_slot"), (40, "packs_unlisted"), (41, "packs_listed"), (42, "projections_by_projected_at")] {
         assert!(created.contains(&want), "{want:?} is built online: {created:?}");
     }
     // What an online section may hold, and what it may not.

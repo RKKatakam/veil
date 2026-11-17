@@ -319,13 +319,26 @@ fn rows_without_file_history_answer_exactly_as_the_viewers_copy() {
             // Blame and the history of a path: `warming` whatever the path
             // (readable, hidden or missing), or the copy's own refusal of
             // a revision or a request (decided before any file history).
-            let quick = Limits { deadline: Duration::from_millis(40), ..Limits::default() };
+            // The deadline is short so that the wait for the file history
+            // ends soon in `warming`. A refusal decided on the graph after
+            // that deadline is `deadline` instead (`on_graph`: an error past
+            // the deadline is the deadline's, BUG-2468: the root revision,
+            // whose file history is always there, under the suite's load),
+            // which is no answer either: ask again with twice the deadline,
+            // until the answer is not the deadline's (at most about 5 s).
             let mut warming = 0usize;
             for q in of_files.iter().take(10) {
-                let mine = match q {
-                    Q::Blame(p, _) => th.rt.block_on(query::blame(&h.hub, &mine_ask, p.clone(), quick)),
-                    Q::History(p, _) => th.rt.block_on(query::history(&h.hub, &mine_ask, p.clone(), quick)),
-                    _ => unreachable!(),
+                let mut quick = Limits { deadline: Duration::from_millis(40), ..Limits::default() };
+                let mine = loop {
+                    let mine = match q {
+                        Q::Blame(p, _) => th.rt.block_on(query::blame(&h.hub, &mine_ask, p.clone(), quick)),
+                        Q::History(p, _) => th.rt.block_on(query::history(&h.hub, &mine_ask, p.clone(), quick)),
+                        _ => unreachable!(),
+                    };
+                    if code(&mine) != "deadline" || quick.deadline >= Duration::from_secs(5) {
+                        break mine;
+                    }
+                    quick.deadline *= 2;
                 };
                 match code(&mine).as_str() {
                     "warming" => warming += 1,

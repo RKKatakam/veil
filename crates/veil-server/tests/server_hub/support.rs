@@ -25,6 +25,34 @@ pub fn test_db_prefix() -> String {
     std::env::var("VEIL_TEST_DB_PREFIX").unwrap_or_else(|_| format!("r{}x", std::process::id()))
 }
 
+/// A new database of the test's own on the run's database server, made and
+/// migrated before any server starts on it (which then runs no DDL); its
+/// name starts with the run's prefix, so it is dropped with the run's.
+///
+/// **One at a time in a test process** (BUG-2582): migrations of several
+/// new databases at once on the shared YugabyteDB (about 80 online index
+/// builds each) stalled it for ten minutes, every test's statements with it.
+/// The lock is held while the database is made and migrated, never while a
+/// test runs. (`startup.rs`'s and `blame.rs`'s tests of migrating itself
+/// make theirs as they need.)
+pub fn own_database(tag: &str) -> String {
+    static MIGRATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let admin = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
+    let name = format!("{}{}", test_db_prefix(), unique(tag));
+    let url = format!("{}/{name}", admin.rsplit_once('/').unwrap().0);
+    let _one = MIGRATING.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let db = veil_server::db::connect(&admin, 1).await.unwrap();
+        sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
+        db.close().await;
+        let db = veil_server::db::connect(&url, 1).await.unwrap();
+        veil_server::db::migrate(&db).await.unwrap();
+        db.close().await;
+    });
+    url
+}
+
 /// `prefix` and a suffix no other call of this process returns (BUG-2211:
 /// every test of a run shares one database, and 4 random bytes alone gave
 /// two of a run's people one name). The count comes first; the random
@@ -98,9 +126,24 @@ impl TestHub {
             },
             None => Storage::Dir(dir.path().join("objects")),
         };
+        // A server whose objects are in a directory of its own never shares
+        // the run's database while the run's objects are in S3 (BUG-2580):
+        // its background loops are the whole database's, and its embargo
+        // release loop tried the other tests' due embargoes, found their
+        // objects missing from its empty store, and recorded them `failed`
+        // (`embargo_prs::guarantee_3`, 4 in 459 runs beside the `prs::`
+        // module, whose `merge_check_past_underived_bound_answers_busy` starts
+        // such a server). It gets a database of its own, as BUG-2457's did
+        // ([`own_database`]: made and migrated one at a time).
+        let shared = std::env::var("VEIL_TEST_DATABASE_URL").ok();
+        let database_url = if matches!(storage, Storage::Dir(_)) && std::env::var("VEIL_TEST_S3_ENDPOINT").is_ok() && shared.as_deref() == Some(database_url) {
+            own_database("veil_own_store_")
+        } else {
+            database_url.to_string()
+        };
         let config = Config {
             listen,
-            database_url: database_url.to_string(),
+            database_url,
             storage,
             tls: TlsSource::SelfSigned,
             data_dir: dir.path().join("data"),
@@ -451,6 +494,10 @@ impl Api {
         }
     }
 
+    /// A request that fails (a connection cut, say) panics at the test's own
+    /// line, which names the request: every method that ends here, and the
+    /// tests' wrappers of them, are `#[track_caller]` (BUG-2531).
+    #[track_caller]
     fn finish(r: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Reply {
         let r = r.unwrap();
         let status = r.status().as_u16();
@@ -458,6 +505,7 @@ impl Api {
         Reply { status, body }
     }
 
+    #[track_caller]
     pub fn get(&self, token: Option<&str>, path: &str) -> Reply {
         let mut r = self.agent.get(format!("{}{path}", self.base));
         if let Some(t) = token {
@@ -467,6 +515,7 @@ impl Api {
     }
 
     /// GET with extra headers (the object routes' `Veil-Grant`, …).
+    #[track_caller]
     pub fn get_with(&self, path: &str, headers: &[(&str, &str)]) -> Reply {
         let mut r = self.agent.get(format!("{}{path}", self.base));
         for (k, v) in headers {
@@ -475,6 +524,7 @@ impl Api {
         Self::finish(r.call())
     }
 
+    #[track_caller]
     pub fn delete(&self, token: Option<&str>, path: &str) -> Reply {
         let mut r = self.agent.delete(format!("{}{path}", self.base));
         if let Some(t) = token {
@@ -483,10 +533,12 @@ impl Api {
         Self::finish(r.call())
     }
 
+    #[track_caller]
     pub fn agent_delete(&self, token: &str, path: &str) -> Reply {
         Self::finish(self.agent.delete(format!("{}{path}", self.base)).header("authorization", &format!("Bearer {token}")).call())
     }
 
+    #[track_caller]
     pub fn post(&self, token: Option<&str>, path: &str, body: &[u8], json: bool) -> Reply {
         let mut r = self.agent.post(format!("{}{path}", self.base));
         if let Some(t) = token {
@@ -497,6 +549,7 @@ impl Api {
     }
 
     /// POST JSON with extra headers (a cache's token, …).
+    #[track_caller]
     pub fn post_with(&self, path: &str, body: &[u8], headers: &[(&str, &str)]) -> Reply {
         let mut r = self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json");
         for (k, v) in headers {
@@ -507,6 +560,7 @@ impl Api {
 
     /// `POST …/history` as this release's `vl` asks it: saying which
     /// repository format it reads (BUG-1379).
+    #[track_caller]
     pub fn history(&self, token: &str, project: &str, tips: &[ObjectId]) -> Reply {
         let body = serde_json::to_vec(&serde_json::json!({"tips": tips.iter().map(|t| t.hex()).collect::<Vec<_>>()})).unwrap();
         let auth = format!("Bearer {token}");
@@ -518,6 +572,7 @@ impl Api {
         )
     }
 
+    #[track_caller]
     pub fn post_json(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> Reply {
         self.post(token, path, &serde_json::to_vec(v).unwrap(), true)
     }
@@ -525,6 +580,7 @@ impl Api {
     /// POST JSON, failing the test only after `limit` (instead of the
     /// agent's 120 s): for requests whose duration a test scales from a
     /// baseline measured in the same run.
+    #[track_caller]
     pub fn post_json_within(&self, token: &str, path: &str, v: &serde_json::Value, limit: std::time::Duration) -> Reply {
         let r = self.agent.post(format!("{}{path}", self.base)).header("authorization", &format!("Bearer {token}")).header("content-type", "application/json");
         Self::finish(r.config().timeout_global(Some(limit)).build().send(&serde_json::to_vec(v).unwrap()[..]))
@@ -571,6 +627,7 @@ impl Api {
     }
 
     /// POST JSON as a `vl` that reads encoded frames (compressed objects).
+    #[track_caller]
     pub fn post_json_encoded(&self, token: Option<&str>, path: &str, v: &serde_json::Value) -> (Reply, Option<String>) {
         let mut r = self.agent.post(format!("{}{path}", self.base)).header("content-type", "application/json").header("accept", encoding::FRAMES);
         if let Some(t) = token {
@@ -582,6 +639,7 @@ impl Api {
     }
 
     /// POST object frames as they are (encoded or not, well formed or not).
+    #[track_caller]
     pub fn upload_body(&self, token: &str, project: &str, body: &[u8]) -> Reply {
         self.post(Some(token), &format!("/v1/projects/{project}/objects"), body, false)
     }
@@ -589,6 +647,7 @@ impl Api {
     /// POST encoded object frames (S27), under the encoded frames' media
     /// type (which the server does not need: it reads every upload as
     /// encoded frames).
+    #[track_caller]
     pub fn upload_encoded_body(&self, token: &str, project: &str, body: &[u8]) -> Reply {
         let r = self
             .agent
@@ -599,6 +658,7 @@ impl Api {
     }
 
     /// POST JSON with the `Host` header a relaying server would send.
+    #[track_caller]
     pub fn post_json_host(&self, path: &str, v: &serde_json::Value, host: &str) -> Reply {
         let r = self
             .agent

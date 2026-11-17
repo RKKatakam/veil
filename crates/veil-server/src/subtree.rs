@@ -72,7 +72,7 @@ async fn wants(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: Obj
     if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &snapshot).await? {
         return Err(gone());
     }
-    let Some(real) = sync::resolve(hub, project.id, &project.view(viewer).key(), &snapshot).await?.into_iter().next() else {
+    let Some(real) = sync::resolve_first(hub, project.id, &project.view(viewer).key(), &snapshot).await? else {
         return Err(gone());
     };
     if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {

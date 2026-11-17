@@ -1722,8 +1722,15 @@ stands for a real snapshot whose projection *for that viewer's view key*
 is that id (any of them gives that viewer the same tree and history);
 another view's real snapshot for the same id is never used, since the
 same projected id can stand for different real snapshots in different
-views (BUG-915). Without one for the asker's view, the database lists every
-real snapshot the id stands for. A push resolves parents from the database
+views (BUG-915). Without one for the asker's view, the database answers
+in one statement: an id that is committed history stands for itself, and
+no projection is read; any other id, the real snapshots of every view it
+stands for, newest first, read in that order (`projections_by_projected_at`,
+migration 42) and only as many as the caller takes: one for history,
+fetch, subtrees and queries; a grant reads the rest only when the newest
+does not give the root it grants (BUG-2510: a run hidden from a view is
+one projected id for every real snapshot of it, and reading them all to
+sort them read the whole run). A push resolves parents from the database
 (newest first) or from the branch tips it reads.
 
 **Bounded by bytes, and by limits** (BUG-913). Every entry is weighed by
@@ -2369,17 +2376,20 @@ veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
   records being received (one record of 16 KiB being assembled, and up to
   32 KiB decrypted ahead: 50 KiB), TLS records to send (one record, 16 KiB:
   the cache sets rustls's 64 KiB default down) and the HTTP read buffer
-  (64 KiB; the HTTP write side holds only slices under the budget: HTTP/1.1
-  only, since HTTP/2 keeps a send buffer per stream), about 130 KiB; to the
+  (80 KiB, which bounds a request's head: the longest valid one, a
+  `Veil-Chain` of `MAX_CHAIN` ids with its grant, is about 67 KB and is
+  always read, however its bytes arrive: BUG-1415, BUG-2469; the HTTP write
+  side holds only slices under the budget: HTTP/1.1 only, since HTTP/2
+  keeps a send buffer per stream), about 146 KiB; to the
   server, for an answer passed on, its TLS records received (50 KiB) and its
   HTTP read buffer, which holds the chunk the answer is waiting to send
   (records arrive at most two per read, so it stays within 64 KiB, and
   128 KiB while a chunk is out), or, for a body passed on as it arrives,
   two chunks of it (64 KiB each) and the TLS records to send (80 KiB):
-  about 220 KiB. **So a connection holds at most about 352 KiB beyond
+  about 220 KiB. **So a connection holds at most about 368 KiB beyond
   `--memory`,** and at most `--max-connections` (default 1,024) are open,
   the next waiting in the listener's queue: **the cache holds at most
-  `--memory` + 352 KiB × `--max-connections`, about 480 MiB with the
+  `--memory` + 368 KiB × `--max-connections`, about 496 MiB with the
   defaults,** besides its fixed costs and the kernel's socket buffers
   (measured: 192 clients stalled on cold answers grow it by 6 MiB, about
   32 KiB each, since the kernel's buffers take most of each answer; 8
@@ -2429,7 +2439,7 @@ requests), signed:
 | 20 landings/s | 1,000 | cache | 3,837 | 254 / 454 | 0.24 ms | 99.98 % | 0.02 | 3.16 ms | 179 MiB |
 
 Gates met: at least 99 % of objects from the cache's store, its peak at
-most 512 MiB (the defaults' bound is about 480 MiB; before cycle 3, at
+most 512 MiB (the defaults' bound is about 496 MiB, 480 MiB before BUG-2469's fix; before cycle 3, at
 `--memory 256M`, 221–281 MiB at 1,000 agents). The server's CPU per read
 falls about 11× (it answers the tips only); the cache spends about what the
 server did. Neither the slices with a share each, the smaller pools nor

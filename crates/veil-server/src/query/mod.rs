@@ -228,6 +228,8 @@ pub async fn resolve_real(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instan
                 // Only an id this viewer was given: a projection memoised
                 // under their view key.
                 sqlx::query_scalar("SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 LIMIT 1")
+                    // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
+                    .persistent(false)
                     .bind(project)
                     .bind(&vk)
                     .bind(id.hex())
@@ -736,7 +738,7 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, from: &[Obj
         if crate::embargo::is_withheld_for_query(hub, project, f).await? {
             continue;
         }
-        if let Some(r) = crate::sync::resolve(hub, project, &vk, f).await?.into_iter().next() {
+        if let Some(r) = crate::sync::resolve_first(hub, project, &vk, f).await? {
             if !crate::embargo::is_withheld_for_query(hub, project, &r).await? {
                 reals.push(r);
             }
@@ -924,7 +926,7 @@ pub async fn generations(hub: &Arc<Hub>, ask: &Ask, snapshots: Vec<ObjectId>, li
         if crate::embargo::is_withheld_for_query(hub, project, id).await? {
             continue;
         }
-        if let Some(r) = crate::sync::resolve(hub, project, &vk, id).await?.into_iter().next() {
+        if let Some(r) = crate::sync::resolve_first(hub, project, &vk, id).await? {
             if !crate::embargo::is_withheld_for_query(hub, project, &r).await? {
                 reals.push(r);
             }

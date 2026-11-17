@@ -424,22 +424,24 @@ fn guessed_checks_refuse_with_the_first_error_in_order() {
     let p = setup_project(&hub);
     let tip = hub.api().tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"];
     let env = |i: usize| Some(format!("src/chain/e{i}/.env"));
+    // A path not named is checked as a path (`/e20/`): a refusal also names
+    // a snapshot by its hex id, which may hold `e20` (BUG-2471's class).
     for who in [&p.admin, &p.dev] {
         // Two secrets: the first in order is the answer.
         let (status, body) = refused_history(&hub, &p, who, 30, &[(20, env(20)), (6, env(6))]);
         assert_eq!(status, 403, "{}: {body}", who.name);
-        assert!(body.contains("'src/chain/e6/.env' is a secret and must arrive encrypted") && !body.contains("e20"), "{}: {body}", who.name);
+        assert!(body.contains("'src/chain/e6/.env' is a secret and must arrive encrypted") && !body.contains("/e20/"), "{}: {body}", who.name);
         // A precheck refusal (an unknown key) after a secret, and before one.
         let (status, body) = refused_history(&hub, &p, who, 30, &[(2, env(2)), (5, None)]);
         assert_eq!(status, 403, "{}: {body}", who.name);
         assert!(body.contains("'src/chain/e2/.env'"), "{}: {body}", who.name);
         let (status, body) = refused_history(&hub, &p, who, 30, &[(3, None), (10, env(10))]);
         assert_eq!(status, 403, "{}: {body}", who.name);
-        assert!(body.contains("signed by a key no device here is registered with") && !body.contains("e10"), "{}: {body}", who.name);
+        assert!(body.contains("signed by a key no device here is registered with") && !body.contains("/e10/"), "{}: {body}", who.name);
         // Past the first window of guesses.
         let (status, body) = refused_history(&hub, &p, who, 75, &[(70, env(70)), (66, env(66))]);
         assert_eq!(status, 403, "{}: {body}", who.name);
-        assert!(body.contains("'src/chain/e66/.env'") && !body.contains("e70"), "{}: {body}", who.name);
+        assert!(body.contains("'src/chain/e66/.env'") && !body.contains("/e70/"), "{}: {body}", who.name);
     }
     assert_eq!(hub.api().tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"], tip, "nothing landed");
 }

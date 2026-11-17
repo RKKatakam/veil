@@ -150,7 +150,7 @@ pub const GATE_STORAGE_WRITES_PER_PUSH: f64 = 2.0;
 
 /// `objects` through a regional cache: the share of objects it serves from
 /// its store, and its peak memory (it runs with the default `--memory 128M` and
-/// 1,024 connections: a bound of about 480 MiB, `docs/HUB.md` §13.18).
+/// 1,024 connections: a bound of about 496 MiB, `docs/HUB.md` §13.18).
 pub const GATE_CACHE_HITS: f64 = 0.99;
 pub const GATE_CACHE_MIB: f64 = 512.0;
 
