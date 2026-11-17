@@ -557,7 +557,13 @@ fn not_built_whole(name: &str, builds: u32) -> Error {
 /// stage's catalog version, which is past the last of the builds before
 /// it), so one is made here for that wait alone, of an index on the
 /// migrations' own table, dropped at once (and before it, if a start that
-/// died left one).
+/// died left one). The wait covers a transaction that wrote without the
+/// index and has not ended: a session keeps its catalog version for the
+/// whole of a transaction, and is waited for until the transaction ends
+/// (measured: a build on another table did not return while a session
+/// was idle in a transaction that had written, nor while that
+/// transaction ran another statement and stayed open). So what was
+/// written without the index is committed, or gone, when the check reads.
 async fn checked_on_yugabyte(c: &mut PgConnection, built: &[&IndexStep]) -> Result<Vec<bool>> {
     sqlx::raw_sql(&format!("DROP INDEX IF EXISTS {SETTLE_INDEX}")).execute(&mut *c).await?;
     sqlx::raw_sql(&format!("CREATE INDEX CONCURRENTLY {SETTLE_INDEX} ON schema_migrations (version)")).execute(&mut *c).await?;

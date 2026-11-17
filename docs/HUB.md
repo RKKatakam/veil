@@ -1158,7 +1158,19 @@ invite join or the person's own vouch. Server lists are hints.
   recorded only over indexes that passed (BUG-2626: an online build there
   ended live, ready and valid without the rows a session wrote during its
   backfill; that session wrote without the index until it took in the
-  build's last stage). Every
+  build's last stage). The wait covers a transaction that wrote without
+  the index and commits late: a session keeps its catalog version for the
+  whole of a transaction, and YugabyteDB waits for it until the transaction
+  ends (measured). Writers exist during a migration only in a rolling
+  upgrade (the servers of the version before); a fresh deployment, or an
+  upgrade with every server stopped, has none. What is left: the indexes of
+  migrations an earlier version recorded are not checked again. Where such
+  a version migrated a YugabyteDB while servers wrote to it, check them
+  once, at any time, with
+  `DO $$ DECLARE r record; BEGIN FOR r IN SELECT x.indexrelid AS oid FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid JOIN pg_namespace s ON s.oid = c.relnamespace WHERE s.nspname = current_schema() AND NOT x.indisprimary LOOP PERFORM yb_index_check(r.oid); END LOOP; END $$;`
+  (it stops at the first index that misses a row and names it; drop that
+  index, build it again with its migration's statement, and check again).
+  Every
   request that fails on a retryable database error (`40001`, a restarted
   read, a catalog changed by DDL on YugabyteDB) before anything it did was
   committed runs again, with capped and jittered backoff, until a 45 s
