@@ -1705,7 +1705,8 @@ A workspace is only a named pointer in the view. It owns no directory.
      injection, durably (`guard.sealed`, sealed under `local`), starts the
      reaper and tells it on its pipe what it injected (path, blob id,
      stash), then writes the files. It then writes `pending` (the run, the
-     snapshot synced to, `-m`, the start time, the files outside the set)
+     snapshot synced to, `-m`, the start time, the files outside the set
+     and the directories that could not be listed)
      and clears `running`, durably: **from here on the files are the
      command's output and are never wiped**. It runs the command with
      `GIT_CEILING_DIRECTORIES` set to the sandbox (and `find_root` never
@@ -1814,7 +1815,14 @@ A workspace is only a named pointer in the view. It owns no directory.
   before the command ran: hand edits in the sandbox, and files a narrower
   set's checkout kept because they held something else. Those are not
   the command's output: they stay, unrecorded, reported on every run,
-  until a run whose set holds them records them. Quarantined files of earlier
+  until a run whose set holds them records them. A directory below the
+  root that cannot be listed (`chmod 000`) is no error in either listing,
+  as for the builder: the run, already recorded, names it in a warning
+  (what it holds is not recorded and stays), and the listing before the
+  command keeps its name in `pending` (`unlisted`), so files found below
+  it later are not known to be the command's and stay too (BUG-2200). A
+  rebuild still refuses such a sandbox (`unrecorded_work`): work it cannot
+  list cannot be re-imported. Quarantined files of earlier
   runs that a narrower set leaves outside stay, and stay in the manifest
   for `vl ws rm`'s guard. `--with-isolated` injects every isolated file,
   inside the set or not: they are what the command runs with (`.env` at

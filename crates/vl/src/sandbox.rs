@@ -159,6 +159,21 @@ fn warn_strays(set: &SparseSet, strays: &[VPath], removed: bool) {
     ));
 }
 
+/// Name the directories that could not be listed for what the command
+/// wrote outside the `--only` paths (`chmod 000`): the run is recorded all
+/// the same, and whatever they hold is not (BUG-2200). `fate`: what
+/// becomes of it.
+fn warn_unlisted(set: &SparseSet, unlisted: &[(VPath, veil_core::VeilError)], fate: &str) {
+    for (dir, e) in unlisted {
+        warn(&format!(
+            "cannot list {} ({}): whatever the command wrote there, outside --only {}, is not recorded and {fate}",
+            safe(dir.as_str()),
+            safe(&core::Strays::why(e)),
+            show_set(Some(set)),
+        ));
+    }
+}
+
 /// The exit status of a `vl ws exec` whose command exited `code` and whose
 /// recording left out the files `left` as secrets (BUG-2171): the
 /// command's own status, but [`QUARANTINE_STATUS`] for a 0, so a harness
@@ -550,7 +565,7 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
                 let pin = core::PolicyPin::new(&fs, ctx.repo.store(), &synced)?;
                 core::strays(&fs, s, &[&Policy::load_or_accepted(&pin, None)?.0])?
             }
-            None => Vec::new(),
+            None => core::Strays::default(),
         };
         let injection = match a.with_isolated {
             true => {
@@ -581,7 +596,8 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
         base,
         message: a.message.to_string(),
         started,
-        kept: kept.iter().map(|p| p.as_str().to_string()).collect(),
+        kept: kept.files.iter().map(|p| p.as_str().to_string()).collect(),
+        unlisted: kept.unlisted.iter().map(|(p, _)| p.as_str().to_string()).collect(),
         injected: injection.is_some(),
         recorded: None,
     });
@@ -786,7 +802,8 @@ fn not_recorded(name: &str, paths: &SandboxPaths, e: impl std::fmt::Display) -> 
 /// it: injected files and every copy of an injected value taken out,
 /// files written outside a sparse set removed. `injection`: the run's own
 /// (else the one the guard file saved, for a run that died); `kept`: the
-/// files outside the set before the command (else the manifest's).
+/// files outside the set before the command, and the directories that
+/// could not be listed then (else the manifest's).
 ///
 /// Never deletes unrecorded output: whatever fails, the manifest still
 /// says `pending` (recorded or not), and the next run, or
@@ -800,7 +817,7 @@ fn finish(
     cache: &mut StatCache,
     fs: &SandboxFs,
     injection: Option<&core::Injection>,
-    kept: Option<&[VPath]>,
+    kept: Option<&core::Strays>,
 ) -> Result<Vec<LeftOut>> {
     let p = m.pending.clone().expect("a pending run");
     // One recorder of the workspace at a time, and its operations are the
@@ -822,7 +839,7 @@ fn finish_recording(
     cache: &mut StatCache,
     fs: &SandboxFs,
     injection: Option<&core::Injection>,
-    kept: Option<&[VPath]>,
+    kept: Option<&core::Strays>,
     p: Pending,
 ) -> Result<Vec<LeftOut>> {
     let store = ctx.repo.store().clone();
@@ -1003,14 +1020,19 @@ fn finish_recording(
         // it left: not its output to remove (BUG-549).
         let before = Policy::load_or_accepted(&TreeView::new(store.clone(), synced), None)?.0;
         let after = Policy::load_or_accepted(&pin, None)?.0;
-        let kept_before: Vec<VPath> = match kept {
-            Some(k) => k.to_vec(),
-            None => p.kept.iter().filter_map(|k| VPath::new(k).ok()).collect(),
+        let paths = |l: &[String]| -> Vec<VPath> { l.iter().filter_map(|k| VPath::new(k).ok()).collect() };
+        // What a directory that could not be listed before the command
+        // held is not known to be its output: it stays, as `kept` does.
+        let (kept_before, unlisted_before): (Vec<VPath>, Vec<VPath>) = match kept {
+            Some(k) => (k.files.clone(), k.unlisted.iter().map(|(d, _)| d.clone()).collect()),
+            None => (paths(&p.kept), paths(&p.unlisted)),
         };
-        let (strays, left): (Vec<VPath>, Vec<VPath>) = core::strays(fs, set, &[&before, &after])?
+        let found = core::strays(fs, set, &[&before, &after])?;
+        let (strays, left): (Vec<VPath>, Vec<VPath>) = found
+            .files
             .into_iter()
             .filter(|q| !quarantined.iter().any(|x| x == q.as_str()))
-            .partition(|q| !kept_before.contains(q));
+            .partition(|q| !kept_before.contains(q) && !unlisted_before.iter().any(|d| q.starts_with(d)));
         if !left.is_empty() {
             let shown: Vec<String> = left.iter().take(20).map(|q| safe(q.as_str()).into_owned()).collect();
             warn(&format!(
@@ -1027,6 +1049,7 @@ fn finish_recording(
             .filter(|q| !injection.is_some_and(|i| i.paths.contains(q)))
             .collect();
         warn_strays(set, &by_command, true);
+        warn_unlisted(set, &found.unlisted, "stays in the sandbox");
         for (q, why) in &failed {
             warn(&format!(
                 "could not remove {} from the sandbox ({why}); it is outside --only and is not recorded",
@@ -1442,11 +1465,10 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
             };
             let before = Policy::load_or_accepted(&TreeView::new(ctx.repo.store().clone(), tree), None)?.0;
             let after = Policy::load_or_accepted(&pin, None)?.0;
-            let strays: Vec<VPath> = core::strays(&sandbox, set, &[&before, &after])?
-                .into_iter()
-                .filter(|p| !injected_paths.contains(p))
-                .collect();
+            let found = core::strays(&sandbox, set, &[&before, &after])?;
+            let strays: Vec<VPath> = found.files.into_iter().filter(|p| !injected_paths.contains(p)).collect();
             warn_strays(set, &strays, false);
+            warn_unlisted(set, &found.unlisted, "goes with the throwaway directory");
         }
         print_build_warnings(&report);
         print_working_copy_warnings(&report);

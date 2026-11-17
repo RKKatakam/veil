@@ -474,7 +474,10 @@ a copy of the repository: `vl ws new agent`, then
   exception: build output such as `target/` or `node_modules/` stays for
   the next run wherever it is (it would not be recorded anyway), as do
   quarantined files from earlier runs and files the command did not write
-  (see below).
+  (see below). A directory `vl` cannot list (the command left it
+  `chmod 000`) is named in a warning (`cannot list …`): the run is
+  recorded all the same, and what the directory holds is not recorded
+  and stays in the sandbox.
 * **`.veilpolicy` is always there** (the snapshot needs it to classify
   anything). If the command edits it, the new policy applies to every
   file of the workspace, inside the paths or not, as for a full run: a

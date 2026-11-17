@@ -521,18 +521,20 @@ fn ephemeral_ws_exec_keeps_a_quarantined_file_across_filesystems() {
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
-/// A step after the recording that fails (here: listing what the command
-/// wrote outside `--only src`, in a directory it made unreadable) fails
-/// the run, but the file the recording left out is kept and named all the
-/// same, not deleted with the throwaway directory.
+/// A run that left an unreadable directory outside `--only src` beside a
+/// file the recording left out: the run is recorded (BUG-2200; this step
+/// failed it before), exits 3 for the file, and the file is kept and named,
+/// not deleted with the throwaway directory (BUG-2171: it is moved out
+/// before any later step).
 #[test]
-fn ephemeral_ws_exec_that_fails_after_recording_still_keeps_the_file() {
+fn ephemeral_ws_exec_with_an_unreadable_directory_outside_the_set_still_keeps_the_file() {
     let env = Env::new();
     let proj = project(&env);
     let leak = "echo \"const key = 'AKIAIOSFODNN7EXAMPLE';\" > src/cfg.js && mkdir shut && chmod 000 shut";
     let out = env.vl("alice", &proj, &["ws", "exec", "--ephemeral", "--only", "src", "--", "sh", "-c", leak]);
     let t = text(&out);
-    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert_eq!(out.status.code(), Some(3), "{t}");
+    assert!(t.contains("Recorded "), "{t}");
     assert!(t.contains("  src/cfg.js (aws-access-key-id at line 1; never recorded)"), "{t}");
     let dirs: Vec<PathBuf> = std::fs::read_dir(proj.join(".veil/local/ephemeral-kept")).unwrap().map(|e| e.unwrap().path()).collect();
     assert_eq!(dirs.len(), 1, "{dirs:?}");
@@ -540,14 +542,62 @@ fn ephemeral_ws_exec_that_fails_after_recording_still_keeps_the_file() {
     assert_eq!(std::fs::read_to_string(dirs[0].join("src/cfg.js")).unwrap(), "const key = 'AKIAIOSFODNN7EXAMPLE';\n");
 }
 
+/// BUG-2200: a directory the command made unreadable outside the `--only`
+/// set is named in a warning, as a recording names one inside it; the run,
+/// already recorded, does not fail on it, and the throwaway directory goes.
 #[test]
-#[ignore = "BUG-2200: an --ephemeral --only run fails after recording when the command left an unreadable directory outside the set"]
 fn bug_2200_an_unreadable_directory_outside_the_set_does_not_fail_a_recorded_ephemeral_run() {
     let env = Env::new();
     let proj = project(&env);
-    let out = env.vl("alice", &proj, &["ws", "exec", "--ephemeral", "--only", "src", "--", "sh", "-c", "echo ok > src/ok.txt && mkdir shut && chmod 000 shut"]);
+    let cmd = "echo ok > src/ok.txt && echo stray > notes.txt && mkdir shut && echo in > shut/f && chmod 000 shut";
+    let out = env.vl("alice", &proj, &["ws", "exec", "--ephemeral", "--only", "src", "--", "sh", "-c", cmd]);
     let t = text(&out);
     assert_eq!(out.status.code(), Some(0), "{t}");
     let id = recorded_id(&t);
     assert_eq!(env.stdout("alice", &proj, &["cat", "-r", &id, "src/ok.txt"]), "ok\n");
+    // What could be listed is named as before; what could not, by its directory.
+    assert!(t.contains("not recorded: 1 file(s) written outside --only src: notes.txt"), "{t}");
+    assert!(
+        t.contains("cannot list shut (Permission denied (os error 13)): whatever the command wrote there, outside --only src, is not recorded and goes with the throwaway directory"),
+        "{t}"
+    );
+    assert!(!paths(&env, &proj, &id).iter().any(|p| p.starts_with("shut") || p == "notes.txt"));
+    assert!(tree_listing(&env.root.join("tmp")).is_empty(), "the throwaway directory is gone");
+}
+
+/// BUG-2200, a persistent sandbox (the same step after its recording): the
+/// run is recorded, and the sandbox takes the next `--only` run too. What
+/// is in a directory that could not be listed before a command is not
+/// known to be that command's output: once listable it is kept, never
+/// removed as "written outside --only".
+#[test]
+fn bug_2200_an_unreadable_directory_outside_the_set_does_not_fail_a_persistent_sandbox() {
+    let env = Env::new();
+    let proj = project(&env);
+    let dir = files_dir(&proj, "agent");
+    let cannot = "cannot list shut (Permission denied (os error 13)): whatever the command wrote there, outside --only src, is not recorded and stays in the sandbox";
+    let cmd = "echo one > src/one.txt && mkdir shut && echo work > shut/f && chmod 000 shut";
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "sh", "-c", cmd]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(t.contains("Recorded ") && t.contains(cannot), "{t}");
+    assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "src/one.txt"]), "one\n");
+    // The next run starts, is recorded, and says so again.
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "sh", "-c", "echo two > src/two.txt && echo stray > notes.txt"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(t.contains("Recorded ") && t.contains(cannot), "{t}");
+    assert!(t.contains("not recorded: 1 file(s) written outside --only src (removed from the sandbox): notes.txt"), "{t}");
+    assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "src/two.txt"]), "two\n");
+    // A run that opens the directory: its file was there before this
+    // command, so it stays.
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "sh", "-c", "chmod 755 shut && echo new > new.txt"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(!t.contains("cannot list"), "{t}");
+    assert!(t.contains("not recorded: 1 file(s) written outside --only src (removed from the sandbox): new.txt"), "{t}");
+    assert!(t.contains("that the command did not write (kept; a run whose paths hold them records them): shut/f"), "{t}");
+    assert_eq!(read(&dir, "shut/f"), "work\n");
+    assert!(!dir.join("new.txt").exists());
+    assert!(!paths(&env, &proj, "agent@").iter().any(|p| p.starts_with("shut")));
 }

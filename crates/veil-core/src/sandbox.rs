@@ -270,6 +270,11 @@ pub struct Pending {
     /// not its output.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kept: Vec<String>,
+    /// Directories that could not be listed before the command ran
+    /// ([`Strays::unlisted`]): what they hold is not known to be its
+    /// output, so nothing below them is removed as such.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unlisted: Vec<String>,
     /// Isolated files were injected for the command.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub injected: bool,
@@ -469,14 +474,24 @@ pub fn sync_to(
 /// a file only counts if neither ignores or isolates it, so a command that
 /// edits `.veilpolicy` never makes ignored files it did not write (a build
 /// cache, a local config) look like its output (BUG-549).
-pub fn strays(fs: &dyn StorageBackend, set: &SparseSet, policies: &[&Policy]) -> Result<Vec<VPath>> {
+///
+/// A directory below the root that cannot be listed (`chmod 000`) is no
+/// error, as for a recording (which keeps what it tracked there and says
+/// so): it is returned in [`Strays::unlisted`], and what it holds is not
+/// known (BUG-2200).
+pub fn strays(fs: &dyn StorageBackend, set: &SparseSet, policies: &[&Policy]) -> Result<Strays> {
     let mut out = Vec::new();
+    let mut unlisted = Vec::new();
     // (directory, entirely outside the set?)
     let mut stack = vec![(VPath::root(), false)];
     while let Some((dir, outside)) = stack.pop() {
         let listing = match fs.list_dir_full(&dir) {
             Ok(l) => l,
             Err(e) if e.is_not_found() => continue,
+            Err(e @ VeilError::Io { .. }) if !dir.is_root() => {
+                unlisted.push((dir, e));
+                continue;
+            }
             Err(e) => return Err(e),
         };
         if outside && holds_repository(&listing) {
@@ -507,7 +522,30 @@ pub fn strays(fs: &dyn StorageBackend, set: &SparseSet, policies: &[&Policy]) ->
         }
     }
     out.sort();
-    Ok(out)
+    unlisted.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Strays { files: out, unlisted })
+}
+
+/// What [`strays`] found.
+#[derive(Debug, Default)]
+pub struct Strays {
+    /// The files outside the set that a full working copy would record.
+    /// Sorted.
+    pub files: Vec<VPath>,
+    /// The directories that could not be listed, with why: what they hold
+    /// is not in `files`. Sorted.
+    pub unlisted: Vec<(VPath, VeilError)>,
+}
+
+impl Strays {
+    /// Why a directory of [`Strays::unlisted`] could not be listed, as a
+    /// recording words it ("Permission denied (os error 13)").
+    pub fn why(e: &VeilError) -> String {
+        match e {
+            VeilError::Io { source, .. } => source.to_string(),
+            e => e.to_string(),
+        }
+    }
 }
 
 /// Remove `paths` (from [`strays`]) from the sandbox, and the directories
@@ -1653,7 +1691,13 @@ fn unrecorded_work(repo: &Repo, paths: &SandboxPaths, m: &Manifest, target: Opti
     }
     if let Ok(Some(set)) = m.only_set() {
         let (policy, _) = Policy::load_or_accepted(&fs, None)?;
-        keep.extend(strays(&fs, &set, &[&policy])?);
+        let found = strays(&fs, &set, &[&policy])?;
+        // Work that cannot be listed cannot be re-imported: the rebuild is
+        // refused, and the sandbox stays as it is.
+        if let Some((_, e)) = found.unlisted.into_iter().next() {
+            return Err(e);
+        }
+        keep.extend(found.files);
     }
     // What is the tree's own content is no work of anyone's.
     let store = repo.store();
