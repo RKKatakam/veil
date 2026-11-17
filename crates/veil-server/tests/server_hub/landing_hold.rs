@@ -1241,3 +1241,178 @@ fn bug_2362_a_submits_grafted_trees_are_stored_with_its_objects() {
         assert_eq!((r.status, String::from_utf8_lossy(&r.body).to_string()), (200, want), "{path} at the landed tip");
     }
 }
+
+/// Packs of project `pid` in `state` (0 staged, 1 listed, 2 discarded).
+fn packs_in(hub: &TestHub, pid: i64, state: i16) -> Vec<String> {
+    hub.rt
+        .block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = $2 ORDER BY name").bind(pid).bind(state).fetch_all(&hub.hub().db))
+        .unwrap()
+}
+
+/// [`wait_ticket`], for a batch that is built twice: up to 30 s.
+fn wait_landed(api: &Api, token: &str, project: &str, ticket: &str) {
+    for _ in 0..600 {
+        let r = api.get(Some(token), &format!("/v1/projects/{project}/land/{ticket}"));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v = r.json();
+        if v["state"] != "queued" && v["state"] != "merging" {
+            assert_eq!(v["state"], "landed", "{v}");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("ticket {ticket} still queued");
+}
+
+/// Every tree and blob of snapshot `tip`, read by a second server beside
+/// `hub` (the same database and object storage, nothing of its memory):
+/// how many trees.
+fn whole_tree_beside(hub: &TestHub, pid: i64, tip: veil_core::ObjectId) -> usize {
+    let other = TestHub::beside(hub);
+    let objects = &other.hub().objects;
+    let read = |id: &veil_core::ObjectId| {
+        let raw = other.rt.block_on(objects.get(pid, id)).unwrap();
+        veil_core::object::Object::decode(&raw.unwrap_or_else(|| panic!("{} is stored", id.short()))).unwrap()
+    };
+    let veil_core::object::Object::Snapshot(landed) = read(&tip) else { panic!("the tip is a snapshot") };
+    let mut todo = vec![landed.tree];
+    let mut trees = 0;
+    while let Some(t) = todo.pop() {
+        let veil_core::object::Object::Tree(tree) = read(&t) else { panic!("{} is a tree", t.short()) };
+        trees += 1;
+        for e in &tree.entries {
+            if e.kind == veil_core::object::EntryKind::Dir {
+                todo.push(e.id);
+            } else {
+                read(&e.id);
+            }
+        }
+    }
+    trees
+}
+
+/// BUG-1955: what a batch makes (the landed snapshots, the trees above
+/// each change, their projections) is stored as one pack, one storage
+/// write, which the batch's transaction lists; it was one write an object
+/// (some 600 a batch at 1,000 landings a second, each waiting twice for
+/// the disk's journal). Every batch lists one pack, none is left staged,
+/// the tip is in no object of its own, and a second server reads the
+/// landed tip whole.
+#[test]
+fn bug_1955_a_batchs_objects_are_one_pack_its_transaction_lists() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    hold_branch(&hub, pid, "main");
+    let mut tickets = Vec::new();
+    for i in 0..4 {
+        let r = land_edit(&api, &dev, &p.name, base, &format!("src/packed{i}/f.rs"), &format!("packed {i}\n"), false);
+        assert_eq!(r.status, 200, "submit {i}: {}", String::from_utf8_lossy(&r.body));
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    let batches = |hub: &TestHub| hub.hub().landing.stats.batches.load(std::sync::atomic::Ordering::Relaxed);
+    let (listed_before, staged_before, batches_before) = (packs_in(&hub, pid, 1), packs_in(&hub, pid, 0), batches(&hub));
+    release_branch(&hub, pid, "main");
+    for t in &tickets {
+        wait_landed(&api, &dev, &p.name, t);
+    }
+    let tip = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    assert_ne!(tip, base, "the branch moved");
+    let made = batches(&hub) - batches_before;
+    assert!((1..=4).contains(&made), "the four changes landed in {made} batches");
+    let listed: Vec<String> = packs_in(&hub, pid, 1).into_iter().filter(|n| !listed_before.contains(n)).collect();
+    assert_eq!(listed.len() as u64, made, "each batch lists one pack of what it made: {listed:?}");
+    assert_eq!(packs_in(&hub, pid, 0), staged_before, "no pack of a batch that committed is left staged");
+    let h = hub.hub();
+    let store = h.objects.blob_store();
+    assert!(!hub.rt.block_on(store.exists(&veil_server::store::object_key(pid, &tip))).unwrap(), "the landed tip is stored as an object of its own");
+    for n in &listed {
+        assert!(hub.rt.block_on(store.exists(&veil_server::pack::key(pid, n))).unwrap(), "listed pack {n} is stored");
+    }
+    assert!(whole_tree_beside(&hub, pid, tip) >= 6, "the root, src/ and the four new folders");
+    for i in 0..4 {
+        let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path=src/packed{i}/f.rs", p.name, tip.hex()));
+        assert_eq!((r.status, String::from_utf8_lossy(&r.body).to_string()), (200, format!("packed {i}\n")));
+    }
+}
+
+/// BUG-1955: a batch that does not commit discards the pack it stored. Its
+/// transaction is held at its first statement (the project's GC epoch row,
+/// as a GC switch holds it) until its pack is written, then loses to the
+/// switch (the epoch moved): nothing landed, the pack's row is discarded
+/// and its storage object deleted, and nobody ever read it. The batch built
+/// again lands with a pack of its own, and the tip reads whole.
+#[test]
+fn bug_1955_a_batch_that_does_not_commit_discards_its_pack() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    let api = hub.api();
+    let dev = p.dev.token();
+    let base = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    hold_branch(&hub, pid, "main");
+    let mut tickets = Vec::new();
+    for i in 0..3 {
+        let r = land_edit(&api, &dev, &p.name, base, &format!("src/lost{i}/f.rs"), &format!("lost {i}\n"), false);
+        assert_eq!(r.status, 200, "submit {i}: {}", String::from_utf8_lossy(&r.body));
+        tickets.push(r.json()["ticket"].as_str().unwrap().to_string());
+    }
+    let (listed_before, staged_before) = (packs_in(&hub, pid, 1), packs_in(&hub, pid, 0));
+    let h = hub.hub();
+    let store = h.objects.blob_store();
+    // A GC switch's hold on the epoch row: the batch's transaction waits.
+    let mut switch = hub.rt.block_on(h.db.begin()).unwrap();
+    let epoch: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE").bind(pid).fetch_one(&mut *switch))
+        .expect("the project's GC epoch row exists once something was submitted");
+    release_branch(&hub, pid, "main");
+    // The batch is built and its pack written while its transaction waits.
+    let mut staged: Vec<String> = Vec::new();
+    for _ in 0..600 {
+        staged = packs_in(&hub, pid, 0).into_iter().filter(|n| !staged_before.contains(n)).collect();
+        if staged.first().is_some_and(|n| hub.rt.block_on(store.exists(&veil_server::pack::key(pid, n))).unwrap()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let tip_while_waiting = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    // The switch commits: the batch read the epoch before it, and loses.
+    // (Committed before anything is asserted: the held transaction is never
+    // dropped by a failing test.)
+    hub.rt
+        .block_on(async {
+            sqlx::query("UPDATE access_epochs SET epoch = $2 WHERE project_id = $1 AND person_id = -1").bind(pid).bind(epoch + 1).execute(&mut *switch).await?;
+            switch.commit().await
+        })
+        .unwrap();
+    assert_eq!(staged.len(), 1, "the batch stored what it made as one staged pack while its transaction waited: {staged:?}");
+    let pack = staged.remove(0);
+    assert_eq!(tip_while_waiting, base, "nothing landed while the transaction waited");
+    for t in &tickets {
+        wait_landed(&api, &dev, &p.name, t);
+    }
+    let tip = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    assert_ne!(tip, base, "the batch built again landed");
+    // The lost batch's pack: discarded, deleted, never listed.
+    let mut gone = false;
+    for _ in 0..200 {
+        gone = packs_in(&hub, pid, 2).contains(&pack) && !hub.rt.block_on(store.exists(&veil_server::pack::key(pid, &pack))).unwrap();
+        if gone {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(gone, "the pack of the batch that lost is discarded and deleted");
+    let listed: Vec<String> = packs_in(&hub, pid, 1).into_iter().filter(|n| !listed_before.contains(n)).collect();
+    assert!(!listed.is_empty() && !listed.contains(&pack), "the batch that landed listed a pack of its own: {listed:?}");
+    assert_eq!(packs_in(&hub, pid, 0), staged_before, "nothing is left staged");
+    assert!(whole_tree_beside(&hub, pid, tip) >= 5, "the root, src/ and the three new folders");
+    for i in 0..3 {
+        let r = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path=src/lost{i}/f.rs", p.name, tip.hex()));
+        assert_eq!((r.status, String::from_utf8_lossy(&r.body).to_string()), (200, format!("lost {i}\n")));
+    }
+}
