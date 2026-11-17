@@ -2797,9 +2797,12 @@ tested pointers and the embargo records of the caller, each read every
 time). **The gate (10,000 pulls a second while `main` moves) is met with 10
 and 100 agents and not with 1,000** (5,616 to 5,729): what bounds it there
 was not traced; the machine is not out of CPU (19 of 32 threads: server 6,
-database 6, load tool 7), each of a pull's 6.7 requests takes about 26 ms
-at the median, and the project's request gate is the first thing to look
-at. A thin pull (the tip, not every snapshot since) still has no benchmark.
+database 6, load tool 7), and each of a pull's 6.7 requests takes about
+26 ms at the median. It is not the project's request gate (three quarters
+of the server's database connections, 48 of 64 here): the same run with
+`--db-connections 128` gave 6,245 pulls a second (p50 165 ms, 8.5
+statements), a tenth more. A thin pull (the tip, not every snapshot since)
+still has no benchmark.
 
 ## A landing batch's objects as one pack (BUG-1955, 2026-11-17, `t3/fable-speed`)
 
