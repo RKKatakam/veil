@@ -787,6 +787,71 @@ fn bug_2200_a_directory_shut_on_the_way_to_the_paths_does_not_refuse_those_paths
     assert!(!paths(&env, &proj, "agent@").iter().any(|p| p == "a/stray.txt"));
 }
 
+/// The project of BUG-2651's reproductions, after its first two steps: an
+/// `--only a/src` run whose command shut `a` (the sandbox remembers `a`
+/// with the paths `a/src`), and `a` opened again by hand.
+fn bug_2651_project(env: &Env) -> (PathBuf, PathBuf) {
+    let proj = env.project("alice", "proj", &[("a/src/lib.rs", "pub fn f() {}\n"), ("a/src/deep/m.rs", "// m\n"), ("a/README.md", "a\n")]);
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "main"]);
+    let dir = files_dir(&proj, "agent");
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "a/src", "--", "sh", "-c", "chmod 000 a"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    std::fs::set_permissions(dir.join("a"), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    (proj, dir)
+}
+
+/// BUG-2651: a shut directory that stays (or is shut again) keeps the paths
+/// of the *first* run that shut it, though a later, narrower run may be
+/// the one that wrote there. A run with `--only a/src/deep` (allowed: the
+/// first run held it) writes `a/src/y.rs`, outside its own paths, and
+/// shuts `a` again; the entry still says `a/src`, so `a/src/y.rs` counts
+/// as held by the run that shut `a`, and the `--only a/src` run the
+/// refusal itself suggests records it.
+#[test]
+#[ignore = "BUG-2651: a file a narrower run wrote outside its paths in a directory shut again is recorded by a run with the first shutting run's paths"]
+fn bug_2651_a_narrower_run_that_shuts_the_directory_again_does_not_get_its_strays_recorded() {
+    let env = Env::new();
+    let (proj, dir) = bug_2651_project(&env);
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "a/src/deep", "--", "sh", "-c", "echo y > a/src/y.rs && chmod 000 a"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(t.contains("running sh") && t.contains("cannot list a (Permission denied (os error 13))"), "{t}");
+    std::fs::set_permissions(dir.join("a"), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "a/src", "--", "true"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let recorded = paths(&env, &proj, "agent@");
+    assert!(recorded.contains(&"a/src/lib.rs".to_string()), "{recorded:?}");
+    assert!(!recorded.iter().any(|p| p == "a/src/y.rs"), "a/src/y.rs, written outside --only a/src/deep, was recorded: {recorded:?}");
+}
+
+/// BUG-2651, its second form: the narrower run shuts `a/src` itself. The
+/// entry for `a/src` inherits the paths `a/src`, which hold it whole, so a
+/// run with `--only a/src` is refused, and the command its message gives
+/// as the way on is that same run: refused again.
+#[test]
+#[ignore = "BUG-2651: after a narrower run shut a directory the first shutting run held, the refusal's own way on is refused"]
+fn bug_2651_the_way_on_the_refusal_gives_is_not_refused_itself() {
+    let env = Env::new();
+    let (proj, dir) = bug_2651_project(&env);
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "a/src/deep", "--", "sh", "-c", "echo y > a/src/y.rs && chmod 000 a/src"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(t.contains("running sh") && t.contains("cannot list a/src (Permission denied (os error 13))"), "{t}");
+    std::fs::set_permissions(dir.join("a/src"), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    // What a refusal would tell the person to run (`vl ws exec agent --only
+    // a/src/deep -- true`, the paths of the run that shut `a/src`) starts,
+    // and removes what that run wrote outside them.
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "a/src/deep", "--", "true"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(!dir.join("a/src/y.rs").exists(), "{t}");
+    // And then the wider run starts, with nothing of it to record.
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "a/src", "--", "true"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "the way on is refused: {t}");
+    assert!(!paths(&env, &proj, "agent@").iter().any(|p| p == "a/src/y.rs"));
+}
+
 /// BUG-2200: a rebuild of the sandbox (here: after a run that died) keeps
 /// the files outside the paths as work to bring over, but not what a
 /// command left in a directory it shut: that was to be removed, and no

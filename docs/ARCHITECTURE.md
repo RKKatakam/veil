@@ -1841,7 +1841,15 @@ A workspace is only a named pointer in the view. It owns no directory.
   workspace's, does not start while the directory exists, and says how
   to go on (the shutting run's paths once more); a run with those paths,
   or narrower ones, starts. A rebuild does not bring it over, and names
-  it. A directory no command shut
+  it. **Known residue (BUG-2651, open):** an entry that stays, or a
+  directory shut again at or below one, keeps the paths of the *first*
+  run that shut it, though a later, narrower run (allowed to start) may
+  be the one that wrote there: what that run wrote outside its own
+  paths but inside the first run's then counts as held, and a run with
+  the first run's paths records it; and when the narrower run shut a
+  directory the first run held whole, the refusal's own way on is
+  refused. So the rule "what a command writes outside `--only` is never
+  recorded" does not hold for that sequence yet. A directory no command shut
   (unlistable at the listing before a command, and not in
   `shut_by_command`: made so by hand) is kept in `pending` (`unlisted`),
   and files found below it later stay, as files the command did not
