@@ -2948,3 +2948,70 @@ in the load tool against 6,035, and the machine's least available memory
 is 19.6 GB against 12.3 to 12.6. Every other run of this page's 2026-11-17
 sections used the tool as it was, the same for both sides of each
 comparison.
+
+## A pack for every landing: the lookup budget (BUG-1955, BUG-2631, 2026-11-17, `t3/fable-speed`)
+
+With a batch's objects in a pack ("A landing batch's objects as one pack")
+and each submit's too ("An API commit's objects as one pack": a submit of
+this benchmark is an API commit that queues a landing, which cannot lose a
+race and always packs), a landing makes 2 storage writes where it made
+14.3, and the gate's mix for three minutes is, in three runs of three
+builds: 1,000.1/s each, **p50 34, 35 and 34 ms, p99 449, 421 and 399 ms**,
+nobody told to come back, nothing failed, 9.2 to 9.3 landings a batch
+(store 5.2 to 5.4 ms, transaction 7.2 to 7.3 ms), 1.13 commits a landing
+of its own (2.47 to 2.49 with the rows that record the packs), the server
+on 6.4 to 6.6 cores and the database on 6.7 to 6.8.
+
+**Ten minutes found a cliff, and what it was.** The same shape for ten
+minutes (`DURATION=600`), each build once, `integration` @ `ff29db9b`
+first (the load tool as it was, the same for all; load before 9.5, 15.0,
+2.5 and 2.8; 08:54 to 12:47 UTC):
+
+| Server | Landed/s | Per 10 s | p50 (ms) | p99 (ms) | p99 per 10 s (ms) | Told to come back | Failed | Longest queue | Landings per batch | Prepare / store / transaction (ms per batch) | Commits per landing, all (own) | Statements per landing | Storage writes / reads per landing | CPU ms per landing: server / database | Deriver behind at the end | Server memory (MB) | Most packs listed |
+|---|---:|---|---:|---:|---|---:|---:|---:|---:|---|---|---:|---|---|---:|---:|---:|
+| before (`ff29db9b`) | 886.9 | 412 to 1,192 | 10,380 | 59,611 | 264 to 66,588 | 1,669,000 | 17,610 | 2,181 | 50.8 | 11.1 / 33.9 / 48.4 | 1.15 (1.09) | 39.0 | 14.46 / 14.5 | 10.23 / 6.08 | 29.4 s | 2,486 | 1 |
+| packs for a batch and for a submit | 517.8 | 68 to 1,013 | 46 | 74,157 | 122 to 85,273 | 824,054 | 228,153 | 131 | 6.2 | 2.4 / 4.4 / 7.0 | 2.62 (1.18) | 43.6 | 2.24 / 53.6 | 21.40 / 7.60 | 15.7 s | 2,815 | 1,126 |
+| + an unloaded index searched in storage | 835.3 | 155 to 1,040 | 40 | 62,395 | 100 to 81,332 | 383,074 | 30,971 | 375 | 9.2 | 3.0 / 5.5 / 8.7 | 2.48 (1.14) | 41.4 | 2.19 / 67.6 | 14.06 / 6.77 | 69.7 s | 2,995 | 1,577 |
+| + the read grants ask for loose trees only (the branch) | **1,000.0** | 938 to 1,058 | **37** | **477** | 100 to 2,513 | **0** | **0** | 146 | 10.1 | 2.5 / 5.8 / 8.2 | 2.42 (1.12) | 39.6 | 2.03 / 19.5 | 7.58 / 6.23 | 19.8 s | 2,881 | 1,705 |
+
+- With packs alone the service held 1,000/s at p50 30 to 40 ms for four
+  minutes, then fell to about 100 a second for good (the second row).
+  Counters on the lookup maps (an experiment build, the same run for seven
+  minutes) showed why: the indexes of the project's listed packs, held in
+  memory within 128 MiB for every project together, grew 17.5 MiB every
+  30 s (10 to 17 new objects a landing at 48 bytes a slot) and reached
+  that budget at about 225 s. Past it the indexes used least recently are
+  unloaded, and a lookup that found its object in no loaded index read
+  **every** unloaded index whole from storage and loaded each, which
+  unloaded another. Some 55 lookups a second were for objects stored
+  nowhere (below), so each read all of them: 190,000 to 310,000 index
+  reads and 307 to 450 s of reading and parsing every 10 s, and the
+  commits a second fell from 1,020 to about 100. The same build with the
+  budget at 1 GiB held 1,000.0/s for the seven minutes (p50 34 ms, p99
+  315 ms). Before these changes nothing of this benchmark was in a pack,
+  so its project never had an index to unload; a project that pushes had
+  the same cliff waiting at 2.7 million packed objects (BUG-2631).
+- **An unloaded index is now searched where it is stored**, by ranged
+  reads of at most 64 KiB, and only the index that holds the object is
+  loaded (third row: seven and a half minutes at 1,000/s, then the same
+  fall, later, because a lookup for an object no pack holds still reads a
+  little of every unloaded index, and there are more of them every
+  minute).
+- **The lookups for objects stored nowhere came from the read grants:**
+  for every new tip, the first `tips` request made the projected trees of
+  the caller's grant and asked the whole store whether each was there
+  before storing it loose. They only ever are loose: the grants now ask
+  the cache and the object's own key (fourth row). With both, **ten
+  minutes hold at 1,000.0 landings a second, p50 37 ms, p99 477 ms, no
+  request failed and nobody told to come back**: the first run of the
+  gate's mix for ten minutes inside the design's 150 ms and 1 s here. One
+  run; the three-minute run of the same build after it: 1,000.1/s, p50
+  34 ms, p99 399 ms.
+- What is left: the deriver ends 20 s behind (30 s before); the listed
+  packs climb through the run (1,705 at the end: the background merges do
+  not quite keep up with 1,100 packs a second); the server holds 2.9 GB
+  (2.5); and a lookup for an object in no pack, from whoever makes one,
+  still costs a few ranged reads for every unloaded index, which grows
+  with the project (BUG-2631's last column: a filter of each unloaded
+  index kept in memory, or the objects' packs in the database, would bound
+  it; not built).
