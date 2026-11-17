@@ -251,7 +251,10 @@ pub enum FaultPoint {
 /// what a failure in the middle of a switch leaves): asked at each
 /// [`FaultPoint`] with the object; an error it answers is that request's.
 #[derive(Clone)]
-pub struct Fault(pub Arc<dyn Fn(FaultPoint, ObjectId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> + Send + Sync>);
+pub struct Fault(pub Arc<dyn Fn(FaultPoint, ObjectId) -> FaultAnswer + Send + Sync>);
+
+/// What a [`Fault`] answers: `Ok` lets the request go on.
+pub type FaultAnswer = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
 
 impl std::fmt::Debug for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
