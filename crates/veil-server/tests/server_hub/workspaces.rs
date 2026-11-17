@@ -365,13 +365,13 @@ fn a_sparse_sandbox_fetches_only_its_paths() {
 }
 
 /// BUG-1360: after an upgrade that changes the secret scanner's rules, the
-/// next recording of a workspace re-reads every file of it; in a thin clone
-/// that fetches the whole workspace (here: a mount's first recording after
-/// the rules changed). A new workspace is not re-scanned any more (`vl ws
-/// new` marks it scanned).
+/// next recording of a workspace reads unchanged content again; in a thin
+/// clone that fetched the whole workspace (here: a mount's first recording
+/// after the rules changed). It reads what the clone fetched or wrote, and
+/// fetches nothing. A new workspace is not re-scanned at all (`vl ws new`
+/// marks it scanned).
 #[test]
-#[ignore = "BUG-1360: a re-scan after a scanner-rules upgrade fetches a thin clone's whole workspace"]
-fn bug_1360_a_rules_rescan_fetches_the_whole_thin_workspace() {
+fn bug_1360_a_rules_rescan_does_not_fetch_a_thin_workspace() {
     let hub = TestHub::start();
     let p = project_with_feature(&hub);
     let thin = thin_with_agent(&p, &hub, &p.admin, "thin");
@@ -382,7 +382,15 @@ fn bug_1360_a_rules_rescan_fetches_the_whole_thin_workspace() {
     let before = cached(&thin).1;
     m.unmount();
     let after = cached(&thin).1;
+    // The unmount recorded the new file.
+    let o = p.admin.ok(&thin, &["show", "agent@", "--stat", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(o.lines().find(|l| l.starts_with('{')).unwrap()).unwrap();
+    let changed: Vec<String> = v["diff"]["files"].as_array().unwrap().iter().map(|c| format!("{} {}", c["status"].as_str().unwrap(), c["path"].as_str().unwrap())).collect();
+    assert_eq!(changed, ["added src/wide/new.txt"], "the unmount did not record the edit");
     assert!(after - before < SMALL, "the recording fetched {} files of the workspace", after - before);
+    // The re-scan is done: the workspace is marked scanned by today's rules.
+    let marker = std::fs::read_to_string(thin.join(".veil/local/scanned/agent.version")).unwrap();
+    assert_eq!(marker.trim(), veil_core::secrets::RULES_VERSION.to_string());
 }
 
 /// §4.8's numbers: a fresh workspace on a branch this thin clone never

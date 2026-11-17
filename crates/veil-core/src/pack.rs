@@ -84,6 +84,10 @@ const MAX_READ_CHAIN: usize = 64;
 const BULK_LIMIT: u64 = 64 << 20;
 /// Output buffer of a streamed decode.
 const STREAM_CHUNK: usize = 1 << 20;
+/// The most [`Pack::head`] reads of an entry: its header, its frame's
+/// header and the frame's first block (a block is at most 128 KiB).
+#[cfg(feature = "os")]
+const HEAD_READ: usize = 41 + 18 + 3 + (128 << 10);
 
 /// Largest object a pack entry may hold by default: the ceiling one file
 /// read from an SFTP remote has (`VEIL_SFTP_MAX_FILE`), and the Veil Hub's
@@ -530,6 +534,54 @@ impl Pack {
         })
     }
 
+    /// The first bytes (at most `want`) of the canonical encoding of `id`
+    /// and its length, from the head of its entry: a ranged read of at most
+    /// [`HEAD_READ`] bytes and the first block of its frame, never the
+    /// whole object (BUG-1461). `None` when this pack lacks it or its head
+    /// cannot be told this way: read it whole then. Nothing here is
+    /// checked against the id: good for a decision that every read of the
+    /// object checks again, never for content.
+    ///
+    /// A delta's frame is decoded against a stand-in for its base: as long
+    /// as the base, starting with the base's own head (found the same way)
+    /// and zeros after it. A byte of the result that is not zero is then
+    /// the object's own (a literal of the frame, or a copy of one of the
+    /// base's bytes this holds); a zero may stand for a byte of the base
+    /// this does not hold. So a delta's head ends before its first zero.
+    #[cfg(feature = "os")]
+    pub(crate) fn head(&self, backend: &dyn StorageBackend, id: &ObjectId, want: usize) -> Option<(u64, Vec<u8>)> {
+        self.head_at(backend, self.index.find(id)?, want, 0)
+    }
+
+    #[cfg(feature = "os")]
+    fn head_at(&self, backend: &dyn StorageBackend, i: usize, want: usize, depth: usize) -> Option<(u64, Vec<u8>)> {
+        if depth > MAX_READ_CHAIN {
+            return None;
+        }
+        let len = usize::try_from(self.index.lens[i]).unwrap_or(usize::MAX).min(HEAD_READ);
+        let raw = backend.read_range(&self.path, self.index.offsets[i], len).ok()?;
+        if raw.len() < 9 {
+            return None;
+        }
+        let raw_len = u64_at(&raw, 1);
+        if raw_len > self.max_object {
+            return None;
+        }
+        let want = want.min(usize::try_from(raw_len).unwrap_or(usize::MAX));
+        let head = match EntryKind::from_u8(raw[0])? {
+            EntryKind::Stored => raw[9..].iter().take(want).copied().collect(),
+            EntryKind::Zstd => frame_head(&raw[9..], None, want)?,
+            EntryKind::Delta if raw.len() >= 41 => {
+                let base = self.head_at(backend, self.index.find(&id_at(&raw, 9))?, want, depth + 1)?;
+                let mut head = frame_head(&raw[41..], Some((base.0, &base.1)), want)?;
+                head.truncate(head.iter().position(|b| *b == 0).unwrap_or(head.len()));
+                head
+            }
+            EntryKind::Delta => return None,
+        };
+        Some((raw_len, head))
+    }
+
     /// The canonical encoding of `id`, or `None` if this pack lacks it.
     /// Delta bases met on the way are cached in `bases`.
     pub fn get(
@@ -605,6 +657,103 @@ impl Pack {
             self.get(backend, id, &bases)?;
         }
         Ok(())
+    }
+}
+
+/// The first bytes (at most `want`) of the content of the zstd frame
+/// `data` starts with, decoding no further than the block that holds them;
+/// `data` may end before the frame does (fewer bytes then, if its first
+/// block is not whole). `base`, for a delta: its base's length and head
+/// (see [`Pack::head`]).
+#[cfg(all(feature = "os", feature = "zstd"))]
+fn frame_head(data: &[u8], base: Option<(u64, &[u8])>, want: usize) -> Option<Vec<u8>> {
+    use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer};
+    let stand_in = match base {
+        Some((len, head)) => Some(StandIn::new(len, head)?),
+        None => None,
+    };
+    let mut d = DCtx::create();
+    d.set_parameter(DParameter::WindowLogMax(MAX_DELTA_WINDOW_LOG)).ok()?;
+    if let Some(s) = &stand_in {
+        d.ref_prefix(s.bytes()).ok()?;
+    }
+    let mut out = vec![0u8; want];
+    let mut input = InBuffer::around(data);
+    let mut output = OutBuffer::around(&mut out[..]);
+    while output.pos() < want {
+        let before = (input.pos, output.pos());
+        let left = d.decompress_stream(&mut output, &mut input).ok()?;
+        if left == 0 || (input.pos, output.pos()) == before {
+            break;
+        }
+    }
+    let n = output.pos();
+    out.truncate(n);
+    Some(out)
+}
+
+/// Without the C library nothing is decoded by its head.
+#[cfg(all(feature = "os", not(feature = "zstd")))]
+fn frame_head(_data: &[u8], _base: Option<(u64, &[u8])>, _want: usize) -> Option<Vec<u8>> {
+    None
+}
+
+/// `len` bytes that start with `head` and are zeros after it, in a mapping
+/// of its own: the zeros take no memory, whatever `len`, as nothing ever
+/// writes them.
+#[cfg(all(feature = "zstd", feature = "os", unix))]
+struct StandIn {
+    at: *mut libc::c_void,
+    len: usize,
+}
+
+#[cfg(all(feature = "zstd", feature = "os", unix))]
+impl StandIn {
+    fn new(len: u64, head: &[u8]) -> Option<StandIn> {
+        let len = usize::try_from(len).ok()?;
+        if len == 0 || head.len() > len {
+            return None;
+        }
+        // SAFETY: a new private anonymous mapping, at an address the kernel
+        // chooses; the value returned owns it and unmaps it when dropped.
+        let at = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+        if at == libc::MAP_FAILED {
+            return None;
+        }
+        let s = StandIn { at, len };
+        // SAFETY: `head.len() <= len`, the mapping is writable and nothing
+        // else refers to it yet.
+        unsafe { std::ptr::copy_nonoverlapping(head.as_ptr(), s.at.cast::<u8>(), head.len()) };
+        Some(s)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `len` readable bytes mapped in `new`, alive as long as
+        // `self`, and not written after `new`.
+        unsafe { std::slice::from_raw_parts(self.at.cast::<u8>(), self.len) }
+    }
+}
+
+#[cfg(all(feature = "zstd", feature = "os", unix))]
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        // SAFETY: the mapping made in `new`, unmapped once.
+        unsafe { libc::munmap(self.at, self.len) };
+    }
+}
+
+/// Elsewhere a delta is not decoded by its head.
+#[cfg(all(feature = "zstd", feature = "os", not(unix)))]
+struct StandIn;
+
+#[cfg(all(feature = "zstd", feature = "os", not(unix)))]
+impl StandIn {
+    fn new(_len: u64, _head: &[u8]) -> Option<StandIn> {
+        None
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &[]
     }
 }
 
@@ -1473,6 +1622,182 @@ mod tests {
         assert_eq!(pack.get(&fs, &b_id, &cache).unwrap().unwrap(), b_raw);
         assert_eq!(pack.get(&fs, &e_id, &cache).unwrap().unwrap(), e_raw);
         pack.verify(&fs).unwrap();
+    }
+
+    /// BUG-1461: the first bytes of an object are told from the head of its
+    /// entry, whatever its kind, by a read of at most `HEAD_READ` bytes of
+    /// the pack; what a head gives is always the object's own first bytes.
+    #[cfg(all(feature = "zstd", feature = "os", unix))]
+    #[test]
+    fn heads_are_read_without_the_object() {
+        /// The reads of the pack file, by length.
+        #[derive(Debug)]
+        struct Counting(MemoryBackend, std::sync::Mutex<Vec<usize>>);
+        impl StorageBackend for Counting {
+            fn kind(&self) -> &'static str {
+                self.0.kind()
+            }
+            fn read(&self, path: &VPath) -> Result<Vec<u8>> {
+                let d = self.0.read(path)?;
+                self.1.lock().unwrap().push(d.len());
+                Ok(d)
+            }
+            fn read_range(&self, path: &VPath, offset: u64, len: usize) -> Result<Vec<u8>> {
+                self.1.lock().unwrap().push(len);
+                self.0.read_range(path, offset, len)
+            }
+            fn write(&self, path: &VPath, data: &[u8]) -> Result<()> {
+                self.0.write(path, data)
+            }
+            fn create_new(&self, path: &VPath, data: &[u8]) -> Result<bool> {
+                self.0.create_new(path, data)
+            }
+            fn remove_file(&self, path: &VPath) -> Result<()> {
+                self.0.remove_file(path)
+            }
+            fn remove_dir_all(&self, path: &VPath) -> Result<()> {
+                self.0.remove_dir_all(path)
+            }
+            fn create_dir_all(&self, path: &VPath) -> Result<()> {
+                self.0.create_dir_all(path)
+            }
+            fn list_dir(&self, path: &VPath) -> Result<Vec<crate::vfs::DirEntry>> {
+                self.0.list_dir(path)
+            }
+            fn metadata(&self, path: &VPath) -> Result<Option<crate::vfs::Metadata>> {
+                self.0.metadata(path)
+            }
+            fn set_executable(&self, path: &VPath, executable: bool) -> Result<()> {
+                self.0.set_executable(path, executable)
+            }
+        }
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+        // Plain text (a zstd entry), noise (stored: it does not compress),
+        // a sealed secret (stored), and deltas: a small edit of the noise
+        // far from its start, an edit of that (a chain), and one that
+        // differs from its base from the first byte of the content.
+        let text = blob(&(0..400_000).flat_map(|i| format!("line {i}\n").into_bytes()).collect::<Vec<u8>>());
+        let random = noise(6 << 20);
+        let base = blob(&random);
+        let mut edit = random.clone();
+        edit[3 << 20] ^= 0x5a;
+        let edited = blob(&edit);
+        edit[4 << 20] ^= 0x5a;
+        let twice = blob(&edit);
+        edit[..64].copy_from_slice(&noise(64));
+        let other_start = blob(&edit);
+        // And one that starts where its base goes on a megabyte in: its
+        // first bytes are copied from where the stand-in holds zeros.
+        let later = blob(&random[1 << 20..]);
+        let sealed_raw = [&b"veil:seal\n\x00\x04team"[..], &noise(3 << 20)[..]].concat();
+        let sealed = (ObjectId::hash(&sealed_raw), sealed_raw);
+        let fs = Counting(MemoryBackend::new(), Default::default());
+        let dir = VPath::new("p").unwrap();
+        let mut pb = PackBuilder::new(DEFAULT_LEVEL).unwrap();
+        pb.add(text.0, &text.1, None).unwrap();
+        pb.add(base.0, &base.1, None).unwrap();
+        pb.add(sealed.0, &sealed.1, None).unwrap();
+        pb.add(edited.0, &edited.1, Some((&base.0, &base.1))).unwrap();
+        pb.add(twice.0, &twice.1, Some((&edited.0, &edited.1))).unwrap();
+        pb.add(other_start.0, &other_start.1, Some((&twice.0, &twice.1))).unwrap();
+        pb.add(later.0, &later.1, Some((&base.0, &base.1))).unwrap();
+        let (name, stats) = pb.finish(&fs, &dir).unwrap().unwrap();
+        assert_eq!((stats.stored, stats.compressed, stats.deltas), (2, 1, 4), "{stats:?}");
+        let pack = Pack::open(&fs, &dir, &name).unwrap();
+        fs.1.lock().unwrap().clear();
+        for (what, (id, raw), whole) in [
+            ("zstd", &text, true),
+            ("stored", &base, true),
+            ("sealed", &sealed, true),
+            ("delta", &edited, false),
+            ("delta of a delta", &twice, false),
+            ("delta, another start", &other_start, false),
+            ("delta, starting further on in its base", &later, false),
+        ] {
+            let (len, head) = pack.head(&fs, id, 64).unwrap_or_else(|| panic!("{what}: no head"));
+            assert_eq!(len, raw.len() as u64, "{what}");
+            assert!(raw.starts_with(&head), "{what}: {head:?} is not how the object starts");
+            // A whole entry's head is all that was asked for; a delta's
+            // holds at least the tag, which has no zero byte.
+            match whole {
+                true => assert_eq!(head.len(), 64, "{what}"),
+                false => assert!(head.starts_with(b"veil:blob\n"), "{what}: {head:?}"),
+            }
+        }
+        let reads = fs.1.lock().unwrap().clone();
+        assert!(!reads.is_empty() && reads.iter().all(|n| *n <= HEAD_READ), "a head read more than {HEAD_READ} bytes at once: {reads:?}");
+        assert!(reads.iter().sum::<usize>() < 2 << 20, "{reads:?}");
+        // An absent object has no head.
+        assert!(pack.head(&fs, &ObjectId::hash(b"absent"), 64).is_none());
+    }
+
+    #[cfg(all(feature = "zstd", feature = "os", unix))]
+    mod head_props {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            /// Whatever the base and the edits, a head is the object's own
+            /// first bytes (never a byte of the stand-in for its base).
+            #[test]
+            fn a_head_is_how_the_object_starts(
+                seed in any::<u64>(),
+                len in 64usize..40_000,
+                edits in prop::collection::vec((any::<u16>(), any::<u8>(), any::<bool>()), 0..20),
+                cut in 0usize..300,
+                zeros in 0usize..40,
+                want in 1usize..200,
+            ) {
+                let mut x = seed | 1;
+                let mut content: Vec<u8> = (0..len).map(|i| match seed % 3 {
+                    0 => b"some text, again and again\n"[i % 27],
+                    _ => { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 24) as u8 }
+                }).collect();
+                // Content that itself starts with zeros: a head may stop
+                // there, but never says anything else.
+                for b in content.iter_mut().take(zeros) {
+                    *b = 0;
+                }
+                let base = blob(&content);
+                // Bytes put in and taken out, and the start cut off: the
+                // edited object then starts with bytes from further on in
+                // its base, which the stand-in does not hold.
+                for (at, b, insert) in edits {
+                    let at = at as usize % content.len();
+                    match insert || content.len() < 2 {
+                        true => content.insert(at, b),
+                        false => drop(content.remove(at)),
+                    }
+                }
+                content.drain(..cut.min(content.len() - 1));
+                let edited = blob(&content);
+                let fs = MemoryBackend::new();
+                let dir = VPath::new("p").unwrap();
+                let mut pb = PackBuilder::new(DEFAULT_LEVEL).unwrap();
+                pb.add(base.0, &base.1, None).unwrap();
+                pb.add(edited.0, &edited.1, Some((&base.0, &base.1))).unwrap();
+                let (name, _) = pb.finish(&fs, &dir).unwrap().unwrap();
+                let pack = Pack::open(&fs, &dir, &name).unwrap();
+                for (id, raw) in [&base, &edited] {
+                    let (n, head) = pack.head(&fs, id, want).expect("a head");
+                    prop_assert_eq!(n, raw.len() as u64);
+                    prop_assert!(raw.starts_with(&head), "{:?} is not how the object starts", head);
+                    prop_assert!(head.len() >= want.min(10), "the tag is always told: {:?}", head);
+                }
+            }
+        }
     }
 
     /// Without zstd, a pack holds stored entries only, which every vl reads.

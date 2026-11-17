@@ -431,7 +431,8 @@ fn refused(path: &VPath) -> bool {
     }
 }
 
-/// Large files known to be plain blobs (BUG-1461): decided once a process.
+/// Large files known to be plain (not sealed), by id: decided once a
+/// process (BUG-1461).
 static PLAIN_LARGE: std::sync::LazyLock<Mutex<HashSet<ObjectId>>> = std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Files up to this size are fetched with their folder (the first read of
@@ -503,22 +504,28 @@ impl ReaderView {
                     Err(err) => Err(err),
                 }
             }
-            // A large plain file is not read whole to tell (BUG-1368): a
-            // loose one by its first bytes; a packed one is read whole the
-            // first time (BUG-1461, open), and its answer kept for the
-            // process (a plain blob is plain for every reader).
-            EntryKind::File if shown.size > SPILL_AT && shown.visibility.key_scope().is_none() => {
-                if PLAIN_LARGE.lock().unwrap_or_else(|p| p.into_inner()).contains(&shown.id) || self.store.is_loose_blob(&shown.id) {
+            // A large file is not read whole to tell (BUG-1368, BUG-1461):
+            // the first bytes of its object, loose or packed, say whether
+            // it is sealed, and for which scope. A plain one is plain for
+            // every reader: its answer is kept for the process. Only an
+            // object whose head does not tell is read whole.
+            EntryKind::File if shown.size > SPILL_AT => {
+                if PLAIN_LARGE.lock().unwrap_or_else(|p| p.into_inner()).contains(&shown.id) {
                     return Ok(true);
                 }
-                // One read decides: a plain blob is readable (and kept);
-                // anything else as a checkout decides.
-                match self.store.get_raw(&shown.id) {
-                    Ok(raw) if veil_core::object::Object::is_blob_raw(&raw) => {
+                match self.store.kind_by_head(&shown.id) {
+                    Some(veil_core::HeadKind::Plain) => {
                         PLAIN_LARGE.lock().unwrap_or_else(|p| p.into_inner()).insert(shown.id);
                         Ok(true)
                     }
-                    _ => Ok(self.store.entry_readable(&shown)),
+                    Some(veil_core::HeadKind::Sealed(readable)) => Ok(readable),
+                    None => match self.store.get_raw(&shown.id) {
+                        Ok(raw) if veil_core::object::Object::is_blob_raw(&raw) => {
+                            PLAIN_LARGE.lock().unwrap_or_else(|p| p.into_inner()).insert(shown.id);
+                            Ok(true)
+                        }
+                        _ => Ok(self.store.entry_readable(&shown)),
+                    },
                 }
             }
             _ => Ok(self.store.entry_readable(&shown)),

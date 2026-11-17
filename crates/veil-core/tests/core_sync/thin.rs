@@ -843,6 +843,115 @@ fn s3r3_gc_in_a_thin_clone_completes_after_a_rebase_onto_the_new_tip() {
     assert_eq!(read_at(&repo, &rebased, "new.txt"), b"mine, unpushed\n");
 }
 
+/// BUG-1360: the first recording after the secret scanner's rules changed
+/// reads unchanged content again. In a thin clone that fetched the whole
+/// workspace from the server, a request a file. What the clone never
+/// fetched is the server's content and was never on this device: the
+/// re-scan asks the server for nothing a recording without one does not
+/// ask for, leaves the rest as the server has it, and marks the workspace
+/// scanned.
+#[test]
+fn bug_1360_a_rules_rescan_fetches_nothing_a_thin_clone_never_fetched() {
+    // A recording of a sparse sandbox of the tip with one new file, in a
+    // fresh thin clone that last scanned with the rules `scanned`: what it
+    // asked the server for.
+    let record = |scanned: &str| -> Vec<String> {
+        let pr = project();
+        let (mut repo, fs) = thin(&pr, 1 << 30);
+        let wc = repo.new_change("default", vec![pr.tip], "").unwrap();
+        let marker = p(".veil/local/scanned/default.version");
+        fs.write(&marker, scanned.as_bytes()).unwrap();
+        // The workspace as a sparse sandbox shows it: `src/` in a
+        // directory (its two files fetched to write them), with one new
+        // file; the rest by the tree.
+        let tree = repo.snapshot(&wc).unwrap().tree;
+        let dir = MemoryBackend::new();
+        for f in ["src/a.txt", "src/b.txt"] {
+            dir.write(&p(f), &read_at(&repo, &pr.tip, f)).unwrap();
+        }
+        dir.write(&p("src/new.txt"), b"new here\n").unwrap();
+        let set = veil_core::vfs::SparseSet::new([p("src")]).unwrap();
+        let view = veil_core::vfs::SparseView::new(&dir, repo.store().clone(), tree, &set);
+        pr.server.asked.lock().unwrap().clear();
+        let out = repo.snapshot_workspace_with("default", &view, veil_core::workspace::SnapshotOptions::default()).unwrap();
+        assert!(out.changed && !out.superseded, "the recording did not record");
+        assert_eq!(read_at(&repo, &out.snapshot, "src/new.txt"), b"new here\n");
+        let mut asked: Vec<String> = pr.server.asked.lock().unwrap().iter().map(|w| w.path.clone()).collect();
+        asked.sort();
+        // Everything else is recorded as the server has it, never fetched.
+        for path in ["lib/x.rs", "gen/f3.txt", "doc/r.md"] {
+            let e = entry(&repo, &out.snapshot, path);
+            assert_eq!(e.id, entry(&repo, &pr.tip, path).id, "{path}");
+            assert!(!repo.store().has(&e.id), "{path} was fetched (rules {scanned})");
+        }
+        assert_eq!(fs.read(&marker).unwrap(), veil_core::secrets::RULES_VERSION.to_string().as_bytes());
+        asked
+    };
+    let current = record(&veil_core::secrets::RULES_VERSION.to_string());
+    let outdated = record("0");
+    assert_eq!(outdated, current, "a re-scan asked the server for more than a recording without one");
+}
+
+/// BUG-1360's other half: a re-scan still reads what the clone did fetch.
+/// A fetched file that holds what the scanner's rules look for is found
+/// (and left out of the recording, as in any re-scan), though it is
+/// unchanged; one like it that was never fetched is not asked for.
+#[test]
+fn bug_1360_a_rules_rescan_still_reads_what_a_thin_clone_fetched() {
+    const FETCHED: &str = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n";
+    const NEVER: &str = "aws_access_key_id = AKIAI44QH8DHBEXAMPLE\n";
+    let id = Identity::generate("alice");
+    let sfs = Arc::new(MemoryBackend::new());
+    let mut srepo = Repo::init(sfs.clone(), Some(id.clone()), "alice").unwrap();
+    let t = commit_files(&mut srepo, &*sfs, &[("src/a.txt", "a one\n"), ("doc/r.md", "readme\n")], "t");
+    // The server's tip holds a key file in `src/` and one in `doc/`, as
+    // rules older than today's let them in: a snapshot made by hand (the
+    // scanner would not record them).
+    let store = srepo.store().clone();
+    let Object::Snapshot(mut snap) = store.get(&t).unwrap() else { panic!("a snapshot") };
+    let mut root = (*store.tree(&snap.tree).unwrap()).clone();
+    for (dir, key) in [("src", FETCHED), ("doc", NEVER)] {
+        let blob = store.put(&Object::Blob(key.as_bytes().to_vec())).unwrap();
+        let mut sub = (*store.tree(&root.get(dir).unwrap().id).unwrap()).clone();
+        sub.insert(veil_core::TreeEntry { name: "cfg.txt".into(), kind: EntryKind::File, id: blob, size: key.len() as u64, executable: false, visibility: veil_core::Visibility::Public });
+        root.insert(veil_core::TreeEntry::dir(dir, store.put(&Object::Tree(sub)).unwrap()));
+    }
+    snap.tree = store.put(&Object::Tree(root)).unwrap();
+    snap.parents = vec![t];
+    let q = store.put(&Object::Snapshot(snap)).unwrap();
+    let server = Arc::new(Server {
+        store,
+        tips: vec![q],
+        down: AtomicBool::new(false),
+        tamper: AtomicBool::new(false),
+        refuse: Mutex::new(HashSet::new()),
+        asked: Mutex::new(Vec::new()),
+        pages: Mutex::new(0),
+    });
+    let pr = Project { server: server.clone(), commits: vec![t, q], tip: q, id };
+    let (mut repo, fs) = thin(&pr, 1 << 30);
+    let wc = repo.new_change("default", vec![q], "").unwrap();
+    // `src/cfg.txt` is read here (fetched); nothing of `doc/` ever is.
+    fs.write(&p(".veil/local/scanned/default.version"), b"0").unwrap();
+    // A sparse sandbox of `src/` (its files fetched to write them) with
+    // one new file; `doc/` by the tree.
+    let dir = MemoryBackend::new();
+    for f in ["src/a.txt", "src/cfg.txt"] {
+        dir.write(&p(f), &read_at(&repo, &q, f)).unwrap();
+    }
+    dir.write(&p("src/new.txt"), b"new here\n").unwrap();
+    let set = veil_core::vfs::SparseSet::new([p("src")]).unwrap();
+    let view = veil_core::vfs::SparseView::new(&dir, repo.store().clone(), repo.snapshot(&wc).unwrap().tree, &set);
+    server.asked.lock().unwrap().clear();
+    let out = repo.snapshot_workspace_with("default", &view, veil_core::workspace::SnapshotOptions::default()).unwrap();
+    assert!(out.changed && !out.superseded, "the recording did not record");
+    let found: Vec<String> = out.report.quarantined.iter().map(|(path, _)| path.to_string()).collect();
+    assert_eq!(found, ["src/cfg.txt"], "the fetched file is scanned again; the one never fetched is not read");
+    let asked: Vec<String> = server.asked.lock().unwrap().iter().map(|w| w.path.clone()).collect();
+    assert!(!asked.iter().any(|a| a.starts_with("doc/")), "the re-scan asked the server for {asked:?}");
+    assert!(!repo.store().has(&entry(&repo, &q, "doc/cfg.txt").id), "doc/cfg.txt was fetched");
+}
+
 /// The server of `inner`, serving history pages of at most `cap` snapshots
 /// (a server may send fewer than asked): a walk of the whole graph then
 /// takes a page per `cap` snapshots, which a project's 2,000-snapshot page

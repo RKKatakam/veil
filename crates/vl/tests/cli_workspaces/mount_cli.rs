@@ -533,15 +533,14 @@ fn a_mount_writes_and_renames_large_files_without_holding_them() {
     assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "moved.bin"]).len(), 128 << 20);
 }
 
-/// BUG-1461: BUG-1368's bound covers a large file only while it is a loose
-/// object. Once `vl gc` has packed it (or in any full clone, whose objects
-/// arrive in packs), every lookup, `stat` and listing of it in a mount
-/// inflates it whole to decide its visibility (`visible_leaf` →
-/// `entry_readable` → `id_readable` → `get_raw`), though `HUB.md` §13.28
-/// says such an object is "read whole once". Here three `stat`s of a 128
-/// MiB packed file, nothing opened: the mount's peak grows by the file.
+/// BUG-1461: BUG-1368's bound covered a large file only while it was a
+/// loose object. Once `vl gc` had packed it (or in any full clone, whose
+/// objects arrive in packs), a lookup, `stat` or listing of it in a mount
+/// inflated it whole to decide its visibility (`visible_leaf` →
+/// `entry_readable` → `id_readable` → `get_raw`). Here three `stat`s of a
+/// 128 MiB packed file, nothing opened: the mount's peak does not grow by
+/// the file (it is told by the head of its pack entry).
 #[test]
-#[ignore = "BUG-1461: a mount inflates a packed large file whole at each stat or listing, not once"]
 fn bug_1461_a_stat_of_a_packed_large_file_never_reads_it_whole() {
     if !fuse_available() {
         return;
@@ -567,6 +566,165 @@ fn bug_1461_a_stat_of_a_packed_large_file_never_reads_it_whole() {
     }
     let peak = hwm();
     assert!(peak < start + 48, "three stats of a packed 128 MiB file grew the mount's peak from {start} to {peak} MiB");
+}
+
+/// The peak memory (`VmHWM`, MiB) of the mount of `ws`.
+fn mount_peak(proj: &Path, ws: &str) -> u64 {
+    let s = std::fs::read_to_string(format!("/proc/{}/status", state_pid(proj, ws))).unwrap();
+    s.lines().find(|l| l.starts_with("VmHWM:")).unwrap().split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() / 1024
+}
+
+/// `mib` MiB of text that compresses to about half (hex digits of noise).
+fn hex_noise(mib: usize, mut x: u64) -> String {
+    let mut s = String::with_capacity(mib << 20);
+    while s.len() < mib << 20 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.push_str(&format!("{x:016x}"));
+    }
+    s
+}
+
+/// BUG-1461, the whole class: a large file is told by the first bytes of
+/// its object whatever holds it. Packed as a compressed entry tens of MiB
+/// long; as a delta of its earlier version; as a sealed secret (stored as
+/// it is), for a member, who sees it, and for a non-member, who does not;
+/// and each while still a loose object. Lookups, `stat`s and a listing,
+/// nothing opened: no mount grows by a file.
+#[test]
+fn bug_1461_large_files_of_every_kind_are_told_by_their_first_bytes() {
+    if !fuse_available() {
+        return;
+    }
+    const LEN: u64 = 64 << 20;
+    let env = Env::new();
+    let alice = env.dir("alice");
+    let noise = hex_noise(64, 0x9e37_79b9_7f4a_7c15);
+    write(&alice, "README.md", "hello\n");
+    write(&alice, "big/noise.txt", &noise);
+    write(&alice, "big/versions.txt", &noise);
+    // (2 MiB of ordinary lines: a mount reads every sealed file whole for
+    // its guard of secret values, at its start too; BUG-2650 is its cost.)
+    let plan: String = (0..).map(|i| format!("plan line {i} of the dump\n")).take_while({
+        let mut n = 0;
+        move |l| {
+            n += l.len();
+            n <= 2 << 20
+        }
+    }).collect();
+    let plan_len = plan.len() as u64;
+    assert!(plan_len > 2_000_000);
+    write(&alice, "internal/.env.plan", &plan);
+    env.ok("alice", &alice, &["init"]);
+    env.ok("alice", &alice, &["cloak", "internal/.env.plan"]);
+    env.ok("alice", &alice, &["commit", "-m", "initial"]);
+    env.ok("alice", &alice, &["tag", "set", "first", "-r", "@-"]);
+    // A second version of one file: 64 bytes changed, 40 MiB in.
+    let mut edited = noise.into_bytes();
+    edited[40 << 20..(40 << 20) + 64].fill(b'z');
+    std::fs::write(alice.join("big/versions.txt"), &edited).unwrap();
+    drop(edited);
+    env.ok("alice", &alice, &["commit", "-m", "edited"]);
+    env.ok("alice", &alice, &["tag", "set", "main", "-r", "@-"]);
+    let team = env.root.join("team");
+    env.ok("alice", &alice, &["remote", "add", "origin", team.to_str().unwrap()]);
+    env.ok("alice", &alice, &["push"]);
+    env.ok("alice", &alice, &["ws", "new", "view", "-r", "main"]);
+    let look = |mnt: &Path, sealed: bool| {
+        for _ in 0..2 {
+            for f in ["big/noise.txt", "big/versions.txt"] {
+                assert_eq!(std::fs::metadata(mnt.join(f)).unwrap().len(), LEN, "{f}");
+            }
+            let mut listed: Vec<String> = std::fs::read_dir(mnt.join("big")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            listed.sort();
+            assert_eq!(listed, ["noise.txt", "versions.txt"]);
+            match sealed {
+                true => assert_eq!(std::fs::metadata(mnt.join("internal/.env.plan")).unwrap().len(), plan_len),
+                false => assert!(!mnt.join("internal").exists() && !mnt.join("internal/.env.plan").exists()),
+            }
+        }
+    };
+
+    let large_loose = |proj: &Path| -> Vec<String> {
+        walk_files(&proj.join(".veil/objects")).into_iter().filter(|p| !p.contains("/pack")).filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 1 << 20)).collect()
+    };
+    // Loose objects (each is over 1 MiB): the sealed one too.
+    // (Two plain contents, the two versions, and the sealed file.)
+    assert_eq!(large_loose(&alice).len(), 3, "{:?}", large_loose(&alice));
+    let (am, ga) = mount(&env, "alice", &alice, "view");
+    let start = mount_peak(&alice, "view");
+    look(&am, true);
+    let peak = mount_peak(&alice, "view");
+    assert!(peak < start + 32, "looking at loose 64 MiB files grew the mount's peak from {start} to {peak} MiB");
+    env.ok("alice", &alice, &["ws", "unmount", "view"]);
+    drop(ga);
+
+    // Packed: a delta among them, and nothing large left loose.
+    let gc = env.ok("alice", &alice, &["gc"]);
+    // "Packed N object(s) into pack-… (D delta, C compressed, S stored)".
+    let deltas = gc.split_once(" delta,").and_then(|(before, _)| before.rsplit('(').next()).and_then(|n| n.trim().parse::<usize>().ok());
+    assert!(deltas.is_some_and(|d| d >= 1), "gc made no delta: {gc}");
+    assert!(large_loose(&alice).is_empty(), "gc packs the large objects: {:?}", large_loose(&alice));
+    let (am, _ga) = mount(&env, "alice", &alice, "view");
+    let start = mount_peak(&alice, "view");
+    look(&am, true);
+    let peak = mount_peak(&alice, "view");
+    assert!(peak < start + 32, "looking at packed 64 MiB files grew the mount's peak from {start} to {peak} MiB");
+    // The earlier version too: whichever of the two is the delta, a mount
+    // looked at it.
+    env.ok("alice", &alice, &["ws", "new", "old", "-r", "first"]);
+    let (om, _go) = mount(&env, "alice", &alice, "old");
+    let start = mount_peak(&alice, "old");
+    look(&om, true);
+    let peak = mount_peak(&alice, "old");
+    assert!(peak < start + 32, "looking at the packed earlier version grew the mount's peak from {start} to {peak} MiB");
+    // What a stat told is what a read gives.
+    let mut b = [0u8; 64];
+    let f = std::fs::File::open(am.join("big/versions.txt")).unwrap();
+    std::os::unix::fs::FileExt::read_exact_at(&f, &mut b, 40 << 20).unwrap();
+    assert_eq!(b, [b'z'; 64]);
+    drop(f);
+
+    // A non-member's clone (its objects arrived in packs): the sealed file
+    // is absent, by its first bytes as well.
+    env.ok("bob", &env.root, &["clone", "team", "bob"]);
+    let bob = env.root.join("bob");
+    env.ok("bob", &bob, &["ws", "new", "work", "-r", "main"]);
+    let (bm, _gb) = mount(&env, "bob", &bob, "work");
+    let start = mount_peak(&bob, "work");
+    look(&bm, false);
+    let peak = mount_peak(&bob, "work");
+    assert!(peak < start + 32, "looking at 64 MiB files of a clone grew the mount's peak from {start} to {peak} MiB");
+}
+
+/// BUG-2650: a mount guards the values of the workspace's sealed files (no
+/// recording may hold one in another file), and builds that guard from
+/// every sealed file, whole, at each recording that follows an edit: 4
+/// MiB of sealed key material and a one-line edit of another file take
+/// the mount's peak to about 960 MiB (and 13 s of CPU in a debug build).
+#[test]
+#[ignore = "BUG-2650: a mount's recording costs hundreds of MiB of memory per MiB of sealed file (its guard of secret values)"]
+fn bug_2650_a_recording_beside_a_large_sealed_file_keeps_the_mounts_memory_bounded() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    let alice = env.dir("alice");
+    write(&alice, "README.md", "hello\n");
+    write(&alice, "internal/.env.plan", &hex_noise(4, 0x2545_f491_4f6c_dd1d));
+    env.ok("alice", &alice, &["init"]);
+    env.ok("alice", &alice, &["cloak", "internal/.env.plan"]);
+    env.ok("alice", &alice, &["commit", "-m", "initial"]);
+    env.ok("alice", &alice, &["tag", "set", "main", "-r", "@-"]);
+    env.ok("alice", &alice, &["ws", "new", "view", "-r", "main"]);
+    let (mnt, _g) = mount(&env, "alice", &alice, "view");
+    let start = mount_peak(&alice, "view");
+    std::fs::write(mnt.join("README.md"), "edited\n").unwrap();
+    // Any command records the mount first.
+    assert_eq!(env.stdout("alice", &alice, &["ws", "cat", "view", "README.md"]), "edited\n");
+    let peak = mount_peak(&alice, "view");
+    assert!(peak < start + 128, "recording a one-line edit beside a 4 MiB sealed file grew the mount's peak from {start} to {peak} MiB");
 }
 
 /// Every file below `dir`, as paths.

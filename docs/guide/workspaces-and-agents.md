@@ -474,7 +474,20 @@ a copy of the repository: `vl ws new agent`, then
   exception: build output such as `target/` or `node_modules/` stays for
   the next run wherever it is (it would not be recorded anyway), as do
   quarantined files from earlier runs and files the command did not write
-  (see below).
+  (see below). A directory `vl` cannot list (the command left it
+  `chmod 000`) is named in a warning (`cannot list …`): the run is
+  recorded all the same, and what the directory holds is not recorded
+  and stays in the sandbox for now. The next `--only` run that can list
+  it removes what was written there, as it removes its own command's
+  files outside the paths. Until then a run whose paths reach further
+  into that directory (the whole tree, or `--only` a part of it the
+  earlier run did not have), which would record those files, does not
+  start, and says what to do: make the directory listable and run once
+  more with the earlier paths, or delete it. One sequence is not covered
+  yet (a known bug, BUG-2651): if a later run with *narrower* paths
+  inside that directory makes it unlistable again, what that run wrote
+  outside its own paths can be recorded by the next run with the earlier
+  paths. Delete such a directory rather than reopening it.
 * **`.veilpolicy` is always there** (the snapshot needs it to classify
   anything). If the command edits it, the new policy applies to every
   file of the workspace, inside the paths or not, as for a full run: a

@@ -9,6 +9,10 @@
 //! whole file matches the object's id is the copy good. Anything else (a
 //! packed object, a sealed secret, a conflict) is `None`: read it whole, as
 //! before.
+//!
+//! Whether a reader can open a large file at all is told by the first
+//! bytes of its object, loose or packed ([`ObjectStore::kind_by_head`],
+//! BUG-1461): a mount's `stat` reads no more.
 
 use std::io::{Read, Write};
 
@@ -22,23 +26,50 @@ use crate::{
 const PIECE: usize = 1 << 20;
 const BLOB_TAG: &[u8] = b"veil:blob\n";
 
+/// The bytes [`ObjectStore::kind_by_head`] looks at: the tag of an object
+/// and, of a sealed one, its scope's name.
+const HEAD: usize = 512;
+
+/// What the first bytes of an object say of it ([`ObjectStore::kind_by_head`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadKind {
+    /// Not sealed: every reader opens it.
+    Plain,
+    /// A sealed secret: whether this reader holds the key of its scope.
+    Sealed(bool),
+}
+
 fn io(path: &std::path::Path, source: std::io::Error) -> VeilError {
     VeilError::Io { path: path.display().to_string(), source }
 }
 
 impl ObjectStore {
-    /// Is `id` a plain blob, by the first bytes of its loose object here
-    /// (this store's own files or a thin clone's cache), without reading it
-    /// whole? `false` when there is no loose copy, or it is not a blob (a
-    /// sealed secret): decide the full way then. A visibility decision
-    /// only: every read still checks the whole object against its id.
-    pub fn is_loose_blob(&self, id: &ObjectId) -> bool {
+    /// Can this reader open object `id`, told by the first bytes of its
+    /// copy here without reading it whole: of its loose object, or of its
+    /// entry in a pack (a ranged read and the first block of its frame,
+    /// BUG-1461), in this store's own files or a thin clone's cache? What
+    /// [`ObjectStore::entry_readable`] answers for a file it reads whole.
+    /// `None` when no copy here tells (none here, an object staged by a
+    /// transaction, a delta whose first bytes are not its base's first):
+    /// decide the full way then. A visibility decision only: every read
+    /// still checks the whole object against its id.
+    pub fn kind_by_head(&self, id: &ObjectId) -> Option<HeadKind> {
         let stores: Vec<&ObjectStore> = std::iter::once(self).chain(self.cache().map(|c| &**c)).collect();
-        stores.into_iter().any(|store| {
-            let Some(path) = store.backend().local_path(&store.loose_path(id)) else { return false };
-            let mut head = [0u8; BLOB_TAG.len()];
-            std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && head == BLOB_TAG
+        let (len, head) = stores.into_iter().find_map(|store| store.loose_head(id).or_else(|| store.packed_head(id, HEAD)))?;
+        Some(match crate::object::Object::sealed_scope_of_head(&head, head.len() as u64 == len)? {
+            Some(scope) => HeadKind::Sealed(self.keys.has(&scope)),
+            None => HeadKind::Plain,
         })
+    }
+
+    /// The length of the loose object of `id` in this store's own files,
+    /// and its first bytes.
+    fn loose_head(&self, id: &ObjectId) -> Option<(u64, Vec<u8>)> {
+        let f = std::fs::File::open(self.backend().local_path(&self.loose_path(id))?).ok()?;
+        let len = f.metadata().ok()?.len();
+        let mut head = Vec::with_capacity(HEAD);
+        f.take(HEAD as u64).read_to_end(&mut head).ok()?;
+        Some((len, head))
     }
 
     /// Copy the content of blob `id` to `out`, from its loose object in

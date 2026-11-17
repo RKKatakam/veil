@@ -835,7 +835,13 @@ CAS, and it applies these rules in order:
      Latin-1 file), no NUL within 4 KiB, so random binary data is not
      taken for one.
      `secrets::RULES_VERSION` is part of the stat-cache key, so "scanned
-     clean" facts from an older scanner are not reused.
+     clean" facts from an older scanner are not reused. Each device also
+     re-scans a workspace once after an upgrade that changes the rules
+     (`.veil/local/scanned/<ws>.version`): that recording reads unchanged
+     content again. In a thin clone it reads what the clone fetched or the
+     working copy wrote, never what it did not fetch (`Builder::unchanged`,
+     BUG-1360): that is the server's content, which was never on this
+     device, as a new workspace's is (marked scanned when made).
    * A **never-tracked** file is left out of the tree.
    * A **tracked** file keeps the parent's entry, so history still holds
      the previous, safe version. The edit is *held back*, not recorded as a
@@ -1705,7 +1711,8 @@ A workspace is only a named pointer in the view. It owns no directory.
      injection, durably (`guard.sealed`, sealed under `local`), starts the
      reaper and tells it on its pipe what it injected (path, blob id,
      stash), then writes the files. It then writes `pending` (the run, the
-     snapshot synced to, `-m`, the start time, the files outside the set)
+     snapshot synced to, `-m`, the start time, the files outside the set
+     and the directories that could not be listed)
      and clears `running`, durably: **from here on the files are the
      command's output and are never wiped**. It runs the command with
      `GIT_CEILING_DIRECTORIES` set to the sandbox (and `find_root` never
@@ -1801,7 +1808,8 @@ A workspace is only a named pointer in the view. It owns no directory.
   secrets, conflicts, quarantine) is decided as for a full working copy
   whose files outside the set did not change: a policy edit, or a scanner
   upgrade, turns the hints off and the builder reads the outside files
-  from the tree to reclassify them (slow, exact). A superseded run (step
+  from the tree to reclassify them (slow, exact; after a scanner upgrade a
+  thin clone reads only those it has fetched, BUG-1360). A superseded run (step
   7) saves the same view as a child of the snapshot it started from.
   In step 8, `strays` lists the files the command wrote outside the
   set that a full snapshot would record (ignored or isolated by neither
@@ -1814,7 +1822,40 @@ A workspace is only a named pointer in the view. It owns no directory.
   before the command ran: hand edits in the sandbox, and files a narrower
   set's checkout kept because they held something else. Those are not
   the command's output: they stay, unrecorded, reported on every run,
-  until a run whose set holds them records them. Quarantined files of earlier
+  until a run whose set holds them records them. A directory below the
+  root that cannot be listed (`chmod 000`) is no error in either listing,
+  as for the builder (BUG-2200): the run, already recorded, names it in a
+  warning (what it holds is not recorded and stays). Whose its content is
+  is remembered, not guessed. A directory the listing *after* a command
+  cannot list, and the one before it could (or did not have), was shut by
+  that command: the manifest keeps it with that run's set
+  (`shut_by_command`: `ShutDir`), and what is below it outside that set
+  is that command's output outside its paths, which could not be removed
+  (`ShutDir::covers`; what that set held below it stays the sandbox's).
+  The listing before a later command names nothing of it as "there
+  before", so the first sparse run that can list it removes it as
+  written outside the set. A run whose set reaches into the directory
+  further than the shutting run's did (`ShutDir::reached_by`: the whole
+  tree, a set holding the directory, or a path below it that the
+  shutting run's set did not hold), which would record it as the
+  workspace's, does not start while the directory exists, and says how
+  to go on (the shutting run's paths once more); a run with those paths,
+  or narrower ones, starts. A rebuild does not bring it over, and names
+  it. **Known residue (BUG-2651, open):** an entry that stays, or a
+  directory shut again at or below one, keeps the paths of the *first*
+  run that shut it, though a later, narrower run (allowed to start) may
+  be the one that wrote there: what that run wrote outside its own
+  paths but inside the first run's then counts as held, and a run with
+  the first run's paths records it; and when the narrower run shut a
+  directory the first run held whole, the refusal's own way on is
+  refused. So the rule "what a command writes outside `--only` is never
+  recorded" does not hold for that sequence yet. A directory no command shut
+  (unlistable at the listing before a command, and not in
+  `shut_by_command`: made so by hand) is kept in `pending` (`unlisted`),
+  and files found below it later stay, as files the command did not
+  write. A rebuild still refuses a sandbox with a directory it cannot
+  list (`unrecorded_work`): work it cannot list cannot be re-imported.
+  Quarantined files of earlier
   runs that a narrower set leaves outside stay, and stay in the manifest
   for `vl ws rm`'s guard. `--with-isolated` injects every isolated file,
   inside the set or not: they are what the command runs with (`.env` at
@@ -2810,6 +2851,24 @@ pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
   that miss report `Corrupt` rather than `Missing`, because "missing" means
   "redacted" to the rest of the engine. `ObjectStore::verify_packs` does a
   full check, and `gc` refuses to run on a store with a broken pack.
+* **An object's first bytes without the object** (`Pack::head`, BUG-1461;
+  native builds). A mount decides whether a large file is shown from its
+  object's tag and, for a sealed one, its scope's name
+  (`ObjectStore::kind_by_head`), and must not inflate 128 MiB for a
+  `stat`. One ranged read of at most 128 KiB of the entry (its header,
+  the frame's header and first block) gives them: a stored entry's first
+  bytes as they are, a zstd entry's by decoding its first block. A delta
+  needs its base to decode; its first block is decoded against a
+  stand-in instead: an anonymous mapping as long as the base, holding the
+  base's own first bytes (found the same way, down the chain) and zeros
+  after, which take no memory. A byte of the result that is not zero is
+  then the object's own (a literal of the frame, or a copy of a byte of
+  the base the stand-in holds); a zero may stand for a byte it does not
+  hold, so a delta's head ends before its first zero. The tags have no
+  zero byte, so a delta that starts as its base does is told; one that
+  does not is read whole (`None`). Nothing a head tells is checked
+  against the object's id: it serves a decision every read of the object
+  checks again, never content.
 * **Atomic publication.** The `.pack` is written before its `.idx`, and
   readers find packs only through `.idx` files. Old packs are removed index
   first.

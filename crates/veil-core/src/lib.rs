@@ -110,6 +110,8 @@ pub mod wc_policy;
 pub mod working_copy;
 pub mod workspace;
 
+#[cfg(feature = "os")]
+pub use blob_stream::HeadKind;
 pub use error::{Result, VeilError};
 pub use id::{ChangeId, ObjectId};
 pub use identity::Identity;

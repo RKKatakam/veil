@@ -91,7 +91,7 @@ The server stores code as plain text and decides who may see each path (`docs/VI
 
 - **Recording.** The project directory is recorded through a `SparseView` (the path sparse sandboxes use), and checked out with `restrict(tree, set)`, which always includes `.veilpolicy`.
 - **Paths outside the set** keep the working copy's recorded entries by id and are never fetched.
-- **A policy edit or a scanner upgrade** turns the hints off, so the builder reads the outside files to reclassify them (exact, as for sandboxes). In a partial clone that fetches them: `vl` prints the number and size and asks for `--fetch` when more than 1,000 files or 1 GiB would be fetched.
+- **A policy edit or a scanner upgrade** turns the hints off, so the builder reads the outside files to reclassify them (exact, as for sandboxes). After a scanner upgrade a partial clone reads only what it has fetched (BUG-1360: the rest is the server's content, never on this device). A policy edit in a partial clone fetches them: `vl` prints the number and size and asks for `--fetch` when more than 1,000 files or 1 GiB would be fetched.
 
 ### Other commands
 
