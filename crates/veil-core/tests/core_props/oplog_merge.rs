@@ -2413,8 +2413,9 @@ fn bug_1534_rewrites_follow_with_undo_restore_and_concurrent_describes_replayed(
 /// stayed visible below it
 /// (`bug_1444_what_follows_a_rewrite_lands_on_a_current_snapshot` is that
 /// shape built by hand). It failed 104 replays in 150; replayed, it must
-/// pass every time. (The 28 steps after it reach BUG-2640's cause now and
-/// then: 1 replay in 300.)
+/// pass every time. (The whole input, 28 steps more, reaches another cause
+/// now and then, 5 replays in 1100, at step 80: it is pinned, ignored, as
+/// `bug_2641_a_settlers_rebase_an_op_restore_went_back_past_replayed`.)
 #[test]
 fn bug_1444_rewrites_follow_with_concurrent_describes_replayed() {
     let steps: Vec<u16> = vec![
@@ -2598,6 +2599,86 @@ fn bug_2640_an_undo_of_a_restore_reapplies_the_rewrites_it_puts_back_in_force() 
     let c: Vec<ObjectId> = visible.iter().copied().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "c").collect();
     assert_eq!(c.len(), 1, "one commit c: {descs:?}");
     assert_eq!(repo.snapshot(&c[0]).unwrap().parents.clone(), vec![a1], "the commit on a1");
+}
+
+/// BUG-2640: the input BUG-1444's model check shrank to at seed 50 (23
+/// steps, two writers): a describe; an op restore to before it; a commit
+/// made on the old version by a command that saw neither, merged with the
+/// restore; then `vl undo` of the restore. The describe is in force again
+/// and the commit stays on the version it replaced
+/// (`bug_2640_an_undo_of_a_restore_reapplies_…` is this, built by hand).
+/// It fails every replay, before BUG-1444's fix and after.
+#[test]
+#[ignore = "BUG-2640: an undo of an op restore puts a describe back in force, and a commit put on the old version meanwhile stays there (seed 50's input)"]
+fn bug_2640_an_undo_of_a_restore_seed_50_replayed() {
+    let steps: Vec<u16> = vec![
+        57600, 5947, 8063, 57644, 30607, 24192, 60884, 22268, 36740, 8932, 62002, 2987, 57788, 6348, 39405, 61518, 40713, 21894, 8070, 39670, 26613, 51229, 49270,
+    ];
+    let mut failed = Vec::new();
+    for n in 0..10 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 2, true, false, &steps) {
+            failed.push((n, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 10 failed; the first: {:?}", failed.len(), failed.first());
+}
+
+/// BUG-2640 through a merge: the input BUG-1444's model check shrank to at
+/// seed 34 (57 steps, four writers). A describe of `A` lands; an op restore
+/// takes it back; a concurrent describe of a commit on `A` is merged while
+/// it is taken back, and stays on `A`; a second op restore, to the first
+/// describe's operation, takes the first restore back, so that describe
+/// stands again. Its command is shared history by then: no step of the
+/// merge collects its rewrite, and what was put on `A` stays there. It
+/// fails 16 to 18 replays in 40, before BUG-1444's fix and after.
+#[test]
+#[ignore = "BUG-2640: an op restore that takes an op restore back puts a describe back in force, and the merge leaves what was put on the old version meanwhile (seed 34's input)"]
+fn bug_2640_a_restore_of_a_restore_seed_34_replayed() {
+    let steps: Vec<u16> = vec![
+        27364, 17703, 51354, 31916, 38464, 41170, 64826, 60689, 19053, 58688, 20633, 27569, 10649, 24256, 44557, 41677, 45797, 55185, 9335, 5971, 31145, 42550, 31717,
+        7276, 13012, 63083, 6623, 14053, 16992, 2956, 16860, 49377, 38865, 27157, 53168, 61004, 44283, 61343, 48990, 63942, 21793, 53445, 47387, 59346, 65319, 52957,
+        46189, 28075, 65435, 27447, 44417, 56839, 31550, 32491, 2870, 26399, 49992,
+    ];
+    let mut failed = Vec::new();
+    for n in 0..40 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 4, true, false, &steps) {
+            failed.push((n, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 40 failed; the first: {:?}", failed.len(), failed.first());
+}
+
+/// BUG-2641, cause (c): the whole input BUG-1444's model check shrank to at
+/// seed 5 (82 steps, three writers), whose first 54 steps are
+/// `bug_1444_rewrites_follow_with_concurrent_describes_replayed`. With
+/// BUG-1444's fix it still fails now and then at step 80 (5 replays in
+/// 1100; traced on three of them): settlers rebased a described commit `X`
+/// (`X'`, a rewrite only merges recorded); op restores then took the view
+/// back past those merges, `X` visible again; a describe of `X` lands, and
+/// a describe of its child, made by a command that had not seen that
+/// describe, lands last, on `X`. The last merge counts the settlers'
+/// recorded rebase as a second version of `X` beside the describe's (the
+/// op log says an op restore takes back the operations it went back past,
+/// and a merge's record is judged by the views instead), calls `X` a
+/// divergent change, and leaves the late describe's result on `X`, which
+/// the describe replaced. Replayed 300 times here, so that it fails most
+/// runs (about 3 in 4).
+#[test]
+#[ignore = "BUG-2641: a settler's recorded rebase that op restores went back past still counts as a version of the snapshot (the whole seed-5 input: about 1 replay in 220)"]
+fn bug_2641_a_settlers_rebase_an_op_restore_went_back_past_replayed() {
+    let steps: Vec<u16> = vec![
+        12675, 1612, 47070, 57123, 55165, 16163, 44657, 21442, 48616, 10224, 34716, 24770, 33690, 66, 7935, 50658, 60607, 17734, 18538, 62880, 28974, 49248, 22749,
+        35142, 22639, 15344, 8869, 57450, 62616, 42820, 57182, 46600, 55180, 45484, 28880, 64079, 39401, 52162, 775, 38990, 31215, 63410, 58254, 28812, 2127, 15756,
+        11632, 4398, 49360, 42369, 41814, 33868, 65244, 21467, 31837, 45709, 59770, 32663, 47560, 9278, 32908, 45717, 33438, 62534, 1461, 37817, 13934, 55287, 6671,
+        32262, 35521, 55142, 21340, 51850, 5331, 22376, 10040, 45448, 10573, 21973, 2000, 29418,
+    ];
+    let mut failed = Vec::new();
+    for n in 0..300 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 3, true, false, &steps) {
+            failed.push((n, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 300 failed; the first: {:?}", failed.len(), failed.first());
 }
 
 /// BUG-2642 (found by the fresh-seed runs of BUG-1444's fix, seed 5; as
