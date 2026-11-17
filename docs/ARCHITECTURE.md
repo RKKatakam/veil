@@ -2567,15 +2567,20 @@ take no lock:
   rewrite only merges recorded (the op log does not say which command it
   is) is still judged by the views: not applied when a head that saw it
   shows its old snapshot, or a side shows it where the fold step's shared
-  history does not (BUG-1295). On one side, a rewrite replaces an earlier
-  one of the same snapshot when its operation descends from the earlier
-  one's; two that stand and differ are a divergent change, which nothing
-  follows, and a merge does not revisit that decision when one of them is
-  taken back later (BUG-1444). Open (BUG-1488): when a command that saw
-  a rewrite rewrites the old version again, the merge's answer depends
-  on whether the two rewrites first meet in one fold step (the second
-  replaces the first) or not (divergent); the intended rule is
-  divergence while both versions are visible.
+  history does not (BUG-1295). Two rewrites of one snapshot that stand
+  and differ are a divergent change, whether their commands ran
+  concurrently or one saw the other (a command that saw a rewrite and
+  rewrote the old version again made a second version, BUG-1488; one
+  that was taken back is dropped by what the op log says took it back,
+  never because a later one "replaces" it). Nothing follows either
+  version, and a snapshot with two versions that commands made (each
+  recorded by a command the merge collects, neither taken back) stays
+  where it is, with what is on it: the merge's rebase does not move it
+  through an ancestor's rewrite either (that made a third version). One
+  whose differing rewrites only merges recorded is rebased like any
+  other snapshot: the op log does not say what those are. A merge does
+  not revisit a divergence when one of the versions is taken back
+  later.
   **Whatever follows a rewrite lands on a current snapshot** (BUG-1444,
   BUG-1534): a side's rewrite can name a replacement that no ref of the
   merged view shows (a settler's rebased copy whose head the views'

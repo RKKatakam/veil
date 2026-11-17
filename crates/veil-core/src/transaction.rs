@@ -61,6 +61,8 @@ struct MergeCtx {
     held: Vec<(ObjectId, String)>,
     /// Refs the rebase leaves where they are (`MergePlan::pinned`).
     pinned: BTreeSet<crate::repo::RefKey>,
+    /// Snapshots the rebase leaves where they are (`MergePlan::divergent`).
+    divergent: BTreeSet<ObjectId>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +206,7 @@ impl<'r> Transaction<'r> {
         let crate::repo::MergePlan {
             view,
             rewritten,
+            divergent,
             pinned,
             before,
             timestamp,
@@ -243,6 +246,7 @@ impl<'r> Transaction<'r> {
             warnings,
             held: Vec::new(),
             pinned,
+            divergent,
         });
         Ok(tx)
     }
@@ -1260,14 +1264,18 @@ impl<'r> Transaction<'r> {
         // the command put them: the server's version of a change, a
         // projection.)
         let merging = self.merge.is_some() && floor != crate::graph_index::Gen::MAX;
+        // A merge leaves a divergent snapshot where it is (BUG-1488).
+        let divergent = self.merge.as_ref().map(|m| m.divergent.clone()).unwrap_or_default();
         if merging {
             let mut asked: HashSet<ObjectId> = HashSet::new();
             // What lands somewhere: a ref, and a parent of a snapshot the
             // rebase may move (not one that is itself rewritten, which
-            // goes: rebasing what its parents became would bring back what
-            // nothing shows).
+            // goes, nor a divergent one, which stays: rebasing what their
+            // parents became would bring back what nothing shows).
             let mut todo: Vec<ObjectId> = roots.clone();
-            todo.extend(walked.iter().filter(|(id, _)| !self.rewritten.contains_key(*id)).flat_map(|(_, (_, s))| s.parents.iter().copied()));
+            todo.extend(
+                walked.iter().filter(|(id, _)| !self.rewritten.contains_key(*id) && !divergent.contains(*id)).flat_map(|(_, (_, s))| s.parents.iter().copied()),
+            );
             while let Some(x) = todo.pop() {
                 for t in self.resolve(x).0 {
                     if t == x || walked.contains_key(&t) || !asked.insert(t) {
@@ -1275,7 +1283,7 @@ impl<'r> Transaction<'r> {
                     }
                     for (id, v) in self.repo.exact().down_to([t], floor + 1)? {
                         if let std::collections::hash_map::Entry::Vacant(e) = walked.entry(id) {
-                            if !self.rewritten.contains_key(&id) {
+                            if !self.rewritten.contains_key(&id) && !divergent.contains(&id) {
                                 todo.extend(v.1.parents.iter().copied());
                             }
                             e.insert(v);
@@ -1332,7 +1340,7 @@ impl<'r> Transaction<'r> {
         }
         let store = self.repo.store.clone();
         for id in order {
-            if self.rewritten.contains_key(&id) {
+            if self.rewritten.contains_key(&id) || divergent.contains(&id) {
                 continue;
             }
             let s = self.repo.snapshot(&id)?;

@@ -1129,6 +1129,15 @@ fn check_rewrites_followed(cmds: &[RwCmd], repo: &Repo, at: &str) -> Result<(), 
 /// heads; everything publishes after a random delay. Every command's view
 /// and the final one satisfy [`check_rewrites_followed`].
 fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, old_refs: bool, steps: &[u16]) -> Result<(), TestCaseError> {
+    check_rewrites_follow_with(disk, nw, undo, old_refs, false, steps)
+}
+
+/// [`check_rewrites_follow_through_merges`], with `second_versions`: a
+/// describe may pick an old version a landed command rewrote (one a tag or
+/// a workspace of `old_refs` shows), which makes a second version of the
+/// change (BUG-1488). A separate flag: the describes of the pinned inputs
+/// of the other checks keep picking what they picked.
+fn check_rewrites_follow_with(disk: bool, nw: usize, undo: bool, old_refs: bool, second_versions: bool, steps: &[u16]) -> Result<(), TestCaseError> {
     let me = Identity::generate("alice");
     let truth = Device::new(disk);
     {
@@ -1231,10 +1240,13 @@ fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, old_r
                 repo.commit_working_copy(&ws, &format!("{ws} {n}")).map(|_| ())
             }
             4..=7 => {
-                // Describe a visible commit (not a working copy), and not an
-                // old version a landed command rewrote: a second version of
-                // a change is BUG-1488's, not decided yet.
-                let rewritten: std::collections::HashSet<ObjectId> = cmds.iter().filter(|c| c.landed.is_some()).flat_map(|c| c.rewrites.iter().map(|r| r.1)).collect();
+                // Describe a visible commit (not a working copy), and,
+                // without `second_versions`, not an old version a landed
+                // command rewrote (a second version of a change, BUG-1488).
+                let rewritten: std::collections::HashSet<ObjectId> = match second_versions {
+                    true => Default::default(),
+                    false => cmds.iter().filter(|c| c.landed.is_some()).flat_map(|c| c.rewrites.iter().map(|r| r.1)).collect(),
+                };
                 let wcs: Vec<ObjectId> = repo.view().workspaces.values().map(|w| w.wc).chain(rewritten).collect();
                 let cands: Vec<ObjectId> = repo
                     .exact()
@@ -1396,6 +1408,18 @@ proptest! {
     #[test]
     fn rewrites_follow_with_refs_to_old_versions_disk(nw in 2usize..4, steps in prop::collection::vec(any::<u16>(), steps(20, 70))) {
         check_rewrites_follow_through_merges(true, nw, false, true, &steps)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: review_cases(64), failure_persistence: None, ..ProptestConfig::default() })]
+
+    /// The same, where a describe may also pick an old version a landed
+    /// command rewrote: a second version of the change, which with the
+    /// first is a divergent change (BUG-1488).
+    #[test]
+    fn bug_1488_rewrites_follow_with_second_versions_memory(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), steps(20, 100))) {
+        check_rewrites_follow_with(false, nw, false, true, true, &steps)?;
     }
 }
 
@@ -2227,9 +2251,11 @@ fn a_restore_written_before_restore_of_still_takes_back_what_it_restored_past() 
 /// different steps of the fold (a head between them), the same merge
 /// keeps them divergent, so the result depends on the order of the heads:
 /// `rewrites_follow_with_refs_to_old_versions_memory` fails about 1 run
-/// in 8 of 200 cases.
+/// in 8 of 200 cases. Fixed: two versions that stand and differ are a
+/// divergent change however they meet (no "the later one replaces"), and
+/// the merge leaves a divergent snapshot where it is, rather than move it
+/// through its parent's rewrite into a third version.
 #[test]
-#[ignore = "BUG-1488: a second rewrite of an old version by a command that saw the first replaces it in the merge, though both stand (a divergent change)"]
 fn bug_1488_a_second_version_of_a_change_is_divergent_in_the_merge() {
     let me = Identity::generate("alice");
     let commit = |repo: &mut Repo, file: &str| -> ObjectId {

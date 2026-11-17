@@ -672,37 +672,6 @@ pub struct Split {
 }
 
 impl Split {
-    /// For each operation of `within` (`only_a` or `only_b`), the operations
-    /// of `within` it descends from.
-    pub(crate) fn ancestors_within(&self, within: &[ObjectId]) -> HashMap<ObjectId, std::collections::HashSet<ObjectId>> {
-        let set: std::collections::HashSet<&ObjectId> = within.iter().collect();
-        let parents = |id: &ObjectId| -> Vec<ObjectId> { self.ops.get(id).map(|o| o.parents.iter().filter(|p| set.contains(p)).copied().collect()).unwrap_or_default() };
-        let mut out: HashMap<ObjectId, std::collections::HashSet<ObjectId>> = HashMap::new();
-        for start in within {
-            // Depth first: an operation is done once its parents are (times
-            // do not order them).
-            let mut stack = vec![(*start, false)];
-            while let Some((id, expanded)) = stack.pop() {
-                if out.contains_key(&id) {
-                    continue;
-                }
-                let ps = parents(&id);
-                if !expanded {
-                    stack.push((id, true));
-                    stack.extend(ps.iter().filter(|p| !out.contains_key(*p)).map(|p| (*p, false)));
-                    continue;
-                }
-                let mut mine = std::collections::HashSet::new();
-                for p in ps {
-                    mine.insert(p);
-                    mine.extend(out.get(&p).into_iter().flatten().copied());
-                }
-                out.insert(id, mine);
-            }
-        }
-        out
-    }
-
     /// What the operations of `ids` (`only_a` or `only_b`) introduced:
     /// see [`Introduced`].
     pub(crate) fn introduced(&self, ids: &[ObjectId]) -> Introduced {
