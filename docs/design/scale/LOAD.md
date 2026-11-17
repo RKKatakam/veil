@@ -2973,6 +2973,8 @@ first (the load tool as it was, the same for all; load before 9.5, 15.0,
 | packs for a batch and for a submit | 517.8 | 68 to 1,013 | 46 | 74,157 | 122 to 85,273 | 824,054 | 228,153 | 131 | 6.2 | 2.4 / 4.4 / 7.0 | 2.62 (1.18) | 43.6 | 2.24 / 53.6 | 21.40 / 7.60 | 15.7 s | 2,815 | 1,126 |
 | + an unloaded index searched in storage | 835.3 | 155 to 1,040 | 40 | 62,395 | 100 to 81,332 | 383,074 | 30,971 | 375 | 9.2 | 3.0 / 5.5 / 8.7 | 2.48 (1.14) | 41.4 | 2.19 / 67.6 | 14.06 / 6.77 | 69.7 s | 2,995 | 1,577 |
 | + the read grants ask for loose trees only (the branch) | **1,000.0** | 938 to 1,058 | **37** | **477** | 100 to 2,513 | **0** | **0** | 146 | 10.1 | 2.5 / 5.8 / 8.2 | 2.42 (1.12) | 39.6 | 2.03 / 19.5 | 7.58 / 6.23 | 19.8 s | 2,881 | 1,705 |
+| the branch, again | **1,000.0** | 946 to 1,053 | 36 | 388 | 87 to 1,681 | 0 | 0 | 151 | 9.9 | 2.5 / 5.5 / 7.9 | 2.43 (1.12) | 40.4 | 1.89 / 18.7 | 7.56 / 6.20 | 57.7 s | 2,870 | 1,703 |
+| before (`ff29db9b`), again | 917.7 | 722 to 1,069 | 6,592 | 47,334 | 762 to 63,283 | 1,269,043 | 8,103 | 2,088 | 53.5 | 9.2 / 37.8 / 52.7 | 1.17 (1.10) | 39.0 | 14.40 / 8.1 | 10.55 / 6.38 | 29.3 s | 2,426 | 1 |
 
 - With packs alone the service held 1,000/s at p50 30 to 40 ms for four
   minutes, then fell to about 100 a second for good (the second row).
@@ -3004,10 +3006,14 @@ first (the load tool as it was, the same for all; load before 9.5, 15.0,
   the cache and the object's own key (fourth row). With both, **ten
   minutes hold at 1,000.0 landings a second, p50 37 ms, p99 477 ms, no
   request failed and nobody told to come back**: the first run of the
-  gate's mix for ten minutes inside the design's 150 ms and 1 s here. One
-  run; the three-minute run of the same build after it: 1,000.1/s, p50
-  34 ms, p99 399 ms.
-- What is left: the deriver ends 20 s behind (30 s before); the listed
+  gate's mix for ten minutes inside the design's 150 ms and 1 s here. A
+  second pair an hour later (the last two rows; load before 14.5 and
+  13.9): the branch 1,000.0/s again, p50 36 ms, p99 388 ms, nothing
+  failed; `ff29db9b` 917.7/s, p50 6.6 s, p99 47.3 s, 8,103 failed. The
+  three-minute run of the same build between them: 1,000.1/s, p50 34 ms,
+  p99 399 ms.
+- What is left: the deriver ends 20 and 58 s behind in the two runs (29 s
+  before); the listed
   packs climb through the run (1,705 at the end: the background merges do
   not quite keep up with 1,100 packs a second); the server holds 2.9 GB
   (2.5); and a lookup for an object in no pack, from whoever makes one,
