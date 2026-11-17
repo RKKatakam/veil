@@ -2794,6 +2794,24 @@ pack-<sum>.idx    "VEILIDX1" | count u32 | fanout[256] u32 | ids[count] (sorted)
   that miss report `Corrupt` rather than `Missing`, because "missing" means
   "redacted" to the rest of the engine. `ObjectStore::verify_packs` does a
   full check, and `gc` refuses to run on a store with a broken pack.
+* **An object's first bytes without the object** (`Pack::head`, BUG-1461;
+  native builds). A mount decides whether a large file is shown from its
+  object's tag and, for a sealed one, its scope's name
+  (`ObjectStore::kind_by_head`), and must not inflate 128 MiB for a
+  `stat`. One ranged read of at most 128 KiB of the entry (its header,
+  the frame's header and first block) gives them: a stored entry's first
+  bytes as they are, a zstd entry's by decoding its first block. A delta
+  needs its base to decode; its first block is decoded against a
+  stand-in instead: an anonymous mapping as long as the base, holding the
+  base's own first bytes (found the same way, down the chain) and zeros
+  after, which take no memory. A byte of the result that is not zero is
+  then the object's own (a literal of the frame, or a copy of a byte of
+  the base the stand-in holds); a zero may stand for a byte it does not
+  hold, so a delta's head ends before its first zero. The tags have no
+  zero byte, so a delta that starts as its base does is told; one that
+  does not is read whole (`None`). Nothing a head tells is checked
+  against the object's id: it serves a decision every read of the object
+  checks again, never content.
 * **Atomic publication.** The `.pack` is written before its `.idx`, and
   readers find packs only through `.idx` files. Old packs are removed index
   first.

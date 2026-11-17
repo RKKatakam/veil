@@ -1394,6 +1394,20 @@ impl Object {
             .and_then(Envelope::peek_scope)
     }
 
+    /// [`Object::sealed_scope`] of the object whose encoding starts with
+    /// `head` (`whole`: `head` is all of it): `Some(None)` for a plaintext
+    /// object, `None` when `head` is too short to tell.
+    pub fn sealed_scope_of_head(head: &[u8], whole: bool) -> Option<Option<String>> {
+        if whole {
+            return Some(Self::sealed_scope(head));
+        }
+        match head.strip_prefix(SEAL_TAG).or_else(|| head.strip_prefix(SEAL_AES_SIV_TAG)) {
+            // An envelope starts with its scope: two bytes of length, then the name.
+            Some(env) => (env.len() >= 2 && env.len() - 2 >= u16::from_be_bytes([env[0], env[1]]) as usize).then(|| Envelope::peek_scope(env)),
+            None => (head.len() >= SEAL_TAG.len()).then_some(None),
+        }
+    }
+
     pub fn is_blob_raw(raw: &[u8]) -> bool {
         raw.starts_with(BLOB_TAG)
     }

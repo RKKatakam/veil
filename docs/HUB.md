@@ -4392,17 +4392,26 @@ protocol or server change.
     server's refusal too (`promisor.rs`, `names_held`).
   * an open file's content is in memory only up to 1 MiB, 64 MiB across
     open files; larger, in an anonymous file (BUG-1365). A file over 1
-    MiB is never read whole by the mount: `stat` decides from the first
-    bytes of its loose object, and opening, writing into (copy-up) and
-    renaming it stream that object to the spill file, checked against its
-    id, and on to the upper layer atomically; an unlinked open file is
-    written to an anonymous file (BUG-1368). **Outside the bound:** a file a
-    thin clone has not fetched arrives whole from the server (an object at
-    a time) before it is spilled; a large file the store holds in a pack
-    is inflated whole when the mount first looks at it (its first `stat`,
-    listing or lookup in the process: BUG-1461, open) and when it is read;
-    a sealed secret and a conflicted file are read whole when read;
-    recording reads changed files as any snapshot does.
+    MiB is never read whole by the mount to look at it: `stat`, a lookup
+    and a listing decide from the first bytes of its object
+    (`ObjectStore::kind_by_head`: whether it is sealed, and for which
+    scope), read from its loose file or, for an object in a pack, from
+    the head of its pack entry (`Pack::head`: one ranged read of at most
+    128 KiB and the first block of its zstd frame; BUG-1461). Opening,
+    writing into (copy-up) and renaming a loose one stream that object to
+    the spill file, checked against its id, and on to the upper layer
+    atomically; an unlinked open file is written to an anonymous file
+    (BUG-1368). **Outside the bound:** a file a thin clone has not fetched
+    arrives whole from the server (an object at a time) before it is
+    spilled; a large file the store holds in a pack is inflated whole
+    when it is read (opened), not when it is looked at, except a delta
+    whose first bytes are neither written out in its own frame nor its
+    base's first bytes (a file that starts where its earlier version went
+    on further in): that one is inflated whole the first time the mount
+    looks at it, once a process; a sealed secret and a conflicted file are
+    read whole when read; recording reads changed files as any snapshot
+    does, and every sealed file of the workspace whole, for the guard of
+    their values (its memory grows with their size: BUG-2650, open).
   * a reader that knows an entry's path asks at that path: the mount
     (`read_at`, its folder's prefetch), a checkout and the fallback's
     prefetch (`prefetch_diff_below`, `prefetch_at`) ask for each file at

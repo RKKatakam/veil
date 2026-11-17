@@ -985,6 +985,20 @@ impl ObjectStore {
         opened || self.open_pending(Some(id))
     }
 
+    /// The length of the canonical encoding of `id` and its first bytes
+    /// (at most `want`), from the head of its entry in a pack of this
+    /// store's own files ([`Pack::head`]), never the whole object. `None`
+    /// when no pack listed here tells: read it whole then.
+    #[cfg(feature = "os")]
+    pub(crate) fn packed_head(&self, id: &ObjectId, want: usize) -> Option<(u64, Vec<u8>)> {
+        self.ensure_packs().ok()?;
+        if !self.in_loaded_packs(id) {
+            return None;
+        }
+        let packs = self.packs.read().unwrap().packs.clone();
+        packs.iter().filter(|p| p.contains(id)).find_map(|p| p.head(&*self.backend, id, want))
+    }
+
     /// Look `id` up in the packs. Not found in the packs as listed, the
     /// pack directory is listed again, and searched again as long as it
     /// changed: a concurrent gc may have replaced a pack before this
