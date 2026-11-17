@@ -363,6 +363,18 @@ async fn migrate_once(c: &mut PgConnection, deadline: tokio::time::Instant, afte
 ///   step's catalog version increment lost a race with another database's
 ///   DDL, and `indisvalid` stayed false). An index that no build made
 ///   built fails the migration, which is not recorded.
+/// * On YugabyteDB an index that reads built is then checked against its
+///   table (`yb_index_check`, `index_holds_every_row`), whoever built it:
+///   an online build there ended live, ready and valid without the rows
+///   other sessions wrote during its backfill (BUG-2626). One that misses a
+///   row, or holds one its table does not, is dropped and built again,
+///   within the same `BUILD_ATTEMPTS`; a migration is recorded only over an
+///   index that passed. The check reads the whole index and its table rows
+///   (200,000 rows in 1.2 s on the test cluster), under the step's
+///   timeouts: one that does not finish fails the start, and the next start
+///   checks again with the whole deadline. PostgreSQL's online build waits
+///   out every transaction that could write the table without the index,
+///   and is not checked.
 /// * An index step runs under statement and lock timeouts of what is left
 ///   of the migrations' deadline (at least [`STATEMENT_TIMEOUT`]), not the
 ///   pool's: a large table's build takes longer than 15 s, and the
@@ -507,17 +519,19 @@ async fn online_index_step(
         };
         if attempt >= BUILD_ATTEMPTS || tokio::time::Instant::now() >= deadline {
             return Err(Error::Other(anyhow::anyhow!(
-                "index {name} is not built (live, ready and valid) {VALID_WAIT:?} after its build, in {attempt} builds: \
-                 the migration is not recorded, and the next start drops the index and builds it again"
+                "index {name} is not built whole (live, ready and valid within {VALID_WAIT:?} of its build, and holding its \
+                 table's rows) in {attempt} builds: the migration is not recorded, and the next start builds the index again"
             )));
         }
-        // Dropped by the next build, before it begins.
-        eprintln!("veil-server: index {name} is not built (live, ready and valid) {VALID_WAIT:?} after build {attempt} returned: building it again");
+        // One that does not read built is dropped by the next build, before
+        // it begins; one that misses rows was dropped as that was found.
+        eprintln!("veil-server: index {name} is not built whole after build {attempt} returned: building it again");
     }
 }
 
 /// One try at a step: `false` when a build returned and its index did not
-/// read built within `VALID_WAIT`.
+/// read built within `VALID_WAIT`, or (YugabyteDB) read built and did not
+/// hold its table's rows (BUG-2626: dropped then).
 async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &IndexStep, after_build: Option<&AfterBuild>) -> Result<bool> {
     let (name, sql) = match step {
         IndexStep::Drop { name } => return drop_index(&mut *c, yugabyte, name).await.map(|()| true),
@@ -564,12 +578,52 @@ async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &Inde
                 if looks > 1 {
                     eprintln!("veil-server: index {name} read built {:?} after its build returned", began.elapsed());
                 }
-                return Ok(true);
+                // Whoever built it (this try, or a start that ended before
+                // it recorded the migration).
+                return if yugabyte { index_holds_every_row(&mut *c, name).await } else { Ok(true) };
             }
             Some(Some(false)) | None if tokio::time::Instant::now() < until => tokio::time::sleep(Duration::from_millis(200)).await,
             Some(Some(false)) | None => return Ok(false),
             Some(None) => return Err(Error::Other(anyhow::anyhow!("{name} is not an index, so the index of that name was not built"))),
         }
+    }
+}
+
+/// On YugabyteDB: whether index `name`, which reads built, holds a row for
+/// every row of its table and no other (`yb_index_check`: every index row
+/// against its table row, and the two counts). One that does not is dropped
+/// here, and `false` is the answer: the step builds it again.
+///
+/// BUG-2626: an online build there ended live, ready and valid with the
+/// rows two sessions inserted during its backfill missing (42,471 of
+/// 698,266 in one build of twelve, beside DDL in other databases): its
+/// flags say what the build did, not what the other sessions wrote. A
+/// built index that was dropped only for its flags would stay (`IF NOT
+/// EXISTS`), so it is dropped by what the check finds.
+async fn index_holds_every_row(c: &mut PgConnection, name: &str) -> Result<bool> {
+    let e = match sqlx::query("SELECT yb_index_check(to_regclass($1))").bind(name).execute(&mut *c).await {
+        Ok(_) => return Ok(true),
+        Err(e) => e,
+    };
+    let code = e.as_database_error().and_then(|d| d.code()).map(|code| code.into_owned());
+    match code.as_deref() {
+        // `index_corrupted`: a row missing from the index, or one in it
+        // that its table does not hold.
+        Some("XX002") => {
+            eprintln!("veil-server: index {name} reads built and does not hold its table's rows ({e}): dropping it to build it again");
+            drop_index(&mut *c, true, name).await?;
+            Ok(false)
+        }
+        // Under what was left of the migrations' deadline, as the build.
+        Some("57014" | "55P03") => Err(Error::Other(anyhow::anyhow!(
+            "checking index {name} against its table did not finish within what was left of the migrations' {MIGRATION_DEADLINE:?} \
+             ({e}): the migration is not recorded, and the next start checks the index again, with the whole of that time"
+        ))),
+        Some("42883") => Err(Error::Other(anyhow::anyhow!(
+            "this YugabyteDB has no yb_index_check ({e}), so an index built online cannot be checked against its table, and \
+             the migration is not recorded: YugabyteDB 2025.2 has it"
+        ))),
+        _ => Err(e.into()),
     }
 }
 
