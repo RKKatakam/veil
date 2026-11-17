@@ -2862,3 +2862,89 @@ disk; one run in the same turn): 1,000.1/s, p50 **32 ms**, p99 **390 ms**
 deriver 2.5 s behind. So most of what is left of a landing's latency here
 is the journal waits of the seven objects each submit stores, which is
 what the next section removes without giving up their durability.
+
+## An API commit's objects as one pack (BUG-1948, BUG-2370, 2026-11-17, `t3/fable-speed`)
+
+An API commit (`POST …/changes`, `POST …/land` with edits) stored what it
+made, its blob, the trees above it, the server's snapshot and the caller's
+projection, one object at a time before its checks: 7.6 to 9.7 storage
+writes a commit, each a request to the object store, where a push makes
+two. It now holds them for its checks and stores them as one pack that its
+transaction lists (`changes.rs` `store_packed`; `docs/HUB.md` §13.20),
+unless it races other commits for its branch on its server or holds more
+than 8 MiB.
+
+**Across projects** (`veil-bench load --mode api --projects 1,10,100
+--clients 1 --rates max --duration 15`, objects in MinIO, PostgreSQL 17
+with the deployment's settings, release builds, the same load tool; before
+is the server without the change; before and after alternated, twice,
+each after `bench-quiet.sh` found the 1-minute load below 16 (14.9, 15.5,
+then 15.9 and 15.4 before; 26 to 84 after), 2026-11-17 08:45 to 08:50 and
+11:40 to 11:44 UTC). The first "after" is the first version of the change
+(with a pack for every API commit, recorded only while its branch had not
+moved); the second is the branch's:
+
+| Server | Projects | Commits/s | p50 / p99 (ms) | Storage writes a commit (its own) | Database commits a commit (its own) | Statements a commit | CPU ms a commit: server / database |
+|---|---:|---:|---|---|---|---:|---|
+| before | 1 | 78.7 | 10 / 27 | 9.68 (0) | 2.39 (1.00) | 49.3 | 11.46 / 9.46 |
+| before | 10 | 454.3 | 20 / 59 | 8.56 (0) | 1.42 (1.01) | 31.8 | 7.08 / 6.63 |
+| before | 100 | 519.1 | 128 / 1,348 | 7.56 (0) | 1.37 (1.00) | 24.6 | 3.81 / 4.13 |
+| after | 1 | 114.1 | 6 / 25 | 3.74 (1.00) | 3.44 (1.00) | 52.5 | 6.77 / 6.34 |
+| after | 10 | 887.2 | 10 / 34 | 2.49 (1.00) | 2.33 (1.00) | 32.9 | 4.71 / 4.31 |
+| after | 100 | **2,036.6** | **41 / 182** | **1.74** (1.00) | 2.22 (1.00) | 27.0 | 2.71 / 3.77 |
+| before, again | 1 | 66.1 | 16 / 25 | 9.70 (0) | 2.42 (1.00) | 49.7 | 12.70 / 11.70 |
+| before, again | 10 | 422.1 | 22 / 49 | 8.58 (0) | 1.43 (1.01) | 32.1 | 7.81 / 6.94 |
+| before, again | 100 | 524.1 | 116 / 1,422 | 7.68 (0) | 1.39 (1.01) | 25.2 | 3.56 / 3.94 |
+| after, again | 1 | 86.4 | 10 / 23 | 3.75 (1.00) | 3.47 (1.00) | 52.8 | 9.43 / 9.42 |
+| after, again | 10 | 703.3 | 13 / 33 | 2.49 (1.00) | 2.36 (1.01) | 33.1 | 5.78 / 5.75 |
+| after, again | 100 | **2,088.1** | **40 / 186** | **1.76** (1.00) | 2.20 (1.00) | 26.3 | 2.47 / 3.30 |
+
+Four times the commits a second across 100 projects (the object store's
+requests were the limit: 7.6 a commit against 1.75), at a third of the
+median latency. A commit's own storage write is now counted and gated as a
+push's is (one, gate two); it costs one more database commit, the pack's
+row recorded before the pack is written, and two or three more statements.
+The gate (4,000 a second across projects) is still **missed**, by API
+commits and by pushes (1,608 a second on `integration` @ `ff29db9b` in the
+same day's `load` profile).
+
+**Past capacity on one branch** (`--projects 1 --clients 50`, pushes at
+5, 20, 40 and 80 a second offered, API commits at 20, 50, 100 and as fast
+as they go; 15 s points, so each is noisy; 11:50 to 12:00 UTC):
+
+| Curve | Server | Offered/s | Held/s | Collisions a landing | Commits a landing of its own | Pack rows a landing | Storage writes a landing |
+|---|---|---:|---:|---:|---:|---:|---:|
+| pushes | before | 40 | 39.9 | 3.29 | 3.28 | 7.64 | 12.49 |
+| pushes | after | 40 | 40.0 | 3.46 | 3.44 | 7.94 | 12.81 |
+| pushes | before | 80 | 50.2 | 45.39 | 12.01 | 58.64 | 62.02 |
+| pushes | after | 80 | 50.3 | 45.59 | 12.04 | 58.80 | 62.13 |
+| API | before | 50 | 26.5 | 35.47 | 6.64 | 0 | 236.80 |
+| API | after | 50 | 39.0 | 8.51 | 2.30 | 0.85 | 55.59 |
+| API | before | 100 | 51.6 | 12.57 | 2.69 | 0 | 89.30 |
+| API | after | 100 | 41.3 | 23.31 | 4.52 | 0 | 158.15 |
+| API | before | max | 57.2 | 11.60 | 2.50 | 0 | 82.67 |
+| API | after | max | 62.9 | 11.45 | 2.46 | 0 | 82.07 |
+
+A push is not changed, and measures the same. An API commit past its
+branch's capacity stores loose, as before, and costs what it did (about a
+fifth of a commit of its own and seven storage writes for each collision):
+with a pack for every API commit (the first version) the same curve cost
+20.5 and 33.7 commits a landing of its own at 23 and 36 collisions, a row
+and a discard for each try that lost after its pack was written, which is
+why a commit that races others for its branch does not pack
+(`changes::Moving`). What a landing costs past capacity is its lost tries'
+own (BUG-2370, traced there): about a quarter of a commit for each
+collision, on either path.
+
+## The load tool's memory (BUG-2363, 2026-11-17)
+
+Each of the load tool's agents has a connection of its own, and `ureq`
+gave each of a connection's two layers an input and an output buffer of
+128 KiB: 512 KiB an agent, most of the 6 GB that 10,000 agents held, on a
+30 GB machine that also runs the server and the database. With 16 KiB
+buffers (`load.rs` `CONNECTION_BUFFER`) the landing gate's run (10,000
+agents, 1,000/s, three minutes, the same server build) holds **1,661 MB**
+in the load tool against 6,035, and the machine's least available memory
+is 19.6 GB against 12.3 to 12.6. Every other run of this page's 2026-11-17
+sections used the tool as it was, the same for both sides of each
+comparison.
