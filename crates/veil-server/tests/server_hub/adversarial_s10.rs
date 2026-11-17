@@ -269,8 +269,10 @@ fn deep_edit_in_a_child() {
 /// The deep change is ten times the objects of the flat one and took about
 /// 22 times as long; under load both stretch alike, so the deep change may
 /// take 60 times the flat one's duration, measured first in the same run,
-/// before it counts as hung (with the 120 s of every other request at the
-/// least): a fixed limit failed on a loaded machine.
+/// before it counts as hung: a fixed limit failed on a loaded machine. Ten
+/// minutes at the least (BUG-1151: with the 120 s of every other request as
+/// the least, a load that rose after the flat change was measured, in a
+/// whole parallel run at a load of 100 to 500, still failed it).
 #[test]
 fn bug_1053_a_change_of_ten_thousand_files_lands_on_s3() {
     let hub = TestHub::start();
@@ -285,7 +287,7 @@ fn bug_1053_a_change_of_ten_thousand_files_lands_on_s3() {
     assert_eq!(r.status, 200, "{}", body(&r));
     let chain = vec!["d"; 98].join("/");
     let deep: Vec<Value> = (0..1_000).map(|i| put(&format!("src/deep/{i}/{chain}"), &format!("file {i}\n"))).collect();
-    let limit = (baseline * 60).max(std::time::Duration::from_secs(120));
+    let limit = (baseline * 60).max(std::time::Duration::from_secs(600));
     let r = hub.api().post_json_within(&token, &path, &json!({"base": base.hex(), "edits": deep}), limit);
     assert_eq!(r.status, 200, "{}", body(&r));
 }
