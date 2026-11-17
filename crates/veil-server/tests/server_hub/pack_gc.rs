@@ -2189,6 +2189,65 @@ fn bug_2621_a_commit_between_the_loose_switch_and_its_deletes_keeps_its_file() {
     assert_closure_stored(&hub, pid, committed, "the change committed as GC deleted");
 }
 
+/// BUG-2622: GC's walk takes the object a tree's file entry names for a
+/// leaf and never expands it, and a push accepts a file entry that names a
+/// tree. A member who may write `src/` pushes, to a branch of their own, a
+/// commit whose file entry `src/aaa-forged` names the tree of
+/// `src/victim/deep` (a directory of main they can read). The walk meets
+/// that entry before the directory entry that names the same tree, marks
+/// the tree reached, and never walks it: the directory's files are
+/// unreferenced, and deleted from main once past the window.
+#[test]
+#[ignore = "BUG-2622: a file entry naming a directory's tree makes GC delete the directory's files"]
+fn bug_2622_a_file_entry_naming_a_tree_never_hides_the_trees_files_from_gc() {
+    const CONTENT: &str = "VICTIM-2622-CONTENT-41c9\n";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+
+    // On main: a directory two levels under `src/`, with a file.
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/victim/deep/file.txt", CONTENT);
+    let before = c.tip;
+    let (main1, r) = c.push_edited("main", Some(before), |_| {});
+    assert_eq!(r.status, 200, "push main: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "push main ok: {}", String::from_utf8_lossy(&r.body));
+
+    // The directory's tree, as stored.
+    let get = |id: &ObjectId| Object::decode(&hub.rt.block_on(h.objects.get(pid, id)).unwrap().expect("stored")).unwrap();
+    let Object::Snapshot(s) = get(&main1) else { panic!("a snapshot") };
+    let mut at = s.tree;
+    for part in ["src", "victim", "deep"] {
+        let Object::Tree(t) = get(&at) else { panic!("a tree") };
+        at = t.get(part).unwrap_or_else(|| panic!("no {part}")).id;
+    }
+    let Object::Tree(deep) = get(&at) else { panic!("a tree") };
+    let (blob, _) = make_blob(CONTENT);
+
+    // A member with write access to `src/` pushes, to a branch of their
+    // own, a file entry that names that tree.
+    let mut forge = Craft::new(&api, &p.dev, &p.name, "main");
+    forge.set_kind("src/aaa-forged", Object::Tree(deep), EntryKind::File, Visibility::Public);
+    let (_, r) = forge.push_edited("forge-2622", None, |_| {});
+    assert_eq!(r.status, 200, "the forged push: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "the forged push is accepted: {}", String::from_utf8_lossy(&r.body));
+
+    // Two passes: marked, then past the window.
+    for at in [0, 120_000] {
+        let rep = gc_pass(&hub, pid, &Options { min_packs_to_merge: 1, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: at, ..Options::default() });
+        assert!(!rep.skipped, "the pass at {at} ran: {rep:?}");
+    }
+
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    assert!(hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "main's file under the directory was deleted by GC");
+    let r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/victim/deep/file.txt", p.name));
+    assert_eq!(r.status, 200, "main's file: {}", String::from_utf8_lossy(&r.body).chars().take(300).collect::<String>());
+    assert_closure_stored(&hub, pid, main1, "main");
+}
+
 /// BUG-2602: what a switch reads from the store while root writers wait is
 /// bounded (`SWITCH_WALK_MAX` objects). A root written as the pass switches
 /// that names more than that gives the switch way, as any root write did
