@@ -34,6 +34,13 @@ S3_IMAGE=bitnamilegacy/minio:latest
 RUN=$$
 LOGS=${TMPDIR:-/tmp}/veil-server-verify-$RUN
 mkdir -p "$LOGS"
+# The tests' temporary files go in a short directory of this run's own, on
+# disk: a worktree's TMPDIR made the daemons' socket paths longer than
+# SUN_LEN (108 bytes) and failed the socket tests in every T3 worktree.
+# Removed at the end; the logs above stay.
+mkdir -p "$HOME/.vt"
+VT=$(mktemp -d "$HOME/.vt/XXXXXX")
+export TMPDIR="$VT"
 if [ "${VEIL_VERIFY_FRESH:-0}" = 1 ]; then
   TAG=veil-verify-$RUN SHARED=0
 else
@@ -55,6 +62,7 @@ remove_buckets() { # names in the shared MinIO's data directory
   [ $# -gt 0 ] && D exec "$S3" sh -c 'cd /bitnami/minio/data && for b; do case "$b" in ""|.*|*/*) continue;; esac; rm -rf -- "$b" ".minio.sys/buckets/$b"; done' sh "$@" >/dev/null 2>&1
 }
 cleanup() {
+  case "$VT" in "$HOME"/.vt/??????) rm -rf -- "$VT" 2>/dev/null ;; esac
   if [ $SHARED = 1 ]; then
     remove_buckets $(for k in $BUCKETS; do echo "$k-$RUN"; done)
     local db q="SELECT datname FROM pg_database WHERE datname LIKE 'r${RUN}x%'"
