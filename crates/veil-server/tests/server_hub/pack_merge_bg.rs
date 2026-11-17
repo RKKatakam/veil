@@ -483,3 +483,102 @@ fn bug_2310_a_push_never_lists_an_upload_swept_while_it_ran() {
         assert_eq!(tip_of(&api, &p.admin.token(), &p.name, "slow"), tip, "the branch did not move");
     });
 }
+
+/// List `n` packs of one new object each in `project` (`first..first + n`)
+/// as pushes do: each recorded staged before it is written, then all
+/// listed in one statement, entered into this server's lookup map and
+/// a background merge asked for. The objects' ids.
+fn list_packs(hub: &TestHub, project: i64, first: usize, n: usize) -> Vec<ObjectId> {
+    let h = hub.hub();
+    hub.rt.block_on(async {
+        let mut set = tokio::task::JoinSet::new();
+        for i in first..first + n {
+            let h = h.clone();
+            set.spawn(async move {
+                let raw = Bytes::from(Object::Blob(format!("BUG-2462 object {i}").into_bytes()).encode());
+                let id = ObjectId::hash(&raw);
+                let (name, held) = h.objects.put_pack(project, 1, vec![(id, veil_server::store::encode(raw))]).await.expect("the pack is stored");
+                (id, name, held)
+            });
+        }
+        let mut ids = Vec::with_capacity(n);
+        let mut packs = Vec::with_capacity(n);
+        while let Some(r) = set.join_next().await {
+            let (id, name, held) = r.expect("the pack task ran");
+            ids.push(id);
+            packs.push((name, held.index.clone()));
+        }
+        let names: Vec<String> = packs.iter().map(|(n, _)| n.to_string()).collect();
+        let r = sqlx::query("UPDATE packs SET state = $3 WHERE project_id = $1 AND name = ANY($2) AND state = 0")
+            .bind(project)
+            .bind(&names)
+            .bind(LISTED)
+            .execute(&h.db)
+            .await
+            .expect("the packs are listed");
+        assert_eq!(r.rows_affected() as usize, n, "every pack is listed");
+        h.objects.listed_here(project, packs);
+        pack_gc::maybe_schedule(&h, project);
+        ids
+    })
+}
+
+/// BUG-2462: one busy project's packs piled up without bound. A push lists
+/// about two packs; background merges took at most 64 packs a run, one
+/// pack read after another, so at 1,500 pushes a second one project's
+/// lookup map held 147,000 packs after a minute and a half, and every
+/// lookup of an object not in a recent pack walked them all. Here packs
+/// are listed for 15 seconds at up to 1,000 a second (at least 500: merges
+/// as they were managed fewer than 400 here), as pushes list them
+/// (each asks for a background merge): the small listed packs stay
+/// bounded throughout (at most two seconds' worth of the rate reached,
+/// once the first half has passed), go under the merge threshold once the
+/// listing stops, and every object listed is read, on this server and a
+/// fresh one.
+#[test]
+fn bug_2462_a_busy_projects_packs_stay_bounded_under_a_sustained_listing_rate() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id_of(&hub, &p.name);
+    const RATE: f64 = 1_000.0;
+    const BATCH: usize = 200;
+    let run = Duration::from_secs(15);
+    let mut ids: Vec<ObjectId> = Vec::new();
+    let mut most_late = 0i64;
+    let mut samples = Vec::new();
+    let mut next_sample = Instant::now();
+    let start = Instant::now();
+    while start.elapsed() < run {
+        let due = start + Duration::from_secs_f64(ids.len() as f64 / RATE);
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        let first = ids.len();
+        ids.extend(list_packs(&hub, pid, first, BATCH));
+        if Instant::now() >= next_sample {
+            next_sample += Duration::from_millis(500);
+            let (small, _) = small_and_discarded(&hub, pid);
+            samples.push((start.elapsed().as_secs_f64(), small));
+            if start.elapsed() >= run / 2 {
+                most_late = most_late.max(small);
+            }
+        }
+    }
+    let took = start.elapsed().as_secs_f64();
+    let rate = ids.len() as f64 / took;
+    assert!(rate >= 500.0, "the packs were listed at {rate:.0} a second, not the 500 or more the test needs");
+    assert!(
+        most_late as f64 <= 2.0 * rate,
+        "{} packs listed in {took:.1} s: the small listed packs grew to {most_late} in the second half (samples: {samples:?})",
+        ids.len()
+    );
+    let until = Instant::now() + Duration::from_secs(60);
+    while small_and_discarded(&hub, pid).0 >= MERGE_MIN_PACKS as i64 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (small, discarded) = small_and_discarded(&hub, pid);
+    assert!(small < MERGE_MIN_PACKS as i64, "{small} small packs still listed a minute after the listing stopped ({discarded} discarded)");
+    read_all(&hub, pid, &ids, "after the merges");
+    let fresh = TestHub::beside(&hub);
+    read_all(&fresh, pid, &ids, "after the merges, another server");
+}

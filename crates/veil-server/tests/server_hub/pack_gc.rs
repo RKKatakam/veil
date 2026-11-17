@@ -1130,6 +1130,24 @@ fn guarantee_5_cost_of_merging_10000_small_pushes() {
     }
 }
 
+/// A GC pass by hand, run again if it lost a race with another database's
+/// schema change on a shared YugabyteDB (40001), as the server's own GC
+/// loop runs it at its next tick (BUG-2212: every pass of the test, not
+/// only some).
+fn gc_pass(hub: &TestHub, pid: i64, opts: &Options) -> pack_gc::Report {
+    let mut tries = 0;
+    loop {
+        match hub.rt.block_on(pack_gc::run_project(&hub.hub(), pid, opts)) {
+            Ok(r) => return r,
+            Err(e) if e.is_retryable() && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => panic!("GC pass at offset {}: {e:?}", opts.now_offset_ms),
+        }
+    }
+}
+
 /// BUG-1780: Cross-server cache invalidation (`hub2` warm before GC, re-push on
 /// `hub2` while discarded pack is still inside `pack_grace_ms`, both admin and
 /// restricted viewer read whole) AND retention-window closure preservation (an
@@ -1174,19 +1192,17 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
         &json!({"updates": [{"branch": "b_early", "expected": s1.hex(), "new": null}], "force": true}),
     );
     assert_eq!(del1.status, 200);
-    hub.rt
-        .block_on(pack_gc::run_project(
-            &hub.hub(),
-            pid,
-            &Options {
-                min_packs_to_merge: 1,
-                run_gc: true,
-                retention_window_ms: 60_000,
-                now_offset_ms: 0,
-                ..Options::default()
-            },
-        ))
-        .unwrap();
+    gc_pass(
+        &hub,
+        pid,
+        &Options {
+            min_packs_to_merge: 1,
+            run_gc: true,
+            retention_window_ms: 60_000,
+            now_offset_ms: 0,
+            ..Options::default()
+        },
+    );
 
     // 3. Push `s2` on `b_late` referencing the SAME `src/shared.txt` content, then
     // delete `b_late` and run GC at t=40_000 (`b_late` unreferenced at t=40_000),
@@ -1215,20 +1231,7 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
             now_offset_ms: off,
             ..Options::default()
         };
-        // A pass that lost a race with another database's schema change on a
-        // shared YugabyteDB (40001) is run again, as the server's own GC loop
-        // runs it at its next tick (BUG-2212).
-        let mut tries = 0;
-        loop {
-            match hub.rt.block_on(pack_gc::run_project(&hub.hub(), pid, &opts)) {
-                Ok(_) => break,
-                Err(e) if e.is_retryable() && tries < 20 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                Err(e) => panic!("GC pass at offset {off}: {e:?}"),
-            }
-        }
+        gc_pass(&hub, pid, &opts);
     }
     let (shared_blob_id, _) = make_blob("SHARED-BLOB-1780\n");
     assert!(
@@ -1238,21 +1241,18 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
 
     // 4. Advance past `s2`'s retention window too (t=120_000), keeping `pack_grace_ms = 300_000`
     // so discarded packs still sit in storage while `hub2` did NOT run GC itself.
-    let rep_exp = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &hub.hub(),
-            pid,
-            &Options {
-                min_packs_to_merge: 1,
-                run_gc: true,
-                retention_window_ms: 60_000,
-                pack_grace_ms: 300_000,
-                now_offset_ms: 120_000,
-                ..Options::default()
-            },
-        ))
-        .unwrap();
+    let rep_exp = gc_pass(
+        &hub,
+        pid,
+        &Options {
+            min_packs_to_merge: 1,
+            run_gc: true,
+            retention_window_ms: 60_000,
+            pack_grace_ms: 300_000,
+            now_offset_ms: 120_000,
+            ..Options::default()
+        },
+    );
     assert!(rep_exp.packed_objects_deleted >= 1, "expired objects dropped from packs: {rep_exp:?}");
 
     // 5. Re-upload `saved_s1` and push `revived_on_peer` directly against `hub2`!

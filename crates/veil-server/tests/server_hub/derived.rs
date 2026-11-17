@@ -2237,3 +2237,141 @@ fn bug_2361_the_read_ahead_derives_what_one_read_at_a_time_did() {
         assert_eq!(prev, want, "prev of {path} in {}", s.short());
     }
 }
+
+/// A store that holds each read [`SlowReads::HOLD`] and records the most
+/// reads it had in flight at once (BUG-2480).
+struct SlowReads {
+    inner: Arc<dyn veil_server::store::BlobStore>,
+    in_flight: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl SlowReads {
+    const HOLD: Duration = Duration::from_millis(10);
+
+    async fn held<T>(&self, read: impl std::future::Future<Output = T>) -> T {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.most.fetch_max(now, SeqCst);
+        tokio::time::sleep(Self::HOLD).await;
+        let r = read.await;
+        self.in_flight.fetch_sub(1, SeqCst);
+        r
+    }
+}
+
+#[async_trait::async_trait]
+impl veil_server::store::BlobStore for SlowReads {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+        self.held(self.inner.get(key)).await
+    }
+    async fn put(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
+        self.inner.put(key, data).await
+    }
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        self.held(self.inner.exists(key)).await
+    }
+    async fn len(&self, key: &str) -> anyhow::Result<Option<u64>> {
+        self.held(self.inner.len(key)).await
+    }
+    async fn get_range(&self, key: &str, start: u64, end: u64) -> anyhow::Result<Option<(bytes::Bytes, u64)>> {
+        self.held(self.inner.get_range(key, start, end)).await
+    }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+}
+
+/// BUG-2480: a burst of pushes to 1,000 branches of one project left the
+/// deriver minutes behind (167 to 277 s after the agents stopped): each
+/// run asked the database whether each moved branch's new snapshots were
+/// derived in a statement of its own, one branch after another, and read
+/// their snapshots down each branch's line one at a time, a storage round
+/// trip each once the object cache no longer held them. Here a second
+/// server on the same database and store (its caches empty, so every
+/// snapshot it reads is a storage read, each held 10 ms) derives 64 moved
+/// branches of 4 new snapshots each: it asks about them in a few
+/// statements, not one a branch, and reads their lines together. (The new
+/// snapshots keep their parent's tree, so the walk is all the run reads.)
+#[test]
+fn bug_2480_a_run_over_many_moved_branches_asks_and_reads_them_together() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let th = TestHub::start();
+    let (text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &text, &bindings);
+    let files = Files::from([("pub/a.txt".to_string(), b"a\n".to_vec())]);
+    let base = h.commit(&th, &[root_snapshot_id()], files.clone(), [1; 16], 1_700_000_000_000, None);
+    h.set_branch(&th, "main", base);
+    assert_eq!(h.derive(&th).snapshots, 1, "the base derived");
+    const BRANCHES: usize = 64;
+    const NEW: usize = 4;
+    let mut ts = 1_700_000_001_000i64;
+    for b in 0..BRANCHES {
+        let mut tip = base;
+        for i in 0..NEW {
+            ts += 1;
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&(b as u64).to_le_bytes());
+            change[8..].copy_from_slice(&(i as u64 + 2).to_le_bytes());
+            tip = h.commit(&th, &[tip], files.clone(), change, ts, None);
+        }
+        h.set_branch(&th, &format!("b{b}"), tip);
+    }
+    // The second server.
+    let first = h.hub.clone();
+    let store = Arc::new(SlowReads {
+        inner: first.objects.blob_store().clone(),
+        in_flight: AtomicUsize::new(0),
+        most: AtomicUsize::new(0),
+    });
+    let statements = Arc::new(AtomicUsize::new(0));
+    let url = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    let _in_rt = th.rt.enter();
+    let derive_db = {
+        let (a, b) = (statements.clone(), statements.clone());
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(veil_server::derive::DERIVE_CONNECTIONS)
+            .after_connect(move |_, _| {
+                a.fetch_add(1, SeqCst);
+                Box::pin(async { Ok(()) })
+            })
+            .before_acquire(move |_, _| {
+                b.fetch_add(1, SeqCst);
+                Box::pin(async { Ok(true) })
+            })
+            .connect_lazy(&url)
+            .unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Arc::new(Hub {
+        db: first.db.clone(),
+        objects: Arc::new(veil_server::store::Objects::with_db(store.clone(), 256 << 20, Some(first.db.clone()))),
+        trees: veil_core::cache::LruCache::new(256 << 20),
+        identity: first.identity.clone(),
+        receipt_key: first.receipt_key,
+        grants: veil_server::grant::Grants::load(dir.path()).unwrap(),
+        cache_token: first.cache_token,
+        session_ttl_ms: first.session_ttl_ms,
+        certificate: first.certificate.clone(),
+        caches: Default::default(),
+        derive: derive::Workers::new(derive_db),
+        query: Default::default(),
+        landing: Default::default(),
+        events: Default::default(),
+        embargo: Default::default(),
+        pack_gc: Default::default(),
+        limits: veil_server::limits::Limits::new(Default::default(), 16),
+        commits: Default::default(),
+    });
+    let stats = th.rt.block_on(derive::catch_up(&hub, h.id, derive::Scope::All)).unwrap();
+    assert_eq!(stats.snapshots, BRANCHES * NEW, "every new snapshot derived");
+    assert_eq!(stats.branches.len(), BRANCHES + 1, "every branch derived through its tip");
+    assert_eq!(h.derive(&th).snapshots, 0, "nothing left to derive");
+    let statements = statements.load(SeqCst);
+    eprintln!("statements on the deriver's pool: {statements}; most reads at once: {}", store.most.load(SeqCst));
+    assert!(statements < BRANCHES / 4, "{statements} statements for {BRANCHES} moved branches: not one a branch");
+    assert!(store.most.load(SeqCst) > 1, "the branches' lines are read together, not one snapshot after another");
+}

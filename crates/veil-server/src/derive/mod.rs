@@ -978,13 +978,16 @@ impl<'a> Batch<'a> {
     /// Every snapshot `roots` reach that has no value yet, parents first.
     /// Whether a snapshot is derived is asked of the database once for up
     /// to [`AHEAD`] of them down its first parents (BUG-2361: once for each,
-    /// a statement for every snapshot landed, that found nothing): only the
-    /// project's deriver, which holds its lock, writes rows.
+    /// a statement for every snapshot landed, that found nothing), first
+    /// for every root's line together (BUG-2480: once for each root, a
+    /// statement for every branch moved): only the project's deriver, which
+    /// holds its lock, writes rows.
     fn underived(&mut self, roots: &[ObjectId]) -> Result<Vec<ObjectId>> {
         let mut order = Vec::new();
         let mut done: HashSet<ObjectId> = HashSet::new();
         let mut expanded: HashSet<ObjectId> = HashSet::new();
         let mut absent: HashSet<ObjectId> = HashSet::new();
+        self.ask_rows(roots, &mut absent)?;
         let mut stack: Vec<(ObjectId, bool)> = roots.iter().map(|r| (*r, false)).collect();
         while let Some((x, ready)) = stack.pop() {
             if done.contains(&x) {
@@ -999,7 +1002,7 @@ impl<'a> Batch<'a> {
                 continue;
             }
             if !absent.contains(&x) {
-                self.ask_rows(x, &mut absent)?;
+                self.ask_rows(&[x], &mut absent)?;
             }
             if !absent.contains(&x) && self.graph.row(&x)?.is_some() {
                 done.insert(x);
@@ -1017,30 +1020,52 @@ impl<'a> Batch<'a> {
         Ok(order)
     }
 
-    /// Ask the database at once whether `x` and up to [`AHEAD`] snapshots
+    /// Ask the database whether each of `xs` and up to [`AHEAD`] snapshots
     /// down its first parents are derived, unless one is known to be (in
-    /// the batch or the rows' cache): the rows found are cached, the others
-    /// added to `absent`.
-    fn ask_rows(&mut self, x: ObjectId, absent: &mut HashSet<ObjectId>) -> Result<()> {
+    /// the batch or the rows' cache), [`AHEAD`] of them a statement: the
+    /// rows found are cached, the others added to `absent`. The lines are
+    /// walked together, a snapshot of each at a time, read
+    /// [`AHEAD_THREADS`] at once, and asked about once [`AHEAD`] are
+    /// waiting, so a line stops at a row just found (BUG-2480: one line
+    /// after another, a statement for each and a storage round trip for
+    /// each snapshot the object cache no longer held, a burst of pushes to
+    /// 1,000 branches left the deriver minutes behind).
+    fn ask_rows(&mut self, xs: &[ObjectId], absent: &mut HashSet<ObjectId>) -> Result<()> {
         let src = &self.cx.src;
         let known = |y: &ObjectId| {
             *y == root_snapshot_id() || self.graph.pending.contains_key(y) || self.cx.hub().derive.rows.get(&row_key(self.cx.project(), y)).is_some()
         };
-        let mut ids = Vec::new();
-        let mut y = x;
-        while ids.len() < AHEAD && !known(&y) && !absent.contains(&y) {
-            ids.push(y);
-            match src.snapshot(&y)?.parents.first() {
-                Some(p) => y = *p,
-                None => break,
+        let ask = |ids: &mut Vec<ObjectId>, absent: &mut HashSet<ObjectId>| -> Result<()> {
+            for ids in ids.chunks(AHEAD) {
+                let found = self.cx.stored_rows(ids)?;
+                absent.extend(ids.iter().filter(|i| !found.contains(i)));
             }
+            ids.clear();
+            Ok(())
+        };
+        let mut ids = Vec::new();
+        // What `ids` and `step` hold (once asked about, a snapshot is known
+        // or absent).
+        let mut seen = HashSet::new();
+        let mut step: Vec<ObjectId> = xs.iter().copied().filter(|y| !known(y) && !absent.contains(y) && seen.insert(*y)).collect();
+        for _ in 0..AHEAD {
+            if step.is_empty() {
+                break;
+            }
+            ids.extend_from_slice(&step);
+            if ids.len() >= AHEAD {
+                ask(&mut ids, absent)?;
+                seen.clear();
+                // A derived snapshot's line is derived below it.
+                step.retain(|y| absent.contains(y));
+            }
+            step = first_parents(src, &step)?
+                .into_iter()
+                .flatten()
+                .filter(|y| !known(y) && !absent.contains(y) && seen.insert(*y))
+                .collect();
         }
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let found = self.cx.stored_rows(&ids)?;
-        absent.extend(ids.into_iter().filter(|i| !found.contains(i)));
-        Ok(())
+        ask(&mut ids, absent)
     }
 
     /// Read ahead for `chunk` (about to be derived in this order): what each
@@ -1349,6 +1374,26 @@ impl<'a> Batch<'a> {
 /// The leaves a snapshot changed, and the folders that changed with no leaf
 /// below them.
 type TreeChanges = (Vec<Change>, Vec<String>);
+
+/// The first parent of each of `ids` (`None` for a first snapshot), their
+/// snapshots read on up to [`AHEAD_THREADS`] threads.
+fn first_parents(src: &Source, ids: &[ObjectId]) -> Result<Vec<Option<ObjectId>>> {
+    let first = |x: &ObjectId| -> Result<Option<ObjectId>> { Ok(src.snapshot(x)?.parents.first().copied()) };
+    if ids.len() <= 1 {
+        return ids.iter().map(first).collect();
+    }
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = ids
+            .chunks(ids.len().div_ceil(AHEAD_THREADS))
+            .map(|part| crate::spawn_scoped(sc, move || deriving(|| part.iter().map(first).collect::<Result<Vec<_>>>())))
+            .collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for h in hs {
+            out.extend(h.join().unwrap_or_else(|_| Err(bad("a snapshot reader panicked")))?);
+        }
+        Ok(out)
+    })
+}
 
 /// What snapshot `id` (with `parents`) changed against its first parent
 /// ([`changes::diff`]).

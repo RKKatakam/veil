@@ -91,6 +91,22 @@ pub const MAX_MERGED_BYTES: u64 = 32 << 20;
 /// Maximum number of source packs merged in one pass (bounds work per run).
 pub const MAX_PACKS_PER_RUN: usize = 64;
 
+/// Maximum number of source packs one background merge pass takes
+/// ([`maybe_schedule`]): past [`MAX_PACKS_PER_RUN`], only while the batch
+/// stays within [`MAX_MERGED_BYTES`] (one merged pack). BUG-2462: a push
+/// lists about two packs, so at 1,500 pushes a second one project lists
+/// 3,000 a second, and passes of 64 packs fell behind (each pass also
+/// lists every listed pack): its packs grew to 147,000 in a minute and a
+/// half, and every lookup walked them.
+pub const BACKGROUND_PACKS_PER_RUN: usize = 4096;
+
+/// Storage requests one merge or sweep pass makes at once (BUG-2462: one
+/// after another, a pass of 64 packs took 110 ms on MinIO): reads of packs
+/// at most [`pack::FIRST_READ`] long (index and entries in one request;
+/// a larger pack's index alone), range reads together at most
+/// [`COPY_SPAN`] bytes, deletes.
+const AT_ONCE: usize = 32;
+
 /// A size class of small packs spans a factor of 2^`TIER_BITS` (16) in
 /// bytes ([`Options::size_tiers`]): merging [`TIER_MIN_PACKS`] to
 /// [`MAX_PACKS_PER_RUN`] packs of one class makes a pack one or two classes
@@ -154,8 +170,9 @@ pub struct Options {
     /// packs / deletes loose objects (for deterministic race tests).
     pub before_switch: Option<SwitchHook>,
     /// Merge small packs by size class ([`TIER_BITS`]): only packs of one
-    /// class, the smallest class with at least `min_packs_to_merge` packs
-    /// (the background merges, BUG-2230). Without it the smallest small
+    /// class, the class with the most packs of those with at least
+    /// `min_packs_to_merge` (the background merges, BUG-2230; the most, not
+    /// the smallest, BUG-2462). Without it the smallest small
     /// packs are merged together whatever their sizes, so a merged pack
     /// that is still small is copied again by every later pass until it
     /// passes `small_pack_bytes`.
@@ -286,8 +303,9 @@ pub const CHECK_GAP: std::time::Duration = std::time::Duration::from_millis(500)
 /// ([`Options`] with `run_gc: false`: no object is dropped, so the switch
 /// takes neither the GC epoch row nor the root writers' gate and never
 /// waits for, or holds up, a push or a landing's transaction) by size
-/// class ([`Options::size_tiers`]: the smallest class with at least
-/// [`TIER_MIN_PACKS`] packs, at most [`MAX_PACKS_PER_RUN`] of them a pass),
+/// class ([`Options::size_tiers`]: the class with the most packs of those
+/// with at least [`TIER_MIN_PACKS`], at most [`BACKGROUND_PACKS_PER_RUN`]
+/// of them a pass, their storage requests `AT_ONCE` at a time),
 /// one after another while one merged, each under the project's advisory
 /// lock (one server at a time; another server's run makes this one's a
 /// skip), a derive worker permit and S24's shedding (`derive_turn` before
@@ -323,11 +341,13 @@ pub fn maybe_schedule(hub: &Arc<Hub>, project: i64) {
 /// One background merge-only pass on `project` if its small listed packs
 /// reach [`MERGE_MIN_PACKS`]: whether it merged any (so another may follow).
 async fn merge_small_packs(hub: &Arc<Hub>, project: i64) -> bool {
+    const _: () = assert!(LISTED == 1);
+    // `state = 1` (LISTED) is written literally so the partial index
+    // `packs_listed` (migration 41) serves it under a generic plan too.
     let count: i64 = match sqlx::query_scalar(
-        "SELECT count(*) FROM packs WHERE project_id = $1 AND state = $2 AND size <= $3",
+        "SELECT count(*) FROM packs WHERE project_id = $1 AND state = 1 AND size <= $2",
     )
     .bind(project)
-    .bind(LISTED)
     .bind(SMALL_PACK_BYTES as i64)
     .fetch_one(&hub.derive.db)
     .await
@@ -340,6 +360,7 @@ async fn merge_small_packs(hub: &Arc<Hub>, project: i64) -> bool {
     }
     let opts = Options {
         min_packs_to_merge: TIER_MIN_PACKS,
+        max_packs_per_run: BACKGROUND_PACKS_PER_RUN,
         run_gc: false,
         size_tiers: true,
         ..Options::default()
@@ -819,11 +840,11 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
     };
 
     // 3. Load listed packs for `project`, oldest first.
+    // `state = 1` (LISTED) literally: `packs_listed` (migration 41).
     let listed_rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
-        "SELECT name, size, objects, created_at FROM packs WHERE project_id = $1 AND state = $2 ORDER BY created_at, name",
+        "SELECT name, size, objects, created_at FROM packs WHERE project_id = $1 AND state = 1 ORDER BY created_at, name",
     )
     .bind(project)
-    .bind(LISTED)
     .fetch_all(&hub.db)
     .await?;
 
@@ -939,13 +960,21 @@ async fn select_batch(
     });
 
     if opts.size_tiers {
-        // The smallest class with enough packs, alone (sorted by size within).
+        // The class with the most packs, of those with enough (the smaller
+        // on a tie), alone (sorted by size within). BUG-2462: the smallest
+        // class with enough was picked, and a busy project's pushes refill
+        // the smallest class within every pass, so the class above it,
+        // where the other pack of each push falls, was never merged.
         let class = |p: &PackRow| (u64::BITS - p.size.max(1).leading_zeros()) / TIER_BITS;
         let mut counts: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
         for p in &small {
             *counts.entry(class(p)).or_default() += 1;
         }
-        let pick = counts.iter().find(|(_, n)| **n >= opts.min_packs_to_merge.max(2)).map(|(c, _)| *c);
+        let pick = counts
+            .iter()
+            .filter(|(_, n)| **n >= opts.min_packs_to_merge.max(2))
+            .max_by_key(|(c, n)| (**n, std::cmp::Reverse(**c)))
+            .map(|(c, _)| *c);
         small.retain(|p| Some(class(p)) == pick);
         small.sort_by(|a, b| (a.size, a.created_at, &a.name).cmp(&(b.size, b.created_at, &b.name)));
     }
@@ -954,7 +983,19 @@ async fn select_batch(
         if small.len() < opts.min_packs_to_merge {
             return Ok((Vec::new(), HashSet::new(), None, false));
         }
-        let batch = small.into_iter().take(max_per_run).collect();
+        // Past `MAX_PACKS_PER_RUN`, only while the batch stays within one
+        // merged pack (BUG-2462: many tiny packs a pass, never gigabytes).
+        let mut bytes = 0u64;
+        let batch = small
+            .into_iter()
+            .take(max_per_run)
+            .enumerate()
+            .take_while(|(i, p)| {
+                bytes += p.size;
+                *i < MAX_PACKS_PER_RUN || bytes <= opts.max_merged_bytes
+            })
+            .map(|(_, p)| p)
+            .collect();
         return Ok((batch, HashSet::new(), None, false));
     };
 
@@ -1000,6 +1041,67 @@ async fn select_batch(
     Ok((chosen, gc.expired_unreferenced, Some(gc.stamp), complete_dead_sweep))
 }
 
+/// The replacement packs a merge writes as it copies entries, each at
+/// most `max_merged_bytes` and `max_merged_objects` ([`Options`]).
+struct Merged {
+    objects: Vec<(ObjectId, Bytes)>,
+    /// What `objects` makes a pack of: its head and entries.
+    bytes: u64,
+    max_bytes: u64,
+    max_objects: usize,
+    /// Staged, recorded before written: `(name, index, size, objects)`.
+    written: Vec<(Arc<str>, Held, u64, usize)>,
+    kept: usize,
+}
+
+impl Merged {
+    fn new(opts: &Options) -> Merged {
+        Merged {
+            objects: Vec::new(),
+            bytes: 14, // MAGIC + count
+            max_bytes: opts.max_merged_bytes.max(1 << 20),
+            max_objects: opts.max_merged_objects.clamp(1, pack::MAX_OBJECTS),
+            written: Vec::new(),
+            kept: 0,
+        }
+    }
+
+    /// Add an entry, writing the pack so far first if it would pass a cap.
+    async fn push(&mut self, hub: &Arc<Hub>, project: i64, id: ObjectId, enc: Bytes) -> Result<()> {
+        let entry_cost = 44 + 36 + enc.len() as u64;
+        if !self.objects.is_empty() && (self.objects.len() >= self.max_objects || self.bytes + entry_cost > self.max_bytes) {
+            self.write(hub, project).await?;
+        }
+        self.bytes += entry_cost;
+        self.objects.push((id, enc));
+        self.kept += 1;
+        Ok(())
+    }
+
+    /// Write the entries added since the last pack as a staged job pack.
+    async fn write(&mut self, hub: &Arc<Hub>, project: i64) -> Result<()> {
+        if self.objects.is_empty() {
+            return Ok(());
+        }
+        let count = self.objects.len();
+        let objects = std::mem::take(&mut self.objects);
+        self.bytes = 14;
+        let (name, held) = crate::store::not_own(hub.objects.put_job_pack(project, objects)).await.map_err(Error::Other)?;
+        let size = held.size;
+        self.written.push((name, held, size, count));
+        Ok(())
+    }
+
+    /// Discard the packs written so far (the merge gave way).
+    async fn discard(self, hub: &Arc<Hub>, project: i64) -> Result<()> {
+        let names: Vec<Arc<str>> = self.written.into_iter().map(|(n, _, _, _)| n).collect();
+        if !names.is_empty() {
+            hub.objects.discard(project, &names).await.map_err(Error::Other)?;
+        }
+        Ok(())
+    }
+}
+
 /// Merge and/or GC-filter `batch` of listed packs into one or more replacement
 /// packs. Returns `Ok(true)` if a simulated crash stopped the pass early.
 #[allow(clippy::too_many_arguments)]
@@ -1014,128 +1116,197 @@ async fn compact_batch(
     now_ms: i64,
     report: &mut Report,
 ) -> Result<bool> {
-    let store = hub.objects.blob_store();
-    let bound = hub.objects.index_bound();
-
-    // 1. Read the index of each pack in `batch` one at a time (so we hold only
-    // one index share at a time!) and collect the live slots to copy,
-    // deduplicating across `batch` (keeping the newest pack's copy, or first
-    // seen).
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut dead_count = 0usize;
     let mut dead_ids: HashSet<ObjectId> = HashSet::new();
-    // Per pack in `batch` (newest first so newest copy wins if duplicated, then
-    // reversed back to chronological pack order): `(PackRow, Vec<(ObjectId, Slot)>)`.
-    let mut plan: Vec<(PackRow, Vec<(ObjectId, Slot)>)> = Vec::with_capacity(batch.len());
+    let mut out = Merged::new(opts);
 
-    for p in batch.iter().rev() {
-        hub.limits.derive_turn().await;
-        let k = pack::key(project, &p.name);
-        hub.objects.reads.fetch_add(1, Ordering::Relaxed);
-        let Some(held) = pack::read_index(&**store, &k, bound).await.map_err(Error::Other)? else {
-            // Pack was already replaced by another run.
-            return Ok(false);
-        };
-        let mut keep_slots: Vec<(ObjectId, Slot)> = Vec::new();
-        for (id, slot) in held.index.iter() {
-            if expired_unreferenced.contains(id) {
-                dead_count += 1;
-                dead_ids.insert(*id);
-                continue;
-            }
-            if seen.insert(*id) {
-                keep_slots.push((*id, *slot));
-            }
-        }
-        // Sort by offset so we read contiguous/nearby spans in few range requests.
-        keep_slots.sort_unstable_by_key(|(_, s)| s.offset);
-        drop(held);
-        plan.push((p.clone(), keep_slots));
-    }
-    plan.reverse();
-
-    // If only 1 pack is in the batch and no objects were removed from it,
-    // there is nothing to rewrite.
-    if batch.len() == 1 && dead_count == 0 {
-        return Ok(false);
-    }
-
-    // 2. Stream/read the kept entries from the source packs in bounded range
-    // spans under `ReadAhead`, building replacement packs capped at
-    // `opts.max_merged_bytes` and `opts.max_merged_objects`.
-    let max_bytes = opts.max_merged_bytes.max(1 << 20);
-    let max_objs = opts.max_merged_objects.clamp(1, pack::MAX_OBJECTS);
-
-    let mut written_packs: Vec<(Arc<str>, Held, u64, usize)> = Vec::new();
-    let mut cur_objects: Vec<(ObjectId, Bytes)> = Vec::new();
-    let mut cur_bytes: u64 = 14; // MAGIC + count
-    let mut total_kept = 0usize;
-
-    for (p, slots) in &plan {
-        if slots.is_empty() {
-            continue;
-        }
-        let k = pack::key(project, &p.name);
-        let mut i = 0;
-        while i < slots.len() {
+    if batch.len() > 1 && batch.iter().all(|p| p.size <= pack::FIRST_READ) {
+        // Every pack whole in one read (the background merges' tiny packs,
+        // BUG-2462): its index and its entries in one request, `AT_ONCE`
+        // packs at a time (their shares of the bound and their bytes
+        // under 3 MB, their bytes at most 2 MB), copied newest first, so the newest copy of
+        // an object is kept.
+        for chunk in batch.rchunks(AT_ONCE) {
             hub.limits.derive_turn().await;
-            let start_off = slots[i].1.offset;
-            let mut end_idx = i;
-            while end_idx + 1 < slots.len() {
-                let next_last = slots[end_idx + 1].1.last();
-                if next_last - start_off + 1 > COPY_SPAN {
-                    break;
+            let _ra = ReadAhead::wait(chunk.iter().map(|p| p.size).sum()).await;
+            let mut reads = tokio::task::JoinSet::new();
+            for (i, p) in chunk.iter().enumerate() {
+                let (hub, k) = (hub.clone(), pack::key(project, &p.name));
+                hub.objects.reads.fetch_add(1, Ordering::Relaxed);
+                reads.spawn(async move { (i, pack::read_whole(&**hub.objects.blob_store(), &k, hub.objects.index_bound()).await) });
+            }
+            let mut got: Vec<Option<(Held, Bytes)>> = (0..chunk.len()).map(|_| None).collect();
+            while let Some(r) = reads.join_next().await {
+                let (i, r) = r.map_err(|e| Error::Other(e.into()))?;
+                let Some(whole) = r.map_err(Error::Other)? else {
+                    // Pack was already replaced by another run.
+                    out.discard(hub, project).await?;
+                    return Ok(false);
+                };
+                got[i] = Some(whole);
+            }
+            let mut entries: Vec<(ObjectId, Bytes)> = Vec::new();
+            for (p, whole) in chunk.iter().zip(got).rev() {
+                let (held, bytes) = whole.expect("every read answered");
+                for &(id, slot) in held.index.iter() {
+                    if expired_unreferenced.contains(&id) {
+                        dead_count += 1;
+                        dead_ids.insert(id);
+                        continue;
+                    }
+                    if seen.insert(id) {
+                        let at = bytes
+                            .get(slot.offset as usize..=slot.last() as usize)
+                            .ok_or_else(|| Error::Other(anyhow!("source pack {} shorter than its index", p.name)))?;
+                        let enc = pack::entry(&id, slot, at).map_err(Error::Other)?;
+                        entries.push((id, Bytes::copy_from_slice(enc)));
+                    }
                 }
-                end_idx += 1;
             }
-            let end_off = slots[end_idx].1.last();
-            let span_len = end_off - start_off + 1;
-            let _ra = ReadAhead::wait(span_len).await;
-            hub.objects.reads.fetch_add(1, Ordering::Relaxed);
-            let (bytes, _) = store
-                .get_range(&k, start_off, end_off)
-                .await
-                .map_err(Error::Other)?
-                .ok_or_else(|| Error::Other(anyhow!("source pack {} missing during merge", p.name)))?;
-            if (bytes.len() as u64) < span_len {
-                return Err(Error::Other(anyhow!("source pack {} shorter than its index", p.name)));
+            // The chunk's index shares are back before a merged pack is
+            // written: writing one takes a share of its own, and waiting
+            // for it while holding others could wait on ourselves.
+            for (id, enc) in entries {
+                out.push(hub, project, id, enc).await?;
             }
-            for &(id, slot) in &slots[i..=end_idx] {
-                let from = (slot.offset - start_off) as usize;
-                let to = (slot.last() - start_off) as usize;
-                let enc_slice = pack::entry(&id, slot, &bytes[from..=to]).map_err(Error::Other)?;
-                let enc = Bytes::copy_from_slice(enc_slice);
-                let entry_cost = 44 + 36 + enc.len() as u64;
-                if !cur_objects.is_empty()
-                    && (cur_objects.len() >= max_objs || cur_bytes + entry_cost > max_bytes)
-                {
-                    let count = cur_objects.len();
-                    let batch_objs = std::mem::take(&mut cur_objects);
-                    cur_bytes = 14;
-                    let (name, held) = crate::store::not_own(hub.objects.put_job_pack(project, batch_objs))
-                        .await
-                        .map_err(Error::Other)?;
-                    let sz = held.size;
-                    written_packs.push((name, held, sz, count));
+        }
+    } else {
+        // 1. Read the index of each pack in `batch` (a small pack's with
+        // others, `AT_ONCE` at a time; a larger one's alone) and collect the
+        // live slots to copy, deduplicating across `batch` (keeping the
+        // newest pack's copy, or first seen).
+        // Per pack in `batch` (newest first so newest copy wins if duplicated, then
+        // reversed back to chronological pack order): `(PackRow, Vec<(ObjectId, Slot)>)`.
+        let mut plan: Vec<(PackRow, Vec<(ObjectId, Slot)>)> = Vec::with_capacity(batch.len());
+        let newest_first: Vec<&PackRow> = batch.iter().rev().collect();
+        let mut at = 0;
+        while at < newest_first.len() {
+            hub.limits.derive_turn().await;
+            // Packs whole in an index read's first read, `AT_ONCE` at a time
+            // (BUG-2462: their shares of the bound together stay under 3 MB);
+            // a larger pack alone, as before.
+            let n = newest_first[at..]
+                .iter()
+                .take(AT_ONCE)
+                .take_while(|p| p.size <= pack::FIRST_READ)
+                .count()
+                .max(1);
+            let chunk = &newest_first[at..at + n];
+            at += n;
+            let mut reads = tokio::task::JoinSet::new();
+            for (i, p) in chunk.iter().enumerate() {
+                let (hub, k) = (hub.clone(), pack::key(project, &p.name));
+                hub.objects.reads.fetch_add(1, Ordering::Relaxed);
+                reads.spawn(async move { (i, pack::read_index(&**hub.objects.blob_store(), &k, hub.objects.index_bound()).await) });
+            }
+            let mut helds: Vec<Option<Held>> = (0..n).map(|_| None).collect();
+            while let Some(r) = reads.join_next().await {
+                let (i, r) = r.map_err(|e| Error::Other(e.into()))?;
+                let Some(held) = r.map_err(Error::Other)? else {
+                    // Pack was already replaced by another run.
+                    return Ok(false);
+                };
+                helds[i] = Some(held);
+            }
+            // In order, newest first, so the newest copy of an object is kept.
+            for (p, held) in chunk.iter().zip(helds) {
+                let held = held.expect("every read answered");
+                let mut keep_slots: Vec<(ObjectId, Slot)> = Vec::new();
+                for (id, slot) in held.index.iter() {
+                    if expired_unreferenced.contains(id) {
+                        dead_count += 1;
+                        dead_ids.insert(*id);
+                        continue;
+                    }
+                    if seen.insert(*id) {
+                        keep_slots.push((*id, *slot));
+                    }
                 }
-                cur_bytes += entry_cost;
-                cur_objects.push((id, enc));
-                total_kept += 1;
+                // Sort by offset so we read contiguous/nearby spans in few range requests.
+                keep_slots.sort_unstable_by_key(|(_, s)| s.offset);
+                drop(held);
+                plan.push(((*p).clone(), keep_slots));
             }
-            drop(_ra);
-            i = end_idx + 1;
+        }
+        plan.reverse();
+
+        // If only 1 pack is in the batch and no objects were removed from it,
+        // there is nothing to rewrite.
+        if batch.len() == 1 && dead_count == 0 {
+            return Ok(false);
+        }
+
+        // 2. Stream/read the kept entries from the source packs in bounded range
+        // spans under `ReadAhead`, building replacement packs capped at
+        // `opts.max_merged_bytes` and `opts.max_merged_objects`.
+        // Each pack's kept slots in spans of at most `COPY_SPAN` bytes:
+        // `(pack in plan, its slots first..=last)`.
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        for (pi, (_, slots)) in plan.iter().enumerate() {
+            let mut i = 0;
+            while i < slots.len() {
+                let start_off = slots[i].1.offset;
+                let mut end_idx = i;
+                while end_idx + 1 < slots.len() {
+                    let next_last = slots[end_idx + 1].1.last();
+                    if next_last - start_off + 1 > COPY_SPAN {
+                        break;
+                    }
+                    end_idx += 1;
+                }
+                spans.push((pi, i, end_idx));
+                i = end_idx + 1;
+            }
+        }
+        let span_len = |&(pi, i, e): &(usize, usize, usize)| plan[pi].1[e].1.last() - plan[pi].1[i].1.offset + 1;
+        let mut s = 0;
+        while s < spans.len() {
+            hub.limits.derive_turn().await;
+            // Up to `AT_ONCE` spans read at once, together at most `COPY_SPAN`
+            // bytes (BUG-2462), under one `ReadAhead`.
+            let mut e = s + 1;
+            let mut chunk_len = span_len(&spans[s]);
+            while e < spans.len() && e - s < AT_ONCE && chunk_len + span_len(&spans[e]) <= COPY_SPAN {
+                chunk_len += span_len(&spans[e]);
+                e += 1;
+            }
+            let _ra = ReadAhead::wait(chunk_len).await;
+            let mut reads = tokio::task::JoinSet::new();
+            for (j, &(pi, i, end_idx)) in spans[s..e].iter().enumerate() {
+                let (p, slots) = &plan[pi];
+                let (start_off, end_off) = (slots[i].1.offset, slots[end_idx].1.last());
+                let (hub, k, name) = (hub.clone(), pack::key(project, &p.name), p.name.clone());
+                hub.objects.reads.fetch_add(1, Ordering::Relaxed);
+                reads.spawn(async move {
+                    let got = hub.objects.blob_store().get_range(&k, start_off, end_off).await.map_err(Error::Other)?;
+                    let (bytes, _) = got.ok_or_else(|| Error::Other(anyhow!("source pack {name} missing during merge")))?;
+                    if (bytes.len() as u64) < end_off - start_off + 1 {
+                        return Err(Error::Other(anyhow!("source pack {name} shorter than its index")));
+                    }
+                    Ok((j, bytes))
+                });
+            }
+            let mut got: Vec<Bytes> = vec![Bytes::new(); e - s];
+            while let Some(r) = reads.join_next().await {
+                let (j, bytes) = r.map_err(|e| Error::Other(e.into()))??;
+                got[j] = bytes;
+            }
+            for (&(pi, i, end_idx), bytes) in spans[s..e].iter().zip(got) {
+                let slots = &plan[pi].1;
+                let start_off = slots[i].1.offset;
+                for &(id, slot) in &slots[i..=end_idx] {
+                    let from = (slot.offset - start_off) as usize;
+                    let to = (slot.last() - start_off) as usize;
+                    let enc = pack::entry(&id, slot, &bytes[from..=to]).map_err(Error::Other)?;
+                    out.push(hub, project, id, Bytes::copy_from_slice(enc)).await?;
+                }
+            }
+            s = e;
         }
     }
-
-    if !cur_objects.is_empty() {
-        let count = cur_objects.len();
-        let batch_objs = std::mem::take(&mut cur_objects);
-        let (name, held) = crate::store::not_own(hub.objects.put_job_pack(project, batch_objs))
-            .await
-            .map_err(Error::Other)?;
-        let sz = held.size;
-        written_packs.push((name, held, sz, count));
-    }
+    out.write(hub, project).await?;
+    let Merged { written: written_packs, kept: total_kept, .. } = out;
 
     // Simulated crash after writing the staged replacement pack(s), before
     // switching the database rows.
@@ -1313,11 +1484,15 @@ async fn sweep_staged(
     report: &mut Report,
 ) -> Result<()> {
     let cutoff = now_ms.saturating_sub(staged_grace_ms.max(0));
+    // `state = 0` (STAGED) is written literally so the partial index
+    // `packs_unlisted` (migration 40) serves it under a generic plan too:
+    // by the primary key alone every pass read every row of the project,
+    // listed and discarded (BUG-2462).
+    const _: () = assert!(STAGED == 0);
     let stale: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM packs WHERE project_id = $1 AND state = $2 AND (person_id IS NULL OR created_at <= $3)",
+        "SELECT name FROM packs WHERE project_id = $1 AND state = 0 AND (person_id IS NULL OR created_at <= $2)",
     )
     .bind(project)
-    .bind(STAGED)
     .bind(cutoff)
     .fetch_all(&hub.db)
     .await?;
@@ -1345,7 +1520,10 @@ async fn sweep_discarded(
 ) -> Result<()> {
     let cutoff = now_ms.saturating_sub(pack_grace_ms.max(0));
     let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM packs WHERE project_id = $1 AND state = $2 AND COALESCE(discarded_at, $4) <= $3 ORDER BY name LIMIT $5",
+        // Any due rows, not the first by name: sorting every due row to
+        // take a few walked all of them each pass (BUG-2462: about 300,000
+        // at 5,000 packs merged a second and the 60 s grace period).
+        "SELECT name FROM packs WHERE project_id = $1 AND state = $2 AND COALESCE(discarded_at, $4) <= $3 LIMIT $5",
     )
     .bind(project)
     .bind(DISCARDED)
@@ -1359,17 +1537,24 @@ async fn sweep_discarded(
         return Ok(());
     }
 
-    let store = hub.objects.blob_store();
     let mut deleted_names: Vec<String> = Vec::with_capacity(rows.len());
     let mut arcs: Vec<Arc<str>> = Vec::with_capacity(rows.len());
-    for name in rows {
+    for chunk in rows.chunks(AT_ONCE) {
         hub.limits.derive_turn().await;
-        store
-            .delete(&pack::key(project, &name))
-            .await
-            .map_err(Error::Other)?;
-        arcs.push(Arc::<str>::from(name.as_str()));
-        deleted_names.push(name);
+        // `AT_ONCE` at a time (BUG-2462); a failed delete fails the pass
+        // before any row goes, as one at a time did.
+        let mut deletes = tokio::task::JoinSet::new();
+        for name in chunk {
+            let (hub, k) = (hub.clone(), pack::key(project, name));
+            deletes.spawn(async move { hub.objects.blob_store().delete(&k).await });
+        }
+        while let Some(r) = deletes.join_next().await {
+            r.map_err(|e| Error::Other(e.into()))?.map_err(Error::Other)?;
+        }
+        for name in chunk {
+            arcs.push(Arc::<str>::from(name.as_str()));
+            deleted_names.push(name.clone());
+        }
     }
     hub.objects.forget_packs(project, &arcs);
 

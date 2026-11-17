@@ -2614,11 +2614,11 @@ channels) and timing each step of a request (temporary probes, not kept):
    every project shares (BUG-2461, fixed).** `pack::Packs::evict` asked each
    project's lookup map its weight, which walked its packs: 16 ms of a push's
    26 ms, waiting on that lock, with 147,000 packs listed (item 4).
-4. **Packs pile up faster than they merge (BUG-2462, open).** A push lists
-   about two packs; merges take at most 64 a run, checked every 500 ms, so
-   at 1,500 pushes a second one project's lookup map grew to 147,000 packs
-   in a minute and a half, and a lookup walks them newest first. The next
-   ceiling.
+4. **Packs pile up faster than they merge (BUG-2462, fixed: below).** A
+   push lists about two packs; merges take at most 64 a run, checked every
+   500 ms, so at 1,500 pushes a second one project's lookup map grew to
+   147,000 packs in a minute and a half, and a lookup walks them newest
+   first. The next ceiling.
 5. **The disk's flushes, here.** With MinIO and PostgreSQL on one drive,
    2,842 flushes a second (2.4 a push, 0.30 ms each) kept it flushing 85% of
    the time: about 1,390 pushes a second is this machine's limit for durable
@@ -2643,3 +2643,99 @@ in the server (its checks 4, its own pack stored 2.4, its transaction 4,
 listing its packs 7), an upload 12, a read of the tips 4.5; a read waits in
 the project's bulkhead (§13.25: three quarters of the server's database
 connections) behind the writes, which go first.
+
+**Item 4, BUG-2462: merges that keep up.** The same test, MinIO on a RAM
+disk of its own and PostgreSQL on the drive (the shared container, a
+database of the run's), each server with timing probes in its merge
+passes (not kept). The listed packs were counted every 5 s.
+
+| Server | Pushes/s | p50 / p99 ms | Most packs listed | Listed after the run | Passes failed | Deriver done after |
+|---|---:|---|---:|---:|---:|---:|
+| before (`f2ea7734`) | 1,496 | 639 / 1,427 | 186,640 | 186,640 | 0 | 0.3 s |
+| before, again (no parallel plans) | 1,482 | 775 / 1,280 | 187,184 | 187,184 | 0 | 0.3 s |
+| requests 16 at a time, 1,024 packs a pass | 1,731 | 518 / 1,052 | 92,899 | 92,899 | 4 | 0.3 s |
+| and the class with the most packs | 1,899 | 475 / 870 | 51,143 | 119 | 6 | 131 s |
+| and one request a small pack, listed rows indexed | 2,296 | 407 / 722 | 76,594 | 76,594 | 22 | 0.3 s |
+| and 32 at a time | 2,585 | 373 / 568 | 35,480 | 35,480 | 0 | 0.3 s |
+| and 4,096 packs a pass | 2,615 | 405 / 556 | 3,229 | 78 | 0 | 233 s |
+| **final** (and the sweep unsorted; no parallel plans) | **2,584** | **356 / 586** | **4,048** | **88** | **0** | 197 s |
+| final with 1,024 packs a pass (no parallel plans) | 2,419 | 413 / 761 | 13,250 | 53 | 0 | 167 s |
+
+No push failed in any run. "Passes failed" are background merge passes
+that ended in an error: four unknown (the first probe did not print
+them), four that waited 10 s for the index bound (`IndexesFull`, all in
+the two-request path; none since) and the rest PostgreSQL's "could not
+resize shared memory segment" (below). "Deriver done after" is
+the load tool's lag of the deriver once the agents stopped (BUG-2480,
+fixed: below).
+
+What the probes showed, before: passes did run back to back, but a pass
+of 64 packs took 110 ms, nearly all of it its storage requests one after
+another (an index read, then a range read, for each pack); each pass also
+listed every listed pack by the primary key, which walked the rows of the
+packs merges had replaced too (130 ms at 180,000), and swept up to 512
+replaced packs one delete at a time (up to 1 s). About 180 packs a second
+were merged against 3,000 to 5,600 listed. With the requests made 16 at a
+time a second cause showed: a pass took the smallest size class with 16
+packs, which the pushes refilled within every pass, so the class above
+it, where the other pack of each push falls, was never merged (passes of
+about 400 packs, while 90,000 waited in the next class). Each step then
+moved the limit: pushes got faster, so packs were listed faster (2 a
+push), and a pass's fixed costs (its listing, its switch and its sweep,
+about 100 ms together) were spread over more packs by larger passes.
+With 4,096 packs a pass the listed packs stayed at most 3,229 through the
+run, at 5,200 listed a second.
+
+The runs with the shared PostgreSQL container's 64 MB `/dev/shm` (not the
+1 GB `scripts/bench-server.sh` gives its own) failed some passes with
+"could not resize shared memory segment" once 300,000 replaced rows waited
+out their 60 s grace period: statements over them were planned in
+parallel. The runs marked "no parallel plans" set
+`max_parallel_workers_per_gather = 0` on the run's database; a pass's
+sweep no longer sorts every due row to take a few.
+
+**The deriver's lag (BUG-2480, fixed 2026-11-16).** Where merges kept up
+for most of the run the deriver finished 167 to 233 s after the agents
+stopped (0.3 s before, and in the runs where merges fell behind early);
+it always caught up. Supposed at first: on S3 the deriver reads each object
+it has not cached with one request at a time, and merges that keep up add
+about two MinIO requests a pack. Timing probes in the deriver, the store
+and the merges (not kept) showed otherwise: no wait for a derive worker
+permit (under 1 ms a run), for S24's shedding or for the deriver's pool,
+and a storage read took 1.1 to 1.5 ms during the burst against 0.9 to 1.0
+after it. The deriver's time went to its own round trips, one after
+another. Each run asked the database whether each moved branch's new
+snapshots were derived in a statement of its own: about 1,000 a run at
+1,000 branches, 0.8 ms each at first and 2 to 12 ms once the burst loaded
+the database, so a run took 2 to 13 s and the deriver fell a few seconds
+behind. The object cache (256 MiB) holds only a few seconds of this
+burst's objects, so from then on nearly every snapshot it read was a
+storage read, made down each branch's line one at a time: one run's walk
+took 51.7 s, and after the burst its read-ahead (8 threads, about 9 reads a
+snapshot) derived about 900 snapshots a second. BUG-2462's faster merges
+only brought the push rate past what those asks kept up with. Now a run
+walks every moved branch's line together, a snapshot of each at a time,
+read 8 at once, and asks about 512 snapshots a statement: about 22
+statements a run of 1,000 branches, the walk 20 ms, and the deriver stays
+within the object cache. Same test, two runs of each, MinIO on a RAM disk
+of its own, a database of the run's (no parallel plans):
+
+| Server | Pushes/s | p50 / p99 ms | Most packs listed | Object cache hits | Deriver done after |
+|---|---:|---|---:|---:|---:|
+| before (`b5682a59`) | 2,661 | 368 / 523 | 3,520 | 0.96 | 222.4 s |
+| before, again | 2,704 | 356 / 531 | 3,785 | 0.97 | 223.0 s |
+| after | 2,766 | 358 / 448 | 4,886 | 0.99 | 0.04 s |
+| after, again | 2,725 | 363 / 460 | 4,668 | 0.99 | 0.04 s |
+
+The packs listed climb through the burst in every run, before and after
+(merges run back to back, one pass at a time, and a pass grew from about
+30 to 450 ms as more packs waited), and fall to tens once it stops; with
+the deriver doing its work during the burst, on the machine the merges
+share, about 1,000 more were listed at its end. The deriver is now busy
+most of the time at this rate (runs of about 0.5 s, most of it its own
+batched statements of about 28 ms); one that falls past the object cache
+still reads trees 8 at a time, about 900 snapshots a second on MinIO.
+Two runs were void and are not in the table: another
+worktree's test suite on the shared PostgreSQL during them (856 and 503
+pushes a second, 26 and 34 statements a push instead of 15).
+
