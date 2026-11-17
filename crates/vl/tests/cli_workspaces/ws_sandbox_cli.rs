@@ -542,6 +542,32 @@ fn ephemeral_ws_exec_with_an_unreadable_directory_outside_the_set_still_keeps_th
     assert_eq!(std::fs::read_to_string(dirs[0].join("src/cfg.js")).unwrap(), "const key = 'AKIAIOSFODNN7EXAMPLE';\n");
 }
 
+/// A step after the recording that fails fails the run, but the file the
+/// recording left out is kept and named all the same, not deleted with the
+/// throwaway directory (BUG-2171: it is moved out before any later step).
+/// The step: an unconfined command, given the isolated files, shuts the
+/// project's own vault of them, which `vl` reads again after the recording
+/// to tell them from what the command wrote outside `--only`. (A confined
+/// command cannot make a later step fail any more: BUG-2200.)
+#[test]
+fn ephemeral_ws_exec_that_fails_after_recording_still_keeps_the_file() {
+    let env = Env::new();
+    let proj = project(&env);
+    let vault = proj.join(".veil/local/vault.sealed");
+    assert!(vault.is_file(), "the project has an isolated file");
+    let leak = format!("echo \"const key = 'AKIAIOSFODNN7EXAMPLE';\" > src/cfg.js && chmod 000 '{}'", vault.display());
+    let out = env.vl("alice", &proj, &["ws", "exec", "--ephemeral", "--unconfined", "--with-isolated", "--only", "src", "--", "sh", "-c", &leak]);
+    std::fs::set_permissions(&vault, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert!(t.contains("vault.sealed: Permission denied"), "{t}");
+    assert!(t.contains("  src/cfg.js (aws-access-key-id at line 1; never recorded)"), "{t}");
+    let dirs: Vec<PathBuf> = std::fs::read_dir(proj.join(".veil/local/ephemeral-kept")).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    assert!(t.contains(&dirs[0].display().to_string()), "{t}");
+    assert_eq!(std::fs::read_to_string(dirs[0].join("src/cfg.js")).unwrap(), "const key = 'AKIAIOSFODNN7EXAMPLE';\n");
+}
+
 /// BUG-2200: a directory the command made unreadable outside the `--only`
 /// set is named in a warning, as a recording names one inside it; the run,
 /// already recorded, does not fail on it, and the throwaway directory goes.
@@ -567,9 +593,10 @@ fn bug_2200_an_unreadable_directory_outside_the_set_does_not_fail_a_recorded_eph
 
 /// BUG-2200, a persistent sandbox (the same step after its recording): the
 /// run is recorded, and the sandbox takes the next `--only` run too. What
-/// is in a directory that could not be listed before a command is not
-/// known to be that command's output: once listable it is kept, never
-/// removed as "written outside --only".
+/// the command left in the directory it made unlistable is its output
+/// outside its paths: it could not be removed then, and is, as written
+/// outside `--only`, by the first `--only` run that can list it, so no
+/// later run takes it for the workspace's.
 #[test]
 fn bug_2200_an_unreadable_directory_outside_the_set_does_not_fail_a_persistent_sandbox() {
     let env = Env::new();
@@ -589,15 +616,146 @@ fn bug_2200_an_unreadable_directory_outside_the_set_does_not_fail_a_persistent_s
     assert!(t.contains("Recorded ") && t.contains(cannot), "{t}");
     assert!(t.contains("not recorded: 1 file(s) written outside --only src (removed from the sandbox): notes.txt"), "{t}");
     assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "src/two.txt"]), "two\n");
-    // A run that opens the directory: its file was there before this
-    // command, so it stays.
+    // A run that opens the directory: what the first command left there
+    // goes with what this one wrote outside the paths.
     let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "sh", "-c", "chmod 755 shut && echo new > new.txt"]);
     let t = text(&out);
     assert_eq!(out.status.code(), Some(0), "{t}");
-    assert!(!t.contains("cannot list"), "{t}");
-    assert!(t.contains("not recorded: 1 file(s) written outside --only src (removed from the sandbox): new.txt"), "{t}");
-    assert!(t.contains("that the command did not write (kept; a run whose paths hold them records them): shut/f"), "{t}");
-    assert_eq!(read(&dir, "shut/f"), "work\n");
-    assert!(!dir.join("new.txt").exists());
+    assert!(!t.contains("cannot list") && !t.contains("did not write"), "{t}");
+    assert!(t.contains("not recorded: 2 file(s) written outside --only src (removed from the sandbox): new.txt, shut/f"), "{t}");
+    assert!(!dir.join("shut").exists() && !dir.join("new.txt").exists());
+    // A run of the whole tree finds nothing of it to record.
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "true"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!paths(&env, &proj, "agent@").iter().any(|p| p.starts_with("shut") || p == "new.txt" || p == "notes.txt"));
+}
+
+/// BUG-2200: the same when the directory is opened between two runs (by
+/// hand, here): the listing before the next command does not take what a
+/// command left there for files the sandbox held before.
+#[test]
+fn bug_2200_what_a_command_left_in_a_directory_it_shut_is_removed_once_listable() {
+    let env = Env::new();
+    let proj = project(&env);
+    let dir = files_dir(&proj, "agent");
+    let cmd = "echo one > src/one.txt && mkdir -p shut/deep && echo work > shut/deep/f && chmod 000 shut";
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "sh", "-c", cmd]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    std::fs::set_permissions(dir.join("shut"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "true"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(t.contains("not recorded: 1 file(s) written outside --only src (removed from the sandbox): shut/deep/f"), "{t}");
+    assert!(!t.contains("did not write"), "{t}");
+    assert!(!dir.join("shut").exists());
+}
+
+/// BUG-2200: what an `--only` run's command left in a directory it shut
+/// cannot be removed after that run. A run of the whole tree would record
+/// it as the workspace's if its command opened the directory: it does not
+/// start while the directory is there, and says how to go on. After an
+/// `--only` run that can list the directory (which removes what was
+/// written there) it runs, and records none of it.
+#[test]
+fn bug_2200_a_whole_tree_run_never_records_what_an_only_run_left_in_a_shut_directory() {
+    let env = Env::new();
+    let proj = project(&env);
+    let dir = files_dir(&proj, "agent");
+    let cmd = "echo one > src/one.txt && mkdir shut && echo stray > shut/f && chmod 000 shut";
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "sh", "-c", cmd]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let whole = ["ws", "exec", "agent", "--", "sh", "-c", "chmod 755 shut; echo ran > ran.txt"];
+    let out = env.vl("alice", &proj, &whole);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert!(t.contains("holds shut, which a command of an earlier `--only src` run made unlistable"), "{t}");
+    assert!(t.contains(&format!("`chmod u+rwx {}`", dir.join("shut").display())) && t.contains("`vl ws exec agent --only src -- true`"), "{t}");
+    assert!(!t.contains("running sh") && !dir.join("ran.txt").exists(), "the command ran: {t}");
+    assert!(!paths(&env, &proj, "agent@").iter().any(|p| p.starts_with("shut")));
+    // As the message says.
+    std::fs::set_permissions(dir.join("shut"), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "true"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(t.contains("not recorded: 1 file(s) written outside --only src (removed from the sandbox): shut/f"), "{t}");
+    let out = env.vl("alice", &proj, &whole);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    let recorded = paths(&env, &proj, "agent@");
+    assert!(recorded.contains(&"src/one.txt".to_string()) && recorded.contains(&"ran.txt".to_string()), "{recorded:?}");
+    assert!(!recorded.iter().any(|p| p.starts_with("shut")), "recorded: {recorded:?}");
+}
+
+/// BUG-2200: deleting the directory is the other way on: a run of the
+/// whole tree then starts.
+#[test]
+fn bug_2200_a_whole_tree_run_starts_once_the_shut_directory_is_deleted() {
+    let env = Env::new();
+    let proj = project(&env);
+    let dir = files_dir(&proj, "agent");
+    let cmd = "mkdir shut && echo stray > shut/f && chmod 000 shut";
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "sh", "-c", cmd]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    std::fs::set_permissions(dir.join("shut"), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    std::fs::remove_dir_all(dir.join("shut")).unwrap();
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", "echo ran > ran.txt"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(paths(&env, &proj, "agent@").contains(&"ran.txt".to_string()));
+}
+
+/// BUG-2200: a rebuild of the sandbox (here: after a run that died) keeps
+/// the files outside the paths as work to bring over, but not what a
+/// command left in a directory it shut: that was to be removed, and no
+/// later run finds it.
+#[test]
+fn bug_2200_a_rebuild_does_not_bring_over_what_a_command_left_in_a_shut_directory() {
+    let env = Env::new();
+    let proj = project(&env);
+    let dir = files_dir(&proj, "agent");
+    let cmd = "mkdir shut && echo stray > shut/f && chmod 000 shut";
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "sh", "-c", cmd]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    std::fs::set_permissions(dir.join("shut"), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    // A file put beside it by hand is work; then, as if a run died.
+    std::fs::write(dir.join("mine.txt"), "by hand\n").unwrap();
+    let mpath = proj.join(".veil/local/sandboxes/agent/manifest.json");
+    let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(&mpath).unwrap()).unwrap();
+    assert_eq!(m["shut_by_command"], serde_json::json!(["shut"]));
+    m["running"] = "deadbeef".into();
+    std::fs::write(&mpath, serde_json::to_vec(&m).unwrap()).unwrap();
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "true"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(t.contains("Rebuilding the sandbox of workspace agent: the previous run did not finish"), "{t}");
+    assert_eq!(read(&dir, "mine.txt"), "by hand\n");
+    assert!(!dir.join("shut").exists(), "{t}");
     assert!(!paths(&env, &proj, "agent@").iter().any(|p| p.starts_with("shut")));
 }
+
+/// BUG-2200: a directory nobody's command shut (unlistable before any
+/// command ran: made so by hand) keeps what it holds. Once listable, its
+/// files are files the command did not write: kept, never removed.
+#[test]
+fn bug_2200_a_directory_unlistable_before_any_command_keeps_what_it_holds() {
+    let env = Env::new();
+    let proj = project(&env);
+    let dir = files_dir(&proj, "agent");
+    // The sandbox exists, with `src` only.
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "true"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    // By hand: work in a directory, shut.
+    std::fs::create_dir(dir.join("mine")).unwrap();
+    std::fs::write(dir.join("mine/notes.txt"), "by hand\n").unwrap();
+    std::fs::set_permissions(dir.join("mine"), std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    // A run that leaves it shut, then one that opens it.
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "sh", "-c", "echo two > src/two.txt"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(t.contains("Recorded ") && t.contains("cannot list mine (Permission denied (os error 13))"), "{t}");
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "src", "--", "sh", "-c", "chmod 755 mine"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(t.contains("that the command did not write (kept; a run whose paths hold them records them): mine/notes.txt"), "{t}");
+    assert_eq!(read(&dir, "mine/notes.txt"), "by hand\n");
+}
+

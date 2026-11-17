@@ -232,6 +232,14 @@ pub struct Manifest {
     /// snapshot. `vl ws rm` refuses to delete them without `--force`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quarantined: Vec<String>,
+    /// Directories outside the sparse set that a command of this sandbox
+    /// left unlistable ([`Strays::unlisted`] after a run, not before it):
+    /// what they hold is that command's output outside its paths, which
+    /// could not be removed then. The next sparse run that can list one
+    /// removes it, and a run whose paths hold one (the whole tree) does
+    /// not start while it is there (BUG-2200).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shut_by_command: Vec<String>,
     /// Set (durably) just before the command starts, cleared once its
     /// output is recorded and the sandbox cleaned up: the files hold a
     /// command's output that is in no snapshot yet. Never wiped; the next
@@ -271,8 +279,10 @@ pub struct Pending {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kept: Vec<String>,
     /// Directories that could not be listed before the command ran
-    /// ([`Strays::unlisted`]): what they hold is not known to be its
-    /// output, so nothing below them is removed as such.
+    /// ([`Strays::unlisted`]) and that no earlier command of the sandbox
+    /// left so ([`Manifest::shut_by_command`]): what they hold is not
+    /// known to be a command's output, so nothing below them is removed
+    /// as such.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unlisted: Vec<String>,
     /// Isolated files were injected for the command.
@@ -297,6 +307,7 @@ impl Manifest {
             only: None,
             quarantined: Vec::new(),
             pending: None,
+            shut_by_command: Vec::new(),
             guard_checked: None,
             workspace_id: None,
         }
@@ -1697,7 +1708,10 @@ fn unrecorded_work(repo: &Repo, paths: &SandboxPaths, m: &Manifest, target: Opti
         if let Some((_, e)) = found.unlisted.into_iter().next() {
             return Err(e);
         }
-        keep.extend(found.files);
+        // What a command left in a directory it made unlistable outside its
+        // paths is no work to keep: it was to be removed (BUG-2200).
+        let shut: Vec<VPath> = m.shut_by_command.iter().filter_map(|d| VPath::new(d).ok()).collect();
+        keep.extend(found.files.into_iter().filter(|f| !shut.iter().any(|d| f.starts_with(d))));
     }
     // What is the tree's own content is no work of anyone's.
     let store = repo.store();

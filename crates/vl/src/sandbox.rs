@@ -492,6 +492,25 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
         return Err(e.into());
     }
     let set = sparse_set(ctx, a.only, &synced, &format!("workspace '{}'", safe(name)))?;
+    // What an earlier command left in a directory it made unlistable
+    // outside its `--only` paths is not the workspace's, and could not be
+    // removed (BUG-2200). A run whose paths hold the directory (the whole
+    // tree, above all) would record it: it does not start. An `--only` run
+    // beside it does, and removes what it can list there.
+    m.shut_by_command.retain(|d| VPath::new(d).is_ok_and(|p| !matches!(fs.metadata(&p), Ok(None))));
+    let held = m.shut_by_command.iter().filter_map(|d| VPath::new(d).ok()).find(|d| set.as_ref().is_none_or(|s| s.contains(d)));
+    if let Some(d) = held {
+        let was = show_set(m.only_set().ok().flatten().as_ref());
+        bail!(
+            "the sandbox of workspace '{n}' holds {d}, which a command of an earlier `--only {was}` run made unlistable: what is \
+             in it was written outside those paths and is not the workspace's, so this run, whose paths hold it, would record \
+             it. Make it listable (`chmod u+rwx {at}`) and run `vl ws exec {n} --only {was} -- true`, which removes what was \
+             written there; or delete it. Then run again",
+            n = safe(name),
+            d = safe(d.as_str()),
+            at = paths.files.join(d.as_str()).display(),
+        );
+    }
     let run_id = hex::encode(veil_core::crypto::random_bytes::<8>());
     m.running = Some(run_id.clone());
     m.boot = veil_core::lock::boot_identity();
@@ -563,7 +582,15 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
         let kept = match &set {
             Some(s) => {
                 let pin = core::PolicyPin::new(&fs, ctx.repo.store(), &synced)?;
-                core::strays(&fs, s, &[&Policy::load_or_accepted(&pin, None)?.0])?
+                let mut kept = core::strays(&fs, s, &[&Policy::load_or_accepted(&pin, None)?.0])?;
+                // Except below a directory an earlier command left
+                // unlistable: what is there is that command's output outside
+                // its paths, which could not be removed then, and is, like
+                // this command's, once it can be listed (BUG-2200).
+                let shut: Vec<VPath> = m.shut_by_command.iter().filter_map(|d| VPath::new(d).ok()).collect();
+                kept.files.retain(|f| !shut.iter().any(|d| f.starts_with(d)));
+                kept.unlisted.retain(|(u, _)| !shut.iter().any(|d| u.starts_with(d)));
+                kept
             }
             None => core::Strays::default(),
         };
@@ -1022,7 +1049,9 @@ fn finish_recording(
         let after = Policy::load_or_accepted(&pin, None)?.0;
         let paths = |l: &[String]| -> Vec<VPath> { l.iter().filter_map(|k| VPath::new(k).ok()).collect() };
         // What a directory that could not be listed before the command
-        // held is not known to be its output: it stays, as `kept` does.
+        // held is not known to be its output: it stays, as `kept` does
+        // (neither names anything below a directory an earlier command
+        // left unlistable).
         let (kept_before, unlisted_before): (Vec<VPath>, Vec<VPath>) = match kept {
             Some(k) => (k.files.clone(), k.unlisted.iter().map(|(d, _)| d.clone()).collect()),
             None => (paths(&p.kept), paths(&p.unlisted)),
@@ -1050,6 +1079,14 @@ fn finish_recording(
             .collect();
         warn_strays(set, &by_command, true);
         warn_unlisted(set, &found.unlisted, "stays in the sandbox");
+        // The directories a command left unlistable, this one or an
+        // earlier one: the next sparse run removes what it can list there.
+        m.shut_by_command = found
+            .unlisted
+            .iter()
+            .filter(|(u, _)| !unlisted_before.iter().any(|d| u.starts_with(d)))
+            .map(|(u, _)| u.as_str().to_string())
+            .collect();
         for (q, why) in &failed {
             warn(&format!(
                 "could not remove {} from the sandbox ({why}); it is outside --only and is not recorded",

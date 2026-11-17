@@ -1824,12 +1824,24 @@ A workspace is only a named pointer in the view. It owns no directory.
   the command's output: they stay, unrecorded, reported on every run,
   until a run whose set holds them records them. A directory below the
   root that cannot be listed (`chmod 000`) is no error in either listing,
-  as for the builder: the run, already recorded, names it in a warning
-  (what it holds is not recorded and stays), and the listing before the
-  command keeps its name in `pending` (`unlisted`), so files found below
-  it later are not known to be the command's and stay too (BUG-2200). A
-  rebuild still refuses such a sandbox (`unrecorded_work`): work it cannot
-  list cannot be re-imported. Quarantined files of earlier
+  as for the builder (BUG-2200): the run, already recorded, names it in a
+  warning (what it holds is not recorded and stays). Whose its content is
+  is remembered, not guessed. A directory the listing *after* a command
+  cannot list, and the one before it could (or did not have), was shut by
+  that command: the manifest keeps it (`shut_by_command`), and what is
+  below it is that command's output outside its paths, which could not be
+  removed. The listing before a later command names nothing below it as
+  "there before", so the first sparse run that can list it removes what
+  it holds as written outside the set; a run whose set holds the
+  directory (the whole tree, above all), which would record it as the
+  workspace's, does not start while the directory exists, and says how to
+  go on; a rebuild does not bring it over. A directory no command shut
+  (unlistable at the listing before a command, and not in
+  `shut_by_command`: made so by hand) is kept in `pending` (`unlisted`),
+  and files found below it later stay, as files the command did not
+  write. A rebuild still refuses a sandbox with a directory it cannot
+  list (`unrecorded_work`): work it cannot list cannot be re-imported.
+  Quarantined files of earlier
   runs that a narrower set leaves outside stay, and stay in the manifest
   for `vl ws rm`'s guard. `--with-isolated` injects every isolated file,
   inside the set or not: they are what the command runs with (`.env` at
