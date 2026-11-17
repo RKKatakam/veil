@@ -2198,7 +2198,13 @@ const EPOCH_AFTER_DELETES_TRIES: u32 = 20;
 /// the object gone. What is left: a server that stops, or the gate's
 /// session ending (checked before every batch), between a delete and step
 /// 3: the writers that checked that object while the deletes ran keep the
-/// epoch they read. (The first raise covers those that checked before.)
+/// epoch they read. (The first raise covers those that checked before;
+/// when the session ended and the server lives, it raises the epoch from
+/// another connection at once, which covers those not yet at their guard.)
+///
+/// A store that does not answer a delete holds the gate until it does
+/// (BUG-2624, accepted): giving the request up would let the store apply
+/// it later, after a writer had stored the object again.
 async fn delete_loose_chunk(
     hub: &Arc<Hub>,
     project: i64,
@@ -2208,19 +2214,48 @@ async fn delete_loose_chunk(
     opts: &Options,
 ) -> Result<(usize, bool)> {
     let mut conn = hub.db.acquire().await?;
+    // The session ends with this connection, whatever ends the chunk (an
+    // error, a panic, this future dropped): one that holds the gate, or an
+    // open transaction, never goes back to the pool.
+    conn.close_on_drop();
     // Nothing is held if this fails (the wait for the writers in their
     // transactions is bounded by the connection's lock timeout).
     sqlx::query("SELECT pg_advisory_lock($1)").bind(gate_key(project)).execute(&mut *conn).await?;
-    let done = loose_chunk_under_gate(hub, project, &mut conn, gc, chunk, packed_too, opts).await;
-    // The gate goes back: by its unlock, or, after any failure (a
-    // transaction may be open, the session's state unknown), with the
-    // session.
-    let unlocked = match &done {
-        Ok(_) => sqlx::query("SELECT pg_advisory_unlock($1)").bind(gate_key(project)).execute(&mut *conn).await.is_ok(),
-        Err(_) => false,
-    };
-    if !unlocked {
-        let _ = conn.close().await;
+    let deleting = std::sync::atomic::AtomicBool::new(false);
+    let done = loose_chunk_under_gate(hub, project, &mut conn, gc, chunk, packed_too, opts, &deleting).await;
+    // The gate goes back: by its unlock, or with the session.
+    if done.is_ok() {
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)").bind(gate_key(project)).execute(&mut *conn).await;
+    }
+    drop(conn);
+    if done.is_err() && deleting.load(Ordering::SeqCst) {
+        // The chunk ended after its deletes began and before its second
+        // raise (the gate's session ended, or the raise failed every
+        // time): the gate is open with the epoch as the first raise left
+        // it. Raise it from here, as best we can: raising it only ever
+        // sends writers back to their checks. It covers the writers that
+        // have not reached their guard yet; one that passed it since the
+        // gate opened is not sent back.
+        let mut raised = None;
+        for _ in 0..3 {
+            let r = gc_transaction(hub, |c| {
+                Box::pin(async move {
+                    lock_gc_epoch_tx(c, project).await?;
+                    bump_gc_epoch_tx(c, project).await
+                })
+            })
+            .await;
+            match r {
+                Ok(epoch) => {
+                    raised = Some(epoch);
+                    break;
+                }
+                Err(e) => eprintln!("veil-server: pack GC of project {project}: the GC epoch was not raised after a chunk of loose deletes lost its gate: {e:?}"),
+            }
+        }
+        if let Some(epoch) = raised {
+            notify_gc_epoch(hub, project, epoch).await;
+        }
     }
     let (deleted, more, epochs, failed) = done?;
     for epoch in epochs {
@@ -2236,7 +2271,8 @@ async fn delete_loose_chunk(
 
 /// [`delete_loose_chunk`] with the gate held on `conn`'s session: the
 /// objects deleted, whether the pass goes on, the epochs raised, and a
-/// delete's failure.
+/// delete's failure. `deleting` is set once the deletes begin.
+#[allow(clippy::too_many_arguments)]
 async fn loose_chunk_under_gate(
     hub: &Arc<Hub>,
     project: i64,
@@ -2245,6 +2281,7 @@ async fn loose_chunk_under_gate(
     chunk: &[ObjectId],
     packed_too: &HashSet<ObjectId>,
     opts: &Options,
+    deleting: &std::sync::atomic::AtomicBool,
 ) -> Result<(usize, bool, Vec<i64>, Option<String>)> {
     let fault = |point: FaultPoint, id: ObjectId| {
         let fault = opts.fault.clone();
@@ -2289,6 +2326,7 @@ async fn loose_chunk_under_gate(
     hub.commits.count(crate::db::Commit::PackGc);
 
     // 2. The deletes.
+    deleting.store(true, Ordering::SeqCst);
     let (mut deleted, mut failed) = (0usize, None::<String>);
     let began = std::time::Instant::now();
     let mut gate_held = true;
@@ -2348,8 +2386,12 @@ async fn loose_chunk_under_gate(
             Err(e) if tries >= EPOCH_AFTER_DELETES_TRIES => {
                 return Err(Error::Other(anyhow!("the GC epoch could not be raised after {deleted} loose objects were deleted: {e:?}")));
             }
-            Err(_) => {
+            Err(e) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                // The session is gone, and the gate with it: no use trying here.
+                if sqlx::query("SELECT 1").execute(&mut *conn).await.is_err() {
+                    return Err(Error::Other(anyhow!("the session holding the root writers' gate ended after {deleted} loose objects were deleted: {e:?}")));
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(tries))).await;
             }
         }

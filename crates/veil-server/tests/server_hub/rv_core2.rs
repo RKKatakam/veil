@@ -1182,18 +1182,15 @@ fn bug_2621_the_epoch_is_raised_after_the_deletes_though_its_commit_fails_once()
 /// deletes. An API commit stores its blob and waits at the gate; the chunk
 /// deletes the blob; then the session that holds the gate is ended (as when
 /// its server stops): the gate opens with no second raise, and the commit
-/// still starts over and stores its blob again. (PostgreSQL only: the test
-/// finds the gate's session in `pg_locks`.)
+/// still starts over and stores its blob again. (On a database of its own:
+/// the session is found, and ended, among that database's alone.)
 #[test]
 fn bug_2621_writers_waiting_before_a_chunk_are_sent_back_though_the_gates_session_ends() {
     use veil_server::pack_gc::{Fault, FaultPoint};
     const CONTENT: &str = "BEFORE-2621-CHUNK-71d4\n";
-    let th = TestHub::start();
+    let th = TestHub::start_own();
     let h = th.hub();
-    if th.rt.block_on(is_yugabyte(&h.db)) {
-        eprintln!("skipped on YugabyteDB: the gate's session is found in pg_locks");
-        return;
-    }
+    let yb = th.rt.block_on(is_yugabyte(&h.db));
     let p = setup_project(&th);
     let api = th.api();
     let pid = project_id(&th, &p.name);
@@ -1261,15 +1258,30 @@ fn bug_2621_writers_waiting_before_a_chunk_are_sent_back_though_the_gates_sessio
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     assert!(!hub2.objects.blob_store().exists(&key).await.unwrap(), "the chunk deleted the commit's blob");
-                    let gate: i64 = 0x7665_696c_6763_6774 ^ pid;
-                    let n: i64 = sqlx::query_scalar(
-                        "SELECT count(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND granted AND mode = 'ExclusiveLock' \
-                         AND classid::bigint = (($1::bigint >> 32) & 4294967295) AND objid::bigint = ($1::bigint & 4294967295)",
-                    )
-                    .bind(gate)
-                    .fetch_one(&db)
-                    .await
-                    .unwrap();
+                    // The gate's session, in this test's database alone: by
+                    // its lock; on YugabyteDB (whose `pg_locks` names no
+                    // backend) the idle session whose last statement was
+                    // the chunk's look at its session before the batch.
+                    let n: i64 = if yb {
+                        sqlx::query_scalar(
+                            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE datname = current_database() \
+                             AND pid <> pg_backend_pid() AND state = 'idle' AND query = 'SELECT 1'",
+                        )
+                        .fetch_one(&db)
+                        .await
+                        .unwrap()
+                    } else {
+                        let gate: i64 = 0x7665_696c_6763_6774 ^ pid;
+                        sqlx::query_scalar(
+                            "SELECT count(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND granted AND mode = 'ExclusiveLock' \
+                             AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                             AND classid::bigint = (($1::bigint >> 32) & 4294967295) AND objid::bigint = ($1::bigint & 4294967295)",
+                        )
+                        .bind(gate)
+                        .fetch_one(&db)
+                        .await
+                        .unwrap()
+                    };
                     assert_eq!(n, 1, "the session holding the project's gate was ended");
                     ended.store(true, Ordering::SeqCst);
                     return Err(veil_server::error::Error::Other(anyhow::anyhow!("injected: the gate's session ended")));
@@ -1306,6 +1318,74 @@ fn bug_2621_writers_waiting_before_a_chunk_are_sent_back_though_the_gates_sessio
     // In the store itself (the server may still hold the blob in memory).
     let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     assert!(th.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "the committed file's blob is stored");
+}
+
+/// BUG-2624 (an accepted residual): a chunk of loose deletes holds the root
+/// writers' gate until every delete it sent has been answered, with no
+/// bound: the object store's client has no request timeout, and giving a
+/// delete up would let the store apply it later, after a writer had stored
+/// the object again (BUG-2621). While a delete does not answer, every root
+/// writer of the project waits at the gate and is refused when its
+/// transaction's time is up. Here one delete takes longer than a
+/// transaction may wait, and an API commit on the project begun meanwhile
+/// is answered `busy`.
+#[test]
+#[ignore = "BUG-2624 (accepted): a store that does not answer a delete holds the project's root writers at the gate"]
+fn bug_2624_root_writers_are_not_held_by_a_delete_the_store_does_not_answer() {
+    use veil_server::pack_gc::{Fault, FaultPoint};
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let admin_tok = p.admin.token();
+    let h = th.hub();
+    let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let slow_raw = bytes::Bytes::from(veil_core::object::Object::Blob(b"UNANSWERED-DELETE-2624\n".to_vec()).encode());
+    let slow = ObjectId::hash(&slow_raw);
+    th.rt.block_on(h.objects.put(pid, &slow, slow_raw)).unwrap();
+    let marked = crate::pack_gc::gc_pass(&th, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    assert!(!marked.skipped, "the marking pass ran");
+
+    // The delete does not answer for longer than a transaction may wait;
+    // an API commit on the project begins as it starts.
+    let answer: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<Reply>>>> = Arc::default();
+    let fault = {
+        let answer = answer.clone();
+        let (authority, cert, tok, name) = (th.authority(), th.cert_pem.clone(), admin_tok.clone(), p.name.clone());
+        Fault(Arc::new(move |at, id| {
+            let answer = answer.clone();
+            let (authority, cert, tok, name) = (authority.clone(), cert.clone(), tok.clone(), name.clone());
+            Box::pin(async move {
+                if at == FaultPoint::LooseDelete && id == slow {
+                    let (tx, rx) = std::sync::mpsc::channel::<Reply>();
+                    std::thread::spawn(move || {
+                        let api = Api::at(&authority, &cert);
+                        let r = api.post_json(
+                            Some(&tok),
+                            &format!("/v1/projects/{name}/changes"),
+                            &json!({"base": main0.hex(), "edits": [{"path": "src/held-2624.txt", "put": {"text": "HELD-2624\n"}}]}),
+                        );
+                        let _ = tx.send(r);
+                    });
+                    *answer.lock().unwrap() = Some(rx);
+                    tokio::time::sleep(veil_server::db::TRANSACTION_DEADLINE + Duration::from_secs(5)).await;
+                }
+                Ok(())
+            })
+        }))
+    };
+    let rep = th
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, fault: Some(fault), ..Options::default() },
+        ))
+        .expect("the pass waits for the delete, and ends");
+    assert!(!rep.skipped, "the pass ran: {rep:?}");
+    let rx = answer.lock().unwrap().take().expect("the API commit began while the delete was out");
+    let r = rx.recv_timeout(Duration::from_secs(120)).expect("the API commit answers");
+    assert_eq!(r.status, 200, "an API commit on the project while a delete of GC's is unanswered: {}", String::from_utf8_lossy(&r.body));
 }
 
 #[test]
