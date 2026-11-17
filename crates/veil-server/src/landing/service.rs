@@ -550,9 +550,24 @@ async fn store(hub: &Arc<Hub>, project: i64, person: i64, objects: Vec<(ObjectId
     let mut packs = Vec::new();
     while !encoded.is_empty() {
         let rest = if encoded.len() > crate::pack::MAX_OBJECTS { encoded.split_off(crate::pack::MAX_OBJECTS) } else { Vec::new() };
-        let (name, mut held) = hub.objects.put_pack(project, person, encoded).await.map_err(Error::Other)?;
-        held.unproject();
-        packs.push((name, held));
+        match hub.objects.put_pack(project, person, encoded).await {
+            Ok((name, mut held)) => {
+                held.unproject();
+                packs.push((name, held));
+            }
+            // A later pack's write failed: the earlier ones, which nothing
+            // will list or name, are discarded now and not left staged for
+            // the sweep (the error drops their names; a store that keeps
+            // failing is tried again every `STORE_RETRY`), as an API
+            // commit's are (`changes::store_packed`).
+            Err(e) => {
+                let names: Vec<Arc<str>> = packs.iter().map(|(n, _)| n.clone()).collect();
+                if let Err(d) = hub.objects.discard(project, &names).await {
+                    eprintln!("veil-server: discarding a landing batch's packs of project {project}: {d:?}");
+                }
+                return Err(Error::Other(e));
+            }
+        }
         encoded = rest;
     }
     Ok(packs)

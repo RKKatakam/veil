@@ -2624,15 +2624,18 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         }
     }
     out.push_str(
-        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed |\n\
-         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|\n",
+        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed | Gates not measured |\n\
+         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n",
     );
     let pct = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.0} %", v * 100.0)).unwrap_or_else(|| "–".into());
     let kib = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.1}", v / 1024.0)).unwrap_or_else(|| "–".into());
     for r in v["runs"].as_array().ok_or_else(|| anyhow!("no runs"))? {
         let missed = r["gates_missed"].as_array().map(|m| m.len()).unwrap_or(0);
+        // Gates this run could not judge (a running cache's, BUG-1591): a
+        // column of their own, so "none missed" is never read as "all met".
+        let unmeasured = r["gates_unmeasured"].as_array().map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} / {} / {} | {} |\n",
+            "| {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} / {} / {} | {} | {} |\n",
             r["mode"].as_str().unwrap_or(""),
             r["projects"],
             r["clients"],
@@ -2651,6 +2654,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             pct(&r["permission_hit_share"]),
             pct(&r["tips_hit_share"]),
             if missed == 0 { "none".to_string() } else { format!("**{missed}**") },
+            if unmeasured == 0 { "none".to_string() } else { format!("**{unmeasured}**") },
         ));
     }
     let landing: Vec<&serde_json::Value> = v["runs"].as_array().map(|r| r.iter().filter(|r| r["mode"] == "landing").collect()).unwrap_or_default();
@@ -2774,6 +2778,21 @@ mod tests {
         assert_eq!(missed_gates(&run(false, None, None), 0.0).len(), 2);
         assert!(unmeasured_gates(&run(false, None, None)).is_empty());
         assert!(unmeasured_gates(&json!({"mode": "pull"})).is_empty());
+
+        // The summary table names them in a column of their own: a run with
+        // gates it could not judge never reads as "none missed" alone.
+        let mut far_run = run(true, None, None);
+        far_run["gates_missed"] = json!(missed_gates(&far_run, 0.0));
+        far_run["gates_unmeasured"] = json!(unmeasured_gates(&far_run));
+        let mut near_run = run(true, Some(0.995), Some(300.0));
+        near_run["gates_missed"] = json!(missed_gates(&near_run, 0.0));
+        near_run["gates_unmeasured"] = json!(unmeasured_gates(&near_run));
+        let table = markdown(&json!({"runs": [far_run, near_run]})).expect("a table");
+        let rows: Vec<&str> = table.lines().filter(|l| l.starts_with("| objects |") && l.contains("– / – / –")).collect();
+        assert_eq!(rows.len(), 2, "{table}");
+        assert!(table.contains("| Gates missed | Gates not measured |"), "{table}");
+        assert!(rows[0].ends_with("| none | **2** |"), "{}", rows[0]);
+        assert!(rows[1].ends_with("| none | none |"), "{}", rows[1]);
     }
 
     #[test]
