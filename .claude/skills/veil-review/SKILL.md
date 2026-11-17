@@ -197,6 +197,7 @@ Anthropic once saw an agent author and an agent reviewer cycle more than fifty t
   - the layer that should have caught it.
 
   When this skill, a brief or `verify-fast.sh` changes, re-check the change against every row: would the new process catch it?
+  Also add each new escape (with its `base..head` review range and one-sentence answer key) to `eval/review/cases.jsonl`; see `eval/review/README.md` for running `eval/review/run.sh` and `eval/review/score.py` (tune on `tuning` only; hold `test` fixed).
   Seed it with: the dropped `verified_visibility` in `change()`, a format-5 kind missing from a branch's matches, the WASM break from feature-gated date helpers, and the policy pin that a fix wave closed for only one route of its class.
 - **Fix recurring findings at the source.** If the same class keeps being found, turn it into:
   - a test or clippy lint;
