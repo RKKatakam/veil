@@ -892,6 +892,83 @@ fn bug_1881_a_push_committing_during_the_gc_switch_points_its_branch_at_deleted_
     assert!(String::from_utf8_lossy(&r.body).contains(CONTENT.trim_end()), "the file's content is served");
 }
 
+/// BUG-2621: GC deletes loose objects in transactions that hold the root
+/// writers' gate and raise the GC epoch as they commit, so a writer that
+/// checked (or stored) its objects before a delete and waits for the
+/// transaction is sent back to its checks. An API commit puts back a file
+/// whose blob is stored loose, unreferenced and past the window; it begins
+/// while the deleting transaction holds the gate (it has stored its blob
+/// and waits at its guard); GC deletes the blob and commits; the commit
+/// starts over, stores the blob again, and its file is there.
+#[test]
+fn bug_2621_a_writer_waiting_for_gcs_loose_deletes_checks_its_objects_again() {
+    const CONTENT: &str = "WAITED-2621-CONTENT-93b2\n";
+    let th = TestHub::start();
+    let p = setup_project(&th);
+    let api = th.api();
+    let pid = project_id(&th, &p.name);
+    let admin_tok = p.admin.token();
+    let h = th.hub();
+    let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+
+    // The file's blob, stored loose, that nothing names.
+    let blob_raw = bytes::Bytes::from(veil_core::object::Object::Blob(CONTENT.as_bytes().to_vec()).encode());
+    let blob = ObjectId::hash(&blob_raw);
+    th.rt.block_on(h.objects.put(pid, &blob, blob_raw)).unwrap();
+    let pass = |offset: i64, hook: Option<SwitchHook>| {
+        th.rt.block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: offset, during_loose_delete: hook, ..Options::default() },
+        ))
+    };
+    let marked = crate::pack_gc::gc_pass(&th, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    assert!(!marked.skipped, "the marking pass ran");
+
+    // In the deleting transaction, the gate held, before its deletes: an
+    // API commit of a file with that content begins, and waits at its guard.
+    let (tx_done, rx_done) = std::sync::mpsc::channel::<Reply>();
+    let once = Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (db, once) = (h.db.clone(), once.clone());
+        let (authority, cert, tok, name) = (th.authority(), th.cert_pem.clone(), admin_tok.clone(), p.name.clone());
+        SwitchHook(Arc::new(move || {
+            let (db, once, tx_done) = (db.clone(), once.clone(), tx_done.clone());
+            let (authority, cert, tok, name) = (authority.clone(), cert.clone(), tok.clone(), name.clone());
+            Box::pin(async move {
+                if once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::spawn(move || {
+                    let api = Api::at(&authority, &cert);
+                    let r = api.post_json(
+                        Some(&tok),
+                        &format!("/v1/projects/{name}/changes"),
+                        &json!({"base": main0.hex(), "edits": [{"path": "src/waited-2621.txt", "put": {"text": CONTENT}}]}),
+                    );
+                    let _ = tx_done.send(r);
+                });
+                wait_for_sql_lock(&db, "SELECT e.epoch FROM (SELECT pg_advisory_xact_lock_shared%", "the API commit never reached its guard").await;
+            })
+        }))
+    };
+    let rep = pass(120_000, Some(hook)).unwrap();
+    assert!(!rep.skipped, "the pass ran: {rep:?}");
+    assert!(once.load(Ordering::SeqCst), "GC reached its loose deletes");
+    assert!(rep.loose_objects_deleted >= 1, "GC deleted the loose objects past the window, the blob among them: {rep:?}");
+
+    let r = rx_done.recv_timeout(Duration::from_secs(60)).expect("the API commit answers");
+    assert_eq!(r.status, 200, "the API commit: {}", String::from_utf8_lossy(&r.body));
+    let committed: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).expect("the commit's snapshot");
+
+    // What the commit holds can be read: it stored the blob again.
+    let r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev={}&path=src/waited-2621.txt", p.name, committed.hex()));
+    assert_eq!(r.status, 200, "the committed file's blob was deleted by GC: {}", String::from_utf8_lossy(&r.body).chars().take(300).collect::<String>());
+    assert!(String::from_utf8_lossy(&r.body).contains(CONTENT.trim_end()), "the file's content is served");
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    assert!(th.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "the blob is stored");
+}
+
 #[test]
 fn bug_1881_pr_writer_and_reverse_switch_order_serialize_with_gc() {
     let th = TestHub::start();

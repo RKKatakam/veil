@@ -57,6 +57,10 @@
 //!   written since the mark reaches is kept, the rest of what the mark
 //!   found is deleted. Past a bound on that walk under the gate
 //!   ([`SWITCH_WALK_MAX`]), the switch deletes nothing.
+//! * **Loose objects are deleted under the gate too (BUG-2621):** after the
+//!   purge's commit, in chunks ([`LOOSE_DELETE_CHUNK`]), each in a
+//!   transaction that holds the gate, reads the roots again, and raises the
+//!   GC epoch as it commits.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -156,6 +160,10 @@ pub const SWITCH_WALK_MAX: usize = 256;
 /// switch gives way.
 pub const SWITCH_WALK_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The most loose objects one transaction of a pass deletes from the store
+/// while it holds the root writers' gate (BUG-2621), [`AT_ONCE`] at a time.
+pub const LOOSE_DELETE_CHUNK: usize = 256;
+
 /// The most rounds a pass reads the roots again before a switch, outside
 /// its transaction ([`catch_up`]): each costs what was written during the
 /// one before.
@@ -198,6 +206,11 @@ pub struct Options {
     /// committed and before the first of them is deleted from the store
     /// (for a deterministic test of that window, BUG-2621).
     pub before_loose_delete: Option<SwitchHook>,
+    /// Optional hook invoked inside a transaction that deletes loose
+    /// objects, once it holds the root writers' gate and has read the
+    /// roots, before its first delete (for a deterministic test of a
+    /// writer that waits for it, BUG-2621).
+    pub during_loose_delete: Option<SwitchHook>,
     /// Merge small packs by size class ([`TIER_BITS`]): only packs of one
     /// class, the class with the most packs of those with at least
     /// `min_packs_to_merge` (the background merges, BUG-2230; the most, not
@@ -236,6 +249,7 @@ impl Default for Options {
             crash: None,
             before_switch: None,
             before_loose_delete: None,
+            during_loose_delete: None,
             size_tiers: false,
         }
     }
@@ -2041,41 +2055,97 @@ async fn mark_and_sweep_loose(
             (hook.0)().await;
         }
 
-        let mut deleted_any_loose = false;
-        let mut deleted_loose_only_hexes = Vec::new();
-        {
+        // The deletes (BUG-2621), in chunks: each in a transaction that
+        // holds the root writers' gate and the epoch row, reads the roots
+        // again ([`roots_at_switch`]: a root committed since the purge
+        // keeps what it names), deletes what is still a candidate, and
+        // raises the epoch as it commits (a writer that waited for it
+        // checks its objects again). Deleted after the purge's commit and
+        // outside any lock, as they were, a writer could find an object
+        // still stored, commit, and lose it to the delete.
+        let loose: Vec<ObjectId> = {
             let gc = gc.lock().await;
-            for id in loose_ids {
-                if gc.expired_unreferenced.contains(&id) {
-                    hub.limits.derive_turn().await;
-                    store.delete(&object_key(project, &id)).await.map_err(Error::Other)?;
-                    deleted_any_loose = true;
-                    if !packed_stored.contains(&id) {
-                        deleted_loose_only_hexes.push(id.hex());
-                    }
-                    report.loose_objects_deleted += 1;
-                }
-            }
-        }
-        if deleted_any_loose {
-            let gce2 = gc_transaction(hub, |c| {
-                let deleted_loose_only_hexes = deleted_loose_only_hexes.clone();
+            loose_ids.into_iter().filter(|id| gc.expired_unreferenced.contains(id)).collect()
+        };
+        for chunk in loose.chunks(LOOSE_DELETE_CHUNK) {
+            hub.limits.derive_turn().await;
+            let chunk: Arc<[ObjectId]> = chunk.into();
+            let packed_too: Arc<HashSet<ObjectId>> = Arc::new(chunk.iter().filter(|id| packed_stored.contains(id)).copied().collect());
+            let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let deleted: Result<Option<(usize, Option<i64>)>> = gc_transaction(hub, |c| {
+                let (hub, gc, chunk, packed_too, started) = (hub.clone(), gc.clone(), chunk.clone(), packed_too.clone(), started.clone());
+                let hook = opts.during_loose_delete.clone();
                 Box::pin(async move {
                     lock_gc_epoch_tx(c, project).await?;
-                    for chunk in deleted_loose_only_hexes.chunks(500) {
-                        sqlx::query(
-                            "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
-                        )
-                        .bind(project)
-                        .bind(chunk)
-                        .execute(&mut *c)
-                        .await?;
+                    let mut gc = gc.lock().await;
+                    if !roots_at_switch(&hub, project, c, &mut gc).await? {
+                        return Ok(None);
                     }
-                    bump_gc_epoch_tx(c, project).await
+                    if let Some(hook) = &hook {
+                        (hook.0)().await;
+                    }
+                    let ids: Vec<ObjectId> = chunk.iter().filter(|id| gc.expired_unreferenced.contains(id)).copied().collect();
+                    if ids.is_empty() {
+                        // Every one is named again: nothing deleted, no
+                        // writer sent back.
+                        return Ok(Some((0, None)));
+                    }
+                    started.store(true, Ordering::SeqCst);
+                    for ids in ids.chunks(AT_ONCE) {
+                        let mut deletes = tokio::task::JoinSet::new();
+                        for id in ids {
+                            let (hub, k) = (hub.clone(), object_key(project, id));
+                            deletes.spawn(async move { hub.objects.blob_store().delete(&k).await });
+                        }
+                        while let Some(r) = deletes.join_next().await {
+                            r.map_err(|e| Error::Other(e.into()))?.map_err(Error::Other)?;
+                        }
+                    }
+                    let loose_only: Vec<String> = ids.iter().filter(|id| !packed_too.contains(id)).map(ObjectId::hex).collect();
+                    for chunk in loose_only.chunks(500) {
+                        sqlx::query("DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)")
+                            .bind(project)
+                            .bind(chunk)
+                            .execute(&mut *c)
+                            .await?;
+                    }
+                    let gce = bump_gc_epoch_tx(c, project).await?;
+                    Ok(Some((ids.len(), Some(gce))))
                 })
             })
-            .await?;
-            notify_gc_epoch(hub, project, gce2).await;
+            .await;
+            match deleted {
+                Ok(Some((n, gce))) => {
+                    report.loose_objects_deleted += n;
+                    if let Some(gce) = gce {
+                        notify_gc_epoch(hub, project, gce).await;
+                    }
+                }
+                // Gave way (the bound on its walk): the pass deletes
+                // nothing more.
+                Ok(None) => break,
+                Err(e) => {
+                    // Objects may be deleted with the epoch not raised (the
+                    // transaction failed after its deletes): raise it, so
+                    // that a writer that waited checks its objects again.
+                    if started.load(Ordering::SeqCst) {
+                        for _ in 0..3 {
+                            let bumped = gc_transaction(hub, |c| {
+                                Box::pin(async move {
+                                    lock_gc_epoch_tx(c, project).await?;
+                                    bump_gc_epoch_tx(c, project).await
+                                })
+                            })
+                            .await;
+                            if let Ok(gce) = bumped {
+                                notify_gc_epoch(hub, project, gce).await;
+                                break;
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         }
     }
 

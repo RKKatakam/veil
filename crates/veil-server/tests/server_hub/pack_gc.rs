@@ -2109,19 +2109,18 @@ fn bug_2602_an_object_stored_as_gc_switches_that_others_already_named_keeps_what
     assert_closure_stored(&hub, pid, kept, "the snapshot that stays");
 }
 
-/// BUG-2621: the switch that drops loose objects commits (the purge, the
-/// GC epoch raised), then deletes the objects from the store with no lock
-/// held, and raises the epoch again only once all are deleted. A writer
-/// that begins after the commit reads the new epoch, stores or finds its
-/// objects, and commits before they are deleted: its guard passes, and its
-/// root then names an object GC deletes. Here an API commit puts back a
+/// BUG-2621: the switch that drops loose objects committed (the purge, the
+/// GC epoch raised), then deleted the objects from the store with no lock
+/// held, and raised the epoch again only once all were deleted. A writer
+/// that began after the commit read the new epoch, stored or found its
+/// objects, and committed before they were deleted: its guard passed, and
+/// its root then named an object GC deleted. Here an API commit puts back a
 /// file whose blob is stored loose, unreferenced and past the window (the
-/// server stores an API commit's objects loose, under the same key).
-/// (BUG-1881's class, in the window after the switch's transaction. A
-/// push names only what it uploaded or a parent names, and objects in
-/// packs are not affected: their switch is the deletion.)
+/// server stores an API commit's objects loose, under the same key), between
+/// the switch's commit and the deletes. The deletes are now made in
+/// transactions that hold the root writers' gate and read the roots again:
+/// the commit's root is seen, and its blob is kept.
 #[test]
-#[ignore = "BUG-2621: a writer that commits between the loose switch's transaction and its deletes names an object GC then deletes"]
 fn bug_2621_a_commit_between_the_loose_switch_and_its_deletes_keeps_its_file() {
     use veil_server::pack_gc::SwitchHook;
     const CONTENT: &str = "BACK-AGAIN-2621-CONTENT-7a1e\n";
@@ -2186,6 +2185,9 @@ fn bug_2621_a_commit_between_the_loose_switch_and_its_deletes_keeps_its_file() {
     // What the commit holds is stored.
     let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     assert!(hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "the committed file's blob was deleted by GC: {rep:?}");
+    let r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev={}&path=src/back-2621.txt", p.name, committed.hex()));
+    assert_eq!(r.status, 200, "the committed file: {}", String::from_utf8_lossy(&r.body).chars().take(300).collect::<String>());
+    assert!(String::from_utf8_lossy(&r.body).contains(CONTENT.trim_end()), "the file's content is served");
     assert_closure_stored(&hub, pid, committed, "the change committed as GC deleted");
 }
 
