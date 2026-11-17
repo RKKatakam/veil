@@ -440,6 +440,11 @@ impl Writer<'_> {
 }
 
 fn put(src: &Source, raw: Vec<u8>, stats: &mut Stats) -> Result<SegRef> {
+    // A stopping server stores no more segments (BUG-1990): the update ends
+    // here, and the next start brings the index up to date ([`resume`]).
+    if src.hub.landing.stopping() {
+        return Err(Error::Other(anyhow::anyhow!("the server is stopping: the search index is brought up to date at its next start")));
+    }
     let id = ObjectId::hash(&raw);
     let bytes = raw.len() as u64;
     stats.segments += 1;
@@ -605,6 +610,64 @@ fn permits() -> &'static tokio::sync::Semaphore {
     P.get_or_init(|| tokio::sync::Semaphore::new(UPDATERS))
 }
 
+/// The updates at work on blocking threads in this process, per hub (by
+/// its address): what a stopping server waits for ([`stop`]).
+fn at_work() -> &'static Mutex<HashMap<usize, usize>> {
+    static W: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+/// One update at work: counted from before its blocking thread starts
+/// until that thread is done with it.
+struct AtWork(usize);
+
+impl AtWork {
+    fn new(hub: &Arc<Hub>) -> AtWork {
+        let key = Arc::as_ptr(hub) as usize;
+        *at_work().lock().unwrap().entry(key).or_default() += 1;
+        AtWork(key)
+    }
+}
+
+impl Drop for AtWork {
+    fn drop(&mut self) {
+        let mut w = at_work().lock().unwrap();
+        if let Some(n) = w.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                w.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// How many updates of `hub` are at work on blocking threads.
+#[doc(hidden)]
+pub fn updates_at_work(hub: &Arc<Hub>) -> usize {
+    at_work().lock().unwrap().get(&(Arc::as_ptr(hub) as usize)).copied().unwrap_or(0)
+}
+
+/// How long a stopping server waits for its updates to end ([`stop`]).
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The server is stopping (`landing::stop` has said so): wait for this
+/// hub's updates at work to end, at most [`STOP_WAIT`]. Each ends at the
+/// next segment it would store ([`put`]). An update runs on a blocking
+/// thread and stores its segments through the runtime; one still at it
+/// when the runtime shuts down made a timer on a runtime that had none
+/// any more, and its thread panicked (BUG-1990: "A Tokio 1.x context was
+/// found, but it is being shutdown", seen as tests' servers were dropped).
+pub async fn stop(hub: &Arc<Hub>) {
+    let until = std::time::Instant::now() + STOP_WAIT;
+    while updates_at_work(hub) > 0 {
+        if std::time::Instant::now() > until {
+            eprintln!("veil-server: {} search index updates still at work at the stop", updates_at_work(hub));
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// A landing moved `branches` of `project` (derived already): update their
 /// indexes in the background. One update per project at a time here;
 /// landings meanwhile make it run again for their branches.
@@ -706,7 +769,9 @@ pub async fn update(hub: &Arc<Hub>, project: i64, branches: Option<Vec<String>>)
             staged: None,
         },
     };
+    let at_work = AtWork::new(hub);
     tokio::task::spawn_blocking(move || {
+        let _at_work = at_work;
         let lines = cx.lines()?;
         // Every branch in one transaction (BUG-2350: an update of the
         // branches many pushes moved cost two commits a branch); when a

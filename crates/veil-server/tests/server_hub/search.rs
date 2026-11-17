@@ -1398,3 +1398,48 @@ fn search_index_catches_up_every_branch() {
     rebuild(&th, &h);
     assert_eq!(caught_up, side_answers(&h));
 }
+
+/// BUG-1990: an index update runs on a blocking thread and stores its
+/// segments through the server's runtime. A server that stopped did not
+/// wait for one at work, and its thread, storing a segment as the runtime
+/// shut down, panicked ("A Tokio 1.x context was found, but it is being
+/// shutdown": the store's timer on a runtime that had none any more); seen
+/// as tests' servers were dropped, where the panic's lines could hide
+/// another. A stopping server now stores no more segments and waits for its
+/// updates at work to end. Here an update of 1,500 files is at work when
+/// the server stops: none is when the stop returns, and the next update
+/// brings the index up to the tip.
+#[test]
+fn bug_1990_a_stopping_server_waits_for_its_search_index_updates_to_end() {
+    let th = TestHub::start();
+    let (policy_text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let files: Files = (0..1_500).map(|i| (format!("pub/stop/f{i:04}.txt"), format!("searchable line {i} of the stopping server\n").repeat(40).into_bytes())).collect();
+    let tip = h.commit(&th, &[root_snapshot_id()], files, [1; 16], 1_000, None);
+    h.set_branch(&th, "main", tip);
+    h.derive(&th);
+    let (hub, project) = (h.hub.clone(), h.id);
+
+    // What a landing does: the update runs in the background.
+    th.rt.block_on(async { index::landed(&hub, project, vec!["main".to_string()]) });
+    let until = Instant::now() + Duration::from_secs(30);
+    while index::updates_at_work(&hub) == 0 {
+        assert!(Instant::now() < until, "the landing's index update never started");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (old, at_stop) = (hub.clone(), std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)));
+    let seen = at_stop.clone();
+    let th = th.restart(move |_| seen.store(index::updates_at_work(&old), std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(at_stop.load(std::sync::atomic::Ordering::SeqCst), 0, "an index update of the stopped server was still at work when its stop returned");
+
+    // The update the stop cut short is done by the next one: what a server
+    // does at its start for every branch whose index is behind
+    // (`index::resume`; the tests' servers do not catch up at their start).
+    let hub = th.hub();
+    th.rt.block_on(index::update(&hub, project, Some(Vec::new()))).expect("the next update, of the branches that are behind");
+    let heads: Vec<String> = th
+        .rt
+        .block_on(sqlx::query_scalar("SELECT snapshot FROM search_heads WHERE project_id = $1 AND branch = 'main' AND kind IN ('code', 'walk')").bind(project).fetch_all(&hub.db))
+        .unwrap();
+    assert!(heads.len() == 2 && heads.iter().all(|s| *s == tip.hex()), "the next update did not bring main's index up to its tip: {heads:?}");
+}

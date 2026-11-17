@@ -178,11 +178,14 @@ pub struct Running {
 
 impl Running {
     /// A clean stop: the server stops taking connections, then its landing
-    /// services end and give their leases up (`landing::stop`, BUG-1970).
+    /// services end and give their leases up (`landing::stop`, BUG-1970),
+    /// and its search index updates at work end (`search::index::stop`,
+    /// BUG-1990).
     pub async fn stop(self) {
         let _ = self.shutdown.send(true);
         let _ = self.task.await;
         landing::stop(&self.hub).await;
+        search::index::stop(&self.hub).await;
     }
 }
 
