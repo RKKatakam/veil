@@ -994,6 +994,9 @@ struct Builder<'a> {
     fs: &'a dyn StorageBackend,
     opts: &'a BuildOptions<'a>,
     use_hints: bool,
+    /// Only a re-scan turned the hints off, in a thin clone: they still
+    /// hold for what it never fetched (see [`Builder::unchanged`]).
+    unfetched_hints: bool,
     /// `.veilpolicy` differs from the parent's: content that is unchanged
     /// since the parent must still be re-scanned, because the parent may
     /// have been built under rules (e.g. `public!`) that no longer apply.
@@ -1091,6 +1094,9 @@ pub(crate) fn build_tree_planned(
         (None, None) => !fs.exists(&policy_path)?,
         _ => false,
     };
+    // A re-scan reads what hints would reuse, except what a thin clone
+    // never fetched (see `Builder::unchanged`).
+    let unfetched_hints = use_hints && opts.rescan && store.is_partial();
     let use_hints = use_hints && !opts.rescan;
     // Read as the policy is (a symlink followed, see `read_policy_file`).
     let policy_changed = match (crate::policy::read_policy_file(fs)?, parent_policy) {
@@ -1163,6 +1169,7 @@ pub(crate) fn build_tree_planned(
         fs,
         opts,
         use_hints,
+        unfetched_hints,
         policy_changed,
         parent_policy,
         rescan: opts.rescan,
@@ -1242,6 +1249,20 @@ impl<'a> Builder<'a> {
         Ok(self.deleted_secrets.insert(map))
     }
 
+    /// Does `fs` say that what it holds at `path` is the parent's object
+    /// `id`, to be reused without reading it? With hints, whenever it says
+    /// so. In a re-scan after a change of the scanner's rules, which reads
+    /// unchanged content again, still for what a thin clone never fetched:
+    /// that is the server's content, which was never on this device, so
+    /// nothing of this device's is in it for the new rules to find, and
+    /// reading it would fetch the whole workspace (BUG-1360). What was
+    /// fetched or written here is read.
+    fn unchanged(&self, path: &VPath, id: &ObjectId) -> bool {
+        (self.use_hints || self.unfetched_hints)
+            && self.fs.known_id(path) == Some(*id)
+            && (self.use_hints || !self.store.has(id))
+    }
+
     fn compute_deleted_secrets(&self) -> Result<HashMap<(EntryKind, ObjectId), Visibility>> {
         let mut map: HashMap<(EntryKind, ObjectId), Visibility> = HashMap::new();
         let Some(root_id) = self.opts.base_tree.or(self.opts.parent_tree) else {
@@ -1251,7 +1272,7 @@ impl<'a> Builder<'a> {
         let mut stack = vec![(VPath::root(), root_id, 0usize)];
         while let Some((dir, tid, depth)) = stack.pop() {
             if same_as_parent {
-                if self.use_hints && self.fs.known_id(&dir) == Some(tid) {
+                if self.unchanged(&dir, &tid) {
                     continue;
                 }
                 if self.watch.is_some_and(|w| !w.must_open(&dir)) {
@@ -1593,7 +1614,7 @@ impl<'a> Builder<'a> {
                         continue;
                     }
                     if let Some(pe) = pdir {
-                        if self.use_hints && self.fs.known_id(&path) == Some(pe.id) {
+                        if self.unchanged(&path, &pe.id) {
                             f.out.insert(pe.clone());
                             continue;
                         }
@@ -2151,7 +2172,7 @@ impl<'a> Builder<'a> {
     /// A reader who cannot read every side cannot resolve the conflict:
     /// its edits are held back, as an edit of a file it cannot seal.
     fn conflict_entry(&mut self, path: &VPath, name: &str, ce: &TreeEntry, kind: EntryKind) -> Result<Option<TreeEntry>> {
-        if self.use_hints && self.fs.known_id(path) == Some(ce.id) {
+        if self.unchanged(path, &ce.id) {
             return Ok(Some(ce.clone()));
         }
         let conflict = match self.store.conflict(&ce.id) {
@@ -2389,7 +2410,7 @@ impl<'a> Builder<'a> {
         // Fast path: overlay/tree-view says the file is byte-identical.
         if !move_candidate {
             if let Some(pe) = parent_file {
-                if self.use_hints && !self.renormalizing(path) && self.fs.known_id(path) == Some(pe.id) {
+                if !self.renormalizing(path) && self.unchanged(path, &pe.id) {
                     return Ok(Some(pe.clone()));
                 }
             }

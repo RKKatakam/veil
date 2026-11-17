@@ -4522,7 +4522,9 @@ protocol or server change.
   "unreadable"). A new workspace (`vl ws new`) is marked scanned by the
   current scanner rules, so its first recording does not re-read every file
   (it did: in a thin clone, a fetch of the whole workspace). A re-scan after
-  a rules upgrade still reads everything: BUG-1360.
+  a rules upgrade reads what the clone fetched or the workspace wrote and
+  fetches nothing: what was never fetched is the server's content, never
+  on this device (BUG-1360).
 * **`vl ws exec --mount`:** the sandbox is a mount of the workspace (a
   private mountpoint under `$XDG_RUNTIME_DIR`, bound at the project's path
   when confined), started for the run and unmounted after it, or the mount

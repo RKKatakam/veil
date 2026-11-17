@@ -835,7 +835,13 @@ CAS, and it applies these rules in order:
      Latin-1 file), no NUL within 4 KiB, so random binary data is not
      taken for one.
      `secrets::RULES_VERSION` is part of the stat-cache key, so "scanned
-     clean" facts from an older scanner are not reused.
+     clean" facts from an older scanner are not reused. Each device also
+     re-scans a workspace once after an upgrade that changes the rules
+     (`.veil/local/scanned/<ws>.version`): that recording reads unchanged
+     content again. In a thin clone it reads what the clone fetched or the
+     working copy wrote, never what it did not fetch (`Builder::unchanged`,
+     BUG-1360): that is the server's content, which was never on this
+     device, as a new workspace's is (marked scanned when made).
    * A **never-tracked** file is left out of the tree.
    * A **tracked** file keeps the parent's entry, so history still holds
      the previous, safe version. The edit is *held back*, not recorded as a
@@ -1802,7 +1808,8 @@ A workspace is only a named pointer in the view. It owns no directory.
   secrets, conflicts, quarantine) is decided as for a full working copy
   whose files outside the set did not change: a policy edit, or a scanner
   upgrade, turns the hints off and the builder reads the outside files
-  from the tree to reclassify them (slow, exact). A superseded run (step
+  from the tree to reclassify them (slow, exact; after a scanner upgrade a
+  thin clone reads only those it has fetched, BUG-1360). A superseded run (step
   7) saves the same view as a child of the snapshot it started from.
   In step 8, `strays` lists the files the command wrote outside the
   set that a full snapshot would record (ignored or isolated by neither
