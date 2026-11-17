@@ -2800,3 +2800,62 @@ was not traced; the machine is not out of CPU (19 of 32 threads: server 6,
 database 6, load tool 7), each of a pull's 6.7 requests takes about 26 ms
 at the median, and the project's request gate is the first thing to look
 at. A thin pull (the tip, not every snapshot since) still has no benchmark.
+
+## A landing batch's objects as one pack (BUG-1955, 2026-11-17, `t3/fable-speed`)
+
+What bounded the landing service on this machine was the batch's commit
+waiting for its objects (`lateslow`, above): a batch stored the some 600
+objects it made (the landed snapshots, the trees above each change, their
+projections) one by one, in rounds of 256, each object two waits on the
+disk's journal, the same journal every submit's objects and the database's
+log wait for. A push has stored what the server makes for it as one pack
+since S28; the landing service (S17) still stored loose. Now a batch's
+objects are one pack: one storage write, recorded staged before it is
+written, listed by the batch's transaction (its last statement), discarded
+when the batch does not commit (`landing/service.rs` `store`, `Storing`;
+`docs/HUB.md` §13.32 item 10).
+
+`OBJECTS=local LANDING_CLIENTS=10000 LANDING_RATES=1000 DURATION=180
+scripts/bench-server.sh landing -- --protected --mix --people 100` (the
+gate's mix; the commands of "Final local measurements" above, the server
+and the load tool built once each and passed in, the load tool the same for
+every run), `integration` @ `ff29db9b` against the fix, alternated, each
+through `bench-quiet.sh` (it waits for a 1-minute load below 16 for at most
+five minutes; after: 111.6, 57.8, 133.1, 53.1, the runs' own 10,000
+agents), 2026-11-17 05:36 to 06:20 UTC, 21 GB of memory free at the start
+of each turn:
+
+| Server | Landed/s | Per 10 s | p50 (ms) | p99 (ms) | p99 per 10 s (ms) | Told to come back | Failed | Longest queue | Landings per batch | Prepare / store / transaction (ms per batch) | Commits per landing, all (own) | Statements per landing | Storage writes per landing | CPU ms per landing: server / database | Cores: server / database | Deriver behind at the end | Least memory available / load tool / server (MB) |
+|---|---:|---|---:|---:|---|---:|---:|---:|---:|---|---|---:|---:|---|---|---:|---|
+| before | 972.8 | 580 to 1,085 | 270 | 9,688 | 198 to 14,153 | 79,510 | 0 | 1,999 | 32.8 | 5.8 / 22.7 / 29.6 | 1.16 (1.09) | 35.6 | 14.34 | 8.16 / 5.60 | 7.9 / 5.5 | 25.0 s | 12,617 / 6,095 / 1,825 |
+| after | **999.9** | 952 to 1,048 | **98** | **1,087** | 327 to 3,571 | **0** | 0 | 369 | 17.4 | 3.6 / **9.8** / **14.7** | 1.28 (1.11) | 36.8 | **8.24** | 6.72 / 5.61 | 6.7 / 5.6 | 18.1 s | 12,264 / 6,035 / 2,208 |
+| before, again | 1,000.6 | 932 to 1,064 | 192 | 2,266 | 344 to 6,345 | 0 | 3 | 548 | 30.0 | 4.8 / 20.0 / 26.2 | 1.16 (1.09) | 35.2 | 14.33 | 7.58 / 5.24 | 7.6 / 5.2 | 3.3 s | 12,730 / 6,042 / 1,826 |
+| after, again | **998.1** | 931 to 1,069 | **89** | **1,055** | 172 to 2,919 | **0** | 0 | 627 | 17.4 | 3.4 / **9.5** / **14.9** | 1.26 (1.10) | 36.4 | **8.33** | 6.90 / 5.63 | 6.9 / 5.6 | 23.5 s | 12,642 / 6,034 / 2,261 |
+
+- **p50 89 to 98 ms (192 to 270) and p99 1,055 to 1,087 ms (2,266 to
+  9,688)**: the median is inside the design's 150 ms, the 99th percentile
+  just outside its 1 s. No landing was told to come back (79,510 in the
+  first run before, where the queue reached its bound from 130 s on; the
+  second run before had none: this benchmark differs that much from run to
+  run on one build, which is why each build ran twice, alternated).
+- A batch's store is 9.5 to 9.8 ms (20.0 to 22.7) and its transaction 14.7
+  to 14.9 ms (26.2 to 29.6), so batches are picked sooner and are smaller
+  (17.4 landings against 30 to 33): more batches a landing, hence 1.26 to
+  1.28 commits a landing (1.16), of which 0.06 record a batch's pack; the
+  gate is 1.5.
+- Storage writes a landing fall from 14.3 to 8.2 to 8.3: what is left is
+  the submit's own (an API commit stored its blob, trees and snapshots one
+  by one: BUG-1948, next section) and the deriver's.
+- The server's CPU a landing falls (7.6 to 8.2 → 6.7 to 6.9 ms); the
+  database's is the same. Its memory peaks higher (2.2 GB against 1.8):
+  with every batch listing a pack, the project now has packs, their indexes
+  and the background merges of small packs; before, nothing of this
+  benchmark was in a pack.
+
+**What the submit's own loose objects cost** (an experiment, not merged:
+the fix, with an API commit's objects written without waiting for the
+disk; one run in the same turn): 1,000.1/s, p50 **32 ms**, p99 **390 ms**
+(64 to 1,690 per 10 s), 9.4 landings a batch (2.5 / 6.0 / 7.8 ms), the
+deriver 2.5 s behind. So most of what is left of a landing's latency here
+is the journal waits of the seven objects each submit stores, which is
+what the next section removes without giving up their durability.
