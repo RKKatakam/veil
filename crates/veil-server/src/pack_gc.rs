@@ -194,6 +194,10 @@ pub struct Options {
     /// Optional hook invoked right before GC verifies `RefStamp` and switches
     /// packs / deletes loose objects (for deterministic race tests).
     pub before_switch: Option<SwitchHook>,
+    /// Optional hook invoked after the switch that drops loose objects has
+    /// committed and before the first of them is deleted from the store
+    /// (for a deterministic test of that window, BUG-2621).
+    pub before_loose_delete: Option<SwitchHook>,
     /// Merge small packs by size class ([`TIER_BITS`]): only packs of one
     /// class, the class with the most packs of those with at least
     /// `min_packs_to_merge` (the background merges, BUG-2230; the most, not
@@ -231,6 +235,7 @@ impl Default for Options {
             now_offset_ms: 0,
             crash: None,
             before_switch: None,
+            before_loose_delete: None,
             size_tiers: false,
         }
     }
@@ -2032,6 +2037,9 @@ async fn mark_and_sweep_loose(
             return Ok(gc);
         };
         notify_gc_epoch(hub, project, gce).await;
+        if let Some(hook) = &opts.before_loose_delete {
+            (hook.0)().await;
+        }
 
         let mut deleted_any_loose = false;
         let mut deleted_loose_only_hexes = Vec::new();

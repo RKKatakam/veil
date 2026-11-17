@@ -2109,6 +2109,86 @@ fn bug_2602_an_object_stored_as_gc_switches_that_others_already_named_keeps_what
     assert_closure_stored(&hub, pid, kept, "the snapshot that stays");
 }
 
+/// BUG-2621: the switch that drops loose objects commits (the purge, the
+/// GC epoch raised), then deletes the objects from the store with no lock
+/// held, and raises the epoch again only once all are deleted. A writer
+/// that begins after the commit reads the new epoch, stores or finds its
+/// objects, and commits before they are deleted: its guard passes, and its
+/// root then names an object GC deletes. Here an API commit puts back a
+/// file whose blob is stored loose, unreferenced and past the window (the
+/// server stores an API commit's objects loose, under the same key).
+/// (BUG-1881's class, in the window after the switch's transaction. A
+/// push names only what it uploaded or a parent names, and objects in
+/// packs are not affected: their switch is the deletion.)
+#[test]
+#[ignore = "BUG-2621: a writer that commits between the loose switch's transaction and its deletes names an object GC then deletes"]
+fn bug_2621_a_commit_between_the_loose_switch_and_its_deletes_keeps_its_file() {
+    use veil_server::pack_gc::SwitchHook;
+    const CONTENT: &str = "BACK-AGAIN-2621-CONTENT-7a1e\n";
+
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+
+    // The file's blob, stored loose, that nothing names: past the window at
+    // the second pass.
+    let (blob, blob_raw) = make_blob(CONTENT);
+    hub.rt.block_on(h.objects.put(pid, &blob, blob_raw)).unwrap();
+    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    assert!(!marked.skipped, "the marking pass ran");
+
+    // After the switch's transaction, before the deletes: an API commit of
+    // a file with that content.
+    let (tx, rx) = std::sync::mpsc::channel::<Reply>();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook = {
+        let (authority, cert, name, token, calls) = (hub.authority(), hub.cert_pem.clone(), p.name.clone(), admin_tok.clone(), calls.clone());
+        SwitchHook(Arc::new(move || {
+            let (authority, cert, name, token, tx) = (authority.clone(), cert.clone(), name.clone(), token.clone(), tx.clone());
+            let first = calls.fetch_add(1, Relaxed) == 0;
+            Box::pin(async move {
+                if !first {
+                    return;
+                }
+                let (done, committed) = tokio::sync::oneshot::channel();
+                std::thread::spawn(move || {
+                    let api = Api::at(&authority, &cert);
+                    let r = api.post_json(
+                        Some(&token),
+                        &format!("/v1/projects/{name}/changes"),
+                        &json!({"base": main0.hex(), "edits": [{"path": "src/back-2621.txt", "put": {"text": CONTENT}}]}),
+                    );
+                    let _ = tx.send(r);
+                    let _ = done.send(());
+                });
+                let _ = committed.await;
+            })
+        }))
+    };
+    let rep = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, before_loose_delete: Some(hook), ..Options::default() },
+        ))
+        .unwrap();
+    assert!(!rep.skipped, "the pass ran: {rep:?}");
+    assert_eq!(calls.load(Relaxed), 1, "the pass committed its loose switch and reached its deletes once: {rep:?}");
+    let r = rx.recv_timeout(Duration::from_secs(60)).expect("the commit answers");
+    assert_eq!(r.status, 200, "the API commit: {}", String::from_utf8_lossy(&r.body));
+    let committed: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).expect("the commit's snapshot");
+
+    // What the commit holds is stored.
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    assert!(hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "the committed file's blob was deleted by GC: {rep:?}");
+    assert_closure_stored(&hub, pid, committed, "the change committed as GC deleted");
+}
+
 /// BUG-2602: what a switch reads from the store while root writers wait is
 /// bounded (`SWITCH_WALK_MAX` objects). A root written as the pass switches
 /// that names more than that gives the switch way, as any root write did
