@@ -2429,13 +2429,13 @@ mod tests {
             vec![(Arc::from("valid"), StagedSlots { objects: valid_items.len(), size: valid_bytes.len() as u64, slots: all_slots.clone() })],
             HashMap::new(),
         );
-        let listed_ok = crate::sync::packs_to_list(&hub, 1, 7, &st_valid, &touched, &[], &Mutex::new(Default::default())).await;
+        let listed_ok = crate::sync::packs_to_list(&hub, 1, 7, &st_valid, &touched, &[], &[], &Mutex::new(Default::default())).await;
         assert_eq!(listed_ok.expect("valid uncached staged pack lists as-is").len(), 1);
         let st_unsorted = crate::sync::Staged::from_packs(
             vec![(Arc::from("unsorted"), StagedSlots { objects: valid_items.len(), size: damaged.len() as u64, slots: all_slots })],
             HashMap::new(),
         );
-        let unsorted_res = crate::sync::packs_to_list(&hub, 1, 7, &st_unsorted, &touched, &[], &Mutex::new(Default::default())).await;
+        let unsorted_res = crate::sync::packs_to_list(&hub, 1, 7, &st_unsorted, &touched, &[], &[], &Mutex::new(Default::default())).await;
         assert!(
             untiled_res.is_err() && missing_wanted_res.is_err() && unsorted_res.is_err(),
             "staged_slots / packs_to_list must refuse untiled and unsorted indexes as a full read would, but returned untiled={:?}, missing_wanted={:?}, unsorted_list={:?}",
@@ -2628,7 +2628,7 @@ mod tests {
         }
         let st = crate::sync::Staged::from_packs(Vec::new(), made_map);
         let progress = Mutex::new(crate::sync::Progress::default());
-        let split_res = crate::sync::packs_to_list(&hub, 3, 7, &st, &HashSet::new(), &made_ids, &progress).await;
+        let split_res = crate::sync::packs_to_list(&hub, 3, 7, &st, &HashSet::new(), &made_ids, &[], &progress).await;
         assert!(
             p1_again.is_ok() && p1_after_other.is_ok() && split_res.is_ok(),
             "Bound::take_for / packs_to_list answered 503 IndexesFull: route1={:?}, route1b={:?}, route2={:?}",
@@ -2659,7 +2659,7 @@ mod tests {
             )],
             HashMap::new(),
         );
-        let fail_res = crate::sync::packs_to_list(&hub, 3, 7, &st_fail, &touched_fail, &made_ids, &Mutex::new(Default::default())).await;
+        let fail_res = crate::sync::packs_to_list(&hub, 3, 7, &st_fail, &touched_fail, &made_ids, &[], &Mutex::new(Default::default())).await;
         assert!(fail_res.is_err(), "packs_to_list fails when a touched staged pack vanished");
         assert_eq!(objects.index_bound().available(), INDEXES_HELD, "all shares released when packs_to_list fails");
     }
