@@ -1245,20 +1245,93 @@ impl<'r> Transaction<'r> {
                 floor = floor.min(g);
             }
         }
-        let mut order: Vec<(crate::graph_index::Gen, i64, ObjectId)> = match floor {
-            crate::graph_index::Gen::MAX => Vec::new(),
-            f => self
-                .repo
-                .exact()
-                .down_to(roots, f + 1)?
-                .into_iter()
-                .map(|(id, (g, s))| (g, s.timestamp, id))
-                .collect(),
+        let mut walked: HashMap<ObjectId, (crate::graph_index::Gen, std::sync::Arc<Snapshot>)> = match floor {
+            crate::graph_index::Gen::MAX => HashMap::new(),
+            f => self.repo.exact().down_to(roots.iter().copied(), f + 1)?,
         };
+        // A merge: whatever follows a rewrite lands on a current snapshot
+        // (BUG-1444). A side's rewrite can name a replacement no ref of the
+        // merged view shows (a settler's rebased copy whose head the views'
+        // merge dropped, the commit a restored working copy was snapshotted
+        // into), on a parent rewritten since. A ref or a parent that
+        // resolves to it would be left there, above what a rewrite
+        // replaced: the replacement is part of the rebase, with its
+        // ancestors above the floor. (A command's replacements are where
+        // the command put them: the server's version of a change, a
+        // projection.)
+        let merging = self.merge.is_some() && floor != crate::graph_index::Gen::MAX;
+        if merging {
+            let mut asked: HashSet<ObjectId> = HashSet::new();
+            // What lands somewhere: a ref, and a parent of a snapshot the
+            // rebase may move (not one that is itself rewritten, which
+            // goes: rebasing what its parents became would bring back what
+            // nothing shows).
+            let mut todo: Vec<ObjectId> = roots.clone();
+            todo.extend(walked.iter().filter(|(id, _)| !self.rewritten.contains_key(*id)).flat_map(|(_, (_, s))| s.parents.iter().copied()));
+            while let Some(x) = todo.pop() {
+                for t in self.resolve(x).0 {
+                    if t == x || walked.contains_key(&t) || !asked.insert(t) {
+                        continue;
+                    }
+                    for (id, v) in self.repo.exact().down_to([t], floor + 1)? {
+                        if let std::collections::hash_map::Entry::Vacant(e) = walked.entry(id) {
+                            if !self.rewritten.contains_key(&id) {
+                                todo.extend(v.1.parents.iter().copied());
+                            }
+                            e.insert(v);
+                        }
+                    }
+                }
+            }
+        }
+        let mut sorted: Vec<(crate::graph_index::Gen, i64, ObjectId)> = walked.iter().map(|(id, (g, s))| (*g, s.timestamp, *id)).collect();
         // Parents first: a parent has a smaller generation than its child.
-        order.sort();
+        sorted.sort();
+        let mut order: Vec<ObjectId> = Vec::with_capacity(sorted.len());
+        if merging {
+            // And a replacement before what follows a rewrite onto it: it
+            // can have a higher generation than the children of what it
+            // replaces, so the order is by dependency (a snapshot after its
+            // parents and after what its parents resolve to), the
+            // generations only breaking ties.
+            let mut done: HashSet<ObjectId> = HashSet::new();
+            let mut open: HashSet<ObjectId> = HashSet::new();
+            for (_, _, seed) in &sorted {
+                let mut stack = vec![(*seed, false)];
+                while let Some((id, expanded)) = stack.pop() {
+                    if done.contains(&id) {
+                        continue;
+                    }
+                    if expanded {
+                        done.insert(id);
+                        order.push(id);
+                        continue;
+                    }
+                    // (A cycle of rewrites, a rewrite and its reversal: each
+                    // once.)
+                    if !open.insert(id) {
+                        continue;
+                    }
+                    stack.push((id, true));
+                    let Some((_, snap)) = walked.get(&id) else { continue };
+                    let mut deps: Vec<ObjectId> = Vec::new();
+                    for p in &snap.parents {
+                        deps.push(*p);
+                        deps.extend(self.resolve(*p).0);
+                    }
+                    // Pushed in reverse: the first parent is settled first.
+                    for d in deps.into_iter().rev() {
+                        if walked.contains_key(&d) && !done.contains(&d) && !open.contains(&d) {
+                            stack.push((d, false));
+                        }
+                    }
+                }
+            }
+        } else {
+            order.extend(sorted.into_iter().map(|(_, _, id)| id));
+        }
         let store = self.repo.store.clone();
-        for id in order.into_iter().map(|(_, _, id)| id) {
+        for id in order {
             if self.rewritten.contains_key(&id) {
                 continue;
             }

@@ -993,6 +993,16 @@ struct RwCmd {
     ops: std::collections::HashSet<ObjectId>,
     /// Each rewrite with the operation that recorded it: (op, old, new).
     rewrites: Vec<(ObjectId, ObjectId, ObjectId)>,
+    /// The rewrites an undo or an op restore recorded, as (op, old, new):
+    /// the edits recorded since, re-applied on the working copy it
+    /// restored (`Repo::undo_keeping_edits`, the restored working copy
+    /// rewritten into one holding them), and what that rebased. Rewrites
+    /// of a command like any other (BUG-1444: the check knew only those of
+    /// commits and describes, and so took a describe concurrent with such
+    /// a restore of one snapshot for a rewrite to follow, not for the
+    /// divergent change it is). Kept apart from `rewrites`: those also
+    /// choose what later commands of an input describe and tag.
+    reapplied: Vec<(ObjectId, ObjectId, ObjectId)>,
     /// The operations it took back (an undo the one it undid, an op
     /// restore every one between the restored one and its parents).
     retracts: Vec<ObjectId>,
@@ -1004,7 +1014,8 @@ struct RwCmd {
 
 /// The auto-rebase guarantee (BUG-1299's class), in `repo`'s view: a
 /// rewrite of a snapshot that a landed command made (a commit of the
-/// working copy, a describe) and that no landed undo or op restore took
+/// working copy, a describe, the edits an undo or an op restore re-applied
+/// on the working copy it restored) and that no landed undo or op restore took
 /// back (undid the command, restored to before it, or, having seen it,
 /// showed its old snapshot again) leaves its old snapshot invisible: everything built on it, by
 /// commands that never saw the rewrite too, moved onto the replacement.
@@ -1018,11 +1029,16 @@ fn check_rewrites_followed(cmds: &[RwCmd], repo: &Repo, at: &str) -> Result<(), 
         !cmds.iter().enumerate().any(|(x, c)| c.landed.is_some() && c.retracts.iter().any(|o| cmds[r].ops.contains(o)) && in_force(cmds, x))
     }
     let retracted = |op: &ObjectId| cmds.iter().enumerate().any(|(r, c)| c.landed.is_some() && c.retracts.contains(op) && in_force(cmds, r));
+    // Every rewrite a command recorded: a commit's, a describe's, and an
+    // undo's or op restore's (the edits it re-applied).
+    fn recorded(c: &RwCmd) -> impl Iterator<Item = &(ObjectId, ObjectId, ObjectId)> {
+        c.rewrites.iter().chain(c.reapplied.iter())
+    }
     let live: Vec<(usize, (ObjectId, ObjectId))> = cmds
         .iter()
         .enumerate()
         .filter(|(_, c)| c.landed.is_some())
-        .flat_map(|(i, c)| c.rewrites.iter().filter(|r| !retracted(&r.0)).map(move |r| (i, (r.1, r.2))))
+        .flat_map(|(i, c)| recorded(c).filter(|r| !retracted(&r.0)).map(move |r| (i, (r.1, r.2))))
         .collect();
     // Snapshots two concurrent commands rewrote differently: a divergent
     // change, nothing follows either, so they stay where they are, with
@@ -1030,7 +1046,7 @@ fn check_rewrites_followed(cmds: &[RwCmd], repo: &Repo, at: &str) -> Result<(), 
     // revisit that when one is taken back later (only a later merge with
     // both still to merge would see it).
     let landed: Vec<(usize, (ObjectId, ObjectId))> =
-        cmds.iter().enumerate().filter(|(_, c)| c.landed.is_some()).flat_map(|(i, c)| c.rewrites.iter().map(move |r| (i, (r.1, r.2)))).collect();
+        cmds.iter().enumerate().filter(|(_, c)| c.landed.is_some()).flat_map(|(i, c)| recorded(c).map(move |r| (i, (r.1, r.2)))).collect();
     let concurrent = |i: usize, j: usize| cmds[i].landed.unwrap() >= cmds[j].forked && cmds[j].landed.unwrap() >= cmds[i].forked;
     // Or two that both still stand (a command that saw the first rewrote
     // the old version again: two versions of one change).
@@ -1092,7 +1108,7 @@ fn check_rewrites_followed(cmds: &[RwCmd], repo: &Repo, at: &str) -> Result<(), 
                 !cmds.iter().any(|j| {
                     saw(j)
                         && (j.writes.iter().any(|(k2, w)| w.is_some_and(|w| versions.contains(&w.0)) || (k2 == *k && w.is_some_and(|w| at_or_above(old, &w.0))))
-                            || j.rewrites.iter().any(|(_, _, n)| versions.contains(n)))
+                            || recorded(j).any(|(_, _, n)| versions.contains(n)))
                 })
             })
             .map(|(k, v)| format!("{k:?}={}", v.0.short()))
@@ -1101,6 +1117,7 @@ fn check_rewrites_followed(cmds: &[RwCmd], repo: &Repo, at: &str) -> Result<(), 
     }
     Ok(())
 }
+
 
 /// The model check of auto-rebase through concurrent merges (op log merges
 /// review): `nw` writers commit in their own workspaces, any command
@@ -1258,23 +1275,26 @@ fn check_rewrites_follow_through_merges(disk: bool, nw: usize, undo: bool, old_r
         }
         // The operations this command wrote (not the merge it opened with).
         let mine = repo.ops().split(&[repo.op_id()], &[start]).unwrap().only_a;
-        let mut rewrites = Vec::new();
+        let (mut rewrites, mut reapplied) = (Vec::new(), Vec::new());
         for id in &mine {
             let op = repo.ops().get(id).unwrap();
             if let Some(u) = op.undo_of {
                 retracts.push(u);
             }
-            if kind < 8 && !op.is_merge() {
+            if !op.is_merge() {
                 for (old, new) in op.rewritten {
                     if let [n] = new.as_slice() {
-                        rewrites.push((*id, old, *n));
+                        match kind < 8 {
+                            true => rewrites.push((*id, old, *n)),
+                            false => reapplied.push((*id, old, *n)),
+                        }
                     }
                 }
             }
         }
         let writes = writes(&before, repo.view());
         drop(repo);
-        cmds.push(RwCmd { forked: clock, landed: None, ops: mine.into_iter().collect(), rewrites, retracts, writes, what });
+        cmds.push(RwCmd { forked: clock, landed: None, ops: mine.into_iter().collect(), rewrites, reapplied, retracts, writes, what });
         pending.push((fork, heads, Some(cmds.len() - 1), slots));
     }
     let end = steps.len() + 1;
@@ -1383,10 +1403,17 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: review_cases(64), failure_persistence: None, ..ProptestConfig::default() })]
 
     /// The same with `vl undo` and `vl op restore` among the commands, and
-    /// describes concurrent with each other (BUG-1403's reproduction; what
-    /// it still finds, now and then, is BUG-1444).
+    /// describes concurrent with each other (BUG-1403's reproduction, and
+    /// BUG-1444's). Two causes of what it found are fixed (BUG-1444's
+    /// row: a snapshot that followed a rewrite onto a replacement the
+    /// merge's rebase never walked; the check itself, which did not know
+    /// the rewrites an undo or op restore records). It still fails on
+    /// fresh seeds, about 1 in 60 at this length and more in long runs: an
+    /// undo of an op restore puts a describe back in force and nothing
+    /// moves what was put on its old version meanwhile (BUG-2640), and the
+    /// long runs find more (BUG-2641).
     #[test]
-    #[ignore = "BUG-1444: undo, op restore and concurrent describes: the merge and the model still disagree now and then on whether a rewrite stands (25 replays in 60 on fresh seeds)"]
+    #[ignore = "BUG-2640: an undo of an op restore puts a rewrite back in force, and what was put on its old snapshot meanwhile stays there (about 1 seed in 60; BUG-2641 in long runs)"]
     fn bug_1444_rewrites_follow_with_undo_restore_and_concurrent_describes(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), steps(20, 100))) {
         check_rewrites_follow_through_merges(false, nw, true, false, &steps)?;
     }
@@ -2326,9 +2353,15 @@ fn bug_1489_the_model_check_accepts_a_loser_a_restore_took_back() {
 /// BUG-1488 in place: a described snapshot is still visible below a
 /// workspace and a head in a command's view. The input proptest shrank
 /// to; the failure depends on more than the input (random identities
-/// and change ids), so it is replayed and must pass every time.
+/// and change ids), so it is replayed and must pass every time. Traced
+/// (BUG-1444): an op restore brings back a working copy that a concurrent
+/// commit had snapshotted and committed; the restored ref follows those
+/// rewrites to the commit, which no ref of the merged view showed, so the
+/// merge's rebase never walked it and left it on a parent a describe had
+/// rewritten since (two settlers' rebases of the commit, one made from
+/// describes the restore took back, kept it from following either). It
+/// failed 14 to 18 replays in 60.
 #[test]
-#[ignore = "BUG-1534: the BUG-1444 model check (undo, op restore, concurrent describes) still fails at its default length on fresh seeds"]
 fn bug_1534_rewrites_follow_with_undo_restore_and_concurrent_describes_replayed() {
     let steps: Vec<u16> = vec![
         23264, 46812, 38543, 15785, 26640, 15929, 21122, 9261, 54694, 11624, 56747, 56534, 64520, 9806, 37357, 49583, 3432, 36839, 15965, 10860, 60463, 16525, 40514,
@@ -2343,6 +2376,257 @@ fn bug_1534_rewrites_follow_with_undo_restore_and_concurrent_describes_replayed(
         }
     }
     assert!(failed.is_empty(), "{} replays in 60 failed; the first: {:?}", failed.len(), failed.first());
+}
+
+/// BUG-1444: the input its model check shrank to at seed 5 (three writers;
+/// no undo or restore takes part in the failure), up to the step that
+/// failed: its first 54 steps. A describe's new version follows its
+/// parent's rewrite onto a settler's rebased copy that no ref shows any
+/// more, on a version a concurrent describe of the line's first commit
+/// replaced; the rebase never walked the copy, and the replaced version
+/// stayed visible below it
+/// (`bug_1444_what_follows_a_rewrite_lands_on_a_current_snapshot` is that
+/// shape built by hand). It failed 104 replays in 150; replayed, it must
+/// pass every time. (The 28 steps after it reach BUG-2640's cause now and
+/// then: 1 replay in 300.)
+#[test]
+fn bug_1444_rewrites_follow_with_concurrent_describes_replayed() {
+    let steps: Vec<u16> = vec![
+        12675, 1612, 47070, 57123, 55165, 16163, 44657, 21442, 48616, 10224, 34716, 24770, 33690, 66, 7935, 50658, 60607, 17734, 18538, 62880, 28974, 49248, 22749,
+        35142, 22639, 15344, 8869, 57450, 62616, 42820, 57182, 46600, 55180, 45484, 28880, 64079, 39401, 52162, 775, 38990, 31215, 63410, 58254, 28812, 2127, 15756,
+        11632, 4398, 49360, 42369, 41814, 33868, 65244, 21467,
+    ];
+    let mut failed = Vec::new();
+    for n in 0..40 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 3, true, false, &steps) {
+            failed.push((n, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 40 failed; the first: {:?}", failed.len(), failed.first());
+}
+
+/// BUG-1444, one of its two causes, built by hand: what follows a rewrite
+/// must land on a current snapshot. `A` is committed in `w`; `B` and `C` on
+/// it in `v`. A describe of `A` that saw neither (`A1`) is merged with them
+/// by a settler, which rebases `B` (`B'`) and `C` onto `A1`. Meanwhile a
+/// describe of `C` that never saw `A1` makes `C2` (on `B`), and a describe
+/// of `A1` that never saw `B` makes `A2`. In the last merge the describe's
+/// `C2` stands (the settler's rebase of `C` is no version), and `C2`
+/// follows its parent's rewrite `B` → `B'`. Nothing shows `B'` any more
+/// (the settler's rebased working copy gave way to the describe's), so the
+/// rebase never walked it: `B'` stayed on `A1`, which `A2` replaced, and
+/// `C2` was put on it, `A1` visible below. The replacement is part of the
+/// rebase: `B'` moves onto `A2` first. Run until each of the three heads
+/// was merged last (the fold order is by operation id).
+#[test]
+fn bug_1444_what_follows_a_rewrite_lands_on_a_current_snapshot() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let commit = |repo: &mut Repo, ws: &str, file: &str| -> ObjectId {
+        repo.set_command_workspace(Some(ws.into()));
+        let ov = repo.workspace_overlay(ws).unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace(ws, &ov).unwrap();
+        repo.commit_working_copy(ws, file).unwrap().0
+    };
+    let mut last: std::collections::HashSet<&str> = Default::default();
+    for _ in 0..200 {
+        let truth = Device::new(false);
+        let a = {
+            let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+            repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+            commit(&mut repo, "w", "a")
+        };
+        let h0 = op_heads(&*truth.fs);
+        // The describe of `a` that never saw `b` and `c`.
+        let d1 = truth.fork(&h0);
+        let a1 = open(&d1).describe(a, "a1").unwrap();
+        let c = {
+            let mut repo = open(&truth);
+            repo.create_workspace("v", vec![a]).unwrap();
+            commit(&mut repo, "v", "b");
+            commit(&mut repo, "v", "c")
+        };
+        let h1 = op_heads(&*truth.fs);
+        // The describe of `c` that never saw `a1`.
+        let d3 = truth.fork(&h1);
+        let (c2, d3_op) = {
+            let mut repo = open(&d3);
+            let c2 = repo.describe(c, "c2").unwrap();
+            (c2, repo.op_id())
+        };
+        truth.land(&d1, &h0);
+        let h2 = op_heads(&*truth.fs);
+        assert_eq!(h2.len(), 2, "the commits and the describe of a");
+        // The describe of `a1` that never saw `b` and `c`.
+        let d1_head: Vec<String> = h2.iter().filter(|h| !h1.contains(h)).cloned().collect();
+        assert_eq!(d1_head.len(), 1);
+        let d4 = truth.fork(&d1_head);
+        let (a2, d4_op) = {
+            let mut repo = open(&d4);
+            let a2 = repo.describe(a1, "a2").unwrap();
+            (a2, repo.op_id())
+        };
+        // The settler: `b` and `c` onto `a1`.
+        let m = truth.fork(&h2);
+        let m_op = {
+            let repo = open(&m);
+            assert_eq!(repo.heads().len(), 1, "the settler merged");
+            let merge = repo.ops().get(&repo.op_id()).unwrap();
+            let b1 = merge.rewritten.get(&repo.snapshot(&c).unwrap().parents[0]).and_then(|n| n.first().copied()).expect("the settler rebased b");
+            assert_eq!(repo.snapshot(&b1).unwrap().parents.clone(), vec![a1], "onto a1");
+            repo.op_id()
+        };
+        truth.land(&m, &h2);
+        truth.land(&d3, &h1);
+        truth.land(&d4, &d1_head);
+        assert_eq!(op_heads(&*truth.fs).len(), 3, "the settler's merge and the two describes");
+        let repo = open(&truth);
+        assert_eq!(repo.heads().len(), 1, "settled");
+        let visible = repo.exact().visible().unwrap();
+        let descs: Vec<String> = visible.iter().map(|s| repo.snapshot(s).unwrap().description.as_str().to_string()).collect();
+        assert!(visible.contains(&a2), "a2 {} visible: {descs:?}", a2.short());
+        assert!(!visible.contains(&a1) && !visible.contains(&a), "an old version of a is still visible: {descs:?}");
+        // The described `c`, moved with `b` onto `a2`.
+        let cs: Vec<ObjectId> = visible.iter().copied().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "c2").collect();
+        assert_eq!(cs.len(), 1, "one c2 ({}): {descs:?}", c2.short());
+        let b_now = repo.snapshot(&cs[0]).unwrap().parents[0];
+        assert_eq!(repo.snapshot(&b_now).unwrap().description.as_str(), "b");
+        assert_eq!(repo.snapshot(&b_now).unwrap().parents.clone(), vec![a2], "b on a2");
+        last.insert(match [m_op, d3_op, d4_op].iter().max().unwrap() {
+            x if *x == m_op => "the settler",
+            x if *x == d3_op => "the describe of c",
+            _ => "the describe of a1",
+        });
+        if last.len() == 3 {
+            break;
+        }
+    }
+    assert_eq!(last.len(), 3, "each head merged last once: {last:?}");
+}
+
+/// BUG-2640 (found while fixing BUG-1444, by its model check: seed 50, and
+/// seed 109 of the long runs, each failing every replay): an undo of an op
+/// restore puts back in force the commands the restore took back, and
+/// nothing applies their rewrites to what was put on the old snapshots
+/// meanwhile. `A` is committed in `w`. A describe of `A` (`A1`) lands; an
+/// op restore to before it takes it back (`A` stands again); a commit `C`
+/// made on `A` by a command that saw neither lands, and its merge with
+/// the restore rightly leaves it on `A`. Then `vl undo` undoes the restore:
+/// the describe stands again and its view comes back (`A1`), but `C` stays
+/// on `A`, the version the describe replaced, visible below it. Had the
+/// restore and its undo not happened, the merge of the commit with the
+/// describe would have moved `C` onto `A1`: a restore and its undo must
+/// leave the same result.
+#[test]
+#[ignore = "BUG-2640: an undo of an op restore puts a describe back in force, and a commit put on the old version meanwhile stays there"]
+fn bug_2640_an_undo_of_a_restore_reapplies_the_rewrites_it_puts_back_in_force() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let commit = |repo: &mut Repo, ws: &str, file: &str| -> ObjectId {
+        repo.set_command_workspace(Some(ws.into()));
+        let ov = repo.workspace_overlay(ws).unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace(ws, &ov).unwrap();
+        repo.commit_working_copy(ws, file).unwrap().0
+    };
+    let truth = Device::new(false);
+    let (a, before) = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        repo.create_workspace("v", vec![repo.root_id()]).unwrap();
+        let a = commit(&mut repo, "w", "a");
+        (a, repo.op_id())
+    };
+    let h0 = op_heads(&*truth.fs);
+    // The commit on `a`, by a command that sees neither the describe nor
+    // the restore.
+    let k = truth.fork(&h0);
+    commit(&mut open(&k), "w", "c");
+    let a1 = open(&truth).describe(a, "a1").unwrap();
+    {
+        let mut repo = open(&truth);
+        repo.restore_operation(before).unwrap();
+        assert!(repo.exact().visible().unwrap().contains(&a), "the restore brought a back");
+    }
+    let h1 = op_heads(&*truth.fs);
+    truth.land(&k, &h0);
+    assert_eq!(op_heads(&*truth.fs).len(), 2, "the restore and the commit");
+    let _ = h1;
+    {
+        let mut repo = open(&truth);
+        assert_eq!(repo.heads().len(), 1, "settled");
+        let c: Vec<ObjectId> = repo.exact().visible().unwrap().into_iter().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "c").collect();
+        assert_eq!(c.len(), 1, "one commit c");
+        assert_eq!(repo.snapshot(&c[0]).unwrap().parents.clone(), vec![a], "on a: the describe is taken back");
+        // Undo the restore (in a workspace that did nothing since).
+        repo.set_command_workspace(Some("v".into()));
+        let (_, what) = repo.undo_keeping_edits("v").unwrap();
+        assert!(what.starts_with("restore to operation"), "the undo undid the restore: {what}");
+    }
+    let repo = open(&truth);
+    let visible = repo.exact().visible().unwrap();
+    let descs: Vec<String> = visible.iter().map(|s| repo.snapshot(s).unwrap().description.as_str().to_string()).collect();
+    assert!(visible.contains(&a1), "the describe is back in force: {descs:?}");
+    assert!(!visible.contains(&a), "the version the describe replaced is still visible: {descs:?}");
+    let c: Vec<ObjectId> = visible.iter().copied().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "c").collect();
+    assert_eq!(c.len(), 1, "one commit c: {descs:?}");
+    assert_eq!(repo.snapshot(&c[0]).unwrap().parents.clone(), vec![a1], "the commit on a1");
+}
+
+/// BUG-2642 (found by the fresh-seed runs of BUG-1444's fix, seed 5; as
+/// often on the engine before it): the every-write model check with `vl
+/// undo` and `vl op restore` (`bug_1295_every_write_survives_with_undo_and_
+/// restore`, which runs in the default suite at the pinned seed) reports a
+/// conflict's losing tag target dropped. The input it shrank to (86 steps,
+/// three writers), not traced: it fails 8 to 11 replays in 150.
+#[test]
+#[ignore = "BUG-2642: the every-write model check with undo and op restore reports a conflict's losing tag target dropped on a fresh seed (not traced)"]
+fn bug_2642_every_write_survives_with_undo_and_restore_replayed() {
+    let steps: Vec<u16> = vec![
+        39438, 46179, 13977, 5347, 24046, 6292, 64970, 30544, 13397, 31427, 35815, 59922, 8737, 31656, 39721, 24544, 12840, 6634, 10893, 29748, 2557, 33089, 37837,
+        54196, 51187, 43346, 29386, 23386, 53874, 23382, 27948, 4455, 55573, 15444, 11015, 42999, 31369, 31381, 35518, 54789, 40661, 43582, 49445, 43039, 59977,
+        22963, 16514, 35358, 56444, 13409, 57453, 43064, 18169, 57752, 17261, 46911, 34575, 54112, 29340, 33762, 18110, 58763, 6829, 15614, 44645, 28325, 50918,
+        31018, 60092, 46970, 44895, 61472, 38092, 9040, 11481, 17975, 31384, 29970, 49371, 60078, 19215, 55195, 34185, 45230, 8229, 9004,
+    ];
+    let mut failed = Vec::new();
+    for n in 0..150 {
+        if let Err(e) = check_every_write_survives(false, 3, true, true, &steps) {
+            failed.push((n, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 150 failed; the first: {:?}", failed.len(), failed.first());
+}
+
+/// BUG-2641: the long runs (120 to 300 steps) of BUG-1444's model check
+/// still fail on fresh seeds after its fixes and with BUG-2640's cause
+/// known: 6 seeds in 16. This is the input of seed 107 (244 steps, two
+/// writers), not traced: a describe's old version still visible below a
+/// head in a command's view. It fails about 16 replays in 30, as often on
+/// the engine before BUG-1444's fixes.
+#[test]
+#[ignore = "BUG-2641: the long runs of the undo, op restore and concurrent describes model check still fail on fresh seeds (not traced)"]
+fn bug_2641_rewrites_follow_with_undo_restore_in_long_runs_replayed() {
+    let steps: Vec<u16> = vec![
+        33417, 15452, 58658, 19228, 1610, 57910, 14223, 50835, 37183, 61744, 14153, 13786, 1230, 54063, 32812, 40437, 29068, 62093, 21566, 27474, 10962, 18173, 37637,
+        60058, 38671, 45702, 10491, 9341, 2111, 23845, 58850, 15853, 35167, 49343, 13819, 26979, 63827, 62, 20515, 32936, 59727, 9577, 4944, 63518, 28188, 49975,
+        35600, 3699, 30974, 33755, 55374, 50674, 26741, 62995, 13558, 27664, 33468, 43274, 63652, 59526, 36955, 51381, 12215, 3626, 8023, 63735, 21513, 27951, 55129,
+        60311, 58906, 47853, 22686, 4323, 64166, 55680, 6653, 3936, 21851, 42671, 30254, 29911, 11021, 32792, 27769, 63708, 6467, 29885, 19528, 1929, 21932, 26368,
+        41894, 44293, 3528, 54503, 21461, 60099, 22153, 17798, 57402, 57143, 6519, 7950, 19235, 10168, 40225, 54197, 61699, 4134, 32242, 56645, 40392, 15854, 59749,
+        12361, 19645, 3509, 30522, 9811, 22576, 26154, 18715, 65342, 12663, 2449, 9339, 26642, 49280, 28327, 8779, 38076, 20421, 25190, 22650, 27055, 40707, 35255,
+        33875, 56357, 46226, 35075, 25030, 3645, 38480, 20716, 53509, 16545, 43683, 26432, 32845, 43583, 44313, 21511, 45984, 61380, 48258, 16504, 52796, 48456,
+        58875, 10606, 61688, 26159, 7797, 53380, 49998, 49610, 33691, 60874, 47103, 9496, 59315, 32497, 2325, 26905, 56055, 34270, 58840, 60493, 27387, 1374, 16656,
+        34590, 65066, 32323, 20226, 8587, 12488, 2367, 15815, 5991, 24998, 31620, 25796, 9186, 6095, 38109, 17448, 7847, 51362, 16243, 55897, 5101, 23469, 49318,
+        38635, 34406, 19398, 63599, 46645, 64256, 37020, 62207, 22930, 31560, 16971, 146, 29663, 17391, 47992, 52538, 6239, 21016, 27041, 26540, 44186, 18821, 26776,
+        17624, 18969, 13551, 8665, 62352, 14209, 5280, 5007, 29780, 29492, 25606, 56642, 42427, 53599, 35995,
+    ];
+    let mut failed = Vec::new();
+    for n in 0..30 {
+        if let Err(e) = check_rewrites_follow_through_merges(false, 2, true, false, &steps) {
+            failed.push((n, e.to_string()));
+        }
+    }
+    assert!(failed.is_empty(), "{} replays in 30 failed; the first: {:?}", failed.len(), failed.first());
 }
 
 /// BUG-2464, the second way: a describe of `X` runs concurrently with a

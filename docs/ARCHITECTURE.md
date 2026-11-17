@@ -2576,6 +2576,23 @@ take no lock:
   on whether the two rewrites first meet in one fold step (the second
   replaces the first) or not (divergent); the intended rule is
   divergence while both versions are visible.
+  **Whatever follows a rewrite lands on a current snapshot** (BUG-1444,
+  BUG-1534): a side's rewrite can name a replacement that no ref of the
+  merged view shows (a settler's rebased copy whose head the views'
+  merge dropped; the commit that a working copy, brought back by an op
+  restore, was snapshotted into), sitting on a parent rewritten since.
+  A ref, or a parent of a snapshot the rebase may move, that a rewrite
+  resolves to such a replacement makes it part of the merge's rebase,
+  with its ancestors: it is rebased first, in dependency order (a
+  replacement can have a higher generation than the children of what
+  it replaces), and what follows the rewrite lands on the result. A
+  command's own rebase is unchanged: its replacements are where the
+  command put them (the server's version of a change, a projection).
+  Open: an undo of an op restore (or of an undo) puts rewrites back in
+  force that nothing applies to what was put on their old snapshots
+  meanwhile (BUG-2640), and in a fold of three or more heads the
+  merged view of the heads folded so far, not rebased yet, can be
+  taken for a side that brought an old snapshot back (BUG-2641).
   The confinement check runs against **every side's view**: a rewrite that
   would move a change out of an unreleased embargo either side had it in
   is dropped and its replacement rewritten back, so the change stays
