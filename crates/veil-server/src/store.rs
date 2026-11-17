@@ -1060,20 +1060,7 @@ impl Objects {
     /// after (BUG-1399). Its index is held under a share of the server's
     /// bound on indexes (BUG-1496), taken before it is built.
     pub async fn put_pack(&self, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Held)> {
-        Ok(self.write_pack(project, objects, true, Some(person), &[]).await?.expect("recorded: nothing it depends on"))
-    }
-
-    /// [`Objects::put_pack`], only while every branch of `tips` (its name
-    /// and target; `None`: no such branch) is as given: else `None`, with
-    /// nothing recorded and nothing written
-    /// (`pack::Packs::record_staged_by`). For a pack whose transaction lists
-    /// it only by a compare-and-swap of those branches: one that has lost
-    /// already costs no pack row, no storage write and no discard (an API
-    /// commit, BUG-1948; BUG-2370). A branch that moves after the row is
-    /// recorded is the transaction's to find, and the pack its caller's to
-    /// discard, as before.
-    pub async fn put_pack_on(&self, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>, tips: &[(String, Option<String>)]) -> Result<Option<(Arc<str>, Held)>> {
-        self.write_pack(project, objects, true, Some(person), tips).await
+        self.write_pack(project, objects, true, Some(person)).await
     }
 
     /// Write `objects` as one staged pack of `project` for a merge or
@@ -1084,31 +1071,28 @@ impl Objects {
     /// requests' own objects out (under the background merges of the
     /// many-branch run, the store's reads went from 4 to 57 a push).
     pub async fn put_job_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Held)> {
-        Ok(self.write_pack(project, objects, true, None, &[]).await?.expect("recorded: nothing it depends on"))
+        self.write_pack(project, objects, true, None).await
     }
 
     /// [`Objects::put_pack`]; when `record` is set, the pack is recorded
-    /// staged before it is written, only while `tips` hold
-    /// ([`Objects::put_pack_on`]): `None` when they do not.
-    async fn write_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>, record: bool, staged_by: Option<i64>, tips: &[(String, Option<String>)]) -> Result<Option<(Arc<str>, Held)>> {
+    /// staged before it is written.
+    async fn write_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>, record: bool, staged_by: Option<i64>) -> Result<(Arc<str>, Held)> {
         let share = self.packs.bound().take_for(Some(project), Index::write_weight_of(objects.len()) as u64).await?;
         let name: Arc<str> = crate::pack::new_name().into();
-        // Cached once the pack is recorded (the bytes are shared, not copied).
-        let cached: Vec<(ObjectId, Bytes)> = if staged_by.is_some() { objects.clone() } else { Vec::new() };
+        if staged_by.is_some() {
+            for (id, enc) in &objects {
+                self.cache.insert(Self::staged_key(project, &name, id, false), enc.clone(), enc.len());
+            }
+        }
         let (bytes, index) = crate::pack::build(objects)?;
         let size = bytes.len() as u64;
         if record {
-            if !self.packs.record_staged_by(project, staged_by, &name, size, index.len(), tips).await? {
-                return Ok(None);
-            }
+            self.packs.record_staged_by(project, staged_by, &name, size, index.len()).await?;
             bump(&self.pack_rows);
-        }
-        for (id, enc) in &cached {
-            self.cache.insert(Self::staged_key(project, &name, id, false), enc.clone(), enc.len());
         }
         count_write(self, size as usize);
         self.store.put(&crate::pack::key(project, &name), bytes).await?;
-        Ok(Some((name, Held::new(Arc::new(index), size, share))))
+        Ok((name, Held::new(Arc::new(index), size, share)))
     }
 
     /// Stage `objects` (checked encodings `person` uploaded) as one pack,
@@ -1121,7 +1105,7 @@ impl Objects {
         if let Some(name) = self.packs.staged_holding(project, person, &ids).await? {
             return Ok(name);
         }
-        let (name, held) = self.write_pack(project, objects, true, Some(person), &[]).await?.expect("recorded: nothing it depends on");
+        let (name, held) = self.write_pack(project, objects, true, Some(person)).await?;
         self.packs.staged_here(project, person, &name, held);
         Ok(name)
     }

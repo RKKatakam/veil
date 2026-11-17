@@ -1751,3 +1751,76 @@ fn embargoed_stack_across_guess_windows_stays_on_hidden_line_until_release_and_p
     }
 }
 
+/// BUG-2370: a push that loses its race in its transaction discards the
+/// pack of its own that it wrote (what the server made for it). Eight
+/// pushes race onto one tip, five rounds: each round exactly one lands and the others
+/// are told to pull and push again; afterwards the only packs still staged
+/// are uploads (kept for the next try, BUG-1157), no discarded pack is
+/// still stored, every pack in storage has a row, and the tip holds
+/// exactly the winners' files.
+#[test]
+fn bug_2370_racing_pushes_leave_no_pack_of_their_own_behind() {
+    use std::collections::HashSet;
+    const RACERS: usize = 8;
+    const ROUNDS: usize = 5;
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let mut uploads: HashSet<String> = HashSet::new();
+    let mut winners = Vec::new();
+    for round in 0..ROUNDS {
+        // Every racer's push is made on the same tip, then all are sent at once.
+        let crafted: Vec<_> = (0..RACERS)
+            .map(|i| {
+                let mut c = Craft::new(&api, &p.dev, &p.name, "main");
+                c.file(&format!("src/race/r{round}_{i}.rs"), &format!("round {round}, racer {i}\n"));
+                let s = { let t = c.tip; snap(&mut c, vec![t], &format!("round {round}, racer {i}"), None) };
+                let (map, pack) = upload_all(&api, &c);
+                (c.token.clone(), c.tip, s, map, pack)
+            })
+            .collect();
+        uploads.extend(crafted.iter().map(|c| c.4.clone()));
+        let answers: Vec<(u16, bool, String)> = std::thread::scope(|sc| {
+            let handles: Vec<_> = crafted
+                .iter()
+                .map(|(token, tip, s, map, _)| {
+                    let (hub, name) = (&hub, &p.name);
+                    sc.spawn(move || {
+                        let r = push_body(&hub.api(), token, name, *tip, *s, map);
+                        let body = String::from_utf8_lossy(&r.body).to_string();
+                        (r.status, r.status == 200 && r.json()["results"][0]["ok"] == json!(true), body)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let won: Vec<usize> = answers.iter().enumerate().filter(|(_, a)| a.1).map(|(i, _)| i).collect();
+        assert_eq!(won.len(), 1, "round {round}: exactly one push lands: {answers:?}");
+        for (i, (status, ok, body)) in answers.iter().enumerate() {
+            if !ok {
+                assert!(*status == 409 || (*status == 200 && body.contains("moved")), "round {round}, racer {i}: a lost race is told so: {status} {body}");
+            }
+        }
+        winners.push((round, won[0]));
+    }
+    settle(&hub);
+    let h = hub.hub();
+    let rows: Vec<(String, i16)> = hub.rt.block_on(sqlx::query_as("SELECT name, state FROM packs WHERE project_id = $1").bind(pid).fetch_all(&h.db)).unwrap();
+    let staged_own: Vec<&String> = rows.iter().filter(|(n, st)| *st == 0 && !uploads.contains(n)).map(|(n, _)| n).collect();
+    assert!(staged_own.is_empty(), "a push's own pack was left staged: {staged_own:?}");
+    for (n, _) in rows.iter().filter(|(_, st)| *st == 2) {
+        assert!(!hub.rt.block_on(h.objects.blob_store().exists(&veil_server::pack::key(pid, n))).unwrap(), "discarded pack {n} is still stored");
+    }
+    assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "packs in storage with no row");
+    let token = p.dev.token();
+    for round in 0..ROUNDS {
+        for i in 0..RACERS {
+            let there = read_file(&api, &token, &p.name, &format!("src/race/r{round}_{i}.rs"));
+            match winners.contains(&(round, i)) {
+                true => assert_eq!(there.as_deref(), Some(format!("round {round}, racer {i}\n").as_bytes()), "round {round}: the winner's file"),
+                false => assert_eq!(there, None, "round {round}, racer {i}: a push that lost left its file on the branch"),
+            }
+        }
+    }
+}

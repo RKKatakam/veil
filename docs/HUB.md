@@ -2968,20 +2968,21 @@ Nothing changes for `vl` or on the wire.
   (not after a lost race: the caller may try again with the same receipts).
   **What it made is one pack, listed by its transaction** (BUG-1948,
   `changes.rs` `store_packed`; it was stored one object at a time before
-  its checks, some seven storage writes where a push makes one, also for
-  an attempt that then lost its race): its checks read what it made from
-  memory (`sync::Staged::holding`), and its commit writes the pack, staged
-  for the caller, **only while the branch it moves is still where the move
-  expects it** (decided in the statement that records the pack,
-  `Objects::put_pack_on`: an attempt that has lost already records and
-  writes nothing, and runs again as after a lost race), lists it in the
-  commit's transaction (its last statement: every pack, or the commit is
-  answered `conflict` and runs again), enters it in this server's lookup
-  map, and discards it when the transaction fails. A change kept whatever
-  becomes of its move (`keep_on_loss`) is written without that condition.
-  A change of more than 8 MiB (`changes::PACKED_BYTES`) is stored one object
-  at a time before its checks, as before; so are the changes a commit
-  restacks (`restack`).
+  its checks, some seven storage writes where a push makes one): its checks
+  read what it made from memory (`sync::Staged::holding`), and its commit
+  writes the pack, staged for the caller, lists it in the commit's
+  transaction (its last statement: every pack, or the commit is answered
+  `conflict` and runs again), enters it in this server's lookup map, and
+  discards it when the transaction fails. **Stored one object at a time
+  before its checks, as before:** a commit that races other commits for
+  its branch on this server (`changes::Moving`: past a branch's capacity
+  most tries lose after their objects are stored, and a pack lost that way
+  is a row, a write and a discard, two commits and two storage requests a
+  try, where loose objects cost no commit: BUG-2370; a commit that moves no
+  branch, or queues a landing, cannot lose and always packs; commits racing
+  through other servers are not seen, and cost what a lost pack costs); a
+  change of more than 8 MiB (`changes::PACKED_BYTES`); and the changes a
+  commit restacks (`restack`).
 * **Reads.** `Objects` finds a project's object in its cache, then in the
   indexes of the listed packs this server holds (per project, newest pack
   first, each a sorted array of 48 bytes a slot, searched by bisection;
@@ -3024,8 +3025,9 @@ Nothing changes for `vl` or on the wire.
   queries, search), never 500 and never with an index held outside the
   bound (BUG-1496, BUG-1622). Then
   loose (objects from
-  before S28, and what grants, an API commit of more than 8 MiB, a landing
-  build past `BATCH_BYTES`, the deriver and the search index store). After a miss in both it reads the project's listing again
+  before S28, and what grants, an API commit of more than 8 MiB or racing
+  for its branch, a landing build past `BATCH_BYTES`, the deriver and the
+  search index store). After a miss in both it reads the project's listing again
   (one statement, unless a listing began after the miss: it holds every
   pack listed before) and the indexes of packs it does not know, so a
   server reads what another server's push listed. A push's own packs join

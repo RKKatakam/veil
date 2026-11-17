@@ -664,19 +664,10 @@ async fn commit(
         }
     };
     // What the change made (and anything its checks made), as one pack the
-    // transaction lists: written only while the branch it moves is where
-    // the move expects it, unless the change is kept whatever becomes of
-    // the move (`keep_on_loss`).
+    // transaction lists.
     let packs = match held {
         None => Vec::new(),
-        Some(st) => {
-            let tips: Vec<(String, Option<String>)> = mv.iter().filter(|(_, _, keep)| !keep).map(|(b, cur, _)| (b.clone(), Some(cur.clone()))).collect();
-            match store_packed(hub, pid, person, st.made(), &tips).await? {
-                Some(packs) => packs,
-                // As the transaction would have found.
-                None => return Err(Error::conflict(format!("branch '{}' moved", tips.first().map_or("", |t| t.0.as_str())))),
-            }
-        }
+        Some(st) => store_packed(hub, pid, person, st.made()).await?,
     };
     let pack_names: Vec<Arc<str>> = packs.iter().map(|(n, _)| n.clone()).collect();
     let listing: Vec<String> = pack_names.iter().map(|n| n.to_string()).collect();
@@ -939,16 +930,9 @@ const PACKED_BYTES: usize = 8 << 20;
 
 /// Store `objects` (what an API commit made, canonical encodings) as one
 /// pack of `project` (several past `pack::MAX_OBJECTS`), staged for
-/// `person` until the commit's transaction lists it, only while `tips`
-/// hold (`store::Objects::put_pack_on`): `None`, with nothing left stored,
-/// when a branch moved.
-async fn store_packed(
-    hub: &Arc<Hub>,
-    project: i64,
-    person: i64,
-    objects: Vec<(ObjectId, Bytes)>,
-    tips: &[(String, Option<String>)],
-) -> Result<Option<Vec<(Arc<str>, crate::pack::Held)>>> {
+/// `person` until the commit's transaction lists it; a write that fails
+/// leaves none of them.
+async fn store_packed(hub: &Arc<Hub>, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<Vec<(Arc<str>, crate::pack::Held)>> {
     // Compressed on a blocking thread (the server's own encoding).
     let mut encoded = tokio::task::spawn_blocking(move || objects.into_iter().map(|(id, raw)| (id, crate::store::encode(raw))).collect::<Vec<_>>())
         .await
@@ -957,24 +941,64 @@ async fn store_packed(
     while !encoded.is_empty() {
         let rest = if encoded.len() > crate::pack::MAX_OBJECTS { encoded.split_off(crate::pack::MAX_OBJECTS) } else { Vec::new() };
         // The commit's own storage write (counted as a push's own is).
-        match crate::store::own(hub.objects.put_pack_on(project, person, encoded, tips)).await {
-            Ok(Some((name, mut held))) => {
+        match crate::store::own(hub.objects.put_pack(project, person, encoded)).await {
+            Ok((name, mut held)) => {
                 held.unproject();
                 packs.push((name, held));
             }
-            r => {
-                // A branch moved, or the write failed: the packs written so
-                // far go.
+            Err(e) => {
                 let names: Vec<Arc<str>> = packs.iter().map(|(n, _)| n.clone()).collect();
                 if let Err(d) = hub.objects.discard(project, &names).await {
                     eprintln!("veil-server: discarding what an API commit did not list: {d:#}");
                 }
-                return r.map(|_| None).map_err(Error::Other);
+                return Err(Error::Other(e));
             }
         }
         encoded = rest;
     }
-    Ok(Some(packs))
+    Ok(packs)
+}
+
+/// The API commits moving each branch on this server now, by project and
+/// branch (in this process: a hint, nothing depends on it being exact).
+static MOVING: std::sync::LazyLock<std::sync::Mutex<HashMap<(i64, String), usize>>> = std::sync::LazyLock::new(Default::default);
+
+/// One API commit's place among those moving a branch here, from when it
+/// begins until it is answered. A commit that is the only one stores what
+/// it made as a pack; one that races others stores it one object at a
+/// time, as API commits always did: past a branch's capacity most tries
+/// lose their race after their objects are stored, and a pack lost that
+/// way is a row recorded, a write and a discard (two commits and two
+/// storage requests a try: `scripts/bench-server.sh load`'s `api-hot`
+/// curve went from 7 to 20 to 34 commits a landing with packs for all,
+/// BUG-2370), where objects stored loose cost no commit. Commits racing
+/// through other servers are not seen: they cost what a lost pack costs,
+/// never a wrong answer.
+pub struct Moving((i64, String));
+
+impl Moving {
+    pub fn enter(project: i64, branch: &str) -> Moving {
+        let key = (project, branch.to_string());
+        *MOVING.lock().unwrap().entry(key.clone()).or_default() += 1;
+        Moving(key)
+    }
+
+    /// Is this the only commit moving its branch here now?
+    pub fn alone(&self) -> bool {
+        MOVING.lock().unwrap().get(&self.0).is_some_and(|n| *n == 1)
+    }
+}
+
+impl Drop for Moving {
+    fn drop(&mut self) {
+        let mut m = MOVING.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.0);
+            }
+        }
+    }
 }
 
 /// The real tip of `branch`, if it exists.
@@ -1297,6 +1321,13 @@ pub(crate) async fn create_with(
             }
         }
     }
+    // This commit's place among those moving the branch here, now (none
+    // for a change that moves no branch, or queues a landing: it cannot
+    // lose a race).
+    let moving = match (&onto, &land) {
+        (Some(o), None) => Some(Moving::enter(project.id, &o.branch)),
+        _ => None,
+    };
     let rebase = onto.as_ref().is_some_and(|o| o.expected == Expected::Rebase);
     let mut rebased = 0u32;
     let mut attempts = 0u32;
@@ -1338,10 +1369,13 @@ pub(crate) async fn create_with(
         // from there, and stored by its commit as one pack that the commit's
         // transaction lists (BUG-1948: stored one by one before the checks,
         // a change's blob, trees and snapshots were some seven storage
-        // writes where a push makes one, also for an attempt that then lost
-        // its race). A change of more than `PACKED_BYTES` is stored before
-        // anything reads it, one object at a time, as before.
-        let held = (built.store.iter().map(|(_, b)| b.len()).sum::<usize>() <= PACKED_BYTES).then(|| sync::Staged::holding(built.store.iter().cloned()));
+        // writes where a push makes one). Stored before anything reads it,
+        // one object at a time, as before: a change of more than
+        // `PACKED_BYTES`, and one that races other commits for its branch
+        // (`Moving`: each try that lost would record a pack, write it and
+        // discard it).
+        let packed = built.store.iter().map(|(_, b)| b.len()).sum::<usize>() <= PACKED_BYTES && moving.as_ref().is_none_or(Moving::alone);
+        let held = packed.then(|| sync::Staged::holding(built.store.iter().cloned()));
         if held.is_none() {
             sync::put_all(hub, project.id, built.store.clone()).await?;
         }

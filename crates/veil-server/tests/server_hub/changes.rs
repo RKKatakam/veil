@@ -612,54 +612,65 @@ fn bug_1948_an_api_commit_stores_what_it_made_as_one_pack_its_commit_lists() {
     assert_eq!((f.status, String::from_utf8_lossy(&f.body).to_string()), (200, "packed\n".to_string()));
 }
 
-/// BUG-1948, BUG-2370: a pack is recorded and written only while the
-/// branches its transaction will compare and swap are where it expects
-/// them (`Objects::put_pack_on`): with a branch elsewhere, or one that
-/// should not exist, nothing is recorded and nothing written; with every
-/// branch as given, the pack is staged and stored.
+/// BUG-1948, BUG-2370: an API commit that races another for its branch on
+/// this server stores what it made one object at a time, as API commits
+/// always did (a pack lost to the race would be recorded, written and
+/// discarded: two commits and two storage requests a try); alone on its
+/// branch it stores one pack; and a change that moves no branch stores a
+/// pack whoever else is moving one, since it cannot lose a race.
 #[test]
-fn bug_1948_a_pack_is_written_only_while_the_branches_it_depends_on_hold() {
+fn bug_1948_an_api_commit_racing_another_for_its_branch_stores_as_before() {
     use crate::landing_hold::packs_in;
     use std::sync::atomic::Ordering::Relaxed;
     let hub = TestHub::start();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
+    let token = p.dev.token();
     let h = hub.hub();
-    let target: String = hub.rt.block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'").bind(pid).fetch_one(&h.db)).unwrap();
-    let person: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT person_id FROM project_admins WHERE project_id = $1 LIMIT 1").bind(pid).fetch_one(&h.db)).unwrap();
-    let raw = bytes::Bytes::from(O::Blob(b"guarded pack".to_vec()).encode());
-    let objects = || vec![(ObjectId::hash(&raw), veil_server::store::encode(raw.clone()))];
-    let elsewhere = ObjectId::hash(b"another tip").hex();
-    let (staged_before, writes_before) = (packs_in(&hub, pid, 0), h.objects.writes.load(Relaxed));
-    for (what, tips) in [
-        ("main elsewhere", vec![("main".to_string(), Some(elsewhere.clone()))]),
-        ("main, which exists, expected not to", vec![("main".to_string(), None)]),
-        ("a branch that does not exist expected at a tip", vec![("no-such-branch".to_string(), Some(target.clone()))]),
-        ("one of two elsewhere", vec![("main".to_string(), Some(target.clone())), ("no-such-branch".to_string(), Some(elsewhere.clone()))]),
-    ] {
-        let r = hub.rt.block_on(h.objects.put_pack_on(pid, person, objects(), &tips)).unwrap();
-        assert!(r.is_none(), "{what}: a pack was written");
-        assert_eq!(packs_in(&hub, pid, 0), staged_before, "{what}: a pack was recorded");
-        assert_eq!(h.objects.writes.load(Relaxed), writes_before, "{what}: something was written");
+    let store = h.objects.blob_store();
+    let commit = |path: &str, onto: bool| -> ObjectId {
+        let base = tip_for(&hub, &token, &p.name);
+        let mut body = json!({"base": base.hex(), "description": path, "edits": [put(path, "raced\n")]});
+        if onto {
+            body["onto"] = json!({"branch": "main", "expected": base.hex()});
+        }
+        let r = change(&hub, &token, &p.name, &body);
+        assert_eq!(r.status, 200, "{path}: {}", String::from_utf8_lossy(&r.body));
+        let v = r.json();
+        if onto {
+            assert_eq!(v["branch"]["status"], "ok", "{path}: {v}");
+        }
+        serde_json::from_value(v["snapshot"].clone()).unwrap()
+    };
+    let counts = || (packs_in(&hub, pid, 1).len(), packs_in(&hub, pid, 0).len(), h.objects.own_writes.load(Relaxed));
+    let loose = |id: &ObjectId| hub.rt.block_on(store.exists(&veil_server::store::object_key(pid, id))).unwrap();
+
+    // Another commit is moving `main` here: this one stores loose.
+    let other = veil_server::changes::Moving::enter(pid, "main");
+    let before = counts();
+    let raced = commit("src/raced/a.rs", true);
+    assert_eq!(counts(), before, "a commit racing another listed, staged or wrote a pack");
+    assert!(loose(&raced), "its snapshot is an object of its own, as before");
+    // A change that moves no branch cannot lose a race: one pack.
+    let kept = commit("src/raced/kept.rs", false);
+    assert_eq!(counts(), (before.0 + 1, before.1, before.2 + 1), "a change that moves no branch stores one pack");
+    assert!(!loose(&kept) && stored(&hub, pid, &kept), "and is read from it");
+    // Alone on the branch again: one pack.
+    drop(other);
+    let alone = commit("src/raced/b.rs", true);
+    assert_eq!(counts(), (before.0 + 2, before.1, before.2 + 2), "a commit alone on its branch stores one pack");
+    assert!(!loose(&alone) && stored(&hub, pid, &alone), "and is read from it");
+    for (path, at) in [("src/raced/a.rs", alone), ("src/raced/b.rs", alone), ("src/raced/kept.rs", kept)] {
+        let f = hub.api().get(Some(&token), &format!("/v1/projects/{}/q/file?rev={}&path={path}", p.name, at.hex()));
+        assert_eq!((f.status, String::from_utf8_lossy(&f.body).to_string()), (200, "raced\n".to_string()), "{path}");
     }
-    for (what, tips) in [
-        ("main where it is", vec![("main".to_string(), Some(target.clone()))]),
-        ("main where it is and a branch that is not there", vec![("main".to_string(), Some(target.clone())), ("no-such-branch".to_string(), None)]),
-        ("no branch named", vec![]),
-    ] {
-        let (name, _held) = hub.rt.block_on(h.objects.put_pack_on(pid, person, objects(), &tips)).unwrap().unwrap_or_else(|| panic!("{what}: no pack written"));
-        assert!(packs_in(&hub, pid, 0).iter().any(|n| **n == *name), "{what}: the pack is recorded staged");
-        assert!(hub.rt.block_on(h.objects.blob_store().exists(&veil_server::pack::key(pid, &name))).unwrap(), "{what}: the pack is stored");
-        hub.rt.block_on(h.objects.discard(pid, &[name])).unwrap();
-    }
-    assert_eq!(packs_in(&hub, pid, 0), staged_before, "the packs written here were discarded");
 }
 
 /// BUG-1948: twenty API commits race onto one branch, the server rebasing
-/// each: every one lands, each attempt that lost its race either wrote no
-/// pack or had it discarded and deleted (none is left staged, and every
-/// discarded pack's storage object is gone), and the tip a second server
-/// reads holds every file.
+/// each: every one lands, whichever way each try stored what it made (a
+/// pack when it was alone on the branch, loose when it raced); no pack is
+/// left staged, every discarded pack's storage object is gone, and the tip
+/// a second server reads holds every file.
 #[test]
 fn bug_1948_racing_api_commits_leave_no_pack_behind() {
     use crate::landing_hold::{packs_in, whole_tree_beside};
