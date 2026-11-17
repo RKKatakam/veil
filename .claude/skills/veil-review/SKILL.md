@@ -50,6 +50,10 @@ Agent approvals never stand in for the owner's where the owner is required. The 
 
 **An approval covers one commit.** If the branch changes after review, the new commits get re-reviewed: only the new diff, unless they touch tier A. That includes an agent pushing more work, and **anyone resolving a merge conflict by hand**.
 
+## Step 0.2: diff-triggered reliability checklist
+
+Run `bash scripts/reliability-triggers.sh <base>...<branch>`. Read only the matched `R-NN` items in `docs/RELIABILITY.md` (usually 3–10; 0 on pure doc edits) and answer each matched item's **Check** (`yes` or `no`) with `file:line` evidence in the review report. Any `no` is a candidate finding verified under Step 3.
+
 ## Step 0.5: design conformance (every tier)
 The diff must match `docs/OVERVIEW.md` and `docs/VISIBILITY.md`. Reject anything that:
 - encrypts anything but secret files (code, folders, descriptions, tags, embargoes, attribution);
@@ -152,6 +156,7 @@ Report format:
 Tier: A | B | C (Quick | Standard | Deep)   Branch: <branch> @ <sha>   Base: integration @ <sha>   Cycle: n/3
 Summary: <N> blocking, <M> nits, <P> pre-existing  —  or exactly "No issues found."
 Proofs checked: <claim → verified / false>
+Checklist (<K> matched): <R-NN yes/no (file:line), … — or "none">
 
 1. [critical|important|medium] <class> — crates/…/x.rs:123 — <one sentence>
    Scenario: <input → wrong result>   Verified: <test / transcript / trace>   Fix: <smallest fix for the class>
