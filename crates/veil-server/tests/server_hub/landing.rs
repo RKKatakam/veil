@@ -3110,12 +3110,19 @@ struct HiddenRun {
     url: String,
 }
 
-/// A statement on the database at `url` (a pool of its own).
+/// A statement on the database at `url` (a pool of its own), with no
+/// statement timeout: it drops a test's database of 1.5 million rows, which
+/// took YugabyteDB longer than the server's 15 s under the suite's load and
+/// failed the test before its last assertion (BUG-2633).
 fn sql_at(url: &str, q: String) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let db = veil_server::db::connect(url, 1).await.unwrap();
-        sqlx::raw_sql(&q).execute(&db).await.unwrap();
+        {
+            let mut c = db.acquire().await.unwrap();
+            sqlx::raw_sql("SET statement_timeout = 0").execute(&mut *c).await.unwrap();
+            sqlx::raw_sql(&q).execute(&mut *c).await.unwrap();
+        }
         db.close().await;
     });
 }
