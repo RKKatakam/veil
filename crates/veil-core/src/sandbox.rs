@@ -267,7 +267,9 @@ pub struct ShutDir {
     pub dir: String,
     /// The `--only` paths of the run whose command shut it: what that run
     /// held below the directory is its sandbox's, not output outside its
-    /// paths.
+    /// paths. The last run whose command could write there: a later run
+    /// that finds the directory open and leaves it shut replaces them
+    /// with its own (BUG-2651).
     pub only: Vec<String>,
 }
 
@@ -321,6 +323,14 @@ pub struct Pending {
     /// as such.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unlisted: Vec<String>,
+    /// Directories that could not be listed before the command ran and
+    /// that an earlier command left so (at or below an entry of
+    /// [`Manifest::shut_by_command`], outside its paths). One still
+    /// unlistable after the command was never open to it and keeps the
+    /// paths of the run that shut it; one the command shut itself, after
+    /// someone opened it, takes this run's (BUG-2651).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shut_at_start: Vec<String>,
     /// Isolated files were injected for the command.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub injected: bool,

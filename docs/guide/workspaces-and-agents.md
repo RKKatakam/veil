@@ -483,11 +483,13 @@ a copy of the repository: `vl ws new agent`, then
   into that directory (the whole tree, or `--only` a part of it the
   earlier run did not have), which would record those files, does not
   start, and says what to do: make the directory listable and run once
-  more with the earlier paths, or delete it. One sequence is not covered
-  yet (a known bug, BUG-2651): if a later run with *narrower* paths
-  inside that directory makes it unlistable again, what that run wrote
-  outside its own paths can be recorded by the next run with the earlier
-  paths. Delete such a directory rather than reopening it.
+  more with the earlier paths, or delete it (the message gives the
+  command, to run as it is written). If a later run with *narrower*
+  paths inside that directory makes it unlistable again, the directory
+  counts as that run's: the paths to run once more are then the narrower
+  ones, and everything in the directory outside them is removed and
+  named, including a file the earlier run had written inside its own
+  paths but not yet recorded.
 * **`.veilpolicy` is always there** (the snapshot needs it to classify
   anything). If the command edits it, the new policy applies to every
   file of the workspace, inside the paths or not, as for a full run: a

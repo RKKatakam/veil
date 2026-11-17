@@ -139,6 +139,11 @@ fn show_set(set: Option<&SparseSet>) -> String {
     }
 }
 
+/// A sparse set as `--only` takes it on a command line: `src tests/unit.rs`.
+fn set_args(set: Option<&SparseSet>) -> String {
+    set.map(|s| s.paths().iter().map(|p| safe(p.as_str()).into_owned()).collect::<Vec<_>>().join(" ")).unwrap_or_default()
+}
+
 /// Say which files the command wrote outside the `--only` paths (they are
 /// not recorded).
 fn warn_strays(set: &SparseSet, strays: &[VPath], removed: bool) {
@@ -513,7 +518,7 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     // does, and removes what it can list there.
     m.shut_by_command.retain(|d| VPath::new(&d.dir).is_ok_and(|p| !matches!(fs.metadata(&p), Ok(None))));
     if let Some(shut) = m.shut_by_command.iter().find(|d| d.reached_by(set.as_ref())) {
-        let (d, was) = (&shut.dir, show_set(shut.only_set().as_ref()));
+        let (d, was) = (&shut.dir, set_args(shut.only_set().as_ref()));
         bail!(
             "the sandbox of workspace '{n}' holds {d}, which a command of an earlier `--only {was}` run made unlistable: what is \
              in it was written outside those paths and is not the workspace's, so this run, whose paths reach into it, would \
@@ -530,6 +535,8 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     paths.save_manifest(&m)?;
 
     let was = m.tree.map(|_| m.only.clone());
+    // The directories an earlier command shut that cannot be listed now.
+    let mut shut_at_start = Vec::new();
     let (co, kept, injection) = {
         let _umask = PrivateUmask::set();
         private_dir(&paths.files)?;
@@ -601,7 +608,12 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
                 // its paths, which could not be removed then, and is, like
                 // this command's, once it can be listed (BUG-2200).
                 kept.files.retain(|f| !m.shut_by_command.iter().any(|d| d.covers(f)));
-                kept.unlisted.retain(|(u, _)| !m.shut_by_command.iter().any(|d| d.covers(u)));
+                // And those still unlistable now, which this run's command
+                // cannot have written to unless someone opens them.
+                let (shut, unlisted): (Vec<_>, Vec<_>) =
+                    std::mem::take(&mut kept.unlisted).into_iter().partition(|(u, _)| m.shut_by_command.iter().any(|d| d.covers(u)));
+                kept.unlisted = unlisted;
+                shut_at_start = shut;
                 kept
             }
             None => core::Strays::default(),
@@ -637,6 +649,7 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
         started,
         kept: kept.files.iter().map(|p| p.as_str().to_string()).collect(),
         unlisted: kept.unlisted.iter().map(|(p, _)| p.as_str().to_string()).collect(),
+        shut_at_start: shut_at_start.iter().map(|(p, _)| p.as_str().to_string()).collect(),
         injected: injection.is_some(),
         recorded: None,
     });
@@ -1093,8 +1106,13 @@ fn finish_recording(
         warn_unlisted(set, &found.unlisted, "stays in the sandbox");
         // The directories a command left unlistable, this one or an
         // earlier one: the next sparse run removes what it can list there.
-        // One already known (or below one) keeps the paths of the run
-        // that shut it.
+        // One that was unlistable before this command too (at or below an
+        // entry) was never open to it: it keeps the paths of the run that
+        // shut it. Any other was shut by this command, an entry opened
+        // meanwhile and shut again included: what is in it outside this
+        // run's paths is this command's to lose, so it takes this run's
+        // (which lie inside the entry's, or the run had not started;
+        // BUG-2651).
         m.shut_by_command = found
             .unlisted
             .iter()
@@ -1102,8 +1120,8 @@ fn finish_recording(
             .map(|(u, _)| core::ShutDir {
                 dir: u.as_str().to_string(),
                 only: match m.shut_by_command.iter().find(|d| VPath::new(&d.dir).is_ok_and(|d| u.starts_with(&d))) {
-                    Some(d) => d.only.clone(),
-                    None => set.to_strings(),
+                    Some(d) if p.shut_at_start.iter().any(|s| s == u.as_str()) => d.only.clone(),
+                    _ => set.to_strings(),
                 },
             })
             .collect();

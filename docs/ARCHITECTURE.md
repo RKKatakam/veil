@@ -1841,15 +1841,22 @@ A workspace is only a named pointer in the view. It owns no directory.
   workspace's, does not start while the directory exists, and says how
   to go on (the shutting run's paths once more); a run with those paths,
   or narrower ones, starts. A rebuild does not bring it over, and names
-  it. **Known residue (BUG-2651, open):** an entry that stays, or a
-  directory shut again at or below one, keeps the paths of the *first*
-  run that shut it, though a later, narrower run (allowed to start) may
-  be the one that wrote there: what that run wrote outside its own
-  paths but inside the first run's then counts as held, and a run with
-  the first run's paths records it; and when the narrower run shut a
-  directory the first run held whole, the refusal's own way on is
-  refused. So the rule "what a command writes outside `--only` is never
-  recorded" does not hold for that sequence yet. A directory no command shut
+  it. An entry's paths are those of the last run whose command could
+  write there (BUG-2651). A directory unlistable both before a command
+  (the raw listing, `Pending::shut_at_start`) and after it was not open
+  to that run: its entry, or a new one for a directory below an entry,
+  keeps the earlier paths. (A command could open, write and shut a
+  directory of its own unseen, but a run whose paths below a directory
+  still shut differ from the last run's cannot start: its sync must
+  write or remove files there. So below it such a run holds exactly what
+  the shutting run held.) Any other directory left unlistable was shut
+  by this command, an entry someone opened meanwhile included, and takes
+  this run's paths, which lie inside the entry's or the run had not
+  started. **The price, never silent:** in that last case, unrecorded
+  output of the earlier run inside *its* paths but outside this run's,
+  left in the directory, cannot be told from what this command wrote
+  there; the run that cleans the directory removes it, and names it, as
+  written outside `--only`, and it is not recorded. A directory no command shut
   (unlistable at the listing before a command, and not in
   `shut_by_command`: made so by hand) is kept in `pending` (`unlisted`),
   and files found below it later stay, as files the command did not
