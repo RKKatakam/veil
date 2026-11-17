@@ -3051,7 +3051,7 @@ async fn push_staged(
             }
             if judged.stack.is_empty() {
                 let mut msg = crate::landing::NOTHING_TO_LAND.to_string();
-                let skipped = crate::landing::skipped_warnings(hub, project.id, &u.branch, &judged.skipped).await?;
+                let skipped = crate::landing::skipped_warnings(hub, project.id, &u.branch, &judged.skipped, None).await?;
                 if !skipped.is_empty() {
                     msg = format!("{msg}; {}", skipped.join("; "));
                 }
@@ -3764,7 +3764,7 @@ async fn push_staged(
             }
         };
         let skipped = q.skipped.lock().unwrap().clone();
-        r.warnings.extend(crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped).await?);
+        r.warnings.extend(crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped, None).await?);
         landings.push(r);
     }
     // Derived history data for the public branches moved, in the background:

@@ -2337,7 +2337,7 @@ pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: 
     let r = crate::landing::wait(hub, ask.project.id, me, &q.branch, w, deadline).await?;
     let mut r = crate::landing::seen(hub, &ask.project, &ask.viewer, r).await?;
     let skipped = q.skipped.lock().unwrap().clone();
-    r.warnings.extend(crate::landing::skipped_warnings(hub, ask.project.id, &q.branch, &skipped).await?);
+    r.warnings.extend(crate::landing::skipped_warnings(hub, ask.project.id, &q.branch, &skipped, None).await?);
     use veil_core::hub::land::LandState;
     match r.state {
         // The batch that landed it marked the PR and cleans its source

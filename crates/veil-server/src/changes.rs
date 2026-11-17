@@ -1401,7 +1401,7 @@ pub(crate) async fn create_with(
             if q.stack.is_empty() {
                 let skipped = q.skipped.lock().unwrap().clone();
                 let mut msg = "nothing to land: this change is on the branch already".to_string();
-                let named = crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped).await?;
+                let named = crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped, held.clone()).await?;
                 if !named.is_empty() {
                     msg = format!("{msg}; {}", named.join("; "));
                 }

@@ -206,12 +206,21 @@ pub struct Queued {
 
 /// What an answer says of the changes a stack left out as landed already
 /// with the same edits: never silent.
-pub async fn skipped_warnings(hub: &Arc<Hub>, project: i64, branch: &str, skipped: &[ObjectId]) -> Result<Vec<String>> {
+///
+/// `staged`: what the request holds that is not stored yet (an API
+/// commit's own change, read here before its commit stores it, BUG-1948).
+pub async fn skipped_warnings(
+    hub: &Arc<Hub>,
+    project: i64,
+    branch: &str,
+    skipped: &[ObjectId],
+    staged: Option<Arc<crate::sync::Staged>>,
+) -> Result<Vec<String>> {
     if skipped.is_empty() {
         return Ok(Vec::new());
     }
     let ids = skipped.to_vec();
-    let cids = crate::sync::blocking(hub, project, move |src| ids.iter().map(|x| Ok(src.snapshot(x)?.change_id.to_string())).collect::<Result<Vec<_>>>()).await?;
+    let cids = crate::sync::blocking_staged(hub, project, staged, move |src| ids.iter().map(|x| Ok(src.snapshot(x)?.change_id.to_string())).collect::<Result<Vec<_>>>()).await?;
     Ok(cids.into_iter().map(|c| format!("change {c} already landed on '{branch}' with the same edits: not landed again")).collect())
 }
 
@@ -1058,7 +1067,7 @@ pub async fn submit(
             };
             r.change_id = Some(made.change_id);
             let skipped = q.skipped.lock().unwrap().clone();
-            r.warnings.extend(skipped_warnings(hub, project.id, &q.branch, &skipped).await?);
+            r.warnings.extend(skipped_warnings(hub, project.id, &q.branch, &skipped, None).await?);
             Ok(Ok(seen(hub, project, viewer, r).await?))
         }
         _ => Err(Error::bad_request("a landing names either an uploaded `snapshot`, or `edits` on a `base`")),
