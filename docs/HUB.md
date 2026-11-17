@@ -1150,12 +1150,15 @@ invite join or the person's own vouch. Server lists are hints.
   on YugabyteDB it did not hold writes off), and one a build returned from
   without making it live, ready and valid is dropped and built again at
   once, a bounded number of times (BUG-2571: on YugabyteDB a stage of the
-  build can be lost while the build reports success). On YugabyteDB an
-  index that reads built is then checked against its table
-  (`yb_index_check`), and one that misses a row is dropped and built again
-  within the same bound: a migration is recorded only over an index that
-  passed (BUG-2626: an online build there ended live, ready and valid
-  without the rows other sessions wrote during its backfill). Every
+  build can be lost while the build reports success). On YugabyteDB the
+  indexes a migration built are then checked against their tables
+  (`yb_index_check`), after a wait for every session of the database (one
+  more online build, made for its wait and dropped), and one that misses a
+  row is dropped and built again within the same bound: a migration is
+  recorded only over indexes that passed (BUG-2626: an online build there
+  ended live, ready and valid without the rows a session wrote during its
+  backfill; that session wrote without the index until it took in the
+  build's last stage). Every
   request that fails on a retryable database error (`40001`, a restarted
   read, a catalog changed by DDL on YugabyteDB) before anything it did was
   committed runs again, with capped and jittered backoff, until a 45 s
