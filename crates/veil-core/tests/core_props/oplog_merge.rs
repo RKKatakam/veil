@@ -2664,7 +2664,7 @@ fn bug_2640_a_restore_of_a_restore_seed_34_replayed() {
 /// the describe replaced. Replayed 300 times here, so that it fails most
 /// runs (about 3 in 4).
 #[test]
-#[ignore = "BUG-2641: a settler's recorded rebase that op restores went back past still counts as a version of the snapshot (the whole seed-5 input: about 1 replay in 220)"]
+#[ignore = "BUG-2641: a settler's recorded rebase that op restores went back past still counts as a version of the snapshot (the whole seed-5 input: about 1 replay in 220, so this test still passes about 1 run in 4: a pass alone does not mean it is fixed)"]
 fn bug_2641_a_settlers_rebase_an_op_restore_went_back_past_replayed() {
     let steps: Vec<u16> = vec![
         12675, 1612, 47070, 57123, 55165, 16163, 44657, 21442, 48616, 10224, 34716, 24770, 33690, 66, 7935, 50658, 60607, 17734, 18538, 62880, 28974, 49248, 22749,
