@@ -2667,6 +2667,56 @@ fn bug_2621_a_snapshot_purged_by_the_switch_is_named_again_only_by_uploading_it_
     assert_eq!(r.status, 200, "its file: {}", String::from_utf8_lossy(&r.body).chars().take(300).collect::<String>());
 }
 
+/// BUG-2621 (review, cycle 2): a delete of a loose object is never dropped in
+/// flight. The time a chunk's deletes may take (`LOOSE_DELETE_TIME`) is
+/// looked at between batches; a batch is joined to its end. (A time limit
+/// around the deletes dropped the requests still out when it ran out: one
+/// the store already had was applied later, after the epoch had been raised
+/// and a writer had stored the object again.) One delete here takes longer
+/// than the limit: the pass waits for it, and the object is deleted when
+/// the pass returns.
+#[test]
+fn bug_2621_a_slow_delete_is_joined_to_its_end_never_dropped_in_flight() {
+    use veil_server::pack_gc::{Fault, FaultPoint};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let (slow, slow_raw) = make_blob("SLOW-DELETE-2621\n");
+    hub.rt.block_on(h.objects.put(pid, &slow, slow_raw)).unwrap();
+    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    assert!(!marked.skipped, "the marking pass ran");
+
+    let slept = Arc::new(AtomicBool::new(false));
+    let fault = {
+        let slept = slept.clone();
+        Fault(Arc::new(move |at, id| {
+            let slept = slept.clone();
+            Box::pin(async move {
+                if at == FaultPoint::LooseDelete && id == slow {
+                    tokio::time::sleep(pack_gc::LOOSE_DELETE_TIME + Duration::from_millis(500)).await;
+                    slept.store(true, Relaxed);
+                }
+                Ok(())
+            })
+        }))
+    };
+    let t = Instant::now();
+    let rep = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, fault: Some(fault), ..Options::default() },
+        ))
+        .unwrap();
+    assert!(!rep.skipped, "the pass ran: {rep:?}");
+    assert!(slept.load(Relaxed), "the slow delete ran to its end");
+    assert!(t.elapsed() >= pack_gc::LOOSE_DELETE_TIME, "the pass waited for it: {:?}", t.elapsed());
+    let stored = hub.rt.block_on(h.objects.blob_store().exists(&veil_server::store::object_key(pid, &slow))).unwrap();
+    assert!(!stored, "the object whose delete was slow is deleted when the pass returns: {rep:?}");
+}
+
 /// BUG-2602: what a switch reads from the store while root writers wait is
 /// bounded (`SWITCH_WALK_MAX` objects). A root written as the pass switches
 /// that names more than that gives the switch way, as any root write did

@@ -58,9 +58,9 @@
 //!   found is deleted. Past a bound on that walk under the gate
 //!   ([`SWITCH_WALK_MAX`]), the switch deletes nothing.
 //! * **Loose objects are deleted under the gate too (BUG-2621):** after the
-//!   purge's commit, in chunks ([`LOOSE_DELETE_CHUNK`]), each in a
-//!   transaction that holds the gate, reads the roots again, and raises the
-//!   GC epoch as it commits.
+//!   purge's commit, in chunks ([`delete_loose_chunk`]), each with the gate
+//!   held on a session from the reading of the roots to the GC epoch's
+//!   raise after the last delete.
 //! * **An entry's kind is a claim (BUG-2622):** what a tree names as a file
 //!   is kept as a leaf and not read, and an object so named that the walk
 //!   also meets as a directory or a root is read and expanded.
@@ -163,15 +163,15 @@ pub const SWITCH_WALK_MAX: usize = 256;
 /// switch gives way.
 pub const SWITCH_WALK_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The most loose objects one transaction of a pass deletes from the store
-/// while it holds the root writers' gate (BUG-2621), [`AT_ONCE`] at a time.
+/// The most loose objects a pass deletes from the store in one hold of the
+/// root writers' gate (BUG-2621, [`delete_loose_chunk`]), [`AT_ONCE`] at a
+/// time.
 pub const LOOSE_DELETE_CHUNK: usize = 256;
 
-/// The longest one transaction's deletes of loose objects may take
-/// ([`LOOSE_DELETE_CHUNK`]): past it the rest are left for the next pass,
-/// and the transaction commits what it did (well inside
-/// [`crate::db::TRANSACTION_DEADLINE`], past which it would be rolled back
-/// with objects deleted and the epoch not raised).
+/// How long one chunk's deletes of loose objects go on starting new
+/// batches ([`LOOSE_DELETE_CHUNK`], [`AT_ONCE`] a batch): looked at between
+/// batches, never inside one (a batch is joined to its end, however long
+/// the store takes). Past it the rest are left for the next pass.
 pub const LOOSE_DELETE_TIME: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The most rounds a pass reads the roots again before a switch, outside
@@ -216,10 +216,9 @@ pub struct Options {
     /// committed and before the first of them is deleted from the store
     /// (for a deterministic test of that window, BUG-2621).
     pub before_loose_delete: Option<SwitchHook>,
-    /// Optional hook invoked inside a transaction that deletes loose
-    /// objects, once it holds the root writers' gate and has read the
-    /// roots, before its first delete (for a deterministic test of a
-    /// writer that waits for it, BUG-2621).
+    /// Optional hook invoked in a chunk of loose deletes, once it holds the
+    /// root writers' gate and has read the roots, before its first delete
+    /// (for a deterministic test of a writer that waits for it, BUG-2621).
     pub during_loose_delete: Option<SwitchHook>,
     /// Optional failures of a pass's store requests under a switch's lock
     /// (for tests).
@@ -240,8 +239,12 @@ pub enum FaultPoint {
     /// Before the walk of a switch's transaction reads an object from the
     /// store ([`roots_at_switch`]).
     SwitchRead,
-    /// Before a transaction that deletes loose objects deletes one.
+    /// Before a chunk of loose deletes deletes an object.
     LooseDelete,
+    /// Before each commit of a chunk of loose deletes (its first
+    /// transaction, and each try of the epoch's raise after the deletes):
+    /// an error is that commit's failure.
+    LooseCommit,
 }
 
 /// Async callback that may fail a store request of a GC pass (for tests of
@@ -2133,13 +2136,9 @@ async fn mark_and_sweep_loose(
             (hook.0)().await;
         }
 
-        // The deletes (BUG-2621), in chunks: each in a transaction that
-        // holds the root writers' gate and the epoch row, reads the roots
-        // again ([`roots_at_switch`]: a root committed since the purge
-        // keeps what it names), deletes what is still a candidate, and
-        // raises the epoch as it commits (a writer that waited for it
-        // checks its objects again). Deleted after the purge's commit and
-        // outside any lock, as they were, a writer could find an object
+        // The deletes (BUG-2621), in chunks, each under the root writers'
+        // gate ([`delete_loose_chunk`]). Deleted after the purge's commit
+        // and outside any lock, as they were, a writer could find an object
         // still stored, commit, and lose it to the delete.
         let loose: Vec<ObjectId> = {
             let gc = gc.lock().await;
@@ -2149,122 +2148,210 @@ async fn mark_and_sweep_loose(
         };
         for chunk in loose.chunks(LOOSE_DELETE_CHUNK) {
             hub.limits.derive_turn().await;
-            let chunk: Arc<[ObjectId]> = chunk.into();
-            let packed_too: Arc<HashSet<ObjectId>> = Arc::new(chunk.iter().filter(|id| packed_stored.contains(id)).copied().collect());
-            let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let deleted: Result<Option<(usize, Option<i64>, Option<String>)>> = gc_transaction(hub, |c| {
-                let (hub, gc, chunk, packed_too, started) = (hub.clone(), gc.clone(), chunk.clone(), packed_too.clone(), started.clone());
-                let (hook, fault) = (opts.during_loose_delete.clone(), opts.fault.clone());
-                Box::pin(async move {
-                    lock_gc_epoch_tx(c, project).await?;
-                    let mut gc = gc.lock().await;
-                    if !roots_at_switch(&hub, project, c, &mut gc).await? {
-                        return Ok(None);
-                    }
-                    if let Some(hook) = &hook {
-                        (hook.0)().await;
-                    }
-                    let ids: Vec<ObjectId> = chunk.iter().filter(|id| gc.expired_unreferenced.contains(id)).copied().collect();
-                    if ids.is_empty() {
-                        // Every one is named again: nothing deleted, no
-                        // writer sent back.
-                        return Ok(Some((0, None, None)));
-                    }
-                    // The database first: the marks, and the epoch. After
-                    // the first delete nothing below can fail this
-                    // transaction but its commit, so the epoch is raised
-                    // with every delete made (an error here, before any
-                    // delete, runs the transaction again or ends the pass
-                    // with nothing deleted).
-                    let loose_only: Vec<String> = ids.iter().filter(|id| !packed_too.contains(id)).map(ObjectId::hex).collect();
-                    for chunk in loose_only.chunks(500) {
-                        sqlx::query("DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)")
-                            .bind(project)
-                            .bind(chunk)
-                            .execute(&mut *c)
-                            .await?;
-                    }
-                    let gce = bump_gc_epoch_tx(c, project).await?;
-                    // The deletes: a failed one (or their time running out)
-                    // stops the rest and is answered after the commit. (An
-                    // object left stored lost its mark: the next pass marks
-                    // it again.)
-                    started.store(true, Ordering::SeqCst);
-                    let mut deleted = 0usize;
-                    let mut failed: Option<Error> = None;
-                    let deletes = async {
-                        for ids in ids.chunks(AT_ONCE) {
-                            let mut set = tokio::task::JoinSet::new();
-                            for id in ids {
-                                let (hub, k, id, fault) = (hub.clone(), object_key(project, id), *id, fault.clone());
-                                set.spawn(async move {
-                                    if let Some(fault) = &fault {
-                                        (fault.0)(FaultPoint::LooseDelete, id).await?;
-                                    }
-                                    hub.objects.blob_store().delete(&k).await.map_err(Error::Other)
-                                });
-                            }
-                            while let Some(r) = set.join_next().await {
-                                match r.map_err(|e| Error::Other(e.into())).and_then(|r| r) {
-                                    Ok(()) => deleted += 1,
-                                    Err(e) => failed = Some(e),
-                                }
-                            }
-                            if failed.is_some() {
-                                break;
-                            }
-                        }
-                    };
-                    if tokio::time::timeout(LOOSE_DELETE_TIME, deletes).await.is_err() {
-                        failed = Some(Error::Other(anyhow!("deleting loose objects took longer than {LOOSE_DELETE_TIME:?}")));
-                    }
-                    Ok(Some((deleted, Some(gce), failed.map(|e| format!("{e:?}")))))
-                })
-            })
-            .await;
-            match deleted {
-                Ok(Some((n, gce, failed))) => {
-                    report.loose_objects_deleted += n;
-                    if let Some(gce) = gce {
-                        notify_gc_epoch(hub, project, gce).await;
-                    }
-                    // A delete failed: the chunk committed (its epoch
-                    // raised with the deletes made), and the pass ends.
-                    if let Some(e) = failed {
-                        return Err(Error::Other(anyhow!("deleting a loose object: {e}")));
-                    }
-                }
-                // Gave way (the bound on its walk): the pass deletes
-                // nothing more.
-                Ok(None) => break,
-                Err(e) => {
-                    // Objects may be deleted with the epoch not raised: the
-                    // transaction's commit failed after its deletes (the
-                    // one thing that can), and the writers that waited for
-                    // it may have gone on. Raise it, so that those still
-                    // on their way check their objects again.
-                    if started.load(Ordering::SeqCst) {
-                        for _ in 0..3 {
-                            let bumped = gc_transaction(hub, |c| {
-                                Box::pin(async move {
-                                    lock_gc_epoch_tx(c, project).await?;
-                                    bump_gc_epoch_tx(c, project).await
-                                })
-                            })
-                            .await;
-                            if let Ok(gce) = bumped {
-                                notify_gc_epoch(hub, project, gce).await;
-                                break;
-                            }
-                        }
-                    }
-                    return Err(e);
-                }
+            let packed_too: HashSet<ObjectId> = chunk.iter().filter(|id| packed_stored.contains(id)).copied().collect();
+            let (deleted, more) = delete_loose_chunk(hub, project, &gc, chunk, &packed_too, opts).await?;
+            report.loose_objects_deleted += deleted;
+            if !more {
+                break;
             }
         }
     }
 
     Ok(gc)
+}
+
+/// How often a chunk of loose deletes tries to raise the GC epoch after its
+/// deletes before it gives up ([`delete_loose_chunk`]); it holds the root
+/// writers' gate meanwhile.
+const EPOCH_AFTER_DELETES_TRIES: u32 = 20;
+
+/// Delete one chunk of loose objects under the root writers' gate
+/// (BUG-2621): the objects deleted, and whether the pass goes on to the
+/// next chunk.
+///
+/// The gate ([`GATE_BASE`]) is taken **on a session**, exclusively, and held
+/// from before the roots are read until the epoch is raised after the last
+/// delete, so no step in between (a commit that fails, a delete that fails)
+/// lets a waiting root writer through:
+/// 1. a transaction locks the epoch row, reads the roots again
+///    ([`roots_at_switch`]: a root committed since the purge keeps what it
+///    names, and that object leaves the chunk), clears the marks of what is
+///    still a candidate and raises the epoch, and commits. If anything of it
+///    fails, nothing has been deleted: the pass ends there.
+/// 2. the store deletes, [`AT_ONCE`] at a time, each batch joined to its end
+///    (a request is never dropped in flight: one the store already has
+///    would be applied later, after a writer stored the object again). A
+///    delete that fails, or [`LOOSE_DELETE_TIME`] passing between batches,
+///    stops the rest (an object left stored lost its mark: the next pass
+///    marks it again).
+/// 3. a second transaction raises the epoch again, tried again while it
+///    fails ([`EPOCH_AFTER_DELETES_TRIES`]), the gate still held: a writer
+///    that checked an object while the deletes ran (the first raise came
+///    before its check) starts over.
+///
+/// So for every object deleted: a writer that committed before the gate was
+/// taken is seen by step 1; one that waits at the gate reads an epoch
+/// raised after the delete and checks again; one that begins later finds
+/// the object gone. What is left: a server that stops, or the gate's
+/// session ending (checked before every batch), between a delete and step
+/// 3: the writers that checked that object while the deletes ran keep the
+/// epoch they read. (The first raise covers those that checked before.)
+async fn delete_loose_chunk(
+    hub: &Arc<Hub>,
+    project: i64,
+    gc: &Arc<tokio::sync::Mutex<GcState>>,
+    chunk: &[ObjectId],
+    packed_too: &HashSet<ObjectId>,
+    opts: &Options,
+) -> Result<(usize, bool)> {
+    let mut conn = hub.db.acquire().await?;
+    // Nothing is held if this fails (the wait for the writers in their
+    // transactions is bounded by the connection's lock timeout).
+    sqlx::query("SELECT pg_advisory_lock($1)").bind(gate_key(project)).execute(&mut *conn).await?;
+    let done = loose_chunk_under_gate(hub, project, &mut conn, gc, chunk, packed_too, opts).await;
+    // The gate goes back: by its unlock, or, after any failure (a
+    // transaction may be open, the session's state unknown), with the
+    // session.
+    let unlocked = match &done {
+        Ok(_) => sqlx::query("SELECT pg_advisory_unlock($1)").bind(gate_key(project)).execute(&mut *conn).await.is_ok(),
+        Err(_) => false,
+    };
+    if !unlocked {
+        let _ = conn.close().await;
+    }
+    let (deleted, more, epochs, failed) = done?;
+    for epoch in epochs {
+        notify_gc_epoch(hub, project, epoch).await;
+    }
+    match failed {
+        // A delete failed: the epoch is raised for the deletes made, and
+        // the pass ends with the error.
+        Some(e) => Err(Error::Other(anyhow!("deleting a loose object: {e}"))),
+        None => Ok((deleted, more)),
+    }
+}
+
+/// [`delete_loose_chunk`] with the gate held on `conn`'s session: the
+/// objects deleted, whether the pass goes on, the epochs raised, and a
+/// delete's failure.
+async fn loose_chunk_under_gate(
+    hub: &Arc<Hub>,
+    project: i64,
+    conn: &mut PgConnection,
+    gc: &Arc<tokio::sync::Mutex<GcState>>,
+    chunk: &[ObjectId],
+    packed_too: &HashSet<ObjectId>,
+    opts: &Options,
+) -> Result<(usize, bool, Vec<i64>, Option<String>)> {
+    let fault = |point: FaultPoint, id: ObjectId| {
+        let fault = opts.fault.clone();
+        async move {
+            match &fault {
+                Some(fault) => (fault.0)(point, id).await,
+                None => Ok(()),
+            }
+        }
+    };
+    // 1. The roots, the marks, the epoch.
+    sqlx::query("BEGIN ISOLATION LEVEL READ COMMITTED").execute(&mut *conn).await?;
+    lock_gc_epoch_tx(conn, project).await?;
+    let ids: Vec<ObjectId> = {
+        let mut gc = gc.lock().await;
+        if !roots_at_switch(hub, project, conn, &mut gc).await? {
+            // Gave way (the bound on its walk): the pass deletes nothing more.
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Ok((0, false, Vec::new(), None));
+        }
+        if let Some(hook) = &opts.during_loose_delete {
+            (hook.0)().await;
+        }
+        chunk.iter().filter(|id| gc.expired_unreferenced.contains(id)).copied().collect()
+    };
+    if ids.is_empty() {
+        // Every one is named again: nothing deleted, no writer sent back.
+        sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+        return Ok((0, true, Vec::new(), None));
+    }
+    let loose_only: Vec<String> = ids.iter().filter(|id| !packed_too.contains(id)).map(ObjectId::hex).collect();
+    for hexes in loose_only.chunks(500) {
+        sqlx::query("DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)")
+            .bind(project)
+            .bind(hexes)
+            .execute(&mut *conn)
+            .await?;
+    }
+    let mut epochs = vec![bump_gc_epoch_tx(conn, project).await?];
+    fault(FaultPoint::LooseCommit, ids[0]).await?;
+    sqlx::query("COMMIT").execute(&mut *conn).await?;
+    hub.commits.count(crate::db::Commit::PackGc);
+
+    // 2. The deletes.
+    let (mut deleted, mut failed) = (0usize, None::<String>);
+    let began = std::time::Instant::now();
+    let mut gate_held = true;
+    for batch in ids.chunks(AT_ONCE) {
+        if began.elapsed() > LOOSE_DELETE_TIME {
+            failed = Some(format!("the deletes took longer than {LOOSE_DELETE_TIME:?}"));
+            break;
+        }
+        // The gate is this session's: without it, no more deletes.
+        if sqlx::query("SELECT 1").execute(&mut *conn).await.is_err() {
+            failed = Some("the session holding the root writers' gate ended".into());
+            gate_held = false;
+            break;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for id in batch {
+            let (hub, k, id, fault) = (hub.clone(), object_key(project, id), *id, opts.fault.clone());
+            set.spawn(async move {
+                if let Some(fault) = &fault {
+                    (fault.0)(FaultPoint::LooseDelete, id).await?;
+                }
+                hub.objects.blob_store().delete(&k).await.map_err(Error::Other)
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            match r.map_err(|e| Error::Other(e.into())).and_then(|r| r) {
+                Ok(()) => deleted += 1,
+                Err(e) => failed = Some(format!("{e:?}")),
+            }
+        }
+        if failed.is_some() {
+            break;
+        }
+    }
+    if !gate_held {
+        return Err(Error::Other(anyhow!("deleting loose objects: {}", failed.unwrap_or_default())));
+    }
+
+    // 3. The epoch again, for what was checked while the deletes ran.
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let raised: Result<i64> = async {
+            sqlx::query("BEGIN ISOLATION LEVEL READ COMMITTED").execute(&mut *conn).await?;
+            let epoch = bump_gc_epoch_tx(conn, project).await?;
+            fault(FaultPoint::LooseCommit, ids[0]).await?;
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(epoch)
+        }
+        .await;
+        match raised {
+            Ok(epoch) => {
+                hub.commits.count(crate::db::Commit::PackGc);
+                epochs.push(epoch);
+                break;
+            }
+            Err(e) if tries >= EPOCH_AFTER_DELETES_TRIES => {
+                return Err(Error::Other(anyhow!("the GC epoch could not be raised after {deleted} loose objects were deleted: {e:?}")));
+            }
+            Err(_) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(tries))).await;
+            }
+        }
+    }
+    Ok((deleted, failed.is_none(), epochs, failed))
 }
 
 async fn bump_gc_epoch_tx(c: &mut PgConnection, project: i64) -> Result<i64> {
