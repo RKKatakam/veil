@@ -2451,6 +2451,87 @@ fn bug_2602_a_read_that_fails_in_the_switchs_walk_leaves_nothing_to_delete() {
     assert_closure_stored(&hub, pid, snap, "after the next pass");
 }
 
+/// BUG-2623: a projection memo (`projections`) is written with no GC guard
+/// (its writer stores the projected snapshot, then inserts the row), and its
+/// table is not in the reference stamp. A memo whose snapshot is stored,
+/// unreferenced and past the window, whose writer stored it before a pass
+/// deleted it and committed the row after the pass's last purge, names a
+/// snapshot that is gone; the server does not derive it again: it answers
+/// the memo's viewer `missing object`. Here the memo of `main`'s tip for a
+/// member's view loses its row (the projected snapshot stays stored and
+/// passes the window), a pass deletes the snapshot, and the row is written
+/// again after it, as that writer's insert would be: the member can no
+/// longer read `main`'s history. (The race itself is not driven here: it
+/// needs a writer held between its put and its insert.)
+#[test]
+#[ignore = "BUG-2623: a projection memo committed after a pass deleted its snapshot is answered 'missing object', never derived again"]
+fn bug_2623_a_memo_whose_snapshot_gc_deleted_is_derived_again() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+    hub.rt.block_on(veil_server::derive::catch_up_project(&h, pid)).unwrap();
+    // The member's view of main's tip: a projection (they do not see billing).
+    let real = api.tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"];
+    let projected = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_ne!(real, projected, "the member sees a projection of main");
+    let stored = |id: &ObjectId| hub.rt.block_on(h.objects.blob_store().exists(&veil_server::store::object_key(pid, id))).unwrap();
+    assert!(stored(&projected), "the projected snapshot is stored loose");
+
+    // Its memo rows go (as when a purge took them and the object stayed).
+    let rows: Vec<(String, String, i64, bool)> = hub
+        .rt
+        .block_on(
+            sqlx::query_as("DELETE FROM projections WHERE project_id = $1 AND projected_id = $2 RETURNING view_key, real_id, created_at, collapsed")
+                .bind(pid)
+                .bind(projected.hex())
+                .fetch_all(&h.db),
+        )
+        .unwrap();
+    assert!(!rows.is_empty(), "the projection had a memo");
+    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    assert!(!marked.skipped, "the marking pass ran");
+
+    // The pass deletes the snapshot; the memo's row is committed after the
+    // pass's last purge (its writer stored the object before the delete).
+    let rep = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, ..Options::default() },
+        ))
+        .unwrap();
+    assert!(!rep.skipped, "the pass ran: {rep:?}");
+    for (view_key, real_id, created_at, collapsed) in rows {
+        hub.rt
+            .block_on(
+                sqlx::query("INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, $6)")
+                    .bind(pid)
+                    .bind(view_key)
+                    .bind(real_id)
+                    .bind(projected.hex())
+                    .bind(created_at)
+                    .bind(collapsed)
+                    .execute(&h.db),
+            )
+            .unwrap();
+    }
+    let memo: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT count(*) FROM projections WHERE project_id = $1 AND projected_id = $2").bind(pid).bind(projected.hex()).fetch_one(&h.db))
+        .unwrap();
+    assert!(memo >= 1, "the memo written during the pass is there");
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    assert!(!hub.rt.block_on(fresh.exists(pid, &projected)).unwrap(), "the pass deleted the projected snapshot (unreferenced, past the window): {rep:?}");
+    // The member still reads main's history.
+    let r = api.history(&dev_tok, &p.name, &[projected]);
+    assert_eq!(r.status, 200, "the member's history of main: {}", String::from_utf8_lossy(&r.body).chars().take(300).collect::<String>());
+    assert!(r.frames().iter().any(|(id, _)| *id == projected), "the member's history holds main's tip");
+}
+
 /// BUG-2602: what a switch reads from the store while root writers wait is
 /// bounded (`SWITCH_WALK_MAX` objects). A root written as the pass switches
 /// that names more than that gives the switch way, as any root write did
