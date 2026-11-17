@@ -711,6 +711,9 @@ impl Split {
             if let Some(op) = self.ops.get(id) {
                 let parents: Vec<&View> = op.parents.iter().filter_map(|p| self.ops.get(p)).map(|o| &o.view).collect();
                 out.add(&op.view, &parents);
+                if op.is_merge() {
+                    out.add_rebases(&op.view, &parents, &op.rewritten);
+                }
             }
         }
         out
@@ -719,6 +722,10 @@ impl Split {
 
 /// A tag's target and annotation, merged as one unit.
 type TagUnit = (ObjectId, Option<ObjectId>);
+
+/// What merges' rebases made: (a ref's name, the value made) to the values
+/// it was made from. See [`Introduced::add_rebases`].
+type Rebased<T> = HashMap<(String, T), Vec<T>>;
 
 /// The values some operations introduced: a key's value in an operation's
 /// view that none of its parents' views has (a new snapshot of a
@@ -731,9 +738,60 @@ pub struct Introduced {
     tags: std::collections::HashSet<(String, Option<TagUnit>)>,
     remote_tags: std::collections::HashSet<(String, Option<ObjectId>)>,
     heads: std::collections::HashSet<(ObjectId, bool)>,
+    /// What a merge's rebase made of a parent's working copy or tag (the
+    /// value it made, the parent's value): see [`Introduced::add_rebases`].
+    /// (Keyed by the name and the value made, to the parents' values.)
+    rebased_workspaces: Rebased<ObjectId>,
+    rebased_tags: Rebased<TagUnit>,
+    /// A head a merge's rebase made of a parent's head (made, the parent's).
+    rebased_heads: HashMap<ObjectId, Vec<ObjectId>>,
 }
 
 impl Introduced {
+    /// Record what a merge (its `view`, `parents` and `rewritten`) made of
+    /// its parents' working copies and tags by following the rewrites it
+    /// records: its rebase, derived from the operations it merged, not a
+    /// change of anyone's (BUG-2464).
+    pub fn add_rebases(&mut self, view: &View, parents: &[&View], rewritten: &BTreeMap<ObjectId, Vec<ObjectId>>) {
+        // What the rewrites it records make of `from` (`from` if none).
+        let follow = |from: ObjectId| {
+            let mut x = from;
+            for _ in 0..64 {
+                match rewritten.get(&x).map(Vec::as_slice) {
+                    Some([n]) => x = *n,
+                    _ => break,
+                }
+            }
+            x
+        };
+        let follows = |from: ObjectId, to: ObjectId| from != to && follow(from) == to;
+        // Only a value the merge itself made: one no parent has for that
+        // key. Its `rewritten` also holds the rewrites of the commands it
+        // merged, and a value one of those set (a describe's new version
+        // as a head, its working copy, a tag it moved) is that command's
+        // change, not a rebase (BUG-2550).
+        for p in parents {
+            for h in p.heads.iter().filter(|h| !view.heads.contains(*h)) {
+                let n = follow(*h);
+                if follows(*h, n) && view.heads.contains(&n) && !parents.iter().any(|q| q.heads.contains(&n)) {
+                    self.rebased_heads.entry(n).or_default().push(*h);
+                }
+            }
+            for (n, w) in &view.workspaces {
+                let made = !parents.iter().any(|q| q.workspaces.get(n).is_some_and(|qw| qw.wc == w.wc));
+                if let Some(pw) = p.workspaces.get(n).filter(|pw| made && follows(pw.wc, w.wc)) {
+                    self.rebased_workspaces.entry((n.clone(), w.wc)).or_default().push(pw.wc);
+                }
+            }
+            for (n, t) in &view.tags {
+                let made = !parents.iter().any(|q| q.tags.get(n).is_some_and(|qt| qt.target == t.target && qt.annotation == t.annotation));
+                if let Some(pt) = p.tags.get(n).filter(|pt| made && pt.annotation == t.annotation && follows(pt.target, t.target)) {
+                    self.rebased_tags.entry((n.clone(), (t.target, t.annotation))).or_default().push((pt.target, pt.annotation));
+                }
+            }
+        }
+    }
+
     /// Record what `view` introduces over `parents` (an operation without
     /// known parents introduces all of it).
     pub fn add(&mut self, view: &View, parents: &[&View]) {
@@ -783,53 +841,90 @@ impl Introduced {
 /// value `base` lacks but both sides' shared history holds looks changed
 /// on both sides, and the conflict rule could keep the side with the
 /// older value: a commit's working copy lost.
+///
+/// A merge's rebase is no change (BUG-2464): where both sides introduced
+/// a value, one that a side's merge made by rebasing a value the side's
+/// own operations did not introduce is the shared history's value, moved,
+/// so the other side's change wins (two settlers made the same rebase of a
+/// working copy, and one side then committed it: the commit's new working
+/// copy wins, not the rebased old one). A head so moved, whose original
+/// the other side's own operations dropped, is dropped.
 pub fn shared_base(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introduced) -> View {
-    fn key<T: Clone + PartialEq + Eq + std::hash::Hash, V: Clone>(
+    shared_base_with(base, a, ia, b, ib, true)
+}
+
+/// [`shared_base`], where a merge's rebase counts as a change of its side
+/// unless `rebases`: the shared history as the op log records it, which
+/// `Repo::merge_plan` judges rewrites against (is a rewrite from the shared
+/// history, or made since the sides split?).
+pub(crate) fn shared_base_with(base: &View, a: &View, ia: &Introduced, b: &View, ib: &Introduced, rebases: bool) -> View {
+    type Set<T> = std::collections::HashSet<(String, Option<T>)>;
+    fn key<T: Copy + PartialEq + Eq + std::hash::Hash, V: Clone>(
         name: &str,
         va: Option<&V>,
         vb: Option<&V>,
         vbase: Option<&V>,
         unit: impl Fn(&V) -> T,
-        ia: &std::collections::HashSet<(String, Option<T>)>,
-        ib: &std::collections::HashSet<(String, Option<T>)>,
+        (ia, ra): (&Set<T>, &Rebased<T>),
+        (ib, rb): (&Set<T>, &Rebased<T>),
     ) -> Option<V> {
         let (ua, ub) = (va.map(&unit), vb.map(&unit));
         if ua == ub {
             return vbase.cloned();
         }
+        // A merge's rebase of a value the side's own operations did not
+        // introduce (one of the shared history, moved): no change of that
+        // side's (BUG-2464).
+        let rebased = |u: Option<T>, i: &Set<T>, r: &Rebased<T>| {
+            u.is_some_and(|u| r.get(&(name.to_string(), u)).is_some_and(|from| from.iter().any(|f| !i.contains(&(name.to_string(), Some(*f))))))
+        };
         match (ia.contains(&(name.to_string(), ua)), ib.contains(&(name.to_string(), ub))) {
             (false, true) => va.cloned(),
             (true, false) => vb.cloned(),
-            (true, true) => None,
+            (true, true) => match (rebased(ua, ia, ra), rebased(ub, ib, rb)) {
+                (true, false) => va.cloned(),
+                (false, true) => vb.cloned(),
+                _ => None,
+            },
             (false, false) => vbase.cloned(),
         }
     }
+    // Without `rebases`, no value counts as a merge's rebase.
+    let (no_ws, no_tags): (Rebased<ObjectId>, Rebased<TagUnit>) = Default::default();
     let mut out = View::default();
     let names: BTreeSet<&String> = base.workspaces.keys().chain(a.workspaces.keys()).chain(b.workspaces.keys()).collect();
     for n in names {
-        let v = key(n, a.workspaces.get(n), b.workspaces.get(n), base.workspaces.get(n), |w| w.wc, &ia.workspaces, &ib.workspaces);
+        let v = key(n, a.workspaces.get(n), b.workspaces.get(n), base.workspaces.get(n), |w| w.wc, (&ia.workspaces, if rebases { &ia.rebased_workspaces } else { &no_ws }), (&ib.workspaces, if rebases { &ib.rebased_workspaces } else { &no_ws }));
         if let Some(v) = v {
             out.workspaces.insert(n.clone(), v);
         }
     }
     let names: BTreeSet<&String> = base.tags.keys().chain(a.tags.keys()).chain(b.tags.keys()).collect();
     for n in names {
-        let v = key(n, a.tags.get(n), b.tags.get(n), base.tags.get(n), |t| (t.target, t.annotation), &ia.tags, &ib.tags);
+        let v = key(n, a.tags.get(n), b.tags.get(n), base.tags.get(n), |t| (t.target, t.annotation), (&ia.tags, if rebases { &ia.rebased_tags } else { &no_tags }), (&ib.tags, if rebases { &ib.rebased_tags } else { &no_tags }));
         if let Some(v) = v {
             out.tags.insert(n.clone(), v);
         }
     }
     let names: BTreeSet<&String> = base.remote_tags.keys().chain(a.remote_tags.keys()).chain(b.remote_tags.keys()).collect();
     for n in names {
-        let v = key(n, a.remote_tags.get(n), b.remote_tags.get(n), base.remote_tags.get(n), |t| *t, &ia.remote_tags, &ib.remote_tags);
+        let v = key(n, a.remote_tags.get(n), b.remote_tags.get(n), base.remote_tags.get(n), |t| *t, (&ia.remote_tags, &Default::default()), (&ib.remote_tags, &Default::default()));
         if let Some(v) = v {
             out.remote_tags.insert(n.clone(), v);
         }
     }
     let heads: BTreeSet<&ObjectId> = base.heads.iter().chain(a.heads.iter()).chain(b.heads.iter()).collect();
+    // A head one side's merge rebased from a head that side did not add,
+    // where the other side's own operations dropped that head: the shared
+    // history's head, moved, which the other side dropped (BUG-2464).
+    let moved = |h: &ObjectId, i: &Introduced, other: &Introduced| {
+        rebases && i.rebased_heads.get(h).is_some_and(|from| from.iter().any(|f| !i.heads.contains(&(*f, true)) && other.heads.contains(&(*f, false))))
+    };
     for h in heads {
         let (pa, pb) = (a.heads.contains(h), b.heads.contains(h));
         let keep = match (pa == pb, ia.heads.contains(&(*h, pa)), ib.heads.contains(&(*h, pb))) {
+            (false, _, true) if pb && moved(h, ib, ia) => true,
+            (false, true, _) if pa && moved(h, ia, ib) => true,
             (false, false, true) => pa,
             (false, true, false) => pb,
             // Added on one side, dropped on the other: the addition wins.
