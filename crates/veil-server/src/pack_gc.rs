@@ -61,6 +61,9 @@
 //!   purge's commit, in chunks ([`LOOSE_DELETE_CHUNK`]), each in a
 //!   transaction that holds the gate, reads the roots again, and raises the
 //!   GC epoch as it commits.
+//! * **An entry's kind is a claim (BUG-2622):** what a tree names as a file
+//!   is kept as a leaf and not read, and an object so named that the walk
+//!   also meets as a directory or a root is read and expanded.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -994,12 +997,17 @@ struct GcState {
 /// What a GC pass's walks know of the project's objects (BUG-2602).
 #[derive(Default)]
 struct Marks {
-    /// The closed set: every object a walk read and expanded, and the
-    /// leaves they name (a file's blob, a derived object, a search
-    /// segment). Every object an expanded member names is in it too, so a
-    /// later walk stops at a member: nothing behind it is unknown. It only
-    /// grows.
+    /// The closed set: every object a walk read and expanded. Every object
+    /// a member names is in it too, or in `leaves` or `unread`, so a later
+    /// walk stops at a member: nothing behind it is unknown. It only grows.
     reachable: HashSet<ObjectId>,
+    /// Objects named as leaves and not read: what a tree's file or symlink
+    /// entry or a conflict's term names, a `graph.changed` object, a
+    /// search segment. Kept, and **not taken for expanded** (BUG-2622): an
+    /// entry's kind is a claim of whoever wrote the tree, so a walk that
+    /// meets one of them as a directory, a snapshot or a root reads it and
+    /// expands what it is.
+    leaves: HashSet<ObjectId>,
     /// Ids a walk reached and could not read: not stored then (a
     /// predecessor never pushed, the tree of a signed origin). What they
     /// name is unknown, so they are not in `reachable`; a walk does not
@@ -1018,9 +1026,10 @@ struct Marks {
 }
 
 impl Marks {
-    /// Reached by a walk (read or not), or in an upload read.
+    /// Reached by a walk (read, named as a leaf, or not stored), or in an
+    /// upload read.
     fn live(&self, id: &ObjectId) -> bool {
-        self.reachable.contains(id) || self.staged_ids.contains(id) || self.unread.contains(id)
+        self.reachable.contains(id) || self.leaves.contains(id) || self.staged_ids.contains(id) || self.unread.contains(id)
     }
 
     /// Read the index of the client upload `name` if it was not yet: its
@@ -1132,10 +1141,10 @@ async fn catch_up_round(
             seeds.extend(projected.iter().copied());
         }
     }
-    marks.reachable.extend(roots.leaf_objects.iter().copied());
+    marks.leaves.extend(roots.leaf_objects.iter().copied());
     for (snapshot, changed) in &roots.graph_changed {
         if marks.reachable.contains(snapshot) {
-            marks.reachable.insert(*changed);
+            marks.leaves.insert(*changed);
         }
     }
     let left = limit.map(|l| l - reads);
@@ -1869,7 +1878,7 @@ async fn mark_and_sweep_loose(
     let (roots, uploads) = roots.expect("read with no stamp to compare");
 
     // Walk object graph from `roots` to find all reachable `ObjectId`s.
-    let mut marks = Marks { reachable: roots.leaf_objects.clone(), ..Marks::default() };
+    let mut marks = Marks { leaves: roots.leaf_objects.clone(), ..Marks::default() };
     walk_from_roots(hub, project, roots.walk_objects.iter().copied(), &mut marks, &roots, None).await?;
 
     // Also keep all objects in active `STAGED` upload packs so a push in
@@ -2010,7 +2019,7 @@ async fn mark_and_sweep_loose(
         // set is a candidate. What it reaches joins the set (it is kept;
         // its marks in `unreferenced_objects` stay: nothing references it).
         walk_from_roots(hub, project, retained_snaps, &mut marks, &roots, None).await?;
-        expired_unreferenced.retain(|id| !marks.reachable.contains(id));
+        expired_unreferenced.retain(|id| !marks.live(id));
     }
     drop(roots);
     let gc = Arc::new(tokio::sync::Mutex::new(GcState { expired_unreferenced, stamp, marks }));
@@ -2652,7 +2661,10 @@ fn collect_hex_ids_from_json(s: &str, out: &mut HashSet<ObjectId>) {
 /// annotated tags (`Atag`), and stopping at what `marks` already holds
 /// (its closed set) and at what an earlier walk could not read
 /// (`Marks::unread`). What it reads joins the set; what it cannot read is
-/// noted.
+/// noted. What a tree names as a file, and a conflict as a term, is kept
+/// as a leaf and not read; an object so named that the walk also meets as
+/// a directory, a parent or a root is read and expanded as what it is
+/// (`Marks::leaves`, BUG-2622).
 ///
 /// `limit`: the most objects it may read (BUG-2602: under a switch's
 /// lock, where it does not yield to requests either). Answers the objects
@@ -2667,7 +2679,7 @@ async fn walk_from_roots(
 ) -> Result<Option<usize>> {
     let mut queue: VecDeque<ObjectId> = initial.into_iter().collect();
     let mut reads = 0usize;
-    let Marks { reachable, unread, .. } = marks;
+    let Marks { reachable, unread, leaves, .. } = marks;
 
     while let Some(id) = queue.pop_front() {
         if builtin(&id).is_some() || reachable.contains(&id) || unread.contains(&id) {
@@ -2692,7 +2704,7 @@ async fn walk_from_roots(
             }
         }
         if let Some(&ch) = roots.graph_changed.get(&id) {
-            reachable.insert(ch);
+            leaves.insert(ch);
         }
 
         if limit.is_none() {
@@ -2740,7 +2752,7 @@ async fn walk_from_roots(
                 for entry in &t.entries {
                     match entry.kind {
                         EntryKind::File | EntryKind::Symlink => {
-                            reachable.insert(entry.id);
+                            leaves.insert(entry.id);
                         }
                         EntryKind::Dir | EntryKind::Conflict => {
                             if !reachable.contains(&entry.id) {
@@ -2755,7 +2767,7 @@ async fn walk_from_roots(
             }
             Object::Conflict(c) => {
                 for term in c.interleaved().flatten() {
-                    reachable.insert(term.id);
+                    leaves.insert(term.id);
                 }
             }
             Object::Atag(a) => {

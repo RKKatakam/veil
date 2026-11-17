@@ -2191,34 +2191,17 @@ fn bug_2621_a_commit_between_the_loose_switch_and_its_deletes_keeps_its_file() {
     assert_closure_stored(&hub, pid, committed, "the change committed as GC deleted");
 }
 
-/// BUG-2622: GC's walk takes the object a tree's file entry names for a
-/// leaf and never expands it, and a push accepts a file entry that names a
-/// tree. A member who may write `src/` pushes, to a branch of their own, a
-/// commit whose file entry `src/aaa-forged` names the tree of
-/// `src/victim/deep` (a directory of main they can read). The walk meets
-/// that entry before the directory entry that names the same tree, marks
-/// the tree reached, and never walks it: the directory's files are
-/// unreferenced, and deleted from main once past the window.
-#[test]
-#[ignore = "BUG-2622: a file entry naming a directory's tree makes GC delete the directory's files"]
-fn bug_2622_a_file_entry_naming_a_tree_never_hides_the_trees_files_from_gc() {
-    const CONTENT: &str = "VICTIM-2622-CONTENT-41c9\n";
-    let hub = TestHub::start();
-    let p = setup_project(&hub);
-    let pid = project_id(&hub, &p.name);
-    let h = hub.hub();
+/// On `main`, a directory two levels under `src/` with a file: the commit,
+/// the directory's tree as stored, and the file's blob.
+fn victim_directory(hub: &TestHub, p: &Project, pid: i64, content: &str) -> (ObjectId, Tree, ObjectId) {
     let api = hub.api();
-    let admin_tok = p.admin.token();
-
-    // On main: a directory two levels under `src/`, with a file.
+    let h = hub.hub();
     let mut c = Craft::new(&api, &p.admin, &p.name, "main");
-    c.file("src/victim/deep/file.txt", CONTENT);
+    c.file("src/victim/deep/file.txt", content);
     let before = c.tip;
     let (main1, r) = c.push_edited("main", Some(before), |_| {});
     assert_eq!(r.status, 200, "push main: {}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.json()["results"][0]["ok"], json!(true), "push main ok: {}", String::from_utf8_lossy(&r.body));
-
-    // The directory's tree, as stored.
     let get = |id: &ObjectId| Object::decode(&hub.rt.block_on(h.objects.get(pid, id)).unwrap().expect("stored")).unwrap();
     let Object::Snapshot(s) = get(&main1) else { panic!("a snapshot") };
     let mut at = s.tree;
@@ -2227,15 +2210,135 @@ fn bug_2622_a_file_entry_naming_a_tree_never_hides_the_trees_files_from_gc() {
         at = t.get(part).unwrap_or_else(|| panic!("no {part}")).id;
     }
     let Object::Tree(deep) = get(&at) else { panic!("a tree") };
-    let (blob, _) = make_blob(CONTENT);
+    (main1, deep, make_blob(content).0)
+}
 
-    // A member with write access to `src/` pushes, to a branch of their
-    // own, a file entry that names that tree.
+/// BUG-2622, the push's end: an entry's object is of the entry's kind. A
+/// file or symlink entry names a file's content (a blob, or a secret's
+/// sealed envelope), a directory entry a tree, a conflict entry a conflict:
+/// a push of anything else is refused, as is an API commit that puts a
+/// tree at a file's path. (Pack GC keeps what a file entry names as a leaf:
+/// a member who may write `src/` pushed, to a branch of their own, a file
+/// entry naming the tree of a directory of `main`, the push was accepted,
+/// and GC deleted the directory's files.)
+#[test]
+fn bug_2622_a_push_or_an_api_commit_of_an_entry_whose_object_is_not_of_its_kind_is_refused() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+    let (_main1, deep, _blob) = victim_directory(&hub, &p, pid, "VICTIM-2622-KINDS\n");
+    let branches = || api.tips(Some(&dev_tok), &p.name).unwrap().branches;
+
+    // The member's ordinary push is accepted: what is refused below is the entry.
+    let mut ok = Craft::new(&api, &p.dev, &p.name, "main");
+    ok.file("src/ordinary-2622.txt", "ORDINARY-2622\n");
+    let (_, r) = ok.push_edited("ordinary-2622", None, |_| {});
+    assert_eq!(r.status, 200, "an ordinary push: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "an ordinary push is accepted: {}", String::from_utf8_lossy(&r.body));
+
+    let refused = |what: &str, branch: &str, r: Reply, message: &str| {
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert_eq!(r.status, 400, "{what}: refused: {body}");
+        assert!(body.contains(message), "{what}: the refusal says why ({message}): {body}");
+        assert!(!branches().contains_key(branch), "{what}: nothing was pushed");
+    };
+    // A file entry, and a symlink entry, naming a directory's tree.
+    for (what, kind, branch) in [("a file entry naming a tree", EntryKind::File, "forge-file-2622"), ("a symlink entry naming a tree", EntryKind::Symlink, "forge-link-2622")] {
+        let mut forge = Craft::new(&api, &p.dev, &p.name, "main");
+        forge.set_kind("src/aaa-forged", Object::Tree(deep.clone()), kind, Visibility::Public);
+        let (_, r) = forge.push_edited(branch, None, |_| {});
+        refused(what, branch, r, "'src/aaa-forged': a file entry names something that is not a file's content");
+    }
+    // A directory entry naming a file's blob.
+    {
+        let mut forge = Craft::new(&api, &p.dev, &p.name, "main");
+        let id = forge.put(Object::Blob(b"NOT-A-DIRECTORY-2622\n".to_vec()));
+        forge.refer_dir("src/aaa-notadir", id);
+        let (_, r) = forge.push_edited("forge-dir-2622", None, |_| {});
+        refused("a directory entry naming a blob", "forge-dir-2622", r, "'src/aaa-notadir': a directory entry names something that is not a directory");
+    }
+    // A conflict entry naming a blob.
+    {
+        let mut forge = Craft::new(&api, &p.dev, &p.name, "main");
+        forge.set_kind("src/aaa-conflict", Object::Blob(b"NOT-A-CONFLICT-2622\n".to_vec()), EntryKind::Conflict, Visibility::Public);
+        let (_, r) = forge.push_edited("forge-conflict-2622", None, |_| {});
+        refused("a conflict entry naming a blob", "forge-conflict-2622", r, "'src/aaa-conflict': a conflict entry names something else");
+    }
+    // An API commit that puts the tree, uploaded first, at a file's path.
+    {
+        let raw = Object::Tree(deep.clone()).encode_with(veil_core::object::TreeEncoding::Binary);
+        let id = ObjectId::hash(&raw);
+        let up = api.upload(&dev_tok, &p.name, &[(id, raw)]);
+        assert_eq!(up.status, 200, "the upload: {}", String::from_utf8_lossy(&up.body));
+        let base = branches()["main"];
+        let receipt = up.json()["receipts"][0].as_str().expect("the upload's receipt").to_string();
+        let r = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({"base": base.hex(), "edits": [{"path": "src/aaa-forged", "put": {"object": id.hex()}}], "receipts": {id.hex(): receipt}}),
+        );
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        assert_eq!(r.status, 400, "an API commit putting a tree at a file's path: refused: {body}");
+        assert!(body.contains("'src/aaa-forged': the object is not a file's content"), "the refusal says why: {body}");
+    }
+}
+
+/// BUG-2622, GC's end: the walk kept what a tree's file entry names as a
+/// leaf, never read, and took it for walked: a directory entry naming the
+/// same object was then skipped. A commit whose file entry `src/aaa-forged`
+/// names the tree of `src/victim/deep` (a directory of `main`) is stored
+/// here directly, on a branch, as one accepted before the push checked an
+/// entry's kind (the push of it is refused now): the walk met that entry
+/// before the directory entry, never walked the directory, and a pass past
+/// the retention window deleted its files from `main`. An object named as
+/// a leaf and also as a directory is now read and expanded.
+#[test]
+fn bug_2622_a_file_entry_naming_a_tree_never_hides_the_trees_files_from_gc() {
+    const CONTENT: &str = "VICTIM-2622-CONTENT-41c9\n";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+    let admin_tok = p.admin.token();
+    let (main1, deep, blob) = victim_directory(&hub, &p, pid, CONTENT);
+
+    // The forged commit, as a member with write access to `src/` made it.
     let mut forge = Craft::new(&api, &p.dev, &p.name, "main");
     forge.set_kind("src/aaa-forged", Object::Tree(deep), EntryKind::File, Visibility::Public);
-    let (_, r) = forge.push_edited("forge-2622", None, |_| {});
-    assert_eq!(r.status, 200, "the forged push: {}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["results"][0]["ok"], json!(true), "the forged push is accepted: {}", String::from_utf8_lossy(&r.body));
+    let mut s = Snapshot {
+        parents: vec![forge.tip],
+        change_id: ChangeId::random(),
+        tree: forge.root,
+        description: Text::Plain("forged".into()),
+        author: "crafter".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s.sign(&forge.identity);
+    let forged_raw = Object::Snapshot(s).encode();
+    let forged = ObjectId::hash(&forged_raw);
+    // Its push is refused,
+    let mut pushed = Craft::new(&api, &p.dev, &p.name, "main");
+    pushed.objects = forge.objects.clone();
+    pushed.root = forge.root;
+    let (_, r) = pushed.push_edited("forge-2622", None, |_| {});
+    assert_eq!(r.status, 400, "the forged push is refused: {}", String::from_utf8_lossy(&r.body));
+    // so it is stored as it would have been: its objects, and its branch.
+    for (id, raw) in forge.objects.iter().cloned().chain([(forged, forged_raw)]) {
+        hub.rt.block_on(h.objects.put(pid, &id, Bytes::from(raw))).unwrap();
+    }
+    hub.rt
+        .block_on(sqlx::query("INSERT INTO branches (project_id, name, target) VALUES ($1, 'forge-2622', $2)").bind(pid).bind(forged.hex()).execute(&h.db))
+        .unwrap();
 
     // Two passes: marked, then past the window.
     for at in [0, 120_000] {
@@ -2247,6 +2350,7 @@ fn bug_2622_a_file_entry_naming_a_tree_never_hides_the_trees_files_from_gc() {
     assert!(hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "main's file under the directory was deleted by GC");
     let r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/victim/deep/file.txt", p.name));
     assert_eq!(r.status, 200, "main's file: {}", String::from_utf8_lossy(&r.body).chars().take(300).collect::<String>());
+    assert!(String::from_utf8_lossy(&r.body).contains(CONTENT.trim_end()), "main's file is served");
     assert_closure_stored(&hub, pid, main1, "main");
 }
 
