@@ -826,13 +826,15 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     ord_c.file("src/ord_ref.rs", "pub const ORD: u8 = 1;\n");
     let ord_ch = ord_c.push_to("ord-ref", None);
     assert_eq!(ord_ch.status, 200, "{}", body_str(&ord_ch));
-    let ord_pr = api1
-        .post_json(
-            Some(&dev_tok),
-            &format!("/v1/projects/{}/prs", p.name),
-            &json!({"head": "ord-ref", "title": "Ordinary reference PR"}),
-        )
-        .json();
+    let ord_pr = api1.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"head": "ord-ref", "title": "Ordinary reference PR"}),
+    );
+    // BUG-2581: a refusal's keys (shed under load) must not become the
+    // "ordinary PR" shape.
+    assert_eq!(ord_pr.status, 200, "the ordinary reference PR is opened: {}", body_str(&ord_pr));
+    let ord_pr = ord_pr.json();
     let mut ord_keys: Vec<String> = ord_pr.as_object().unwrap().keys().cloned().collect();
     ord_keys.sort();
 
