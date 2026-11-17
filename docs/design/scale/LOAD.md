@@ -2739,3 +2739,64 @@ Two runs were void and are not in the table: another
 worktree's test suite on the shared PostgreSQL during them (856 and 503
 pushes a second, 26 and 34 statements a push instead of 15).
 
+
+## Pulls while `main` moves: the embargo question asked once a request (BUG-1947, 2026-11-17, `t3/fable-speed`)
+
+With 1,000 agents and `main` moving 20 times a second a pull cost 59.8
+statements (65.8 on `integration` @ `ff29db9b`), and pulls fell to about
+1,060 a second. A statement profile of the same curve (a PostgreSQL of the
+run's own with `pg_stat_statements`, 50 agents) named them: for every
+snapshot a `history` or a `fetch` names, once for the id the client sent
+and once for the real snapshot it stands for, the server asked whether an
+unreleased embargo withholds it (`embargo::is_withheld_from_viewer`: 83,910
+calls against 59,200 session checks), an unprepared statement each, in a
+project with no embargo at all. A pull that catches up on 14 snapshots
+names all of them in each of its fetches.
+
+The statement that reads a request's epochs now also reads whether its
+project has an unreleased embargo line (`caches::read_epochs`,
+`Epochs::embargo_free`). With none, nothing of the project is withheld from
+anyone, and `history`, `fetch` and `subtree` ask nothing more
+(`embargo::is_withheld_in`); with one, each snapshot is asked about as
+before. Nothing is cached: it is the database's answer at the moment of the
+request, as its epochs are (`docs/HUB.md` §13.14), so an embargo committed
+before a request starts is withheld by that request, on every server
+(`embargo::bug_1947_…`: the next request of a second server with
+everything cached refuses both embargoed snapshots by every route of a
+pull).
+
+`veil-bench load --mode pull --projects 1 --clients 10,100,1000
+--background 20 --duration 15`, objects in MinIO, PostgreSQL 17 with the
+deployment's settings (`scripts/bench-server.sh`'s containers), release
+builds, the same load tool; before is the fix's parent in the server's
+sources, runs alternated (before, after, before, after), each after
+`bench-quiet.sh`'s wait for a 1-minute load below 16 (after: 29.8, 54.6,
+30.8, 74.6, the runs' own agents), 2026-11-17 06:45 to 06:54 UTC:
+
+| Server | Agents | Pulls/s | p50 / p99 (ms) | Requests per pull | Statements per pull | Server CPU (ms/pull) | Database CPU (ms/pull) | Cores: server / database / load tool |
+|---|---:|---:|---|---:|---:|---:|---:|---|
+| before | 10 | 8,888 | 0.7 / 15.3 | 1.14 | 3.6 | 0.49 | 0.62 | 4.4 / 5.5 / 1.7 |
+| before | 100 | 20,745 | 2.3 / 30.5 | 1.58 | 4.8 | 0.32 | 0.65 | 6.5 / 13.5 / 3.8 |
+| before | 1,000 | 1,060 | 943 / 1,014 | 7.07 | 65.8 | 3.85 | 17.32 | 4.1 / 18.4 / 1.2 |
+| after | 10 | 18,492 | 0.5 / 2.2 | 1.07 | 3.2 | 0.25 | 0.27 | 4.5 / 5.0 / 1.8 |
+| after | 100 | 29,500 | 2.5 / 19.3 | 1.41 | 3.5 | 0.24 | 0.31 | 7.1 / 9.1 / 5.1 |
+| after | 1,000 | **5,729** | **177 / 322** | 6.69 | **8.9** | **1.04** | **1.02** | 6.0 / 5.8 / 7.1 |
+| before, again | 10 | 20,775 | 0.4 / 1.3 | 1.06 | 3.3 | 0.22 | 0.24 | 4.5 / 5.0 / 1.8 |
+| before, again | 100 | 20,692 | 2.3 / 30.3 | 1.59 | 4.8 | 0.32 | 0.64 | 6.6 / 13.3 / 3.7 |
+| before, again | 1,000 | 1,118 | 894 / 938 | 6.99 | 65.3 | 3.86 | 16.30 | 4.3 / 18.2 / 1.2 |
+| after, again | 10 | 21,483 | 0.4 / 1.1 | 1.06 | 3.1 | 0.21 | 0.23 | 4.5 / 5.0 / 1.7 |
+| after, again | 100 | 29,727 | 2.4 / 19.5 | 1.41 | 3.5 | 0.24 | 0.30 | 7.1 / 9.0 / 5.1 |
+| after, again | 1,000 | **5,616** | **182 / 343** | 6.59 | **8.8** | **1.01** | **1.05** | 5.7 / 5.9 / 7.0 |
+
+(`integration` @ `ff29db9b` itself, in the full `load` profile of the same
+turn: 20,346, 17,824 and 1,058 pulls a second, 3.3, 5.1 and 65.9
+statements.) With 1,000 agents: 5.2 times the pulls, a seventh of the
+statements, a sixteenth of the database's CPU a pull. A pull's statements
+are now one a request (the session's) and two more for its `tips` (the
+tested pointers and the embargo records of the caller, each read every
+time). **The gate (10,000 pulls a second while `main` moves) is met with 10
+and 100 agents and not with 1,000** (5,616 to 5,729): what bounds it there
+was not traced; the machine is not out of CPU (19 of 32 threads: server 6,
+database 6, load tool 7), each of a pull's 6.7 requests takes about 26 ms
+at the median, and the project's request gate is the first thing to look
+at. A thin pull (the tip, not every snapshot since) still has no benchmark.
