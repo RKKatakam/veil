@@ -239,7 +239,7 @@ pub struct Manifest {
     /// removes it, and a run whose paths hold one (the whole tree) does
     /// not start while it is there (BUG-2200).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub shut_by_command: Vec<String>,
+    pub shut_by_command: Vec<ShutDir>,
     /// Set (durably) just before the command starts, cleared once its
     /// output is recorded and the sandbox cleaned up: the files hold a
     /// command's output that is in no snapshot yet. Never wiped; the next
@@ -260,6 +260,42 @@ pub struct Manifest {
 }
 
 /// The output of a command that is not recorded yet ([`Manifest::pending`]).
+/// A directory a command left unlistable outside its `--only` paths
+/// ([`Manifest::shut_by_command`]).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ShutDir {
+    pub dir: String,
+    /// The `--only` paths of the run whose command shut it: what that run
+    /// held below the directory is its sandbox's, not output outside its
+    /// paths.
+    pub only: Vec<String>,
+}
+
+impl ShutDir {
+    /// The paths of the run that shut the directory.
+    pub fn only_set(&self) -> Option<SparseSet> {
+        SparseSet::from_strings(&self.only).ok().flatten()
+    }
+
+    /// Is `path` at or below the directory and outside the paths of the
+    /// run that shut it: that run's output outside its paths, or where it
+    /// would be?
+    pub fn covers(&self, path: &VPath) -> bool {
+        VPath::new(&self.dir).is_ok_and(|d| path.starts_with(&d)) && !self.only_set().is_some_and(|o| o.contains(path))
+    }
+
+    /// Would a run with the paths `set` (`None`: the whole tree) hold, and
+    /// so record, something at or below the directory that the run that
+    /// shut it did not hold?
+    pub fn reached_by(&self, set: Option<&SparseSet>) -> bool {
+        let Ok(d) = VPath::new(&self.dir) else { return false };
+        match set {
+            None => true,
+            Some(s) => s.contains(&d) || s.paths().iter().any(|p| self.covers(p)),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Pending {
     /// The run that started the command.
@@ -1603,13 +1639,17 @@ pub enum SetAside {
 /// files), ignored and isolated output (build caches, `.env`) and
 /// injected files go. The manifest and stat cache go too, after the files
 /// (a crash half way leaves a sandbox the next run rebuilds again, and a
-/// re-import that was interrupted is kept whole).
+/// re-import that was interrupted is kept whole). What a command left in a
+/// directory it made unlistable outside its paths is no work
+/// ([`ShutDir::covers`]): it is not brought over, and is returned beside
+/// the result, to be named.
 ///
 /// `target`: the tree the sandbox is rebuilt to. A file that is neither the
 /// previous tree's nor `target`'s (a hand edit in the sandbox, or a file a
 /// power loss tore, which Veil cannot tell apart) keeps the previous files
 /// whole.
-pub fn set_aside(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Loaded, target: Option<&ObjectId>) -> Result<SetAside> {
+pub fn set_aside(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Loaded, target: Option<&ObjectId>) -> Result<(SetAside, Vec<VPath>)> {
+    let mut not_work = Vec::new();
     let io = |e: io::Error| VeilError::Io {
         path: paths.files.display().to_string(),
         source: e,
@@ -1637,7 +1677,8 @@ pub fn set_aside(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Loaded, t
             // Only this very workspace's work is re-imported: another one's
             // (an earlier workspace of the same name) is kept aside whole.
             Loaded::Found(m) if m.pending.is_none() && m.version == MANIFEST_VERSION && m.workspace == ws && m.workspace_id == workspace_id(repo, ws) => {
-                let (keep, quarantined, differing) = unrecorded_work(repo, paths, m, target)?;
+                let Work { keep, quarantined, differing, dropped } = unrecorded_work(repo, paths, m, target)?;
+                not_work = dropped;
                 if keep.is_empty() && differing {
                     let dir = kept_dir(paths);
                     std::fs::rename(&paths.files, &dir).map_err(io)?;
@@ -1666,7 +1707,7 @@ pub fn set_aside(repo: &Repo, paths: &SandboxPaths, ws: &str, loaded: &Loaded, t
         },
     };
     wipe(paths).map_err(io)?;
-    Ok(result)
+    Ok((result, not_work))
 }
 
 fn kept_dir(paths: &SandboxPaths) -> PathBuf {
@@ -1685,12 +1726,27 @@ fn trash(paths: &SandboxPaths) -> io::Result<()> {
     std::fs::rename(&paths.files, trash)
 }
 
+/// What [`unrecorded_work`] found.
+struct Work {
+    /// The files to re-import.
+    keep: Vec<VPath>,
+    /// The quarantined ones among them.
+    quarantined: Vec<String>,
+    /// Other files (in the set) differ from both the manifest's tree and
+    /// the target.
+    differing: bool,
+    /// What a command left in a directory it shut outside its paths
+    /// ([`ShutDir::covers`]): no work.
+    dropped: Vec<VPath>,
+}
+
 /// The files of the sandbox `m` describes that are unrecorded work to
 /// re-import, the quarantined ones among them, and whether other files
 /// (in the set) differ from both `m`'s tree and `target`.
-fn unrecorded_work(repo: &Repo, paths: &SandboxPaths, m: &Manifest, target: Option<&ObjectId>) -> Result<(Vec<VPath>, Vec<String>, bool)> {
+fn unrecorded_work(repo: &Repo, paths: &SandboxPaths, m: &Manifest, target: Option<&ObjectId>) -> Result<Work> {
     let fs = SandboxFs::new(&paths.files, None, false);
     let mut keep: BTreeSet<VPath> = BTreeSet::new();
+    let mut dropped = Vec::new();
     let mut quarantined = Vec::new();
     for q in &m.quarantined {
         if let Ok(p) = VPath::new(q) {
@@ -1710,8 +1766,9 @@ fn unrecorded_work(repo: &Repo, paths: &SandboxPaths, m: &Manifest, target: Opti
         }
         // What a command left in a directory it made unlistable outside its
         // paths is no work to keep: it was to be removed (BUG-2200).
-        let shut: Vec<VPath> = m.shut_by_command.iter().filter_map(|d| VPath::new(d).ok()).collect();
-        keep.extend(found.files.into_iter().filter(|f| !shut.iter().any(|d| f.starts_with(d))));
+        let (left, work): (Vec<VPath>, Vec<VPath>) = found.files.into_iter().partition(|f| m.shut_by_command.iter().any(|d| d.covers(f)));
+        dropped = left;
+        keep.extend(work);
     }
     // What is the tree's own content is no work of anyone's.
     let store = repo.store();
@@ -1732,7 +1789,7 @@ fn unrecorded_work(repo: &Repo, paths: &SandboxPaths, m: &Manifest, target: Opti
         out.push(p);
     }
     let differing = differs_from_trees(store, &fs, paths, m, tree.as_ref(), target, &out)?;
-    Ok((out, quarantined, differing))
+    Ok(Work { keep: out, quarantined, differing, dropped })
 }
 
 /// Does a file of the sandbox `fs` (inside `m`'s set; recorded under its

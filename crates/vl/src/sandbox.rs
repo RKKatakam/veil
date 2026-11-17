@@ -440,8 +440,21 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
                 eprintln!("{} the sandbox of workspace {}: {why}", yellow("Rebuilding"), safe(name));
             }
             let target = ctx.repo.snapshot(&ctx.repo.workspace_wc(name)?)?.tree;
-            let aside = core::set_aside(&ctx.repo, &paths, name, &loaded, Some(&target))
+            let (aside, not_work) = core::set_aside(&ctx.repo, &paths, name, &loaded, Some(&target))
                 .with_context(|| format!("setting the files of {} aside", paths.files.display()))?;
+            if !not_work.is_empty() {
+                const SHOWN: usize = 20;
+                let mut list: Vec<String> = not_work.iter().take(SHOWN).map(|p| safe(p.as_str()).into_owned()).collect();
+                if not_work.len() > SHOWN {
+                    list.push(format!("and {} more", not_work.len() - SHOWN));
+                }
+                warn(&format!(
+                    "not recorded: {} file(s) in a directory a command had made unlistable outside its --only paths (not \
+                     brought over to the rebuilt sandbox): {}",
+                    not_work.len(),
+                    list.join(", ")
+                ));
+            }
             if let SetAside::Kept { dir } = &aside {
                 warn(&format!(
                     "the sandbox's previous files may hold work that is in no snapshot (the output of a run that was \
@@ -494,21 +507,21 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     let set = sparse_set(ctx, a.only, &synced, &format!("workspace '{}'", safe(name)))?;
     // What an earlier command left in a directory it made unlistable
     // outside its `--only` paths is not the workspace's, and could not be
-    // removed (BUG-2200). A run whose paths hold the directory (the whole
-    // tree, above all) would record it: it does not start. An `--only` run
-    // beside it does, and removes what it can list there.
-    m.shut_by_command.retain(|d| VPath::new(d).is_ok_and(|p| !matches!(fs.metadata(&p), Ok(None))));
-    let held = m.shut_by_command.iter().filter_map(|d| VPath::new(d).ok()).find(|d| set.as_ref().is_none_or(|s| s.contains(d)));
-    if let Some(d) = held {
-        let was = show_set(m.only_set().ok().flatten().as_ref());
+    // removed (BUG-2200). A run whose paths reach into the directory
+    // further than those of the run that shut it (the whole tree, above
+    // all) would record it: it does not start. A run with that run's paths
+    // does, and removes what it can list there.
+    m.shut_by_command.retain(|d| VPath::new(&d.dir).is_ok_and(|p| !matches!(fs.metadata(&p), Ok(None))));
+    if let Some(shut) = m.shut_by_command.iter().find(|d| d.reached_by(set.as_ref())) {
+        let (d, was) = (&shut.dir, show_set(shut.only_set().as_ref()));
         bail!(
             "the sandbox of workspace '{n}' holds {d}, which a command of an earlier `--only {was}` run made unlistable: what is \
-             in it was written outside those paths and is not the workspace's, so this run, whose paths hold it, would record \
-             it. Make it listable (`chmod u+rwx {at}`) and run `vl ws exec {n} --only {was} -- true`, which removes what was \
-             written there; or delete it. Then run again",
+             in it was written outside those paths and is not the workspace's, so this run, whose paths reach into it, would \
+             record it. Make it listable (`chmod u+rwx {at}`) and run `vl ws exec {n} --only {was} -- true`, which removes \
+             what was written there; or delete it. Then run again",
             n = safe(name),
-            d = safe(d.as_str()),
-            at = paths.files.join(d.as_str()).display(),
+            d = safe(d),
+            at = paths.files.join(d).display(),
         );
     }
     let run_id = hex::encode(veil_core::crypto::random_bytes::<8>());
@@ -587,9 +600,8 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
                 // unlistable: what is there is that command's output outside
                 // its paths, which could not be removed then, and is, like
                 // this command's, once it can be listed (BUG-2200).
-                let shut: Vec<VPath> = m.shut_by_command.iter().filter_map(|d| VPath::new(d).ok()).collect();
-                kept.files.retain(|f| !shut.iter().any(|d| f.starts_with(d)));
-                kept.unlisted.retain(|(u, _)| !shut.iter().any(|d| u.starts_with(d)));
+                kept.files.retain(|f| !m.shut_by_command.iter().any(|d| d.covers(f)));
+                kept.unlisted.retain(|(u, _)| !m.shut_by_command.iter().any(|d| d.covers(u)));
                 kept
             }
             None => core::Strays::default(),
@@ -1081,11 +1093,19 @@ fn finish_recording(
         warn_unlisted(set, &found.unlisted, "stays in the sandbox");
         // The directories a command left unlistable, this one or an
         // earlier one: the next sparse run removes what it can list there.
+        // One already known (or below one) keeps the paths of the run
+        // that shut it.
         m.shut_by_command = found
             .unlisted
             .iter()
             .filter(|(u, _)| !unlisted_before.iter().any(|d| u.starts_with(d)))
-            .map(|(u, _)| u.as_str().to_string())
+            .map(|(u, _)| core::ShutDir {
+                dir: u.as_str().to_string(),
+                only: match m.shut_by_command.iter().find(|d| VPath::new(&d.dir).is_ok_and(|d| u.starts_with(&d))) {
+                    Some(d) => d.only.clone(),
+                    None => set.to_strings(),
+                },
+            })
             .collect();
         for (q, why) in &failed {
             warn(&format!(

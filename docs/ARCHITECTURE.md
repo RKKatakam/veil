@@ -1828,14 +1828,20 @@ A workspace is only a named pointer in the view. It owns no directory.
   warning (what it holds is not recorded and stays). Whose its content is
   is remembered, not guessed. A directory the listing *after* a command
   cannot list, and the one before it could (or did not have), was shut by
-  that command: the manifest keeps it (`shut_by_command`), and what is
-  below it is that command's output outside its paths, which could not be
-  removed. The listing before a later command names nothing below it as
-  "there before", so the first sparse run that can list it removes what
-  it holds as written outside the set; a run whose set holds the
-  directory (the whole tree, above all), which would record it as the
-  workspace's, does not start while the directory exists, and says how to
-  go on; a rebuild does not bring it over. A directory no command shut
+  that command: the manifest keeps it with that run's set
+  (`shut_by_command`: `ShutDir`), and what is below it outside that set
+  is that command's output outside its paths, which could not be removed
+  (`ShutDir::covers`; what that set held below it stays the sandbox's).
+  The listing before a later command names nothing of it as "there
+  before", so the first sparse run that can list it removes it as
+  written outside the set. A run whose set reaches into the directory
+  further than the shutting run's did (`ShutDir::reached_by`: the whole
+  tree, a set holding the directory, or a path below it that the
+  shutting run's set did not hold), which would record it as the
+  workspace's, does not start while the directory exists, and says how
+  to go on (the shutting run's paths once more); a run with those paths,
+  or narrower ones, starts. A rebuild does not bring it over, and names
+  it. A directory no command shut
   (unlistable at the listing before a command, and not in
   `shut_by_command`: made so by hand) is kept in `pending` (`unlisted`),
   and files found below it later stay, as files the command did not
