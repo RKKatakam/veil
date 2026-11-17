@@ -922,19 +922,29 @@ impl Packs {
         };
         for name in unloaded {
             reads.fetch_add(1, Ordering::Relaxed);
-            // Held under its share of the bound while it is read and
-            // searched; then the lookup maps' (BUG-1496). If another server
-            // merged and deleted `name` after its grace period (S29), forget
-            // it here and keep searching.
-            let Some(held) = read_index(&**store, &key(project, &name), &self.bound).await? else {
+            // Searched where it is stored, by ranged reads under one small
+            // share of the bound, as a staged pack's index is (BUG-1496):
+            // an index that does not hold the object is neither read whole
+            // nor loaded (BUG-2631: every unloaded index was read whole and
+            // loaded, each one unloading another, for an object none of
+            // them held; a project past the budget, asked for such objects
+            // some fifty times a second, did nothing else). If another
+            // server merged and deleted `name` after its grace period
+            // (S29), forget it here and keep searching.
+            let k = key(project, &name);
+            let Some(found) = self.stored_slots(&**store, project, &k, std::slice::from_ref(id), false).await? else {
                 self.forget(project, std::slice::from_ref(&name));
                 continue;
             };
-            let slot = held.index.get(id);
-            self.load(p, project, &name, &held.index);
-            if let Some(s) = slot {
-                return Ok(Some((name, s)));
+            let Some((_, slot)) = found.slots.first().copied() else { continue };
+            // The pack that holds it: its index is loaded, for its
+            // neighbours' lookups, held under its share of the bound while
+            // it is read; then the lookup maps' (one deleted meanwhile is
+            // the read's to find).
+            if let Some(held) = read_index(&**store, &k, &self.bound).await? {
+                self.load(p, project, &name, &held.index);
             }
+            return Ok(Some((name, slot)));
         }
         Ok(None)
     }
@@ -1270,9 +1280,23 @@ impl Packs {
             let slots = ids.iter().filter_map(|id| Some((*id, held.index.get(id)?))).collect();
             return Ok(Some(StagedSlots { objects: held.index.len(), size: held.size, slots }));
         }
+        self.stored_slots(store, project, &key(project, name), ids, true).await
+    }
+
+    /// The slots of `ids` in the index of the pack stored at `k` (a pack of
+    /// `project`), with its object count and length; `None` if it is not
+    /// stored. Its index's first [`FIRST_READ`] bytes, then a bisection of
+    /// the rest by ranged reads of that size, all under one share of that
+    /// size: never the whole index (BUG-1496).
+    ///
+    /// `every`: each of `ids` must be there (a staged pack's receipts say
+    /// so, and an index that does not hold one is refused, BUG-1499). Without
+    /// it (a lookup in a listed pack, whose index a server wrote sorted and
+    /// which is checked whole whenever it is loaded) one that is not found
+    /// is not there; every window read is still checked.
+    async fn stored_slots(&self, store: &dyn BlobStore, project: i64, k: &str, ids: &[ObjectId], every: bool) -> Result<Option<StagedSlots>> {
         let _share = self.bound.take_for(Some(project), FIRST_READ.min(self.bound.most as u64)).await?;
-        let k = key(project, name);
-        let Some((first, size)) = store.get_range(&k, 0, FIRST_READ - 1).await? else { return Ok(None) };
+        let Some((first, size)) = store.get_range(k, 0, FIRST_READ - 1).await? else { return Ok(None) };
         let hl = head_len(&first).with_context(|| format!("reading pack {k}"))?;
         if size < hl {
             bail!("a pack's index is cut short");
@@ -1300,7 +1324,7 @@ impl Packs {
             None => 0,
         };
         if rem_start < wanted.len() {
-            bisect_slots(store, &k, hl, size, in_first, count, last_first, None, &wanted[rem_start..], &mut found)
+            bisect_slots(store, k, hl, size, in_first, count, last_first, None, &wanted[rem_start..], every, &mut found)
                 .await
                 .with_context(|| format!("reading pack {k}"))?;
         }
@@ -1390,7 +1414,8 @@ type BisectStep<'a> = (usize, usize, Option<ObjectId>, Option<ObjectId>, &'a [Ob
 
 /// Find `wanted` (sorted, deduplicated) in entries `lo..hi` of a pack index in
 /// `store` by bisecting with ranged reads of at most [`WINDOW_ENTRIES`]
-/// entries (within one [`FIRST_READ`] buffer).
+/// entries (within one [`FIRST_READ`] buffer). With `every`, each of them
+/// must be there.
 #[allow(clippy::too_many_arguments)]
 async fn bisect_slots(
     store: &dyn BlobStore,
@@ -1402,6 +1427,7 @@ async fn bisect_slots(
     prev_before_lo: Option<ObjectId>,
     next_after_hi: Option<ObjectId>,
     wanted: &[ObjectId],
+    every: bool,
     found: &mut HashMap<ObjectId, Slot>,
 ) -> Result<()> {
     let mut work: Vec<BisectStep<'_>> = vec![(lo, hi, prev_before_lo, next_after_hi, wanted)];
@@ -1456,7 +1482,10 @@ async fn bisect_slots(
             }
         }
     }
-    ensure!(wanted.iter().all(|id| found.contains_key(id)), "a pack's index is not sorted");
+    // A staged pack's receipts say it holds each of `wanted`: one not
+    // found is an index that is not what it says (BUG-1499). A lookup in a
+    // listed pack asks whether it holds them.
+    ensure!(!every || wanted.iter().all(|id| found.contains_key(id)), "a pack's index is not sorted");
     Ok(())
 }
 
@@ -1596,6 +1625,100 @@ mod tests {
         if matches!(packs.find(7, &missing), Found::Paged) {
             assert!(packs.find_paged(&store, 7, &missing, &reads).await.unwrap().is_none());
         }
+    }
+
+    /// BUG-2631: past the lookup budget, a lookup that found its object in
+    /// no loaded index read every unloaded index whole from storage and
+    /// loaded each, unloading another for it; for an object no pack holds
+    /// that was every unloaded index of the project, each time (with
+    /// every landing's objects in packs, the landing benchmark stopped at
+    /// about four minutes: 190,000 to 310,000 index reads in 10 s). Now an
+    /// unloaded index is searched where it is stored, by ranged reads of
+    /// at most [`FIRST_READ`]: a lookup for an object no pack holds reads no
+    /// index whole and loads or unloads none; one for an object an
+    /// unloaded pack holds finds it and loads that pack's index alone.
+    #[tokio::test]
+    async fn bug_2631_a_lookup_past_the_budget_reads_whole_only_the_index_that_holds_its_object() {
+        struct Counting(crate::store::FsStore, Mutex<Vec<(u64, u64)>>);
+        #[async_trait::async_trait]
+        impl BlobStore for Counting {
+            async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+                self.0.get(key).await
+            }
+            async fn put(&self, key: &str, data: Bytes) -> Result<()> {
+                self.0.put(key, data).await
+            }
+            async fn exists(&self, key: &str) -> Result<bool> {
+                self.0.exists(key).await
+            }
+            async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+                self.1.lock().unwrap().push((start, end));
+                self.0.get_range(key, start, end).await
+            }
+            async fn delete(&self, key: &str) -> Result<()> {
+                self.0.delete(key).await
+            }
+            async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.0.list(prefix).await
+            }
+        }
+        // Twelve packs whose stored index (4,000 slots of 44 bytes) is
+        // longer than one first read, and a budget for two or three loaded.
+        const PACKS: usize = 12;
+        let per = 4_000;
+        assert!((per * ENTRY) as u64 > 2 * FIRST_READ);
+        let budget = 3 * per * 48;
+        let packs = Packs { budget, ..Packs::new(None) };
+        let dir = tempfile::tempdir().unwrap();
+        let counting = Arc::new(Counting(crate::store::FsStore::new(dir.path()), Mutex::new(Vec::new())));
+        let store: Arc<dyn BlobStore> = counting.clone();
+        let (mut names, mut inside) = (Vec::new(), Vec::new());
+        for k in 0..PACKS {
+            let objects: Vec<_> = (0..per).map(|i| obj(&format!("pack {k} object {i}"))).collect();
+            inside.push(objects[per / 2].0);
+            let (bytes, index) = build(objects).unwrap();
+            let name: Arc<str> = Arc::from(new_name());
+            store.put(&key(7, &name), bytes).await.unwrap();
+            packs.add(7, vec![(name.clone(), Some(Arc::new(index)))], true);
+            names.push(name);
+        }
+        assert!(total(&packs) <= budget, "within the budget: {}", total(&packs));
+        let loaded = |packs: &Packs| -> Vec<Arc<str>> {
+            let p = packs.projects.lock().unwrap()[&7].clone();
+            let m = p.map.read().unwrap();
+            m.packs.iter().filter(|l| l.index.is_some()).map(|l| l.name.clone()).collect()
+        };
+        let before = loaded(&packs);
+        let unloaded = PACKS - before.len();
+        assert!((1..PACKS).contains(&before.len()), "some indexes are loaded and some are not: {}", before.len());
+        let reads = AtomicU64::new(0);
+
+        // An object no pack holds: every unloaded index is searched where
+        // it is stored, none read whole, none loaded, none unloaded.
+        let missing = ObjectId::hash(b"in no pack");
+        assert!(matches!(packs.find(7, &missing), Found::Paged));
+        counting.1.lock().unwrap().clear();
+        assert!(packs.find_paged(&store, 7, &missing, &reads).await.unwrap().is_none(), "an object no pack holds is absent");
+        let asked = counting.1.lock().unwrap().clone();
+        assert!(asked.len() >= unloaded, "every unloaded index was searched: {} reads of {unloaded}", asked.len());
+        assert!(asked.iter().all(|(start, end)| end - start < FIRST_READ), "an index was read whole for an object it does not hold: {asked:?}");
+        assert!(asked.len() <= unloaded * 4, "a first read and a bisection of each: {} reads of {unloaded} indexes", asked.len());
+        assert_eq!(loaded(&packs), before, "a lookup for an object no pack holds loaded or unloaded an index");
+
+        // An object an unloaded pack holds: found there, and that pack's
+        // index alone is loaded (and others unloaded for it, within the
+        // budget).
+        let k = (0..PACKS).find(|k| !before.contains(&names[*k])).expect("an unloaded pack");
+        assert!(matches!(packs.find(7, &inside[k]), Found::Paged));
+        let (name, slot) = packs.find_paged(&store, 7, &inside[k], &reads).await.unwrap().expect("an object of an unloaded pack is found");
+        assert_eq!(name, names[k]);
+        let (b, _) = store.get_range(&key(7, &name), slot.offset, slot.last()).await.unwrap().unwrap();
+        assert!(entry(&inside[k], slot, &b).is_ok(), "at its slot");
+        let after = loaded(&packs);
+        assert!(after.contains(&names[k]), "the index of the pack that holds it is loaded");
+        assert!(after.iter().all(|n| *n == names[k] || before.contains(n)), "no other index was loaded");
+        assert!(total(&packs) <= budget, "within the budget: {}", total(&packs));
+        assert!(matches!(packs.find(7, &inside[k]), Found::At(..)), "and found in memory from now on");
     }
 
     /// BUG-1495 (S28 cycle 3 review): `Objects::in_pack` asks
