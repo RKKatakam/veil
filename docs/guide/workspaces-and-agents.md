@@ -486,7 +486,8 @@ a copy of the repository: `vl ws new agent`, then
   from the workspace's). The refusal says what to do: make the directory
   listable and run once more with the earlier paths (it gives the
   commands, to run as written), or delete it. A run that names nothing
-  in that directory is not affected.
+  in that directory is not affected if the earlier run named nothing in
+  it either.
 * **`.veilpolicy` is always there** (the snapshot needs it to classify
   anything). If the command edits it, the new policy applies to every
   file of the workspace, inside the paths or not, as for a full run: a
