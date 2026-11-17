@@ -2354,6 +2354,103 @@ fn bug_2622_a_file_entry_naming_a_tree_never_hides_the_trees_files_from_gc() {
     assert_closure_stored(&hub, pid, main1, "main");
 }
 
+/// BUG-2602 (found by its review): a switch's transaction is run again when
+/// it fails on an error that may pass (a lost race, a timeout), and its walk
+/// had already put the objects it read into the pass's marks: run again, it
+/// stopped at an object whose tree it had never read, and the tree and its
+/// files stayed candidates and were deleted. A root naming a snapshot past
+/// the window is written as the pass switches, and the walk's read of that
+/// snapshot's tree fails once with such an error: the pass deletes nothing
+/// (a walk that failed leaves no candidate), the snapshot is whole, and the
+/// next pass collects.
+#[test]
+fn bug_2602_a_read_that_fails_in_the_switchs_walk_leaves_nothing_to_delete() {
+    use veil_server::pack_gc::{Fault, FaultPoint, SwitchHook};
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let admin_pid: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+
+    let (dead, dead_raw) = make_blob("DEAD-LOOSE-2602-fault\n");
+    hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
+    let (snap, blob) = expiring_snapshot(&hub, &p, pid, "exp-fault", 0);
+    let Object::Snapshot(s) = Object::decode(&hub.rt.block_on(h.objects.get(pid, &snap)).unwrap().expect("stored")).unwrap() else { panic!("a snapshot") };
+    let tree = s.tree;
+
+    let (writes, faults) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let hook = {
+        let (db, writes, snap_hex) = (h.db.clone(), writes.clone(), snap.hex());
+        SwitchHook(Arc::new(move || {
+            let (db, writes, snap_hex) = (db.clone(), writes.clone(), snap_hex.clone());
+            Box::pin(async move {
+                if writes.fetch_add(1, Relaxed) == 0 {
+                    sqlx::query("INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) VALUES ($1, 'chg-2602-fault', $2, $3, 1000)")
+                        .bind(pid)
+                        .bind(&snap_hex)
+                        .bind(admin_pid)
+                        .execute(&db)
+                        .await
+                        .unwrap();
+                }
+            })
+        }))
+    };
+    let fault = {
+        let (db, faults) = (h.db.clone(), faults.clone());
+        Fault(Arc::new(move |at, id| {
+            let (db, faults) = (db.clone(), faults.clone());
+            Box::pin(async move {
+                if at == FaultPoint::SwitchRead && id == tree && faults.fetch_add(1, Relaxed) == 0 {
+                    // A lost race, as the database answers one.
+                    let e = sqlx::query("DO $$ BEGIN RAISE EXCEPTION 'injected' USING ERRCODE = '40001'; END $$").execute(&db).await.expect_err("raises");
+                    return Err(veil_server::error::Error::Db(e));
+                }
+                Ok(())
+            })
+        }))
+    };
+    let rep = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options {
+                min_packs_to_merge: 99,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: 120_000,
+                before_switch: Some(hook),
+                fault: Some(fault),
+                ..Options::default()
+            },
+        ))
+        .expect("the transaction ran again and the pass ended");
+    assert!(!rep.skipped, "the pass ran: {rep:?}");
+    assert_eq!(faults.load(Relaxed), 1, "the walk's read of the snapshot's tree failed once");
+    assert_eq!(rep.loose_objects_deleted + rep.packed_objects_deleted, 0, "a walk that failed leaves nothing to delete: {rep:?}");
+    assert!(hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "the file of the snapshot the walk was reading is kept");
+    assert_closure_stored(&hub, pid, snap, "after the failed walk");
+    assert!(hub.rt.block_on(fresh.exists(pid, &dead)).unwrap(), "nothing is deleted by that pass");
+
+    let next = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 240_000, ..Options::default() },
+        ))
+        .unwrap();
+    assert!(!next.skipped, "the next pass ran: {next:?}");
+    assert!(!hub.rt.block_on(fresh.exists(pid, &dead)).unwrap(), "the next pass collects what nothing names: {next:?}");
+    assert_closure_stored(&hub, pid, snap, "after the next pass");
+}
+
 /// BUG-2602: what a switch reads from the store while root writers wait is
 /// bounded (`SWITCH_WALK_MAX` objects). A root written as the pass switches
 /// that names more than that gives the switch way, as any root write did
