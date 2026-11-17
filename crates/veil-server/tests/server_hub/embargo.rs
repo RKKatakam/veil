@@ -1843,3 +1843,79 @@ fn bug_1947_an_embargo_made_after_a_request_read_its_epochs_withholds_what_the_r
         }
     }
 }
+
+/// BUG-2634 (open; found by the review of BUG-1947's fix; the same before
+/// it): while an embargo lasts, someone outside it is refused `main`'s tip.
+/// The routes of a pull ask about the id a request names before they
+/// resolve it, and `is_withheld_from_viewer` counts an id as embargoed when
+/// **any view's** `projections` row maps it to an embargoed snapshot. An
+/// embargo member whose view cannot see the fix's folder sees the embargoed
+/// snapshot as its parent's projection; if their view sees `main`'s tip as
+/// someone outside sees it, that is the id the outsider names for `main`,
+/// and their pull's row turns the outsider's pulls into 404s, on every
+/// server (the check comes before the server's own memory of the id). The
+/// row is written here as that pull stores it (as in the test above; the
+/// two views are not built). Expected: the outsider still pulls what is
+/// theirs, `main`'s tip as they see it, and nothing of the embargo.
+#[test]
+#[ignore = "BUG-2634: during an embargo, someone outside it is refused main's tip (404) when another view's projections row maps the id they name to the embargoed snapshot"]
+fn bug_2634_an_embargo_another_view_sees_as_mains_tip_does_not_refuse_main_to_those_outside_it() {
+    const FIX_MARK: &str = "EMBARGO-SECRET-FIX-2634";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let other = TestHub::beside(&hub);
+    let (dev, sec) = (p.dev.token(), p.sec.token());
+    let history = |h: &TestHub, tok: &str, id: ObjectId| h.api().post_json(Some(tok), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [id.hex()], "stop": []}));
+
+    // `main`'s tip as dev sees it, pulled through both servers: each has
+    // resolved the id for dev's view.
+    let named = hub.api().tips(Some(&dev), &p.name).unwrap().branches["main"];
+    for (name, h) in [("the first server", &hub), ("the second server", &other)] {
+        let r = history(h, &dev, named);
+        assert_eq!(r.status, 200, "{name}, before the embargo: {}", String::from_utf8_lossy(&r.body));
+    }
+
+    // Someone in `security` pushes an embargoed fix.
+    let sec_dir = p.sec.dir("work");
+    p.sec.ok(p.sec.home.path(), &["clone", &hub.url(&p.name), sec_dir.to_str().unwrap()]);
+    write_files(&sec_dir, &[("src/embargo_2634.rs", &format!("pub const FIX: &str = \"{FIX_MARK}\";\n"))]);
+    p.sec.ok(&sec_dir, &["commit", "--no-advance", "-m", "an embargoed fix"]);
+    let until = iso_utc(veil_core::now_millis() + 3_600_000);
+    let merge_out = p.sec.ok(&sec_dir, &["merge", "@-", "--into", "main", "--embargo-for", "security", "--until", &until, "-m", "an embargoed merge"]);
+    let eid = parse_embargo_id(&merge_out);
+    let out = p.sec.ok(&sec_dir, &["log", "-r", "main", "-n", "1", "--json"]);
+    let embargoed = ObjectId::from_hex(serde_json::from_str::<Value>(&out).unwrap()["entries"][0]["snapshot_id"].as_str().unwrap()).unwrap();
+    p.sec.ok(&sec_dir, &["push"]);
+    let (r_dev, r_sec) = (history(&hub, &dev, embargoed), history(&hub, &sec, embargoed));
+    assert_eq!(r_dev.status, 404, "the embargo is there: {}", String::from_utf8_lossy(&r_dev.body));
+    assert_eq!(r_sec.status, 200, "and its member reads it: {}", String::from_utf8_lossy(&r_sec.body));
+    // `main` has not moved for dev, and they still pull it.
+    assert_eq!(hub.api().tips(Some(&dev), &p.name).unwrap().branches["main"], named, "main as dev sees it");
+    let r = history(&hub, &dev, named);
+    assert_eq!(r.status, 200, "with the embargo, before the other view's pull: {}", String::from_utf8_lossy(&r.body));
+
+    // An embargo member of another view pulls the embargoed snapshot and
+    // sees it as the id dev names for `main`: the row their pull stores.
+    let ho = hub.hub();
+    let stored = hub.rt.block_on(async {
+        let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&ho.db).await.unwrap();
+        sqlx::query("INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, 'another-view', $2, $3, $4, TRUE)")
+            .bind(pid)
+            .bind(embargoed.hex())
+            .bind(named.hex())
+            .bind(veil_core::now_millis() + 3_600_000)
+            .execute(&ho.db)
+            .await
+    });
+    assert_eq!(stored.unwrap().rows_affected(), 1, "the other view's row");
+
+    // dev still pulls `main`, through either server, and gets nothing of
+    // the embargo.
+    for (name, h) in [("the first server", &hub), ("the second server", &other)] {
+        let r = history(h, &dev, named);
+        assert_eq!(r.status, 200, "{name}: someone outside the embargo is refused main's tip: {}", String::from_utf8_lossy(&r.body));
+        assert!(r.frames().iter().any(|(id, _)| *id == named), "{name}: main's tip is in its history");
+        assert_no_str(&String::from_utf8_lossy(&r.body), &[FIX_MARK, &eid], name);
+    }
+}
