@@ -2182,9 +2182,9 @@ fn bug_1875_a_pr_onto_a_rewritten_line_is_closed_at_release_and_lands_nothing_un
 /// (the held line is a root), and once approved it lands whole.
 #[test]
 fn bug_1875_the_collector_keeps_a_held_embargos_fix_until_it_lands() {
-    use veil_server::pack_gc::{self, Options};
+    use veil_server::pack_gc::Options;
     const FIX_FILE: &str = "pub const FIX: &str = \"GC_KEEPS_HELD_FIX_1875\";\n";
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let (p, rev1) = protected_project(&hub);
     let api = hub.api();
     let (sec, dev) = (p.sec.token(), p.dev.token());
@@ -2212,12 +2212,14 @@ fn bug_1875_the_collector_keeps_a_held_embargos_fix_until_it_lands() {
     assert_eq!(rel.status, 409, "{}", body_str(&rel));
     assert!(released_at(&hub, &eid).is_none(), "held, not released");
 
-    // Two collections, the second past the retention window.
+    // Two offline collections, the second past the retention window.
     for now_offset_ms in [0, 180_000] {
         let opts = Options { min_packs_to_merge: 2, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms, ..Options::default() };
-        let r = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).unwrap();
+        let r = hub.offline_gc(pid, &opts).unwrap();
         assert!(!r.skipped, "{r:?}");
     }
+    let api = hub.api();
+    let h = hub.hub();
     let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     assert!(hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "the collector deleted a held embargo's fix");
     assert!(api.tips(Some(&sec), &p.name).unwrap().branches.contains_key(&line), "the held line stays");

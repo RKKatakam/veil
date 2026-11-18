@@ -478,7 +478,7 @@ fn bug_1922_a_change_below_an_api_commit_that_moved_the_branch_is_not_landed_aga
 /// as every root writer does: its transaction first locks the project's GC
 /// epoch row `FOR SHARE` and finds the epoch it read before. Answers whether
 /// the snapshot is still stored after GC.
-fn snapshot_survives_a_root_written_before_the_switch(th: &TestHub, p: &Project, round: i64, row: &'static str) -> bool {
+fn snapshot_survives_a_root_written_before_the_switch(th: &mut TestHub, p: &Project, round: i64, row: &'static str) -> bool {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -500,10 +500,13 @@ fn snapshot_survives_a_root_written_before_the_switch(th: &TestHub, p: &Project,
     );
     assert_eq!(r.json()["results"][0]["ok"], true, "{}", body(&r));
     assert!(th.rt.block_on(h.objects.exists(pid, &snap)).unwrap(), "the change is stored");
+    drop(h);
 
+    th.stop_serving();
+    let offline = th.offline_hub();
     let gc = |offset: i64, hook: Option<SwitchHook>| {
         th.rt.block_on(pack_gc::run_project(
-            &h,
+            &offline,
             pid,
             &Options {
                 min_packs_to_merge: 1,
@@ -521,7 +524,7 @@ fn snapshot_survives_a_root_written_before_the_switch(th: &TestHub, p: &Project,
     gc(round * 240_000, None).unwrap();
     let wrote = Arc::new(AtomicBool::new(false));
     let hook = {
-        let (db, wrote, hex) = (h.db.clone(), wrote.clone(), snap.hex());
+        let (db, wrote, hex) = (offline.db.clone(), wrote.clone(), snap.hex());
         SwitchHook(Arc::new(move || {
             let (db, wrote, hex) = (db.clone(), wrote.clone(), hex.clone());
             Box::pin(async move {
@@ -541,7 +544,10 @@ fn snapshot_survives_a_root_written_before_the_switch(th: &TestHub, p: &Project,
     };
     gc(round * 240_000 + 120_000, Some(hook)).unwrap();
     assert!(wrote.load(Ordering::SeqCst), "GC reached its switch, and the writer committed before it");
-    th.rt.block_on(h.objects.exists(pid, &snap)).unwrap()
+    let kept = th.rt.block_on(offline.objects.exists(pid, &snap)).unwrap();
+    th.rt.block_on(offline.db.close());
+    th.start_serving();
+    kept
 }
 
 /// BUG-1881's guarantee ("every writer that adds a root takes the GC guard
@@ -562,10 +568,10 @@ fn snapshot_survives_a_root_written_before_the_switch(th: &TestHub, p: &Project,
 /// The control is the same writer with a row in a stamped table.
 #[test]
 fn bug_1923_gc_gives_way_to_a_search_shard_written_right_before_its_switch() {
-    let th = TestHub::start();
+    let mut th = TestHub::start_own();
     let p = setup_project(&th);
     let kept = snapshot_survives_a_root_written_before_the_switch(
-        &th,
+        &mut th,
         &p,
         0,
         "INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) \
@@ -573,7 +579,7 @@ fn bug_1923_gc_gives_way_to_a_search_shard_written_right_before_its_switch() {
     );
     assert!(kept, "control: GC gives way to a change ref written right before its switch");
     let kept = snapshot_survives_a_root_written_before_the_switch(
-        &th,
+        &mut th,
         &p,
         1,
         "INSERT INTO search_shards (project_id, kind, branch, line_key, segments, docs, text_docs, text_bytes, dead) \
@@ -583,7 +589,7 @@ fn bug_1923_gc_gives_way_to_a_search_shard_written_right_before_its_switch() {
     // The other root table the stamp left out (its `checked` is the
     // default branch's tip in use; the stamp reads it all the same).
     let kept = snapshot_survives_a_root_written_before_the_switch(
-        &th,
+        &mut th,
         &p,
         2,
         "INSERT INTO pr_review_rules (project_id, checked, state) VALUES ($1, $3, $2) \

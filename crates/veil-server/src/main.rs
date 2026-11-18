@@ -7,6 +7,8 @@
 //!             [--device-rate 200/50000] [--anonymous-rate 20/1000]
 //!             [--max-connections 1024] [--request-memory 512M]   (docs/HUB.md §13.25)
 //! veil-server migrate --database-url postgres://…   (apply migrations, then exit)
+//! veil-server gc --database-url postgres://… [--data ./hub] [--project NAME] [--dry-run]
+//!             [--storage DIR | --s3-endpoint URL --s3-bucket B]   (offline GC: docs/HUB.md §13.37)
 //! veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
 //!             [--listen 127.0.0.1:8444] [--size 10G] [--memory 128M] [--max-connections 1024]
 //!             [--upstream-ca PEM]
@@ -100,6 +102,34 @@ enum Command {
         #[arg(long)]
         database_url: Option<String>,
     },
+    /// Run offline garbage collection on one or all projects, refusing if any
+    /// `veil-server` is serving the database (`docs/HUB.md` §13.37).
+    Gc {
+        /// PostgreSQL connection URL (default: VEIL_DATABASE_URL).
+        #[arg(long)]
+        database_url: Option<String>,
+        /// Server data directory (default object directory: DATA/objects).
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// Keep objects in this directory (default: DATA/objects).
+        #[arg(long, conflicts_with = "s3_endpoint")]
+        storage: Option<PathBuf>,
+        /// Keep objects in S3 at this endpoint (credentials in
+        /// VEIL_S3_ACCESS_KEY and VEIL_S3_SECRET_KEY; a CA of its own, in
+        /// PEM, in the file VEIL_S3_CA names).
+        #[arg(long, requires = "s3_bucket")]
+        s3_endpoint: Option<String>,
+        #[arg(long)]
+        s3_bucket: Option<String>,
+        #[arg(long, default_value = "us-east-1")]
+        s3_region: String,
+        /// Collect only this project (default: every project in the database).
+        #[arg(long)]
+        project: Option<String>,
+        /// Report what would be deleted without modifying the database or storage.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run a regional cache of the object routes in front of a Veil
     /// server (`docs/HUB.md` §13.18). It holds objects only, no key and no
     /// database, and serves one only under a grant the server signed.
@@ -137,6 +167,14 @@ enum Command {
         #[arg(long)]
         tls_key: Option<PathBuf>,
     },
+}
+
+fn server_err(e: veil_server::error::Error) -> anyhow::Error {
+    match e {
+        veil_server::error::Error::Api { message, .. } => anyhow::anyhow!("{message}"),
+        veil_server::error::Error::Db(e) => anyhow::Error::from(e),
+        veil_server::error::Error::Other(e) => e,
+    }
 }
 
 /// `123`, `64K`, `256M`, `10G`.
@@ -197,6 +235,118 @@ async fn serve() -> anyhow::Result<()> {
         let db = veil_server::db::connect(&database_url(url)?, 2).await?;
         veil_server::db::migrate(&db).await?;
         println!("veil-server: the database schema is current");
+        return Ok(());
+    }
+    if let Some(Command::Gc {
+        database_url: url,
+        data,
+        storage,
+        s3_endpoint,
+        s3_bucket,
+        s3_region,
+        project,
+        dry_run,
+    }) = a.command
+    {
+        let db_url = database_url(url)?;
+        let store = match (s3_endpoint, storage, data) {
+            (Some(endpoint), _, _) => Storage::S3 {
+                endpoint,
+                bucket: s3_bucket.unwrap_or_default(),
+                region: s3_region,
+                key: std::env::var("VEIL_S3_ACCESS_KEY").unwrap_or_default(),
+                secret: std::env::var("VEIL_S3_SECRET_KEY").unwrap_or_default(),
+            },
+            (None, Some(dir), _) => Storage::Dir(dir),
+            (None, None, Some(d)) => Storage::Dir(d.join("objects")),
+            (None, None, None) => anyhow::bail!("give --data, --storage, or --s3-endpoint"),
+        };
+        let hub = veil_server::open_offline(&db_url, &store).await?;
+        // No server is serving while `OfflineGcFence` is held, so unreachable
+        // objects, superseded packs, and abandoned staged uploads can all be
+        // reclaimed in one offline maintenance pass without waiting on online
+        // retention or grace windows.
+        let opts = veil_server::pack_gc::Options {
+            retention_window_ms: 0,
+            pack_grace_ms: 0,
+            staged_grace_ms: 0,
+            ..veil_server::pack_gc::Options::default()
+        };
+        if dry_run {
+            let reports = veil_server::pack_gc::dry_run_offline(&hub, project.as_deref(), &opts)
+                .await
+                .map_err(server_err)?;
+            let mut tot = veil_server::pack_gc::DryRunReport::default();
+            for (name, r) in &reports {
+                println!(
+                    "project {name}: would delete {} loose objects, {} packed objects, {} expired snapshots; \
+                     rewrite {} packs; sweep {} discarded packs, {} staged uploads ({} newly unreferenced, {} in retention window)",
+                    r.loose_objects_to_delete,
+                    r.packed_objects_to_delete,
+                    r.expired_snapshots_to_purge,
+                    r.packs_to_rewrite,
+                    r.discarded_packs_to_sweep,
+                    r.staged_packs_to_sweep,
+                    r.newly_unreferenced,
+                    r.unreferenced_in_window,
+                );
+                tot.newly_unreferenced += r.newly_unreferenced;
+                tot.unreferenced_in_window += r.unreferenced_in_window;
+                tot.loose_objects_to_delete += r.loose_objects_to_delete;
+                tot.packed_objects_to_delete += r.packed_objects_to_delete;
+                tot.expired_snapshots_to_purge += r.expired_snapshots_to_purge;
+                tot.packs_to_rewrite += r.packs_to_rewrite;
+                tot.discarded_packs_to_sweep += r.discarded_packs_to_sweep;
+                tot.staged_packs_to_sweep += r.staged_packs_to_sweep;
+            }
+            println!(
+                "veil-server gc (dry run, {} projects): would delete {} loose objects, {} packed objects, {} expired snapshots; \
+                 rewrite {} packs; sweep {} discarded packs, {} staged uploads",
+                reports.len(),
+                tot.loose_objects_to_delete,
+                tot.packed_objects_to_delete,
+                tot.expired_snapshots_to_purge,
+                tot.packs_to_rewrite,
+                tot.discarded_packs_to_sweep,
+                tot.staged_packs_to_sweep,
+            );
+        } else {
+            let reports = veil_server::pack_gc::run_offline(&hub, project.as_deref(), &opts)
+                .await
+                .map_err(server_err)?;
+            let mut tot = veil_server::pack_gc::Report::default();
+            for (name, r) in &reports {
+                println!(
+                    "project {name}: deleted {} loose objects, {} packed objects; merged {} packs into {} ({} objects kept); \
+                     swept {} discarded packs, {} staged uploads",
+                    r.loose_objects_deleted,
+                    r.packed_objects_deleted,
+                    r.packs_merged,
+                    r.packs_written,
+                    r.objects_kept,
+                    r.discarded_packs_swept,
+                    r.staged_packs_swept,
+                );
+                tot.packs_merged += r.packs_merged;
+                tot.packs_written += r.packs_written;
+                tot.objects_kept += r.objects_kept;
+                tot.packed_objects_deleted += r.packed_objects_deleted;
+                tot.loose_objects_deleted += r.loose_objects_deleted;
+                tot.discarded_packs_swept += r.discarded_packs_swept;
+                tot.staged_packs_swept += r.staged_packs_swept;
+            }
+            println!(
+                "veil-server gc ({} projects): deleted {} loose objects, {} packed objects; merged {} packs into {}; \
+                 swept {} discarded packs, {} staged uploads",
+                reports.len(),
+                tot.loose_objects_deleted,
+                tot.packed_objects_deleted,
+                tot.packs_merged,
+                tot.packs_written,
+                tot.discarded_packs_swept,
+                tot.staged_packs_swept,
+            );
+        }
         return Ok(());
     }
     if let Some(Command::Cache { upstream, upstream_ca, token_file, dir, listen, size, memory, max_connections, tls_cert, tls_key }) = a.command {

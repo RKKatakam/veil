@@ -25,8 +25,15 @@
 //!   4. once `now_ms - discarded_at >= grace_ms`, the sweep deletes the
 //!      discarded packs' storage objects and then their rows in `packs` (and
 //!      discards stale `STAGED` uploads past `staged_grace_ms`).
-//! * **Garbage collection with a retention window.** GC marks every object
-//!   reachable from the project's live roots:
+//! * **Offline-only garbage collection with a retention window.** In v1,
+//!   unreachable-object collection (`veil-server gc`, [`run_project`] with
+//!   `run_gc: true`) runs **offline only**: every serving `veil-server` holds
+//!   [`ServingLock`] (shared session advisory lock on [`SERVING_LOCK_KEY`]),
+//!   and offline GC acquires [`OfflineGcFence`] (exclusive), refusing if any
+//!   server is serving and refusing server start-up while GC runs. Online
+//!   servers only merge small packs (`run_gc: false`) and sweep superseded
+//!   packs and stale staged uploads. GC marks every object reachable from the
+//!   project's live roots:
 //!   - all `branches` (including hidden embargo branches `embargo/<id>` with
 //!     `hidden_for_embargo IS NOT NULL`),
 //!   - tags (any `tags` table if present, and `Atag` objects),
@@ -603,38 +610,417 @@ pub async fn projects_to_sweep(hub: &Hub) -> Result<Vec<i64>> {
     .await?)
 }
 
+/// Two-integer PostgreSQL session advisory lock (`"veil"`, `-"gcof"`) held
+/// shared by every serving `veil-server` on a dedicated connection, and
+/// exclusively by offline garbage collection (`veil-server gc`, or
+/// [`run_project`] with `run_gc: true`).
+///
+/// `k2 < 0` keeps it disjoint from [`crate::landing::lease_lock`]'s
+/// two-integer keys (`k2 = (epoch & 0x7fff_ffff) >= 0`), and two-integer keys
+/// occupy a separate `pg_locks` namespace (`objsubid = 2`) from every
+/// one-`bigint` advisory lock in the server.
+pub const SERVING_LOCK_KEY: (i32, i32) = (0x7665_696c, -0x6763_6f66);
+
+/// Shared session advisory lock held on a dedicated database connection for
+/// the whole serving lifetime of a `veil-server`, preventing offline garbage
+/// collection from running concurrently and refusing server start-up while
+/// `veil-server gc` holds [`OfflineGcFence`].
+pub struct ServingLock {
+    conn: PgConnection,
+}
+
+impl ServingLock {
+    /// Acquire the shared serving session lock without waiting, or fail with
+    /// a clear error if offline garbage collection holds [`OfflineGcFence`].
+    pub async fn acquire(db: &sqlx::PgPool) -> anyhow::Result<ServingLock> {
+        use sqlx::Connection as _;
+        let opts = (*db.connect_options()).clone().application_name("veil-server-serving");
+        let mut conn = PgConnection::connect_with(&opts).await?;
+        let (k1, k2) = SERVING_LOCK_KEY;
+        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock_shared($1, $2)")
+            .bind(k1)
+            .bind(k2)
+            .fetch_one(&mut conn)
+            .await?;
+        if !got {
+            let _ = conn.close().await;
+            anyhow::bail!(
+                "cannot start veil-server while offline garbage collection (`veil-server gc`) is running on this database"
+            );
+        }
+        Ok(ServingLock { conn })
+    }
+
+    /// Close the dedicated session connection, releasing the shared lock at
+    /// once on PostgreSQL.
+    pub async fn release(self) {
+        use sqlx::Connection as _;
+        let _ = self.conn.close().await;
+    }
+}
+
+/// Exclusive session advisory lock held on a dedicated database connection
+/// while offline garbage collection runs, refusing if any `veil-server` holds
+/// [`ServingLock`] (or another offline GC is running) and preventing any
+/// `veil-server` from starting until GC finishes.
+pub struct OfflineGcFence {
+    conn: PgConnection,
+}
+
+impl OfflineGcFence {
+    /// Acquire the exclusive offline-GC session lock without waiting, or fail
+    /// with a `409 Conflict` error if any server is serving the database (or
+    /// another offline GC holds the fence).
+    pub async fn acquire(db: &sqlx::PgPool) -> Result<OfflineGcFence> {
+        use sqlx::Connection as _;
+        let opts = (*db.connect_options()).clone().application_name("veil-server-gc");
+        let mut conn = PgConnection::connect_with(&opts).await.map_err(sqlx::Error::from)?;
+        let (k1, k2) = SERVING_LOCK_KEY;
+        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, $2)")
+            .bind(k1)
+            .bind(k2)
+            .fetch_one(&mut conn)
+            .await?;
+        if !got {
+            let _ = conn.close().await;
+            return Err(Error::conflict(
+                "cannot run garbage collection while a server is serving this database (or another `veil-server gc` is running); stop all veil-server instances first",
+            ));
+        }
+        Ok(OfflineGcFence { conn })
+    }
+
+    /// Close the dedicated session connection, releasing the exclusive lock at
+    /// once on PostgreSQL.
+    pub async fn release(self) {
+        use sqlx::Connection as _;
+        let _ = self.conn.close().await;
+    }
+}
+
+/// Read-only inspection report for `veil-server gc --dry-run` on one project.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DryRunReport {
+    /// Stored objects unreferenced now and not yet recorded in `unreferenced_objects`.
+    pub newly_unreferenced: usize,
+    /// Stored unreferenced objects still inside `retention_window_ms`.
+    pub unreferenced_in_window: usize,
+    /// Expired unreferenced loose objects that a collection pass would delete.
+    pub loose_objects_to_delete: usize,
+    /// Expired unreferenced packed objects that pack rewrites would drop.
+    pub packed_objects_to_delete: usize,
+    /// Expired unreferenced `snapshots` rows whose database records would be purged.
+    pub expired_snapshots_to_purge: usize,
+    /// Listed packs that would be merged or rewritten (small packs or packs holding expired objects).
+    pub packs_to_rewrite: usize,
+    /// `DISCARDED` packs that would be deleted from storage and `packs`.
+    pub discarded_packs_to_sweep: usize,
+    /// Stale `STAGED` packs that would be discarded and deleted.
+    pub staged_packs_to_sweep: usize,
+}
+
+async fn resolve_target_projects(db: &sqlx::PgPool, project_name: Option<&str>) -> Result<Vec<(i64, String)>> {
+    match project_name {
+        Some(name) => {
+            let row: Option<(i64, String)> = sqlx::query_as("SELECT id, name FROM projects WHERE name = $1")
+                .bind(name)
+                .fetch_optional(db)
+                .await?;
+            match row {
+                Some(p) => Ok(vec![p]),
+                None => Err(Error::not_found(format!("project '{name}' does not exist"))),
+            }
+        }
+        None => Ok(sqlx::query_as("SELECT id, name FROM projects ORDER BY id").fetch_all(db).await?),
+    }
+}
+
+/// Run offline garbage collection across `project_name` (`None`: every project
+/// in the database), holding [`OfflineGcFence`] across the whole run.
+pub async fn run_offline(hub: &Arc<Hub>, project_name: Option<&str>, opts: &Options) -> Result<Vec<(String, Report)>> {
+    let fence = OfflineGcFence::acquire(&hub.db).await?;
+    let res: Result<Vec<(String, Report)>> = async {
+        let projects = resolve_target_projects(&hub.db, project_name).await?;
+        let mut out = Vec::with_capacity(projects.len());
+        for (pid, name) in projects {
+            let listed_count: i64 = sqlx::query_scalar("SELECT count(*) FROM packs WHERE project_id = $1 AND state = 1")
+                .bind(pid)
+                .fetch_one(&hub.db)
+                .await?;
+            let max_passes = (listed_count.max(0) as usize).saturating_add(2).max(16);
+            let mut total = Report::default();
+            for _ in 0..max_passes {
+                let r = run_locked(hub, pid, opts, true).await?;
+                if r.skipped {
+                    total.skipped = true;
+                    break;
+                }
+                total.packs_merged += r.packs_merged;
+                total.packs_written += r.packs_written;
+                total.objects_kept += r.objects_kept;
+                total.packed_objects_deleted += r.packed_objects_deleted;
+                total.loose_objects_deleted += r.loose_objects_deleted;
+                total.discarded_packs_swept += r.discarded_packs_swept;
+                total.staged_packs_swept += r.staged_packs_swept;
+                if r.packs_merged == 0 && r.loose_objects_deleted == 0 && r.discarded_packs_swept == 0 {
+                    break;
+                }
+            }
+            out.push((name, total));
+        }
+        Ok(out)
+    }
+    .await;
+    fence.release().await;
+    res
+}
+
+/// Inspect what offline garbage collection would delete across `project_name`
+/// (`None`: every project in the database), holding [`OfflineGcFence`] across
+/// the whole inspection without modifying the database or object store.
+pub async fn dry_run_offline(
+    hub: &Arc<Hub>,
+    project_name: Option<&str>,
+    opts: &Options,
+) -> Result<Vec<(String, DryRunReport)>> {
+    let fence = OfflineGcFence::acquire(&hub.db).await?;
+    let res: Result<Vec<(String, DryRunReport)>> = async {
+        let projects = resolve_target_projects(&hub.db, project_name).await?;
+        let mut out = Vec::with_capacity(projects.len());
+        for (pid, name) in projects {
+            out.push((name, dry_run_project(hub, pid, opts).await?));
+        }
+        Ok(out)
+    }
+    .await;
+    fence.release().await;
+    res
+}
+
+async fn dry_run_project(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<DryRunReport> {
+    let now_ms = opts.now_ms();
+    let staged_cutoff = now_ms.saturating_sub(opts.staged_grace_ms.max(0));
+    let staged_packs_to_sweep: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM packs WHERE project_id = $1 AND state = 0 AND (person_id IS NULL OR created_at <= $2)",
+    )
+    .bind(project)
+    .bind(staged_cutoff)
+    .fetch_one(&hub.db)
+    .await?;
+
+    let discarded_cutoff = now_ms.saturating_sub(opts.pack_grace_ms.max(0));
+    let discarded_packs_to_sweep: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM packs WHERE project_id = $1 AND state = $2 AND COALESCE(discarded_at, $4) <= $3",
+    )
+    .bind(project)
+    .bind(DISCARDED)
+    .bind(discarded_cutoff)
+    .bind(now_ms)
+    .fetch_one(&hub.db)
+    .await?;
+
+    let (stamp, roots) = read_stamp_and_roots(hub, project, None).await?;
+    let (roots, uploads) = roots.expect("read with no stamp to compare");
+    let mut marks = Marks { leaves: roots.leaf_objects.clone(), fault: opts.fault.clone(), ..Marks::default() };
+    walk_from_roots(hub, project, roots.walk_objects.iter().copied(), &mut marks, &roots, None).await?;
+
+    let store = hub.objects.blob_store();
+    let bound = hub.objects.index_bound();
+    let surviving_staged: HashSet<String> = sqlx::query_scalar(
+        "SELECT name FROM packs WHERE project_id = $1 AND state = 0 AND person_id IS NOT NULL AND created_at > $2",
+    )
+    .bind(project)
+    .bind(staged_cutoff)
+    .fetch_all(&hub.db)
+    .await?
+    .into_iter()
+    .collect();
+    marks.uploads = uploads.into_iter().filter(|name| !surviving_staged.contains(name)).collect();
+    for staged_name in &stamp.staged_packs {
+        if surviving_staged.contains(staged_name) {
+            marks.read_upload(hub, project, staged_name).await?;
+        }
+    }
+
+    let listed_rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT name, size, objects, created_at FROM packs WHERE project_id = $1 AND state = 1 ORDER BY created_at, name",
+    )
+    .bind(project)
+    .fetch_all(&hub.db)
+    .await?;
+    let listed: Vec<PackRow> = listed_rows
+        .into_iter()
+        .map(|(name, size, objects, created_at)| PackRow {
+            name: name.into(),
+            size: size.max(0) as u64,
+            objects: objects.max(0) as usize,
+            created_at,
+        })
+        .collect();
+
+    let mut packed_stored: HashSet<ObjectId> = HashSet::new();
+    let mut all_stored: HashSet<ObjectId> = HashSet::new();
+    let mut pack_dead_counts: Vec<(usize, bool)> = Vec::with_capacity(listed.len());
+    let mut pack_entries: Vec<Vec<ObjectId>> = Vec::with_capacity(listed.len());
+    for p in &listed {
+        let k = pack::key(project, &p.name);
+        let mut ids = Vec::new();
+        if let Some(held) = pack::read_index(&**store, &k, bound).await.map_err(Error::Other)? {
+            for (id, _) in held.index.iter() {
+                packed_stored.insert(*id);
+                all_stored.insert(*id);
+                ids.push(*id);
+            }
+        }
+        pack_entries.push(ids);
+    }
+
+    let prefix = format!("p/{project}/");
+    let keys = store.list(&prefix).await.map_err(Error::Other)?;
+    let mut loose_ids: HashSet<ObjectId> = HashSet::new();
+    for k in keys {
+        let Some(rest) = k.strip_prefix(&prefix) else { continue };
+        if rest.starts_with("pack/") {
+            continue;
+        }
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() == 2 && parts[0].len() == 2 && parts[1].len() == 62 {
+            let hex_str = format!("{}{}", parts[0], parts[1]);
+            if let Ok(id) = ObjectId::from_hex(&hex_str) {
+                all_stored.insert(id);
+                loose_ids.insert(id);
+            }
+        }
+    }
+
+    let existing_unreferenced: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT object_id, since_ms FROM unreferenced_objects WHERE project_id = $1",
+    )
+    .bind(project)
+    .fetch_all(&hub.db)
+    .await?;
+
+    let mut unref_map: HashMap<ObjectId, i64> = HashMap::new();
+    for (hex_id, since) in existing_unreferenced {
+        if let Ok(id) = ObjectId::from_hex(&hex_id) {
+            if !marks.live(&id) && all_stored.contains(&id) {
+                unref_map.insert(id, since);
+            }
+        }
+    }
+
+    let mut newly_unreferenced = 0usize;
+    for id in &all_stored {
+        if !marks.live(id) && !unref_map.contains_key(id) {
+            unref_map.insert(*id, now_ms);
+            newly_unreferenced += 1;
+        }
+    }
+
+    let cutoff = now_ms.saturating_sub(opts.retention_window_ms.max(0));
+    let mut expired_unreferenced: HashSet<ObjectId> = unref_map
+        .iter()
+        .filter_map(|(&id, &since)| (since <= cutoff).then_some(id))
+        .collect();
+
+    let mut retained_snaps: Vec<ObjectId> = Vec::new();
+    for &s in &roots.known_snapshots {
+        if marks.live(&s) {
+            continue;
+        }
+        if !all_stored.contains(&s) {
+            expired_unreferenced.insert(s);
+        } else if !expired_unreferenced.contains(&s) {
+            retained_snaps.push(s);
+        }
+    }
+    if !retained_snaps.is_empty() && !expired_unreferenced.is_empty() {
+        walk_from_roots(hub, project, retained_snaps, &mut marks, &roots, None).await?;
+        expired_unreferenced.retain(|id| !marks.live(id));
+    }
+
+    let unreferenced_in_window = unref_map
+        .keys()
+        .filter(|id| !marks.live(id) && !expired_unreferenced.contains(id))
+        .count();
+    let loose_objects_to_delete = loose_ids.iter().filter(|id| expired_unreferenced.contains(id)).count();
+    let packed_objects_to_delete = packed_stored.iter().filter(|id| expired_unreferenced.contains(id)).count();
+    let expired_snapshots_to_purge = roots.known_snapshots.iter().filter(|id| expired_unreferenced.contains(id)).count();
+
+    let small_count = listed
+        .iter()
+        .filter(|p| p.size <= opts.small_pack_bytes && p.objects <= opts.max_merged_objects / 2)
+        .count();
+    let merge_small = small_count >= opts.min_packs_to_merge;
+    for (p, ids) in listed.iter().zip(&pack_entries) {
+        let is_small = merge_small && p.size <= opts.small_pack_bytes && p.objects <= opts.max_merged_objects / 2;
+        let has_dead = ids.iter().any(|id| expired_unreferenced.contains(id));
+        pack_dead_counts.push((ids.len(), is_small || has_dead));
+    }
+    let packs_to_rewrite = pack_dead_counts.iter().filter(|(_, rw)| *rw).count();
+    let discarded_from_rewrites = packs_to_rewrite;
+
+    Ok(DryRunReport {
+        newly_unreferenced,
+        unreferenced_in_window,
+        loose_objects_to_delete,
+        packed_objects_to_delete,
+        expired_snapshots_to_purge,
+        packs_to_rewrite,
+        discarded_packs_to_sweep: (discarded_packs_to_sweep.max(0) as usize)
+            + if opts.pack_grace_ms <= 0 { discarded_from_rewrites } else { 0 },
+        staged_packs_to_sweep: staged_packs_to_sweep.max(0) as usize,
+    })
+}
+
 /// Run one bounded merge and/or garbage-collection pass on `project`.
+///
+/// When `opts.run_gc` is `true`, garbage collection is **offline-only**: it
+/// acquires [`OfflineGcFence`] and refuses with `409 Conflict` if any
+/// `veil-server` is serving the database (or another offline GC is running).
 pub async fn run_project(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<Report> {
     let hub = hub.clone();
     let opts = opts.clone();
-    tokio::spawn(async move { run_locked(&hub, project, &opts).await })
+    tokio::spawn(async move { run_locked(&hub, project, &opts, false).await })
         .await
         .map_err(|e| Error::Other(e.into()))?
 }
 
-async fn run_locked(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<Report> {
-    // Yield to pushes and landings under S24's shedding budget.
-    hub.limits.derive_turn().await;
-    let permit = hub.derive.permit().await?;
-    let mut lock_conn = hub.derive.db.acquire().await?;
-    let lock_key = LOCK_BASE ^ project;
-    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(lock_key)
-        .fetch_one(&mut *lock_conn)
-        .await?;
-    if !got {
-        return Ok(Report {
-            skipped: true,
-            ..Report::default()
-        });
+async fn run_locked(hub: &Arc<Hub>, project: i64, opts: &Options, fenced: bool) -> Result<Report> {
+    let fence = if opts.run_gc && !fenced {
+        Some(OfflineGcFence::acquire(&hub.db).await?)
+    } else {
+        None
+    };
+    let res = async {
+        // Yield to pushes and landings under S24's shedding budget.
+        hub.limits.derive_turn().await;
+        let permit = hub.derive.permit().await?;
+        let mut lock_conn = hub.derive.db.acquire().await?;
+        let lock_key = LOCK_BASE ^ project;
+        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(lock_key)
+            .fetch_one(&mut *lock_conn)
+            .await?;
+        if !got {
+            return Ok(Report {
+                skipped: true,
+                ..Report::default()
+            });
+        }
+        let res = run_with_lock(hub, project, opts).await;
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await;
+        drop((lock_conn, permit));
+        hub.pack_gc.runs.fetch_add(1, Ordering::Relaxed);
+        res
     }
-    let res = run_with_lock(hub, project, opts).await;
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(lock_key)
-        .execute(&mut *lock_conn)
-        .await;
-    drop((lock_conn, permit));
-    hub.pack_gc.runs.fetch_add(1, Ordering::Relaxed);
+    .await;
+    if let Some(fence) = fence {
+        fence.release().await;
+    }
     res
 }
 
@@ -3033,4 +3419,21 @@ where
         hub.commits.count(crate::db::Commit::PackGc);
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serving_lock_key_is_disjoint_from_landing_lease_keys() {
+        assert!(SERVING_LOCK_KEY.1 < 0, "k2 must stay negative so it never collides with landing lease epochs");
+        for project in [0, 1, 2, -1, i64::MAX] {
+            for epoch in [0, 1, 42, i64::MAX, -1] {
+                let k = crate::landing::lease_lock::key(project, "main", epoch);
+                assert!(k.1 >= 0);
+                assert_ne!(k, SERVING_LOCK_KEY);
+            }
+        }
+    }
 }

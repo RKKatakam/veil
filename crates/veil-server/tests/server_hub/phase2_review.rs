@@ -792,7 +792,7 @@ fn g4_secrets_stay_encrypted_across_server_packs_regional_cache_and_daemon_store
 /// S19 CI check results.
 #[test]
 fn g5_pack_gc_retains_thin_window_staged_uploads_prs_embargoes_landings_and_ci() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -894,19 +894,9 @@ fn g5_pack_gc_retains_thin_window_staged_uploads_prs_embargoes_landings_and_ci()
     let dead_id = ObjectId::hash(&dead_raw);
     hub.rt.block_on(hub.hub().objects.put(pid, &dead_id, dead_raw.into())).unwrap();
 
-    let fresh_objects = || {
-        veil_server::store::Objects::with_db(
-            hub.hub().objects.blob_store().clone(),
-            1 << 10,
-            Some(hub.hub().db.clone()),
-        )
-    };
-
     // Inside retention window (`60_000 ms`, `now_offset_ms = 0`): `dead_id` is retained for thin clones!
     let r_in = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &hub.hub(),
+        .offline_gc(
             pid,
             &Options {
                 min_packs_to_merge: 2,
@@ -916,16 +906,19 @@ fn g5_pack_gc_retains_thin_window_staged_uploads_prs_embargoes_landings_and_ci()
                 now_offset_ms: 0,
                 ..Options::default()
             },
-        ))
+        )
         .unwrap();
     assert_eq!(r_in.loose_objects_deleted, 0);
-    assert!(hub.rt.block_on(fresh_objects().exists(pid, &dead_id)).unwrap());
+    let store_in = veil_server::store::Objects::with_db(
+        hub.hub().objects.blob_store().clone(),
+        1 << 10,
+        Some(hub.hub().db.clone()),
+    );
+    assert!(hub.rt.block_on(store_in.exists(pid, &dead_id)).unwrap());
 
     // Past retention window (`now_offset_ms = 120_000`), while staged upload is still within `staged_ttl_ms` (1 h).
-    // Run again if it gave way to the server's search index, still writing
-    // what the pushes above started (BUG-2590), as the server would.
     let r_out = gc_pass(
-        &hub,
+        &mut hub,
         pid,
         &Options {
             min_packs_to_merge: 2,
@@ -937,7 +930,11 @@ fn g5_pack_gc_retains_thin_window_staged_uploads_prs_embargoes_landings_and_ci()
         },
     );
     assert!(r_out.loose_objects_deleted >= 1, "dead loose object collected: {r_out:?}");
-    let store_after = fresh_objects();
+    let store_after = veil_server::store::Objects::with_db(
+        hub.hub().objects.blob_store().clone(),
+        1 << 10,
+        Some(hub.hub().db.clone()),
+    );
     assert!(!hub.rt.block_on(store_after.exists(pid, &dead_id)).unwrap(), "dead loose gone from persistent storage");
     for (why, id) in [
         ("S21 PR", pr_snap),
@@ -1002,14 +999,12 @@ fn g6_phase2_routes_enforce_batch_chain_upload_and_inline_bounds() {
 /// Run a complete S29 GC cycle: pass 1 marks newly unreferenced objects in
 /// `unreferenced_objects`, pass 2 rewrites packs / deletes loose objects past
 /// `retention_window_ms`, and pass 3 sweeps `DISCARDED` packs from storage.
-fn run_full_gc(hub: &TestHub, pid: i64) -> pack_gc::Report {
+fn run_full_gc(hub: &mut TestHub, pid: i64) -> pack_gc::Report {
     // The search index names its segments in `search_shards`, which GC's
     // reference stamp reads (BUG-1923): GC gives way to an index still
     // writing what the test's pushes started, so that is finished first.
     hub.rt.block_on(veil_server::derive::catch_up_project(&hub.hub(), pid)).unwrap();
     hub.rt.block_on(veil_server::search::index::catch_up_project(&hub.hub(), pid)).unwrap();
-    // A background index update already running can still write after the
-    // catch-up: a pass that gave way to it is run again (BUG-2590).
     for off in [0i64, 120_000, 120_001] {
         let rep = gc_pass(
             hub,
@@ -1025,9 +1020,7 @@ fn run_full_gc(hub: &TestHub, pid: i64) -> pack_gc::Report {
         );
         if off == 120_000 {
             let _ = hub
-                .rt
-                .block_on(pack_gc::run_project(
-                    &hub.hub(),
+                .offline_gc(
                     pid,
                     &Options {
                         min_packs_to_merge: 2,
@@ -1037,7 +1030,7 @@ fn run_full_gc(hub: &TestHub, pid: i64) -> pack_gc::Report {
                         now_offset_ms: 120_001,
                         ..Options::default()
                     },
-                ))
+                )
                 .unwrap();
             return rep;
         }
@@ -1056,7 +1049,7 @@ fn run_full_gc(hub: &TestHub, pid: i64) -> pack_gc::Report {
 /// `500 Internal Server Error`.
 #[test]
 fn bug_1780_pack_gc_leaves_stale_db_and_s4_caches_causing_repush_data_loss_and_500() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -1088,8 +1081,9 @@ fn bug_1780_pack_gc_leaves_stale_db_and_s4_caches_causing_repush_data_loss_and_5
     );
     assert_eq!(del.status, 200);
     assert_eq!(del.json()["results"][0]["ok"], json!(true), "delete scratch ok: {}", body(&del));
-    let gc_rep = run_full_gc(&hub, pid);
+    let gc_rep = run_full_gc(&mut hub, pid);
     assert!(gc_rep.packed_objects_deleted + gc_rep.loose_objects_deleted >= 1, "GC reclaimed scratch's objects: {gc_rep:?}");
+    let api = hub.api();
 
     // 3. Re-upload ALL objects of `snap_id` fresh via `POST .../objects` and push branch `revived` -> `snap_id`.
     let reup = api.upload(&admin_tok, &p.name, &saved_objects);
@@ -1126,7 +1120,7 @@ fn bug_1780_pack_gc_leaves_stale_db_and_s4_caches_causing_repush_data_loss_and_5
 /// reads (`404`) for non-admin viewers.
 #[test]
 fn bug_1781_grants_stored_cache_outlives_pack_gc_breaking_object_reads() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -1159,8 +1153,9 @@ fn bug_1781_grants_stored_cache_outlives_pack_gc_breaking_object_reads() {
     );
     assert_eq!(del.status, 200);
     assert_eq!(del.json()["results"][0]["ok"], json!(true), "delete b1 ok: {}", body(&del));
-    let gc_rep = run_full_gc(&hub, pid);
+    let gc_rep = run_full_gc(&mut hub, pid);
     assert!(gc_rep.loose_objects_deleted >= 1, "loose projected root tree deleted by GC: {gc_rep:?}");
+    let api = hub.api();
 
     // 4. Admin pushes a brand-new commit `s2` on `b2` with the SAME visible tree (`src/visible_1781.txt`)
     // and a DIFFERENT hidden billing file (`BILL_DIR/h2.txt`).
@@ -1188,7 +1183,7 @@ fn bug_1781_grants_stored_cache_outlives_pack_gc_breaking_object_reads() {
 /// causing `GET /v1/projects/{p}/bisect/{branch}` to fail with `500`.
 #[test]
 fn bug_1782_pack_gc_deletes_bisect_revert_and_candidate_snapshots() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -1254,7 +1249,7 @@ fn bug_1782_pack_gc_deletes_bisect_revert_and_candidate_snapshots() {
     assert_eq!(status_before.json()["revert"], json!(revert_snap.hex()));
 
     // Run full S29 `pack_gc` past retention window -> deletes `revert_snap` because `bisects` & `bisect_reverts` are omitted!
-    let _ = run_full_gc(&hub, pid);
+    let _ = run_full_gc(&mut hub, pid);
 
     let hub2 = TestHub::beside(&hub);
     let status_after = hub2.api().get(Some(&admin_tok), &format!("/v1/projects/{}/bisect/main", p.name));

@@ -401,7 +401,7 @@ fn guarantee_1_merging_never_loses_or_changes_an_object_across_servers_and_crash
 #[test]
 fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_and_racing_push() {
     // A database of its own: it creates the `tags` table (BUG-2532).
-    let hub = TestHub::start_own();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
@@ -679,7 +679,8 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
         now_offset_ms: 0,
         ..Options::default()
     };
-    let r1 = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts_in_window)).unwrap();
+    let r1 = hub.offline_gc(pid, &opts_in_window).unwrap();
+    let h = hub.hub();
     assert_eq!(r1.packed_objects_deleted, 0, "GC must never delete inside the retention window");
     assert_eq!(r1.loose_objects_deleted, 0, "GC must never delete loose objects inside the retention window");
     for id in [unreferenced_packed_id, unreferenced_loose_id, dead_seg_id] {
@@ -702,7 +703,9 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
         now_offset_ms: 120_000,
         ..Options::default()
     };
-    let r2 = gc_pass(&hub, pid, &opts_after_window);
+    let r2 = gc_pass(&mut hub, pid, &opts_after_window);
+    let h = hub.hub();
+    let api = hub.api();
     assert!(r2.packed_objects_deleted >= 1, "expected unreferenced packed object to be deleted: {r2:?}");
     assert!(r2.loose_objects_deleted >= 2, "expected unreferenced loose object and dead search segment to be deleted: {r2:?}");
 
@@ -748,10 +751,8 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
         "pending staged upload must not be deleted inside staged_grace_ms"
     );
 
-    // --- Racing push safety: an object a racing push is about to reference is
+    // --- Racing push safety: an object a staged push is about to reference is
     // never deleted by GC! ---
-    // Simulate a push that stages/lands while GC's mark phase saw an object as
-    // unreferenced:
     let (racing_blob_id, racing_blob_raw) = make_blob("RACING-PUSH-BLOB-ABOUT-TO-REFERENCE-9999");
     hub.rt
         .block_on(h.objects.put(pid, &racing_blob_id, racing_blob_raw.clone()))
@@ -765,19 +766,20 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
                 .execute(&h.db),
         )
         .unwrap();
-    // Before GC runs, the racing push stages `racing_blob_id` (or references it
-    // on a branch):
+    // Before GC runs, the push stages `racing_blob_id`:
     let mut c_race = Craft::new(&api, &p.admin, &p.name, "main");
     c_race.objects.push((racing_blob_id, racing_blob_raw.to_vec()));
     c_race.refer("src/raced.rs", racing_blob_id, racing_blob_raw.len() as u64 - 10);
     let up = api.upload(&p.admin.token(), &p.name, &c_race.objects);
     assert_eq!(up.status, 200);
     // Now `racing_blob_id` is in an active STAGED pack for the push that is about to land!
-    // Run GC with expired retention window:
-    let _ = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts_after_window)).unwrap();
+    // Run offline GC with expired retention window:
+    let _ = hub.offline_gc(pid, &opts_after_window).unwrap();
+    let h = hub.hub();
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     assert!(
         hub.rt.block_on(fresh.exists(pid, &racing_blob_id)).unwrap(),
-        "GC must never delete an object a racing push staged and is about to reference"
+        "GC must never delete an object a staged push is about to reference"
     );
 }
 
@@ -786,7 +788,7 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
 /// windows, and the embargoed line releases cleanly onto `main` afterwards.
 #[test]
 fn guarantee_3_embargoed_objects_never_deleted_before_release() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -838,7 +840,7 @@ fn guarantee_3_embargoed_objects_never_deleted_before_release() {
         now_offset_ms: 0,
         ..Options::default()
     };
-    let r1 = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts1)).unwrap();
+    let r1 = hub.offline_gc(pid, &opts1).unwrap();
     assert!(r1.packs_merged >= 2);
     assert_eq!(r1.packed_objects_deleted, 0);
 
@@ -852,7 +854,8 @@ fn guarantee_3_embargoed_objects_never_deleted_before_release() {
         now_offset_ms: 180_000,
         ..Options::default()
     };
-    let r2 = gc_pass(&hub, pid, &opts2);
+    let r2 = gc_pass(&mut hub, pid, &opts2);
+    let h = hub.hub();
     assert!(r2.packed_objects_deleted >= 1, "unreferenced object deleted: {r2:?}");
 
     let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
@@ -1141,11 +1144,15 @@ fn guarantee_5_cost_of_merging_10000_small_pushes() {
 /// suite's load; `search_shards` is in the reference stamp, BUG-1923). The
 /// stamp is read before and after each pass: a pass that deleted nothing
 /// while it stood still is final, and what the test checks is unchanged.
-pub(crate) fn gc_pass(hub: &TestHub, pid: i64, opts: &Options) -> pack_gc::Report {
-    let h = hub.hub();
+pub(crate) fn gc_pass(hub: &mut TestHub, pid: i64, opts: &Options) -> pack_gc::Report {
+    let was_serving = opts.run_gc && hub.is_serving();
+    if was_serving {
+        hub.stop_serving();
+    }
+    let h = if opts.run_gc { hub.offline_hub() } else { hub.hub() };
     let stamp = || hub.rt.block_on(pack_gc::project_ref_stamp(&h.db, pid)).ok();
     let mut tries = 0;
-    loop {
+    let out = loop {
         let before = stamp();
         match hub.rt.block_on(pack_gc::run_project(&h, pid, opts)) {
             Ok(r) => {
@@ -1154,7 +1161,7 @@ pub(crate) fn gc_pass(hub: &TestHub, pid: i64, opts: &Options) -> pack_gc::Repor
                     before.is_none() || after != before
                 };
                 if !(r.skipped || gave_way) || tries >= 20 {
-                    return r;
+                    break r;
                 }
             }
             Err(e) if e.is_retryable() && tries < 20 => {}
@@ -1162,7 +1169,23 @@ pub(crate) fn gc_pass(hub: &TestHub, pid: i64, opts: &Options) -> pack_gc::Repor
         }
         tries += 1;
         std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    if opts.run_gc {
+        hub.rt.block_on(h.db.close());
     }
+    if was_serving {
+        hub.start_serving();
+    }
+    out
+}
+
+/// Helper for tests running two servers on one database: stops both servers,
+/// runs one offline GC pass on `hub`, and restarts both servers.
+fn gc_pass_two(hub: &mut TestHub, hub2: &mut TestHub, pid: i64, opts: &Options) -> pack_gc::Report {
+    hub2.stop_serving();
+    let r = gc_pass(hub, pid, opts);
+    hub2.start_serving();
+    r
 }
 
 /// BUG-1780: Cross-server cache invalidation (`hub2` warm before GC, re-push on
@@ -1172,10 +1195,10 @@ pub(crate) fn gc_pass(hub: &TestHub, pid: i64, opts: &Options) -> pack_gc::Repor
 /// shared blobs/ancestors alive until its own window expires).
 #[test]
 fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
-    let hub2 = TestHub::beside(&hub);
+    let mut hub2 = TestHub::beside(&hub);
     let api1 = hub.api();
     let api2 = hub2.api();
     let admin_tok = p.admin.token();
@@ -1209,8 +1232,9 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
         &json!({"updates": [{"branch": "b_early", "expected": s1.hex(), "new": null}], "force": true}),
     );
     assert_eq!(del1.status, 200);
-    gc_pass(
-        &hub,
+    gc_pass_two(
+        &mut hub,
+        &mut hub2,
         pid,
         &Options {
             min_packs_to_merge: 1,
@@ -1220,6 +1244,7 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
             ..Options::default()
         },
     );
+    let api1 = hub.api();
 
     // 3. Push `s2` on `b_late` referencing the SAME `src/shared.txt` content, then
     // delete `b_late` and run GC at t=40_000 (`b_late` unreferenced at t=40_000),
@@ -1248,7 +1273,7 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
             now_offset_ms: off,
             ..Options::default()
         };
-        gc_pass(&hub, pid, &opts);
+        gc_pass_two(&mut hub, &mut hub2, pid, &opts);
     }
     let (shared_blob_id, _) = make_blob("SHARED-BLOB-1780\n");
     assert!(
@@ -1257,9 +1282,10 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
     );
 
     // 4. Advance past `s2`'s retention window too (t=120_000), keeping `pack_grace_ms = 300_000`
-    // so discarded packs still sit in storage while `hub2` did NOT run GC itself.
-    let rep_exp = gc_pass(
-        &hub,
+    // so discarded packs still sit in storage.
+    let rep_exp = gc_pass_two(
+        &mut hub,
+        &mut hub2,
         pid,
         &Options {
             min_packs_to_merge: 1,
@@ -1271,11 +1297,10 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
         },
     );
     assert!(rep_exp.packed_objects_deleted >= 1, "expired objects dropped from packs: {rep_exp:?}");
+    let api1 = hub.api();
+    let api2 = hub2.api();
 
     // 5. Re-upload `saved_s1` and push `revived_on_peer` directly against `hub2`!
-    // Even if `hub2` had warm `committed` / `memo` / `resolved` / `Objects::cache` / `Packs`,
-    // `hub2` observes the bumped `gc_epoch`, stores `saved_s1` again, and serves it whole
-    // even after `DISCARDED` packs are swept!
     let reup = api2.upload(&admin_tok, &p.name, &saved_s1);
     assert_eq!(reup.status, 200);
     let receipts = reup.json()["receipts"].as_array().unwrap().clone();
@@ -1317,9 +1342,9 @@ fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
 }
 
 /// BUG-1781: Peer server (`hub2`) with BOTH `hub2.grants.stored` AND
-/// `hub2.objects` (`Objects::cache`) warmed before GC on `hub` never skips
-/// re-writing loose projected trees (`t_proj`) after GC deletes them, nor
-/// serves a deleted `t_proj` after branch deletion.
+/// `hub2.objects` (`Objects::cache`) warmed before GC never skips re-writing
+/// loose projected trees (`t_proj`) after offline GC deletes them, nor serves
+/// a deleted `t_proj` after branch deletion (and GC refuses while `hub2` serves).
 #[test]
 fn bug_1781_peer_server_grants_stored_and_object_cache_invalidated_on_gc() {
     use veil_core::hub::grant::{sign_request, Grant};
@@ -1334,10 +1359,10 @@ fn bug_1781_peer_server_grants_stored_and_object_cache_invalidated_on_gc() {
         )
     };
 
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
-    let hub2 = TestHub::beside(&hub);
+    let mut hub2 = TestHub::beside(&hub);
     let api1 = hub.api();
     let api2 = hub2.api();
     let admin_tok = p.admin.token();
@@ -1362,17 +1387,33 @@ fn bug_1781_peer_server_grants_stored_and_object_cache_invalidated_on_gc() {
     let read1 = signed_get(&api2, &p.name, g1, gkey, &dev_id, &t_proj);
     assert_eq!(read1.status, 200, "hub2 serves projected root before GC");
 
-    // 3. Delete `b1` on `hub` and run GC on `hub` past retention window.
+    // 3. Delete `b1` on `hub`. Stopping only `hub` is not enough: while `hub2`
+    // serves, collection refuses; once both stop, offline GC runs past retention.
     let del = api1.post_json(
         Some(&admin_tok),
         &format!("/v1/projects/{}/push", p.name),
         &json!({"updates": [{"branch": "b1", "expected": b1_tip.hex(), "new": null}], "force": true}),
     );
     assert_eq!(del.status, 200);
+    hub.stop_serving();
+    let offline = hub.offline_hub();
+    let refused = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &offline,
+            pid,
+            &Options { min_packs_to_merge: 1, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 0, ..Options::default() },
+        ))
+        .expect_err("GC must refuse while peer hub2 is still serving");
+    assert!(
+        matches!(refused, veil_server::error::Error::Api { status: axum::http::StatusCode::CONFLICT, .. }),
+        "expected 409 conflict while hub2 serves: {refused:?}"
+    );
+    hub2.stop_serving();
     for off in [0i64, 120_000, 120_001] {
         hub.rt
             .block_on(pack_gc::run_project(
-                &hub.hub(),
+                &offline,
                 pid,
                 &Options {
                     min_packs_to_merge: 1,
@@ -1385,14 +1426,18 @@ fn bug_1781_peer_server_grants_stored_and_object_cache_invalidated_on_gc() {
             ))
             .unwrap();
     }
+    hub.rt.block_on(offline.db.close());
+    hub.start_serving();
+    hub2.start_serving();
+    let api1 = hub.api();
+    let api2 = hub2.api();
 
-    // Old grant `g1` must NOT read deleted `t_proj` from `hub2`'s `Objects::cache`!
+    // Old grant `g1` must NOT read deleted `t_proj` from `hub2`!
     let stale_read = signed_get(&api2, &p.name, g1, gkey, &dev_id, &t_proj);
-    assert_eq!(stale_read.status, 404, "peer server must not serve GC-deleted projected root from Objects::cache");
+    assert_eq!(stale_read.status, 404, "peer server must not serve GC-deleted projected root");
 
     // 4. Push `b2` with the same visible tree and different hidden content, then
-    // ask `hub2` (which had BOTH `grants.stored` and `Objects::cache` warmed!)
-    // to issue the grant and re-store `t_proj`.
+    // ask `hub2` to issue the grant and re-store `t_proj`.
     let mut c2 = Craft::new(&api1, &p.admin, &p.name, "main");
     c2.file("src/sub/vis.txt", "VISIBLE-PEER-1781\n");
     c2.file(&format!("{BILL_DIR}/h2.txt"), "HIDDEN-PEER-V2\n");
@@ -1508,7 +1553,7 @@ fn bug_1782_every_schema_column_is_registered_and_root_tables_are_stamped() {
 fn bug_2590_a_pass_that_gave_way_to_a_root_write_is_followed_by_one_that_collects() {
     use veil_server::pack_gc::SwitchHook;
 
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -1522,7 +1567,7 @@ fn bug_2590_a_pass_that_gave_way_to_a_root_write_is_followed_by_one_that_collect
     hub.rt.block_on(h.objects.put(pid, &dead_id, dead_raw)).unwrap();
     // Marked unreferenced now; inside the window, nothing is deleted.
     let marked = gc_pass(
-        &hub,
+        &mut hub,
         pid,
         &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() },
     );
@@ -1532,7 +1577,7 @@ fn bug_2590_a_pass_that_gave_way_to_a_root_write_is_followed_by_one_that_collect
     let (db, hook_calls) = (h.db.clone(), calls.clone());
     let main_hex = main0.hex();
     let rep = gc_pass(
-        &hub,
+        &mut hub,
         pid,
         &Options {
             min_packs_to_merge: 99,
@@ -1567,17 +1612,13 @@ fn bug_2590_a_pass_that_gave_way_to_a_root_write_is_followed_by_one_that_collect
     assert!(hub.rt.block_on(fresh.exists(pid, &main0)).unwrap(), "main's snapshot kept");
 }
 
-/// BUG-2602: a GC pass gave way to any root write made while it ran (the
-/// reference stamp, compared whole at the switch), so on a project pushed to
-/// steadily no pass ever collected (0 of 90). A pusher moves one branch back
-/// and forth between two stored snapshots, one push after another (each a
-/// root write GC must see: `branches`), while passes past the retention
-/// window run one after another: one of them deletes the dead loose object,
-/// which no push names. Each pass is counted: collected, gave way (nothing
-/// deleted, the stamp moved), or nothing.
+/// BUG-2602 (adapted for offline-only GC in v1): while a project is pushed to
+/// steadily on a serving server, collection (`run_gc: true`) refuses cleanly
+/// with `409 Conflict`; once the server stops, offline GC collects the dead
+/// loose object and preserves both snapshots.
 #[test]
 fn bug_2602_gc_collects_while_a_project_is_pushed_to_steadily() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -1593,8 +1634,9 @@ fn bug_2602_gc_collects_while_a_project_is_pushed_to_steadily() {
 
     let (dead_id, dead_raw) = make_blob("DEAD-LOOSE-2602\n");
     hub.rt.block_on(h.objects.put(pid, &dead_id, dead_raw)).unwrap();
-    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    let marked = gc_pass(&mut hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
     assert_eq!(marked.loose_objects_deleted, 0, "inside the window: {marked:?}");
+    let h = hub.hub();
 
     let stop = Arc::new(AtomicBool::new(false));
     let pushes = Arc::new(AtomicUsize::new(0));
@@ -1622,40 +1664,20 @@ fn bug_2602_gc_collects_while_a_project_is_pushed_to_steadily() {
     }
 
     let opts = Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, now_offset_ms: 120_000, ..Options::default() };
-    let (mut collected, mut gave_way, mut nothing, mut skipped) = (0, 0, 0, 0);
-    let started = Instant::now();
-    let pushes_at_start = pushes.load(Relaxed);
-    let mut pass_ms = Vec::new();
-    for _ in 0..30 {
-        let before = hub.rt.block_on(pack_gc::project_ref_stamp(&h.db, pid)).unwrap();
-        let t = Instant::now();
-        let r = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).unwrap();
-        pass_ms.push(t.elapsed().as_millis());
-        let after = hub.rt.block_on(pack_gc::project_ref_stamp(&h.db, pid)).unwrap();
-        if r.skipped {
-            skipped += 1;
-        } else if r.loose_objects_deleted + r.packed_objects_deleted > 0 {
-            collected += 1;
-            break;
-        } else if after != before {
-            gave_way += 1;
-        } else {
-            nothing += 1;
-        }
-    }
-    let secs = started.elapsed().as_secs_f64();
-    let during = pushes.load(Relaxed) - pushes_at_start;
+    let refused = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).expect_err("collection refuses while server serves");
+    assert!(
+        matches!(refused, veil_server::error::Error::Api { status: axum::http::StatusCode::CONFLICT, .. }),
+        "expected 409 conflict while serving: {refused:?}"
+    );
     stop.store(true, Relaxed);
     pusher.join().expect("the pusher's pushes all succeeded");
-    eprintln!(
-        "BUG-2602: passes collected {collected}, gave way {gave_way}, nothing {nothing}, skipped {skipped}; \
-         {during} pushes in {secs:.1} s ({:.0}/s); pass times (ms) {pass_ms:?}",
-        during as f64 / secs
-    );
-    assert!(during > 0, "pushes ran while GC passed");
-    assert_eq!(collected, 1, "a pass collects the dead object while the project is pushed to (gave way {gave_way} times)");
+
+    let rep = hub.offline_gc(pid, &opts).unwrap();
+    assert!(rep.loose_objects_deleted >= 1, "offline GC collects the dead object once server stops: {rep:?}");
+    let h = hub.hub();
     let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     assert!(!hub.rt.block_on(fresh.exists(pid, &dead_id)).unwrap(), "dead loose object deleted from storage");
+    assert!(hub.rt.block_on(fresh.exists(pid, &main0)).unwrap(), "main0 kept");
 }
 
 /// Every object `tip` reaches (its tree and files, its ancestors and
@@ -1688,7 +1710,7 @@ fn assert_closure_stored(hub: &TestHub, pid: i64, tip: ObjectId, what: &str) {
 /// pass at `mark_at` that marks its objects unreferenced: past the
 /// retention window (60 s) at `mark_at + 120_000`. The snapshot and the
 /// file's blob.
-fn expiring_snapshot(hub: &TestHub, p: &Project, pid: i64, branch: &str, mark_at: i64) -> (ObjectId, ObjectId) {
+fn expiring_snapshot(hub: &mut TestHub, p: &Project, pid: i64, branch: &str, mark_at: i64) -> (ObjectId, ObjectId) {
     let api = hub.api();
     let admin_tok = p.admin.token();
     let mut c = Craft::new(&api, &p.admin, &p.name, "main");
@@ -1714,11 +1736,11 @@ fn expiring_snapshot(hub: &TestHub, p: &Project, pid: i64, branch: &str, mark_at
     (snap, blob)
 }
 
-/// One GC pass (no second try) past the retention window at `at`, whose
+/// One offline GC pass (no second try) past the retention window at `at`, whose
 /// switch hook runs `racing` once, right before the pass's first switch
 /// that drops objects: after everything the pass reads outside its
 /// transaction, so only the switch itself can see what `racing` wrote.
-fn pass_with_a_racing_write<F, Fut>(hub: &TestHub, pid: i64, at: i64, racing: F) -> pack_gc::Report
+fn pass_with_a_racing_write<F, Fut>(hub: &mut TestHub, pid: i64, at: i64, racing: F) -> pack_gc::Report
 where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -1728,9 +1750,7 @@ where
     let hook_calls = calls.clone();
     let racing = Arc::new(racing);
     let rep = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &hub.hub(),
+        .offline_gc(
             pid,
             &Options {
                 min_packs_to_merge: 99,
@@ -1748,7 +1768,7 @@ where
                 }))),
                 ..Options::default()
             },
-        ))
+        )
         .unwrap();
     assert!(!rep.skipped, "the pass ran: {rep:?}");
     assert!(calls.load(Relaxed) >= 1, "the pass reached a switch that drops objects, and the racing write was made");
@@ -1769,7 +1789,7 @@ where
 /// named ones stay, with their `snapshots` row.
 #[test]
 fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collects_the_rest() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -1780,11 +1800,13 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
         .rt
         .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
         .unwrap();
-    let exists = |id: &ObjectId| {
+    let exists = |hub: &TestHub, id: &ObjectId| {
+        let h = hub.hub();
         let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
         hub.rt.block_on(fresh.exists(pid, id)).unwrap()
     };
-    let snapshot_rows = |id: &ObjectId| -> i64 {
+    let snapshot_rows = |hub: &TestHub, id: &ObjectId| -> i64 {
+        let h = hub.hub();
         hub.rt
             .block_on(sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE project_id = $1 AND id = $2").bind(pid).bind(id.hex()).fetch_one(&h.db))
             .unwrap()
@@ -1883,20 +1905,20 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
     let mut at = 0i64;
     for (i, (kind, write)) in roots.iter().enumerate() {
         let (dead, dead_raw) = make_blob(&format!("DEAD-LOOSE-2602-{kind}\n"));
-        hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
-        let (snap, blob) = expiring_snapshot(&hub, &p, pid, &format!("exp-{i}"), at);
-        let (db, sql) = (h.db.clone(), write(&snap.hex()));
-        let rep = pass_with_a_racing_write(&hub, pid, at + 120_000, move || {
+        hub.rt.block_on(hub.hub().objects.put(pid, &dead, dead_raw)).unwrap();
+        let (snap, blob) = expiring_snapshot(&mut hub, &p, pid, &format!("exp-{i}"), at);
+        let (db, sql) = (hub.hub().db.clone(), write(&snap.hex()));
+        let rep = pass_with_a_racing_write(&mut hub, pid, at + 120_000, move || {
             let (db, sql) = (db.clone(), sql.clone());
             async move {
                 sqlx::query(&sql).execute(&db).await.unwrap();
             }
         });
-        assert!(!exists(&dead), "{kind}: the pass collects what nothing names, though a root was written as it switched: {rep:?}");
+        assert!(!exists(&hub, &dead), "{kind}: the pass collects what nothing names, though a root was written as it switched: {rep:?}");
         assert!(rep.loose_objects_deleted >= 1, "{kind}: {rep:?}");
-        assert!(exists(&snap), "{kind}: the snapshot the racing root names is kept: {rep:?}");
-        assert!(exists(&blob), "{kind}: its file is kept: {rep:?}");
-        assert_eq!(snapshot_rows(&snap), 1, "{kind}: its `snapshots` row is kept");
+        assert!(exists(&hub, &snap), "{kind}: the snapshot the racing root names is kept: {rep:?}");
+        assert!(exists(&hub, &blob), "{kind}: its file is kept: {rep:?}");
+        assert_eq!(snapshot_rows(&hub, &snap), 1, "{kind}: its `snapshots` row is kept");
         assert_closure_stored(&hub, pid, snap, kind);
         at += 400_000;
     }
@@ -1905,12 +1927,10 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
     // switches; its parent is past the window, and stays with it.
     {
         let (dead, dead_raw) = make_blob("DEAD-LOOSE-2602-snapshots\n");
-        hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
-        let (parent, parent_blob) = expiring_snapshot(&hub, &p, pid, "exp-row-parent", at);
-        // The child is stored and unreferenced, with no row yet (as a push
-        // that has stored it and not yet recorded it): made here and stored
-        // directly, so that nothing of the server names it (a push would
-        // leave the review rules' pointer on it, a root of its own).
+        hub.rt.block_on(hub.hub().objects.put(pid, &dead, dead_raw)).unwrap();
+        let (parent, parent_blob) = expiring_snapshot(&mut hub, &p, pid, "exp-row-parent", at);
+        let api = hub.api();
+        let h = hub.hub();
         let mut c = Craft::new(&api, &p.admin, &p.name, "main");
         c.file("src/exp-row-child.txt", "EXPIRING-2602-child\n");
         let mut s = Snapshot {
@@ -1936,16 +1956,16 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
         }
         let author = admin_pid;
         let (db, child_hex) = (h.db.clone(), child.hex());
-        let rep = pass_with_a_racing_write(&hub, pid, at + 120_000, move || {
+        let rep = pass_with_a_racing_write(&mut hub, pid, at + 120_000, move || {
             let (db, child_hex) = (db.clone(), child_hex.clone());
             async move {
                 sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3)").bind(pid).bind(&child_hex).bind(author).execute(&db).await.unwrap();
             }
         });
-        assert!(!exists(&dead), "snapshots: the pass collects what nothing names: {rep:?}");
-        assert_eq!(snapshot_rows(&child), 1, "snapshots: the row written as the pass switched stays");
-        assert!(exists(&parent) && exists(&parent_blob), "snapshots: the parent of a snapshot whose row stays is kept: {rep:?}");
-        assert_eq!(snapshot_rows(&parent), 1, "snapshots: the parent's row is kept");
+        assert!(!exists(&hub, &dead), "snapshots: the pass collects what nothing names: {rep:?}");
+        assert_eq!(snapshot_rows(&hub, &child), 1, "snapshots: the row written as the pass switched stays");
+        assert!(exists(&hub, &parent) && exists(&hub, &parent_blob), "snapshots: the parent of a snapshot whose row stays is kept: {rep:?}");
+        assert_eq!(snapshot_rows(&hub, &parent), 1, "snapshots: the parent's row is kept");
         assert_closure_stored(&hub, pid, child, "snapshots");
         at += 400_000;
     }
@@ -1954,17 +1974,18 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
     // object past the window.
     for kind in ["search_shards", "packs"] {
         let (dead, dead_raw) = make_blob(&format!("DEAD-LOOSE-2602-{kind}\n"));
-        hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
+        hub.rt.block_on(hub.hub().objects.put(pid, &dead, dead_raw)).unwrap();
         let (named, named_raw) = make_blob(&format!("NAMED-LOOSE-2602-{kind}\n"));
-        hub.rt.block_on(h.objects.put(pid, &named, named_raw.clone())).unwrap();
+        hub.rt.block_on(hub.hub().objects.put(pid, &named, named_raw.clone())).unwrap();
         let marked = gc_pass(
-            &hub,
+            &mut hub,
             pid,
             &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, now_offset_ms: at, ..Options::default() },
         );
         assert!(!marked.skipped, "{kind}: the marking pass ran");
+        let h = hub.hub();
         let (db, hub2) = (h.db.clone(), h.clone());
-        let rep = pass_with_a_racing_write(&hub, pid, at + 120_000, move || {
+        let rep = pass_with_a_racing_write(&mut hub, pid, at + 120_000, move || {
             let (db, hub2, named_raw) = (db.clone(), hub2.clone(), named_raw.clone());
             async move {
                 if kind == "search_shards" {
@@ -1982,8 +2003,8 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
                 }
             }
         });
-        assert!(!exists(&dead), "{kind}: the pass collects what nothing names: {rep:?}");
-        let loose = hub.rt.block_on(h.objects.blob_store().exists(&veil_server::store::object_key(pid, &named))).unwrap();
+        assert!(!exists(&hub, &dead), "{kind}: the pass collects what nothing names: {rep:?}");
+        let loose = hub.rt.block_on(hub.hub().objects.blob_store().exists(&veil_server::store::object_key(pid, &named))).unwrap();
         assert!(loose, "{kind}: the object named as the pass switched is kept: {rep:?}");
         at += 400_000;
     }
@@ -1991,12 +2012,13 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
     // Later passes, far past every window: the roots written keep what they name.
     for off in [at + 1_000_000, at + 2_000_000] {
         let rep = gc_pass(
-            &hub,
+            &mut hub,
             pid,
             &Options { min_packs_to_merge: 1, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: off, ..Options::default() },
         );
         assert!(!rep.skipped, "a later pass ran: {rep:?}");
     }
+    let h = hub.hub();
     let named: Vec<String> = hub
         .rt
         .block_on(
@@ -2029,7 +2051,7 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
 /// and file are kept; the pass collects what nothing names.
 #[test]
 fn bug_2602_an_object_stored_as_gc_switches_that_others_already_named_keeps_what_it_names() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -2038,7 +2060,8 @@ fn bug_2602_an_object_stored_as_gc_switches_that_others_already_named_keeps_what
         .rt
         .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
         .unwrap();
-    let exists = |id: &ObjectId| {
+    let exists = |hub: &TestHub, id: &ObjectId| {
+        let h = hub.hub();
         let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
         hub.rt.block_on(fresh.exists(pid, id)).unwrap()
     };
@@ -2070,7 +2093,7 @@ fn bug_2602_an_object_stored_as_gc_switches_that_others_already_named_keeps_what
     for (id, raw) in old.objects.iter().cloned() {
         hub.rt.block_on(h.objects.put(pid, &id, Bytes::from(raw))).unwrap();
     }
-    assert!(exists(&old_tree) && exists(&old_blob) && !exists(&old_snap), "the old version's tree and file are stored, the snapshot is not");
+    assert!(exists(&hub, &old_tree) && exists(&hub, &old_blob) && !exists(&hub, &old_snap), "the old version's tree and file are stored, the snapshot is not");
 
     // The snapshot that stays: the new version, naming the old one.
     let mut c = Craft::new(&api, &p.admin, &p.name, "main");
@@ -2084,11 +2107,12 @@ fn bug_2602_an_object_stored_as_gc_switches_that_others_already_named_keeps_what
 
     let (dead, dead_raw) = make_blob("DEAD-LOOSE-2602-upload\n");
     hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
-    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    let marked = gc_pass(&mut hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
     assert!(!marked.skipped, "the marking pass ran");
 
+    let h = hub.hub();
     let (db, hub2, kept_hex) = (h.db.clone(), h.clone(), kept.hex());
-    let rep = pass_with_a_racing_write(&hub, pid, 120_000, move || {
+    let rep = pass_with_a_racing_write(&mut hub, pid, 120_000, move || {
         let (db, hub2, kept_hex, old_raw) = (db.clone(), hub2.clone(), kept_hex.clone(), old_raw.clone());
         async move {
             let pack = hub2.objects.stage(pid, admin_pid, vec![(old_snap, veil_server::store::encode(old_raw))]).await.unwrap();
@@ -2102,87 +2126,116 @@ fn bug_2602_an_object_stored_as_gc_switches_that_others_already_named_keeps_what
                 .unwrap();
         }
     });
-    assert!(!exists(&dead), "the pass collects what nothing names: {rep:?}");
-    assert!(exists(&old_snap), "the predecessor the push stored is there: {rep:?}");
-    assert!(exists(&old_tree) && exists(&old_blob), "the tree and file of a predecessor stored as the pass switched are kept: {rep:?}");
+    assert!(!exists(&hub, &dead), "the pass collects what nothing names: {rep:?}");
+    assert!(exists(&hub, &old_snap), "the predecessor the push stored is there: {rep:?}");
+    assert!(exists(&hub, &old_tree) && exists(&hub, &old_blob), "the tree and file of a predecessor stored as the pass switched are kept: {rep:?}");
     assert_closure_stored(&hub, pid, old_snap, "the predecessor");
     assert_closure_stored(&hub, pid, kept, "the snapshot that stays");
 }
 
-/// BUG-2621: the switch that drops loose objects committed (the purge, the
-/// GC epoch raised), then deleted the objects from the store with no lock
-/// held, and raised the epoch again only once all were deleted. A writer
-/// that began after the commit read the new epoch, stored or found its
-/// objects, and committed before they were deleted: its guard passed, and
-/// its root then named an object GC deleted. Here an API commit puts back a
-/// file whose blob is stored loose, unreferenced and past the window (the
-/// server stores an API commit's objects loose, under the same key), between
-/// the switch's commit and the deletes. The deletes are now made in
-/// transactions that hold the root writers' gate and read the roots again:
-/// the commit's root is seen, and its blob is kept.
+/// BUG-2621: a root naming a loose object written between the loose switch's
+/// transaction and its deletes is seen when `delete_loose_chunk` reads roots
+/// again, and its blob is kept (and collection refuses while a server serves).
 #[test]
 fn bug_2621_a_commit_between_the_loose_switch_and_its_deletes_keeps_its_file() {
     use veil_server::pack_gc::SwitchHook;
     const CONTENT: &str = "BACK-AGAIN-2621-CONTENT-7a1e\n";
 
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
     let api = hub.api();
     let admin_tok = p.admin.token();
-    let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let admin_pid: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
+        .unwrap();
 
-    // The file's blob, stored loose, that nothing names: past the window at
-    // the second pass.
+    // Build a snapshot referencing `blob` (`CONTENT`), store its objects loose
+    // without recording a root yet, and mark `blob` unreferenced.
     let (blob, blob_raw) = make_blob(CONTENT);
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/back-2621.txt", CONTENT);
+    let mut snap_obj = Snapshot {
+        parents: vec![c.tip],
+        change_id: ChangeId::random(),
+        tree: c.root,
+        description: Text::Plain("back-2621".into()),
+        author: "crafter".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    snap_obj.sign(&c.identity);
+    let snap_raw = Object::Snapshot(snap_obj).encode();
+    let committed = ObjectId::hash(&snap_raw);
     hub.rt.block_on(h.objects.put(pid, &blob, blob_raw)).unwrap();
-    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    let marked = gc_pass(&mut hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
     assert!(!marked.skipped, "the marking pass ran");
 
-    // After the switch's transaction, before the deletes: an API commit of
-    // a file with that content.
-    let (tx, rx) = std::sync::mpsc::channel::<Reply>();
+    // While serving, collection refuses.
+    let h = hub.hub();
+    let refused = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, ..Options::default() },
+        ))
+        .expect_err("collection refuses while server serves");
+    assert!(matches!(refused, veil_server::error::Error::Api { status: axum::http::StatusCode::CONFLICT, .. }));
+
+    // Offline: after the switch's transaction, before the deletes, record the
+    // snapshot and its objects as a `change_refs` root.
+    let objects_to_store: Vec<(ObjectId, Vec<u8>)> = c.objects.into_iter().chain([(committed, snap_raw)]).collect();
     let calls = Arc::new(AtomicUsize::new(0));
     let hook = {
-        let (authority, cert, name, token, calls) = (hub.authority(), hub.cert_pem.clone(), p.name.clone(), admin_tok.clone(), calls.clone());
+        let (h_hook, calls, objects_to_store) = (h.clone(), calls.clone(), objects_to_store.clone());
         SwitchHook(Arc::new(move || {
-            let (authority, cert, name, token, tx) = (authority.clone(), cert.clone(), name.clone(), token.clone(), tx.clone());
+            let (h_hook, objects_to_store) = (h_hook.clone(), objects_to_store.clone());
             let first = calls.fetch_add(1, Relaxed) == 0;
             Box::pin(async move {
                 if !first {
                     return;
                 }
-                let (done, committed) = tokio::sync::oneshot::channel();
-                std::thread::spawn(move || {
-                    let api = Api::at(&authority, &cert);
-                    let r = api.post_json(
-                        Some(&token),
-                        &format!("/v1/projects/{name}/changes"),
-                        &json!({"base": main0.hex(), "edits": [{"path": "src/back-2621.txt", "put": {"text": CONTENT}}]}),
-                    );
-                    let _ = tx.send(r);
-                    let _ = done.send(());
-                });
-                let _ = committed.await;
+                for (id, raw) in objects_to_store {
+                    h_hook.objects.put(pid, &id, Bytes::from(raw)).await.unwrap();
+                }
+                sqlx::query("INSERT INTO snapshots (project_id, id, author) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                    .bind(pid)
+                    .bind(committed.hex())
+                    .bind(admin_pid)
+                    .execute(&h_hook.db)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) VALUES ($1, 'chg-back-2621', $2, $3, 1000)")
+                    .bind(pid)
+                    .bind(committed.hex())
+                    .bind(admin_pid)
+                    .execute(&h_hook.db)
+                    .await
+                    .unwrap();
             })
         }))
     };
     let rep = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
+        .offline_gc(
             pid,
             &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, before_loose_delete: Some(hook), ..Options::default() },
-        ))
+        )
         .unwrap();
     assert!(!rep.skipped, "the pass ran: {rep:?}");
     assert_eq!(calls.load(Relaxed), 1, "the pass committed its loose switch and reached its deletes once: {rep:?}");
-    let r = rx.recv_timeout(Duration::from_secs(60)).expect("the commit answers");
-    assert_eq!(r.status, 200, "the API commit: {}", String::from_utf8_lossy(&r.body));
-    let committed: ObjectId = serde_json::from_value(r.json()["snapshot"].clone()).expect("the commit's snapshot");
 
-    // What the commit holds is stored.
+    // What the commit holds is stored and served after restart.
+    let h = hub.hub();
+    let api = hub.api();
     let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     assert!(hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "the committed file's blob was deleted by GC: {rep:?}");
     let r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev={}&path=src/back-2621.txt", p.name, committed.hex()));
@@ -2297,7 +2350,7 @@ fn bug_2622_a_push_or_an_api_commit_of_an_entry_whose_object_is_not_of_its_kind_
 #[test]
 fn bug_2622_a_file_entry_naming_a_tree_never_hides_the_trees_files_from_gc() {
     const CONTENT: &str = "VICTIM-2622-CONTENT-41c9\n";
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -2342,10 +2395,12 @@ fn bug_2622_a_file_entry_naming_a_tree_never_hides_the_trees_files_from_gc() {
 
     // Two passes: marked, then past the window.
     for at in [0, 120_000] {
-        let rep = gc_pass(&hub, pid, &Options { min_packs_to_merge: 1, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: at, ..Options::default() });
+        let rep = gc_pass(&mut hub, pid, &Options { min_packs_to_merge: 1, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: at, ..Options::default() });
         assert!(!rep.skipped, "the pass at {at} ran: {rep:?}");
     }
 
+    let h = hub.hub();
+    let api = hub.api();
     let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     assert!(hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "main's file under the directory was deleted by GC");
     let r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/victim/deep/file.txt", p.name));
@@ -2366,7 +2421,7 @@ fn bug_2622_a_file_entry_naming_a_tree_never_hides_the_trees_files_from_gc() {
 #[test]
 fn bug_2602_a_read_that_fails_in_the_switchs_walk_leaves_nothing_to_delete() {
     use veil_server::pack_gc::{Fault, FaultPoint, SwitchHook};
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -2374,11 +2429,12 @@ fn bug_2602_a_read_that_fails_in_the_switchs_walk_leaves_nothing_to_delete() {
         .rt
         .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
         .unwrap();
-    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
 
     let (dead, dead_raw) = make_blob("DEAD-LOOSE-2602-fault\n");
     hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
-    let (snap, blob) = expiring_snapshot(&hub, &p, pid, "exp-fault", 0);
+    let (snap, blob) = expiring_snapshot(&mut hub, &p, pid, "exp-fault", 0);
+    let h = hub.hub();
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     let Object::Snapshot(s) = Object::decode(&hub.rt.block_on(h.objects.get(pid, &snap)).unwrap().expect("stored")).unwrap() else { panic!("a snapshot") };
     let tree = s.tree;
 
@@ -2415,9 +2471,7 @@ fn bug_2602_a_read_that_fails_in_the_switchs_walk_leaves_nothing_to_delete() {
         }))
     };
     let rep = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
+        .offline_gc(
             pid,
             &Options {
                 min_packs_to_merge: 99,
@@ -2429,7 +2483,7 @@ fn bug_2602_a_read_that_fails_in_the_switchs_walk_leaves_nothing_to_delete() {
                 fault: Some(fault),
                 ..Options::default()
             },
-        ))
+        )
         .expect("the transaction ran again and the pass ended");
     assert!(!rep.skipped, "the pass ran: {rep:?}");
     assert_eq!(faults.load(Relaxed), 1, "the walk's read of the snapshot's tree failed once");
@@ -2439,12 +2493,10 @@ fn bug_2602_a_read_that_fails_in_the_switchs_walk_leaves_nothing_to_delete() {
     assert!(hub.rt.block_on(fresh.exists(pid, &dead)).unwrap(), "nothing is deleted by that pass");
 
     let next = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
+        .offline_gc(
             pid,
             &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 240_000, ..Options::default() },
-        ))
+        )
         .unwrap();
     assert!(!next.skipped, "the next pass ran: {next:?}");
     assert!(!hub.rt.block_on(fresh.exists(pid, &dead)).unwrap(), "the next pass collects what nothing names: {next:?}");
@@ -2466,7 +2518,7 @@ fn bug_2602_a_read_that_fails_in_the_switchs_walk_leaves_nothing_to_delete() {
 #[test]
 #[ignore = "BUG-2623: a projection memo committed after a pass deleted its snapshot is answered 'missing object', never derived again"]
 fn bug_2623_a_memo_whose_snapshot_gc_deleted_is_derived_again() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -2491,19 +2543,19 @@ fn bug_2623_a_memo_whose_snapshot_gc_deleted_is_derived_again() {
         )
         .unwrap();
     assert!(!rows.is_empty(), "the projection had a memo");
-    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    let marked = gc_pass(&mut hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
     assert!(!marked.skipped, "the marking pass ran");
 
     // The pass deletes the snapshot; the memo's row is committed after the
     // pass's last purge (its writer stored the object before the delete).
     let rep = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
+        .offline_gc(
             pid,
             &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, ..Options::default() },
-        ))
+        )
         .unwrap();
+    let h = hub.hub();
+    let api = hub.api();
     assert!(!rep.skipped, "the pass ran: {rep:?}");
     for (view_key, real_id, created_at, collapsed) in rows {
         hub.rt
@@ -2532,30 +2584,20 @@ fn bug_2623_a_memo_whose_snapshot_gc_deleted_is_derived_again() {
     assert!(r.frames().iter().any(|(id, _)| *id == projected), "the member's history holds main's tip");
 }
 
-/// BUG-2621's review, settled: the loose switch purges the rows of every
-/// candidate (`snapshots`, the derived ones) before its deletes, and a
-/// snapshot named again after that purge keeps its objects. No writer can
-/// name it then without recording it again: a snapshot is named by
-/// resolving its id through `snapshots` (or a memo), which the purge took.
-/// Between the purge and the deletes: a push of a branch to the snapshot
-/// that uploads nothing, an API commit on it, and a push of a child of it
-/// are each refused; a push that uploads it again is accepted, its row is
-/// there again, and the pass keeps what it names.
+/// BUG-2621's review, settled (adapted for offline-only GC in v1): offline GC
+/// purges the rows of an expired unreferenced snapshot (`snapshots`, derived
+/// rows) and deletes its objects; once the server restarts, a push naming the
+/// purged snapshot without uploading it, an API commit on it, and a push of a
+/// child of it are each refused, while uploading it again is accepted and
+/// served.
 #[test]
 fn bug_2621_a_snapshot_purged_by_the_switch_is_named_again_only_by_uploading_it_again() {
-    use veil_server::pack_gc::SwitchHook;
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
     let api = hub.api();
     let admin_tok = p.admin.token();
-    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
-    let rows = |id: &ObjectId| -> i64 {
-        hub.rt
-            .block_on(sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE project_id = $1 AND id = $2").bind(pid).bind(id.hex()).fetch_one(&h.db))
-            .unwrap()
-    };
 
     // A loose candidate (so the pass has a loose switch), and a snapshot
     // past the window with its objects, as its pusher holds them.
@@ -2575,92 +2617,69 @@ fn bug_2621_a_snapshot_purged_by_the_switch_is_named_again_only_by_uploading_it_
         &json!({"updates": [{"branch": "purged-2621", "expected": snap.hex(), "new": null}], "force": true}),
     );
     assert_eq!(del.json()["results"][0]["ok"], json!(true), "delete the branch: {}", String::from_utf8_lossy(&del.body));
-    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    let marked = gc_pass(&mut hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
     assert!(!marked.skipped, "the marking pass ran");
-    assert_eq!(rows(&snap), 1, "the snapshot is recorded before the pass");
-
-    // After the switch's purge, before the deletes.
-    type Tried = (&'static str, u16, String);
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<Tried>>();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let hook = {
-        let (authority, cert, name, token, identity, calls) = (hub.authority(), hub.cert_pem.clone(), p.name.clone(), admin_tok.clone(), p.admin.identity(), calls.clone());
-        let (db, held) = (h.db.clone(), held.clone());
-        SwitchHook(Arc::new(move || {
-            let (authority, cert, name, token, identity, tx, db, held) = (authority.clone(), cert.clone(), name.clone(), token.clone(), identity.clone(), tx.clone(), db.clone(), held.clone());
-            let first = calls.fetch_add(1, Relaxed) == 0;
-            Box::pin(async move {
-                if !first {
-                    return;
-                }
-                let purged: i64 = sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE project_id = $1 AND id = $2").bind(pid).bind(snap.hex()).fetch_one(&db).await.unwrap();
-                let (done, tried) = tokio::sync::oneshot::channel();
-                std::thread::spawn(move || {
-                    let api = Api::at(&authority, &cert);
-                    let push = format!("/v1/projects/{name}/push");
-                    let said = |what: &'static str, r: Reply| (what, r.status, String::from_utf8_lossy(&r.body).to_string());
-                    let mut out: Vec<Tried> = vec![("rows of the snapshot after the purge", purged as u16, String::new())];
-                    // A branch to it, nothing uploaded.
-                    out.push(said("a push naming it", api.post_json(Some(&token), &push, &json!({"updates": [{"branch": "again-a", "expected": null, "new": snap.hex()}]}))));
-                    // An API commit on it.
-                    out.push(said(
-                        "an API commit on it",
-                        api.post_json(Some(&token), &format!("/v1/projects/{name}/changes"), &json!({"base": snap.hex(), "edits": [{"path": "src/on-purged.txt", "put": {"text": "x\n"}}]})),
-                    ));
-                    // A child of it, the child alone uploaded.
-                    let mut child = Craft::with(&api, token.clone(), identity, &name, "main");
-                    child.file("src/child-of-purged.txt", "CHILD-2621\n");
-                    let (_, r) = child.push_edited("again-c", None, |s| s.parents = vec![snap]);
-                    out.push(said("a push of a child of it", r));
-                    // It, uploaded again.
-                    let up = api.upload(&token, &name, &held);
-                    let receipts: serde_json::Map<String, Value> = match up.status {
-                        200 => held.iter().zip(up.json()["receipts"].as_array().unwrap().clone()).map(|((id, _), r)| (id.hex(), r)).collect(),
-                        _ => Default::default(),
-                    };
-                    out.push(said("its upload", up));
-                    out.push(said(
-                        "a push of it, uploaded again",
-                        api.post_json(Some(&token), &push, &json!({"updates": [{"branch": "again-d", "expected": null, "new": snap.hex()}], "receipts": receipts})),
-                    ));
-                    let _ = tx.send(out);
-                    let _ = done.send(());
-                });
-                let _ = tried.await;
-            })
-        }))
-    };
-    let rep = hub
+    let rows_before: i64 = hub
         .rt
-        .block_on(pack_gc::run_project(
-            &h,
+        .block_on(sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE project_id = $1 AND id = $2").bind(pid).bind(snap.hex()).fetch_one(&hub.hub().db))
+        .unwrap();
+    assert_eq!(rows_before, 1, "the snapshot is recorded before the pass");
+
+    // Offline collection purges the snapshot's rows and deletes `dead`.
+    let rep = hub
+        .offline_gc(
             pid,
-            &Options { min_packs_to_merge: 1, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, before_loose_delete: Some(hook), ..Options::default() },
-        ))
+            &Options { min_packs_to_merge: 1, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, ..Options::default() },
+        )
         .unwrap();
     assert!(!rep.skipped, "the pass ran: {rep:?}");
-    assert_eq!(calls.load(Relaxed), 1, "the pass committed its loose switch and reached its deletes once");
-    let tried = rx.recv_timeout(Duration::from_secs(60)).expect("the writers answered");
-    let of = |what: &str| tried.iter().find(|t| t.0 == what).unwrap_or_else(|| panic!("no {what}: {tried:?}")).clone();
-    assert_eq!(of("rows of the snapshot after the purge").1, 0, "the switch purged the snapshot's row: {tried:?}");
+    let h = hub.hub();
+    let api = hub.api();
+    let rows_after: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE project_id = $1 AND id = $2").bind(pid).bind(snap.hex()).fetch_one(&h.db))
+        .unwrap();
+    assert_eq!(rows_after, 0, "the switch purged the snapshot's row");
+
+    let push_path = format!("/v1/projects/{}/push", p.name);
+    // 1. A push naming it without uploading it is refused.
+    let r = api.post_json(Some(&admin_tok), &push_path, &json!({"updates": [{"branch": "again-a", "expected": null, "new": snap.hex()}]}));
+    let body = String::from_utf8_lossy(&r.body);
+    assert!(r.status == 400 || (r.status == 200 && body.contains("\"ok\":false")), "a push naming the purged snapshot without uploading it is refused: {} {body}", r.status);
+    // 2. An API commit on it is refused.
+    let r = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({"base": snap.hex(), "edits": [{"path": "src/on-purged.txt", "put": {"text": "x\n"}}]}),
+    );
+    assert!((400..500).contains(&r.status), "an API commit on the purged snapshot is refused: {} {}", r.status, String::from_utf8_lossy(&r.body));
+    // 3. A push of a child of it without uploading the parent is refused.
+    let mut child = Craft::with(&api, admin_tok.clone(), p.admin.identity(), &p.name, "main");
+    child.file("src/child-of-purged.txt", "CHILD-2621\n");
+    let (_, r) = child.push_edited("again-c", None, |s| s.parents = vec![snap]);
+    let body = String::from_utf8_lossy(&r.body);
+    assert!(r.status == 400 || (r.status == 200 && body.contains("\"ok\":false")), "a push of a child of the purged snapshot is refused: {} {body}", r.status);
+
     let branches = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
-    // Refused, each: nothing names the snapshot without recording it.
-    let (_, status, body) = of("a push naming it");
-    assert!(status == 400 || (status == 200 && body.contains("\"ok\":false")), "a push naming the purged snapshot without uploading it is refused: {status} {body}");
-    assert!(!branches.contains_key("again-a"), "no branch was made: {body}");
-    let (_, status, body) = of("an API commit on it");
-    assert!((400..500).contains(&status), "an API commit on the purged snapshot is refused: {status} {body}");
-    let (_, status, body) = of("a push of a child of it");
-    assert!(status == 400 || (status == 200 && body.contains("\"ok\":false")), "a push of a child of the purged snapshot, the parent not uploaded, is refused: {status} {body}");
-    assert!(!branches.contains_key("again-c"), "no branch was made: {body}");
-    // Uploaded again: accepted, recorded again, and kept by the pass.
-    let (_, status, body) = of("its upload");
-    assert_eq!(status, 200, "the upload: {body}");
-    let (_, status, body) = of("a push of it, uploaded again");
-    assert_eq!(status, 200, "a push of the snapshot, uploaded again: {body}");
-    assert!(body.contains("\"ok\":true"), "is accepted: {body}");
+    assert!(!branches.contains_key("again-a"), "no again-a branch was made");
+    assert!(!branches.contains_key("again-c"), "no again-c branch was made");
+
+    // 4. Uploaded again: accepted, recorded again, and served.
+    let up = api.upload(&admin_tok, &p.name, &held);
+    assert_eq!(up.status, 200, "the upload: {}", String::from_utf8_lossy(&up.body));
+    let receipts: serde_json::Map<String, Value> = held.iter().zip(up.json()["receipts"].as_array().unwrap().clone()).map(|((id, _), r)| (id.hex(), r)).collect();
+    let r = api.post_json(Some(&admin_tok), &push_path, &json!({"updates": [{"branch": "again-d", "expected": null, "new": snap.hex()}], "receipts": receipts}));
+    assert_eq!(r.status, 200, "a push of the snapshot, uploaded again: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "is accepted: {}", String::from_utf8_lossy(&r.body));
+
+    let branches = api.tips(Some(&admin_tok), &p.name).unwrap().branches;
     assert_eq!(branches.get("again-d"), Some(&snap), "its branch is at the snapshot");
-    assert_eq!(rows(&snap), 1, "the snapshot is recorded again");
+    let rows_revived: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT count(*) FROM snapshots WHERE project_id = $1 AND id = $2").bind(pid).bind(snap.hex()).fetch_one(&h.db))
+        .unwrap();
+    assert_eq!(rows_revived, 1, "the snapshot is recorded again");
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     assert!(!hub.rt.block_on(fresh.exists(pid, &dead)).unwrap(), "the pass collected what nothing names: {rep:?}");
     assert_closure_stored(&hub, pid, snap, "the snapshot named again after the purge");
     let r = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev=again-d&path=src/purged-2621.txt", p.name));
@@ -2678,13 +2697,13 @@ fn bug_2621_a_snapshot_purged_by_the_switch_is_named_again_only_by_uploading_it_
 #[test]
 fn bug_2621_a_slow_delete_is_joined_to_its_end_never_dropped_in_flight() {
     use veil_server::pack_gc::{Fault, FaultPoint};
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
     let (slow, slow_raw) = make_blob("SLOW-DELETE-2621\n");
     hub.rt.block_on(h.objects.put(pid, &slow, slow_raw)).unwrap();
-    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    let marked = gc_pass(&mut hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
     assert!(!marked.skipped, "the marking pass ran");
 
     let slept = Arc::new(AtomicBool::new(false));
@@ -2703,17 +2722,15 @@ fn bug_2621_a_slow_delete_is_joined_to_its_end_never_dropped_in_flight() {
     };
     let t = Instant::now();
     let rep = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
+        .offline_gc(
             pid,
             &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, fault: Some(fault), ..Options::default() },
-        ))
+        )
         .unwrap();
     assert!(!rep.skipped, "the pass ran: {rep:?}");
     assert!(slept.load(Relaxed), "the slow delete ran to its end");
     assert!(t.elapsed() >= pack_gc::LOOSE_DELETE_TIME, "the pass waited for it: {:?}", t.elapsed());
-    let stored = hub.rt.block_on(h.objects.blob_store().exists(&veil_server::store::object_key(pid, &slow))).unwrap();
+    let stored = hub.rt.block_on(hub.hub().objects.blob_store().exists(&veil_server::store::object_key(pid, &slow))).unwrap();
     assert!(!stored, "the object whose delete was slow is deleted when the pass returns: {rep:?}");
 }
 
@@ -2724,7 +2741,7 @@ fn bug_2621_a_slow_delete_is_joined_to_its_end_never_dropped_in_flight() {
 /// (which walks the root outside its switch) collects.
 #[test]
 fn bug_2602_a_switch_gives_way_past_its_bound_and_the_next_pass_collects() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -2734,7 +2751,8 @@ fn bug_2602_a_switch_gives_way_past_its_bound_and_the_next_pass_collects() {
         .rt
         .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
         .unwrap();
-    let exists = |id: &ObjectId| {
+    let exists = |hub: &TestHub, id: &ObjectId| {
+        let h = hub.hub();
         let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
         hub.rt.block_on(fresh.exists(pid, id)).unwrap()
     };
@@ -2757,11 +2775,11 @@ fn bug_2602_a_switch_gives_way_past_its_bound_and_the_next_pass_collects() {
     assert_eq!(del.json()["results"][0]["ok"], json!(true), "delete wide ok");
     let (dead, dead_raw) = make_blob("DEAD-LOOSE-2602-bound\n");
     hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
-    let marked = gc_pass(&hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
+    let marked = gc_pass(&mut hub, pid, &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, ..Options::default() });
     assert!(!marked.skipped, "the marking pass ran");
 
-    let (db, wide_hex) = (h.db.clone(), wide.hex());
-    let rep = pass_with_a_racing_write(&hub, pid, 120_000, move || {
+    let (db, wide_hex) = (hub.hub().db.clone(), wide.hex());
+    let rep = pass_with_a_racing_write(&mut hub, pid, 120_000, move || {
         let (db, wide_hex) = (db.clone(), wide_hex.clone());
         async move {
             sqlx::query("INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) VALUES ($1, 'chg-2602-wide', $2, $3, 1000)")
@@ -2774,32 +2792,27 @@ fn bug_2602_a_switch_gives_way_past_its_bound_and_the_next_pass_collects() {
         }
     });
     assert_eq!(rep.loose_objects_deleted + rep.packed_objects_deleted, 0, "past its bound the switch gives way: nothing is deleted: {rep:?}");
-    assert!(exists(&dead), "nothing is deleted by a pass that gave way");
+    assert!(exists(&hub, &dead), "nothing is deleted by a pass that gave way");
     assert_closure_stored(&hub, pid, wide, "after the give-way");
 
     let next = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
+        .offline_gc(
             pid,
             &Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 240_000, ..Options::default() },
-        ))
+        )
         .unwrap();
     assert!(!next.skipped, "the next pass ran: {next:?}");
-    assert!(!exists(&dead), "the next pass collects what nothing names: {next:?}");
+    assert!(!exists(&hub, &dead), "the next pass collects what nothing names: {next:?}");
     assert_closure_stored(&hub, pid, wide, "after the next pass");
 }
 
-/// BUG-2602, with real writers: one thread pushes commit after commit to a
-/// branch (each a staged upload, new objects, a `snapshots` row and a
-/// branch move, through the push's own guard) while GC passes past the
-/// retention window run one after another. A pass collects the dead object,
-/// and every commit pushed is whole afterwards (its tree, files and
-/// ancestors: among them a snapshot past the window, wherever a merge with
-/// it was accepted while the passes ran).
+/// BUG-2602 (adapted for offline-only GC in v1): while a thread pushes new
+/// commits to a serving server, collection (`run_gc: true`) refuses with `409`;
+/// once stopped, offline GC collects the dead object and every pushed commit
+/// stays whole.
 #[test]
 fn bug_2602_gc_collects_under_pushes_of_new_commits_and_loses_nothing() {
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -2813,8 +2826,8 @@ fn bug_2602_gc_collects_under_pushes_of_new_commits_and_loses_nothing() {
 
     let (dead, dead_raw) = make_blob("DEAD-LOOSE-2602-commits\n");
     hub.rt.block_on(h.objects.put(pid, &dead, dead_raw)).unwrap();
-    // Past the window when the passes run: the pusher's commits build on it.
-    let (old, _) = expiring_snapshot(&hub, &p, pid, "old-2602", 0);
+    let (old, _) = expiring_snapshot(&mut hub, &p, pid, "old-2602", 0);
+    let h = hub.hub();
 
     let stop = Arc::new(AtomicBool::new(false));
     let pushed = Arc::new(std::sync::Mutex::new(vec![first]));
@@ -2828,23 +2841,13 @@ fn bug_2602_gc_collects_under_pushes_of_new_commits_and_loses_nothing() {
             let mut n = 0;
             while !stop.load(Relaxed) {
                 n += 1;
-                let commit = |merge: bool| {
-                    let mut c = Craft::with(&api, token.clone(), identity.clone(), &name, "busy");
-                    c.file(&format!("src/busy-{}.rs", n % 7), &format!("BUSY-2602-{n}\n"));
-                    c.push_edited("busy", Some(tip), |s| {
-                        if merge {
-                            s.parents.push(old);
-                        }
-                    })
-                };
-                // Every fifth commit is a merge with the snapshot past the
-                // window: accepted while the server records that snapshot,
-                // refused once a pass has purged it (its pusher would upload
-                // it again); then the commit is pushed without it.
-                let (mut id, mut r) = commit(n % 5 == 0);
-                if n % 5 == 0 && r.status == 400 && String::from_utf8_lossy(&r.body).contains("was not uploaded") {
-                    (id, r) = commit(false);
-                }
+                let mut c = Craft::with(&api, token.clone(), identity.clone(), &name, "busy");
+                c.file(&format!("src/busy-{}.rs", n % 7), &format!("BUSY-2602-{n}\n"));
+                let (id, r) = c.push_edited("busy", Some(tip), |s| {
+                    if n % 5 == 0 {
+                        s.parents.push(old);
+                    }
+                });
                 assert_eq!(r.status, 200, "steady push {n}: {}", String::from_utf8_lossy(&r.body));
                 assert_eq!(r.json()["results"][0]["ok"], json!(true), "steady push {n} ok: {}", String::from_utf8_lossy(&r.body));
                 tip = id;
@@ -2857,31 +2860,20 @@ fn bug_2602_gc_collects_under_pushes_of_new_commits_and_loses_nothing() {
     }
 
     let opts = Options { min_packs_to_merge: 99, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms: 120_000, ..Options::default() };
-    let (mut collected, mut passes) = (0, 0);
-    let at_start = pushed.lock().unwrap().len();
-    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
-    for _ in 0..30 {
-        let r = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).unwrap();
-        passes += 1;
-        if !r.skipped && !hub.rt.block_on(fresh.exists(pid, &dead)).unwrap() {
-            collected += 1;
-            break;
-        }
-    }
-    // More passes while the pushes go on, now with nothing to collect.
-    for _ in 0..5 {
-        hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).unwrap();
-    }
-    let during = pushed.lock().unwrap().len() - at_start;
+    let refused = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).expect_err("collection refuses while server serves");
+    assert!(matches!(refused, veil_server::error::Error::Api { status: axum::http::StatusCode::CONFLICT, .. }));
     stop.store(true, Relaxed);
     pusher.join().expect("the pusher's pushes all succeeded");
-    eprintln!("BUG-2602 (new commits): collected after {passes} passes; {during} pushes while GC passed");
-    assert!(during > 0, "pushes ran while GC passed");
-    assert_eq!(collected, 1, "a pass collects the dead object while commits are pushed");
+
+    let rep = hub.offline_gc(pid, &opts).unwrap();
+    assert!(!rep.skipped, "offline pass ran: {rep:?}");
+    let h = hub.hub();
+    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
+    assert!(!hub.rt.block_on(fresh.exists(pid, &dead)).unwrap(), "offline GC collects the dead object");
     let pushed = pushed.lock().unwrap().clone();
     assert_closure_stored(&hub, pid, *pushed.last().unwrap(), "the last commit pushed");
     for id in &pushed {
-        assert!(hub.rt.block_on(fresh.exists(pid, id)).unwrap(), "commit {id} pushed while GC passed is stored");
+        assert!(hub.rt.block_on(fresh.exists(pid, id)).unwrap(), "commit {id} pushed before GC is stored");
     }
 }
 
@@ -2916,7 +2908,7 @@ fn bug_2602_every_stamped_table_is_read_again_by_the_switch() {
 fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_preserve_roots() {
     use veil_server::pack_gc::{project_ref_stamp, SwitchHook};
 
-    let hub = TestHub::start();
+    let mut hub = TestHub::start_own();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -2926,9 +2918,9 @@ fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_
     let main0 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
 
     // Helper: create a branch snapshot with unique blob content, then delete the
-    // branch and mark the snapshot's closure expired in `unreferenced_objects`
-    // (simulating an expiring snapshot right as a concurrent feature references it).
-    let make_expiring_branch_snap = |branch: &str, tag: &str| -> (ObjectId, ObjectId) {
+    // branch and mark the snapshot's closure expired in `unreferenced_objects`.
+    let make_expiring_branch_snap = |hub: &mut TestHub, branch: &str, tag: &str| -> (ObjectId, ObjectId) {
+        let api = hub.api();
         let mut c = Craft::new(&api, &p.admin, &p.name, "main");
         let content = format!("EXPIRING-1782-{tag}\n");
         let (blob_id, _) = make_blob(&content);
@@ -2943,19 +2935,17 @@ fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_
         );
         assert_eq!(del.status, 200);
         // Mark unreferenced at t=0 so the next pass at offset +120_000 sees it as expired.
-        hub.rt
-            .block_on(pack_gc::run_project(
-                &h,
-                pid,
-                &Options {
-                    min_packs_to_merge: 99,
-                    run_gc: true,
-                    retention_window_ms: 60_000,
-                    now_offset_ms: 0,
-                    ..Options::default()
-                },
-            ))
-            .unwrap();
+        hub.offline_gc(
+            pid,
+            &Options {
+                min_packs_to_merge: 99,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                now_offset_ms: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         (snap, blob_id)
     };
 
@@ -2978,14 +2968,13 @@ fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_
         )
         .unwrap();
 
-    let (snap_amend, blob_amend) = make_expiring_branch_snap("tmp-amend", "AMEND");
+    let (snap_amend, blob_amend) = make_expiring_branch_snap(&mut hub, "tmp-amend", "AMEND");
+    let h = hub.hub();
     let stamp_before = hub.rt.block_on(project_ref_stamp(&h.db, pid)).unwrap();
     let db_for_hook = h.db.clone();
     let snap_amend_hex = snap_amend.hex();
     let rep_amend = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
+        .offline_gc(
             pid,
             &Options {
                 min_packs_to_merge: 1,
@@ -3009,21 +2998,19 @@ fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_
                 }))),
                 ..Options::default()
             },
-        ))
+        )
         .unwrap();
-    let stamp_after = hub.rt.block_on(project_ref_stamp(&h.db, pid)).unwrap();
+    let stamp_after = hub.rt.block_on(project_ref_stamp(&hub.hub().db, pid)).unwrap();
     assert_ne!(stamp_before, stamp_after, "in-place change_refs update must change RefStamp");
     assert_eq!(rep_amend.packed_objects_deleted, 0, "racing change_refs amend must abort GC pack switch");
 
     // --- 2. Concurrent `pr_revisions` write during GC switch ---
-    let (snap_pr, blob_pr) = make_expiring_branch_snap("tmp-pr", "PR-REV");
-    let db_for_pr = h.db.clone();
+    let (snap_pr, blob_pr) = make_expiring_branch_snap(&mut hub, "tmp-pr", "PR-REV");
+    let db_for_pr = hub.hub().db.clone();
     let snap_pr_hex = snap_pr.hex();
     let main0_hex = main0.hex();
     let rep_pr = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
+        .offline_gc(
             pid,
             &Options {
                 min_packs_to_merge: 1,
@@ -3053,11 +3040,12 @@ fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_
                 }))),
                 ..Options::default()
             },
-        ))
+        )
         .unwrap();
     assert_eq!(rep_pr.packed_objects_deleted, 0, "racing pr_revisions insert must abort GC pack switch");
 
     // Verify an in-place update to `pr_revisions` also changes `RefStamp`.
+    let h = hub.hub();
     let pr_stamp_1 = hub.rt.block_on(project_ref_stamp(&h.db, pid)).unwrap();
     hub.rt
         .block_on(
@@ -3071,16 +3059,14 @@ fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_
     assert_ne!(pr_stamp_1, pr_stamp_2, "in-place pr_revisions update must change RefStamp");
 
     // --- 3. Concurrent `bisects` (`probes`, `candidates`) & `bisect_reverts` write during GC switch ---
-    let (snap_probe, blob_probe) = make_expiring_branch_snap("tmp-probe", "BISECT-PROBE");
-    let (snap_rev, blob_rev) = make_expiring_branch_snap("tmp-rev", "BISECT-REVERT");
-    let db_for_bisect = h.db.clone();
+    let (snap_probe, blob_probe) = make_expiring_branch_snap(&mut hub, "tmp-probe", "BISECT-PROBE");
+    let (snap_rev, blob_rev) = make_expiring_branch_snap(&mut hub, "tmp-rev", "BISECT-REVERT");
+    let db_for_bisect = hub.hub().db.clone();
     let probe_hex = snap_probe.hex();
     let rev_hex = snap_rev.hex();
     let main0_hex2 = main0.hex();
     let rep_bisect = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
+        .offline_gc(
             pid,
             &Options {
                 min_packs_to_merge: 1,
@@ -3122,7 +3108,7 @@ fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_
                 }))),
                 ..Options::default()
             },
-        ))
+        )
         .unwrap();
     assert_eq!(rep_bisect.packed_objects_deleted, 0, "racing bisects/bisect_reverts write must abort GC pack switch");
 
@@ -3130,22 +3116,21 @@ fn bug_1782_concurrent_change_refs_pr_revisions_and_bisects_abort_gc_switch_and_
     // roots (`change_refs`, `pr_revisions`, `bisects`, `bisect_reverts`) and
     // their blob closures remain stored! ---
     for off in [480_000i64, 600_000, 600_001] {
-        hub.rt
-            .block_on(pack_gc::run_project(
-                &h,
-                pid,
-                &Options {
-                    min_packs_to_merge: 1,
-                    run_gc: true,
-                    retention_window_ms: 60_000,
-                    pack_grace_ms: 0,
-                    now_offset_ms: off,
-                    ..Options::default()
-                },
-            ))
-            .unwrap();
+        hub.offline_gc(
+            pid,
+            &Options {
+                min_packs_to_merge: 1,
+                run_gc: true,
+                retention_window_ms: 60_000,
+                pack_grace_ms: 0,
+                now_offset_ms: off,
+                ..Options::default()
+            },
+        )
+        .unwrap();
     }
 
+    let h = hub.hub();
     let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
     for (label, id) in [
         ("change_refs snap", snap_amend),
@@ -3327,3 +3312,214 @@ fn bug_1898_every_read_that_finds_its_pack_merged_and_swept_reads_the_listing_ag
         }
     }
 }
+
+/// Offline-only GC fence (v1): collection (`run_gc: true` and `veil-server gc`)
+/// refuses with a clear error whenever one or more `veil-server` instances are
+/// serving the database, succeeds once every serving instance has stopped, and
+/// also succeeds after a serving instance crashes abruptly without releasing
+/// its session advisory lock cleanly.
+#[test]
+fn offline_gc_refuses_while_serving_and_succeeds_after_stop_or_crash() {
+    let mut hub = TestHub::start_own();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+
+    // Put an unreferenced loose blob so GC has something to collect.
+    let blob_raw = bytes::Bytes::from(veil_core::object::Object::Blob(b"OFFLINE-FENCE-BLOB\n".to_vec()).encode());
+    let blob = ObjectId::hash(&blob_raw);
+    hub.rt.block_on(h.objects.put(pid, &blob, blob_raw)).unwrap();
+
+    // 1. With one server serving, both `run_project(..., run_gc: true)` and
+    //    `veil-server gc` refuse with a clear error.
+    let err = hub
+        .rt
+        .block_on(pack_gc::run_project(
+            &h,
+            pid,
+            &Options { run_gc: true, retention_window_ms: 0, pack_grace_ms: 0, staged_grace_ms: 0, ..Options::default() },
+        ))
+        .expect_err("run_gc: true must refuse while a server is serving");
+    assert!(
+        matches!(err, veil_server::error::Error::Api { status: axum::http::StatusCode::CONFLICT, .. }),
+        "expected 409 conflict: {err:?}"
+    );
+    assert!(format!("{err:?}").contains("serving"), "clear refusal message: {err:?}");
+
+    let out = hub.gc_command().output().expect("run veil-server gc");
+    assert!(!out.status.success(), "CLI gc must fail while serving");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("offline-only") || stderr.contains("serving"), "CLI gc error explains why: {stderr}");
+
+    // 2. With a second server also serving, stopping only the first server is
+    //    NOT enough: collection still refuses until EVERY server has stopped.
+    let peer = hub.try_start_serving().expect("second server starts cleanly");
+    hub.stop_serving();
+
+    let out = hub.gc_command().output().expect("run veil-server gc with peer still serving");
+    assert!(!out.status.success(), "CLI gc must refuse while second server still serves");
+
+    // Stop the second server cleanly: now GC succeeds and collects the blob.
+    hub.rt.block_on(peer.stop());
+    let out = hub.gc_command().output().expect("run veil-server gc after both stop");
+    assert!(
+        out.status.success(),
+        "CLI gc must succeed once all servers stop:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fresh = veil_server::store::Objects::with_db(hub.blob_store(), 1 << 10, None);
+    assert!(!hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "offline gc deleted the unreferenced blob");
+
+    // 3. Crash survival: start a server and drop it without calling `stop()`
+    //    (closing its TCP connection abruptly so PostgreSQL releases its
+    //    session advisory lock without an explicit unlock).
+    let crashed = hub.try_start_serving().expect("server starts before crash");
+    // Confirm refusal while `crashed` is alive.
+    let out = hub.gc_command().output().expect("run veil-server gc while server alive");
+    assert!(!out.status.success(), "CLI gc must refuse while server is alive");
+    // Drop `crashed` abruptly (no `stop()`), then give PostgreSQL a moment to
+    // tear down the closed socket and release the session advisory lock.
+    drop(crashed);
+    let mut succeeded = false;
+    for _ in 0..40 {
+        let out = hub.gc_command().arg("--dry-run").output().expect("run veil-server gc --dry-run");
+        if out.status.success() {
+            succeeded = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(succeeded, "offline GC must succeed after a serving instance crashes");
+}
+
+/// Offline-only GC fence (v1): while offline garbage collection holds the
+/// exclusive database fence, starting a `veil-server` refuses with a clear
+/// error, and succeeds once GC releases the fence.
+#[test]
+fn server_refuses_to_start_while_offline_gc_holds_fence() {
+    let mut hub = TestHub::start_own();
+    let _p = setup_project(&hub);
+    hub.stop_serving();
+
+    // Acquire the offline GC fence directly (as `veil-server gc` / `run_offline`
+    // does for the full duration of a collection run).
+    let offline = hub.offline_hub();
+    let fence = hub
+        .rt
+        .block_on(pack_gc::OfflineGcFence::acquire(&offline.db))
+        .expect("offline GC fence acquires cleanly when no server is serving");
+
+    // Starting a server while GC holds the exclusive fence must fail clearly.
+    let err = match hub.try_start_serving() {
+        Ok(_) => panic!("veil-server must refuse to start while offline GC holds the fence"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("offline garbage collection"),
+        "start-up error must explain offline GC is running: {msg}"
+    );
+
+    // Releasing the fence allows the server to start normally again.
+    hub.rt.block_on(fence.release());
+    hub.rt.block_on(offline.db.close());
+    hub.start_serving();
+}
+
+/// `veil-server gc [--project NAME] [--dry-run]`:
+/// - `--dry-run` reports what would be deleted without deleting any object or row;
+/// - `--project NAME` collects only that project and leaves other projects untouched;
+/// - unknown `--project` fails with a clear error;
+/// - `veil-server gc` (all projects) collects the remaining project and reports
+///   exact deletion counts.
+#[test]
+fn cli_gc_dry_run_and_collect_reports_deletions_and_scopes_by_project() {
+    let mut hub = TestHub::start_own();
+    let p1 = setup_project(&hub);
+    let p2 = setup_project(&hub);
+    let pid1 = project_id(&hub, &p1.name);
+    let pid2 = project_id(&hub, &p2.name);
+    let h = hub.hub();
+
+    // Put an unreferenced loose blob in each project.
+    let raw1 = bytes::Bytes::from(veil_core::object::Object::Blob(b"CLI-GC-P1-UNREF\n".to_vec()).encode());
+    let blob1 = ObjectId::hash(&raw1);
+    let raw2 = bytes::Bytes::from(veil_core::object::Object::Blob(b"CLI-GC-P2-UNREF\n".to_vec()).encode());
+    let blob2 = ObjectId::hash(&raw2);
+    hub.rt.block_on(h.objects.put(pid1, &blob1, raw1)).unwrap();
+    hub.rt.block_on(h.objects.put(pid2, &blob2, raw2)).unwrap();
+
+    // Stop serving so offline GC can run.
+    hub.stop_serving();
+
+    // 1. Unknown project name fails clearly.
+    let out = hub
+        .gc_command()
+        .args(["--project", "no-such-project-xyz"])
+        .output()
+        .expect("run veil-server gc --project unknown");
+    assert!(!out.status.success(), "unknown project must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not exist"), "unknown project error: {stderr}");
+
+    // 2. `--dry-run` reports the unreachable objects without deleting anything.
+    let out = hub.gc_command().arg("--dry-run").output().expect("run veil-server gc --dry-run");
+    assert!(
+        out.status.success(),
+        "--dry-run must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&p1.name), "dry-run names project 1: {stdout}");
+    assert!(stdout.contains(&p2.name), "dry-run names project 2: {stdout}");
+    assert!(stdout.contains("dry run"), "dry-run labels output: {stdout}");
+    assert!(stdout.contains("would delete") && stdout.contains("loose objects"), "dry-run reports loose object counts: {stdout}");
+
+    let fresh = veil_server::store::Objects::with_db(hub.blob_store(), 1 << 10, None);
+    assert!(hub.rt.block_on(fresh.exists(pid1, &blob1)).unwrap(), "dry-run must not delete p1 blob");
+    assert!(hub.rt.block_on(fresh.exists(pid2, &blob2)).unwrap(), "dry-run must not delete p2 blob");
+
+    // 3. `--project p1` collects only p1 and leaves p2 untouched.
+    let out = hub
+        .gc_command()
+        .args(["--project", &p1.name])
+        .output()
+        .expect("run veil-server gc --project p1");
+    assert!(
+        out.status.success(),
+        "--project p1 must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&p1.name), "output names p1: {stdout}");
+    assert!(!stdout.contains(&p2.name), "output does not include p2: {stdout}");
+    assert!(stdout.contains("deleted ") && stdout.contains("loose objects"), "output reports p1 loose deletion: {stdout}");
+
+    assert!(!hub.rt.block_on(fresh.exists(pid1, &blob1)).unwrap(), "p1 unreferenced blob was deleted");
+    assert!(hub.rt.block_on(fresh.exists(pid2, &blob2)).unwrap(), "p2 unreferenced blob was untouched");
+
+    // 4. `veil-server gc` (all projects) collects p2 and reports deletion.
+    let out = hub.gc_command().output().expect("run veil-server gc all projects");
+    assert!(
+        out.status.success(),
+        "veil-server gc must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&p2.name), "output names p2: {stdout}");
+    assert!(stdout.contains("deleted ") && stdout.contains("loose objects"), "output reports p2 loose deletion: {stdout}");
+    assert!(!hub.rt.block_on(fresh.exists(pid2, &blob2)).unwrap(), "p2 unreferenced blob was deleted");
+
+    // Restart server and verify both projects still serve their live main branch.
+    hub.start_serving();
+    let api = hub.api();
+    let r1 = api.get(Some(&p1.admin.token()), &format!("/v1/projects/{}/tips", p1.name));
+    assert_eq!(r1.status, 200, "p1 still serves after gc");
+    let r2 = api.get(Some(&p2.admin.token()), &format!("/v1/projects/{}/tips", p2.name));
+    assert_eq!(r2.status, 200, "p2 still serves after gc");
+}
+
