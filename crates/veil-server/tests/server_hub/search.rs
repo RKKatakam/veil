@@ -482,7 +482,7 @@ fn rebuild(th: &TestHub, h: &Hist) {
             again(|| sqlx::query(&q).bind(h.id).execute(&h.hub.db)).await;
         }
     });
-    segment::clear_cache();
+    segment::clear_cache(&h.hub);
     index(th, h);
 }
 
@@ -1452,7 +1452,6 @@ fn bug_1990_a_stopping_server_waits_for_its_search_index_updates_to_end() {
 /// separate uncoordinated 256 MiB cache (also populated during compaction)
 /// on top of the 512 MiB object and tree caches.
 #[test]
-#[ignore = "BUG-2663: all_at_once re-indexes tags from scratch and segment cache adds 256 MiB on top of warm object/tree caches"]
 fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
     let writer = TestHub::start();
     let p = setup_project(&writer);
@@ -1510,7 +1509,7 @@ fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
             again(|| sqlx::query(&q).bind(pid).execute(&hub.db)).await;
         }
     });
-    segment::clear_cache();
+    segment::clear_cache(&srv.hub());
 
     // 1. Full clone against `srv` (warms pack index, objects and trees).
     let cloned = p.admin.dir("full-clone-2663");
@@ -1552,15 +1551,15 @@ fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
         raw_seg[mlen + 8 + path_len] = s_idx.wrapping_add(1);
         let seg_id = ObjectId::hash(&raw_seg);
         srv.rt
-            .block_on(srv.hub().objects.put(seg_project, &seg_id, raw_seg.into()))
+            .block_on(srv.hub().objects.put_ephemeral(seg_project, &seg_id, raw_seg.into()))
             .unwrap();
         seg_ids.push(seg_id);
     }
-    segment::clear_cache();
+    segment::clear_cache(&srv.hub());
 
     // 2. Fill `Hub::objects` (192 MiB encoded + 64 MiB raw = 256 MiB) and
-    // `Hub::trees` (256 MiB) to capacity with resident data, matching the
-    // post-`clone, full` state of `bench-server.sh 1g`.
+    // `Hub::trees` (256 MiB) to capacity (512 MiB total), matching the
+    // post-`clone, full` cache state of `bench-server.sh 1g`.
     let warm_project = pid + 2_000_000;
     let mut tmpl_2m = vec![0u8; (2 << 20) - 64];
     let mut x = 0x9e37_79b9_7f4a_7c15u64;
@@ -1570,23 +1569,24 @@ fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
         x ^= x << 17;
         chunk.copy_from_slice(&x.to_le_bytes());
     }
-    let tmpl_1m = tmpl_2m[..(1 << 20) - 64].to_vec();
+    let tmpl_64k = tmpl_2m[..(64 << 10) - 64].to_vec();
     srv.rt.block_on(async {
         let hub = srv.hub();
-        for i in 0..96u32 {
+        for i in 0..1_040u32 {
+            let mut buf = tmpl_64k.clone();
+            buf[..4].copy_from_slice(&i.to_le_bytes());
+            let raw = Object::Blob(buf).encode();
+            assert!(raw.len() <= 64 << 10, "raw_cache only caches <= 64 KiB objects");
+            let id = ObjectId::hash(&raw);
+            hub.objects.put(warm_project, &id, raw.into()).await.unwrap();
+        }
+        for i in 0..98u32 {
             let mut buf = tmpl_2m.clone();
             buf[..4].copy_from_slice(&i.to_le_bytes());
             let raw = Object::Blob(buf).encode();
             let id = ObjectId::hash(&raw);
             // Already incompressible: store raw directly as its encoding.
             hub.objects.put_encoded(warm_project, &id, raw.into()).await.unwrap();
-        }
-        for i in 0..64u32 {
-            let mut buf = tmpl_1m.clone();
-            buf[..4].copy_from_slice(&i.to_le_bytes());
-            let raw = Object::Blob(buf).encode();
-            let id = ObjectId::hash(&raw);
-            hub.objects.put(warm_project, &id, raw.into()).await.unwrap();
         }
     });
     let base_entries: Vec<TreeEntry> = (0..1_500u32)
@@ -1611,25 +1611,45 @@ fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
         // ~260 KiB per tree -> fills 256 MiB `Hub::trees`.
         srv.hub().trees.insert(ObjectId(key), (std::sync::Arc::new(tree), enc), 262_144);
     }
-    assert!(
-        srv.hub().trees.stats().weight >= 250 << 20,
-        "trees cache should be warm near 256 MiB, got {} MiB",
-        srv.hub().trees.stats().weight >> 20
-    );
-
-    let vm = |field: &str| -> u64 {
-        let s = std::fs::read_to_string("/proc/self/status").unwrap();
-        let l = s.lines().find(|l| l.starts_with(field)).unwrap();
-        l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() << 10
+    let total_cached = || {
+        let h = srv.hub();
+        h.objects.cached_bytes() + h.trees.stats().weight + h.segments.stats().weight
     };
-    std::fs::write("/proc/self/clear_refs", "5").unwrap();
-    let rss_before = vm("VmRSS:");
+    assert!(
+        srv.hub().objects.cached_bytes() >= 250 << 20 && srv.hub().trees.stats().weight >= 250 << 20,
+        "expected both objects ({} MiB) and trees ({} MiB) warm near 256 MiB",
+        srv.hub().objects.cached_bytes() >> 20,
+        srv.hub().trees.stats().weight >> 20,
+    );
+    assert!(
+        total_cached() <= veil_server::HUB_CACHE_BYTES,
+        "warm caches exceeded HUB_CACHE_BYTES: {} > {}",
+        total_cached(),
+        veil_server::HUB_CACHE_BYTES,
+    );
 
     // 3. Index `main` + all 19 `rel-*` tags in one `index::update`, then
     // query every branch/tag over HTTP and verify exact search results and
     // permissions.
     let stats = srv.rt.block_on(index::update(&srv.hub(), pid, None)).unwrap();
     assert_eq!(stats.branches.len(), 20, "expected main + 19 rel-* branches: {:?}", stats.branches);
+    assert!(
+        stats.docs < 200,
+        "BUG-2663: all_at_once indexed {} docs across 20 branches (expected < 200 when rel-* diff from main)",
+        stats.docs,
+    );
+    assert_eq!(
+        srv.hub().segments.stats().weight,
+        0,
+        "background indexing/compaction must not populate Hub::segments (got {} bytes)",
+        srv.hub().segments.stats().weight,
+    );
+    assert!(
+        total_cached() <= veil_server::HUB_CACHE_BYTES,
+        "post-indexing caches exceeded HUB_CACHE_BYTES: {} > {}",
+        total_cached(),
+        veil_server::HUB_CACHE_BYTES,
+    );
 
     let api = srv.api();
     let r_main = api.get(Some(&admin_token), &format!("/v1/projects/{}/q/search?q=release_marker_main_head&rev=main", p.name));
@@ -1653,9 +1673,17 @@ fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
         assert_eq!(leak_rep.status, 200, "{tag} dev: {}", String::from_utf8_lossy(&leak_rep.body));
         assert!(leak_rep.json()["results"].as_array().unwrap().is_empty(), "dev must never see restricted billing hits on {tag}");
     }
+    assert!(
+        total_cached() <= veil_server::HUB_CACHE_BYTES,
+        "post-query caches exceeded HUB_CACHE_BYTES: {} > {}",
+        total_cached(),
+        veil_server::HUB_CACHE_BYTES,
+    );
 
-    // Load all 32 distinct ~6 MiB segments (~195 MiB) through `segment::load`
-    // while `objects` + `trees` are already warm at 512 MiB.
+    // 4. Load all 32 distinct ~5.6 MiB segments (~180 MiB) through
+    // `segment::load` while `objects` + `trees` are already at 512 MiB:
+    // global LRU eviction must keep `objects + trees + segments <= 512 MiB`
+    // instead of adding an uncoordinated 256 MiB segment cache on top.
     let loaded_weight: usize = srv
         .rt
         .block_on(veil_server::sync::blocking(&srv.hub(), seg_project, move |src| {
@@ -1669,25 +1697,20 @@ fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
         }))
         .unwrap();
     assert!(loaded_weight >= 140 << 20, "expected >= 140 MiB of decoded segments, got {} MiB", loaded_weight >> 20);
-
-    let rss_grew = vm("VmRSS:").saturating_sub(rss_before);
-    let hwm_grew = vm("VmHWM:").saturating_sub(rss_before);
-
-    // Cause 1: `all_at_once` must diff `rel-01`..`rel-19` from `main` rather
-    // than re-indexing all ~85 files 20 times from `empty_tree_id()`.
-    // Cause 2 + 3: with `objects` + `trees` already holding 512 MiB, indexing
-    // and loading ~192 MiB of segments must evict within the shared 512 MiB
-    // cache budget rather than adding an uncoordinated 256 MiB cache on top.
     assert!(
-        stats.docs < 200 && rss_grew <= 64 << 20 && hwm_grew <= 96 << 20,
-        "BUG-2663 reproduced in packs: indexed {} docs across 20 branches (expected < 200); \
-         post-warm indexing + {} MiB segment loads grew VmRSS by +{} MiB (total {} MiB) and VmHWM by +{} MiB (trees still {} MiB)",
-        stats.docs,
+        srv.hub().segments.stats().weight >= 140 << 20,
+        "expected segments cached in Hub::segments, got {} MiB",
+        srv.hub().segments.stats().weight >> 20,
+    );
+    assert!(
+        total_cached() <= veil_server::HUB_CACHE_BYTES,
+        "BUG-2663: loading {} MiB of segments on warm caches pushed objects ({} MiB) + trees ({} MiB) + segments ({} MiB) = {} MiB past {} MiB",
         loaded_weight >> 20,
-        rss_grew >> 20,
-        vm("VmRSS:") >> 20,
-        hwm_grew >> 20,
+        srv.hub().objects.cached_bytes() >> 20,
         srv.hub().trees.stats().weight >> 20,
+        srv.hub().segments.stats().weight >> 20,
+        total_cached() >> 20,
+        veil_server::HUB_CACHE_BYTES >> 20,
     );
     let src_shards: Vec<(String, String)> = srv
         .rt

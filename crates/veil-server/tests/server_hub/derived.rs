@@ -2365,6 +2365,7 @@ fn bug_2480_a_run_over_many_moved_branches_asks_and_reads_them_together() {
         db: first.db.clone(),
         objects: Arc::new(veil_server::store::Objects::with_db(store.clone(), 256 << 20, Some(first.db.clone()))),
         trees: veil_core::cache::LruCache::new(256 << 20),
+        segments: veil_core::cache::LruCache::new(256 << 20),
         identity: first.identity.clone(),
         receipt_key: first.receipt_key,
         grants: veil_server::grant::Grants::load(dir.path()).unwrap(),

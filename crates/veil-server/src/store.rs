@@ -655,12 +655,27 @@ impl Objects {
 
     /// Objects in `store`, with the packs listed in `db`.
     pub fn with_db(store: Arc<dyn BlobStore>, cache_bytes: usize, db: Option<sqlx::PgPool>) -> Objects {
+        Objects::with_db_and_budget(store, cache_bytes, db, None)
+    }
+
+    /// Objects in `store`, with the packs listed in `db` and an optional
+    /// shared [`veil_core::cache::CacheBudget`].
+    pub fn with_db_and_budget(
+        store: Arc<dyn BlobStore>,
+        cache_bytes: usize,
+        db: Option<sqlx::PgPool>,
+        budget: Option<&Arc<veil_core::cache::CacheBudget>>,
+    ) -> Objects {
         let raw_bytes = (cache_bytes / 4).max(1);
         let enc_bytes = cache_bytes.saturating_sub(raw_bytes).max(1);
+        let (cache, raw_cache) = match budget {
+            Some(b) => (LruCache::with_budget(enc_bytes, b), LruCache::with_budget(raw_bytes, b)),
+            None => (LruCache::new(enc_bytes), LruCache::new(raw_bytes)),
+        };
         Objects {
             store,
-            cache: LruCache::new(enc_bytes),
-            raw_cache: LruCache::new(raw_bytes),
+            cache,
+            raw_cache,
             packs: crate::pack::Packs::new(db),
             gc_epochs: Default::default(),
             writes: Default::default(),
@@ -693,6 +708,11 @@ impl Objects {
     /// The server's bound on pack indexes held outside the lookup maps.
     pub fn index_bound(&self) -> &crate::pack::Bound {
         self.packs.bound()
+    }
+
+    /// Combined weight of the encoded and decoded object caches.
+    pub fn cached_bytes(&self) -> usize {
+        self.cache.stats().weight + self.raw_cache.stats().weight
     }
 
     /// Key of decoded tree `id` of `project` in [`crate::Hub::trees`].
@@ -1047,6 +1067,15 @@ impl Objects {
         self.store.put(&object_key(project, id), enc.clone()).await?;
         self.cache.insert(self.cache_key(project, id), enc.clone(), enc.len());
         Ok(())
+    }
+
+    /// Store object `id` loose without inserting into the object caches (for
+    /// derived search segments, which live decoded in [`crate::Hub::segments`]
+    /// only when a query reads them).
+    pub async fn put_ephemeral(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {
+        let enc = encode(raw);
+        count_write(self, enc.len());
+        self.store.put(&object_key(project, id), enc).await
     }
 
     /// Write `objects` (encodings the caller has checked or made) as one
@@ -2254,6 +2283,7 @@ mod tests {
             db: db.clone(),
             objects: objects.clone(),
             trees: LruCache::new(1 << 20),
+            segments: LruCache::new(1 << 20),
             identity: veil_core::Identity::generate("hub"),
             receipt_key: [0; 32],
             grants: crate::grant::Grants::load(data.path()).unwrap(),
