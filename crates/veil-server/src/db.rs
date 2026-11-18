@@ -639,11 +639,16 @@ async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &Inde
         // and begun again (BUG-2520). Say how to build it by hand instead.
         let timed_out = e.as_database_error().and_then(|d| d.code()).is_some_and(|code| code == "57014" || code == "55P03");
         if timed_out {
+            // On YugabyteDB the start that finds it built still checks it
+            // against its table before it records anything (BUG-2626).
+            let then = match yugabyte {
+                true => "it finds the index built, checks it against its table (`yb_index_check`, which reads all of both, within the same time), and records the migration",
+                false => "it finds the index built and records the migration",
+            };
             return Err(Error::Other(anyhow::anyhow!(
                 "building index {name} did not finish within what was left of the migrations' {MIGRATION_DEADLINE:?} ({e}): \
                  build it by hand, as long as it takes, with `{sql}` (if that build fails, first drop the invalid index it \
-                 leaves with `DROP INDEX IF EXISTS {name}`), then start the server again: it finds the index built and \
-                 records the migration"
+                 leaves with `DROP INDEX IF EXISTS {name}`), then start the server again: {then}"
             )));
         }
         return Err(e.into());
