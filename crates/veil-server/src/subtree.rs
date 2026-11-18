@@ -58,24 +58,31 @@ pub async fn subtree(State(hub): State<HubState>, caller: Caller, Path(p): Path<
     let ask = Ask::open(&hub, &p, &caller).await?;
     let path = ask.file_path(q.path.as_deref())?;
     let snapshot = ObjectId::from_hex(&q.snapshot).map_err(|_| Error::bad_request("snapshot: an object id in hex"))?;
-    let wants = wants(&hub, &ask.project, &ask.viewer, snapshot, path).await?;
+    let wants = wants(&hub, &ask.project, &ask.viewer, &caller.epochs, snapshot, path).await?;
     let encoded = crate::api::reads_encoded(&headers);
-    let stream = sync::fetch(&hub, &ask.project, &ask.viewer, snapshot, wants, encoded).await?;
+    let stream = sync::fetch(&hub, &ask.project, &ask.viewer, &caller.epochs, snapshot, wants, encoded).await?;
     Ok(([(header::CONTENT_TYPE, crate::api::frames_type(encoded))], axum::body::Body::new(stream)).into_response())
 }
 
 /// The trees the answer names: the root, the folders down to `path`, and
-/// the trees below it, as `viewer` sees snapshot `snapshot`.
-async fn wants(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, path: String) -> Result<Vec<Want>> {
+/// the trees below it, as `viewer` sees snapshot `snapshot`. (Public for
+/// the tests: the route's own part, before the fetch it answers through.)
+pub async fn wants(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, epochs: &crate::caches::Epochs, snapshot: ObjectId, path: String) -> Result<Vec<Want>> {
     // Refused as `fetch` refuses it (which checks it again).
     let gone = || Error::not_found(format!("no snapshot {} that you can see", snapshot.short()));
-    if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &snapshot).await? {
+    if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &snapshot).await? {
         return Err(gone());
     }
     let Some(real) = sync::resolve_first(hub, project.id, &project.view(viewer).key(), &snapshot).await? else {
         return Err(gone());
     };
-    if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+    if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {
+        return Err(gone());
+    }
+    // An embargo made while this request resolved the snapshot (BUG-1947's
+    // review): what the walk below would say of its tree, the refusals
+    // told apart, is the embargo's too.
+    if crate::embargo::withheld_since(hub, project, viewer, epochs, &[(snapshot, real)]).await?.is_some() {
         return Err(gone());
     }
     let (policy_text, bindings, viewer) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());

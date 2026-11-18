@@ -325,6 +325,7 @@ fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
         "s3_slow_down": veil_server::store::S3_SLOW_DOWN.load(Relaxed),
         "s3_gave_up": veil_server::store::S3_GAVE_UP.load(Relaxed),
         "session_hits": c.session_hits.load(Relaxed),
+        "embargo_asks": c.embargo_asks.load(Relaxed),
         "session_misses": c.session_misses.load(Relaxed),
         "permission_hits": c.permission_hits.load(Relaxed),
         "permission_misses": c.permission_misses.load(Relaxed),

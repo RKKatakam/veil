@@ -2739,3 +2739,332 @@ Two runs were void and are not in the table: another
 worktree's test suite on the shared PostgreSQL during them (856 and 503
 pushes a second, 26 and 34 statements a push instead of 15).
 
+
+## Pulls while `main` moves: the embargo question asked once a request (BUG-1947, 2026-11-17, `t3/fable-speed`)
+
+With 1,000 agents and `main` moving 20 times a second a pull cost 59.8
+statements (65.8 on `integration` @ `ff29db9b`), and pulls fell to about
+1,060 a second. A statement profile of the same curve (a PostgreSQL of the
+run's own with `pg_stat_statements`, 50 agents) named them: for every
+snapshot a `history` or a `fetch` names, once for the id the client sent
+and once for the real snapshot it stands for, the server asked whether an
+unreleased embargo withholds it (`embargo::is_withheld_from_viewer`: 83,910
+calls against 59,200 session checks), an unprepared statement each, in a
+project with no embargo at all. A pull that catches up on 14 snapshots
+names all of them in each of its fetches.
+
+The statement that reads a request's epochs now also reads whether its
+project has an unreleased embargo line (`caches::read_epochs`,
+`Epochs::embargo_free`). With none, nothing of the project is withheld from
+anyone, and `history`, `fetch` and `subtree` ask about no snapshot
+(`embargo::is_withheld_in`; in this first form they asked nothing more at
+all, which its review corrected: the end of this section); with one, each
+snapshot is asked about as before. Nothing is cached: it is the database's answer at the moment of the
+request, as its epochs are (`docs/HUB.md` §13.14), so an embargo committed
+before a request starts is withheld by that request, on every server
+(`embargo::bug_1947_…`: the next request of a second server with
+everything cached refuses both embargoed snapshots by every route of a
+pull).
+
+`veil-bench load --mode pull --projects 1 --clients 10,100,1000
+--background 20 --duration 15`, objects in MinIO, PostgreSQL 17 with the
+deployment's settings (`scripts/bench-server.sh`'s containers), release
+builds, the same load tool; before is the fix's parent in the server's
+sources, runs alternated (before, after, before, after), each after
+`bench-quiet.sh`'s wait for a 1-minute load below 16 (after: 29.8, 54.6,
+30.8, 74.6, the runs' own agents), 2026-11-17 06:45 to 06:54 UTC:
+
+| Server | Agents | Pulls/s | p50 / p99 (ms) | Requests per pull | Statements per pull | Server CPU (ms/pull) | Database CPU (ms/pull) | Cores: server / database / load tool |
+|---|---:|---:|---|---:|---:|---:|---:|---|
+| before | 10 | 8,888 | 0.7 / 15.3 | 1.14 | 3.6 | 0.49 | 0.62 | 4.4 / 5.5 / 1.7 |
+| before | 100 | 20,745 | 2.3 / 30.5 | 1.58 | 4.8 | 0.32 | 0.65 | 6.5 / 13.5 / 3.8 |
+| before | 1,000 | 1,060 | 943 / 1,014 | 7.07 | 65.8 | 3.85 | 17.32 | 4.1 / 18.4 / 1.2 |
+| after | 10 | 18,492 | 0.5 / 2.2 | 1.07 | 3.2 | 0.25 | 0.27 | 4.5 / 5.0 / 1.8 |
+| after | 100 | 29,500 | 2.5 / 19.3 | 1.41 | 3.5 | 0.24 | 0.31 | 7.1 / 9.1 / 5.1 |
+| after | 1,000 | **5,729** | **177 / 322** | 6.69 | **8.9** | **1.04** | **1.02** | 6.0 / 5.8 / 7.1 |
+| before, again | 10 | 20,775 | 0.4 / 1.3 | 1.06 | 3.3 | 0.22 | 0.24 | 4.5 / 5.0 / 1.8 |
+| before, again | 100 | 20,692 | 2.3 / 30.3 | 1.59 | 4.8 | 0.32 | 0.64 | 6.6 / 13.3 / 3.7 |
+| before, again | 1,000 | 1,118 | 894 / 938 | 6.99 | 65.3 | 3.86 | 16.30 | 4.3 / 18.2 / 1.2 |
+| after, again | 10 | 21,483 | 0.4 / 1.1 | 1.06 | 3.1 | 0.21 | 0.23 | 4.5 / 5.0 / 1.7 |
+| after, again | 100 | 29,727 | 2.4 / 19.5 | 1.41 | 3.5 | 0.24 | 0.30 | 7.1 / 9.0 / 5.1 |
+| after, again | 1,000 | **5,616** | **182 / 343** | 6.59 | **8.8** | **1.01** | **1.05** | 5.7 / 5.9 / 7.0 |
+
+(`integration` @ `ff29db9b` itself, in the full `load` profile of the same
+turn: 20,346, 17,824 and 1,058 pulls a second, 3.3, 5.1 and 65.9
+statements.) With 1,000 agents: 5.2 times the pulls, a seventh of the
+statements, a sixteenth of the database's CPU a pull. A pull's statements
+are now one a request (the session's; a second for each `history` and
+`fetch` as corrected, below) and two more for its `tips` (the
+tested pointers and the embargo records of the caller, each read every
+time). **The gate (10,000 pulls a second while `main` moves) is met with 10
+and 100 agents and not with 1,000** (5,616 to 5,729 in this first form; 5,736 to 5,799 as corrected, below): what bounds it there
+was not traced; the machine is not out of CPU (19 of 32 threads: server 6,
+database 6, load tool 7), and each of a pull's 6.7 requests takes about
+26 ms at the median. It is not the project's request gate (three quarters
+of the server's database connections, 48 of 64 here): the same run with
+`--db-connections 128` gave 6,245 pulls a second (p50 165 ms, 8.5
+statements), a tenth more. A thin pull (the tip, not every snapshot since)
+still has no benchmark.
+
+**The fix's review found a leak in it, and closing it costs a statement a
+request** (`ce1fff86`, 2026-11-17). "No unreleased embargo line", read with
+the request's epochs, was trusted for a snapshot the request found
+afterwards: an id a request names is resolved to the real snapshot behind
+it later (a projected id to the newest snapshot any view projects to it),
+and an embargoed snapshot committed in between, seen as that id by an
+embargo member of another view, was served as the caller sees it. Each of
+`history`, `fetch` and `subtree` now reads the line once more after its
+last resolution and before anything it found is read or projected
+(`embargo::withheld_since`, `docs/HUB.md` §13.14); with a line there every
+snapshot is asked about, as before the fix. The same curve, the reviewed
+head (`bb5d744b`) against the corrected one (`f4dc93e6`), release builds
+from clean worktrees of those commits, the same load tool, alternated
+twice, each through `bench-quiet.sh` (load before 6.8, 15.1, 14.3, 15.7;
+after 48.1, 64.2, 49.4, 62.5, the runs' own agents), 20:09 to 20:17 UTC:
+
+| Server | Agents | Pulls/s | p50 / p99 (ms) | Requests per pull | Statements per pull | Server CPU (ms/pull) | Database CPU (ms/pull) | Cores: server / database / load tool |
+|---|---:|---:|---|---:|---:|---:|---:|---|
+| reviewed | 10 | 9,739 | 1 / 6 | 1.13 | 3.3 | 0.49 | 0.52 | 4.7 / 5.1 / 1.9 |
+| reviewed | 100 | 32,409 | 2 / 18 | 1.37 | 3.4 | 0.24 | 0.30 | 7.7 / 9.8 / 5.7 |
+| reviewed | 1,000 | 6,107 | 164 / 301 | 6.77 | 8.9 | 1.09 | 1.03 | 6.6 / 6.3 / 8.6 |
+| corrected | 10 | 7,481 | 1 / 10 | 1.16 | 3.6 | 0.64 | 0.69 | 4.8 / 5.2 / 1.9 |
+| corrected | 100 | 31,555 | 2 / 17 | 1.38 | 3.8 | 0.25 | 0.32 | 7.9 / 10.2 / 4.9 |
+| corrected | 1,000 | **5,799** | **172 / 312** | 6.82 | **14.8** | **1.28** | **1.36** | 7.4 / 7.9 / 7.6 |
+| reviewed, again | 10 | 8,275 | 1 / 7 | 1.15 | 3.4 | 0.58 | 0.61 | 4.8 / 5.1 / 1.9 |
+| reviewed, again | 100 | 31,861 | 2 / 18 | 1.38 | 3.4 | 0.24 | 0.30 | 7.6 / 9.6 / 5.6 |
+| reviewed, again | 1,000 | 6,706 | 154 / 298 | 6.45 | 8.6 | 1.00 | 0.98 | 6.7 / 6.6 / 8.3 |
+| corrected, again | 10 | 7,693 | 1 / 9 | 1.16 | 3.5 | 0.62 | 0.67 | 4.8 / 5.2 / 1.9 |
+| corrected, again | 100 | 31,051 | 2 / 18 | 1.39 | 3.8 | 0.25 | 0.32 | 7.8 / 10.0 / 5.3 |
+| corrected, again | 1,000 | **5,736** | **172 / 310** | 6.85 | **14.9** | **1.30** | **1.39** | 7.4 / 8.0 / 7.6 |
+
+With 1,000 agents the corrected server makes 14.8 to 14.9 statements a pull
+(8.6 to 8.9 on the reviewed head, 65.3 to 65.8 before the fix): six more,
+one for each of a catching-up pull's `history` and `fetch` requests. Pulls
+are 5,736 to 5,799 a second against 6,107 to 6,706 (5 to 14 % fewer; the
+reviewed head's two runs differ by 10 %), the database's CPU a pull 1.36 to
+1.39 ms against 0.98 to 1.03 (17.3 before the fix). With 100 agents: 3.8
+statements against 3.4, 31,051 to 31,555 pulls a second against 31,861 to
+32,409. Against `integration` @ `ff29db9b` the corrected fix is still 5.2
+times the pulls with 1,000 agents and under a quarter of the statements.
+A statement could be spared for a request whose every id is a committed
+snapshot's own (it resolves to itself; only someone who holds an embargoed
+snapshot can name its id before it is committed): not done, the check is
+the same for every request.
+
+## A landing batch's objects as one pack (BUG-1955, 2026-11-17, `t3/fable-speed`)
+
+What bounded the landing service on this machine was the batch's commit
+waiting for its objects (`lateslow`, above): a batch stored the some 600
+objects it made (the landed snapshots, the trees above each change, their
+projections) one by one, in rounds of 256, each object two waits on the
+disk's journal, the same journal every submit's objects and the database's
+log wait for. A push has stored what the server makes for it as one pack
+since S28; the landing service (S17) still stored loose. Now a batch's
+objects are one pack: one storage write, recorded staged before it is
+written, listed by the batch's transaction (its last statement), discarded
+when the batch does not commit (`landing/service.rs` `store`, `Storing`;
+`docs/HUB.md` §13.32 item 10).
+
+`OBJECTS=local LANDING_CLIENTS=10000 LANDING_RATES=1000 DURATION=180
+scripts/bench-server.sh landing -- --protected --mix --people 100` (the
+gate's mix; the commands of "Final local measurements" above, the server
+and the load tool built once each and passed in, the load tool the same for
+every run), `integration` @ `ff29db9b` against the fix, alternated, each
+through `bench-quiet.sh` (it waits for a 1-minute load below 16 for at most
+five minutes; after: 111.6, 57.8, 133.1, 53.1, the runs' own 10,000
+agents), 2026-11-17 05:36 to 06:20 UTC, 21 GB of memory free at the start
+of each turn:
+
+| Server | Landed/s | Per 10 s | p50 (ms) | p99 (ms) | p99 per 10 s (ms) | Told to come back | Failed | Longest queue | Landings per batch | Prepare / store / transaction (ms per batch) | Commits per landing, all (own) | Statements per landing | Storage writes per landing | CPU ms per landing: server / database | Cores: server / database | Deriver behind at the end | Least memory available / load tool / server (MB) |
+|---|---:|---|---:|---:|---|---:|---:|---:|---:|---|---|---:|---:|---|---|---:|---|
+| before | 972.8 | 580 to 1,085 | 270 | 9,688 | 198 to 14,153 | 79,510 | 0 | 1,999 | 32.8 | 5.8 / 22.7 / 29.6 | 1.16 (1.09) | 35.6 | 14.34 | 8.16 / 5.60 | 7.9 / 5.5 | 25.0 s | 12,617 / 6,095 / 1,825 |
+| after | **999.9** | 952 to 1,048 | **98** | **1,087** | 327 to 3,571 | **0** | 0 | 369 | 17.4 | 3.6 / **9.8** / **14.7** | 1.28 (1.11) | 36.8 | **8.24** | 6.72 / 5.61 | 6.7 / 5.6 | 18.1 s | 12,264 / 6,035 / 2,208 |
+| before, again | 1,000.6 | 932 to 1,064 | 192 | 2,266 | 344 to 6,345 | 0 | 3 | 548 | 30.0 | 4.8 / 20.0 / 26.2 | 1.16 (1.09) | 35.2 | 14.33 | 7.58 / 5.24 | 7.6 / 5.2 | 3.3 s | 12,730 / 6,042 / 1,826 |
+| after, again | **998.1** | 931 to 1,069 | **89** | **1,055** | 172 to 2,919 | **0** | 0 | 627 | 17.4 | 3.4 / **9.5** / **14.9** | 1.26 (1.10) | 36.4 | **8.33** | 6.90 / 5.63 | 6.9 / 5.6 | 23.5 s | 12,642 / 6,034 / 2,261 |
+
+- **p50 89 to 98 ms (192 to 270) and p99 1,055 to 1,087 ms (2,266 to
+  9,688)**: the median is inside the design's 150 ms, the 99th percentile
+  just outside its 1 s. No landing was told to come back (79,510 in the
+  first run before, where the queue reached its bound from 130 s on; the
+  second run before had none: this benchmark differs that much from run to
+  run on one build, which is why each build ran twice, alternated).
+- A batch's store is 9.5 to 9.8 ms (20.0 to 22.7) and its transaction 14.7
+  to 14.9 ms (26.2 to 29.6), so batches are picked sooner and are smaller
+  (17.4 landings against 30 to 33): more batches a landing, hence 1.26 to
+  1.28 commits a landing (1.16), of which 0.06 record a batch's pack; the
+  gate is 1.5.
+- Storage writes a landing fall from 14.3 to 8.2 to 8.3: what is left is
+  the submit's own (an API commit stored its blob, trees and snapshots one
+  by one: BUG-1948, next section) and the deriver's.
+- The server's CPU a landing falls (7.6 to 8.2 → 6.7 to 6.9 ms); the
+  database's is the same. Its memory peaks higher (2.2 GB against 1.8):
+  with every batch listing a pack, the project now has packs, their indexes
+  and the background merges of small packs; before, nothing of this
+  benchmark was in a pack.
+
+**What the submit's own loose objects cost** (an experiment, not merged:
+the fix, with an API commit's objects written without waiting for the
+disk; one run in the same turn): 1,000.1/s, p50 **32 ms**, p99 **390 ms**
+(64 to 1,690 per 10 s), 9.4 landings a batch (2.5 / 6.0 / 7.8 ms), the
+deriver 2.5 s behind. So most of what is left of a landing's latency here
+is the journal waits of the seven objects each submit stores, which is
+what the next section removes without giving up their durability.
+
+## An API commit's objects as one pack (BUG-1948, BUG-2370, 2026-11-17, `t3/fable-speed`)
+
+An API commit (`POST …/changes`, `POST …/land` with edits) stored what it
+made, its blob, the trees above it, the server's snapshot and the caller's
+projection, one object at a time before its checks: 7.6 to 9.7 storage
+writes a commit, each a request to the object store, where a push makes
+two. It now holds them for its checks and stores them as one pack that its
+transaction lists (`changes.rs` `store_packed`; `docs/HUB.md` §13.20),
+unless it races other commits for its branch on its server or holds more
+than 8 MiB.
+
+**Across projects** (`veil-bench load --mode api --projects 1,10,100
+--clients 1 --rates max --duration 15`, objects in MinIO, PostgreSQL 17
+with the deployment's settings, release builds, the same load tool; before
+is the server without the change; before and after alternated, twice,
+each after `bench-quiet.sh` found the 1-minute load below 16 (14.9, 15.5,
+then 15.9 and 15.4 before; 26 to 84 after), 2026-11-17 08:45 to 08:50 and
+11:40 to 11:44 UTC). The first "after" is the first version of the change
+(with a pack for every API commit, recorded only while its branch had not
+moved); the second is the branch's:
+
+| Server | Projects | Commits/s | p50 / p99 (ms) | Storage writes a commit (its own) | Database commits a commit (its own) | Statements a commit | CPU ms a commit: server / database |
+|---|---:|---:|---|---|---|---:|---|
+| before | 1 | 78.7 | 10 / 27 | 9.68 (0) | 2.39 (1.00) | 49.3 | 11.46 / 9.46 |
+| before | 10 | 454.3 | 20 / 59 | 8.56 (0) | 1.42 (1.01) | 31.8 | 7.08 / 6.63 |
+| before | 100 | 519.1 | 128 / 1,348 | 7.56 (0) | 1.37 (1.00) | 24.6 | 3.81 / 4.13 |
+| after | 1 | 114.1 | 6 / 25 | 3.74 (1.00) | 3.44 (1.00) | 52.5 | 6.77 / 6.34 |
+| after | 10 | 887.2 | 10 / 34 | 2.49 (1.00) | 2.33 (1.00) | 32.9 | 4.71 / 4.31 |
+| after | 100 | **2,036.6** | **41 / 182** | **1.74** (1.00) | 2.22 (1.00) | 27.0 | 2.71 / 3.77 |
+| before, again | 1 | 66.1 | 16 / 25 | 9.70 (0) | 2.42 (1.00) | 49.7 | 12.70 / 11.70 |
+| before, again | 10 | 422.1 | 22 / 49 | 8.58 (0) | 1.43 (1.01) | 32.1 | 7.81 / 6.94 |
+| before, again | 100 | 524.1 | 116 / 1,422 | 7.68 (0) | 1.39 (1.01) | 25.2 | 3.56 / 3.94 |
+| after, again | 1 | 86.4 | 10 / 23 | 3.75 (1.00) | 3.47 (1.00) | 52.8 | 9.43 / 9.42 |
+| after, again | 10 | 703.3 | 13 / 33 | 2.49 (1.00) | 2.36 (1.01) | 33.1 | 5.78 / 5.75 |
+| after, again | 100 | **2,088.1** | **40 / 186** | **1.76** (1.00) | 2.20 (1.00) | 26.3 | 2.47 / 3.30 |
+
+Four times the commits a second across 100 projects (the object store's
+requests were the limit: 7.6 a commit against 1.75), at a third of the
+median latency. A commit's own storage write is now counted and gated as a
+push's is (one, gate two); it costs one more database commit, the pack's
+row recorded before the pack is written, and two or three more statements.
+The gate (4,000 a second across projects) is still **missed**, by API
+commits and by pushes (1,608 a second on `integration` @ `ff29db9b` in the
+same day's `load` profile).
+
+**Past capacity on one branch** (`--projects 1 --clients 50`, pushes at
+5, 20, 40 and 80 a second offered, API commits at 20, 50, 100 and as fast
+as they go; 15 s points, so each is noisy; 11:50 to 12:00 UTC):
+
+| Curve | Server | Offered/s | Held/s | Collisions a landing | Commits a landing of its own | Pack rows a landing | Storage writes a landing |
+|---|---|---:|---:|---:|---:|---:|---:|
+| pushes | before | 40 | 39.9 | 3.29 | 3.28 | 7.64 | 12.49 |
+| pushes | after | 40 | 40.0 | 3.46 | 3.44 | 7.94 | 12.81 |
+| pushes | before | 80 | 50.2 | 45.39 | 12.01 | 58.64 | 62.02 |
+| pushes | after | 80 | 50.3 | 45.59 | 12.04 | 58.80 | 62.13 |
+| API | before | 50 | 26.5 | 35.47 | 6.64 | 0 | 236.80 |
+| API | after | 50 | 39.0 | 8.51 | 2.30 | 0.85 | 55.59 |
+| API | before | 100 | 51.6 | 12.57 | 2.69 | 0 | 89.30 |
+| API | after | 100 | 41.3 | 23.31 | 4.52 | 0 | 158.15 |
+| API | before | max | 57.2 | 11.60 | 2.50 | 0 | 82.67 |
+| API | after | max | 62.9 | 11.45 | 2.46 | 0 | 82.07 |
+
+A push is not changed, and measures the same. An API commit past its
+branch's capacity stores loose, as before, and costs what it did (about a
+fifth of a commit of its own and seven storage writes for each collision):
+with a pack for every API commit (the first version) the same curve cost
+20.5 and 33.7 commits a landing of its own at 23 and 36 collisions, a row
+and a discard for each try that lost after its pack was written, which is
+why a commit that races others for its branch does not pack
+(`changes::Moving`). What a landing costs past capacity is its lost tries'
+own (BUG-2370, traced there): about a quarter of a commit for each
+collision, on either path.
+
+## The load tool's memory (BUG-2363, 2026-11-17)
+
+Each of the load tool's agents has a connection of its own, and `ureq`
+gave each of a connection's two layers an input and an output buffer of
+128 KiB: 512 KiB an agent, most of the 6 GB that 10,000 agents held, on a
+30 GB machine that also runs the server and the database. With 16 KiB
+buffers (`load.rs` `CONNECTION_BUFFER`) the landing gate's run (10,000
+agents, 1,000/s, three minutes, the same server build) holds **1,661 MB**
+in the load tool against 6,035, and the machine's least available memory
+is 19.6 GB against 12.3 to 12.6. Every other run of this page's 2026-11-17
+sections used the tool as it was, the same for both sides of each
+comparison.
+
+## A pack for every landing: the lookup budget (BUG-1955, BUG-2631, 2026-11-17, `t3/fable-speed`)
+
+With a batch's objects in a pack ("A landing batch's objects as one pack")
+and each submit's too ("An API commit's objects as one pack": a submit of
+this benchmark is an API commit that queues a landing, which cannot lose a
+race and always packs), a landing makes 2 storage writes where it made
+14.3, and the gate's mix for three minutes is, in three runs of three
+builds: 1,000.1/s each, **p50 34, 35 and 34 ms, p99 449, 421 and 399 ms**,
+nobody told to come back, nothing failed, 9.2 to 9.3 landings a batch
+(store 5.2 to 5.4 ms, transaction 7.2 to 7.3 ms), 1.13 commits a landing
+of its own (2.47 to 2.49 with the rows that record the packs), the server
+on 6.4 to 6.6 cores and the database on 6.7 to 6.8.
+
+**Ten minutes found a cliff, and what it was.** The same shape for ten
+minutes (`DURATION=600`), each build once, `integration` @ `ff29db9b`
+first (the load tool as it was, the same for all; load before 9.5, 15.0,
+2.5 and 2.8; 08:54 to 12:47 UTC):
+
+| Server | Landed/s | Per 10 s | p50 (ms) | p99 (ms) | p99 per 10 s (ms) | Told to come back | Failed | Longest queue | Landings per batch | Prepare / store / transaction (ms per batch) | Commits per landing, all (own) | Statements per landing | Storage writes / reads per landing | CPU ms per landing: server / database | Deriver behind at the end | Server memory (MB) | Most packs listed |
+|---|---:|---|---:|---:|---|---:|---:|---:|---:|---|---|---:|---|---|---:|---:|---:|
+| before (`ff29db9b`) | 886.9 | 412 to 1,192 | 10,380 | 59,611 | 264 to 66,588 | 1,669,000 | 17,610 | 2,181 | 50.8 | 11.1 / 33.9 / 48.4 | 1.15 (1.09) | 39.0 | 14.46 / 14.5 | 10.23 / 6.08 | 29.4 s | 2,486 | 1 |
+| packs for a batch and for a submit | 517.8 | 68 to 1,013 | 46 | 74,157 | 122 to 85,273 | 824,054 | 228,153 | 131 | 6.2 | 2.4 / 4.4 / 7.0 | 2.62 (1.18) | 43.6 | 2.24 / 53.6 | 21.40 / 7.60 | 15.7 s | 2,815 | 1,126 |
+| + an unloaded index searched in storage | 835.3 | 155 to 1,040 | 40 | 62,395 | 100 to 81,332 | 383,074 | 30,971 | 375 | 9.2 | 3.0 / 5.5 / 8.7 | 2.48 (1.14) | 41.4 | 2.19 / 67.6 | 14.06 / 6.77 | 69.7 s | 2,995 | 1,577 |
+| + the read grants ask for loose trees only (the branch) | **1,000.0** | 938 to 1,058 | **37** | **477** | 100 to 2,513 | **0** | **0** | 146 | 10.1 | 2.5 / 5.8 / 8.2 | 2.42 (1.12) | 39.6 | 2.03 / 19.5 | 7.58 / 6.23 | 19.8 s | 2,881 | 1,705 |
+| the branch, again | **1,000.0** | 946 to 1,053 | 36 | 388 | 87 to 1,681 | 0 | 0 | 151 | 9.9 | 2.5 / 5.5 / 7.9 | 2.43 (1.12) | 40.4 | 1.89 / 18.7 | 7.56 / 6.20 | 57.7 s | 2,870 | 1,703 |
+| before (`ff29db9b`), again | 917.7 | 722 to 1,069 | 6,592 | 47,334 | 762 to 63,283 | 1,269,043 | 8,103 | 2,088 | 53.5 | 9.2 / 37.8 / 52.7 | 1.17 (1.10) | 39.0 | 14.40 / 8.1 | 10.55 / 6.38 | 29.3 s | 2,426 | 1 |
+
+- With packs alone the service held 1,000/s at p50 30 to 40 ms for four
+  minutes, then fell to about 100 a second for good (the second row).
+  Counters on the lookup maps (an experiment build, the same run for seven
+  minutes) showed why: the indexes of the project's listed packs, held in
+  memory within 128 MiB for every project together, grew 17.5 MiB every
+  30 s (10 to 17 new objects a landing at 48 bytes a slot) and reached
+  that budget at about 225 s. Past it the indexes used least recently are
+  unloaded, and a lookup that found its object in no loaded index read
+  **every** unloaded index whole from storage and loaded each, which
+  unloaded another. Some 55 lookups a second were for objects stored
+  nowhere (below), so each read all of them: 190,000 to 310,000 index
+  reads and 307 to 450 s of reading and parsing every 10 s, and the
+  commits a second fell from 1,020 to about 100. The same build with the
+  budget at 1 GiB held 1,000.0/s for the seven minutes (p50 34 ms, p99
+  315 ms). Before these changes nothing of this benchmark was in a pack,
+  so its project never had an index to unload; a project that pushes had
+  the same cliff waiting at 2.7 million packed objects (BUG-2631).
+- **An unloaded index is now searched where it is stored**, by ranged
+  reads of at most 64 KiB, and only the index that holds the object is
+  loaded (third row: seven and a half minutes at 1,000/s, then the same
+  fall, later, because a lookup for an object no pack holds still reads a
+  little of every unloaded index, and there are more of them every
+  minute).
+- **The lookups for objects stored nowhere came from the read grants:**
+  for every new tip, the first `tips` request made the projected trees of
+  the caller's grant and asked the whole store whether each was there
+  before storing it loose. They only ever are loose: the grants now ask
+  the cache and the object's own key (fourth row). With both, **ten
+  minutes hold at 1,000.0 landings a second, p50 37 ms, p99 477 ms, no
+  request failed and nobody told to come back**: the first run of the
+  gate's mix for ten minutes inside the design's 150 ms and 1 s here. A
+  second pair an hour later (the last two rows; load before 14.5 and
+  13.9): the branch 1,000.0/s again, p50 36 ms, p99 388 ms, nothing
+  failed; `ff29db9b` 917.7/s, p50 6.6 s, p99 47.3 s, 8,103 failed. The
+  three-minute run of the same build between them: 1,000.1/s, p50 34 ms,
+  p99 399 ms.
+- What is left: the deriver ends 20 and 58 s behind in the two runs (29 s
+  before); the listed
+  packs climb through the run (1,705 at the end: the background merges do
+  not quite keep up with 1,100 packs a second); the server holds 2.9 GB
+  (2.5); and a lookup for an object in no pack, from whoever makes one,
+  still costs a few ranged reads for every unloaded index, which grows
+  with the project (BUG-2631's last column: a filter of each unloaded
+  index kept in memory, or the objects' packs in the database, would bound
+  it; not built).

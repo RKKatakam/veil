@@ -605,6 +605,7 @@ async fn commit(
     mv: Option<Move>,
     land: Option<&(crate::landing::Submitter, crate::landing::Queued)>,
     base_embargo: Option<&str>,
+    held: Option<&Arc<sync::Staged>>,
 ) -> Result<Option<bool>> {
     let pid = who.project.id;
     // A landing: the change (and what it stacks on: `landing::stack`) joins
@@ -662,6 +663,14 @@ async fn commit(
             (cs, aus, ls)
         }
     };
+    // What the change made (and anything its checks made), as one pack the
+    // transaction lists.
+    let packs = match held {
+        None => Vec::new(),
+        Some(st) => store_packed(hub, pid, person, st.made()).await?,
+    };
+    let pack_names: Vec<Arc<str>> = packs.iter().map(|(n, _)| n.clone()).collect();
+    let listing: Vec<String> = pack_names.iter().map(|n| n.to_string()).collect();
     // An API commit is its push; one that queues a landing, the landing's submit.
     let kind = if land.is_some() { crate::db::Commit::LandSubmit } else { crate::db::Commit::Push };
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
@@ -680,6 +689,7 @@ async fn commit(
             base_embargo.clone(),
         );
         let rules_landing = rules_landing.clone();
+        let listing = listing.clone();
         Box::pin(async move {
             crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             if let Some((w, q)) = &land {
@@ -861,11 +871,42 @@ async fn commit(
                 .bind(&what)
                 .execute(&mut *c)
                 .await?;
+            // Its pack turns listed with everything that names what it
+            // holds: the project's from this commit on, nobody's before.
+            if !listing.is_empty() {
+                let listed = sqlx::query("UPDATE packs SET state = $3 WHERE project_id = $1 AND name = ANY($2) AND state = $4")
+                    .bind(pid)
+                    .bind(&listing)
+                    .bind(crate::pack::LISTED)
+                    .bind(crate::pack::STAGED)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                if listed != listing.len() as u64 {
+                    return Err(Error::conflict("the pack of this change's objects was discarded before it was listed; try again"));
+                }
+            }
             Ok((moved, memos))
         })
     })
-    .await?;
+    .await;
+    let r = match r {
+        Ok(r) => r,
+        Err(e) => {
+            // Nothing listed its pack (a discard leaves alone one that the
+            // transaction did list after all): it goes, as a push's own.
+            if let Err(d) = hub.objects.discard(pid, &pack_names).await {
+                eprintln!("veil-server: discarding what an API commit did not list: {d:#}");
+            }
+            return Err(e);
+        }
+    };
     hub.commits.count(kind);
+    // Before anything reads what it stored.
+    if !packs.is_empty() {
+        hub.objects.listed_here(pid, packs.into_iter().map(|(n, h)| (n, h.index)).collect());
+        crate::pack_gc::maybe_schedule(hub, pid);
+    }
     let (r, memos) = r;
     for id in &committed {
         hub.caches.put_committed(pid, id);
@@ -880,6 +921,84 @@ async fn commit(
         hub.caches.tips_moved(pid);
     }
     Ok(r)
+}
+
+/// Most bytes of objects an API commit made that it stores as one pack
+/// (BUG-1948); a larger change (its uploads' bytes are held once, and would
+/// be held again as a pack) stores them one by one, as before.
+const PACKED_BYTES: usize = 8 << 20;
+
+/// Store `objects` (what an API commit made, canonical encodings) as one
+/// pack of `project` (several past `pack::MAX_OBJECTS`), staged for
+/// `person` until the commit's transaction lists it; a write that fails
+/// leaves none of them.
+async fn store_packed(hub: &Arc<Hub>, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<Vec<(Arc<str>, crate::pack::Held)>> {
+    // Compressed on a blocking thread (the server's own encoding).
+    let mut encoded = tokio::task::spawn_blocking(move || objects.into_iter().map(|(id, raw)| (id, crate::store::encode(raw))).collect::<Vec<_>>())
+        .await
+        .map_err(|e| Error::Other(e.into()))?;
+    let mut packs: Vec<(Arc<str>, crate::pack::Held)> = Vec::new();
+    while !encoded.is_empty() {
+        let rest = if encoded.len() > crate::pack::MAX_OBJECTS { encoded.split_off(crate::pack::MAX_OBJECTS) } else { Vec::new() };
+        // The commit's own storage write (counted as a push's own is).
+        match crate::store::own(hub.objects.put_pack(project, person, encoded)).await {
+            Ok((name, mut held)) => {
+                held.unproject();
+                packs.push((name, held));
+            }
+            Err(e) => {
+                let names: Vec<Arc<str>> = packs.iter().map(|(n, _)| n.clone()).collect();
+                if let Err(d) = hub.objects.discard(project, &names).await {
+                    eprintln!("veil-server: discarding what an API commit did not list: {d:#}");
+                }
+                return Err(Error::Other(e));
+            }
+        }
+        encoded = rest;
+    }
+    Ok(packs)
+}
+
+/// The API commits moving each branch on this server now, by project and
+/// branch (in this process: a hint, nothing depends on it being exact).
+static MOVING: std::sync::LazyLock<std::sync::Mutex<HashMap<(i64, String), usize>>> = std::sync::LazyLock::new(Default::default);
+
+/// One API commit's place among those moving a branch here, from when it
+/// begins until it is answered. A commit that is the only one stores what
+/// it made as a pack; one that races others stores it one object at a
+/// time, as API commits always did: past a branch's capacity most tries
+/// lose their race after their objects are stored, and a pack lost that
+/// way is a row recorded, a write and a discard (two commits and two
+/// storage requests a try: `scripts/bench-server.sh load`'s `api-hot`
+/// curve went from 7 to 20 to 34 commits a landing with packs for all,
+/// BUG-2370), where objects stored loose cost no commit. Commits racing
+/// through other servers are not seen: they cost what a lost pack costs,
+/// never a wrong answer.
+pub struct Moving((i64, String));
+
+impl Moving {
+    pub fn enter(project: i64, branch: &str) -> Moving {
+        let key = (project, branch.to_string());
+        *MOVING.lock().unwrap().entry(key.clone()).or_default() += 1;
+        Moving(key)
+    }
+
+    /// Is this the only commit moving its branch here now?
+    pub fn alone(&self) -> bool {
+        MOVING.lock().unwrap().get(&self.0).is_some_and(|n| *n == 1)
+    }
+}
+
+impl Drop for Moving {
+    fn drop(&mut self) {
+        let mut m = MOVING.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.0);
+            }
+        }
+    }
 }
 
 /// The real tip of `branch`, if it exists.
@@ -1202,6 +1321,13 @@ pub(crate) async fn create_with(
             }
         }
     }
+    // This commit's place among those moving the branch here, now (none
+    // for a change that moves no branch, or queues a landing: it cannot
+    // lose a race).
+    let moving = match (&onto, &land) {
+        (Some(o), None) => Some(Moving::enter(project.id, &o.branch)),
+        _ => None,
+    };
     let rebase = onto.as_ref().is_some_and(|o| o.expected == Expected::Rebase);
     let mut rebased = 0u32;
     let mut attempts = 0u32;
@@ -1239,13 +1365,25 @@ pub(crate) async fn create_with(
             }
             _ => None,
         };
-        // Stored before anything reads them (a landing's stack may).
-        sync::put_all(hub, project.id, built.store.clone()).await?;
+        // What the change made is held for the checks below, which read it
+        // from there, and stored by its commit as one pack that the commit's
+        // transaction lists (BUG-1948: stored one by one before the checks,
+        // a change's blob, trees and snapshots were some seven storage
+        // writes where a push makes one). Stored before anything reads it,
+        // one object at a time, as before: a change of more than
+        // `PACKED_BYTES`, and one that races other commits for its branch
+        // (`Moving`: each try that lost would record a pack, write it and
+        // discard it).
+        let packed = built.store.iter().map(|(_, b)| b.len()).sum::<usize>() <= PACKED_BYTES && moving.as_ref().is_none_or(Moving::alone);
+        let held = packed.then(|| sync::Staged::holding(built.store.iter().cloned()));
+        if held.is_none() {
+            sync::put_all(hub, project.id, built.store.clone()).await?;
+        }
         // A landing of edits: the stack is the submitter's history from the
         // branch up to this one, as for a pushed snapshot (BUG-1112).
         if let Some((_, q)) = land.as_mut() {
             let fresh = HashMap::from([(built.real, (vec![parent], person.id))]);
-            let judged = match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, &fresh, None).await? {
+            let judged = match crate::landing::stack(hub, &who.project, &who.viewer, &q.branch, built.real, &fresh, held.clone()).await? {
                 Ok(j) if j.branch => j,
                 // No branch: the service answers so (unless `agent_stack`
                 // refuses creating the default branch first).
@@ -1257,13 +1395,13 @@ pub(crate) async fn create_with(
             };
             // S11's agent rule (`agent_stack`) on the stack's edits before the
             // landing is queued (BUG-1636).
-            crate::landing::agent_stack(hub, &who.project, &who.viewer, &q.branch, &judged, built.real, false, None).await?;
+            crate::landing::agent_stack(hub, &who.project, &who.viewer, &q.branch, &judged, built.real, false, held.clone()).await?;
             *q.skipped.lock().unwrap() = judged.skipped;
             (q.stack, q.lineage) = (judged.stack, judged.lineage);
             if q.stack.is_empty() {
                 let skipped = q.skipped.lock().unwrap().clone();
                 let mut msg = "nothing to land: this change is on the branch already".to_string();
-                let named = crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped).await?;
+                let named = crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped, held.clone()).await?;
                 if !named.is_empty() {
                     msg = format!("{msg}; {}", named.join("; "));
                 }
@@ -1277,7 +1415,7 @@ pub(crate) async fn create_with(
                 &who.viewer,
                 &q.branch,
                 &q.stack,
-                None,
+                held.clone(),
                 protected.contains(&q.branch),
             )
             .await?;
@@ -1302,7 +1440,7 @@ pub(crate) async fn create_with(
             if crate::bisect::branch_has_reverted_twice(hub, project.id, &o.branch).await? {
                 let stack = [crate::landing::Entry::plain(built.real, c)];
                 if let Err(Error::Api { message, .. }) =
-                    crate::prs::check_landing_review(hub, &who.project, &who.viewer, &o.branch, &stack, None, false).await
+                    crate::prs::check_landing_review(hub, &who.project, &who.viewer, &o.branch, &stack, held.clone(), false).await
                 {
                     rejected = Some(message);
                 }
@@ -1337,7 +1475,7 @@ pub(crate) async fn create_with(
                     true => None,
                     false => tip(hub, project.id, &project.default_branch).await?,
                 };
-                sync::branch_move_write_refusal(hub, &who.project, &who.viewer, Some(c), built.real, landed, &mut sync::PushRows::default(), None).await?
+                sync::branch_move_write_refusal(hub, &who.project, &who.viewer, Some(c), built.real, landed, &mut sync::PushRows::default(), held.clone()).await?
             } else {
                 None
             } {
@@ -1355,7 +1493,7 @@ pub(crate) async fn create_with(
             },
             _ => None,
         };
-        match commit(hub, &plan, &who, &built, &restacked, person.id, gc_epoch, mv, land.as_ref(), base_embargo.as_deref()).await {
+        match commit(hub, &plan, &who, &built, &restacked, person.id, gc_epoch, mv, land.as_ref(), base_embargo.as_deref(), held.as_ref()).await {
             Ok(m) => break (built, m),
             // The tip moved during the request: try again on the new one,
             // with the access as it is now (BUG-1051).

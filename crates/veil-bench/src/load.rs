@@ -67,14 +67,19 @@
 //! In `objects` mode (S9, `docs/HUB.md` §13.18) every agent reads as a
 //! fresh thin workspace, in a closed loop: the tips and its read grant from
 //! the server, then through the object routes (`--via cache`: a regional
-//! cache this tool starts in front of the server; `--via server`: the server
-//! itself) the root tree, `w/`, `w/seed/` (1,000 files of 4 KiB) and 100 of
+//! cache this tool starts in front of the server, or a running one named
+//! by `--cache-url`, with `--cache-ca` for a self-signed certificate;
+//! `--via server`: the server itself) the root tree, `w/`, `w/seed/` (1,000 files of 4 KiB) and 100 of
 //! its files, each request signed by its device. One lander per project
 //! moves `main` at `background` landings per second meanwhile. Measured
 //! besides: the cache's hit share (objects it served from its store, of all
 //! it served), its CPU and its peak memory. **Gates** (`--via cache`): at
 //! least 99 % of objects from the cache's store, and its peak memory at
-//! most 512 MiB.
+//! most 512 MiB. Of a running cache they are measured when it runs on this
+//! machine and `--cache-pid` and `--cache-dir` name its process and its
+//! directory (its `stats.json`, written on `SIGUSR1`); of one on another
+//! machine they are reported as not measured, never as met or missed
+//! (BUG-1591).
 //!
 //! Measured per run: operations per second, latency p50/p99, collisions
 //! and retries per landing, errors, and when known the server's CPU per
@@ -208,6 +213,14 @@ pub struct Args {
     /// `objects`: read through a regional cache (`true`) or the server, one
     /// set of curves each.
     pub vias: Vec<bool>,
+    /// `objects --via cache`: a running regional cache to read through
+    /// (`https://host:port`) instead of one started here, its certificate
+    /// (PEM) when self-signed, and, when it runs on this machine, its
+    /// process and its directory (BUG-1591).
+    pub cache_url: Option<String>,
+    pub cache_ca: Option<PathBuf>,
+    pub cache_pid: Option<u32>,
+    pub cache_dir: Option<PathBuf>,
     /// `main` is a protected branch (`.veilrules`), with every `[review]`
     /// rule at 0 approvals: the landing path's review checks run, and no
     /// PR is needed.
@@ -252,6 +265,15 @@ const MIX_HOT: usize = 16;
 
 // ---- the HTTP client ------------------------------------------------------------------------
 
+/// The input and the output buffer of each layer of a connection (TCP,
+/// TLS). ureq's default is 128 KiB each, zeroed when first used: 512 KiB a
+/// connection, and every agent has one, so 10,000 agents held 6 GB, most of
+/// it these buffers, and a landing run ran the machine out of memory about
+/// 100 s in (BUG-2363). A TLS record's worth: requests and answers are
+/// streamed through them whatever their size, and a request's or an
+/// answer's head (under 1 KiB here) fits many times over.
+const CONNECTION_BUFFER: usize = 16 << 10;
+
 /// One connection's worth of API (each agent has its own).
 struct Api {
     agent: ureq::Agent,
@@ -280,6 +302,8 @@ impl Api {
             .tls_config(tls.build())
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(120)))
+            .input_buffer_size(CONNECTION_BUFFER)
+            .output_buffer_size(CONNECTION_BUFFER)
             .build()
             .new_agent();
         let authority = base.trim_start_matches("https://").trim_end_matches('/').to_string();
@@ -1254,31 +1278,55 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
         if let Some(c) = r["db_branch_landing_commits_per_landing"].as_f64().filter(|c| c * merges > GATE_COMMITS_PER_BRANCH_LANDING * merges * 1.02 + 20.0) {
             out.push(format!("{mode}: {c:.2} database commits per branch landing (gate: {GATE_COMMITS_PER_BRANCH_LANDING})"));
         }
-        // Pushes only: an API commit stores its objects loose (S10).
-        if mode != "api" {
-            let tries = 1.0 + r["collisions_per_op"].as_f64().unwrap_or(0.0);
-            let over = |w: f64| w * ops > GATE_STORAGE_WRITES_PER_PUSH * tries * ops * 1.02 + 20.0;
-            if let Some(w) = r["storage_push_writes_per_op"].as_f64().filter(|w| over(*w)) {
-                out.push(format!(
-                    "{mode}: {:.2} storage writes per push ({w:.2} per landing of {tries:.2} pushes), the deriver's aside (gate: {GATE_STORAGE_WRITES_PER_PUSH})",
-                    w / tries
-                ));
-            }
+        // An API commit too: it stores what it made as one pack (BUG-1948;
+        // stored loose, as S10 did, its writes were only reported).
+        let tries = 1.0 + r["collisions_per_op"].as_f64().unwrap_or(0.0);
+        let over = |w: f64| w * ops > GATE_STORAGE_WRITES_PER_PUSH * tries * ops * 1.02 + 20.0;
+        if let Some(w) = r["storage_push_writes_per_op"].as_f64().filter(|w| over(*w)) {
+            out.push(format!(
+                "{mode}: {:.2} storage writes per push ({w:.2} per landing of {tries:.2} pushes), the deriver's aside (gate: {GATE_STORAGE_WRITES_PER_PUSH})",
+                w / tries
+            ));
         }
     }
     if mode == "objects" && r["via"] == "cache" {
+        // Of a running cache this tool could not read (BUG-1591), neither
+        // is known: not measured ([`unmeasured_gates`]), never missed.
+        let running = r["cache_running"] == true;
         match r["cache_hit_share"].as_f64() {
             Some(h) if h >= GATE_CACHE_HITS => {}
+            None if running => {}
             h => out.push(format!("objects: {} of objects from the cache's store (gate: {:.0} %)", h.map_or("–".into(), |h| format!("{:.2} %", h * 100.0)), GATE_CACHE_HITS * 100.0)),
         }
         match r["cache_peak_mib"].as_f64() {
             Some(m) if m <= GATE_CACHE_MIB => {}
+            None if running => {}
             m => out.push(format!("objects: the cache's peak memory {} MiB (gate: {GATE_CACHE_MIB} MiB)", m.map_or("–".into(), |m| format!("{m:.0}")))),
         }
     }
     if mode == "pull" && background == 0.0 {
         if let Some(n) = r["db_per_op"].as_f64().filter(|n| *n > GATE_STATEMENTS_PER_WARM_PULL) {
             out.push(format!("pull: {n:.1} statements per up-to-date pull (gate: {GATE_STATEMENTS_PER_WARM_PULL})"));
+        }
+    }
+    out
+}
+
+/// The gates of run `r` that could not be judged: those of a running
+/// regional cache (`--cache-url`) whose counters or process this tool could
+/// not read (BUG-1591). They are neither met nor missed: whoever runs the
+/// cache reads them there.
+pub fn unmeasured_gates(r: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if r["mode"] == "objects" && r["via"] == "cache" && r["cache_running"] == true {
+        if r["cache_hit_share"].as_f64().is_none() {
+            out.push(format!(
+                "objects: the share of objects from the running cache's store (gate: {:.0} %): `local` of `local` + `upstream` in its stats.json, written on SIGUSR1, before and after the run; or run this tool on its machine with --cache-pid and --cache-dir",
+                GATE_CACHE_HITS * 100.0
+            ));
+        }
+        if r["cache_peak_mib"].as_f64().is_none() {
+            out.push(format!("objects: the running cache's peak memory (gate: {GATE_CACHE_MIB} MiB): VmHWM of its process"));
         }
     }
     out
@@ -1433,12 +1481,55 @@ struct Ctx<'a> {
 /// Scheduled landings of one project, shared by its agents.
 type Schedule = Arc<Mutex<mpsc::Receiver<Instant>>>;
 
+/// The regional cache `objects --via cache` reads through: one this tool
+/// started, or a running one (BUG-1591).
+struct CacheAt {
+    https: String,
+    /// Its certificate (PEM), when self-signed.
+    ca: Option<String>,
+    /// Its process, for its CPU and peak memory, and its `stats.json`
+    /// (written when the process is signalled): both, for its counters.
+    /// Unknown for a running cache on another machine.
+    pid: Option<u32>,
+    stats: Option<PathBuf>,
+    /// Not started here: what this tool cannot read of it is reported as
+    /// not measured.
+    running: bool,
+}
+
+impl CacheAt {
+    fn started(c: &crate::server::CacheProc) -> Result<CacheAt> {
+        Ok(CacheAt {
+            https: c.https(),
+            ca: Some(std::fs::read_to_string(&c.cert)?),
+            pid: Some(c.pid()),
+            stats: Some(c.dir.join("stats.json")),
+            running: false,
+        })
+    }
+
+    /// A running cache at `url`; `pid` and `dir` when it runs on this
+    /// machine.
+    fn running(url: &str, ca: Option<String>, pid: Option<u32>, dir: Option<&std::path::Path>) -> CacheAt {
+        CacheAt {
+            https: url.trim_end_matches('/').to_string(),
+            ca,
+            pid,
+            stats: dir.map(|d| d.join("stats.json")),
+            running: true,
+        }
+    }
+
+    fn counters(&self) -> Option<serde_json::Value> {
+        server_stats(self.pid?, self.stats.as_ref()?)
+    }
+}
+
 /// One point of a curve; `objects` mode reads through `cache` if given.
-fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, cache: Option<&crate::server::CacheProc>) -> Result<serde_json::Value> {
+fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, cache: Option<&CacheAt>) -> Result<serde_json::Value> {
     let setup = Api::new(cx.base, cx.ca)?;
     let seed = if a.mode == Mode::Objects { SEED_FILES } else { 0 };
     let names: Vec<String> = (0..projects).map(|_| create_project(&setup, cx.admin, cx.admin_token, cx.agent_name, cx.more, seed, a.protected, a.mix)).collect::<Result<_>>()?;
-    let cache_ca = cache.map(|c| std::fs::read_to_string(&c.cert)).transpose()?;
     let log = match (&a.log, a.mode) {
         (Some(p), Mode::Landing) => Some(Mutex::new(
             std::fs::OpenOptions::new().create(true).append(true).open(p).with_context(|| p.display().to_string())?,
@@ -1469,7 +1560,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
     std::thread::scope(|s| -> Result<()> {
         for i in 0..clients {
             let p = i % projects;
-            let (name, c, stop, ready, rx, cache_ca) = (&names[p], &c, &stop, &ready, queues[p].1.clone(), &cache_ca);
+            let (name, c, stop, ready, rx) = (&names[p], &c, &stop, &ready, queues[p].1.clone());
             std::thread::Builder::new().stack_size(256 << 10).spawn_scoped(s, move || {
                 let mut agent = match Api::new(cx.base, cx.ca) {
                     Ok(api) => Agent {
@@ -1493,8 +1584,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                         c,
                         mix: a.mix,
                         merge_every: a.merge_every,
-                        objects: match (cache, cache_ca) {
-                            (Some(k), Some(ca)) => match Api::new(&k.https(), Some(ca)) {
+                        objects: match cache {
+                            Some(k) => match Api::new(&k.https, k.ca.as_deref()) {
                                 Ok(api) => Some(api),
                                 Err(e) => {
                                     c.error(&e);
@@ -1502,7 +1593,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
                                     return;
                                 }
                             },
-                            _ => None,
+                            None => None,
                         },
                     },
                     Err(e) => {
@@ -1708,8 +1799,8 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         let before_server_stats = cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f));
         let (sent0, received0) = (BYTES_SENT.load(Ordering::Relaxed), BYTES_RECEIVED.load(Ordering::Relaxed));
         let before_dml = cx.stats.and_then(|(rt, url)| db_writes(rt, url));
-        let cache_pid = cache.map(|k| k.pid());
-        let before_cache = cache.and_then(|k| server_stats(k.pid(), &k.dir.join("stats.json")));
+        let cache_pid = cache.and_then(|k| k.pid);
+        let before_cache = cache.and_then(CacheAt::counters);
         let before_cache_cpu = cache_pid.and_then(cpu_of);
         if let Some(pid) = cache_pid {
             crate::server::reset_peak(pid);
@@ -1785,7 +1876,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         let commit_stmts = dml_both.map(|((bc, _), (ac, _))| bc - ac);
         let commit_kinds = server_stats.as_ref().and_then(|(b, a)| CommitKinds::between(a, b));
         let requests = c.requests.load(Ordering::Relaxed) - req0;
-        let cache_stats = cache.and_then(|k| self::server_stats(k.pid(), &k.dir.join("stats.json"))).zip(before_cache);
+        let cache_stats = cache.and_then(CacheAt::counters).zip(before_cache);
         let cstat = |k: &str| cache_stats.as_ref().and_then(|(b, a)| Some(b[k].as_f64()? - a[k].as_f64()?));
         let cache_cpu = cache_pid.and_then(cpu_of).zip(before_cache_cpu).map(|(b, a)| b - a);
         let cache_peak = cache_pid.and_then(crate::server::peak_kib);
@@ -1905,6 +1996,7 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         result["flood_first_error"] = json!(fl.first_error.lock().unwrap().clone());
         if a.mode == Mode::Objects {
             result["via"] = json!(if cache.is_some() { "cache" } else { "server" });
+            result["cache_running"] = json!(cache.is_some_and(|k| k.running));
             result["objects_per_op"] = json!(per_op(c.noop.load(Ordering::Relaxed) as f64));
             result["cache_hit_share"] = json!(cstat("local").zip(cstat("upstream")).map(|(l, u)| l / (l + u)));
             result["cache_forwarded_per_op"] = json!(cstat("forwarded").map(per_op));
@@ -2409,13 +2501,22 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         Mode::Pull | Mode::Objects | Mode::Agents => vec![Rate::Max],
         Mode::Land | Mode::Branches | Mode::Api | Mode::Landing => a.rates.clone(),
     };
-    // `objects --via cache`: one regional cache in front of the server
-    // started here, for every run.
+    // `objects --via cache`: one regional cache for every run, the running
+    // one named (`--cache-url`, BUG-1591) or one started here in front of
+    // the server started here.
     let vias = if a.mode == Mode::Objects { a.vias.clone() } else { vec![false] };
-    let cache = match (vias.contains(&true), &_server, &a.server.server) {
-        (false, _, _) => None,
-        (true, Some(s), Some(bin)) => Some(crate::server::CacheProc::start(bin, s, &a.dir.join("server"), &a.dir.join("cache"))?),
-        _ => bail!("--via cache needs a server started here (--server)"),
+    let mut _cache = None;
+    let cache = match (vias.contains(&true), &a.cache_url, &_server, &a.server.server) {
+        (false, ..) => None,
+        (true, Some(url), ..) => {
+            let ca = a.cache_ca.as_ref().map(std::fs::read_to_string).transpose()?;
+            Some(CacheAt::running(url, ca, a.cache_pid, a.cache_dir.as_deref()))
+        }
+        (true, None, Some(s), Some(bin)) => {
+            let c = _cache.insert(crate::server::CacheProc::start(bin, s, &a.dir.join("server"), &a.dir.join("cache"))?);
+            Some(CacheAt::started(c)?)
+        }
+        _ => bail!("--via cache needs a running cache (--cache-url) or a server started here (--server)"),
     };
     let mut runs = Vec::new();
     for &via in &vias {
@@ -2435,6 +2536,11 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
                     eprintln!("      GATE MISSED: {m}");
                 }
                 r["gates_missed"] = json!(missed);
+                let unmeasured = unmeasured_gates(&r);
+                for m in &unmeasured {
+                    eprintln!("      GATE NOT MEASURED: {m}");
+                }
+                r["gates_unmeasured"] = json!(unmeasured);
                 runs.push(r);
             }
         }
@@ -2518,15 +2624,18 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         }
     }
     out.push_str(
-        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed |\n\
-         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|\n",
+        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed | Gates not measured |\n\
+         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n",
     );
     let pct = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.0} %", v * 100.0)).unwrap_or_else(|| "–".into());
     let kib = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.1}", v / 1024.0)).unwrap_or_else(|| "–".into());
     for r in v["runs"].as_array().ok_or_else(|| anyhow!("no runs"))? {
         let missed = r["gates_missed"].as_array().map(|m| m.len()).unwrap_or(0);
+        // Gates this run could not judge (a running cache's, BUG-1591): a
+        // column of their own, so "none missed" is never read as "all met".
+        let unmeasured = r["gates_unmeasured"].as_array().map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} / {} / {} | {} |\n",
+            "| {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} / {} / {} | {} | {} |\n",
             r["mode"].as_str().unwrap_or(""),
             r["projects"],
             r["clients"],
@@ -2545,6 +2654,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             pct(&r["permission_hit_share"]),
             pct(&r["tips_hit_share"]),
             if missed == 0 { "none".to_string() } else { format!("**{missed}**") },
+            if unmeasured == 0 { "none".to_string() } else { format!("**{unmeasured}**") },
         ));
     }
     let landing: Vec<&serde_json::Value> = v["runs"].as_array().map(|r| r.iter().filter(|r| r["mode"] == "landing").collect()).unwrap_or_default();
@@ -2619,7 +2729,8 @@ mod tests {
     use super::*;
 
     /// S28's gate: a landing's own storage writes (the deriver's aside), for
-    /// pushes; an API commit's are reported only.
+    /// pushes and, since it stores what it made as one pack (BUG-1948), for
+    /// an API commit.
     #[test]
     fn storage_writes_per_push_are_gated() {
         let run = |mode: &str, push_writes: f64| json!({"mode": mode, "ops": 1000.0, "storage_push_writes_per_op": push_writes});
@@ -2627,7 +2738,8 @@ mod tests {
         assert!(missed_gates(&run("land", 2.0), 0.0).is_empty());
         assert_eq!(missed_gates(&run("land", 6.0), 0.0).len(), 1);
         assert_eq!(missed_gates(&run("branches", 2.5), 0.0).len(), 1);
-        assert!(missed_gates(&run("api", 6.0), 0.0).is_empty());
+        assert!(missed_gates(&run("api", 1.0), 0.0).is_empty());
+        assert_eq!(missed_gates(&run("api", 6.0), 0.0).len(), 1, "an API commit's own writes are gated as a push's");
         // Per push: a landing that lost 4 races pushed 5 times.
         let raced = |w: f64| json!({"mode": "land", "ops": 1000.0, "collisions_per_op": 4.0, "storage_push_writes_per_op": w});
         assert!(missed_gates(&raced(9.0), 0.0).is_empty());
@@ -2638,6 +2750,51 @@ mod tests {
     /// they belong: the background work's and the landings' are not the
     /// push's (a request's projection memo is); a branch landing is gated
     /// at its submit and at most a batch of its own.
+    /// BUG-1591: a running regional cache (`--cache-url`) is read through at
+    /// its address with its certificate; its counters, CPU and memory are
+    /// known only with its process and directory (the tool's machine), and
+    /// without them its two gates are reported as not measured, neither met
+    /// nor missed, while a cache this tool can read is judged as before.
+    #[test]
+    fn bug_1591_a_running_caches_gates_are_measured_or_named_not_measured() {
+        let far = CacheAt::running("https://cache.example:8444/", Some("PEM".into()), None, None);
+        assert_eq!((far.https.as_str(), far.ca.as_deref(), far.pid, far.stats.is_none(), far.running), ("https://cache.example:8444", Some("PEM"), None, true, true));
+        assert!(far.counters().is_none(), "no process, no directory: no counters");
+        let near = CacheAt::running("https://127.0.0.1:8444", None, Some(7), Some(std::path::Path::new("/c")));
+        assert_eq!((near.pid, near.stats.as_deref()), (Some(7), Some(std::path::Path::new("/c/stats.json"))));
+
+        let run = |running: bool, hits: Option<f64>, mib: Option<f64>| json!({"mode": "objects", "via": "cache", "cache_running": running, "cache_hit_share": hits, "cache_peak_mib": mib});
+        // On another machine: nothing known, nothing missed, both named.
+        let r = run(true, None, None);
+        assert!(missed_gates(&r, 0.0).is_empty(), "{:?}", missed_gates(&r, 0.0));
+        let unmeasured = unmeasured_gates(&r);
+        assert_eq!(unmeasured.len(), 2, "{unmeasured:?}");
+        assert!(unmeasured[0].contains("stats.json") && unmeasured[1].contains("peak memory"), "{unmeasured:?}");
+        // On this machine, read: judged like one started here.
+        assert!(missed_gates(&run(true, Some(0.995), Some(300.0)), 0.0).is_empty());
+        assert!(unmeasured_gates(&run(true, Some(0.995), Some(300.0))).is_empty());
+        assert_eq!(missed_gates(&run(true, Some(0.5), Some(900.0)), 0.0).len(), 2, "a running cache that was read and misses, misses");
+        // One started here that could not be read still misses (unchanged).
+        assert_eq!(missed_gates(&run(false, None, None), 0.0).len(), 2);
+        assert!(unmeasured_gates(&run(false, None, None)).is_empty());
+        assert!(unmeasured_gates(&json!({"mode": "pull"})).is_empty());
+
+        // The summary table names them in a column of their own: a run with
+        // gates it could not judge never reads as "none missed" alone.
+        let mut far_run = run(true, None, None);
+        far_run["gates_missed"] = json!(missed_gates(&far_run, 0.0));
+        far_run["gates_unmeasured"] = json!(unmeasured_gates(&far_run));
+        let mut near_run = run(true, Some(0.995), Some(300.0));
+        near_run["gates_missed"] = json!(missed_gates(&near_run, 0.0));
+        near_run["gates_unmeasured"] = json!(unmeasured_gates(&near_run));
+        let table = markdown(&json!({"runs": [far_run, near_run]})).expect("a table");
+        let rows: Vec<&str> = table.lines().filter(|l| l.starts_with("| objects |") && l.contains("– / – / –")).collect();
+        assert_eq!(rows.len(), 2, "{table}");
+        assert!(table.contains("| Gates missed | Gates not measured |"), "{table}");
+        assert!(rows[0].ends_with("| none | **2** |"), "{}", rows[0]);
+        assert!(rows[1].ends_with("| none | none |"), "{}", rows[1]);
+    }
+
     #[test]
     fn bug_2350_commits_by_kind_are_charged_where_they_belong() {
         let at = |push: u64, submit: u64, batch: u64, derive: u64, fill: u64, search: u64, gc: u64, service: u64, memo: u64| {
@@ -2772,6 +2929,26 @@ mod tests {
             }
         });
         (base, seen)
+    }
+
+    /// BUG-2363: an agent's connection has buffers of [`CONNECTION_BUFFER`]
+    /// (ureq's 128 KiB each, on two layers, were most of the 6 GB that
+    /// 10,000 agents held), and a request and an answer many times larger
+    /// than a buffer still go through whole, twice on the one connection.
+    #[test]
+    fn bug_2363_a_connection_holds_small_buffers_and_carries_bodies_larger_than_them() {
+        let (base, seen) = fake_server(|_, body, _| (200, json!({"echo": body})));
+        let api = Api::new(&base, None).unwrap();
+        let cfg = api.agent.config();
+        assert_eq!((cfg.input_buffer_size(), cfg.output_buffer_size()), (CONNECTION_BUFFER, CONNECTION_BUFFER));
+        for n in 1..=2 {
+            let sent: String = (0..40 * CONNECTION_BUFFER).map(|i| char::from(b'a' + ((i + n) % 23) as u8)).collect();
+            let r = api.post(Some("t"), "/v1/big", sent.as_bytes(), false).unwrap();
+            assert_eq!(r.status, 200, "request {n}");
+            let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+            assert!(v["echo"].as_str() == Some(sent.as_str()), "request {n}: {} bytes came back for {} sent", v["echo"].as_str().map_or(0, str::len), sent.len());
+            assert_eq!(seen.lock().unwrap().last().map(|(p, b)| (p.as_str(), b.len())), Some(("/v1/big", sent.len())), "request {n} as the server got it");
+        }
     }
 
     /// BUG-2435: the set-up waits out a `503 busy` answer (with

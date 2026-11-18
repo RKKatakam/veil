@@ -1691,6 +1691,40 @@ was built under exactly those epochs. An entry is built by reading the
 epochs first and the records after, or both in one statement, so it is
 never tagged with an epoch set after what it holds was read.
 
+**The same statement reads whether the project has an unreleased embargo
+line** (BUG-1947; `caches::Epochs::embargo_free`). With none, no snapshot
+of the project is withheld from anyone (`embargo::is_withheld_from_viewer`
+joins an unreleased line), so the routes a pull makes (`history`, `fetch`,
+`subtree`) do not ask about each snapshot they name
+(`embargo::is_withheld_in`); with one, or for a request that did not read
+it (the first of a session or of a project on a server), each snapshot
+named is asked about, as before. Nothing of it is cached: it is the
+database's answer at the moment of the request, as the epochs are, so an
+embargo committed before a request starts is seen by that request on every
+server.
+
+**That answer covers only what existed when it was read, and those routes
+find snapshots afterwards**: an id a request names is resolved to the real
+snapshot behind it later in the request (for a projected id, the newest
+snapshot any view projects to it, `sync::resolve_first`), and an embargoed
+snapshot committed in between can be that snapshot (an embargo member of
+another view sees it as the same id, and their pull stores the row). So a
+request that read "none" reads it **once more after its last resolution**
+and before anything of what it found is read or projected
+(`embargo::withheld_since`: one statement a request). Still none: nothing
+it found is withheld (a line commits in the transaction of its snapshots).
+One is there: every snapshot is asked about, named and real, exactly as a
+request that read the line asks. The first form of BUG-1947's fix did not
+do this, and its review found the leak: a request begun before an embargo
+was served the embargoed snapshot as its caller sees it
+(`embargo::bug_1947_an_embargo_made_after_a_request_read_its_epochs_…`).
+The rule for any flag of this kind: **a fact read with the request's epochs
+may spare a check only on what the request named and the server already
+held then; what the request resolves, reads or reaches afterwards is
+checked after it is found.** Every other caller of
+`is_withheld_from_viewer` (events, CI, bisect, the routes that resolve a
+snapshot for a push or a commit) asks the database each time, unchanged.
+
 *What a read grant can rely on (S5):* (1) an entry records the epochs read
 before its rows, and `perm::open_at` returns them with the view, so a grant
 made from it carries those, never a later read of the epochs; (2) an entry
@@ -2950,9 +2984,25 @@ Nothing changes for `vl` or on the wire.
   together; a commit naming more takes all of it, so such commits run one
   at a time: BUG-1156), **taken before it reads them**: what they decode to
   comes from each entry's first bytes, then the share, then the objects one
-  at a time (BUG-1397); it stores what it keeps loose once every check
-  passed, as before, and discards the staged packs when it is answered
+  at a time (BUG-1397); it discards the staged packs when it is answered
   (not after a lost race: the caller may try again with the same receipts).
+  **What it made is one pack, listed by its transaction** (BUG-1948,
+  `changes.rs` `store_packed`; it was stored one object at a time before
+  its checks, some seven storage writes where a push makes one): its checks
+  read what it made from memory (`sync::Staged::holding`), and its commit
+  writes the pack, staged for the caller, lists it in the commit's
+  transaction (its last statement: every pack, or the commit is answered
+  `conflict` and runs again), enters it in this server's lookup map, and
+  discards it when the transaction fails. **Stored one object at a time
+  before its checks, as before:** a commit that races other commits for
+  its branch on this server (`changes::Moving`: past a branch's capacity
+  most tries lose after their objects are stored, and a pack lost that way
+  is a row, a write and a discard, two commits and two storage requests a
+  try, where loose objects cost no commit: BUG-2370; a commit that moves no
+  branch, or queues a landing, cannot lose and always packs; commits racing
+  through other servers are not seen, and cost what a lost pack costs); a
+  change of more than 8 MiB (`changes::PACKED_BYTES`); and the changes a
+  commit restacks (`restack`).
 * **Reads.** `Objects` finds a project's object in its cache, then in the
   indexes of the listed packs this server holds (per project, newest pack
   first, each a sorted array of 48 bytes a slot, searched by bisection;
@@ -2969,9 +3019,23 @@ Nothing changes for `vl` or on the wire.
   them (§13.37, BUG-2462). Weights are read from the maps under one lock, so
   eviction and additions never miscount. Such a lookup searches the loaded
   indexes and names the unloaded ones **under one read of the map**, then
-  reads those from storage, so together they cover every listed pack and
+  searches those in storage, so together they cover every listed pack and
   **no lookup answers "missing" for a stored object**, whatever other
-  lookups page in or out meanwhile (BUG-1495). **Every pack index held in
+  lookups page in or out meanwhile (BUG-1495). **An unloaded index is
+  searched where it is stored** (BUG-2631, 2026-11-17): its first 64 KiB,
+  then a bisection by ranged reads of that size under one share of that
+  size, as a staged pack's index is (`Packs::stored_slots`); only the index
+  that holds the object is then read whole and loaded. Before, every
+  unloaded index was read whole and loaded, each unloading another, also
+  for an object none of them held: a project whose packed objects outgrew
+  the budget (2.7 million, at 48 bytes a slot), asked for such objects some
+  fifty times a second, spent all its time there (the landing benchmark
+  with every landing's objects in packs: 190,000 to 310,000 index reads
+  every 10 s from the fourth minute, and 100 landings a second where it
+  held 1,000). A lookup for an object in no pack still costs a few ranged
+  reads for every unloaded index, which grows with the project: what would
+  bound it (a filter of each unloaded index kept in memory, or the
+  objects' packs in the database) is not built. **Every pack index held in
   memory outside the lookup maps holds a share of one server-wide bound**
   (`pack::INDEXES_HELD`, 96 MiB for every request together, of which the
   staged-index cache may hold 32 MiB), taken before the first bytes are
@@ -2995,8 +3059,9 @@ Nothing changes for `vl` or on the wire.
   queries, search), never 500 and never with an index held outside the
   bound (BUG-1496, BUG-1622). Then
   loose (objects from
-  before S28, and what grants, API commits, the deriver and the search
-  index store). After a miss in both it reads the project's listing again
+  before S28, and what grants, an API commit of more than 8 MiB or racing
+  for its branch, a landing build past `BATCH_BYTES`, the deriver and the
+  search index store). After a miss in both it reads the project's listing again
   (one statement, unless a listing began after the miss: it holds every
   pack listed before) and the indexes of packs it does not know, so a
   server reads what another server's push listed. A push's own packs join
@@ -5522,6 +5587,24 @@ transaction per landing instead of 23.
    its transaction runs again, so a slow or hung object store never holds
    the lease's row, which the branch's other servers need to take the
    lease over once it expires (BUG-1982).
+   **What a batch makes is stored as one pack** (`landing/service.rs`
+   `store`, BUG-1955, 2026-11-17), as a push stores what the server made
+   for it (§13.20): one storage write, recorded staged before it is written,
+   **listed by the batch's transaction** (its last statement, after the
+   wait above: `UPDATE packs … WHERE state = staged`, every pack or nothing
+   lands), entered in this server's lookup map before anything is told of
+   the new tip, and **discarded when the batch does not commit** (it lost
+   the lease or the tip, its transaction failed, or it was built on a tip
+   that did not come to be). Stored loose, a batch's some 600 objects were
+   600 writes: on a local disk each waited twice for the journal, which
+   every submit and the database's log wait for too; in an object store
+   each was a request. A staged pack needs an uploader (one without is a
+   merge pass's, deleted by the next pass): one of the batch's submitters,
+   who gets no receipt for it and so can name it in no push. Objects a
+   build stores before it ends (past `BATCH_BYTES`) are still stored loose.
+   A store that fails after the pack's row was written leaves a staged row
+   with no object, swept after the grace period like an upload's; the
+   batch is then built again every 250 ms (50 ms after any other failure).
 11. **A landing behind a backlog in its project's gate is told at once**
    (`limits/gate.rs` `WRITE_BACKLOG`, BUG-1955). Past what a project's
    submits get through its bulkhead (48 places with 64 database
@@ -5757,6 +5840,8 @@ transaction per landing instead of 23.
 | 11 | `vl land` waits out a full queue as the answer asks, with a note, and lands | the note `waiting for the server: the landing queue of 'main' is full …`, then landed | `landing_hold::bug_1955_vl_land_waits_for_a_full_queue_and_says_so`; `vl` unit test `bug_1955_a_full_landing_queue_is_waited_out_with_a_note` |
 | 12 | A batch read on several threads is the batch built on one, byte for byte (BUG-1955) | Three seeded batches of 90 submits by two people (new files, overlapping edits of one shared file, two changes adding one path): the same objects, snapshots, landings, memos, tip and answers, with at least one merge and one conflict each; the service then lands what the one-thread build said | `landing_hold::bug_1955_a_batch_read_on_several_threads_is_the_batch_built_on_one` |
 | 13 | A batch commits only once its objects are stored (BUG-1955) | With the store's folders unwritable, three held landings stay queued and the branch keeps its tip for 3 s; once writable, all three land and their files read back at the new tip | `landing_hold::bug_1955_a_batch_lands_only_once_its_objects_are_stored` |
+| 13a | What a batch makes is one pack its transaction lists (BUG-1955) | four held landings: each batch lists one pack, none is left staged, the landed tip is no object of its own, and a second server reads the tip's whole tree | `landing_hold::bug_1955_a_batchs_objects_are_one_pack_its_transaction_lists` |
+| 13b | A batch that does not commit discards its pack (BUG-1955) | the batch's transaction held at its first statement (the GC epoch row, as a switch holds it) until its pack is written, then losing to the switch: nothing landed, the pack's row is discarded and its object deleted; the batch built again lands with a pack of its own | `landing_hold::bug_1955_a_batch_that_does_not_commit_discards_its_pack` |
 | 14 | Behind 2 s of landings waiting in a gate, a new landing is answered at once; those waiting keep their places and get in; pulls still wait; with no backlog landings wait again (BUG-1955) | a gate of one place held, two landings and a pull waiting: after 2 s a third landing is refused without waiting, the gate's load is (1 running, 3 waiting), and all three get in once the place is free | `limits::gate::tests::a_landing_behind_a_long_backlog_is_told_at_once` |
 | 15 | Every landing meets the review rules and holds in force when it commits: a tighter `.veilrules` on the default branch, or an embargo's release moving a hold into `pr_holds`, answered while a batch on another protected branch commits, is never overtaken by it (BUG-2061) | the batch held after its review check, at its entry's row: the rules push and the release wait for it (the change lands, under the rules it was read under), then are answered; the next such change is refused `not_ready` | `rv_core2::bug_2061_rules_tightened_on_main_while_a_batch_on_dev_commits`, `rv_core2::bug_2061_an_embargo_release_moving_holds_waits_for_a_batch_that_read_them` |
 | 16 | Every landing meets the approvals that count when it commits: a reviewer's access taken away (here: out of the group that writes the PR's paths), answered while the batch that counted the approval commits, is never overtaken by it (BUG-2111) | the batch held after its review check, at its entry's row: the removal waits for it (the change lands, counted as it was read), then is answered | `rv_core2::bug_2111_a_reviewer_removed_while_the_batch_commits_does_not_approve_it` |

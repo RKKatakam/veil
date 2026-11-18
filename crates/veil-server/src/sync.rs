@@ -171,6 +171,15 @@ impl Staged {
         })
     }
 
+    /// [`Staged::held`], holding `objects` (canonical encodings) from the
+    /// start: what an API commit made, read by its checks before it is
+    /// stored (BUG-1948).
+    pub(crate) fn holding(objects: impl IntoIterator<Item = (ObjectId, Bytes)>) -> Arc<Staged> {
+        let st = Staged::held();
+        st.made.lock().unwrap().extend(objects);
+        st
+    }
+
     /// What the checks made and hold (never stored by them).
     pub(crate) fn made(&self) -> Vec<(ObjectId, Bytes)> {
         let mut v: Vec<(ObjectId, Bytes)> = self.made.lock().unwrap().iter().map(|(k, v)| (*k, v.clone())).collect();
@@ -1100,6 +1109,7 @@ pub async fn history(
     hub: &Arc<Hub>,
     project: &Project,
     viewer: &Viewer,
+    epochs: &crate::caches::Epochs,
     tips: &[ObjectId],
     stop: &[ObjectId],
     limit: Option<usize>,
@@ -1108,16 +1118,25 @@ pub async fn history(
 ) -> Result<Vec<u8>> {
     let mut starts = Vec::new();
     let mut reals = Vec::new();
+    let mut resolved = Vec::with_capacity(tips.len());
     for t in tips {
-        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, t).await? {
+        if crate::embargo::is_withheld_in(hub, project, viewer, epochs, t).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         }
         let Some(real) = resolve_first(hub, project.id, &project.view(viewer).key(), t).await? else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         };
-        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+        if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         }
+        resolved.push((*t, real));
+    }
+    // An embargo made while this request resolved its tips (BUG-1947's
+    // review): asked before any of them is projected.
+    if let Some(t) = crate::embargo::withheld_since(hub, project, viewer, epochs, &resolved).await? {
+        return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
+    }
+    for (_, real) in resolved {
         starts.push(projected(hub, project, viewer, real).await?);
         reals.push(real);
     }
@@ -1257,7 +1276,15 @@ fn history_page(src: &Source, starts: Vec<ObjectId>, stop: &HashSet<ObjectId>, l
 /// is read and sent a few objects ahead of the caller (`FETCH_WINDOW`);
 /// a failure while sending ends the stream with an error, so it is never
 /// taken as whole.
-pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot: ObjectId, wants: Vec<Want>, encoded: bool) -> Result<FrameStream> {
+pub async fn fetch(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    epochs: &crate::caches::Epochs,
+    snapshot: ObjectId,
+    wants: Vec<Want>,
+    encoded: bool,
+) -> Result<FrameStream> {
     // Each want is checked in its own snapshot (revision 1), as the viewer
     // sees it.
     let mut reals: HashMap<ObjectId, ObjectId> = HashMap::new();
@@ -1265,16 +1292,22 @@ pub async fn fetch(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snapshot:
         if reals.contains_key(&snap) {
             continue;
         }
-        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &snap).await? {
+        if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &snap).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         }
         let Some(real) = resolve_first(hub, project.id, &project.view(viewer).key(), &snap).await? else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         };
-        if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+        if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         }
         reals.insert(snap, real);
+    }
+    // An embargo made while this request resolved its snapshots (BUG-1947's
+    // review).
+    let resolved: Vec<(ObjectId, ObjectId)> = reals.iter().map(|(named, real)| (*named, *real)).collect();
+    if let Some(snap) = crate::embargo::withheld_since(hub, project, viewer, epochs, &resolved).await? {
+        return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
     }
     let (policy_text, bindings, viewer) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
     let wants = Arc::new(wants);
@@ -3052,7 +3085,7 @@ async fn push_staged(
             }
             if judged.stack.is_empty() {
                 let mut msg = crate::landing::NOTHING_TO_LAND.to_string();
-                let skipped = crate::landing::skipped_warnings(hub, project.id, &u.branch, &judged.skipped).await?;
+                let skipped = crate::landing::skipped_warnings(hub, project.id, &u.branch, &judged.skipped, None).await?;
                 if !skipped.is_empty() {
                     msg = format!("{msg}; {}", skipped.join("; "));
                 }
@@ -3765,7 +3798,7 @@ async fn push_staged(
             }
         };
         let skipped = q.skipped.lock().unwrap().clone();
-        r.warnings.extend(crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped).await?);
+        r.warnings.extend(crate::landing::skipped_warnings(hub, project.id, &q.branch, &skipped, None).await?);
         landings.push(r);
     }
     // Derived history data for the public branches moved, in the background:

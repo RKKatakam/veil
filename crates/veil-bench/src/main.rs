@@ -200,6 +200,20 @@ enum Cmd {
         /// front of the server) or `server`; one set of curves each.
         #[arg(long, value_delimiter = ',', default_value = "server,cache")]
         via: Vec<String>,
+        /// `objects --via cache`: a running regional cache to read through
+        /// (`https://host:port`), instead of one started here (BUG-1591).
+        #[arg(long)]
+        cache_url: Option<String>,
+        /// The running cache's certificate (PEM), when self-signed.
+        #[arg(long, requires = "cache_url")]
+        cache_ca: Option<PathBuf>,
+        /// The running cache's process id and directory, when it runs on
+        /// this machine: its CPU, peak memory and hit share are measured
+        /// (else reported as not measured).
+        #[arg(long, requires = "cache_url")]
+        cache_pid: Option<u32>,
+        #[arg(long, requires = "cache_url")]
+        cache_dir: Option<PathBuf>,
         /// Bench directory (the server started here keeps its data there).
         #[arg(long)]
         dir: PathBuf,
@@ -385,6 +399,10 @@ fn main() -> Result<()> {
             flood,
             db_container,
             via,
+            cache_url,
+            cache_ca,
+            cache_pid,
+            cache_dir,
             dir,
             out,
             protected,
@@ -445,6 +463,10 @@ fn main() -> Result<()> {
                 flood,
                 db_container,
                 vias,
+                cache_url,
+                cache_ca,
+                cache_pid,
+                cache_dir,
                 protected,
                 mix,
                 merge_every,
@@ -673,16 +695,15 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// BUG-1591: `veil-bench load --mode objects --via cache` can measure
-    /// only a regional cache the tool starts itself beside a server it
-    /// starts (`--server`): with `--url` (a running, remote server) there is
-    /// no way to name a running cache, so the regional-cache gate cannot be
-    /// run against a deployment's cache droplet (`docs/DEPLOY.md`). The
-    /// fix takes the cache's address and certificate (`--cache-url`,
-    /// `--cache-ca`) and reads its counters from its `stats.json` where it
-    /// can, reporting the hit share as unknown otherwise.
+    /// BUG-1591: `veil-bench load --mode objects --via cache` measured only
+    /// a regional cache the tool started itself beside a server it started
+    /// (`--via cache needs a server started here`), so the regional-cache
+    /// gate could not be run against a deployment's cache droplet
+    /// (`docs/DEPLOY.md`). It takes a running cache's address and
+    /// certificate (`--cache-url`, `--cache-ca`), and its process and
+    /// directory when it runs on the tool's machine; the flags that describe
+    /// a running cache are refused without its address.
     #[test]
-    #[ignore = "BUG-1591: veil-bench load --via cache cannot measure a running (remote) regional cache: no --cache-url"]
     fn bug_1591_the_objects_mode_takes_a_running_cache() {
         let parsed = Cli::try_parse_from([
             "veil-bench", "load", "--mode", "objects", "--via", "cache",
@@ -690,6 +711,14 @@ mod tests {
             "--cache-url", "https://cache.example:8444", "--cache-ca", "ca.pem",
             "--dir", "d", "--out", "o.json",
         ]);
-        assert!(parsed.is_ok(), "{:?}", parsed.err().map(|e| e.to_string()));
+        let Ok(Cli { cmd: Cmd::Load { cache_url, cache_ca, .. } }) = parsed else { panic!("{:?}", parsed.err().map(|e| e.to_string())) };
+        assert_eq!(cache_url.as_deref(), Some("https://cache.example:8444"));
+        assert_eq!(cache_ca.as_deref(), Some(std::path::Path::new("ca.pem")));
+        for flag in [["--cache-ca", "ca.pem"], ["--cache-pid", "7"], ["--cache-dir", "d"]] {
+            let alone = Cli::try_parse_from(
+                ["veil-bench", "load", "--mode", "objects", "--via", "cache", "--url", "https://hub.example:8443", "--dir", "d", "--out", "o.json"].into_iter().chain(flag),
+            );
+            assert!(alone.is_err(), "{} without --cache-url is refused", flag[0]);
+        }
     }
 }

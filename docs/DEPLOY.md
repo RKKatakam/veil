@@ -124,8 +124,10 @@ covers them):
   deletes it.
 - **`VEIL_DO_WITH_CACHE=1`** adds `NAME-cache` (`s-4vcpu-8gb`) running
   `veil-server cache` (the regional cache, `docs/HUB.md` §13.18) in front of
-  the servers, for `vl` clients and manual tests. The cache *gate* cannot be
-  run against it (BUG-1591, §6), so it is off by default.
+  the servers, for `vl` clients and manual tests. The kit's cache *gate*
+  does not run against it yet (§6: `veil-bench` can since BUG-1591's fix,
+  `--cache-url`; `gates.sh` still starts a cache of its own), so it is off
+  by default.
 
 **The full topology** for the paid run is `VEIL_DO_HUBS=3 VEIL_DO_YB_NODES=3`
 (objects on MinIO, the default): ten droplets, $3.447 an hour, **$32.58
@@ -965,8 +967,11 @@ Found and filed by the rehearsal:
 
 - **BUG-1590** (`docs/BUGS.md`, fixed since): the server could not use a
   database that requires TLS, which ruled out managed PostgreSQL (§2).
-- **BUG-1591**: `veil-bench load --via cache` cannot measure a running
-  cache, so the cache gate runs on the hub in its same-machine form (§6).
+- **BUG-1591** (fixed since in `veil-bench`: `--cache-url`, `--cache-ca`,
+  and `--cache-pid` with `--cache-dir` when the tool runs on the cache's
+  machine): `veil-bench load --via cache` could not measure a running
+  cache, so the cache gate runs on the hub in its same-machine form (§6);
+  `gates.sh` has not been changed to use the cache droplet.
 - **BUG-1592** (fixed since): the cache advertised HTTP/2 but serves
   HTTP/1 only; HTTP/2 clients (curl, by default) got a broken stream. It
   offers only HTTP/1.1 now. The health check and the smoke tests still pass
@@ -1045,8 +1050,14 @@ commands (§4) and by the DigitalOcean run.
   database (BUG-1590, fixed; §3), which the kit's PostgreSQL container and
   YugabyteDB nodes do not offer. YugabyteDB's `yugabyte` user has no
   password in the kit, for the same reason.
-- **BUG-1591**: the cache gate runs on the hub in the same-machine form,
-  not across the network to a cache droplet.
+- **BUG-1591** (the tool's part fixed since): the cache gate runs on the
+  hub in the same-machine form, not across the network to a cache droplet.
+  By hand against `NAME-cache`: `veil-bench load --mode objects --via cache
+  --url https://HUB --ca ca.pem --cache-url https://CACHE --cache-ca
+  cache.pem …` from a driver (the hit share and the cache's memory are then
+  reported as not measured: read `local` and `upstream` from the cache's
+  `stats.json`, written on `SIGUSR1`, before and after), or on the cache's
+  machine with `--cache-pid` and `--cache-dir`, which measures them.
 - **Benchmarks that do not exist**: `veil-bench prs` (the PR gate is a
   server test) and `veil-bench bisect` (§6). The tool does not log which
   change each landing was, so "exactly once" under failover rests on the
