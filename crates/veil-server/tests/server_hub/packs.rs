@@ -1979,3 +1979,139 @@ fn bug_2665_concurrent_api_commits_sharing_a_deduplicated_upload_all_succeed() {
     }
 }
 
+/// BUG-1150: a push introducing enough objects (~500,500 tiny blobs + trees)
+/// that per-object receipts exceed the 64 MiB JSON body limit is refused with
+/// 413 before the fix and lands cleanly once a push names its staged packs.
+#[test]
+#[ignore = "BUG-1150: per-object receipts in PushRequest pass the 64 MiB body limit"]
+fn bug_1150_push_past_64_mib_of_per_object_receipts_lands() {
+    use std::sync::Arc;
+    use veil_core::{
+        object::{Snapshot, Text, Tree, TreeEntry, Visibility},
+        oplog::Tag,
+        pack::PackBuilder,
+        vfs::{DiskBackend, StorageBackend},
+        Repo,
+    };
+
+    let hub = TestHub::start_packs();
+    let p = setup_project(&hub);
+    let dir = clone(&hub, &p, &p.admin, "admin-1150");
+
+    let backend: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(&dir));
+    let mut repo = Repo::open(backend, Some(p.admin.identity()), &p.admin.name).unwrap();
+    let tip = repo.view().tags["main"].target;
+    let tip_snap = repo.store().get(&tip).unwrap();
+    let base_root_id = match tip_snap {
+        O::Snapshot(s) => s.tree,
+        _ => panic!("expected snapshot"),
+    };
+    let base_root = repo.store().tree(&base_root_id).unwrap();
+    let base_src_id = base_root.entries.iter().find(|e| e.name == "src").expect("src dir").id;
+    let base_src = repo.store().tree(&base_src_id).unwrap();
+
+    // 500 dirs * 1,000 tiny 7-byte blobs = 500,000 blobs + 504 trees/snapshot.
+    // At 135 bytes per receipt entry in JSON, 500,504 receipts ≈ 67.57 MB > 64 MiB.
+    const DIRS: usize = 500;
+    const FILES_PER_DIR: usize = 1_000;
+    let mut pb = PackBuilder::new(1).unwrap();
+    let mut put = |obj: O| -> ObjectId {
+        let raw = obj.encode();
+        let id = ObjectId::hash(&raw);
+        pb.add(id, &raw, None).unwrap();
+        id
+    };
+
+    let mut bulk_entries = Vec::with_capacity(DIRS);
+    let mut sample_id = ObjectId([0; 32]);
+    let mut sample_text = String::new();
+    for d in 0..DIRS {
+        let mut entries = Vec::with_capacity(FILES_PER_DIR);
+        for f in 0..FILES_PER_DIR {
+            let content = format!("{d:03}/{f:03}");
+            let id = put(O::Blob(content.as_bytes().to_vec()));
+            if d == DIRS - 1 && f == FILES_PER_DIR - 1 {
+                sample_id = id;
+                sample_text = content.clone();
+            }
+            entries.push(TreeEntry {
+                name: format!("f{f:03}"),
+                kind: veil_core::object::EntryKind::File,
+                id,
+                size: content.len() as u64,
+                visibility: Visibility::Public,
+                executable: false,
+            });
+        }
+        let dir_tree_id = put(O::Tree(Tree { entries }));
+        bulk_entries.push(TreeEntry::dir(&format!("d{d:03}"), dir_tree_id));
+    }
+    let bulk_tree_id = put(O::Tree(Tree { entries: bulk_entries }));
+
+    let mut src_entries = base_src.entries.clone();
+    src_entries.push(TreeEntry::dir("bulk", bulk_tree_id));
+    src_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let new_src_id = put(O::Tree(Tree { entries: src_entries }));
+
+    let mut root_entries = base_root.entries.clone();
+    for e in &mut root_entries {
+        if e.name == "src" {
+            e.id = new_src_id;
+        }
+    }
+    root_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let new_root_id = put(O::Tree(Tree { entries: root_entries }));
+
+    let mut snap = Snapshot {
+        parents: vec![tip],
+        change_id: veil_core::ChangeId::random(),
+        tree: new_root_id,
+        description: Text::Plain("BUG-1150 bulk 500k tiny objects".into()),
+        author: p.admin.name.clone(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+        agent: None,
+        attempts: vec![],
+        abandoned: None,
+    };
+    snap.sign(&p.admin.identity());
+    let snap_id = put(O::Snapshot(snap));
+
+    pb.finish(repo.backend().as_ref(), &repo.store().pack_dir()).unwrap();
+    repo.store().reload_packs().unwrap();
+
+    let mut tx = repo.transaction("bulk 500k").unwrap();
+    tx.repository_wide();
+    tx.view.heads.insert(snap_id);
+    tx.view.tags.insert("main".into(), Tag { target: snap_id, annotation: None });
+    tx.commit().unwrap();
+    drop(repo);
+
+    let out = p.admin.run(&dir, &["push"]);
+    assert!(
+        out.status.success(),
+        "vl push with >500k objects failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let api = hub.api();
+    let tips = api.tips(Some(&p.admin.token()), &p.name).unwrap();
+    assert_eq!(tips.branches["main"], snap_id, "main must advance to pushed snapshot");
+
+    let fetched = api.post_json(
+        Some(&p.admin.token()),
+        &format!("/v1/projects/{}/fetch", p.name),
+        &json!({
+            "snapshot": snap_id.hex(),
+            "objects": [{"path": format!("src/bulk/d{:03}/f{:03}", DIRS - 1, FILES_PER_DIR - 1), "id": sample_id.hex()}],
+        }),
+    );
+    assert_eq!(fetched.status, 200, "{}", String::from_utf8_lossy(&fetched.body));
+    let frames = fetched.frames();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(O::decode(&frames[0].1).unwrap(), O::Blob(sample_text.into_bytes()));
+}
