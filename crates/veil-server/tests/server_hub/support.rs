@@ -79,6 +79,7 @@ pub struct TestHub {
     pub ca: PathBuf,
     pub cert_pem: String,
     config: Config,
+    watch_id: u64,
     pub _dir: tempfile::TempDir,
 }
 
@@ -217,14 +218,17 @@ impl TestHub {
             .build()
             .unwrap();
         let running = rt.block_on(veil_server::start(config.clone())).expect("server starts");
+        let port = running.addr.port();
         let ca = config.data_dir.join("self-signed-cert.pem");
+        let watch_id = watchdog::enter(format!("hub 127.0.0.1:{port}"));
         TestHub {
-            port: running.addr.port(),
+            port,
             cert_pem: running.cert_pem.clone(),
             running: Some(running),
             rt,
             ca,
             config,
+            watch_id,
             _dir: dir,
         }
     }
@@ -238,6 +242,7 @@ impl TestHub {
         let rt = std::mem::replace(&mut self.rt, tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
         drop(running);
         rt.shutdown_timeout(Duration::from_secs(5));
+        watchdog::leave(self.watch_id);
     }
 
     pub fn authority(&self) -> String {
@@ -299,8 +304,143 @@ impl Drop for TestHub {
     fn drop(&mut self) {
         if let Some(r) = self.running.take() {
             self.rt.block_on(r.stop());
+            // Never let a wedged `spawn_blocking` worker hold `Runtime::drop`
+            // until `STEP_LIMIT` kills the binary and hides the test's output
+            // (BUG-2720).
+            let rt = std::mem::replace(&mut self.rt, tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
+            rt.shutdown_timeout(Duration::from_secs(15));
+        }
+        watchdog::leave(self.watch_id);
+    }
+}
+
+/// BUG-2720: records live `TestHub`s and `vl` commands and writes any running
+/// past `VEIL_TEST_WATCHDOG_SECS` (default 300 s) straight to fd 2 (libtest
+/// captures `eprintln!` until a test ends, so a step killed at `STEP_LIMIT`
+/// otherwise leaves nothing of what hung).
+mod watchdog {
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Mutex, OnceLock,
+        },
+        time::{Duration, Instant},
+    };
+
+    struct Entry {
+        thread: String,
+        what: String,
+        started: Instant,
+        next_report: Duration,
+    }
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    static ACTIVE: OnceLock<Mutex<BTreeMap<u64, Entry>>> = OnceLock::new();
+
+    fn threshold() -> Duration {
+        let secs = std::env::var("VEIL_TEST_WATCHDOG_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300u64).max(1);
+        Duration::from_secs(secs)
+    }
+
+    fn table() -> &'static Mutex<BTreeMap<u64, Entry>> {
+        ACTIVE.get_or_init(|| {
+            let m = Mutex::new(BTreeMap::new());
+            std::thread::Builder::new()
+                .name("server-hub-watchdog".into())
+                .spawn(|| loop {
+                    let limit = threshold();
+                    std::thread::sleep(limit.min(Duration::from_secs(5)).max(Duration::from_millis(200)));
+                    let mut lines = Vec::new();
+                    if let Some(t) = ACTIVE.get() {
+                        let mut map = t.lock().unwrap();
+                        for e in map.values_mut() {
+                            let elapsed = e.started.elapsed();
+                            if elapsed >= e.next_report {
+                                lines.push(format!(
+                                    "[server_hub watchdog] pid={} test={} elapsed={}s: {}\n",
+                                    std::process::id(),
+                                    e.thread,
+                                    elapsed.as_secs(),
+                                    e.what
+                                ));
+                                e.next_report = elapsed + limit.min(Duration::from_secs(60));
+                            }
+                        }
+                    }
+                    for line in lines {
+                        write_stderr(line.as_bytes());
+                    }
+                })
+                .ok();
+            m
+        })
+    }
+
+    #[cfg(unix)]
+    fn write_stderr(bytes: &[u8]) {
+        use std::{io::Write, os::fd::FromRawFd};
+        let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(2) });
+        let _ = f.write_all(bytes);
+    }
+
+    #[cfg(not(unix))]
+    fn write_stderr(bytes: &[u8]) {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(bytes);
+    }
+
+    pub fn enter(what: String) -> u64 {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let thread = std::thread::current().name().unwrap_or("<unnamed>").to_string();
+        table().lock().unwrap().insert(id, Entry { thread, what, started: Instant::now(), next_report: threshold() });
+        id
+    }
+
+    pub fn leave(id: u64) {
+        if let Some(t) = ACTIVE.get() {
+            t.lock().unwrap().remove(&id);
         }
     }
+
+    pub struct Guard(u64);
+    impl Guard {
+        pub fn new(what: String) -> Guard {
+            Guard(enter(what))
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            leave(self.0);
+        }
+    }
+
+    pub fn snapshot_overdue(after: Duration) -> Vec<String> {
+        let Some(t) = ACTIVE.get() else { return Vec::new() };
+        t.lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.started.elapsed() >= after)
+            .map(|e| format!("[server_hub watchdog] pid={} test={} elapsed={}s: {}", std::process::id(), e.thread, e.started.elapsed().as_secs(), e.what))
+            .collect()
+    }
+}
+
+#[test]
+fn bug_2720_watchdog_reports_overdue_operations_and_clears_finished_ones() {
+    let g = watchdog::Guard::new("admin vl [\"access\", \"infra/\", \"ops\"]".into());
+    std::thread::sleep(Duration::from_millis(60));
+    let overdue = watchdog::snapshot_overdue(Duration::from_millis(40));
+    assert!(
+        overdue.iter().any(|l| l.contains("bug_2720_watchdog_reports_overdue_operations") && l.contains("admin vl [\"access\", \"infra/\", \"ops\"]")),
+        "expected overdue entry in {overdue:?}"
+    );
+    drop(g);
+    let after = watchdog::snapshot_overdue(Duration::ZERO);
+    assert!(
+        !after.iter().any(|l| l.contains("admin vl [\"access\", \"infra/\", \"ops\"]")),
+        "finished guard stayed in {after:?}"
+    );
 }
 
 pub struct Person {
@@ -349,9 +489,12 @@ impl Person {
     }
 
     pub fn run(&self, dir: &Path, args: &[&str]) -> Output {
-        // `timeout` ends a `vl` that never returns: the test then fails.
+        // `timeout --kill-after=10` ends a `vl` that never returns even if it
+        // ignores SIGTERM: the test then fails instead of hanging the step.
+        let _watch = watchdog::Guard::new(format!("{} vl {args:?} in {}", self.name, dir.display()));
         let c = self.command(dir, args);
         Command::new("timeout")
+            .arg("--kill-after=10")
             .arg("300")
             .arg(c.get_program())
             .args(c.get_args())

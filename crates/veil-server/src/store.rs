@@ -237,6 +237,11 @@ const S3_SIGN_FOR: Duration = Duration::from_secs(300);
 /// MinIO that resets connections under load stays unreachable for seconds
 /// at a time (BUG-861).
 const S3_RETRY_FOR: Duration = Duration::from_secs(10);
+/// How long [`S3Store::ensure_bucket`] waits at start before giving up on the
+/// server's start (BUG-2630: after a 100-project burst, MinIO/docker-proxy
+/// reset connections for 21 s, past [`S3_RETRY_FOR`], while holding no
+/// request transaction).
+const S3_START_RETRY_FOR: Duration = Duration::from_secs(60);
 const S3_FIRST_WAIT: Duration = Duration::from_millis(25);
 const S3_MOST_WAIT: Duration = Duration::from_secs(1);
 
@@ -287,15 +292,19 @@ impl std::error::Error for StoreUnavailable {
 /// of a key that names its content or a pack's fresh random name). When the
 /// bound runs out, the error is a [`StoreUnavailable`].
 async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
-    s3_send_inner(make, false).await.map(|(status, _, body)| (status, body))
+    s3_send_inner(make, false, S3_RETRY_FOR).await.map(|(status, _, body)| (status, body))
 }
 
 /// [`s3_send`], with the answer's headers.
 async fn s3_send_with_headers(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
-    s3_send_inner(make, true).await
+    s3_send_inner(make, true, S3_RETRY_FOR).await
 }
 
-async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers: bool) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
+async fn s3_send_inner(
+    make: impl Fn() -> reqwest::RequestBuilder,
+    need_headers: bool,
+    retry_for: Duration,
+) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut wait = S3_FIRST_WAIT;
     for tries in 1.. {
@@ -314,7 +323,7 @@ async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers:
             if matches!(status.as_u16(), 503 | 429) {
                 S3_SLOW_DOWN.fetch_add(1, Ordering::Relaxed);
             }
-            let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
+            let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + retry_for);
             let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
             if tokio::time::Instant::now() + wait + jitter >= dl {
                 S3_GAVE_UP.fetch_add(1, Ordering::Relaxed);
@@ -325,7 +334,7 @@ async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers:
             continue;
         }
         let e = answer.unwrap_err();
-        let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
+        let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + retry_for);
         let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
         if e.is_builder() {
             return Err(anyhow::Error::new(e).context("S3 request"));
@@ -378,7 +387,7 @@ impl S3Store {
     pub async fn ensure_bucket(&self) -> Result<()> {
         use rusty_s3::S3Action;
         let url = self.bucket.create_bucket(&self.credentials).sign(S3_SIGN_FOR);
-        let (status, _) = s3_send(|| self.http.put(url.clone())).await?;
+        let (status, _, _) = s3_send_inner(|| self.http.put(url.clone()), false, S3_START_RETRY_FOR).await?;
         if (200..300).contains(&status) || status == 409 {
             return Ok(());
         }
@@ -2309,5 +2318,55 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// BUG-2630: after a 100-project push curve, MinIO/docker-proxy reset
+    /// every connection (`Connection reset by peer`) for 21 s, past
+    /// `S3_RETRY_FOR` (10 s). A request-path call still gives up at
+    /// `S3_RETRY_FOR` so a request's transaction stays bounded; `ensure_bucket`
+    /// at server start holds no transaction and waits out the resets up to
+    /// `S3_START_RETRY_FOR` (60 s).
+    #[tokio::test(start_paused = true)]
+    async fn bug_2630_ensure_bucket_waits_out_connection_resets_past_a_requests_retry_bound() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn serve_resets_then_ok(reset_for: Duration) -> (String, tokio::task::JoinHandle<usize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let until = tokio::time::Instant::now() + reset_for;
+            let h = tokio::spawn(async move {
+                let mut resets = 0usize;
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else { break };
+                    if tokio::time::Instant::now() < until {
+                        drop(s);
+                        resets += 1;
+                        continue;
+                    }
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    break;
+                }
+                resets
+            });
+            (endpoint, h)
+        }
+
+        // 1. Live request path: still gives up at `S3_RETRY_FOR` (10 s).
+        let (ep1, h1) = serve_resets_then_ok(Duration::from_secs(25)).await;
+        let store1 = S3Store::new(&ep1, "veil-bench", "us-east-1", "k", "s").unwrap();
+        let t0 = tokio::time::Instant::now();
+        let err = BlobStore::get(&store1, "probe").await.expect_err("live GET gives up at S3_RETRY_FOR");
+        assert!(err.downcast_ref::<StoreUnavailable>().is_some(), "expected StoreUnavailable: {err:#}");
+        assert!(t0.elapsed() < Duration::from_secs(15), "live GET stayed bounded by S3_RETRY_FOR: {:?}", t0.elapsed());
+        h1.abort();
+
+        // 2. Server start (`ensure_bucket`): waits out 25 s of resets and succeeds.
+        let (ep2, h2) = serve_resets_then_ok(Duration::from_secs(25)).await;
+        let store2 = S3Store::new(&ep2, "veil-bench", "us-east-1", "k", "s").unwrap();
+        let t1 = tokio::time::Instant::now();
+        store2.ensure_bucket().await.expect("ensure_bucket waits out 25 s of connection resets");
+        let resets = h2.await.unwrap();
+        assert!(resets >= 12 && t1.elapsed() >= Duration::from_secs(25), "waited {resets} resets over {:?}", t1.elapsed());
     }
 }

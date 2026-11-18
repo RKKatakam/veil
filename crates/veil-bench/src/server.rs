@@ -48,10 +48,30 @@ pub struct Server {
     pub cert: PathBuf,
 }
 
+fn stop_child(child: &mut Child) {
+    #[cfg(unix)]
+    if child.try_wait().ok().flatten().is_none() {
+        // Ask `veil-server` for its clean stop first (BUG-1970, BUG-2630):
+        // in-flight landing/derive store connections close cleanly instead of
+        // slamming MinIO when a 100-project curve ends.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < until {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        stop_child(&mut self.child);
     }
 }
 
@@ -107,9 +127,19 @@ impl Server {
             }
         });
         let mut s = Server { child, authority: String::new(), cert: data.join("self-signed-cert.pem") };
-        match rx.recv_timeout(Duration::from_secs(30)) {
+        // Longer than `S3Store::ensure_bucket`'s 60 s retry window (BUG-2630).
+        match rx.recv_timeout(Duration::from_secs(90)) {
             Ok(addr) if s.cert.exists() => s.authority = addr,
-            _ => bail!("veil-server did not start (log: {})", log.display()),
+            _ => {
+                let tail = std::fs::read_to_string(&log)
+                    .ok()
+                    .map(|t| t.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"))
+                    .filter(|t| !t.is_empty());
+                match tail {
+                    Some(t) => bail!("veil-server did not start (log: {}):\n{t}", log.display()),
+                    None => bail!("veil-server did not start (log: {})", log.display()),
+                }
+            }
         }
         Ok(s)
     }
@@ -141,8 +171,7 @@ pub struct CacheProc {
 
 impl Drop for CacheProc {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        stop_child(&mut self.child);
     }
 }
 

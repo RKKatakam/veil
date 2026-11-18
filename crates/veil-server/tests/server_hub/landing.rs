@@ -1363,6 +1363,36 @@ fn every_route_lands_the_changes_under_a_change() {
     assert!(real_file(&hub, pid, "src/route-c.rs").is_some() && real_file(&hub, pid, "src/route-d.rs").is_some());
 }
 
+/// Submit edits to land as `vl` does (`crates/vl/src/hub.rs` `Waits`),
+/// honouring `503 busy` (`retry_after_ms`) when a burst of simultaneous
+/// writes exceeds `gate::WRITE_BACKLOG` (BUG-1955, BUG-2511).
+fn land_retrying_busy(api: &Api, token: &str, project: &str, base: ObjectId, edits: Value, wait: bool) -> Reply {
+    for tries in 0..8 {
+        let r = land(api, token, project, base, edits.clone(), wait);
+        let v = r.json();
+        if r.status == 503 && v["code"] == "busy" && tries < 7 {
+            let ms = v["retry_after_ms"].as_u64().unwrap_or(500).min(2_000);
+            std::thread::sleep(Duration::from_millis(ms));
+            continue;
+        }
+        return r;
+    }
+    unreachable!()
+}
+
+/// Wait until `want` entries are queued in `landing_queue` for `project`
+/// (bounded so a broken submit never hangs the test).
+fn wait_queued(hub: &TestHub, project: i64, want: i64, within: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < within {
+        let n = sql_i64(hub, "SELECT count(*) FROM landing_queue WHERE project_id = $1 AND state = 'queued'", project);
+        if n >= want {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// The costs the cycle-2 review asked to measure, bounded: (1) the service
 /// reads the project's view keys again at an access change, with 5,000
 /// members; (2) waiters on a server that does not hold the lease cost that
@@ -1411,12 +1441,14 @@ fn the_service_s_reads_at_an_access_change_and_remote_waiters_stay_bounded() {
         for i in 0..100 {
             let (bapi, token, name) = (&bapi, &token, &p.name);
             s.spawn(move || {
-                let r = land(bapi, token, name, base, json!([put(&format!("src/remote/{i:03}.rs"), "r\n")]), true);
+                let r = land_retrying_busy(bapi, token, name, base, json!([put(&format!("src/remote/{i:03}.rs"), "r\n")]), true);
                 assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
                 assert_eq!(r.json()["state"], "landed", "a remote waiter: {}", String::from_utf8_lossy(&r.body));
             });
         }
-        // Released after 3 s: a's service lands them, b's poller answers.
+        // Once all 100 are queued (including any retried past WRITE_BACKLOG,
+        // BUG-2511), hold 3 s more so all 100 wait together on b's poller.
+        wait_queued(&a, pid, 100, Duration::from_secs(10));
         std::thread::sleep(Duration::from_secs(3));
         release(&a, pid);
         let _rt = a.rt.enter();
@@ -1426,6 +1458,74 @@ fn the_service_s_reads_at_an_access_change_and_remote_waiters_stay_bounded() {
     let secs = t.elapsed().as_secs_f64();
     eprintln!("100 remote waiters for {secs:.1} s: {n} statements from their server's poller");
     assert!((n as f64) < secs * 4.0 + 8.0, "{n} polls in {secs:.1} s for 100 waiters");
+}
+
+/// BUG-2511: when concurrent submits on the remote server queue behind its
+/// bulkhead for `gate::WRITE_BACKLOG` (2 s, BUG-1955), new writes are shed
+/// with `503 busy` (`retry_after_ms`); clients that honour `retry_after_ms`
+/// (`land_retrying_busy`, as `vl` does) still queue and land once the gate
+/// drains, and the remote server's poller stays bounded.
+#[test]
+fn bug_2511_remote_waiters_shed_at_the_gate_backlog_land_on_retry_with_bounded_polls() {
+    use veil_server::limits::gate::{Class, WRITE_BACKLOG};
+    let a = TestHub::start();
+    let p = setup_project(&a);
+    let pid = project_id(&a, &p.name);
+    let token = p.dev.token();
+    let b = TestHub::beside(&a);
+    hold(&a, pid);
+    let bapi = b.api();
+    let base = tip_for(&b, &token, &p.name);
+    // Hold every place of b's server gate (`2 * db_connections = 32`) so the
+    // first submit queues in `Class::Write` and ages past `WRITE_BACKLOG`.
+    let held: Vec<_> = b.rt.block_on(async {
+        let far = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut places = Vec::with_capacity(32);
+        for _ in 0..32 {
+            places.push(b.hub().limits.server_place(Class::Write, far).await.expect("a server gate place"));
+        }
+        places
+    });
+    let polls = || b.hub().landing.stats.polls.load(std::sync::atomic::Ordering::Relaxed);
+    let polls0 = polls();
+    let t = std::time::Instant::now();
+    std::thread::scope(|s| {
+        let (bapi_first, token_first, name_first) = (&bapi, &token, &p.name);
+        s.spawn(move || {
+            let r = land_retrying_busy(bapi_first, token_first, name_first, base, json!([put("src/shed/first.rs", "r\n")]), true);
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+        });
+        while b.hub().limits.load(None).1 < 1 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(WRITE_BACKLOG + Duration::from_millis(100));
+        // Without retry, a submit arriving past WRITE_BACKLOG is shed 503 busy.
+        let shed = land(&bapi, &token, &p.name, base, json!([put("src/shed/probe.rs", "p\n")]), true);
+        assert_eq!(shed.status, 503, "expected 503 busy past WRITE_BACKLOG: {}", String::from_utf8_lossy(&shed.body));
+        assert_eq!(shed.json()["code"], "busy", "{}", String::from_utf8_lossy(&shed.body));
+        assert!(shed.json()["retry_after_ms"].as_u64().unwrap_or(0) >= 500, "{}", String::from_utf8_lossy(&shed.body));
+        // Submits sent while shedding honour `retry_after_ms` and all land.
+        for i in 0..15 {
+            let (bapi, token, name) = (&bapi, &token, &p.name);
+            s.spawn(move || {
+                let r = land_retrying_busy(bapi, token, name, base, json!([put(&format!("src/shed/{i:02}.rs"), "r\n")]), true);
+                assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                assert_eq!(r.json()["state"], "landed", "{}", String::from_utf8_lossy(&r.body));
+            });
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+        wait_queued(&a, pid, 16, Duration::from_secs(10));
+        std::thread::sleep(Duration::from_secs(1));
+        release(&a, pid);
+        let _rt = a.rt.enter();
+        veil_server::landing::ensure(&a.hub(), pid, "main");
+    });
+    assert_eq!(sql_i64(&a, "SELECT count(*) FROM landing_queue WHERE project_id = $1 AND state = 'landed'", pid), 16);
+    let n = polls() - polls0;
+    let secs = t.elapsed().as_secs_f64();
+    assert!((n as f64) < secs * 4.0 + 8.0, "{n} polls in {secs:.1} s for 16 waiters");
 }
 
 
