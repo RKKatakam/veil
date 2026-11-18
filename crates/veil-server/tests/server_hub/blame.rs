@@ -3543,3 +3543,388 @@ fn consolidated_landing_pass_file_history_and_blame_memos_match_projected_files(
     assert!(blamed > 20 && listed > 40, "expected >20 blames and >40 history entries, got {blamed} and {listed}");
 }
 
+#[derive(Clone, Copy)]
+enum BlameFault {
+    Pass,
+    Internal,
+    Missing,
+    StoreBusy,
+    GcEpochOnce,
+    GcEpochAlways,
+}
+
+struct FaultBlobStore {
+    inner: std::sync::Arc<dyn veil_server::store::BlobStore>,
+    target_key: String,
+    blob_hex: String,
+    mode: std::sync::Mutex<BlameFault>,
+    gate: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    faulted: std::sync::atomic::AtomicU64,
+}
+
+impl FaultBlobStore {
+    async fn maybe_fail(&self, key: &str) -> anyhow::Result<bool> {
+        if key != self.target_key {
+            return Ok(false);
+        }
+        if self.gate.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        let m = {
+            let mut g = self.mode.lock().unwrap();
+            let cur = *g;
+            if matches!(cur, BlameFault::GcEpochOnce) {
+                *g = BlameFault::Pass;
+            }
+            cur
+        };
+        match m {
+            BlameFault::Pass => Ok(false),
+            BlameFault::Missing => {
+                self.faulted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(true)
+            }
+            BlameFault::Internal => {
+                self.faulted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow::anyhow!("CANARY-INTERNAL-2680-SECRET-{}", self.blob_hex))
+            }
+            BlameFault::StoreBusy => {
+                self.faulted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(veil_server::store::StoreUnavailable::new("S3 GET answered HTTP 503 12 times (CANARY-STORE-2680)").into())
+            }
+            BlameFault::GcEpochOnce | BlameFault::GcEpochAlways => {
+                self.faulted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow::Error::new(veil_server::pack_gc::GcEpochChanged))
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl veil_server::store::BlobStore for FaultBlobStore {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+        if self.maybe_fail(key).await? {
+            return Ok(None);
+        }
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
+        self.inner.put(key, data).await
+    }
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        self.inner.exists(key).await
+    }
+    async fn len(&self, key: &str) -> anyhow::Result<Option<u64>> {
+        self.inner.len(key).await
+    }
+    async fn get_range(&self, key: &str, start: u64, end: u64) -> anyhow::Result<Option<(bytes::Bytes, u64)>> {
+        if self.maybe_fail(key).await? {
+            return Ok(None);
+        }
+        self.inner.get_range(key, start, end).await
+    }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+}
+
+fn fault_hub_for_blame(
+    th: &TestHub,
+    first: &std::sync::Arc<veil_server::Hub>,
+    store: std::sync::Arc<FaultBlobStore>,
+    dir: &std::path::Path,
+) -> std::sync::Arc<veil_server::Hub> {
+    let _in_rt = th.rt.enter();
+    std::sync::Arc::new(veil_server::Hub {
+        db: first.db.clone(),
+        objects: std::sync::Arc::new(veil_server::store::Objects::with_db(store, 256 << 20, Some(first.db.clone()))),
+        trees: veil_core::cache::LruCache::new(256 << 20),
+        identity: first.identity.clone(),
+        receipt_key: first.receipt_key,
+        grants: veil_server::grant::Grants::load(dir).unwrap(),
+        cache_token: first.cache_token,
+        session_ttl_ms: first.session_ttl_ms,
+        certificate: first.certificate.clone(),
+        caches: Default::default(),
+        derive: veil_server::derive::Workers::new(first.db.clone()),
+        query: Default::default(),
+        landing: Default::default(),
+        events: Default::default(),
+        embargo: Default::default(),
+        pack_gc: Default::default(),
+        limits: veil_server::limits::Limits::new(TestHub::limits(), 16),
+        commits: Default::default(),
+    })
+}
+
+/// BUG-2680: when a blame job (or viewer-graph fill) fails with an internal or
+/// missing-stored-object error, the route must answer `500` with code
+/// `internal` and message `"internal error"`, never leaking the internal
+/// error's `Debug` text or object ids to any waiter.
+#[test]
+fn bug_2680_a_blame_jobs_internal_error_answers_internal_error_without_detail() {
+    use std::sync::{atomic::Ordering::SeqCst, Arc};
+    use tower::ServiceExt;
+
+    let th = TestHub::start();
+    let (text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &text, &bindings);
+    let content = b"alpha\nbeta\n".to_vec();
+    let blob_id = ObjectId::hash(&veil_core::object::Object::Blob(content.clone()).encode());
+    let tip = h.commit(&th, &[root_snapshot_id()], Files::from([("pub/a.txt".to_string(), content)]), [7; 16], 1_700_000_000_000, None);
+    h.set_branch(&th, "main", tip);
+    assert_eq!(h.derive(&th).snapshots, 1, "the commit must derive");
+    warm_up(&th, &h, &Viewer::default());
+    forget_blames(&th, &h);
+
+    let store = Arc::new(FaultBlobStore {
+        inner: h.hub.objects.blob_store().clone(),
+        target_key: veil_server::store::object_key(h.id, &blob_id),
+        blob_hex: blob_id.hex(),
+        mode: std::sync::Mutex::new(BlameFault::Internal),
+        gate: std::sync::atomic::AtomicBool::new(true),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        faulted: Default::default(),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let hub = fault_hub_for_blame(&th, &h.hub, store.clone(), dir.path());
+    let app = veil_server::api::router(hub.clone());
+    let uri = format!("/v1/projects/{}/q/blame?rev=main&path=pub/a.txt", h.name);
+
+    // Two concurrent callers deterministically join the same blame job via Notify (`entered` -> `joined` -> `release`).
+    let (r1, r2) = th.rt.block_on(async {
+        let entered = store.entered.notified();
+        let joined = hub.query.jobs.joined.notified();
+        let f1 = tokio::spawn({
+            let (app, uri) = (app.clone(), uri.clone());
+            async move {
+                let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let s = resp.status();
+                let b = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+                (s, b)
+            }
+        });
+        entered.await;
+        let f2 = tokio::spawn({
+            let (app, uri) = (app.clone(), uri.clone());
+            async move {
+                let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let s = resp.status();
+                let b = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+                (s, b)
+            }
+        });
+        joined.await;
+        store.release.notify_one();
+        (f1.await.unwrap(), f2.await.unwrap())
+    });
+
+    for (which, (status, body)) in [("waiter 1", r1), ("waiter 2", r2)] {
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{which}: {body}");
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["code"], "internal", "{which}: {body}");
+        assert_eq!(json["message"], "internal error", "{which}: {body}");
+        assert!(!body.contains("CANARY-INTERNAL-2680"), "{which} leaked internal error text: {body}");
+        assert!(!body.contains(&blob_id.short()), "{which} leaked blob id: {body}");
+    }
+    assert_eq!(hub.query.jobs.started.load(SeqCst), 1, "both waiters shared the one blame job");
+    assert_eq!(store.faulted.load(SeqCst), 1, "the blame job hit the injected fault once");
+
+    // Stored blob missing (`VeilError::Missing`) during a blame job must also answer 500 internal, never 400 naming the short id.
+    *store.mode.lock().unwrap() = BlameFault::Missing;
+    let (status, body) = th.rt.block_on(async {
+        let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+        (status, body)
+    });
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing stored blob in blame job: {body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["code"], "internal", "{body}");
+    assert_eq!(json["message"], "internal error", "{body}");
+    assert!(!body.contains(&blob_id.short()), "missing stored blob leaked short id: {body}");
+
+    // Once the fault clears, the same route succeeds.
+    *store.mode.lock().unwrap() = BlameFault::Pass;
+    let (status, body) = th.rt.block_on(async {
+        let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+        (status, body)
+    });
+    assert_eq!(status, axum::http::StatusCode::OK, "after fault clears: {body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["line_count"], 2, "{body}");
+
+    // Stored snapshot missing (`VeilError::Missing`) during a viewer-graph fill must also answer 500 internal, never 400 naming the short id.
+    let tip2 = h.commit(&th, &[tip], Files::from([("pub/a.txt".to_string(), b"alpha\nbeta\ngamma\n".to_vec())]), [10; 16], 1_700_000_002_000, None);
+    h.set_branch(&th, "main", tip2);
+    assert_eq!(h.derive(&th).snapshots, 1);
+    let store_fill = Arc::new(FaultBlobStore {
+        inner: h.hub.objects.blob_store().clone(),
+        target_key: veil_server::store::object_key(h.id, &tip2),
+        blob_hex: tip2.hex(),
+        mode: std::sync::Mutex::new(BlameFault::Missing),
+        gate: std::sync::atomic::AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        faulted: Default::default(),
+    });
+    let dir_fill = tempfile::tempdir().unwrap();
+    let hub_fill = fault_hub_for_blame(&th, &h.hub, store_fill, dir_fill.path());
+    let app_fill = veil_server::api::router(hub_fill);
+    let (status, body) = th.rt.block_on(async {
+        let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+        let resp = app_fill.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+        (status, body)
+    });
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing stored snapshot in viewer-graph fill: {body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["code"], "internal", "{body}");
+    assert_eq!(json["message"], "internal error", "{body}");
+    assert!(!body.contains(&tip2.short()), "missing stored snapshot in fill leaked short id: {body}");
+}
+
+/// BUG-2680: a busy object store (`StoreUnavailable`) or a GC epoch change
+/// (`GcEpochChanged`) during a blame job (or viewer-graph fill) answers
+/// `503 busy` (retryable where `error.rs` marks `Retryable`), never `500`.
+#[test]
+fn bug_2680_a_busy_store_or_gc_epoch_change_in_a_blame_job_answers_busy_retryable() {
+    use axum::response::IntoResponse;
+    use std::sync::{atomic::Ordering::SeqCst, Arc};
+    use tower::ServiceExt;
+
+    let th = TestHub::start();
+    let (text, bindings) = policy(1);
+    let mut h = Hist::new(&th, &text, &bindings);
+    let content = b"line one\nline two\n".to_vec();
+    let blob_id = ObjectId::hash(&veil_core::object::Object::Blob(content.clone()).encode());
+    let tip = h.commit(&th, &[root_snapshot_id()], Files::from([("pub/a.txt".to_string(), content)]), [8; 16], 1_700_000_000_000, None);
+    h.set_branch(&th, "main", tip);
+    assert_eq!(h.derive(&th).snapshots, 1, "the commit must derive");
+    warm_up(&th, &h, &Viewer::default());
+    forget_blames(&th, &h);
+
+    let store = Arc::new(FaultBlobStore {
+        inner: h.hub.objects.blob_store().clone(),
+        target_key: veil_server::store::object_key(h.id, &blob_id),
+        blob_hex: blob_id.hex(),
+        mode: std::sync::Mutex::new(BlameFault::StoreBusy),
+        gate: std::sync::atomic::AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        faulted: Default::default(),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let hub = fault_hub_for_blame(&th, &h.hub, store.clone(), dir.path());
+    let app = veil_server::api::router(hub.clone());
+    let uri = format!("/v1/projects/{}/q/blame?rev=main&path=pub/a.txt", h.name);
+
+    // 1. Busy object store (`StoreUnavailable`) during the blame job -> 503 busy + Retry-After.
+    let (status, has_retry_after, body) = th.rt.block_on(async {
+        let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let has_retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).is_some();
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+        (status, has_retry_after, body)
+    });
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "StoreUnavailable in blame job: {body}");
+    assert!(has_retry_after, "StoreUnavailable must include Retry-After header: {body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["code"], "busy", "{body}");
+    assert_eq!(json["message"], "the object store is busy; try again", "{body}");
+    assert!(json["retry_after_ms"].as_u64().is_some_and(|ms| ms >= 500), "{body}");
+    assert!(!body.contains("CANARY-STORE-2680") && !body.contains("S3 GET"), "store detail leaked: {body}");
+    assert_eq!(hub.query.jobs.started.load(SeqCst), 1, "one blame job ran for StoreUnavailable");
+
+    // 2. GC epoch change (`GcEpochChanged`) during the blame job:
+    //    (a) single-attempt response is `503 busy` with the `Retryable` extension set;
+    *store.mode.lock().unwrap() = BlameFault::GcEpochAlways;
+    let a = ask(&th, &h, &Viewer::default());
+    let (status, is_retryable, has_retry_after, body) = th.rt.block_on(async {
+        let err = query::blame(
+            &hub,
+            &a,
+            BlameParams { rev: Some("main".into()), path: "pub/a.txt".into(), ..Default::default() },
+            Limits::default(),
+        )
+        .await
+        .expect_err("GcEpochChanged must fail the attempt");
+        assert!(veil_server::pack_gc::is_gc_epoch_changed(&err), "GcEpochChanged from blame job must keep its kind: {err:?}");
+        let resp = err.into_response();
+        let status = resp.status();
+        let is_retryable = resp.extensions().get::<veil_server::db::Retryable>().is_some();
+        let has_retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).is_some();
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+        (status, is_retryable, has_retry_after, body)
+    });
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "GcEpochChanged in blame job: {body}");
+    assert!(is_retryable, "GcEpochChanged in blame job must mark response Retryable: {body}");
+    assert!(has_retry_after, "GcEpochChanged must include Retry-After header: {body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["code"], "busy", "{body}");
+    assert!(json["retry_after_ms"].as_u64().is_some_and(|ms| ms >= 500), "{body}");
+    assert_eq!(hub.query.jobs.started.load(SeqCst), 2, "second blame job ran for GcEpochAlways");
+
+    //    (b) through `api::router` (`db::retry_requests`), a transient `GcEpochChanged`
+    //        in the first blame job is automatically retried and succeeds with 200.
+    *store.mode.lock().unwrap() = BlameFault::GcEpochOnce;
+    let (status, body) = th.rt.block_on(async {
+        let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+        (status, body)
+    });
+    assert_eq!(status, axum::http::StatusCode::OK, "transient GcEpochChanged retried by router: {body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["line_count"], 2, "{body}");
+    assert_eq!(hub.query.jobs.started.load(SeqCst), 4, "router ran the failed job and the successful retry");
+
+    // 3. Shared viewer-graph fill (`query::graph::ensure_files`) preserves error kind too:
+    //    a new un-warmed commit whose snapshot read hits `StoreUnavailable` answers `503 busy`, not `500`.
+    let content2 = b"line one\nline two\nline three\n".to_vec();
+    let tip2 = h.commit(&th, &[tip], Files::from([("pub/a.txt".to_string(), content2)]), [9; 16], 1_700_000_001_000, None);
+    h.set_branch(&th, "main", tip2);
+    assert_eq!(h.derive(&th).snapshots, 1, "second commit derived without pre-warming view_file_history");
+    let store2 = Arc::new(FaultBlobStore {
+        inner: h.hub.objects.blob_store().clone(),
+        target_key: veil_server::store::object_key(h.id, &tip2),
+        blob_hex: tip2.hex(),
+        mode: std::sync::Mutex::new(BlameFault::StoreBusy),
+        gate: std::sync::atomic::AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        faulted: Default::default(),
+    });
+    let dir2 = tempfile::tempdir().unwrap();
+    let hub2 = fault_hub_for_blame(&th, &h.hub, store2, dir2.path());
+    let app2 = veil_server::api::router(hub2);
+    let (status, body) = th.rt.block_on(async {
+        let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+        let resp = app2.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+        (status, body)
+    });
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "StoreUnavailable in viewer-graph fill: {body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["code"], "busy", "{body}");
+    assert_eq!(json["message"], "the object store is busy; try again", "{body}");
+    assert!(!body.contains("CANARY-STORE-2680"), "{body}");
+}
+

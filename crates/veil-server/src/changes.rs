@@ -254,16 +254,18 @@ fn entries(src: &Source, pr: &Projector, edits: &[Edit], uploaded: &HashSet<Obje
             Some(Content::Object(id, executable)) => {
                 let at_base = walk(pr, pbase, &e.parts)?.1.is_some_and(|b| b.id == *id);
                 if !uploaded.contains(id) && !at_base {
-                    return Err(veil_core::VeilError::Missing(*id).into());
+                    return Err(Error::client_object(veil_core::VeilError::Missing(*id)));
                 }
-                let raw = src.raw(id)?;
+                let is_upload = uploaded.contains(id);
+                let map_obj = |e| if is_upload { Error::client_object(e) } else { Error::from(e) };
+                let raw = src.raw(id).map_err(map_obj)?;
                 let (size, visibility) = match Object::sealed_scope(&raw) {
                     // The scope a secret is sealed under, without its key
                     // generation (`team#…`), as `vl` labels it.
                     // Its stored length: the server cannot know the
                     // plaintext's, and a recorded size bounds reads (BUG-1087).
                     Some(label) => (raw.len() as u64, Visibility::Cloaked { scope: label.split('#').next().unwrap_or_default().to_string() }),
-                    None if Object::is_blob_raw(&raw) => match Object::decode(&raw)? {
+                    None if Object::is_blob_raw(&raw) => match src.decode_bytes(id, &raw).map_err(map_obj)? {
                         Object::Blob(b) => (b.len() as u64, Visibility::Public),
                         _ => unreachable!("a blob's encoding"),
                     },

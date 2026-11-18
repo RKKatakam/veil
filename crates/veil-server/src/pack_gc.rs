@@ -721,7 +721,7 @@ impl std::fmt::Display for GcEpochChanged {
 impl std::error::Error for GcEpochChanged {}
 
 pub fn gc_epoch_changed(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<GcEpochChanged>().is_some()
+    crate::error::caused_by::<GcEpochChanged>(e)
 }
 
 pub fn is_gc_epoch_changed(e: &Error) -> bool {

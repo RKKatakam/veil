@@ -302,6 +302,12 @@ pub struct StoreUnavailable {
     source: Option<reqwest::Error>,
 }
 
+impl StoreUnavailable {
+    pub fn new(what: impl Into<String>) -> StoreUnavailable {
+        StoreUnavailable { what: what.into(), source: None }
+    }
+}
+
 impl std::fmt::Display for StoreUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.what)

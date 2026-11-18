@@ -1506,21 +1506,29 @@ fn guarantee_11_pushes_schedule_no_merge_leftover_small_packs_merge_once_and_sta
     assert_eq!(listed_after, 1, "leftover small packs merged down to 1 pack (listed={listed_after}, discarded={discarded_after})");
     assert_eq!(discarded_after, total_before_merge as i64, "all {total_before_merge} small packs marked discarded");
 
-    // Sweep discarded packs (grace = 0) so old packs are physically deleted from storage, and verify
-    // every single object reads back byte-identically on BOTH servers (`hub` and `other`)!
-    let sweep = hub
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
-            pid_left,
-            &Options {
-                min_packs_to_merge: 99,
-                run_gc: false,
-                pack_grace_ms: 0,
-                ..Options::default()
-            },
-        ))
-        .unwrap();
+    // Sweep discarded packs (grace = 0) once `other`'s background merge pass
+    // releases the project's advisory lock, so old packs are physically deleted
+    // from storage, and verify every single object reads back byte-identically
+    // on BOTH servers (`hub` and `other`)!
+    let sweep_opts = Options {
+        min_packs_to_merge: 99,
+        run_gc: false,
+        pack_grace_ms: 0,
+        ..Options::default()
+    };
+    let sweep = {
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            match hub.rt.block_on(pack_gc::run_project(&h, pid_left, &sweep_opts)) {
+                Ok(r) if r.skipped && tries < 40 => std::thread::sleep(Duration::from_millis(25)),
+                Ok(r) => break r,
+                Err(e) if e.is_retryable() && tries < 40 => std::thread::sleep(Duration::from_millis(25)),
+                Err(e) => panic!("sweep pass: {e:?}"),
+            }
+        }
+    };
+    assert!(!sweep.skipped);
     assert_eq!(sweep.discarded_packs_swept, total_before_merge);
     assert_eq!(pack_counts(&hub, pid_left), (0, 1, 0));
 
