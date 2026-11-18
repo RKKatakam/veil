@@ -3,15 +3,12 @@
 # §6; the gates themselves are in deploy/gates.sh, shared with the
 # rehearsal). Results land in deploy/results/NAME/<stamp>-<gate>/:
 #   run.txt        the commit, the image tag, the gate's settings, the address, and the
-#                  servers' object layout (object_layout=, as every server reported it
-#                  before the gate; object_layout_changed= when one did not after it)
+#                  object layout the servers ran (object_layout=, as each of them reported it)
 #   topology.env   deploy/do/.env's topology, without a single secret
 #   images.txt     the image ids on every machine, the pinned third-party digests
 #   commands.txt   every veil-bench command line, and on which machine
 #   *.json, *.md   the tool's raw results and its tables; LABEL.log its output
 #   hub<N>-stats.json, hub<N>-docker-stats.log   each server's counters and samples
-#   hub<N>-stats-before.json   its counters before the gate (the difference is the gate's:
-#                  storage writes, reads, deletes and listings, objects kept, uploads)
 #   db<N>-docker-stats.log   each database machine's samples (PostgreSQL's, or YugabyteDB's nodes)
 #   minio-docker-stats.log   the MinIO storage droplet's samples (VEIL_DO_OBJECTS=minio)
 #   minio-restarts.txt       MinIO's restart count before and after the gate (a change fails it)
@@ -122,23 +119,26 @@ db_sql() { # SQL on stdin -> rows, | between columns
 # What runs where, and the record of it.
 HUB_IPS=(); for i in $(seq "$HUBS"); do HUB_IPS+=("$(addr "$(hub_name "$i")")"); done
 DRIVER_IPS=(); for i in $(seq "$DRIVERS"); do DRIVER_IPS+=("$(addr "$NAME-driver$i")"); done
-# The object layout (docs/DEPLOY.md §12.11): a gate runs only when every
-# server says it is in the layout the kit is set to, so a result is never
-# recorded under a layout its servers were not in; nothing is written for
-# a gate refused here. The counters each server gave are kept
-# (hub<N>-stats-before.json): with those after the gate they give its
-# storage requests.
+# The object layout the gate runs on (docs/HUB.md §13.42), for its record:
+# what every server says it runs (its stats.json), not what the kit asked
+# for. A gate is refused, with nothing written, when a server gives none,
+# the servers differ, or they are not in the layout the kit set
+# (OBJECT_LAYOUT; empty: the server's default, whichever it is).
 if [ $APPROVED = 1 ]; then
-    BEFORE=()
+    LAYOUT=
     for i in $(seq "$HUBS"); do
-        BEFORE[i]=$(hub_stats "$i")
-        l=$(layout_of <<<"${BEFORE[i]}")
-        [ "$l" = "$OBJECT_LAYOUT" ] || { echo "bench: server $i reports object layout '${l:-none}', the kit is set to '$OBJECT_LAYOUT': no gate is run on servers in another layout (deploy/$KIT/layout.sh --approve $OBJECT_LAYOUT restarts them in it; docs/DEPLOY.md §12.11)" >&2; exit 2; }
+        l=$(hub_stats "$i" | layout_of)
+        [ -n "$l" ] || { echo "bench: server $i reports no object layout (its stats.json; is it running? deploy/$KIT/logs.sh): no gate is run without knowing the layout" >&2; exit 2; }
+        [ "$l" = "${LAYOUT:-$l}" ] || { echo "bench: server $i reports object layout '$l', server 1 '$LAYOUT': no gate is run on servers in two layouts (deploy/$KIT/configure.sh --approve starts them all in one)" >&2; exit 2; }
+        LAYOUT=$l
     done
+    [ -z "$OBJECT_LAYOUT" ] || [ "$LAYOUT" = "$OBJECT_LAYOUT" ] || { echo "bench: the servers report object layout '$LAYOUT', ${ENV_PREFIX}OBJECT_LAYOUT is '$OBJECT_LAYOUT' (deploy/$KIT/configure.sh --approve starts them in it)" >&2; exit 2; }
     mkdir -p "$OUT"
-    for i in $(seq "$HUBS"); do printf '%s\n' "${BEFORE[i]}" > "$OUT/hub$i-stats-before.json"; done
-else echo "would check that every server reports object layout $OBJECT_LAYOUT (its stats.json), and keep its counters before the gate" >&2; fi
-{ gate_meta "$COMMIT" "$TAG"; echo "object_layout=$OBJECT_LAYOUT"; echo "args=$*"; } | record run.txt
+else
+    LAYOUT=${OBJECT_LAYOUT:-SERVERS_OBJECT_LAYOUT}   # a placeholder in a dry run
+    echo "would ask every server its object layout (its stats.json) and record it in run.txt" >&2
+fi
+{ gate_meta "$COMMIT" "$TAG"; echo "object_layout=$LAYOUT"; echo "args=$*"; } | record run.txt
 topology | record topology.env
 {
     echo "# built here (deploy/docker/build.sh), shipped by configure.sh: the ids are the images' config digests,"
@@ -177,9 +177,9 @@ minio_restarts() { remote "$(addr "$NAME-minio")" "docker inspect -f '{{.Restart
 
 echo "== $GATE against $URL ($HUBS server(s), $DRIVERS driver(s)), limit ${STEP_LIMIT}s per command"
 rc=0
-# The tool is told the layout: a server it starts itself (objects,
-# openscion, scale) runs in it, and every result's json and table name it.
-run_gate "$GATE" --object-layout "$OBJECT_LAYOUT" "$@" || rc=$?
+# The tool is told the layout: its json and tables name it, and a server
+# it starts itself (objects, openscion, scale) runs in the deployment's.
+run_gate "$GATE" --object-layout "$LAYOUT" "$@" || rc=$?
 if [ $WATCH_MINIO = 1 ]; then
     R1=$(minio_restarts)
     [ $APPROVED = 1 ] && echo "before=$R0 after=$R1" > "$OUT/minio-restarts.txt"
@@ -191,16 +191,7 @@ fi
 for i in $(seq "${#SAMPLED[@]}"); do
     h=${SAMPLED[$((i - 1))]}; label=${LABELS[$((i - 1))]}
     if [ $APPROVED = 1 ]; then
-        if [ "$i" -le "$HUBS" ]; then
-            hub_stats "$i" > "$OUT/hub$i-stats.json" || true
-            # Still in the layout the gate started in? (A server started again
-            # in the other one during the gate; one that gives no counters.)
-            l=$(layout_of < "$OUT/hub$i-stats.json")
-            if [ "$l" != "$OBJECT_LAYOUT" ]; then
-                echo "object_layout_changed=server $i reports '${l:-none}' after the gate" >> "$OUT/run.txt"
-                echo "bench: after the gate server $i reports object layout '${l:-none}', not '$OBJECT_LAYOUT': the gate's results are not valid" >&2; rc=1
-            fi
-        fi
+        [ "$i" -gt "$HUBS" ] || hub_stats "$i" > "$OUT/hub$i-stats.json" || true
         remote "$h" "kill \$(cat /srv/metrics/$STAMP-$GATE.pid) 2>/dev/null" || true
     else [ "$i" -gt "$HUBS" ] || hub_stats "$i"; remote "$h" "kill \$(cat /srv/metrics/$STAMP-$GATE.pid)"; fi
     copy_from "$h" "/srv/metrics/$STAMP-$GATE.stats" "$OUT/$label-docker-stats.log" || true

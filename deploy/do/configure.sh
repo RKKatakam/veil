@@ -135,8 +135,10 @@ else
     remote "$DBIP" 'for i in $(seq 60); do docker exec pg pg_isready -U veil -d veil >/dev/null 2>&1 && docker exec pg psql -U veil -d veil -tAc "select 1" >/dev/null 2>&1 && break; sleep 2; done; echo "   postgres answers"'
 fi
 
+S3_REGION=$REGION
 if [ "$OBJECTS" = minio ]; then
     echo "== 4b. MinIO on $NAME-minio (TLS with the run's certificate; reached only from the run's droplets)"
+    S3_REGION=us-east-1   # MinIO's own region
     MIP=$(addr "$NAME-minio"); MPRIV=$(paddr "$NAME-minio")
     # Credentials made for this run: a root-only file here and there, read
     # by Docker's --env-file; the servers get them in their hub.env.
@@ -167,7 +169,7 @@ if [ "$OBJECTS" = minio ]; then
     remote "$MIP" 'for i in $(seq 90); do curl -sf --cacert /etc/veil/tls/ca.pem https://'"$MPRIV"':9000/minio/health/live >/dev/null && break; sleep 2; done; curl -sf --cacert /etc/veil/tls/ca.pem https://'"$MPRIV"':9000/minio/health/live >/dev/null && echo "   minio answers over TLS" || { echo "configure: MinIO did not come up; docker logs minio on '"$MIP"'" >&2; exit 1; }; sleep 15; r=$(docker inspect -f "{{.RestartCount}} {{.State.Running}}" minio); [ "$r" = "0 true" ] || { echo "configure: MinIO is restarting (restarts, running: $r); docker logs minio on '"$MIP"'" >&2; exit 1; }'
 fi
 
-echo "== 5. the servers ($HUBS), all on the one database and the bucket $BUCKET ($OBJECTS: $(objects_endpoint)), object layout $OBJECT_LAYOUT"
+echo "== 5. the servers ($HUBS), all on the one database and the bucket $BUCKET ($OBJECTS: $(objects_endpoint))"
 HUB1=$(addr "$NAME-hub")
 # Each server's /etc/veil/hub.env: the object store's keys (MinIO's, with
 # the run's CA, or Spaces') and its database URL (with YugabyteDB, server I
@@ -195,9 +197,13 @@ elif [ $APPROVED = 1 ]; then
     copy_to "$STATE/spaces.env" "$HUB1" /etc/veil/spaces.env
 else echo "would copy /etc/veil/spaces.env (Spaces keys, the database URL of server 1) to $HUB1" >&2; fi
 remote "$HUB1" "docker run --rm --env-file /etc/veil/hub.env veil-server:$TAG migrate"
-# How each server is started: deploy/kit.sh `server_run` (the limits per
-# device and per address lifted, the object layout the kit's).
-SERVER_RUN=$(server_run "$TAG")
+# The limits per device and per address are lifted, as veil-bench lifts
+# them on a server it starts (crates/veil-bench/src/server.rs): a driver's
+# 10,000 agents are a few devices on one address, and would measure the
+# limits. A server for people keeps the defaults (docs/HUB.md §13.25).
+# The object layout is the server's default unless the kit sets one
+# (OBJECT_LAYOUT; docs/HUB.md §13.42).
+SERVER_RUN="docker run -d --name veil-server --restart unless-stopped -p 8443:8443 --env-file /etc/veil/hub.env -v veil-data:/var/lib/veil -v /etc/veil/tls:/tls:ro --ulimit nofile=1048576:1048576 veil-server:$TAG --listen 0.0.0.0:8443 --data /var/lib/veil --db-connections $DB_CONNECTIONS --s3-endpoint $(objects_endpoint) --s3-bucket $BUCKET --s3-region $S3_REGION --tls-cert /tls/server.pem --tls-key /tls/server-key.pem --device-rate 1000000000/1000000000 --anonymous-rate 1000000000/1000000000 --max-connections 262144${OBJECT_LAYOUT:+ --object-layout $OBJECT_LAYOUT}"
 HEALTHY='for i in $(seq 30); do [ "$(docker inspect -f "{{.State.Health.Status}}" veil-server 2>/dev/null)" = healthy ] && break; sleep 2; done; docker inspect -f "   veil-server: {{.State.Health.Status}}" veil-server; docker logs --tail 5 veil-server'
 remote "$HUB1" "docker rm -f veil-server >/dev/null 2>&1; $SERVER_RUN"
 remote "$HUB1" "$HEALTHY"

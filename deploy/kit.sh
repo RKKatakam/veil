@@ -1,8 +1,8 @@
 # The helpers both deployment kits share (deploy/do, deploy/gcp; docs/DEPLOY.md).
 # Sourced by each kit's lib.sh after it has set NAME, STATE, STATE_FILE,
 # APPROVED, KIT (do or gcp), ENV_PREFIX, HUBS, YB_NODES, YB_LAYOUT, YB_TABLETS,
-# DB_CONNECTIONS, DB_DISK_GB, OBJECTS, OBJECT_LAYOUT (the servers' object
-# layout, packs or objects: docs/HUB.md §13.42), DB_PASSWORD, REGION, BUCKET and
+# DB_CONNECTIONS, DB_DISK_GB, OBJECTS, OBJECT_LAYOUT (empty: the server's
+# default object layout; docs/HUB.md §13.42), DB_PASSWORD and
 # `droplets` (the run's machines: role, name, size). The steps that run on
 # the machines (deploy/do/configure.sh, bench.sh, logs.sh) are shared the
 # same way: deploy/gcp runs them with VEIL_KIT=gcp, and they source its lib.
@@ -10,27 +10,13 @@
 [[ "$YB_LAYOUT" =~ ^(colocated|hash)$ ]] || { echo "$KIT: invalid ${ENV_PREFIX}YB_LAYOUT '$YB_LAYOUT' (colocated or hash)" >&2; exit 2; }
 [[ "$YB_TABLETS" =~ ^[1-9][0-9]?$ ]] || { echo "$KIT: invalid ${ENV_PREFIX}YB_TABLETS '$YB_TABLETS' (1 to 99 tablets per table on each node)" >&2; exit 2; }
 [ "$YB_LAYOUT" = hash ] || [ "$YB_TABLETS" = 1 ] || { echo "$KIT: ${ENV_PREFIX}YB_TABLETS is for ${ENV_PREFIX}YB_LAYOUT=hash (a colocated database is one tablet)" >&2; exit 2; }
-# How a server of the deployment is started, as the command for its
-# machine (configure.sh; deploy/gcp/layout.sh, which starts it again in
-# the other layout). The limits per device and per address are lifted, as
-# veil-bench lifts them on a server it starts (crates/veil-bench/src/server.rs):
-# a driver's 10,000 agents are a few devices on one address, and would
-# measure the limits. A server for people keeps the defaults (docs/HUB.md §13.25).
-server_run() { # image tag
-    local region=$REGION
-    [ "$OBJECTS" = minio ] && region=us-east-1   # MinIO's own region
-    echo "docker run -d --name veil-server --restart unless-stopped -p 8443:8443 --env-file /etc/veil/hub.env -v veil-data:/var/lib/veil -v /etc/veil/tls:/tls:ro --ulimit nofile=1048576:1048576 veil-server:$1 --listen 0.0.0.0:8443 --data /var/lib/veil --db-connections $DB_CONNECTIONS --s3-endpoint $(objects_endpoint) --s3-bucket $BUCKET --s3-region $region --tls-cert /tls/server.pem --tls-key /tls/server-key.pem --device-rate 1000000000/1000000000 --anonymous-rate 1000000000/1000000000 --max-connections 262144 --object-layout $OBJECT_LAYOUT"
-}
-# The layout a running server says it is in: `object_layout` of the
-# counters it writes at start and on SIGUSR1 (stats.json), read here from
-# stdin; empty when there is none. The server is the authority: the
-# setting and the state say only what was asked for.
+# The object layout a server says it runs: `object_layout` of the counters
+# it writes at start and on SIGUSR1 (stats.json), read here from stdin;
+# empty when there is none. The server is the authority on it: bench.sh
+# records what the servers say, not what the kit asked for.
 layout_of() { python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("object_layout") or "")
 except Exception: print("")'; }
-server_layout() { # host
-    { remote "$1" 'docker exec veil-server cat /var/lib/veil/stats.json' 2>/dev/null || true; } | layout_of
-}
 # Veil's database: `veil` on PostgreSQL and on YugabyteDB (made by
 # configure.sh in the chosen layout; never the default `yugabyte` one).
 DB_NAME=veil

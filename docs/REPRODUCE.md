@@ -236,7 +236,7 @@ rehearsal: `deploy/compose/results/<stamp>/<gate>/`):
 
 | File | What |
 |---|---|
-| `run.txt` | the gate, the date, `commit=`, `image_tag=`, the address the agents used, the number of servers, every size setting |
+| `run.txt` | the gate, the date, `commit=`, `image_tag=`, the address the agents used, the number of servers, every size setting, and `object_layout=` (the object layout the servers ran, as they reported it) |
 | `topology.env` | the topology from `deploy/do/.env`: names, region, sizes, counts, image references; never a secret (a fixed list of names) |
 | `images.txt` | the image ids built here and the ones each machine runs; the pinned third-party digests |
 | `commands.txt` | every `veil-bench` command line, and the machine it ran on |

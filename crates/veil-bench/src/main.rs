@@ -755,7 +755,7 @@ mod tests {
         }
     }
 
-    /// The deployment kit (`deploy/do/bench.sh`, `docs/DEPLOY.md` §12.11)
+    /// The deployment kit (`deploy/do/bench.sh`, `docs/DEPLOY.md` §12.4)
     /// ends every gate's command with `--object-layout LAYOUT`: a gate
     /// against the deployment (`--url`) only records it (the kit has asked
     /// the servers), a gate that starts its own server starts it in it.
