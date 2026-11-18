@@ -3523,3 +3523,60 @@ fn cli_gc_dry_run_and_collect_reports_deletions_and_scopes_by_project() {
     assert_eq!(r2.status, 200, "p2 still serves after gc");
 }
 
+/// BUG-2770: calling `Packs::discard` with a pack that was already promoted
+/// from `STAGED` to `LISTED` leaves the DB row and stored blob intact, and
+/// must NOT poison the in-memory `staged` LRU cache with a `None` tombstone
+/// for that pack (only packs actually transitioned to `DISCARDED` by the DB
+/// `UPDATE ... RETURNING name` may be tombstoned).
+#[test]
+fn bug_2770_discard_on_listed_pack_does_not_tombstone_staged_cache() {
+    let hub = TestHub::start_own();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+
+    // Find admin's person_id to stage two packs under it.
+    let person_id: i64 = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT id FROM people LIMIT 1").fetch_one(&h.db))
+        .unwrap();
+
+    let raw1 = bytes::Bytes::from(veil_core::object::Object::Blob(b"BUG-2770-LISTED-BLOB\n".to_vec()).encode());
+    let id1 = ObjectId::hash(&raw1);
+    let raw2 = bytes::Bytes::from(veil_core::object::Object::Blob(b"BUG-2770-DISCARDED-BLOB\n".to_vec()).encode());
+    let id2 = ObjectId::hash(&raw2);
+
+    let listed_pack = hub.rt.block_on(h.objects.stage(pid, person_id, vec![(id1, raw1)])).unwrap();
+    let abandoned_pack = hub.rt.block_on(h.objects.stage(pid, person_id, vec![(id2, raw2)])).unwrap();
+
+    // Simulate a concurrent push committing and promoting `listed_pack` to LISTED.
+    hub.rt
+        .block_on(
+            sqlx::query("UPDATE packs SET state = 1 WHERE project_id = $1 AND name = $2")
+                .bind(pid)
+                .bind(&*listed_pack)
+                .execute(&h.db),
+        )
+        .unwrap();
+
+    // Discard both names together: DB only transitions `abandoned_pack` to DISCARDED.
+    hub.rt
+        .block_on(h.objects.discard(pid, &[listed_pack.clone(), abandoned_pack.clone()]))
+        .unwrap();
+
+    // `abandoned_pack` was genuinely discarded: tombstoned in cache and gone from DB/store.
+    assert!(
+        hub.rt.block_on(h.objects.staged_slots(pid, &abandoned_pack, &[id2])).unwrap().is_none(),
+        "genuinely discarded pack must return None"
+    );
+
+    // `listed_pack` stayed LISTED: its staged-cache entry must NOT be poisoned with None.
+    assert!(
+        h.objects.packs().staged_cached(pid, &listed_pack).is_some(),
+        "already-listed pack must not be tombstoned to None in staged cache"
+    );
+    assert!(
+        hub.rt.block_on(h.objects.staged_slots(pid, &listed_pack, &[id1])).unwrap().is_some(),
+        "already-listed pack must still resolve via staged_slots"
+    );
+}

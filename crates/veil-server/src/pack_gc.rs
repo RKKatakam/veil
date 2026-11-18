@@ -145,9 +145,10 @@ pub const TIER_MIN_PACKS: usize = 16;
 const COPY_SPAN: u64 = 2 << 20;
 
 /// Default grace period before a `DISCARDED` pack's storage object and row are
-/// deleted (`storage-and-cost.md` §8: long enough for in-flight reads to
-/// finish).
-pub const DEFAULT_PACK_GRACE_MS: i64 = 60_000;
+/// deleted (`storage-and-cost.md` §8: 15 minutes — generous enough that
+/// concurrent readers finish without cross-server coordination, accepting
+/// brief duplicate pack storage instead of delicate reader tracking).
+pub const DEFAULT_PACK_GRACE_MS: i64 = 900_000;
 
 /// Default grace period before an uncommitted `STAGED` upload pack is
 /// considered abandoned and discarded (`storage-and-cost.md` §8).

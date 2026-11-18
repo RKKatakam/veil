@@ -1327,9 +1327,12 @@ impl Packs {
             None => 0,
         };
         if rem_start < wanted.len() {
-            bisect_slots(store, k, hl, size, in_first, count, last_first, None, &wanted[rem_start..], every, &mut found)
+            let present = bisect_slots(store, k, hl, size, in_first, count, last_first, None, &wanted[rem_start..], every, &mut found)
                 .await
                 .with_context(|| format!("reading pack {k}"))?;
+            if !present {
+                return Ok(None);
+            }
         }
         let slots = ids.iter().filter_map(|id| Some((*id, *found.get(id)?))).collect();
         Ok(Some(StagedSlots { objects: count, size, slots }))
@@ -1339,15 +1342,13 @@ impl Packs {
     /// first (so no push can list them after), then the storage objects
     /// go, **every one tried** whatever another's delete answers (BUG-1498;
     /// the first error is returned once all were tried). A pack already
-    /// listed is left as it is. A discarded row whose pack is still stored
-    /// (a failed delete, a server stopped in between) is S29's job's to
-    /// delete (`storage-and-cost.md` §8).
+    /// listed is left as it is (BUG-2770: only packs actually transitioned
+    /// from `STAGED` to `DISCARDED` are tombstoned in `self.staged`). A
+    /// discarded row whose pack is still stored (a failed delete, a server
+    /// stopped in between) is S29's job's to delete (`storage-and-cost.md` §8).
     pub async fn discard(&self, store: &dyn BlobStore, project: i64, names: &[Arc<str>]) -> Result<()> {
         if names.is_empty() {
             return Ok(());
-        }
-        for n in names {
-            self.staged.insert(name_key(project, n), None, 64);
         }
         let gone: Vec<String> = match &self.db {
             Some(db) => {
@@ -1365,6 +1366,9 @@ impl Packs {
             }
             None => names.iter().map(|n| n.to_string()).collect(),
         };
+        for n in &gone {
+            self.staged.insert(name_key(project, n), None, 64);
+        }
         let (mut first, mut failed) = (None, 0);
         for n in &gone {
             if let Err(e) = store.delete(&key(project, n)).await {
@@ -1418,7 +1422,9 @@ type BisectStep<'a> = (usize, usize, Option<ObjectId>, Option<ObjectId>, &'a [Ob
 /// Find `wanted` (sorted, deduplicated) in entries `lo..hi` of a pack index in
 /// `store` by bisecting with ranged reads of at most [`WINDOW_ENTRIES`]
 /// entries (within one [`FIRST_READ`] buffer). With `every`, each of them
-/// must be there.
+/// must be there. Returns `Ok(false)` if the pack vanished from `store` during
+/// bisection (e.g. swept after its grace period, BUG-2771) so callers treat it
+/// as absent rather than an internal error.
 #[allow(clippy::too_many_arguments)]
 async fn bisect_slots(
     store: &dyn BlobStore,
@@ -1432,7 +1438,7 @@ async fn bisect_slots(
     wanted: &[ObjectId],
     every: bool,
     found: &mut HashMap<ObjectId, Slot>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut work: Vec<BisectStep<'_>> = vec![(lo, hi, prev_before_lo, next_after_hi, wanted)];
     while let Some((lo, hi, prev_lo, next_hi, sub)) = work.pop() {
         if lo >= hi || sub.is_empty() {
@@ -1450,7 +1456,9 @@ async fn bisect_slots(
         let start = HEAD as u64 + (w_lo * ENTRY) as u64;
         let want_bytes = (w_hi - w_lo) * ENTRY;
         let end = start + want_bytes as u64 - 1;
-        let (bytes, total) = store.get_range(key, start, end).await?.context("pack vanished while bisecting its index")?;
+        let Some((bytes, total)) = store.get_range(key, start, end).await? else {
+            return Ok(false);
+        };
         ensure!(total == size && bytes.len() == want_bytes, "pack index truncated at {start}..={end}");
         let first_id = ObjectId(bytes[..32].try_into().unwrap());
         if let Some(p) = prev_lo {
@@ -1489,7 +1497,7 @@ async fn bisect_slots(
     // found is an index that is not what it says (BUG-1499). A lookup in a
     // listed pack asks whether it holds them.
     ensure!(!every || wanted.iter().all(|id| found.contains_key(id)), "a pack's index is not sorted");
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -2771,5 +2779,111 @@ mod tests {
         let fail_res = crate::sync::packs_to_list(&hub, 3, 7, &st_fail, &touched_fail, &made_ids, &Mutex::new(Default::default())).await;
         assert!(fail_res.is_err(), "packs_to_list fails when a touched staged pack vanished");
         assert_eq!(objects.index_bound().available(), INDEXES_HELD, "all shares released when packs_to_list fails");
+    }
+
+    /// BUG-2771: if a large pack (> WINDOW_ENTRIES entries) is swept after its
+    /// grace period between `stored_slots`'s first range read and `bisect_slots`'s
+    /// follow-up range read, `stored_slots` must return `Ok(None)` (not `Err`)
+    /// so `find_paged_in` forgets the vanished pack and falls back to the
+    /// replacement pack cleanly.
+    #[tokio::test]
+    async fn bug_2771_vanished_pack_mid_bisection_returns_none_and_falls_back() {
+        struct VanishAfterFirstRange {
+            inner: Arc<crate::store::FsStore>,
+            vanish_key: String,
+            first_seen: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl BlobStore for VanishAfterFirstRange {
+            async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+                self.inner.get(key).await
+            }
+            async fn put(&self, key: &str, data: Bytes) -> Result<()> {
+                self.inner.put(key, data).await
+            }
+            async fn exists(&self, key: &str) -> Result<bool> {
+                self.inner.exists(key).await
+            }
+            async fn len(&self, key: &str) -> Result<Option<u64>> {
+                self.inner.len(key).await
+            }
+            async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+                let res = self.inner.get_range(key, start, end).await?;
+                if key == self.vanish_key && start == 0 && !self.first_seen.swap(true, Ordering::SeqCst) {
+                    // Simulate another server sweeping the replaced pack right
+                    // after the first range read completes, before bisection.
+                    self.inner.delete(key).await?;
+                }
+                Ok(res)
+            }
+            async fn delete(&self, key: &str) -> Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.inner.list(prefix).await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(crate::store::FsStore::new(dir.path()));
+        let project = 7;
+
+        // Build > WINDOW_ENTRIES objects so the index exceeds FIRST_READ and
+        // requires at least one bisection range read past the first window.
+        let count = WINDOW_ENTRIES + 50;
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            entries.push(obj(&format!("bug-2771-obj-{i}")));
+        }
+        entries.sort_by_key(|(id, _)| *id);
+        let (target_id, target_bytes) = entries.last().unwrap().clone();
+
+        let (old_bytes, _old_idx) = build(entries).unwrap();
+        let old_name: Arc<str> = Arc::from("old-large-pack");
+        let old_key = key(project, &old_name);
+        fs.put(&old_key, old_bytes.clone()).await.unwrap();
+
+        // Replacement merged pack holding `target_id`.
+        let (rep_bytes, _rep_idx) = build(vec![(target_id, target_bytes)]).unwrap();
+        let rep_name: Arc<str> = Arc::from("replacement-pack");
+        let rep_key = key(project, &rep_name);
+        fs.put(&rep_key, rep_bytes).await.unwrap();
+
+        // 1. Direct `stored_slots` call must return `Ok(None)`, not `Err`.
+        let store1 = VanishAfterFirstRange {
+            inner: fs.clone(),
+            vanish_key: old_key.clone(),
+            first_seen: std::sync::atomic::AtomicBool::new(false),
+        };
+        let packs1 = Packs::new(None);
+        let got = packs1
+            .stored_slots(&store1, project, &old_key, &[target_id], false)
+            .await
+            .expect("vanished pack mid-bisection must return Ok(None), not Err");
+        assert!(got.is_none(), "vanished pack mid-bisection must return None");
+
+        // Re-create `old_key` to verify `find_paged` forgets the vanished pack
+        // and continues to the replacement pack.
+        fs.put(&old_key, old_bytes).await.unwrap();
+        let store2: Arc<dyn BlobStore> = Arc::new(VanishAfterFirstRange {
+            inner: fs.clone(),
+            vanish_key: old_key.clone(),
+            first_seen: std::sync::atomic::AtomicBool::new(false),
+        });
+        let packs2 = Packs::new(None);
+        // Listed order: replacement (older in list) then old_name (newest, so
+        // `find_paged` probes `old_name` first as unloaded, hits the mid-bisection
+        // vanish, forgets `old_name`, and falls through to `rep_name`).
+        packs2.listed(project, vec![(rep_name.clone(), None), (old_name.clone(), None)]);
+        let reads = AtomicU64::new(0);
+        let gone_before = packs2.gone.load(Ordering::SeqCst);
+        let found = packs2
+            .find_paged(&store2, project, &target_id, &reads)
+            .await
+            .expect("find_paged must recover from a vanished pack mid-bisection");
+        let (found_name, _) = found.expect("target must be found in replacement pack");
+        assert_eq!(found_name, rep_name);
+        assert!(packs2.gone.load(Ordering::SeqCst) > gone_before, "vanished pack must be forgotten");
     }
 }
