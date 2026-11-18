@@ -1079,6 +1079,13 @@ pub(crate) async fn own_projection(
                 None => {}
             }
         }
+        // On every GC path (`mark_and_sweep_loose` before `delete_loose_chunk`
+        // in both `packs` and `objects` layouts, and `compact_batch`'s switch
+        // before `forget_packs` / `sweep_discarded`), `purge_expired_db_records`
+        // commits its `DELETE FROM projections` before any expired object is
+        // deleted: if `r` and `p0` were still stored while `parents[1..]` was
+        // swept (BUG-2721), `UPDATE ... AND NOT collapsed` matches 0 rows (and
+        // before the purge, or under BUG-2623, only marks a collapsed row true).
         if !stale.is_empty() {
             stale.sort();
             let updated = sqlx::query(
