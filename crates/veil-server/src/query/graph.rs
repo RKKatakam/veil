@@ -872,7 +872,7 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
         hub.commits.count(crate::db::Commit::Fill);
     }
     for (k, r, p) in &deferred.rows {
-        hub.caches.put_memo(project.id, k, r, p);
+        hub.caches.put_memo_row(project.id, k, r, p, deferred.collapsed.contains(r));
     }
     Ok(Some(ps))
 }
@@ -1329,8 +1329,8 @@ pub(crate) fn cache_prepared_memo(hub: &Hub, project_id: i64, memo: &PreparedMem
         if skip_vks.contains(&k.vk) {
             continue;
         }
-        for (r, p, _) in &k.projections {
-            hub.caches.put_memo(project_id, &k.vk, r, p);
+        for (r, p, collapsed) in &k.projections {
+            hub.caches.put_memo_row(project_id, &k.vk, r, p, *collapsed);
         }
         for (id, row, _) in &k.graph {
             hub.query
