@@ -439,12 +439,18 @@ impl Writer<'_> {
     }
 }
 
-fn put(src: &Source, raw: Vec<u8>, stats: &mut Stats) -> Result<SegRef> {
-    // A stopping server stores no more segments (BUG-1990): the update ends
-    // here, and the next start brings the index up to date ([`resume`]).
-    if src.hub.landing.stopping() {
-        return Err(Error::Other(anyhow::anyhow!("the server is stopping: the search index is brought up to date at its next start")));
+/// A stopping server (`landing::stop` has said so) does no more of an
+/// update (BUG-1990): it ends here, and the next start brings the index up
+/// to date ([`resume`]).
+fn stopping(hub: &Hub) -> Result<()> {
+    match hub.landing.stopping() {
+        true => Err(Error::Other(anyhow::anyhow!("the server is stopping: the search index is brought up to date at its next start"))),
+        false => Ok(()),
     }
+}
+
+fn put(src: &Source, raw: Vec<u8>, stats: &mut Stats) -> Result<SegRef> {
+    stopping(&src.hub)?;
     let id = ObjectId::hash(&raw);
     let bytes = raw.len() as u64;
     stats.segments += 1;
@@ -610,15 +616,17 @@ fn permits() -> &'static tokio::sync::Semaphore {
     P.get_or_init(|| tokio::sync::Semaphore::new(UPDATERS))
 }
 
-/// The updates at work on blocking threads in this process, per hub (by
-/// its address): what a stopping server waits for ([`stop`]).
+/// The updates at work in this process, per hub (by its address): what a
+/// stopping server waits for ([`stop`]).
 fn at_work() -> &'static Mutex<HashMap<usize, usize>> {
     static W: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
     W.get_or_init(Default::default)
 }
 
-/// One update at work: counted from before its blocking thread starts
-/// until that thread is done with it.
+/// One update at work: a landing's background task from the moment the
+/// landing asks for it to its end, and each [`update`] from its first line
+/// until its blocking thread is done (the two counts overlap: only none
+/// matters).
 struct AtWork(usize);
 
 impl AtWork {
@@ -641,7 +649,7 @@ impl Drop for AtWork {
     }
 }
 
-/// How many updates of `hub` are at work on blocking threads.
+/// How many updates of `hub` are at work.
 #[doc(hidden)]
 pub fn updates_at_work(hub: &Arc<Hub>) -> usize {
     at_work().lock().unwrap().get(&(Arc::as_ptr(hub) as usize)).copied().unwrap_or(0)
@@ -651,8 +659,9 @@ pub fn updates_at_work(hub: &Arc<Hub>) -> usize {
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The server is stopping (`landing::stop` has said so): wait for this
-/// hub's updates at work to end, at most [`STOP_WAIT`]. Each ends at the
-/// next segment it would store ([`put`]). An update runs on a blocking
+/// hub's updates at work to end, at most [`STOP_WAIT`]. None starts from
+/// then on, and one at work ends at its next step (before its turn, its
+/// next branch, the next segment it would store). An update runs on a blocking
 /// thread and stores its segments through the runtime; one still at it
 /// when the runtime shuts down made a timer on a runtime that had none
 /// any more, and its thread panicked (BUG-1990: "A Tokio 1.x context was
@@ -685,9 +694,18 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
         a.insert(key, BTreeSet::new());
     }
     let hub = hub.clone();
+    // Counted from here, before its task starts, to the task's end: a
+    // stopping server waits for it whichever step it is at ([`stop`]).
+    let at_work = AtWork::new(&hub);
     tokio::spawn(async move {
+        let _at_work = at_work;
         let mut branches = branches;
         loop {
+            // A stopping server starts no update: the next start resumes.
+            if hub.landing.stopping() {
+                active().lock().unwrap().remove(&key);
+                break;
+            }
             if let Err(e) = update(&hub, project, Some(branches)).await {
                 eprintln!("veil-server: indexing project {project} for search: {e:?}");
             }
@@ -715,7 +733,11 @@ pub async fn catch_up_project(hub: &Arc<Hub>, project: i64) -> Result<Stats> {
 /// Update the indexes of `branches` (every branch when `None`) of
 /// `project` to their tips, deriving them first if needed.
 pub async fn update(hub: &Arc<Hub>, project: i64, branches: Option<Vec<String>>) -> Result<Stats> {
+    // Counted through all of it, its wait for a turn included ([`stop`]).
+    let at_work = AtWork::new(hub);
+    stopping(hub)?;
     let _permit = permits().acquire().await.map_err(|e| Error::Other(e.into()))?;
+    stopping(hub)?;
     let targets: Vec<(String, String)> =
         sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL ORDER BY name")
             .bind(project)
@@ -769,8 +791,8 @@ pub async fn update(hub: &Arc<Hub>, project: i64, branches: Option<Vec<String>>)
             staged: None,
         },
     };
-    let at_work = AtWork::new(hub);
     tokio::task::spawn_blocking(move || {
+        // Held by the blocking thread to its end, whoever stops waiting.
         let _at_work = at_work;
         let lines = cx.lines()?;
         // Every branch in one transaction (BUG-2350: an update of the
@@ -787,6 +809,8 @@ pub async fn update(hub: &Arc<Hub>, project: i64, branches: Option<Vec<String>>)
         // is returned once all were tried (the next update tries again).
         let mut first_error = None;
         for (name, tip) in &wanted {
+            // Not one branch after another once the server stops.
+            stopping(&cx.src.hub)?;
             match code(&cx, &lines, name, *tip, &default, &mut stats).and_then(|()| names(&cx, &lines, name, *tip, &default, &mut stats)) {
                 Ok(()) => stats.branches.push(name.clone()),
                 Err(e) => {
@@ -822,6 +846,9 @@ pub async fn resume(hub: Arc<Hub>, project: Option<i64>) {
     match projects {
         Ok(projects) => {
             for p in projects {
+                if hub.landing.stopping() {
+                    return;
+                }
                 if let Err(e) = update(&hub, p, Some(Vec::new())).await {
                     eprintln!("veil-server: resuming the search index of project {p}: {e:?}");
                 }
