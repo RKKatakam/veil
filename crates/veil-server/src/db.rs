@@ -555,9 +555,8 @@ fn not_built_whole(name: &str, builds: u32) -> Error {
 /// YugabyteDB waits for every backend only inside an online index build
 /// (after its first stage, for every backend of the database to be at that
 /// stage's catalog version, which is past the last of the builds before
-/// it), so one is made here for that wait alone, of an index on the
-/// migrations' own table, dropped at once (and before it, if a start that
-/// died left one). The wait covers a transaction that wrote without the
+/// it), so one is made here for that wait alone
+/// ([`wait_for_every_session`]). The wait covers a transaction that wrote without the
 /// index and has not ended: a session keeps its catalog version for the
 /// whole of a transaction, and is waited for until the transaction ends
 /// (measured: a build on another table did not return while a session
@@ -565,9 +564,7 @@ fn not_built_whole(name: &str, builds: u32) -> Error {
 /// transaction ran another statement and stayed open). So what was
 /// written without the index is committed, or gone, when the check reads.
 async fn checked_on_yugabyte(c: &mut PgConnection, built: &[&IndexStep]) -> Result<Vec<bool>> {
-    sqlx::raw_sql(&format!("DROP INDEX IF EXISTS {SETTLE_INDEX}")).execute(&mut *c).await?;
-    sqlx::raw_sql(&format!("CREATE INDEX CONCURRENTLY {SETTLE_INDEX} ON schema_migrations (version)")).execute(&mut *c).await?;
-    sqlx::raw_sql(&format!("DROP INDEX IF EXISTS {SETTLE_INDEX}")).execute(&mut *c).await?;
+    wait_for_every_session(&mut *c).await?;
     let mut whole = Vec::with_capacity(built.len());
     for step in built {
         whole.push(match step {
@@ -578,8 +575,72 @@ async fn checked_on_yugabyte(c: &mut PgConnection, built: &[&IndexStep]) -> Resu
     Ok(whole)
 }
 
-/// The index [`checked_on_yugabyte`] builds and drops for its wait.
-const SETTLE_INDEX: &str = "veil_settle_before_index_check";
+/// On YugabyteDB: wait until every backend of the database has taken in
+/// every catalog change made so far, by an online build made for that wait
+/// alone ([`checked_on_yugabyte`]): of an index on the migrations' own
+/// table, under a name of its own, dropped at once.
+///
+/// The wait is done when the index reads **ready**: an online build sets
+/// `indisready` only after its wait for every backend at its first stage.
+/// That is what is looked at, not the statement's answer: under other
+/// databases' DDL the statement was seen to commit its live and ready
+/// stages and then fail with "relation … already exists", of its own index
+/// (13 ms after the ready stage; the database running the statement again
+/// from its start is the likely reason), and a build can also answer
+/// success with a stage lost (BUG-2571). An index that does not read ready
+/// is dropped and another is built, up to `BUILD_ATTEMPTS`; then the start
+/// fails, unrecorded.
+async fn wait_for_every_session(c: &mut PgConnection) -> Result<()> {
+    drop_settle_indexes(&mut *c).await;
+    let mut last = None;
+    for _ in 0..BUILD_ATTEMPTS {
+        let name = format!("{SETTLE_PREFIX}{}", hex::encode(veil_core::crypto::random_bytes::<8>()));
+        let built = sqlx::raw_sql(&format!("CREATE INDEX CONCURRENTLY {name} ON schema_migrations (version)")).execute(&mut *c).await;
+        // Read from the catalog itself, not through the session's names.
+        let ready: Option<bool> =
+            sqlx::query_scalar("SELECT i.indisready FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = $1").bind(&name).fetch_optional(&mut *c).await?;
+        drop_settle_indexes(&mut *c).await;
+        match (built, ready) {
+            (_, Some(true)) => return Ok(()),
+            // Its own name taken: the statement was run again before its wait.
+            (Err(e), _) if e.as_database_error().and_then(|d| d.code()).is_some_and(|code| code == "42P07") => last = Some(e.to_string()),
+            (Err(e), _) => return Err(e.into()),
+            (Ok(_), _) => last = Some("the build answered, and its index does not read ready".into()),
+        }
+        eprintln!("veil-server: the build made to wait for every session did not reach its ready stage ({}): another", last.as_deref().unwrap_or_default());
+    }
+    Err(Error::Other(anyhow::anyhow!(
+        "no online build reached its ready stage in {BUILD_ATTEMPTS} tries ({}), so the sessions that may write without a new index were not \
+         waited for and the index cannot be checked: the migration is not recorded, and the next start tries again",
+        last.unwrap_or_default()
+    )))
+}
+
+/// Drop the indexes [`wait_for_every_session`] made (this one's, one a
+/// start that died left, one whose drop the database lost). As far as it
+/// goes: one left is a small index on the migrations' table, dropped by a
+/// later start.
+async fn drop_settle_indexes(c: &mut PgConnection) {
+    let names: std::result::Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid \
+         WHERE i.indrelid = to_regclass('schema_migrations') AND c.relname LIKE $1",
+    )
+    .bind(format!("{}%", SETTLE_PREFIX.replace('_', "\\_")))
+    .fetch_all(&mut *c)
+    .await;
+    for name in names.unwrap_or_default() {
+        // Its own names only: the prefix and sixteen hex digits.
+        let own = name.strip_prefix(SETTLE_PREFIX).is_some_and(|rest| rest.len() == 16 && rest.bytes().all(|b| b.is_ascii_hexdigit()));
+        if own {
+            if let Err(e) = sqlx::raw_sql(&format!("DROP INDEX IF EXISTS {name}")).execute(&mut *c).await {
+                eprintln!("veil-server: dropping {name}, an index made to wait for every session: {e} (a later start drops it)");
+            }
+        }
+    }
+}
+
+/// What the name of an index [`wait_for_every_session`] builds begins with.
+const SETTLE_PREFIX: &str = "veil_settle_";
 
 /// Apply one [`ONLINE_INDEXES`] step, outside any transaction, under
 /// statement and lock timeouts of what is left of the migrations' deadline

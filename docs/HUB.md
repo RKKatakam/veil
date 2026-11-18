@@ -1153,7 +1153,8 @@ invite join or the person's own vouch. Server lists are hints.
   build can be lost while the build reports success). On YugabyteDB the
   indexes a migration built are then checked against their tables
   (`yb_index_check`), after a wait for every session of the database (one
-  more online build, made for its wait and dropped), and one that misses a
+  more online build, made for its wait and dropped; the wait is done when
+  that index reads ready, whatever its statement answered), and one that misses a
   row is dropped and built again within the same bound: a migration is
   recorded only over indexes that passed (BUG-2626: an online build there
   ended live, ready and valid without the rows a session wrote during its

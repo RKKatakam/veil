@@ -1135,8 +1135,6 @@ fn bug_2626_an_index_built_without_rows_written_beside_its_build_is_built_again_
     let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
     assert_eq!(with.len(), 20_050, "two thirds of the 30,000 packs are listed, and the 50 written beside the first build");
     assert!(with == without, "the index built again holds exactly the listed rows");
-    // The index built before each check, for its wait for every session, is gone.
-    assert_eq!(rt.block_on(index_stages(&url, "veil_settle_before_index_check")), None, "the runner's own index is dropped");
     drop_database(&rt, &name);
 }
 
