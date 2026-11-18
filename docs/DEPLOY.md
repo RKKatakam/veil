@@ -344,6 +344,29 @@ given up, on no push or no merge into `main`, or on missing counters; the
 `503` answers, the rate held and the requests a second against the 800
 are recorded, not judged.
 
+### 2.4 Storage only grows (v1)
+
+**Storage is append-only in v1, and there is no garbage collection**
+(owner, 2026-11-18): none runs in the servers, and there is no command to
+run one. Nothing unreachable is deleted: the objects of a deleted branch,
+of a history that was rewritten, or of a superseded search segment stay in
+the bucket. Plan its size, and its cost, for everything ever pushed.
+
+The only deletion is of uploads that were never used. An upload request is
+staged apart from the project's objects until a push names it; what a push
+does not keep (the push was refused, or never came) is discarded: by that
+push, or by the server's sweep when the push never came or a server
+stopped first. So a plain-text secret a push was refused for is never kept
+(`docs/HUB.md` §13.20, BUG-930).
+
+**The object layout.** `objects` is the default (`--object-layout`): each
+object a push keeps is written under its own key, and nothing is packed or
+merged afterwards. `packs`, the earlier layout, stays readable for data
+already written: every server reads both, and a deployment that changes
+layout converts nothing. In `packs` a merge rewrites small packs into a
+larger one and then deletes the packs it replaced; no object is dropped by
+it.
+
 ## 3. The images
 
 ```sh

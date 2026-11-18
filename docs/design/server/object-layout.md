@@ -2,6 +2,8 @@
 
 > **Status: design, not built** (2026-11-17, branch `t3/design-object-layout` from `integration` @ `24696b50`). It adds a second way for the server to keep new objects. The owner's decision (2026-11-17): add it as a **server setting** beside packs, **keep the pack code working**, **packs stay the default** until both are benchmarked side by side, and the higher storage-request cost is accepted.
 >
+> **Decided since (owner, 2026-11-18):** `objects` is the default layout, and `packs` stays readable for data already written. The side-by-side benchmark of §8.3 that was to decide the default is not run. Storage in v1 is append-only with no garbage collection, so §3.2's collector (GC's loose path) does not run: an unreferenced object under a project key stays. The only deletion is of upload containers, as §3 and §4 describe.
+>
 > **Sources of truth:** `docs/OVERVIEW.md`, `docs/VISIBILITY.md`. It builds on `storage-and-cost.md` §7–§9 and `docs/HUB.md` §13.15 (S27), §13.20 (S28), §13.37 (S29; with BUG-2602, BUG-2621 and BUG-2622 as on `t3/fable-open-bugs`).
 >
 > **Numbers:** "measured" names where it was measured. "Estimate" is arithmetic from those, not a run. Nothing was measured for this document.

@@ -91,6 +91,8 @@ In each API server's memory, never in the database:
 
 ## 8. Merging packs (S29)
 
+> **v1 (owner, 2026-11-18): storage is append-only, with no garbage collection.** Merging is built and runs in the `packs` layout; the collection below is built and tested but nothing runs it, on a schedule or by hand. `objects` is the default layout, where nothing is packed or merged; packs stay readable for data already written. The only deletion is of uploads never used (`HUB.md` §13.37).
+
 - Once a project has many small packs, a lookup has to check many indexes. A **background job per project** merges small packs into larger ones when the pack count passes a limit (start at 64), as Git hosting compacts.
 - **Garbage collection** uses the same job. Removing an object (gc, or a secret deleted from history by an admin) means rewriting the packs that hold it. A pack is never edited in place: the job writes the new pack and its index, switches the database rows in one transaction, and deletes the old pack only after a grace period, so readers mid-request still find their objects.
 - **Crash safety:** a crash at any point leaves either the old packs or the new ones listed, never neither (the same write-then-switch-then-delete order as the client's G2 maintenance).
