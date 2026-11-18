@@ -936,7 +936,13 @@ fn search_speed() {
                 last = v;
             }
             let hits = last["results"].as_array().or(last["files"].as_array()).map(|a| a.len()).unwrap_or(0);
-            println!("search_speed: {who}: {name}: p50 {:?}, p99 {:?}, work {}, {hits} hits shown", pct(times.clone(), 50), pct(times, 99), last["work"]);
+            println!(
+                "search_speed: {who}: {name}: p50 {:?}, p95 {:?}, p99 {:?}, work {}, {hits} hits shown",
+                pct(times.clone(), 50),
+                pct(times.clone(), 95),
+                pct(times, 99),
+                last["work"]
+            );
         }
     }
 }
@@ -1563,11 +1569,11 @@ fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
     let warm_project = pid + 2_000_000;
     let mut tmpl_2m = vec![0u8; (2 << 20) - 64];
     let mut x = 0x9e37_79b9_7f4a_7c15u64;
-    for chunk in tmpl_2m.chunks_exact_mut(8) {
+    for chunk in tmpl_2m.as_chunks_mut::<8>().0 {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        chunk.copy_from_slice(&x.to_le_bytes());
+        *chunk = x.to_le_bytes();
     }
     let tmpl_64k = tmpl_2m[..(64 << 10) - 64].to_vec();
     srv.rt.block_on(async {

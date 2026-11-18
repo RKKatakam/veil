@@ -31,11 +31,11 @@
 //! under the accepted policy, queries answer `indexing` (never a result
 //! outside the new access).
 //!
-//! **Bounded.** A segment is written once it holds 32 MiB of content, 4
+//! **Bounded.** A segment is written once it holds 16 MiB of content, 2
 //! million postings or 100,000 documents; segments are merged when the
 //! newest two are of similar size (sizes stay geometric), when a shard
 //! has more than 64, and a shard is rewritten when more of its documents
-//! are dead than half its live ones; a merge's inputs stay under 64 MiB,
+//! are dead than half its live ones; a merge's inputs stay under 16 MiB,
 //! and a rewrite holds one group of them and the shard's paths.
 //!
 //! **Consistent.** Segments are immutable objects (content-addressed,

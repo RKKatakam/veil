@@ -270,9 +270,11 @@ impl<V: Clone> LruCache<V> {
     }
 
     /// Insert (or replace) an entry. Entries heavier than the whole capacity
-    /// (or than the shared [`CacheBudget`]) are not cached at all.
+    /// (or than the shared [`CacheBudget`]) are not cached at all, and drop any
+    /// existing entry under `id`.
     pub fn insert(&self, id: ObjectId, value: V, weight: usize) {
         if self.budget.as_ref().is_some_and(|b| weight > b.limit) {
+            self.remove(&id);
             return;
         }
         let mut evicted = Vec::new();
@@ -281,41 +283,48 @@ impl<V: Clone> LruCache<V> {
             let mut g = self.inner.lock().unwrap();
             let inner = &mut *g;
             if weight > inner.capacity {
-                return;
-            }
-            let stamp = inner.next_stamp();
-            if let Some(&idx) = inner.map.get(&id) {
-                inner.detach(idx);
-                let old_w = inner.slots[idx].as_ref().unwrap().weight;
-                inner.sub_weight(old_w);
-                inner.evict_to(inner.capacity - weight, &mut evicted);
-                let s = inner.slots[idx].as_mut().unwrap();
-                replaced = Some(std::mem::replace(&mut s.value, value));
-                s.weight = weight;
-                s.stamp = stamp;
-                inner.push_tail(idx);
-                inner.add_weight(weight);
+                if let Some(idx) = inner.map.remove(&id) {
+                    inner.detach(idx);
+                    let slot = inner.slots[idx].take().unwrap();
+                    inner.free.push(idx);
+                    inner.sub_weight(slot.weight);
+                    replaced = Some(slot.value);
+                }
             } else {
-                inner.evict_to(inner.capacity - weight, &mut evicted);
-                let slot = Slot {
-                    id,
-                    value,
-                    weight,
-                    stamp,
-                    prev: NONE,
-                    next: NONE,
-                };
-                let idx = if let Some(free_idx) = inner.free.pop() {
-                    inner.slots[free_idx] = Some(slot);
-                    free_idx
+                let stamp = inner.next_stamp();
+                if let Some(&idx) = inner.map.get(&id) {
+                    inner.detach(idx);
+                    let old_w = inner.slots[idx].as_ref().unwrap().weight;
+                    inner.sub_weight(old_w);
+                    inner.evict_to(inner.capacity - weight, &mut evicted);
+                    let s = inner.slots[idx].as_mut().unwrap();
+                    replaced = Some(std::mem::replace(&mut s.value, value));
+                    s.weight = weight;
+                    s.stamp = stamp;
+                    inner.push_tail(idx);
+                    inner.add_weight(weight);
                 } else {
-                    let i = inner.slots.len();
-                    inner.slots.push(Some(slot));
-                    i
-                };
-                inner.map.insert(id, idx);
-                inner.push_tail(idx);
-                inner.add_weight(weight);
+                    inner.evict_to(inner.capacity - weight, &mut evicted);
+                    let slot = Slot {
+                        id,
+                        value,
+                        weight,
+                        stamp,
+                        prev: NONE,
+                        next: NONE,
+                    };
+                    let idx = if let Some(free_idx) = inner.free.pop() {
+                        inner.slots[free_idx] = Some(slot);
+                        free_idx
+                    } else {
+                        let i = inner.slots.len();
+                        inner.slots.push(Some(slot));
+                        i
+                    };
+                    inner.map.insert(id, idx);
+                    inner.push_tail(idx);
+                    inner.add_weight(weight);
+                }
             }
         }
         drop(replaced);
@@ -459,5 +468,57 @@ mod tests {
 
         drop(objects);
         assert_eq!(budget.weight(), 0);
+    }
+
+    #[test]
+    fn oversize_replace_removes_stale_entry() {
+        // Case 1: `weight > inner.capacity` (with `budget.limit` larger than `capacity`).
+        let budget = CacheBudget::new(20);
+        let c = LruCache::with_budget(10, &budget);
+        c.insert(id(1), 100, 4);
+        c.insert(id(2), 200, 3);
+        assert_eq!(c.stats().weight, 7);
+        assert_eq!(budget.weight(), 7);
+
+        c.insert(id(1), 999, 11);
+        assert_eq!(c.get(&id(1)), None);
+        assert_eq!(c.get(&id(2)), Some(200));
+        assert_eq!(
+            c.stats(),
+            CacheStats {
+                entries: 1,
+                weight: 3,
+                capacity: 10,
+            }
+        );
+        assert_eq!(budget.weight(), 3);
+
+        // Slot recycling and LRU links stay intact after oversize removal.
+        c.insert(id(3), 300, 5);
+        assert_eq!(c.get(&id(2)), Some(200));
+        assert_eq!(c.get(&id(3)), Some(300));
+        assert_eq!(c.stats().weight, 8);
+        assert_eq!(budget.weight(), 8);
+
+        // Case 2: `weight > budget.limit` (with `inner.capacity` larger than `budget.limit`).
+        let small_budget = CacheBudget::new(8);
+        let c2 = LruCache::with_budget(12, &small_budget);
+        c2.insert(id(1), 10, 5);
+        c2.insert(id(2), 20, 2);
+        assert_eq!(c2.stats().weight, 7);
+        assert_eq!(small_budget.weight(), 7);
+
+        c2.insert(id(1), 99, 9);
+        assert_eq!(c2.get(&id(1)), None);
+        assert_eq!(c2.get(&id(2)), Some(20));
+        assert_eq!(
+            c2.stats(),
+            CacheStats {
+                entries: 1,
+                weight: 2,
+                capacity: 12,
+            }
+        );
+        assert_eq!(small_budget.weight(), 2);
     }
 }
