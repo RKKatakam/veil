@@ -681,6 +681,27 @@ pub enum KeepError {
     Store(anyhow::Error),
 }
 
+/// Options for [`Objects::keep`].
+#[derive(Clone, Copy)]
+pub struct KeepOpts {
+    /// Uploader recorded on any staged pack [`ObjectLayout::Packs`] writes.
+    pub person: i64,
+    /// Worker threads used to compress `made` objects.
+    pub encode_threads: usize,
+    /// Whether the caller already holds [`DECODED_IN_FLIGHT`] for its bytes.
+    pub already_held: bool,
+}
+
+type KeepWriteSet = tokio::task::JoinSet<Result<(ObjectId, Bytes, Option<Bytes>, Option<ReadAhead>)>>;
+
+#[derive(Clone, Copy)]
+struct KeepWriteCtx {
+    project: i64,
+    gce: i64,
+    at_once: usize,
+    already_held: bool,
+}
+
 async fn encode_many(objects: Vec<(ObjectId, Bytes)>, threads: usize) -> Result<Vec<(ObjectId, Bytes, Bytes)>> {
     let threads = threads.max(1);
     tokio::task::spawn_blocking(move || {
@@ -1251,24 +1272,21 @@ impl Objects {
     ///   §5.2 threat 4), at most `BlobStore::writes_at_once` at a time, with
     ///   container reads and in-flight buffers held under
     ///   [`DECODED_IN_FLIGHT`]; returns an empty `Vec`.
-    #[allow(clippy::too_many_arguments)]
     pub async fn keep(
         &self,
         project: i64,
-        person: i64,
         containers: &[(Arc<str>, StagedSlots)],
         touched: &std::collections::HashSet<ObjectId>,
         made: Vec<(ObjectId, Bytes)>,
-        encode_threads: usize,
-        already_held: bool,
+        opts: KeepOpts,
         written: &mut Vec<Arc<str>>,
     ) -> std::result::Result<Vec<KeptPack>, KeepError> {
         match self.layout {
             ObjectLayout::Packs => {
-                self.keep_packs(project, person, containers, touched, made, encode_threads, written).await
+                self.keep_packs(project, containers, touched, made, opts, written).await
             }
             ObjectLayout::Objects => {
-                self.keep_objects(project, containers, touched, made, encode_threads, already_held).await?;
+                self.keep_objects(project, containers, touched, made, opts).await?;
                 Ok(Vec::new())
             }
         }
@@ -1277,11 +1295,10 @@ impl Objects {
     async fn keep_packs(
         &self,
         project: i64,
-        person: i64,
         containers: &[(Arc<str>, StagedSlots)],
         touched: &std::collections::HashSet<ObjectId>,
         made: Vec<(ObjectId, Bytes)>,
-        encode_threads: usize,
+        opts: KeepOpts,
         written: &mut Vec<Arc<str>>,
     ) -> std::result::Result<Vec<KeptPack>, KeepError> {
         let mut listed = Vec::new();
@@ -1313,13 +1330,10 @@ impl Objects {
             }
         }
         let to_encode: Vec<(ObjectId, Bytes)> = made.into_iter().filter(|(id, _)| kept.insert(*id)).collect();
-        let encoded_from_made = to_encode.len();
         if !to_encode.is_empty() {
-            let encoded = encode_many(to_encode, encode_threads).await.map_err(KeepError::Store)?;
+            let encoded = encode_many(to_encode, opts.encode_threads).await.map_err(KeepError::Store)?;
             own.extend(encoded.into_iter().map(|(id, _, enc)| (id, enc)));
         }
-        let own_count = own.len();
-        let _ = encoded_from_made;
         while !own.is_empty() {
             let rest = if own.len() > crate::pack::MAX_OBJECTS {
                 own.split_off(crate::pack::MAX_OBJECTS)
@@ -1327,14 +1341,13 @@ impl Objects {
                 Vec::new()
             };
             let n = own.len() as u64;
-            let (name, mut held) = self.put_pack(project, person, own).await.map_err(KeepError::Store)?;
+            let (name, mut held) = self.put_pack(project, opts.person, own).await.map_err(KeepError::Store)?;
             self.objects_kept.fetch_add(n, Ordering::Relaxed);
             held.unproject();
             written.push(name.clone());
             listed.push(KeptPack { name, size: held.size, objects: held.index.len(), held: Some(held) });
             own = rest;
         }
-        let _ = own_count;
         Ok(listed)
     }
 
@@ -1344,18 +1357,20 @@ impl Objects {
         containers: &[(Arc<str>, StagedSlots)],
         touched: &std::collections::HashSet<ObjectId>,
         made: Vec<(ObjectId, Bytes)>,
-        encode_threads: usize,
-        already_held: bool,
+        opts: KeepOpts,
     ) -> std::result::Result<(), KeepError> {
         const WHOLE_CONTAINER_MAX: u64 = 16 << 20;
         const MADE_CHUNK_OBJECTS: usize = 1024;
         const MADE_CHUNK_BYTES: usize = 16 << 20;
 
-        let gce = self.gc_epoch(project);
-        let at_once = self.store.writes_at_once().max(1);
+        let cx = KeepWriteCtx {
+            project,
+            gce: self.gc_epoch(project),
+            at_once: self.store.writes_at_once().max(1),
+            already_held: opts.already_held,
+        };
         let mut kept: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
-        let mut set: tokio::task::JoinSet<Result<(ObjectId, Bytes, Option<Bytes>, Option<ReadAhead>)>> =
-            tokio::task::JoinSet::new();
+        let mut set: KeepWriteSet = tokio::task::JoinSet::new();
 
         for (name, sp) in containers {
             let mut cached_entries: Vec<(ObjectId, Bytes)> = Vec::new();
@@ -1376,7 +1391,7 @@ impl Objects {
                 return Err(KeepError::Discarded);
             }
             for (id, enc) in cached_entries {
-                self.enqueue_keep_write(project, gce, at_once, already_held, false, &mut set, id, enc, None).await?;
+                self.enqueue_keep_write(cx, false, &mut set, id, enc, None).await?;
             }
             if uncached.is_empty() {
                 continue;
@@ -1386,8 +1401,8 @@ impl Objects {
             let read_whole = sp.size <= WHOLE_CONTAINER_MAX
                 && (uncached.len() == sp.objects || (uncached.len() > 1 && uncached_bytes.saturating_mul(2) >= sp.size));
             if read_whole {
-                self.drain_keep_writes(project, gce, &mut set).await?;
-                let _run_held = if !already_held {
+                self.drain_keep_writes(project, cx.gce, &mut set).await?;
+                let _run_held = if !opts.already_held {
                     Some(ReadAhead::wait(sp.size).await)
                 } else {
                     ReadAhead::try_take(sp.size)
@@ -1415,11 +1430,10 @@ impl Objects {
                     let enc = Bytes::copy_from_slice(crate::pack::entry(&id, s, &bytes[from..=to]).map_err(KeepError::Store)?);
                     let raw = decoded(&id, &enc).map_err(KeepError::Store)?;
                     let raw_small = (raw.len() <= RAW_CACHE_MAX_OBJECT).then_some(raw);
-                    self.enqueue_keep_write(project, gce, at_once, already_held, true, &mut set, id, enc, raw_small)
-                        .await?;
+                    self.enqueue_keep_write(cx, true, &mut set, id, enc, raw_small).await?;
                 }
                 drop(bytes);
-                self.drain_keep_writes(project, gce, &mut set).await?;
+                self.drain_keep_writes(project, cx.gce, &mut set).await?;
             } else {
                 let mut runs: Vec<Run> = Vec::new();
                 let mut run: Run = Vec::new();
@@ -1439,8 +1453,8 @@ impl Objects {
                 for run in runs {
                     let (start, end) = (run[0].1.offset, run.last().expect("a run").1.last());
                     let span = end - start + 1;
-                    self.drain_keep_writes(project, gce, &mut set).await?;
-                    let _run_held = if !already_held {
+                    self.drain_keep_writes(project, cx.gce, &mut set).await?;
+                    let _run_held = if !opts.already_held {
                         Some(ReadAhead::wait(span).await)
                     } else {
                         ReadAhead::try_take(span)
@@ -1461,11 +1475,10 @@ impl Objects {
                             Bytes::copy_from_slice(crate::pack::entry(&id, s, &bytes[from..=to]).map_err(KeepError::Store)?);
                         let raw = decoded(&id, &enc).map_err(KeepError::Store)?;
                         let raw_small = (raw.len() <= RAW_CACHE_MAX_OBJECT).then_some(raw);
-                        self.enqueue_keep_write(project, gce, at_once, already_held, true, &mut set, id, enc, raw_small)
-                            .await?;
+                        self.enqueue_keep_write(cx, true, &mut set, id, enc, raw_small).await?;
                     }
                     drop(bytes);
-                    self.drain_keep_writes(project, gce, &mut set).await?;
+                    self.drain_keep_writes(project, cx.gce, &mut set).await?;
                 }
             }
         }
@@ -1479,49 +1492,43 @@ impl Objects {
             chunk_bytes += raw.len();
             chunk.push((id, raw));
             if chunk.len() >= MADE_CHUNK_OBJECTS || chunk_bytes >= MADE_CHUNK_BYTES {
-                let encoded = encode_many(std::mem::take(&mut chunk), encode_threads)
+                let encoded = encode_many(std::mem::take(&mut chunk), opts.encode_threads)
                     .await
                     .map_err(KeepError::Store)?;
                 chunk_bytes = 0;
                 for (id, raw, enc) in encoded {
                     let raw_small = (raw.len() <= RAW_CACHE_MAX_OBJECT).then_some(raw);
-                    self.enqueue_keep_write(project, gce, at_once, already_held, false, &mut set, id, enc, raw_small)
-                        .await?;
+                    self.enqueue_keep_write(cx, false, &mut set, id, enc, raw_small).await?;
                 }
             }
         }
         if !chunk.is_empty() {
-            let encoded = encode_many(chunk, encode_threads).await.map_err(KeepError::Store)?;
+            let encoded = encode_many(chunk, opts.encode_threads).await.map_err(KeepError::Store)?;
             for (id, raw, enc) in encoded {
                 let raw_small = (raw.len() <= RAW_CACHE_MAX_OBJECT).then_some(raw);
-                self.enqueue_keep_write(project, gce, at_once, already_held, false, &mut set, id, enc, raw_small)
-                    .await?;
+                self.enqueue_keep_write(cx, false, &mut set, id, enc, raw_small).await?;
             }
         }
 
-        self.drain_keep_writes(project, gce, &mut set).await
+        self.drain_keep_writes(project, cx.gce, &mut set).await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn enqueue_keep_write(
         &self,
-        project: i64,
-        gce: i64,
-        at_once: usize,
-        already_held: bool,
+        cx: KeepWriteCtx,
         covered_by_run: bool,
-        set: &mut tokio::task::JoinSet<Result<(ObjectId, Bytes, Option<Bytes>, Option<ReadAhead>)>>,
+        set: &mut KeepWriteSet,
         id: ObjectId,
         enc: Bytes,
         raw_small: Option<Bytes>,
     ) -> std::result::Result<(), KeepError> {
-        while set.len() >= at_once {
-            self.join_one_keep_write(project, gce, set).await?;
+        while set.len() >= cx.at_once {
+            self.join_one_keep_write(cx.project, cx.gce, set).await?;
         }
         let cost = enc.len() as u64;
         let permit = if covered_by_run {
             None
-        } else if set.is_empty() && !already_held {
+        } else if set.is_empty() && !cx.already_held {
             Some(ReadAhead::wait(cost).await)
         } else {
             loop {
@@ -1529,7 +1536,7 @@ impl Objects {
                     break Some(p);
                 }
                 if !set.is_empty() {
-                    self.join_one_keep_write(project, gce, set).await?;
+                    self.join_one_keep_write(cx.project, cx.gce, set).await?;
                 } else {
                     break None;
                 }
@@ -1539,7 +1546,7 @@ impl Objects {
         count_write(self, enc.len());
         bump(&self.objects_kept);
         let store = self.store.clone();
-        let key = object_key(project, &id);
+        let key = object_key(cx.project, &id);
         set.spawn(async move {
             store.put(&key, enc.clone()).await?;
             Ok((id, enc, raw_small, permit))
@@ -1551,7 +1558,7 @@ impl Objects {
         &self,
         project: i64,
         gce: i64,
-        set: &mut tokio::task::JoinSet<Result<(ObjectId, Bytes, Option<Bytes>, Option<ReadAhead>)>>,
+        set: &mut KeepWriteSet,
     ) -> std::result::Result<(), KeepError> {
         let Some(done) = set.join_next().await else { return Ok(()) };
         let (id, enc, raw_small, _permit) = done.map_err(|e| KeepError::Store(e.into()))?.map_err(KeepError::Store)?;
@@ -1567,7 +1574,7 @@ impl Objects {
         &self,
         project: i64,
         gce: i64,
-        set: &mut tokio::task::JoinSet<Result<(ObjectId, Bytes, Option<Bytes>, Option<ReadAhead>)>>,
+        set: &mut KeepWriteSet,
     ) -> std::result::Result<(), KeepError> {
         while !set.is_empty() {
             self.join_one_keep_write(project, gce, set).await?;
@@ -2823,19 +2830,11 @@ mod tests {
         let slots = objects.staged_slots(1, &cname, &[a_id, b_id, unread_id]).await.unwrap().unwrap();
         let staged = [(cname, slots)];
         let touched: std::collections::HashSet<ObjectId> = [a_id, b_id].into_iter().collect();
+        let opts = KeepOpts { person: 7, encode_threads: 1, already_held: false };
         let mut written = Vec::new();
-        let listed = own(objects.keep(
-            1,
-            7,
-            &staged,
-            &touched,
-            vec![(made_id, made_raw.clone())],
-            1,
-            false,
-            &mut written,
-        ))
-        .await
-        .unwrap();
+        let listed = own(objects.keep(1, &staged, &touched, vec![(made_id, made_raw.clone())], opts, &mut written))
+            .await
+            .unwrap();
         assert!(listed.is_empty() && written.is_empty(), "objects layout lists and writes no pack");
         assert_eq!(objects.objects_kept.load(Ordering::Relaxed), 3);
         assert_eq!(objects.own_writes.load(Ordering::Relaxed), 3, "stage was outside own; 3 kept objects inside own");
@@ -2852,12 +2851,10 @@ mod tests {
         let touched_again: std::collections::HashSet<ObjectId> = [a_id].into_iter().collect();
         let listed2 = own(objects.keep(
             1,
-            7,
             &staged,
             &touched_again,
             vec![(made_id, made_raw.clone())],
-            1,
-            false,
+            opts,
             &mut written,
         ))
         .await
@@ -2876,6 +2873,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = Arc::new(FsStore::new(dir.path()));
         let writer = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
+        let opts = KeepOpts { person: 7, encode_threads: 1, already_held: false };
 
         let mk = |seed: u64, payload_len: usize| {
             let mut v = Vec::with_capacity(10 + payload_len);
@@ -2905,7 +2903,7 @@ mod tests {
         let reads_before = cold.reads.load(Ordering::Relaxed);
         let mut written = Vec::new();
         let touched_small: std::collections::HashSet<ObjectId> = [s1_id, s2_id].into_iter().collect();
-        cold.keep(1, 7, &small_staged, &touched_small, Vec::new(), 1, false, &mut written)
+        cold.keep(1, &small_staged, &touched_small, Vec::new(), opts, &mut written)
             .await
             .unwrap();
         assert_eq!(cold.reads.load(Ordering::Relaxed) - reads_before, 1, "small container read whole in 1 read");
@@ -2925,7 +2923,7 @@ mod tests {
         let cold2 = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
         let touched_large: std::collections::HashSet<ObjectId> = [l_keep_id].into_iter().collect();
         cold2
-            .keep(2, 7, &[(large_name, large_slots)], &touched_large, Vec::new(), 1, false, &mut written)
+            .keep(2, &[(large_name, large_slots)], &touched_large, Vec::new(), opts, &mut written)
             .await
             .unwrap();
         assert!(fs.exists(&object_key(2, &l_keep_id)).await.unwrap());
@@ -2935,7 +2933,7 @@ mod tests {
         // 3. Discarded / missing container returns Err(KeepError::Discarded) whether cached or uncached.
         writer.discard(1, std::slice::from_ref(&small_staged[0].0)).await.unwrap();
         let Err(err_cached) = writer
-            .keep(1, 7, &small_staged, &touched_small, Vec::new(), 1, false, &mut written)
+            .keep(1, &small_staged, &touched_small, Vec::new(), opts, &mut written)
             .await
         else {
             panic!("deleted container must fail even when staged entries are cached");
@@ -2943,7 +2941,7 @@ mod tests {
         assert!(matches!(err_cached, KeepError::Discarded), "expected Discarded, got {err_cached:?}");
         let cold3 = Objects::with_layout(fs, 1 << 20, None, ObjectLayout::Objects);
         let Err(err_uncached) = cold3
-            .keep(1, 7, &small_staged, &touched_small, Vec::new(), 1, false, &mut written)
+            .keep(1, &small_staged, &touched_small, Vec::new(), opts, &mut written)
             .await
         else {
             panic!("deleted container must fail when uncached");

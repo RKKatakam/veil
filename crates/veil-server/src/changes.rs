@@ -935,17 +935,8 @@ const PACKED_BYTES: usize = 8 << 20;
 /// returning an empty `Vec`.
 async fn store_packed(hub: &Arc<Hub>, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<Vec<(Arc<str>, crate::pack::Held)>> {
     let mut written = Vec::new();
-    match crate::store::own(hub.objects.keep(
-        project,
-        person,
-        &[],
-        &HashSet::new(),
-        objects,
-        1,
-        true,
-        &mut written,
-    ))
-    .await
+    let opts = crate::store::KeepOpts { person, encode_threads: 1, already_held: true };
+    match crate::store::own(hub.objects.keep(project, &[], &HashSet::new(), objects, opts, &mut written)).await
     {
         Ok(kept) => Ok(kept.into_iter().filter_map(|p| Some((p.name, p.held?))).collect()),
         Err(crate::store::KeepError::Discarded) => {

@@ -544,9 +544,10 @@ async fn store(hub: &Arc<Hub>, project: i64, person: i64, objects: Vec<(ObjectId
         return Ok(Vec::new());
     }
     let mut written = Vec::new();
+    let opts = crate::store::KeepOpts { person, encode_threads: build_threads(), already_held: false };
     match hub
         .objects
-        .keep(project, person, &[], &HashSet::new(), objects, build_threads(), false, &mut written)
+        .keep(project, &[], &HashSet::new(), objects, opts, &mut written)
         .await
     {
         Ok(kept) => Ok(kept.into_iter().filter_map(|p| Some((p.name, p.held?))).collect()),

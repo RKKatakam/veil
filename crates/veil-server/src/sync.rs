@@ -3980,9 +3980,10 @@ pub(crate) async fn packs_to_list(
         made.iter().filter_map(|id| Some((*id, m.get(id)?.clone()))).collect()
     };
     let mut written = Vec::new();
+    let opts = crate::store::KeepOpts { person, encode_threads: 1, already_held: false };
     let res = hub
         .objects
-        .keep(project, person, &st.packs, touched, made_objects, 1, false, &mut written)
+        .keep(project, &st.packs, touched, made_objects, opts, &mut written)
         .await;
     if !written.is_empty() {
         progress.lock().unwrap().written.extend(written);

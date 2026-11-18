@@ -1488,7 +1488,7 @@ fn guarantee_11_pushes_schedule_no_merge_leftover_small_packs_merge_once_and_sta
             hub_packs.blob_store().delete(&veil_server::pack::key(pid_left, &combined_pack)).await.unwrap();
         });
         let total = pack_counts(&hub_packs, pid_left).1 as usize;
-        assert!(total >= leftover_blobs + 1, "expected >= {} listed small packs, got {total}", leftover_blobs + 1);
+        assert!(total > leftover_blobs, "expected > {leftover_blobs} listed small packs, got {total}");
         (p_left, pid_left, total)
     };
 
