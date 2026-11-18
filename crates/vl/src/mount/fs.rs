@@ -2749,4 +2749,94 @@ mod tests {
         assert!(m.fs.unseen().is_empty());
         assert_eq!(m.journal.lock().unwrap().last().unwrap(), "unseen ");
     }
+
+    /// BUG-1983: deleting 3,000 files while listing in small FUSE-sized chunks
+    /// skips nothing even when periodic recordings (`reconcile`), lower-layer
+    /// refreshes (`refresh_lower`), child `forget`s, and delayed async
+    /// `release`s arrive mid-deletion.
+    #[test]
+    fn bug_1983_deleting_while_listing_under_reconcile_refresh_forget_and_delayed_release_skips_nothing() {
+        let m = mem(&[]);
+        let dir = m.fs.mkdir(ROOT, os("many")).unwrap().ino;
+        let mut pending_releases: Vec<(u64, u64)> = Vec::new();
+        for i in 0..3000u32 {
+            let name = format!("file-{i:05}.txt");
+            let (a, fh) = m.fs.create(dir, os(&name), false, false).unwrap();
+            m.fs.write(fh, 0, b"x").unwrap();
+            m.fs.flush(fh).unwrap();
+            if i % 7 == 0 {
+                // Leave some async `FUSE_RELEASE` calls pending past unlink.
+                pending_releases.push((a.ino, fh));
+            } else {
+                m.fs.release(fh).unwrap();
+            }
+        }
+        // Snapshot the first 1,500 files into a lower layer before deletion
+        // starts (simulating a periodic recording firing mid-write).
+        let snap1: Vec<(String, &'static [u8])> = (0..1500).map(|i| (format!("many/file-{i:05}.txt"), &b"x"[..])).collect();
+        let lower1 = Arc::new(MemoryBackend::from_files(snap1.iter().map(|(k, v)| (k.as_str(), *v))).unwrap());
+        m.fs.reconcile(lower1.clone()).unwrap();
+
+        let dh = m.fs.opendir(dir).unwrap();
+        let mut offset = 0u64;
+        let mut seen = BTreeSet::new();
+        let mut unlinked = 0usize;
+        let mut chunk = 0usize;
+        loop {
+            let batch = m.fs.readdir_at(dh, dir, offset).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            // Simulate a small kernel `getdents64` buffer (~40 entries per call).
+            let take = batch.len().min(40);
+            for (child, next, name, kind) in batch.into_iter().take(take) {
+                offset = next;
+                if name == "." || name == ".." {
+                    continue;
+                }
+                assert_eq!(kind, NodeKind::File);
+                assert!(seen.insert(name.clone()), "duplicate entry {name} at offset {offset}");
+                m.fs.unlink(dir, os(&name)).unwrap();
+                m.fs.forget(child, 1);
+                unlinked += 1;
+            }
+            chunk += 1;
+            if chunk == 20 {
+                // Interleave a second periodic recording mid-deletion: whatever
+                // remains moves into a new lower layer.
+                let remaining: Vec<(String, &'static [u8])> = (0..3000)
+                    .map(|i| format!("file-{i:05}.txt"))
+                    .filter(|n| !seen.contains(n))
+                    .map(|n| (format!("many/{n}"), &b"x"[..]))
+                    .collect();
+                let lower2 = Arc::new(MemoryBackend::from_files(remaining.iter().map(|(k, v)| (k.as_str(), *v))).unwrap());
+                m.fs.reconcile(lower2).unwrap();
+            } else if chunk == 40 {
+                // Interleave a lower-layer refresh mid-deletion.
+                let remaining: Vec<(String, &'static [u8])> = (0..3000)
+                    .map(|i| format!("file-{i:05}.txt"))
+                    .filter(|n| !seen.contains(n))
+                    .map(|n| (format!("many/{n}"), &b"x"[..]))
+                    .collect();
+                let refreshed = Arc::new(MemoryBackend::from_files(remaining.iter().map(|(k, v)| (k.as_str(), *v))).unwrap());
+                m.fs.refresh_lower(refreshed);
+            }
+            // Drain a few delayed releases after their files were unlinked.
+            for _ in 0..5 {
+                if let Some((ino, fh)) = pending_releases.pop() {
+                    m.fs.release(fh).unwrap();
+                    m.fs.forget(ino, 1);
+                }
+            }
+        }
+        m.fs.releasedir(dh);
+        for (ino, fh) in pending_releases {
+            m.fs.release(fh).unwrap();
+            m.fs.forget(ino, 1);
+        }
+        assert_eq!(unlinked, 3000);
+        assert_eq!(seen.len(), 3000);
+        m.fs.rmdir(ROOT, os("many")).unwrap();
+        assert!(m.ino("many").is_err());
+    }
 }
