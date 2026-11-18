@@ -218,16 +218,35 @@ impl Staged {
 }
 
 impl Source {
-    pub fn raw(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
+    /// Is `id` an object uploaded in this request (`pending` or a staged pack)?
+    /// Server-side reads of objects already in `hub.objects` return `store_err`
+    /// (`VeilError::Io` -> logged `500 internal`) when missing or corrupt,
+    /// whereas client uploads keep `VeilError::Missing` / `VeilError::Corrupt`
+    /// for `Error::client_object` (`400 bad_request`: BUG-2681).
+    pub(crate) fn is_client_upload(&self, id: &ObjectId) -> bool {
+        self.pending.contains_key(id) || self.staged.as_ref().is_some_and(|st| st.at.contains_key(id))
+    }
+
+    fn stored_missing(id: &ObjectId) -> VeilError {
+        store_err(anyhow::anyhow!("stored object {id} is missing"))
+    }
+
+    fn stored_corrupt(id: &ObjectId, m: impl std::fmt::Display) -> VeilError {
+        store_err(anyhow::anyhow!("stored object {id} is corrupt: {m}"))
+    }
+
+    /// Object `id` when absence in the store is a valid `None` (`ChainSource`,
+    /// `narrowing_gate`, `resolve_for_in`).
+    pub(crate) fn present_raw(&self, id: &ObjectId) -> veil_core::Result<Option<Bytes>> {
         if let Some(raw) = self.pending.get(id) {
-            return Ok(raw.clone());
+            return Ok(Some(raw.clone()));
         }
         if let Some(b) = builtin(id) {
-            return Ok(b);
+            return Ok(Some(b));
         }
         if let Some(st) = &self.staged {
             if let Some(raw) = st.made.lock().unwrap().get(id) {
-                return Ok(raw.clone());
+                return Ok(Some(raw.clone()));
             }
             if let Some((name, slot)) = st.at.get(id) {
                 // From its staged pack only, never from the project's store
@@ -235,17 +254,21 @@ impl Source {
                 // upload).
                 let got = self.rt.block_on(self.hub.objects.get_staged(self.project, name, *slot, id));
                 let Some((_, raw)) = got.map_err(store_err)? else {
-                    return Err(VeilError::Missing(*id));
+                    return Ok(None);
                 };
                 st.touched.lock().unwrap().insert(*id);
-                return Ok(raw);
+                return Ok(Some(raw));
             }
         }
-        self.hub
-            .objects
-            .get_blocking(&self.rt, self.project, id)
-            .map_err(store_err)?
-            .ok_or(VeilError::Missing(*id))
+        self.hub.objects.get_blocking(&self.rt, self.project, id).map_err(store_err)
+    }
+
+    pub fn raw(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
+        match self.present_raw(id)? {
+            Some(raw) => Ok(raw),
+            None if self.is_client_upload(id) => Err(VeilError::Missing(*id)),
+            None => Err(Self::stored_missing(id)),
+        }
     }
 
     pub fn raw_ephemeral(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
@@ -264,7 +287,7 @@ impl Source {
             .objects
             .get_ephemeral_blocking(&self.rt, self.project, id)
             .map_err(store_err)?
-            .ok_or(VeilError::Missing(*id))
+            .ok_or_else(|| Self::stored_missing(id))
     }
 
     /// Object `id` as stored ([`crate::store::Objects::get_encoded`]).
@@ -275,41 +298,53 @@ impl Source {
         self.rt
             .block_on(self.hub.objects.get_encoded(self.project, id))
             .map_err(store_err)?
-            .ok_or(VeilError::Missing(*id))
+            .ok_or_else(|| Self::stored_missing(id))
     }
 
-    pub fn snapshot(&self, id: &ObjectId) -> veil_core::Result<Arc<Snapshot>> {
+    pub(crate) fn decode_bytes(&self, id: &ObjectId, raw: &[u8]) -> veil_core::Result<Object> {
+        let client = self.is_client_upload(id);
+        Object::decode(raw).map_err(|e| match e {
+            VeilError::Corrupt(_, m) if client => VeilError::Corrupt(id.hex(), m),
+            other if client => other,
+            other => Self::stored_corrupt(id, other),
+        })
+    }
+
+    pub(crate) fn decode(&self, id: &ObjectId) -> veil_core::Result<Object> {
+        let raw = self.raw(id)?;
+        self.decode_bytes(id, &raw)
+    }
+
+    fn decode_snapshot_bytes(&self, id: &ObjectId, raw: &[u8]) -> veil_core::Result<Arc<Snapshot>> {
         if self.pending.contains_key(id) {
-            return match Object::decode(&self.raw(id)?)? {
+            return match self.decode_bytes(id, raw)? {
                 Object::Snapshot(s) => Ok(Arc::new(s)),
                 o => Err(VeilError::Corrupt(id.hex(), format!("expected a snapshot, found a {}", o.kind_name()))),
             };
         }
-        let raw = self.raw(id)?;
-        Object::decode_snapshot_trusted(&raw).map(Arc::new).map_err(|e| match e {
-            VeilError::Corrupt(_, m) => VeilError::Corrupt(id.hex(), m),
-            e => e,
+        let client = self.is_client_upload(id);
+        Object::decode_snapshot_trusted(raw).map(Arc::new).map_err(|e| match e {
+            VeilError::Corrupt(_, m) if client => VeilError::Corrupt(id.hex(), m),
+            other if client => other,
+            other => Self::stored_corrupt(id, other),
         })
     }
-}
 
-/// Keep a store error's cause (`pack::IndexesFull` included: BUG-1622)
-/// through [`VeilError`].
-fn store_err(e: anyhow::Error) -> VeilError {
-    VeilError::Io {
-        path: "object store".into(),
-        source: match e.downcast::<crate::pack::IndexesFull>() {
-            Ok(full) => std::io::Error::other(full),
-            Err(e) => match e.downcast::<std::io::Error>() {
-                Ok(io) => io,
-                Err(e) => std::io::Error::other(e),
-            },
-        },
+    pub fn snapshot(&self, id: &ObjectId) -> veil_core::Result<Arc<Snapshot>> {
+        let raw = self.raw(id)?;
+        self.decode_snapshot_bytes(id, &raw)
     }
-}
 
-impl TreeSource for Source {
-    fn node(&self, id: &ObjectId) -> veil_core::Result<Node> {
+    /// Stored or staged snapshot `id` when absence in the store is a valid
+    /// `None` (`resolve_for_in`).
+    pub(crate) fn present_snapshot(&self, id: &ObjectId) -> veil_core::Result<Option<Arc<Snapshot>>> {
+        let Some(raw) = self.present_raw(id)? else {
+            return Ok(None);
+        };
+        self.decode_snapshot_bytes(id, &raw).map(Some)
+    }
+
+    fn cached_node(&self, id: &ObjectId) -> (ObjectId, Option<Node>) {
         // A push's uploads and made trees are cached under keys of their
         // own, never as the project's.
         let staged = self.staged.as_ref().and_then(|st| st.tree_key(self.project, id).map(|k| (st, k)));
@@ -323,13 +358,16 @@ impl TreeSource for Source {
                     st.touched.lock().unwrap().insert(*id);
                 }
             }
-            return Ok(Node::Tree(t.0, t.1));
+            return (ck, Some(Node::Tree(t.0, t.1)));
         }
-        let raw = self.raw(id)?;
-        let Some(enc) = Object::tree_encoding(&raw) else {
+        (ck, None)
+    }
+
+    fn decode_node(&self, id: &ObjectId, ck: ObjectId, raw: &[u8]) -> veil_core::Result<Node> {
+        let Some(enc) = Object::tree_encoding(raw) else {
             return Ok(Node::Leaf);
         };
-        match Object::decode(&raw)? {
+        match self.decode_bytes(id, raw)? {
             Object::Tree(t) => {
                 let t = Arc::new(t);
                 self.hub.trees.insert(ck, (t.clone(), enc), tree_weight(&t));
@@ -337,6 +375,48 @@ impl TreeSource for Source {
             }
             _ => Ok(Node::Leaf),
         }
+    }
+
+    /// Tree `id` when absence in the store is a valid `None` (`ChainSource`,
+    /// `narrowing_gate`).
+    pub(crate) fn present_tree(&self, id: &ObjectId) -> veil_core::Result<Option<Arc<Tree>>> {
+        let (ck, cached) = self.cached_node(id);
+        if let Some(Node::Tree(t, _)) = cached {
+            return Ok(Some(t));
+        }
+        let Some(raw) = self.present_raw(id)? else {
+            return Ok(None);
+        };
+        Ok(match self.decode_node(id, ck, &raw)? {
+            Node::Tree(t, _) => Some(t),
+            Node::Leaf => None,
+        })
+    }
+}
+
+/// Keep a store error's cause (`pack::IndexesFull` included: BUG-1622)
+/// through [`VeilError`].
+fn store_err(e: anyhow::Error) -> VeilError {
+    VeilError::Io {
+        path: "object store".into(),
+        source: match e.downcast::<crate::pack::IndexesFull>() {
+            Ok(full) => std::io::Error::other(full),
+            Err(e) => match e.downcast::<std::io::Error>() {
+                Ok(io) => io,
+                Err(e) => std::io::Error::other(crate::error::AnyhowCause(e)),
+            },
+        },
+    }
+}
+
+impl TreeSource for Source {
+    fn node(&self, id: &ObjectId) -> veil_core::Result<Node> {
+        let (ck, cached) = self.cached_node(id);
+        if let Some(node) = cached {
+            return Ok(node);
+        }
+        let raw = self.raw(id)?;
+        self.decode_node(id, ck, &raw)
     }
 }
 
@@ -1022,12 +1102,7 @@ async fn resolve_for_mode(
     }
     // Some view's projection is `id` (asked above).
     let named = *id;
-    let cid = blocking(hub, project.id, move |src| match src.snapshot(&named) {
-        Ok(s) => Ok(Some(s.change_id.to_string())),
-        Err(VeilError::Missing(_)) => Ok(None),
-        Err(e) => Err(e.into()),
-    })
-    .await?;
+    let cid = blocking(hub, project.id, move |src| Ok(src.present_snapshot(&named)?.map(|s| s.change_id.to_string()))).await?;
     let Some(cid) = cid else { return Ok(None) };
     let latest: Option<String> = sqlx::query_scalar("SELECT snapshot FROM change_refs WHERE project_id = $1 AND change_id = $2 AND created_by = $3")
         .bind(project.id)
@@ -1632,7 +1707,7 @@ fn differs_where(
     use std::collections::{BTreeMap, BTreeSet};
     fn entries(get: Trees, id: Option<ObjectId>) -> Result<BTreeMap<String, veil_core::TreeEntry>> {
         let Some(id) = id else { return Ok(BTreeMap::new()) };
-        Ok(match get(&id)? {
+        Ok(match get(&id).map_err(Error::client_object)? {
             Some(t) => t.entries.iter().map(|e| (e.name.clone(), e.clone())).collect(),
             None => BTreeMap::new(),
         })
@@ -1951,10 +2026,7 @@ pub(crate) fn narrowing_gate(src: &Source, view: &View, pushed: ObjectId, parent
             if let Some((t, _)) = made.get(id) {
                 return Ok(Some(t.clone()));
             }
-            match stored_tree(src, id) {
-                Err(VeilError::Missing(_)) => Ok(None),
-                r => r,
-            }
+            src.present_tree(id)
         };
         if differs_outside_narrowing(&get, view, seen, pushed)? {
             return Err(agent_refusal(NARROWED_WRITE));
@@ -1981,13 +2053,13 @@ fn personal_key(path: &str) -> bool {
 
 /// The text of the `.veilpolicy` at the root of real tree `tree`.
 pub(crate) fn policy_text(src: &Source, tree: &ObjectId) -> Result<String> {
-    let Node::Tree(t, _) = src.node(tree)? else {
+    let Node::Tree(t, _) = src.node(tree).map_err(Error::client_object)? else {
         return Ok(String::new());
     };
     let Some(e) = t.get(POLICY_FILE) else {
         return Ok(String::new());
     };
-    match Object::decode(&src.raw(&e.id)?)? {
+    match src.decode(&e.id).map_err(Error::client_object)? {
         Object::Blob(b) if e.kind == EntryKind::File => Ok(String::from_utf8_lossy(&b).into_owned()),
         _ => Err(Error::forbidden(".veilpolicy must be a plain-text file")),
     }
@@ -1998,7 +2070,7 @@ pub(crate) fn entry_at(src: &Source, tree: &ObjectId, path: &str) -> Result<Opti
     let mut cur = *tree;
     let parts: Vec<&str> = path.split('/').collect();
     for (i, part) in parts.iter().enumerate() {
-        let Node::Tree(t, _) = src.node(&cur)? else {
+        let Node::Tree(t, _) = src.node(&cur).map_err(Error::client_object)? else {
             return Ok(None);
         };
         let Some(e) = t.get(part) else {
@@ -2017,7 +2089,7 @@ pub(crate) fn entry_at(src: &Source, tree: &ObjectId, path: &str) -> Result<Opti
 pub(crate) fn named_ids(src: &Source, e: &veil_core::TreeEntry) -> Result<Vec<ObjectId>> {
     let mut out = vec![e.id];
     if e.kind == EntryKind::Conflict {
-        if let Object::Conflict(c) = Object::decode(&src.raw(&e.id)?)? {
+        if let Object::Conflict(c) = src.decode(&e.id).map_err(Error::client_object)? {
             out.extend(c.referenced_ids());
         }
     }
@@ -2296,14 +2368,14 @@ fn check_changes(
         // conflict, with its label (BUG-931).
         let contents: Vec<(ObjectId, Visibility, u64)> = match e.kind {
             k if k.holds_blob() => vec![(e.id, e.visibility.clone(), e.size)],
-            EntryKind::Conflict => match Object::decode(&src.raw(&e.id)?)? {
+            EntryKind::Conflict => match src.decode(&e.id).map_err(Error::client_object)? {
                 Object::Conflict(cf) => cf.adds.iter().chain(&cf.removes).flatten().map(|t| (t.id, t.visibility.clone(), t.size)).collect(),
                 _ => return Err(Error::bad_request(format!("'{}': a conflict entry names something else", c.path))),
             },
             // A directory entry that is itself a change (its object could
             // not be walked as a directory) names a tree (BUG-2622).
             EntryKind::Dir => {
-                if !matches!(Object::decode(&src.raw(&e.id)?), Ok(Object::Tree(_))) {
+                if !matches!(src.decode(&e.id).map_err(Error::client_object)?, Object::Tree(_)) {
                     return Err(Error::bad_request(format!("'{}': a directory entry names something that is not a directory", c.path)));
                 }
                 continue;
@@ -2317,7 +2389,7 @@ fn check_changes(
         // may turn `public` into `public!`, which is the same access.
         let unscanned = class.allow_secrets && (admin || accepted.classify(&vp, false).allow_secrets);
         for (id, visibility, size) in contents {
-            let raw = src.raw(&id)?;
+            let raw = src.raw(&id).map_err(Error::client_object)?;
             // What a file or symlink entry, or a conflict's term, names is
             // a file's content: a blob, or a secret's sealed envelope
             // (BUG-2622). Pack GC keeps it as a leaf without reading it, so
@@ -2368,7 +2440,7 @@ fn check_changes(
             // scans before it records one. Findings name the rule and the
             // line, never the text.
             if !sealed && !unscanned {
-                if let Object::Blob(data) = Object::decode(&raw)? {
+                if let Object::Blob(data) = src.decode_bytes(&id, &raw).map_err(Error::client_object)? {
                     if let Some(f) = veil_core::secrets::scan(&data).first() {
                         return Err(Error::forbidden(format!(
                             "'{}' looks like it holds a secret ({}, line {}): put secrets in a secret file such as .env, \
@@ -2404,7 +2476,7 @@ fn sealed_secret_here(src: &Source, c: &Change, changes: &[Change], parents: &[O
             for p in parents {
                 let Some(e) = entry_at(src, &src.snapshot(p)?.tree, path)? else { continue };
                 let sealed = match e.kind {
-                    EntryKind::Conflict => match Object::decode(&src.raw(&e.id)?)? {
+                    EntryKind::Conflict => match src.decode(&e.id)? {
                         Object::Conflict(cf) => cf.adds.iter().chain(&cf.removes).flatten().any(|t| !t.visibility.is_public()),
                         _ => false,
                     },
@@ -2470,11 +2542,11 @@ pub(crate) fn complete(
     // (BUG-1392, BUG-1481, BUG-1539, BUG-1540).
     narrowing_gate(src, &view, n.tree, &ptrees)?;
     let mut g = Graft::new(src, &view).proving(uploaded, ptrees.clone());
-    let real_tree = g.root(n.tree, Some(ptrees[0]))?;
+    let real_tree = g.root(n.tree, Some(ptrees[0])).map_err(Error::client_object)?;
     // A merge must not change what the pusher cannot see.
     for other in &ptrees[1..] {
         let mut g2 = Graft::new(src, &view).proving(uploaded, ptrees.clone());
-        if g2.root(n.tree, Some(*other))? != real_tree && !admin {
+        if g2.root(n.tree, Some(*other)).map_err(Error::client_object)? != real_tree && !admin {
             // Compare the hidden parts: the same full tree from either side.
             return Err(Error::forbidden(
                 "this merge combines changes in folders you cannot see; ask someone with access to merge it",
@@ -2509,10 +2581,10 @@ pub(crate) fn complete(
         }
         let known = |id: &ObjectId| uploaded.contains(id) || before.contains(id);
         if !known(&e.id) {
-            return Err(VeilError::Missing(e.id).into());
+            return Err(Error::client_object(VeilError::Missing(e.id)));
         }
         if let Some(id) = named_ids(src, e)?.into_iter().find(|id| !known(id)) {
-            return Err(VeilError::Missing(id).into());
+            return Err(Error::client_object(VeilError::Missing(id)));
         }
     }
     check_changes(src, rows, &view, &g.changes, &real_tree, rp, &Policy::parse(&p.policy_text), admin)?;
@@ -2543,7 +2615,7 @@ pub(crate) fn complete(
             return Err(Error::forbidden("only admins may change the branch rules (.veilrules)"));
         }
         if let Some(e) = &rules {
-            let text = match Object::decode(&src.raw(&e.id)?)? {
+            let text = match src.decode(&e.id).map_err(Error::client_object)? {
                 Object::Blob(b) if e.kind == EntryKind::File => String::from_utf8_lossy(&b).into_owned(),
                 _ => return Err(Error::bad_request(".veilrules must be a plain-text file")),
             };
@@ -2787,7 +2859,8 @@ async fn push_staged(
         }
         let s = blocking_staged(hub, project.id, Some(st.clone()), move |src| match src.snapshot(&id) {
             Err(VeilError::Missing(_)) => Err(Error::bad_request(format!("snapshot {} was not uploaded", id.short()))),
-            r => Ok(r?),
+            Err(e) => Err(Error::client_object(e)),
+            Ok(s) => Ok(s),
         })
         .await?;
         // Its attempts (format 10) are pushed with it, before it.
@@ -4202,7 +4275,8 @@ pub(crate) async fn take_uploads(
             })
         })
         .await
-        .map_err(|e| Error::Other(e.into()))??;
+        .map_err(|e| Error::Other(e.into()))?
+        .map_err(Error::client_object)?;
         out.insert(id, raw);
     }
     Ok((out.keys().copied().collect(), out, held))
@@ -4256,7 +4330,7 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
     let mut frames: Vec<(ObjectId, Bytes)> = tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Bytes)>> {
         let mut left = limit;
         let mut out = Vec::new();
-        for (id, enc) in encoding::split_frames(&body)? {
+        for (id, enc) in encoding::split_frames(&body).map_err(Error::client_object)? {
             if !encoding::within_ratio(enc) {
                 return Err(Error::bad_request(format!(
                     "object {} expands more than {} times its compressed size: send it uncompressed",
@@ -4273,14 +4347,14 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
                 }
                 false => None,
             };
-            let raw = encoding::decode(&id, enc, left.min(MAX_FRAME_OBJECT as u64))?;
+            let raw = encoding::decode(&id, enc, left.min(MAX_FRAME_OBJECT as u64)).map_err(Error::client_object)?;
             left -= raw.len() as u64;
             if Object::min_repo_format(&raw) > veil_core::repo::REPO_FORMAT {
                 return Err(Error::bad_request("an object of a newer format than this server serves"));
             }
             // Any bytes are a blob: decoding one would only copy it.
             if !raw.starts_with(b"veil:blob\n") {
-                Object::decode(&raw)?;
+                Object::decode(&raw).map_err(Error::client_object)?;
             }
             // The server's own encoding of what it decoded (BUG-1008). Each
             // is its own allocation: a slice would keep the whole body

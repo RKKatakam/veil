@@ -1708,7 +1708,7 @@ pub enum JobEnd {
     Kept,
     /// The version holds no plain text.
     NoText,
-    Failed(StatusCode, &'static str, String),
+    Failed(crate::error::Answer),
 }
 
 impl JobEnd {
@@ -1716,8 +1716,11 @@ impl JobEnd {
         match r {
             Ok(true) => JobEnd::Kept,
             Ok(false) => JobEnd::NoText,
-            Err(Error::Api { status, code, message }) => JobEnd::Failed(status, code, message),
-            Err(e) => JobEnd::Failed(StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("{e:?}")),
+            Err(e @ Error::Api { code: "warming" | "too_wide", .. }) => JobEnd::Failed(e.answer()),
+            Err(Error::Api { status, code, message }) => {
+                JobEnd::Failed(Error::Other(anyhow::anyhow!("blame job: unexpected {status} ({code}): {message}")).answer())
+            }
+            Err(e) => JobEnd::Failed(e.answer()),
         }
     }
 
@@ -1741,6 +1744,8 @@ pub struct Jobs {
     slots: Arc<Slots>,
     /// Jobs started here (the tests count them).
     pub started: std::sync::atomic::AtomicU64,
+    /// Notified when a caller joins a job already in `waiting`.
+    pub joined: tokio::sync::Notify,
 }
 
 /// A job waiting or computing here.
@@ -1836,6 +1841,7 @@ impl Default for Jobs {
             waiting: std::sync::Mutex::new(Waiting::default()),
             slots: Arc::new(Slots::new(BLAME_JOBS)),
             started: std::sync::atomic::AtomicU64::new(0),
+            joined: tokio::sync::Notify::new(),
         }
     }
 }
@@ -1976,14 +1982,22 @@ pub async fn wait_for_blame(
     let key: JobKey = (project.id, vk, path_key(&start.path), follow, start.id);
     let joined = hub.query.jobs.waiting.lock().unwrap().jobs.get(&key).map(|e| e.rx.clone());
     let mut rx = match joined {
-        Some(rx) => rx,
+        Some(rx) => {
+            hub.query.jobs.joined.notify_one();
+            rx
+        }
         None => {
             if let Some(end) = settled(hub, &key, limits).await? {
                 return Ok(end);
             }
             let mut w = hub.query.jobs.waiting.lock().unwrap();
             match w.jobs.get(&key) {
-                Some(e) => e.rx.clone(),
+                Some(e) => {
+                    let rx = e.rx.clone();
+                    drop(w);
+                    hub.query.jobs.joined.notify_one();
+                    rx
+                }
                 None => {
                     let who: Requester = viewer.person;
                     // At the ceiling the job whose place this one takes is
@@ -1998,19 +2012,14 @@ pub async fn wait_for_blame(
                     hub.query.jobs.started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (hub, project, viewer, start) = (hub.clone(), project.clone(), viewer.clone(), start.clone());
                     tokio::spawn(async move {
-                        let r = leased_job(&hub, &project, &viewer, &key, &start, follow, limits, &ticket, seeded_window).await;
-                        if let Err(e) = &r {
-                            if !matches!(e, Error::Api { code: "warming" | "too_wide", .. }) {
-                                eprintln!("veil-server: a blame job of project {}: {e:?}", project.id);
-                            }
-                        }
+                        let end = JobEnd::of(leased_job(&hub, &project, &viewer, &key, &start, follow, limits, &ticket, seeded_window).await);
                         {
                             let mut w = hub.query.jobs.waiting.lock().unwrap();
                             if w.jobs.get(&key).is_some_and(|e| e.seq == seq) {
                                 w.remove(&key);
                             }
                         }
-                        let _ = tx.send(Some(JobEnd::of(r)));
+                        let _ = tx.send(Some(end));
                     });
                     rx
                 }
@@ -2222,7 +2231,7 @@ async fn leased_job(
     let ended = |end: JobEnd| match end {
         JobEnd::Kept => Ok(true),
         JobEnd::NoText => Ok(false),
-        JobEnd::Failed(status, code, message) => Err(Error::Api { status, code, message }),
+        JobEnd::Failed(a) => Err(a.into_error()),
     };
     let wait = tokio::time::Instant::now() + limits.wait;
     let mut pause = Duration::from_millis(250);

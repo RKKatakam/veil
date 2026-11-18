@@ -2392,3 +2392,285 @@ fn s3rd3_resolve_from_roots_is_projection_equivalent() {
         println!("seed {seed}: {} changes, {compared} answers compared", h.order.len());
     }
 }
+
+struct MissingKeyStore {
+    inner: std::sync::Arc<dyn veil_server::store::BlobStore>,
+    missing: std::sync::Mutex<HashSet<String>>,
+}
+
+#[async_trait::async_trait]
+impl veil_server::store::BlobStore for MissingKeyStore {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+        if self.missing.lock().unwrap().contains(key) {
+            return Ok(None);
+        }
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
+        self.inner.put(key, data).await
+    }
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        if self.missing.lock().unwrap().contains(key) {
+            return Ok(false);
+        }
+        self.inner.exists(key).await
+    }
+    async fn len(&self, key: &str) -> anyhow::Result<Option<u64>> {
+        if self.missing.lock().unwrap().contains(key) {
+            return Ok(None);
+        }
+        self.inner.len(key).await
+    }
+    async fn get_range(&self, key: &str, start: u64, end: u64) -> anyhow::Result<Option<(bytes::Bytes, u64)>> {
+        if self.missing.lock().unwrap().contains(key) {
+            return Ok(None);
+        }
+        self.inner.get_range(key, start, end).await
+    }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+}
+
+/// BUG-2681: when a stored object (including a hidden parent snapshot or tree)
+/// is missing from storage under a route that reads it server-side (`q/show`,
+/// `tips`, or parent reads in `changes`), the route must answer `500 internal`
+/// (`"internal error"`) with no object id in the body, while client-requested
+/// or client-uploaded absent/corrupt objects keep their `400` / `404` answers.
+#[test]
+fn bug_2681_a_missing_stored_object_under_server_side_routes_answers_internal_error_without_id() {
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let th = TestHub::start();
+    let dev = th.person("dev2681");
+    let dev_tok = dev.token();
+    let base_hub = th.hub();
+    let dev_id: i64 = th.rt.block_on(async {
+        again(|| sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&dev.name).fetch_one(&base_hub.db)).await
+    });
+    let (text, bindings) = policy(dev_id);
+    let mut h = Hist::new(&th, &text, &bindings);
+    let hidden_bytes = b"secret-group-only\n".to_vec();
+    let hidden_blob = ObjectId::hash(&veil_core::object::Object::Blob(hidden_bytes.clone()).encode());
+    let c_hidden = h.commit(
+        &th,
+        &[root_snapshot_id()],
+        Files::from([("g0/secret.txt".to_string(), hidden_bytes)]),
+        [1; 16],
+        1_700_000_000_000,
+        None,
+    );
+    let c_pub = h.commit(
+        &th,
+        &[c_hidden],
+        Files::from([("pub/readme.txt".to_string(), b"public\n".to_vec())]),
+        [2; 16],
+        1_700_000_001_000,
+        None,
+    );
+    h.set_branch(&th, "main", c_pub);
+    assert_eq!(h.derive(&th).snapshots, 2);
+    // Pre-warm the public viewer's graph so `q/show` runs directly through
+    // `query::on_graph` -> `Trees::roots_of` without a viewer-graph fill.
+    warm_up(&th, &h, &Viewer::default());
+
+    let store = Arc::new(MissingKeyStore {
+        inner: h.hub.objects.blob_store().clone(),
+        missing: std::sync::Mutex::new(HashSet::from([veil_server::store::object_key(h.id, &c_hidden)])),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let hub = {
+        let _in_rt = th.rt.enter();
+        Arc::new(veil_server::Hub {
+            db: h.hub.db.clone(),
+            objects: Arc::new(veil_server::store::Objects::with_db(store.clone(), 0, Some(h.hub.db.clone()))),
+            trees: veil_core::cache::LruCache::new(0),
+            segments: veil_core::cache::LruCache::new(0),
+            identity: h.hub.identity.clone(),
+            receipt_key: h.hub.receipt_key,
+            grants: veil_server::grant::Grants::load(dir.path()).unwrap(),
+            cache_token: h.hub.cache_token,
+            session_ttl_ms: h.hub.session_ttl_ms,
+            certificate: h.hub.certificate.clone(),
+            caches: Default::default(),
+            derive: veil_server::derive::Workers::new(h.hub.db.clone()),
+            query: Default::default(),
+            landing: Default::default(),
+            events: Default::default(),
+            embargo: Default::default(),
+            pack_gc: Default::default(),
+            limits: veil_server::limits::Limits::new(TestHub::limits(), 16),
+            commits: Default::default(),
+        })
+    };
+    let app = veil_server::api::router(hub.clone());
+
+    let call = |req: axum::http::Request<axum::body::Body>| {
+        let app = app.clone();
+        th.rt.block_on(async move {
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 64 << 10).await.unwrap().to_vec()).unwrap();
+            (status, body)
+        })
+    };
+
+    // 1. `GET .../q/show?rev=main` reads hidden parent `c_hidden` in `Trees::roots_of`:
+    //    must answer 500 internal "internal error" and never name `c_hidden.short()`.
+    let (status, body) = call(
+        axum::http::Request::builder()
+            .uri(format!("/v1/projects/{}/q/show?rev=main", h.name))
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    );
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "q/show on missing hidden parent: {body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["code"], "internal", "{body}");
+    assert_eq!(v["message"], "internal error", "{body}");
+    assert!(!body.contains(&c_hidden.short()), "q/show leaked hidden parent short id: {body}");
+
+    // 2. `GET .../tips` when `projections` has no memo for a new commit (`sync::projected_inner`):
+    //    missing stored real snapshot `c_unprojected` must answer 500 internal without its id.
+    let c_unprojected = h.commit(
+        &th,
+        &[c_pub],
+        Files::from([("pub/readme.txt".to_string(), b"public v2\n".to_vec())]),
+        [3; 16],
+        1_700_000_002_000,
+        None,
+    );
+    h.set_branch(&th, "main", c_unprojected);
+    hub.caches.tips_changed(h.id);
+    *store.missing.lock().unwrap() = HashSet::from([veil_server::store::object_key(h.id, &c_unprojected)]);
+    let (status, body) = call(
+        axum::http::Request::builder()
+            .uri(format!("/v1/projects/{}/tips", h.name))
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    );
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "tips on missing stored snapshot: {body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["code"], "internal", "{body}");
+    assert_eq!(v["message"], "internal error", "{body}");
+    assert!(!body.contains(&c_unprojected.short()), "tips leaked stored snapshot short id: {body}");
+
+    // Restore `main` to `c_pub` and test client-error preservation vs stored-parent fault in writes.
+    h.set_branch(&th, "main", c_pub);
+    hub.caches.tips_changed(h.id);
+    store.missing.lock().unwrap().clear();
+
+    // 3. Kept client 400s and 404s:
+    //    (a) malformed upload frame (`POST .../objects`) -> 400 bad_request "invalid object: ..."
+    let (status, body) = call(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/projects/{}/objects", h.name))
+            .header("authorization", format!("Bearer {dev_tok}"))
+            .body(axum::body::Body::from(b"not-a-frame".to_vec()))
+            .unwrap(),
+    );
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "malformed upload: {body}");
+    assert!(body.contains("invalid object:"), "malformed upload message kept: {body}");
+
+    //    (b) API change naming un-uploaded `hidden_blob` -> 400 bad_request "missing object <short>" (BUG-1050)
+    let (tips_status, tips_body) = call(
+        axum::http::Request::builder()
+            .uri(format!("/v1/projects/{}/tips", h.name))
+            .header("authorization", format!("Bearer {dev_tok}"))
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    );
+    assert_eq!(tips_status, axum::http::StatusCode::OK, "{tips_body}");
+    let tips_v: Value = serde_json::from_str(&tips_body).unwrap();
+    let dev_main = tips_v["branches"]["main"].as_str().unwrap().to_string();
+    let (status, body) = call(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/projects/{}/changes", h.name))
+            .header("authorization", format!("Bearer {dev_tok}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&json!({
+                    "base": dev_main,
+                    "edits": [{"path": "carol-d/stolen.txt", "put": {"object": hidden_blob.hex()}}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    );
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "un-uploaded object in change: {body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["message"],
+        format!("missing object {}", hidden_blob.short()),
+        "client missing-object 400 kept: {body}"
+    );
+
+    //    (c) Client-requested object under a grant (`GET /v1/objects/{p}/{id}`) -> 404 not_found kept.
+    let (anon_status, anon_body) = call(
+        axum::http::Request::builder()
+            .uri(format!("/v1/projects/{}/tips", h.name))
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    );
+    assert_eq!(anon_status, axum::http::StatusCode::OK, "{anon_body}");
+    let anon_grant = serde_json::from_str::<Value>(&anon_body).unwrap()["grants"]["main"].as_str().unwrap().to_string();
+    let (status, body) = call(
+        axum::http::Request::builder()
+            .uri(format!("/v1/objects/{}/{}", h.name, hidden_blob.hex()))
+            .header("veil-grant", &anon_grant)
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    );
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "granted get_object on unreached object: {body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["message"],
+        "no such object that your grant reaches",
+        "{body}"
+    );
+
+    //    (d) Control: valid API change (`put.text`) succeeds when stored parent `c_pub` is present,
+    //        and answers 500 internal "internal error" (never 400 naming `c_pub.short()`) when `c_pub` is missing.
+    let (ok_status, ok_body) = call(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/projects/{}/changes", h.name))
+            .header("authorization", format!("Bearer {dev_tok}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&json!({
+                    "base": dev_main,
+                    "edits": [{"path": "carol-d/control.txt", "put": {"text": "control\n"}}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    );
+    assert_eq!(ok_status, axum::http::StatusCode::OK, "control change: {ok_body}");
+
+    *store.missing.lock().unwrap() = HashSet::from([veil_server::store::object_key(h.id, &c_pub)]);
+    let (status, body) = call(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/projects/{}/changes", h.name))
+            .header("authorization", format!("Bearer {dev_tok}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&json!({
+                    "base": dev_main,
+                    "edits": [{"path": "carol-d/ok.txt", "put": {"text": "hello\n"}}]
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    );
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing stored parent in change: {body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["code"], "internal", "{body}");
+    assert_eq!(v["message"], "internal error", "{body}");
+    assert!(!body.contains(&c_pub.short()), "missing stored parent in change leaked real id: {body}");
+}
+
