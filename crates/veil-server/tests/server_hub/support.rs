@@ -48,6 +48,15 @@ pub fn own_database(tag: &str) -> String {
         db.close().await;
         let db = veil_server::db::connect(&url, 1).await.unwrap();
         veil_server::db::migrate(&db).await.unwrap();
+        // Its projects are numbered from a start of its own (BUG-2620): a new
+        // database numbers them from 1, and the run's object store is one
+        // bucket keyed by project id, so its `p/1/` keys were also those of
+        // project 1 of the run's database and of every other such database:
+        // a GC pass of any of them deleted the others' objects as
+        // unreferenced (`pack_gc::guarantee_2` lost a projection memo to a
+        // pass of the run's project 1).
+        let start = (1i64 << 32) + i64::from(u32::from_le_bytes(veil_core::crypto::random_bytes::<4>()));
+        sqlx::query("SELECT setval(pg_get_serial_sequence('projects', 'id'), $1)").bind(start).execute(&db).await.unwrap();
         db.close().await;
     });
     url

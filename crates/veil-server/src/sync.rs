@@ -2263,6 +2263,14 @@ fn check_changes(
                 Object::Conflict(cf) => cf.adds.iter().chain(&cf.removes).flatten().map(|t| (t.id, t.visibility.clone(), t.size)).collect(),
                 _ => return Err(Error::bad_request(format!("'{}': a conflict entry names something else", c.path))),
             },
+            // A directory entry that is itself a change (its object could
+            // not be walked as a directory) names a tree (BUG-2622).
+            EntryKind::Dir => {
+                if !matches!(Object::decode(&src.raw(&e.id)?), Ok(Object::Tree(_))) {
+                    return Err(Error::bad_request(format!("'{}': a directory entry names something that is not a directory", c.path)));
+                }
+                continue;
+            }
             _ => continue,
         };
         let vp = VPath::new(&c.path).map_err(|_| Error::bad_request(format!("invalid path '{}'", c.path)))?;
@@ -2273,6 +2281,17 @@ fn check_changes(
         let unscanned = class.allow_secrets && (admin || accepted.classify(&vp, false).allow_secrets);
         for (id, visibility, size) in contents {
             let raw = src.raw(&id)?;
+            // What a file or symlink entry, or a conflict's term, names is
+            // a file's content: a blob, or a secret's sealed envelope
+            // (BUG-2622). Pack GC keeps it as a leaf without reading it, so
+            // a directory's tree named there was never walked where a
+            // directory entry named it too, and the directory's files were
+            // deleted as unreferenced. (The object is one the pusher
+            // uploaded, or the entry's at this path in a parent: the
+            // answer tells them nothing they do not hold.)
+            if !(Object::is_blob_raw(&raw) || Object::sealed_scope(&raw).is_some()) {
+                return Err(Error::bad_request(format!("'{}': a file entry names something that is not a file's content", c.path)));
+            }
             // The size an entry records bounds what reading its object
             // holds (`store::Objects::read_cost`, BUG-1087).
             if raw.len() as u64 > size.saturating_add(crate::store::SIZE_SLACK) {

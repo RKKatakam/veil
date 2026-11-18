@@ -14,7 +14,8 @@
 //!   1. the replacement pack is recorded in `packs` as `STAGED` (`person_id`
 //!      `None`) before its bytes are written to storage;
 //!   2. a single transaction checks that the replaced packs are still `LISTED`
-//!      (and, for GC rewrites, that no push or ref change raced the mark),
+//!      (and, for GC rewrites, that no root written since the mark names an
+//!      object they drop: `roots_at_switch`),
 //!      lists the replacement pack(s), and marks the replaced packs `DISCARDED`
 //!      with `discarded_at = now_ms`;
 //!   3. this server drops the replaced packs from its in-memory map
@@ -49,6 +50,20 @@
 //!   unreferenced, and is deleted only once `now_ms - since_ms >= retention_ms`
 //!   (thin clones keep no server anchors). Objects referenced again have their
 //!   `unreferenced_objects` rows cleared.
+//! * **A switch that drops objects reads the roots again (BUG-2602).** The
+//!   pass keeps what its walks reached (`Marks`). Before the switch, and
+//!   in its transaction behind the root writers' gate, it reads the roots
+//!   as they are then and walks from where its marks stop: what a root
+//!   written since the mark reaches is kept, the rest of what the mark
+//!   found is deleted. Past a bound on that walk under the gate
+//!   ([`SWITCH_WALK_MAX`]), the switch deletes nothing.
+//! * **Loose objects are deleted under the gate too (BUG-2621):** after the
+//!   purge's commit, in chunks (`delete_loose_chunk`), each with the gate
+//!   held on a session from the reading of the roots to the GC epoch's
+//!   raise after the last delete.
+//! * **An entry's kind is a claim (BUG-2622):** what a tree names as a file
+//!   is kept as a leaf and not read, and an object so named that the walk
+//!   also meets as a directory or a root is read and expanded.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -136,6 +151,34 @@ pub const DEFAULT_STAGED_GRACE_MS: i64 = 3_600_000;
 /// recently uploaded or probed objects).
 pub const DEFAULT_RETENTION_WINDOW_MS: i64 = 3_600_000;
 
+/// The most objects and staged upload indexes a switch that drops objects
+/// reads from the store while it holds the root writers' gate (BUG-2602):
+/// what the roots written since its pass last read them reach. Past it the
+/// switch gives way (deletes nothing), as it does for any root write before
+/// BUG-2602.
+pub const SWITCH_WALK_MAX: usize = 256;
+
+/// The longest those reads may take ([`SWITCH_WALK_MAX`]): they may wait
+/// on budgets that requests waiting for the switch hold, so past it the
+/// switch gives way.
+pub const SWITCH_WALK_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The most loose objects a pass deletes from the store in one hold of the
+/// root writers' gate (BUG-2621, `delete_loose_chunk`), `AT_ONCE` at a
+/// time.
+pub const LOOSE_DELETE_CHUNK: usize = 256;
+
+/// How long one chunk's deletes of loose objects go on starting new
+/// batches ([`LOOSE_DELETE_CHUNK`], `AT_ONCE` a batch): looked at between
+/// batches, never inside one (a batch is joined to its end, however long
+/// the store takes). Past it the rest are left for the next pass.
+pub const LOOSE_DELETE_TIME: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The most rounds a pass reads the roots again before a switch, outside
+/// its transaction ([`catch_up`]): each costs what was written during the
+/// one before.
+const CATCH_UP_ROUNDS: usize = 6;
+
 /// Options controlling one merge / GC pass on a project.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -169,6 +212,17 @@ pub struct Options {
     /// Optional hook invoked right before GC verifies `RefStamp` and switches
     /// packs / deletes loose objects (for deterministic race tests).
     pub before_switch: Option<SwitchHook>,
+    /// Optional hook invoked after the switch that drops loose objects has
+    /// committed and before the first of them is deleted from the store
+    /// (for a deterministic test of that window, BUG-2621).
+    pub before_loose_delete: Option<SwitchHook>,
+    /// Optional hook invoked in a chunk of loose deletes, once it holds the
+    /// root writers' gate and has read the roots, before its first delete
+    /// (for a deterministic test of a writer that waits for it, BUG-2621).
+    pub during_loose_delete: Option<SwitchHook>,
+    /// Optional failures of a pass's store requests under a switch's lock
+    /// (for tests).
+    pub fault: Option<Fault>,
     /// Merge small packs by size class ([`TIER_BITS`]): only packs of one
     /// class, the class with the most packs of those with at least
     /// `min_packs_to_merge` (the background merges, BUG-2230; the most, not
@@ -177,6 +231,35 @@ pub struct Options {
     /// that is still small is copied again by every later pass until it
     /// passes `small_pack_bytes`.
     pub size_tiers: bool,
+}
+
+/// Where a test's [`Fault`] is asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultPoint {
+    /// Before the walk of a switch's transaction reads an object from the
+    /// store (`roots_at_switch`).
+    SwitchRead,
+    /// Before a chunk of loose deletes deletes an object.
+    LooseDelete,
+    /// Before each commit of a chunk of loose deletes (its first
+    /// transaction, and each try of the epoch's raise after the deletes):
+    /// an error is that commit's failure.
+    LooseCommit,
+}
+
+/// Async callback that may fail a store request of a GC pass (for tests of
+/// what a failure in the middle of a switch leaves): asked at each
+/// [`FaultPoint`] with the object; an error it answers is that request's.
+#[derive(Clone)]
+pub struct Fault(pub Arc<dyn Fn(FaultPoint, ObjectId) -> FaultAnswer + Send + Sync>);
+
+/// What a [`Fault`] answers: `Ok` lets the request go on.
+pub type FaultAnswer = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+
+impl std::fmt::Debug for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Fault(..)")
+    }
 }
 
 /// Async callback invoked right before GC verifies `RefStamp` and commits a switch.
@@ -206,6 +289,9 @@ impl Default for Options {
             now_offset_ms: 0,
             crash: None,
             before_switch: None,
+            before_loose_delete: None,
+            during_loose_delete: None,
+            fault: None,
             size_tiers: false,
         }
     }
@@ -864,16 +950,14 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
     // - plus, when `run_gc` is true, any pack that holds at least one
     //   expired-unreferenced object (or duplicate object already held by
     //   another pack in the batch).
-    let (batch, expired_unreferenced, ref_stamp, complete_dead_sweep) =
-        select_batch(hub, project, &listed, opts, gc_state).await?;
+    let (batch, complete_dead_sweep) = select_batch(hub, project, &listed, opts, gc_state.as_deref()).await?;
 
     if !batch.is_empty() {
         let crashed = compact_batch(
             hub,
             project,
             &batch,
-            &expired_unreferenced,
-            ref_stamp.as_ref(),
+            gc_state.as_ref(),
             complete_dead_sweep,
             opts,
             now_ms,
@@ -883,22 +967,24 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
         if crashed {
             return Ok(report);
         }
-    } else if !expired_unreferenced.is_empty() {
-        if let Some(expected) = &ref_stamp {
+    } else if let Some(gc) = &gc_state {
+        if !gc.lock().await.expired_unreferenced.is_empty() {
+            catch_up(hub, project, gc).await?;
+        }
+        if !gc.lock().await.expired_unreferenced.is_empty() {
             if let Some(hook) = &opts.before_switch {
                 (hook.0)().await;
             }
-            let expired_hexes: Vec<String> = expired_unreferenced.iter().map(ObjectId::hex).collect();
             let maybe_gce: Option<i64> =
                 gc_transaction(hub, |c| {
-                    let expected = expected.clone();
-                    let expired_hexes = expired_hexes.clone();
+                    let (hub, gc) = (hub.clone(), gc.clone());
                     Box::pin(async move {
                         lock_gc_epoch_tx(c, project).await?;
-                        let cur = read_ref_stamp(c, project).await?;
-                        if cur != expected {
+                        let mut gc = gc.lock().await;
+                        if !roots_at_switch(&hub, project, c, &mut gc).await? || gc.expired_unreferenced.is_empty() {
                             return Ok(None);
                         }
+                        let expired_hexes: Vec<String> = gc.expired_unreferenced.iter().map(ObjectId::hex).collect();
                         purge_expired_db_records(c, project, &expired_hexes).await?;
                         for chunk in expired_hexes.chunks(500) {
                             sqlx::query(
@@ -936,10 +1022,268 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
 
 struct GcState {
     /// Objects that are NOT reachable and whose `since_ms` in
-    /// `unreferenced_objects` is `<= now_ms - retention_window_ms`.
+    /// `unreferenced_objects` is `<= now_ms - retention_window_ms`: what
+    /// the pass may delete. It only shrinks ([`catch_up_round`]), and holds
+    /// nothing of `marks`.
     expired_unreferenced: HashSet<ObjectId>,
-    /// Fingerprint of refs before reachability was computed.
+    /// Fingerprint of the roots `marks` last covered: read in one snapshot
+    /// with them, or under a switch's lock.
     stamp: RefStamp,
+    /// What the pass's walks reached.
+    marks: Marks,
+}
+
+/// What a GC pass's walks know of the project's objects (BUG-2602).
+#[derive(Default)]
+struct Marks {
+    /// The closed set: every object a walk read and expanded. Every object
+    /// a member names is in it too, or in `leaves` or `unread`, so a later
+    /// walk stops at a member: nothing behind it is unknown. It only grows.
+    reachable: HashSet<ObjectId>,
+    /// Objects named as leaves and not read: what a tree's file or symlink
+    /// entry or a conflict's term names, a `graph.changed` object, a
+    /// search segment. Kept, and **not taken for expanded** (BUG-2622): an
+    /// entry's kind is a claim of whoever wrote the tree, so a walk that
+    /// meets one of them as a directory, a snapshot or a root reads it and
+    /// expands what it is.
+    leaves: HashSet<ObjectId>,
+    /// Ids a walk reached and could not read: not stored then (a
+    /// predecessor never pushed, the tree of a signed origin). What they
+    /// name is unknown, so they are not in `reachable`; a walk does not
+    /// read one again (a project holds many, each a miss) unless a client
+    /// upload the pass read holds it (`staged_ids`; [`catch_up_round`]).
+    /// What such an id is (measured in the tests' projects: 5 to 40 each):
+    /// a predecessor never pushed (a client's snapshot), or the tree of a
+    /// projection (a memo's snapshot, whose trees the server derives when
+    /// asked). A client's object comes to be stored by an upload, which is
+    /// read here. A snapshot the server makes (a landing, a merge, an API
+    /// commit) holds its own time and the server's signature, so its id is
+    /// never one already named. What is left is derived data the server
+    /// stores again (a projection's objects): GC follows that from
+    /// `projections` as read and purges it with its objects, and does not
+    /// read it again here (BUG-2623 is that class's open bug).
+    unread: HashSet<ObjectId>,
+    /// The client uploads (rows of `packs` with a person) the pass knows:
+    /// those listed or discarded when the marks were made (the walk read
+    /// what they hold) and those whose index was read since (a pack's
+    /// bytes never change), and
+    uploads: HashSet<String>,
+    /// the objects of the uploads read: kept, never expanded, so not in
+    /// `reachable` (a root that names one is walked).
+    staged_ids: HashSet<ObjectId>,
+    /// A test's failures of the reads a switch's walk makes
+    /// ([`Options::fault`]).
+    fault: Option<Fault>,
+}
+
+impl Marks {
+    /// Reached by a walk (read, named as a leaf, or not stored), or in an
+    /// upload read.
+    fn live(&self, id: &ObjectId) -> bool {
+        self.reachable.contains(id) || self.leaves.contains(id) || self.staged_ids.contains(id) || self.unread.contains(id)
+    }
+
+    /// Read the index of the client upload `name` if it was not yet: its
+    /// objects are kept. Whether the store was read. (An upload recorded
+    /// and not written yet has no index: read again next time.)
+    async fn read_upload(&mut self, hub: &Arc<Hub>, project: i64, name: &str) -> Result<bool> {
+        if self.uploads.contains(name) {
+            return Ok(false);
+        }
+        let k = pack::key(project, name);
+        if let Some(held) = pack::read_index(&**hub.objects.blob_store(), &k, hub.objects.index_bound()).await.map_err(Error::Other)? {
+            self.staged_ids.extend(held.index.iter().map(|(id, _)| *id));
+            self.uploads.insert(name.to_string());
+        }
+        Ok(true)
+    }
+}
+
+/// The names of `project`'s client uploads, in any state (staged, listed,
+/// replaced by a merge and not swept yet: no row of a pack is deleted
+/// while a pass holds the project's lock).
+async fn upload_names(c: &mut PgConnection, project: i64) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND person_id IS NOT NULL")
+        .bind(project)
+        .fetch_all(&mut *c)
+        .await?)
+}
+
+/// The reference stamp and the roots of `project`, of one moment of the
+/// database (one snapshot: no row is in the stamp and missing from the
+/// roots). With `known`, a stamp equal to it answers no roots: they are
+/// the ones it was read with.
+async fn read_stamp_and_roots(hub: &Hub, project: i64, known: Option<&RefStamp>) -> Result<(RefStamp, Option<(DbRoots, Vec<String>)>)> {
+    let known = known.cloned();
+    crate::db::transaction(&hub.db, crate::db::Isolation::Snapshot, |c| {
+        let known = known.clone();
+        Box::pin(async move {
+            let stamp = read_ref_stamp(c, project).await?;
+            if known.as_ref() == Some(&stamp) {
+                return Ok((stamp, None));
+            }
+            let roots = collect_db_roots(c, project).await?;
+            let uploads = upload_names(c, project).await?;
+            Ok((stamp, Some((roots, uploads))))
+        })
+    })
+    .await
+}
+
+/// One round of a pass's catching up with the roots (BUG-2602): `roots`
+/// and their `stamp`, read after the marks were made (in one snapshot, or
+/// under a switch's lock). Walks what they reach that the marks do not
+/// hold, and takes everything reached or kept out of the candidates
+/// (`expired_unreferenced`), so that afterwards no candidate is reachable
+/// from `roots`:
+/// * every walk root, and every `snapshots` row that is not a candidate
+///   (BUG-1780: a row that stays keeps its whole closure), is walked,
+///   stopping at the closed set;
+/// * what a walk could not read before, and a client upload made since
+///   (`uploads`: every upload's name) holds, is walked;
+/// * the `origins` and `projections` rows of the snapshots already
+///   reached are followed as they are now, as those of the snapshots the
+///   walk newly reaches;
+/// * search segments, `graph.changed` objects and the objects of every
+///   upload made since the marks are kept (one index read for each
+///   upload not read yet).
+///
+/// `limit`: the most store reads it may make (under the lock; `None`
+/// outside, where it also yields to requests). Answers the reads it made,
+/// or `None` past the limit. **Past the limit, or on an error, the walk is
+/// unfinished and the marks no longer closed** (an object it read is in
+/// the set, what that object names is not: a later walk would stop at it),
+/// so the candidates are emptied: the pass deletes nothing more, whatever
+/// runs after (a switch's transaction is run again on an error that may
+/// pass: BUG-2602's review).
+async fn catch_up_round(
+    hub: &Arc<Hub>,
+    project: i64,
+    gc: &mut GcState,
+    stamp: RefStamp,
+    roots: DbRoots,
+    uploads: Vec<String>,
+    limit: Option<usize>,
+) -> Result<Option<usize>> {
+    match catch_up_round_in(hub, project, gc, stamp, roots, uploads, limit).await {
+        Ok(Some(reads)) => Ok(Some(reads)),
+        unfinished => {
+            gc.expired_unreferenced.clear();
+            unfinished
+        }
+    }
+}
+
+async fn catch_up_round_in(
+    hub: &Arc<Hub>,
+    project: i64,
+    gc: &mut GcState,
+    stamp: RefStamp,
+    roots: DbRoots,
+    uploads: Vec<String>,
+    limit: Option<usize>,
+) -> Result<Option<usize>> {
+    let mut reads = 0usize;
+    let over = |reads: usize| limit.is_some_and(|l| reads > l);
+    for name in &uploads {
+        if gc.marks.read_upload(hub, project, name).await? {
+            reads += 1;
+            if over(reads) {
+                return Ok(None);
+            }
+        }
+    }
+    let marks = &mut gc.marks;
+    // What a walk could not read and an upload holds is read again: stored
+    // once the upload is listed (until then, read again every round).
+    let mut seeds: Vec<ObjectId> = marks.unread.iter().filter(|id| marks.staged_ids.contains(id)).copied().collect();
+    for id in &seeds {
+        marks.unread.remove(id);
+    }
+    seeds.extend(roots.walk_objects.iter().copied());
+    seeds.extend(roots.known_snapshots.iter().filter(|s| !gc.expired_unreferenced.contains(s)).copied());
+    for (real, origin) in &roots.origins {
+        if marks.reachable.contains(real) {
+            seeds.push(*origin);
+        }
+    }
+    for (real, projected) in &roots.projections {
+        if marks.reachable.contains(real) {
+            seeds.extend(projected.iter().copied());
+        }
+    }
+    marks.leaves.extend(roots.leaf_objects.iter().copied());
+    for (snapshot, changed) in &roots.graph_changed {
+        if marks.reachable.contains(snapshot) {
+            marks.leaves.insert(*changed);
+        }
+    }
+    let left = limit.map(|l| l - reads);
+    let Some(walked) = walk_from_roots(hub, project, seeds, marks, &roots, left).await? else {
+        return Ok(None);
+    };
+    let marks = &gc.marks;
+    gc.expired_unreferenced.retain(|id| !marks.live(id));
+    gc.stamp = stamp;
+    Ok(Some(reads + walked))
+}
+
+/// Before a switch that drops objects, outside its transaction (BUG-2602):
+/// read the roots again and walk what was written since the marks
+/// ([`catch_up_round`], no limit), round after round until one reads
+/// little (what is left for the switch, under its lock, is what is written
+/// during that round) or [`CATCH_UP_ROUNDS`] ran. A round that finds the
+/// stamp of the last one reads no roots: nothing moved.
+async fn catch_up(hub: &Arc<Hub>, project: i64, gc: &tokio::sync::Mutex<GcState>) -> Result<()> {
+    let mut gc = gc.lock().await;
+    for _ in 0..CATCH_UP_ROUNDS {
+        if gc.expired_unreferenced.is_empty() {
+            break;
+        }
+        let (stamp, Some((roots, uploads))) = read_stamp_and_roots(hub, project, Some(&gc.stamp)).await? else {
+            break;
+        };
+        let reads = catch_up_round(hub, project, &mut gc, stamp, roots, uploads, None).await?.unwrap_or(0);
+        if reads <= SWITCH_WALK_MAX / 8 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// In a switch that drops objects, after [`lock_gc_epoch_tx`] (BUG-2602):
+/// whether the pass may delete its candidates. No root writer commits
+/// until the switch does, so the rows read here are the project's roots
+/// at the switch.
+/// * The stamp equals the one the marks last covered: yes, and nothing
+///   else is read (the switch as it was before BUG-2602).
+/// * Otherwise the roots are read again on the switch's connection and
+///   walked from where the marks stop ([`catch_up_round`]), within
+///   [`SWITCH_WALK_MAX`] store reads and [`SWITCH_WALK_TIME`]: what they
+///   reach leaves the candidates. Past either limit, or on an error of
+///   the walk: no, and the candidates are emptied (the switch gives way,
+///   as it did for any root write), also for the transaction's next run.
+///
+/// It does not yield to requests (`derive_turn`): they wait for it.
+async fn roots_at_switch(hub: &Arc<Hub>, project: i64, c: &mut PgConnection, gc: &mut GcState) -> Result<bool> {
+    // Nothing left to delete (a round gave way or failed, in this run of
+    // the transaction or one before): the marks may not be closed.
+    if gc.expired_unreferenced.is_empty() {
+        return Ok(false);
+    }
+    let cur = read_ref_stamp(c, project).await?;
+    if cur == gc.stamp {
+        return Ok(true);
+    }
+    let roots = collect_db_roots(c, project).await?;
+    let uploads = upload_names(c, project).await?;
+    match tokio::time::timeout(SWITCH_WALK_TIME, catch_up_round(hub, project, gc, cur, roots, uploads, Some(SWITCH_WALK_MAX))).await {
+        Ok(r) => Ok(r?.is_some()),
+        Err(_) => {
+            gc.expired_unreferenced.clear();
+            Ok(false)
+        }
+    }
 }
 
 async fn select_batch(
@@ -947,8 +1291,8 @@ async fn select_batch(
     project: i64,
     listed: &[PackRow],
     opts: &Options,
-    gc: Option<GcState>,
-) -> Result<(Vec<PackRow>, HashSet<ObjectId>, Option<RefStamp>, bool)> {
+    gc: Option<&tokio::sync::Mutex<GcState>>,
+) -> Result<(Vec<PackRow>, bool)> {
     let max_per_run = opts.max_packs_per_run.max(1);
     let mut small: Vec<PackRow> = listed
         .iter()
@@ -981,7 +1325,7 @@ async fn select_batch(
 
     let Some(gc) = gc else {
         if small.len() < opts.min_packs_to_merge {
-            return Ok((Vec::new(), HashSet::new(), None, false));
+            return Ok((Vec::new(), false));
         }
         // Past `MAX_PACKS_PER_RUN`, only while the batch stays within one
         // merged pack (BUG-2462: many tiny packs a pass, never gigabytes).
@@ -996,8 +1340,9 @@ async fn select_batch(
             })
             .map(|(_, p)| p)
             .collect();
-        return Ok((batch, HashSet::new(), None, false));
+        return Ok((batch, false));
     };
+    let gc = gc.lock().await;
 
     let mut chosen: Vec<PackRow> = Vec::new();
     let mut chosen_names: HashSet<Arc<str>> = HashSet::new();
@@ -1038,7 +1383,7 @@ async fn select_batch(
         }
     }
 
-    Ok((chosen, gc.expired_unreferenced, Some(gc.stamp), complete_dead_sweep))
+    Ok((chosen, complete_dead_sweep))
 }
 
 /// The replacement packs a merge writes as it copies entries, each at
@@ -1109,13 +1454,24 @@ async fn compact_batch(
     hub: &Arc<Hub>,
     project: i64,
     batch: &[PackRow],
-    expired_unreferenced: &HashSet<ObjectId>,
-    expected_stamp: Option<&RefStamp>,
+    gc: Option<&Arc<tokio::sync::Mutex<GcState>>>,
     complete_dead_sweep: bool,
     opts: &Options,
     now_ms: i64,
     report: &mut Report,
 ) -> Result<bool> {
+    // A pass that drops objects reads the roots again before it copies
+    // (BUG-2602): what a root written since the marks names is copied, not
+    // dropped (a dropped object named again later loses the switch).
+    if let Some(gc) = gc {
+        catch_up(hub, project, gc).await?;
+    }
+    let held = match gc {
+        Some(gc) => Some(gc.lock().await),
+        None => None,
+    };
+    let nothing = HashSet::new();
+    let expired_unreferenced: &HashSet<ObjectId> = held.as_ref().map_or(&nothing, |gc| &gc.expired_unreferenced);
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut dead_count = 0usize;
     let mut dead_ids: HashSet<ObjectId> = HashSet::new();
@@ -1307,11 +1663,20 @@ async fn compact_batch(
     }
     out.write(hub, project).await?;
     let Merged { written: written_packs, kept: total_kept, .. } = out;
+    drop(held);
 
     // Simulated crash after writing the staged replacement pack(s), before
     // switching the database rows.
     if opts.crash == Some(CrashPoint::AfterWriteBeforeSwitch) {
         return Ok(true);
+    }
+
+    // The switch of a pass that dropped objects (pure compaction is safe
+    // regardless of concurrent pushes). Once more outside it: what was
+    // written while the packs were copied (BUG-2602).
+    let check = if dead_count > 0 { gc.cloned() } else { None };
+    if let Some(gc) = &check {
+        catch_up(hub, project, gc).await?;
     }
 
     if let Some(hook) = &opts.before_switch {
@@ -1320,21 +1685,17 @@ async fn compact_batch(
 
     // 3. Switch the database rows in a single transaction:
     // - verify every pack in `batch` is still `LISTED` (locking the rows);
-    // - if `expected_stamp` is Some (a GC run that drops unreferenced objects),
-    //   verify the project's ref/push stamp has not changed (or if no objects
-    //   were dropped, pure compaction is safe regardless of concurrent pushes!);
+    // - if objects were dropped, make sure no root names a candidate
+    //   ([`roots_at_switch`]) and that none of the dropped ones was named
+    //   again since they were left out of the replacement packs: otherwise
+    //   give way;
     // - mark the new pack(s) `LISTED` (giving them `created_at` matching the
     //   newest replaced pack so pack chronological order is preserved);
     // - mark the old packs `DISCARDED` with `discarded_at = now_ms`.
     let old_names: Vec<String> = batch.iter().map(|p| p.name.to_string()).collect();
     let new_names: Vec<String> = written_packs.iter().map(|(n, _, _, _)| n.to_string()).collect();
     let newest_created_at = batch.iter().map(|p| p.created_at).max().unwrap_or(now_ms);
-    let check_stamp = if dead_count > 0 { expected_stamp.cloned() } else { None };
-    let all_expired_hexes: Vec<String> = if dead_count > 0 {
-        expired_unreferenced.iter().map(ObjectId::hex).collect()
-    } else {
-        Vec::new()
-    };
+    let dead_ids = Arc::new(dead_ids);
     let dead_hexes: Vec<String> = if dead_count > 0 && complete_dead_sweep {
         dead_ids.iter().map(ObjectId::hex).collect()
     } else {
@@ -1345,16 +1706,19 @@ async fn compact_batch(
         gc_transaction(hub, |c| {
             let old_names = old_names.clone();
             let new_names = new_names.clone();
-            let check_stamp = check_stamp.clone();
-            let all_expired_hexes = all_expired_hexes.clone();
+            let (hub, check, dead_ids) = (hub.clone(), check.clone(), dead_ids.clone());
             let dead_hexes = dead_hexes.clone();
             Box::pin(async move {
-                if let Some(expected) = &check_stamp {
+                let mut all_expired_hexes: Vec<String> = Vec::new();
+                if let Some(gc) = &check {
                     lock_gc_epoch_tx(c, project).await?;
-                    let cur = read_ref_stamp(c, project).await?;
-                    if &cur != expected {
+                    let mut gc = gc.lock().await;
+                    if !roots_at_switch(&hub, project, c, &mut gc).await?
+                        || dead_ids.iter().any(|id| !gc.expired_unreferenced.contains(id))
+                    {
                         return Ok(None);
                     }
+                    all_expired_hexes = gc.expired_unreferenced.iter().map(ObjectId::hex).collect();
                 }
                 let locked: Vec<String> = sqlx::query_scalar(
                     "SELECT name FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3 FOR UPDATE",
@@ -1582,26 +1946,26 @@ async fn mark_and_sweep_loose(
     opts: &Options,
     now_ms: i64,
     report: &mut Report,
-) -> Result<GcState> {
-    let mut conn = hub.db.acquire().await?;
-    let mut stamp = read_ref_stamp(&mut conn, project).await?;
-    let roots = collect_db_roots(&mut conn, project).await?;
-    drop(conn);
+) -> Result<Arc<tokio::sync::Mutex<GcState>>> {
+    // The stamp and the roots it stands for, of one snapshot (BUG-2602: a
+    // row in the stamp and missing from the roots would never be walked).
+    let (stamp, roots) = read_stamp_and_roots(hub, project, None).await?;
+    let (roots, uploads) = roots.expect("read with no stamp to compare");
 
     // Walk object graph from `roots` to find all reachable `ObjectId`s.
-    let mut reachable = walk_reachable(hub, project, &roots).await?;
+    let mut marks = Marks { leaves: roots.leaf_objects.clone(), fault: opts.fault.clone(), ..Marks::default() };
+    walk_from_roots(hub, project, roots.walk_objects.iter().copied(), &mut marks, &roots, None).await?;
 
-    // Also include all objects in active `STAGED` upload packs so a push in
-    // flight can never lose an object it staged or is about to reference.
+    // Also keep all objects in active `STAGED` upload packs so a push in
+    // flight can never lose an object it staged or is about to reference
+    // (kept, not walked: `Marks::staged_ids`).
     let store = hub.objects.blob_store();
     let bound = hub.objects.index_bound();
+    // The uploads listed (or discarded) at that moment are known: the walk
+    // read what they hold. One made later is read when the pass catches up.
+    marks.uploads = uploads.into_iter().filter(|name| !stamp.staged_packs.contains(name)).collect();
     for staged_name in &stamp.staged_packs {
-        let k = pack::key(project, staged_name);
-        if let Some(held) = pack::read_index(&**store, &k, bound).await.map_err(Error::Other)? {
-            for (id, _) in held.index.iter() {
-                reachable.insert(*id);
-            }
-        }
+        marks.read_upload(hub, project, staged_name).await?;
     }
 
     // Now enumerate all objects currently stored in `project`:
@@ -1664,7 +2028,7 @@ async fn mark_and_sweep_loose(
     let mut to_clear: Vec<String> = Vec::new();
     for (hex_id, since) in existing_unreferenced {
         match ObjectId::from_hex(&hex_id) {
-            Ok(id) if !reachable.contains(&id) && all_stored.contains(&id) => {
+            Ok(id) if !marks.live(&id) && all_stored.contains(&id) => {
                 unref_map.insert(id, since);
             }
             _ => to_clear.push(hex_id),
@@ -1683,7 +2047,7 @@ async fn mark_and_sweep_loose(
 
     let mut newly_unref: Vec<String> = Vec::new();
     for id in &all_stored {
-        if !reachable.contains(id) && !unref_map.contains_key(id) {
+        if !marks.live(id) && !unref_map.contains_key(id) {
             unref_map.insert(*id, now_ms);
             newly_unref.push(id.hex());
         }
@@ -1716,7 +2080,7 @@ async fn mark_and_sweep_loose(
     // the server never holds a `snapshots` row with missing objects (BUG-1780).
     let mut retained_snaps: Vec<ObjectId> = Vec::new();
     for &s in &roots.known_snapshots {
-        if reachable.contains(&s) {
+        if marks.live(&s) {
             continue;
         }
         if !all_stored.contains(&s) {
@@ -1726,88 +2090,313 @@ async fn mark_and_sweep_loose(
         }
     }
     if !retained_snaps.is_empty() && !expired_unreferenced.is_empty() {
-        let retained_closure = walk_from_roots(hub, project, retained_snaps, HashSet::new(), &roots).await?;
-        for id in retained_closure {
-            expired_unreferenced.remove(&id);
-        }
+        // From where the marks stop: nothing behind a member of the closed
+        // set is a candidate. What it reaches joins the set (it is kept;
+        // its marks in `unreferenced_objects` stay: nothing references it).
+        walk_from_roots(hub, project, retained_snaps, &mut marks, &roots, None).await?;
+        expired_unreferenced.retain(|id| !marks.live(id));
     }
+    drop(roots);
+    let gc = Arc::new(tokio::sync::Mutex::new(GcState { expired_unreferenced, stamp, marks }));
 
-    // Delete expired unreferenced loose objects (after verifying `read_ref_stamp`
-    // is unchanged so no racing push, PR, change_ref, or bisect referenced them,
-    // and purging DB records in the same step).
-    let has_loose_expired =
-        !expired_unreferenced.is_empty() && loose_ids.iter().any(|id| expired_unreferenced.contains(id));
-    if has_loose_expired {
+    // Delete expired unreferenced loose objects, in a switch that first
+    // makes sure no root names them ([`roots_at_switch`]: no racing push,
+    // PR, change_ref, or bisect), purging DB records in the same step.
+    let any_loose = |gc: &GcState| loose_ids.iter().any(|id| gc.expired_unreferenced.contains(id));
+    if any_loose(&*gc.lock().await) {
+        catch_up(hub, project, &gc).await?;
+    }
+    if any_loose(&*gc.lock().await) {
         if let Some(hook) = &opts.before_switch {
             (hook.0)().await;
         }
-        let expired_hexes: Vec<String> = expired_unreferenced.iter().map(ObjectId::hex).collect();
-        let purged: Result<(RefStamp, Option<i64>)> =
-            gc_transaction(hub, |c| {
-                let stamp = stamp.clone();
-                let expired_hexes = expired_hexes.clone();
-                Box::pin(async move {
-                    lock_gc_epoch_tx(c, project).await?;
-                    let cur = read_ref_stamp(c, project).await?;
-                    if cur != stamp {
-                        return Ok((cur, None));
-                    }
-                    purge_expired_db_records(c, project, &expired_hexes).await?;
-                    let gce = bump_gc_epoch_tx(c, project).await?;
-                    let refreshed = read_ref_stamp(c, project).await?;
-                    Ok((refreshed, Some(gce)))
-                })
-            })
-            .await;
-        let (next_stamp, maybe_gce) = purged?;
-        let Some(gce) = maybe_gce else {
-            return Ok(GcState {
-                expired_unreferenced: HashSet::new(),
-                stamp: next_stamp,
-            });
-        };
-        stamp = next_stamp;
-        notify_gc_epoch(hub, project, gce).await;
-
-        let mut deleted_any_loose = false;
-        let mut deleted_loose_only_hexes = Vec::new();
-        for id in loose_ids {
-            if expired_unreferenced.contains(&id) {
-                hub.limits.derive_turn().await;
-                store.delete(&object_key(project, &id)).await.map_err(Error::Other)?;
-                deleted_any_loose = true;
-                if !packed_stored.contains(&id) {
-                    deleted_loose_only_hexes.push(id.hex());
+        let switched: Option<i64> = gc_transaction(hub, |c| {
+            let (hub, gc) = (hub.clone(), gc.clone());
+            Box::pin(async move {
+                lock_gc_epoch_tx(c, project).await?;
+                let mut gc = gc.lock().await;
+                if !roots_at_switch(&hub, project, c, &mut gc).await? || gc.expired_unreferenced.is_empty() {
+                    return Ok(None);
                 }
-                report.loose_objects_deleted += 1;
-            }
-        }
-        if deleted_any_loose {
-            let gce2 = gc_transaction(hub, |c| {
-                let deleted_loose_only_hexes = deleted_loose_only_hexes.clone();
-                Box::pin(async move {
-                    lock_gc_epoch_tx(c, project).await?;
-                    for chunk in deleted_loose_only_hexes.chunks(500) {
-                        sqlx::query(
-                            "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
-                        )
-                        .bind(project)
-                        .bind(chunk)
-                        .execute(&mut *c)
-                        .await?;
-                    }
-                    bump_gc_epoch_tx(c, project).await
-                })
+                let expired_hexes: Vec<String> = gc.expired_unreferenced.iter().map(ObjectId::hex).collect();
+                purge_expired_db_records(c, project, &expired_hexes).await?;
+                let gce = bump_gc_epoch_tx(c, project).await?;
+                // The purge moved the stamp; the roots are those just read,
+                // less what it purged.
+                gc.stamp = read_ref_stamp(c, project).await?;
+                Ok(Some(gce))
             })
-            .await?;
-            notify_gc_epoch(hub, project, gce2).await;
+        })
+        .await?;
+        let Some(gce) = switched else {
+            // Gave way (or every candidate is named again): the pass
+            // deletes nothing more.
+            gc.lock().await.expired_unreferenced.clear();
+            return Ok(gc);
+        };
+        notify_gc_epoch(hub, project, gce).await;
+        if let Some(hook) = &opts.before_loose_delete {
+            (hook.0)().await;
+        }
+
+        // The deletes (BUG-2621), in chunks, each under the root writers'
+        // gate ([`delete_loose_chunk`]). Deleted after the purge's commit
+        // and outside any lock, as they were, a writer could find an object
+        // still stored, commit, and lose it to the delete.
+        let loose: Vec<ObjectId> = {
+            let gc = gc.lock().await;
+            let mut loose: Vec<ObjectId> = loose_ids.into_iter().filter(|id| gc.expired_unreferenced.contains(id)).collect();
+            loose.sort_unstable();
+            loose
+        };
+        for chunk in loose.chunks(LOOSE_DELETE_CHUNK) {
+            hub.limits.derive_turn().await;
+            let packed_too: HashSet<ObjectId> = chunk.iter().filter(|id| packed_stored.contains(id)).copied().collect();
+            let (deleted, more) = delete_loose_chunk(hub, project, &gc, chunk, &packed_too, opts).await?;
+            report.loose_objects_deleted += deleted;
+            if !more {
+                break;
+            }
         }
     }
 
-    Ok(GcState {
-        expired_unreferenced,
-        stamp,
-    })
+    Ok(gc)
+}
+
+/// How often a chunk of loose deletes tries to raise the GC epoch after its
+/// deletes before it gives up ([`delete_loose_chunk`]); it holds the root
+/// writers' gate meanwhile.
+const EPOCH_AFTER_DELETES_TRIES: u32 = 20;
+
+/// Delete one chunk of loose objects under the root writers' gate
+/// (BUG-2621): the objects deleted, and whether the pass goes on to the
+/// next chunk.
+///
+/// The gate ([`GATE_BASE`]) is taken **on a session**, exclusively, and held
+/// from before the roots are read until the epoch is raised after the last
+/// delete, so no step in between (a commit that fails, a delete that fails)
+/// lets a waiting root writer through:
+/// 1. a transaction locks the epoch row, reads the roots again
+///    ([`roots_at_switch`]: a root committed since the purge keeps what it
+///    names, and that object leaves the chunk), clears the marks of what is
+///    still a candidate and raises the epoch, and commits. If anything of it
+///    fails, nothing has been deleted: the pass ends there.
+/// 2. the store deletes, [`AT_ONCE`] at a time, each batch joined to its end
+///    (a request is never dropped in flight: one the store already has
+///    would be applied later, after a writer stored the object again). A
+///    delete that fails, or [`LOOSE_DELETE_TIME`] passing between batches,
+///    stops the rest (an object left stored lost its mark: the next pass
+///    marks it again).
+/// 3. a second transaction raises the epoch again, tried again while it
+///    fails ([`EPOCH_AFTER_DELETES_TRIES`]), the gate still held: a writer
+///    that checked an object while the deletes ran (the first raise came
+///    before its check) starts over.
+///
+/// So for every object deleted: a writer that committed before the gate was
+/// taken is seen by step 1; one that waits at the gate reads an epoch
+/// raised after the delete and checks again; one that begins later finds
+/// the object gone. What is left: a server that stops, or the gate's
+/// session ending (checked before every batch), between a delete and step
+/// 3: the writers that checked that object while the deletes ran keep the
+/// epoch they read. (The first raise covers those that checked before;
+/// when the session ended and the server lives, it raises the epoch from
+/// another connection at once, which covers those not yet at their guard.)
+///
+/// A store that does not answer a delete holds the gate until it does
+/// (BUG-2624, accepted): giving the request up would let the store apply
+/// it later, after a writer had stored the object again.
+async fn delete_loose_chunk(
+    hub: &Arc<Hub>,
+    project: i64,
+    gc: &Arc<tokio::sync::Mutex<GcState>>,
+    chunk: &[ObjectId],
+    packed_too: &HashSet<ObjectId>,
+    opts: &Options,
+) -> Result<(usize, bool)> {
+    let mut conn = hub.db.acquire().await?;
+    // The session ends with this connection, whatever ends the chunk (an
+    // error, a panic, this future dropped): one that holds the gate, or an
+    // open transaction, never goes back to the pool.
+    conn.close_on_drop();
+    // Nothing is held if this fails (the wait for the writers in their
+    // transactions is bounded by the connection's lock timeout).
+    sqlx::query("SELECT pg_advisory_lock($1)").bind(gate_key(project)).execute(&mut *conn).await?;
+    let deleting = std::sync::atomic::AtomicBool::new(false);
+    let done = loose_chunk_under_gate(hub, project, &mut conn, gc, chunk, packed_too, opts, &deleting).await;
+    // The gate goes back: by its unlock, or with the session.
+    if done.is_ok() {
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)").bind(gate_key(project)).execute(&mut *conn).await;
+    }
+    drop(conn);
+    if done.is_err() && deleting.load(Ordering::SeqCst) {
+        // The chunk ended after its deletes began and before its second
+        // raise (the gate's session ended, or the raise failed every
+        // time): the gate is open with the epoch as the first raise left
+        // it. Raise it from here, as best we can: raising it only ever
+        // sends writers back to their checks. It covers the writers that
+        // have not reached their guard yet; one that passed it since the
+        // gate opened is not sent back.
+        let mut raised = None;
+        for _ in 0..3 {
+            let r = gc_transaction(hub, |c| {
+                Box::pin(async move {
+                    lock_gc_epoch_tx(c, project).await?;
+                    bump_gc_epoch_tx(c, project).await
+                })
+            })
+            .await;
+            match r {
+                Ok(epoch) => {
+                    raised = Some(epoch);
+                    break;
+                }
+                Err(e) => eprintln!("veil-server: pack GC of project {project}: the GC epoch was not raised after a chunk of loose deletes lost its gate: {e:?}"),
+            }
+        }
+        if let Some(epoch) = raised {
+            notify_gc_epoch(hub, project, epoch).await;
+        }
+    }
+    let (deleted, more, epochs, failed) = done?;
+    for epoch in epochs {
+        notify_gc_epoch(hub, project, epoch).await;
+    }
+    match failed {
+        // A delete failed: the epoch is raised for the deletes made, and
+        // the pass ends with the error.
+        Some(e) => Err(Error::Other(anyhow!("deleting a loose object: {e}"))),
+        None => Ok((deleted, more)),
+    }
+}
+
+/// [`delete_loose_chunk`] with the gate held on `conn`'s session: the
+/// objects deleted, whether the pass goes on, the epochs raised, and a
+/// delete's failure. `deleting` is set once the deletes begin.
+#[allow(clippy::too_many_arguments)]
+async fn loose_chunk_under_gate(
+    hub: &Arc<Hub>,
+    project: i64,
+    conn: &mut PgConnection,
+    gc: &Arc<tokio::sync::Mutex<GcState>>,
+    chunk: &[ObjectId],
+    packed_too: &HashSet<ObjectId>,
+    opts: &Options,
+    deleting: &std::sync::atomic::AtomicBool,
+) -> Result<(usize, bool, Vec<i64>, Option<String>)> {
+    let fault = |point: FaultPoint, id: ObjectId| {
+        let fault = opts.fault.clone();
+        async move {
+            match &fault {
+                Some(fault) => (fault.0)(point, id).await,
+                None => Ok(()),
+            }
+        }
+    };
+    // 1. The roots, the marks, the epoch.
+    sqlx::query("BEGIN ISOLATION LEVEL READ COMMITTED").execute(&mut *conn).await?;
+    lock_gc_epoch_tx(conn, project).await?;
+    let ids: Vec<ObjectId> = {
+        let mut gc = gc.lock().await;
+        if !roots_at_switch(hub, project, conn, &mut gc).await? {
+            // Gave way (the bound on its walk): the pass deletes nothing more.
+            sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            return Ok((0, false, Vec::new(), None));
+        }
+        if let Some(hook) = &opts.during_loose_delete {
+            (hook.0)().await;
+        }
+        chunk.iter().filter(|id| gc.expired_unreferenced.contains(id)).copied().collect()
+    };
+    if ids.is_empty() {
+        // Every one is named again: nothing deleted, no writer sent back.
+        sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+        return Ok((0, true, Vec::new(), None));
+    }
+    let loose_only: Vec<String> = ids.iter().filter(|id| !packed_too.contains(id)).map(ObjectId::hex).collect();
+    for hexes in loose_only.chunks(500) {
+        sqlx::query("DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)")
+            .bind(project)
+            .bind(hexes)
+            .execute(&mut *conn)
+            .await?;
+    }
+    let mut epochs = vec![bump_gc_epoch_tx(conn, project).await?];
+    fault(FaultPoint::LooseCommit, ids[0]).await?;
+    sqlx::query("COMMIT").execute(&mut *conn).await?;
+    hub.commits.count(crate::db::Commit::PackGc);
+
+    // 2. The deletes.
+    deleting.store(true, Ordering::SeqCst);
+    let (mut deleted, mut failed) = (0usize, None::<String>);
+    let began = std::time::Instant::now();
+    let mut gate_held = true;
+    for batch in ids.chunks(AT_ONCE) {
+        if began.elapsed() > LOOSE_DELETE_TIME {
+            failed = Some(format!("the deletes took longer than {LOOSE_DELETE_TIME:?}"));
+            break;
+        }
+        // The gate is this session's: without it, no more deletes.
+        if sqlx::query("SELECT 1").execute(&mut *conn).await.is_err() {
+            failed = Some("the session holding the root writers' gate ended".into());
+            gate_held = false;
+            break;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for id in batch {
+            let (hub, k, id, fault) = (hub.clone(), object_key(project, id), *id, opts.fault.clone());
+            set.spawn(async move {
+                if let Some(fault) = &fault {
+                    (fault.0)(FaultPoint::LooseDelete, id).await?;
+                }
+                hub.objects.blob_store().delete(&k).await.map_err(Error::Other)
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            match r.map_err(|e| Error::Other(e.into())).and_then(|r| r) {
+                Ok(()) => deleted += 1,
+                Err(e) => failed = Some(format!("{e:?}")),
+            }
+        }
+        if failed.is_some() {
+            break;
+        }
+    }
+    if !gate_held {
+        return Err(Error::Other(anyhow!("deleting loose objects: {}", failed.unwrap_or_default())));
+    }
+
+    // 3. The epoch again, for what was checked while the deletes ran.
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let raised: Result<i64> = async {
+            sqlx::query("BEGIN ISOLATION LEVEL READ COMMITTED").execute(&mut *conn).await?;
+            let epoch = bump_gc_epoch_tx(conn, project).await?;
+            fault(FaultPoint::LooseCommit, ids[0]).await?;
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(epoch)
+        }
+        .await;
+        match raised {
+            Ok(epoch) => {
+                hub.commits.count(crate::db::Commit::PackGc);
+                epochs.push(epoch);
+                break;
+            }
+            Err(e) if tries >= EPOCH_AFTER_DELETES_TRIES => {
+                return Err(Error::Other(anyhow!("the GC epoch could not be raised after {deleted} loose objects were deleted: {e:?}")));
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                // The session is gone, and the gate with it: no use trying here.
+                if sqlx::query("SELECT 1").execute(&mut *conn).await.is_err() {
+                    return Err(Error::Other(anyhow!("the session holding the root writers' gate ended after {deleted} loose objects were deleted: {e:?}")));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(tries))).await;
+            }
+        }
+    }
+    Ok((deleted, failed.is_none(), epochs, failed))
 }
 
 async fn bump_gc_epoch_tx(c: &mut PgConnection, project: i64) -> Result<i64> {
@@ -2304,34 +2893,40 @@ fn collect_hex_ids_from_json(s: &str, out: &mut HashSet<ObjectId>) {
     }
 }
 
-/// Traverse the object graph starting from `roots.walk_objects`, expanding
-/// snapshots (trees, parents, predecessors, S11 `attempts`, `origins`,
-/// `projections`, S12 `graph.changed`), trees (subtrees, blobs, sealed blobs,
-/// conflicts), and annotated tags (`Atag`).
-async fn walk_reachable(hub: &Arc<Hub>, project: i64, roots: &DbRoots) -> Result<HashSet<ObjectId>> {
-    walk_from_roots(
-        hub,
-        project,
-        roots.walk_objects.iter().copied(),
-        roots.leaf_objects.clone(),
-        roots,
-    )
-    .await
-}
-
+/// Traverse the object graph from `initial`, expanding snapshots (trees,
+/// parents, predecessors, S11 `attempts`, `origins`, `projections`, S12
+/// `graph.changed`), trees (subtrees, blobs, sealed blobs, conflicts), and
+/// annotated tags (`Atag`), and stopping at what `marks` already holds
+/// (its closed set) and at what an earlier walk could not read
+/// (`Marks::unread`). What it reads joins the set; what it cannot read is
+/// noted. What a tree names as a file, and a conflict as a term, is kept
+/// as a leaf and not read; an object so named that the walk also meets as
+/// a directory, a parent or a root is read and expanded as what it is
+/// (`Marks::leaves`, BUG-2622).
+///
+/// `limit`: the most objects it may read (BUG-2602: under a switch's
+/// lock, where it does not yield to requests either). Answers the objects
+/// it read, or `None` past the limit: the set is then no longer closed.
 async fn walk_from_roots(
     hub: &Arc<Hub>,
     project: i64,
     initial: impl IntoIterator<Item = ObjectId>,
-    mut reachable: HashSet<ObjectId>,
+    marks: &mut Marks,
     roots: &DbRoots,
-) -> Result<HashSet<ObjectId>> {
+    limit: Option<usize>,
+) -> Result<Option<usize>> {
     let mut queue: VecDeque<ObjectId> = initial.into_iter().collect();
+    let mut reads = 0usize;
+    let Marks { reachable, unread, leaves, fault, .. } = marks;
 
     while let Some(id) = queue.pop_front() {
-        if builtin(&id).is_some() || !reachable.insert(id) {
+        if builtin(&id).is_some() || reachable.contains(&id) || unread.contains(&id) {
             continue;
         }
+        if limit.is_some_and(|l| reads >= l) {
+            return Ok(None);
+        }
+        reads += 1;
         // If `id` is a real snapshot with an origin, projection memos, or S12
         // `graph.changed` object, enqueue those too.
         if let Some(&orig) = roots.origins.get(&id) {
@@ -2347,15 +2942,21 @@ async fn walk_from_roots(
             }
         }
         if let Some(&ch) = roots.graph_changed.get(&id) {
-            reachable.insert(ch);
+            leaves.insert(ch);
         }
 
-        hub.limits.derive_turn().await;
+        if limit.is_none() {
+            hub.limits.derive_turn().await;
+        } else if let Some(fault) = fault {
+            (fault.0)(FaultPoint::SwitchRead, id).await?;
+        }
         let cost = hub.objects.read_cost(project, &id, 0).await.unwrap_or(4096);
         let _ra = ReadAhead::wait(cost).await;
         let Some(raw) = hub.objects.get(project, &id).await.map_err(Error::Other)? else {
+            unread.insert(id);
             continue;
         };
+        reachable.insert(id);
         let Ok(obj) = Object::decode(&raw) else {
             // Derived object (such as S12 `Changed` or S15 `Segment`): leaf.
             continue;
@@ -2391,7 +2992,7 @@ async fn walk_from_roots(
                 for entry in &t.entries {
                     match entry.kind {
                         EntryKind::File | EntryKind::Symlink => {
-                            reachable.insert(entry.id);
+                            leaves.insert(entry.id);
                         }
                         EntryKind::Dir | EntryKind::Conflict => {
                             if !reachable.contains(&entry.id) {
@@ -2406,7 +3007,7 @@ async fn walk_from_roots(
             }
             Object::Conflict(c) => {
                 for term in c.interleaved().flatten() {
-                    reachable.insert(term.id);
+                    leaves.insert(term.id);
                 }
             }
             Object::Atag(a) => {
@@ -2418,7 +3019,7 @@ async fn walk_from_roots(
         }
     }
 
-    Ok(reachable)
+    Ok(Some(reads))
 }
 
 /// A READ COMMITTED `db::transaction` of the merges and garbage collection,

@@ -692,6 +692,11 @@ pub enum Isolation {
     /// queued for minutes. (YugabyteDB runs it as REPEATABLE READ unless
     /// read committed is enabled; both fail fast on a conflict.)
     ReadCommitted,
+    /// For several reads that must be of one moment of the database
+    /// (`REPEATABLE READ READ ONLY`: one snapshot, on PostgreSQL and
+    /// YugabyteDB): pack GC's reference stamp with the roots it stands for
+    /// (BUG-2602).
+    Snapshot,
 }
 
 /// Run `f` in a SERIALIZABLE transaction ([`transaction`]).
@@ -713,6 +718,7 @@ where
     let begin = match isolation {
         Isolation::Serializable => "BEGIN ISOLATION LEVEL SERIALIZABLE",
         Isolation::ReadCommitted => "BEGIN ISOLATION LEVEL READ COMMITTED",
+        Isolation::Snapshot => "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
     };
     let deadline = tokio::time::Instant::now() + TRANSACTION_DEADLINE;
     let mut attempt: u32 = 0;
