@@ -24,6 +24,47 @@ use veil_core::{cache::LruCache, hub::encoding, ObjectId};
 
 use crate::pack::{Found, Held, Index, Slot, StagedSlots};
 
+/// How this server keeps the objects a push, an API commit or a landing
+/// batch keeps (`--object-layout`, `VEIL_OBJECT_LAYOUT`;
+/// `docs/design/server/object-layout.md`). Reads never depend on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ObjectLayout {
+    /// Listed packs (S28), the default.
+    #[default]
+    Packs,
+    /// One object per key (`p/<project>/ab/cdef…`), with uploads still
+    /// staged in a container that is deleted when its push answers.
+    Objects,
+}
+
+impl ObjectLayout {
+    /// Its flag, environment variable and `stats.json` name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ObjectLayout::Packs => "packs",
+            ObjectLayout::Objects => "objects",
+        }
+    }
+}
+
+impl std::fmt::Display for ObjectLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ObjectLayout {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<ObjectLayout, String> {
+        match s {
+            "packs" => Ok(ObjectLayout::Packs),
+            "objects" => Ok(ObjectLayout::Objects),
+            _ => Err(format!("{s}: expected `packs` or `objects`")),
+        }
+    }
+}
+
 #[async_trait]
 pub trait BlobStore: Send + Sync {
     /// The object at `key`, `None` if there is none.
@@ -60,12 +101,19 @@ pub trait BlobStore: Send + Sync {
         None
     }
     /// Remove the object at `key` (no error if there is none): only packs
-    /// that were discarded (`pack::Packs::discard`) are ever removed.
+    /// that were discarded (`pack::Packs::discard`) and expired loose
+    /// objects (`pack_gc`) are ever removed.
     async fn delete(&self, key: &str) -> Result<()>;
     /// Every key that starts with `prefix` (a folder of keys, `…/`): what
     /// the store holds, to compare with the database's rows (the tests;
     /// S29's job).
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    /// [`BlobStore::list`], counting each listing request in `lists`
+    /// (each page on S3).
+    async fn list_counted(&self, prefix: &str, lists: &AtomicU64) -> Result<Vec<String>> {
+        bump(lists);
+        self.list(prefix).await
+    }
 }
 
 /// Bytes `start..=end` of `b`, clamped.
@@ -122,9 +170,6 @@ impl BlobStore for FsStore {
 
     async fn put(&self, key: &str, data: Bytes) -> Result<()> {
         let path = self.path(key)?;
-        if tokio::fs::try_exists(&path).await? {
-            return Ok(());
-        }
         let dir = path.parent().expect("keys have a directory").to_path_buf();
         tokio::task::spawn_blocking(move || -> Result<()> {
             use std::io::Write;
@@ -442,6 +487,10 @@ impl BlobStore for S3Store {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.list_counted(prefix, &AtomicU64::new(0)).await
+    }
+
+    async fn list_counted(&self, prefix: &str, lists: &AtomicU64) -> Result<Vec<String>> {
         use rusty_s3::S3Action;
         let mut out = Vec::new();
         let mut token: Option<String> = None;
@@ -452,6 +501,7 @@ impl BlobStore for S3Store {
                 action.with_continuation_token(t.clone());
             }
             let url = action.sign(S3_SIGN_FOR);
+            bump(lists);
             let (status, body) = s3_send(|| self.http.get(url.clone())).await?;
             if status != 200 {
                 bail!("S3 LIST: HTTP {status}");
@@ -544,6 +594,7 @@ impl ReadAhead {
 /// is ever answered as the project's.
 pub struct Objects {
     store: Arc<dyn BlobStore>,
+    layout: ObjectLayout,
     /// Encodings, checked against their ids.
     cache: LruCache<Bytes>,
     /// Decoded canonical bytes for objects up to [`RAW_CACHE_MAX_OBJECT`],
@@ -554,19 +605,27 @@ pub struct Objects {
     /// Per-project GC epoch observed from `access_epochs (project_id, -1)`.
     gc_epochs: std::sync::RwLock<std::collections::HashMap<i64, i64>>,
     /// Requests to the store, for the benchmarks' cost gates
-    /// (`storage-and-cost.md` §9): writes, bytes written, reads; of the
-    /// writes, a push's and an upload's own (`own_writes`: those made in
-    /// their scope, [`own`], counted where they are made: BUG-1398).
+    /// (`storage-and-cost.md` §9): writes, bytes written, reads, deletes,
+    /// listings; of the writes, a push's and an upload's own (`own_writes`:
+    /// those made in their scope, [`own`], counted where they are made:
+    /// BUG-1398).
     pub writes: AtomicU64,
     pub written_bytes: AtomicU64,
     pub reads: AtomicU64,
+    pub deletes: AtomicU64,
+    pub lists: AtomicU64,
+    /// Objects kept by pushes, API commits and landing batches.
+    pub objects_kept: AtomicU64,
+    /// Upload containers staged (`POST …/objects`).
+    pub uploads: AtomicU64,
     /// Project object lookups answered from the object caches, and those
     /// that were not (BUG-2271).
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
     pub own_writes: AtomicU64,
-    /// Database commits that record a pack before it is written (an
-    /// upload's, a push's own: S28), apart from a push's transaction.
+    /// Database commits that record or remove an unlisted pack row (an
+    /// upload's, a push's own: S28; a discarded container's in `objects`),
+    /// apart from a push's transaction.
     pub pack_rows: AtomicU64,
 }
 
@@ -582,6 +641,12 @@ fn decoded(id: &ObjectId, enc: &Bytes) -> Result<Bytes> {
         Cow::Borrowed(_) => Ok(enc.clone()),
         Cow::Owned(raw) => Ok(Bytes::from(raw)),
     }
+}
+
+/// Check that encoding `enc` decodes within [`MAX_OBJECT`] to `id` without
+/// materializing the decoded buffer (`BUG-2662`).
+fn verified(id: &ObjectId, enc: &Bytes) -> Result<()> {
+    encoding::verify(id, enc, MAX_OBJECT).map_err(|_| anyhow!("stored object {} does not match its id", id.short()))
 }
 
 /// [`decoded`] for an entry in [`Objects::cache`], which was already checked
@@ -609,6 +674,79 @@ pub fn encode(raw: Bytes) -> Bytes {
         Cow::Borrowed(_) => raw,
         Cow::Owned(z) => Bytes::from(z),
     }
+}
+
+/// A pack kept by [`Objects::keep`] in [`ObjectLayout::Packs`].
+pub struct KeptPack {
+    pub name: Arc<str>,
+    pub size: u64,
+    pub objects: usize,
+    pub held: Option<Held>,
+}
+
+/// Why [`Objects::keep`] could not finish.
+#[derive(Debug)]
+pub enum KeepError {
+    /// One of the staged containers named by `containers` was discarded.
+    Discarded,
+    /// Storage or encoding failed.
+    Store(anyhow::Error),
+}
+
+/// Options for [`Objects::keep`].
+#[derive(Clone, Copy)]
+pub struct KeepOpts {
+    /// Uploader recorded on any staged pack [`ObjectLayout::Packs`] writes.
+    pub person: i64,
+    /// Worker threads used to compress `made` objects.
+    pub encode_threads: usize,
+    /// Whether the caller already holds [`DECODED_IN_FLIGHT`] for its bytes.
+    pub already_held: bool,
+}
+
+type KeepWriteSet = tokio::task::JoinSet<Result<(ObjectId, Bytes, Option<Bytes>, Option<ReadAhead>)>>;
+
+#[derive(Clone, Copy)]
+struct KeepWriteCtx {
+    project: i64,
+    gce: i64,
+    at_once: usize,
+    already_held: bool,
+}
+
+async fn encode_many(objects: Vec<(ObjectId, Bytes)>, threads: usize) -> Result<Vec<(ObjectId, Bytes, Bytes)>> {
+    let threads = threads.max(1);
+    tokio::task::spawn_blocking(move || {
+        if threads == 1 || objects.len() < 64 {
+            return objects
+                .into_iter()
+                .map(|(id, raw)| {
+                    let enc = encode(raw.clone());
+                    (id, raw, enc)
+                })
+                .collect();
+        }
+        let chunk_len = objects.len().div_ceil(threads).max(1);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = objects
+                .chunks(chunk_len)
+                .map(|part| {
+                    crate::spawn_scoped(s, move || -> Vec<(ObjectId, Bytes, Bytes)> {
+                        part.iter()
+                            .map(|(id, raw)| (*id, raw.clone(), encode(raw.clone())))
+                            .collect()
+                    })
+                })
+                .collect();
+            let mut out = Vec::with_capacity(objects.len());
+            for h in handles {
+                out.extend(h.join().expect("object encoder panicked"));
+            }
+            out
+        })
+    })
+    .await
+    .map_err(Into::into)
 }
 
 /// Run `f` as a push's or an upload's own work: the storage writes made in
@@ -661,10 +799,16 @@ impl Objects {
 
     /// Objects in `store`, with the packs listed in `db`.
     pub fn with_db(store: Arc<dyn BlobStore>, cache_bytes: usize, db: Option<sqlx::PgPool>) -> Objects {
+        Objects::with_layout(store, cache_bytes, db, ObjectLayout::Packs)
+    }
+
+    /// Objects in `store`, keeping new objects in `layout`.
+    pub fn with_layout(store: Arc<dyn BlobStore>, cache_bytes: usize, db: Option<sqlx::PgPool>, layout: ObjectLayout) -> Objects {
         let raw_bytes = (cache_bytes / 4).max(1);
         let enc_bytes = cache_bytes.saturating_sub(raw_bytes).max(1);
         Objects {
             store,
+            layout,
             cache: LruCache::new(enc_bytes),
             raw_cache: LruCache::new(raw_bytes),
             packs: crate::pack::Packs::new(db),
@@ -672,11 +816,20 @@ impl Objects {
             writes: Default::default(),
             written_bytes: Default::default(),
             reads: Default::default(),
+            deletes: Default::default(),
+            lists: Default::default(),
+            objects_kept: Default::default(),
+            uploads: Default::default(),
             cache_hits: Default::default(),
             cache_misses: Default::default(),
             own_writes: Default::default(),
             pack_rows: Default::default(),
         }
+    }
+
+    /// How this server keeps new objects.
+    pub fn layout(&self) -> ObjectLayout {
+        self.layout
     }
 
     pub fn gc_epoch(&self, project: i64) -> i64 {
@@ -1108,18 +1261,428 @@ impl Objects {
     /// lost a race uploads the same objects again (BUG-1157).
     pub async fn stage(&self, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<Arc<str>> {
         let ids: Vec<ObjectId> = objects.iter().map(|(id, _)| *id).collect();
-        if let Some(name) = self.packs.staged_holding(project, person, &ids).await? {
+        let in_objects = self.layout == ObjectLayout::Objects;
+        if let Some(name) = self.packs.staged_holding(project, person, &ids, in_objects).await? {
             return Ok(name);
         }
+        bump(&self.uploads);
         let (name, held) = self.write_pack(project, objects, true, Some(person)).await?;
-        self.packs.staged_here(project, person, &name, held);
+        if in_objects {
+            self.packs.staged_index_here(project, &name, held);
+        } else {
+            self.packs.staged_here(project, person, &name, held);
+        }
         Ok(name)
+    }
+
+    /// Keep the objects a push, an API commit or a landing batch retains:
+    /// those in `touched` from `containers` (staged uploads) and those in
+    /// `made` (canonical encodings built on the server).
+    ///
+    /// - In [`ObjectLayout::Packs`]: lists any container whose objects were
+    ///   all read (`touched`), and writes the rest and `made` into staged
+    ///   pack(s) (recorded in `written`) for the caller's transaction to
+    ///   list.
+    /// - In [`ObjectLayout::Objects`]: writes every unique kept object under
+    ///   its own key `p/<project>/<2 hex>/<62 hex>`, always writing (never
+    ///   skipping when already stored: `object-layout.md` §3.2 fact 2 and
+    ///   §5.2 threat 4), at most `BlobStore::writes_at_once` at a time, with
+    ///   container reads and in-flight buffers held under
+    ///   [`DECODED_IN_FLIGHT`]; returns an empty `Vec`.
+    pub async fn keep(
+        &self,
+        project: i64,
+        containers: &[(Arc<str>, StagedSlots)],
+        touched: &std::collections::HashSet<ObjectId>,
+        made: Vec<(ObjectId, Bytes)>,
+        opts: KeepOpts,
+        written: &mut Vec<Arc<str>>,
+    ) -> std::result::Result<Vec<KeptPack>, KeepError> {
+        match self.layout {
+            ObjectLayout::Packs => {
+                self.keep_packs(project, containers, touched, made, opts, written).await
+            }
+            ObjectLayout::Objects => {
+                self.keep_objects(project, containers, touched, made, opts).await?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    async fn keep_packs(
+        &self,
+        project: i64,
+        containers: &[(Arc<str>, StagedSlots)],
+        touched: &std::collections::HashSet<ObjectId>,
+        made: Vec<(ObjectId, Bytes)>,
+        opts: KeepOpts,
+        written: &mut Vec<Arc<str>>,
+    ) -> std::result::Result<Vec<KeptPack>, KeepError> {
+        let mut listed = Vec::new();
+        let mut kept: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        for (name, sp) in containers {
+            if sp.objects > 0 && sp.slots.len() == sp.objects && sp.slots.iter().all(|(id, _)| touched.contains(id)) {
+                if self.staged_index(project, name).await.map_err(KeepError::Store)?.is_none() {
+                    return Err(KeepError::Discarded);
+                }
+                for (id, _) in &sp.slots {
+                    if kept.insert(*id) {
+                        bump(&self.objects_kept);
+                    }
+                }
+                listed.push(KeptPack { name: name.clone(), size: sp.size, objects: sp.objects, held: None });
+            }
+        }
+        let mut own: Vec<(ObjectId, Bytes)> = Vec::new();
+        for (name, sp) in containers {
+            for (id, slot) in &sp.slots {
+                if touched.contains(id) && kept.insert(*id) {
+                    let (enc, _) = self
+                        .get_staged(project, name, *slot, id)
+                        .await
+                        .map_err(KeepError::Store)?
+                        .ok_or(KeepError::Discarded)?;
+                    own.push((*id, enc));
+                }
+            }
+        }
+        let to_encode: Vec<(ObjectId, Bytes)> = made.into_iter().filter(|(id, _)| kept.insert(*id)).collect();
+        if !to_encode.is_empty() {
+            let encoded = encode_many(to_encode, opts.encode_threads).await.map_err(KeepError::Store)?;
+            own.extend(encoded.into_iter().map(|(id, _, enc)| (id, enc)));
+        }
+        while !own.is_empty() {
+            let rest = if own.len() > crate::pack::MAX_OBJECTS {
+                own.split_off(crate::pack::MAX_OBJECTS)
+            } else {
+                Vec::new()
+            };
+            let n = own.len() as u64;
+            let (name, mut held) = self.put_pack(project, opts.person, own).await.map_err(KeepError::Store)?;
+            self.objects_kept.fetch_add(n, Ordering::Relaxed);
+            held.unproject();
+            written.push(name.clone());
+            listed.push(KeptPack { name, size: held.size, objects: held.index.len(), held: Some(held) });
+            own = rest;
+        }
+        Ok(listed)
+    }
+
+    async fn keep_objects(
+        &self,
+        project: i64,
+        containers: &[(Arc<str>, StagedSlots)],
+        touched: &std::collections::HashSet<ObjectId>,
+        made: Vec<(ObjectId, Bytes)>,
+        opts: KeepOpts,
+    ) -> std::result::Result<(), KeepError> {
+        const WHOLE_CONTAINER_MAX: u64 = 16 << 20;
+        const MADE_CHUNK_OBJECTS: usize = 1024;
+        const MADE_CHUNK_BYTES: usize = 16 << 20;
+
+        let cx = KeepWriteCtx {
+            project,
+            gce: self.gc_epoch(project),
+            at_once: self.store.writes_at_once().max(1),
+            already_held: opts.already_held,
+        };
+        let mut kept: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        let mut set: KeepWriteSet = tokio::task::JoinSet::new();
+
+        for (name, sp) in containers {
+            let mut cached_entries: Vec<(ObjectId, Bytes)> = Vec::new();
+            let mut uncached: Vec<(ObjectId, Slot)> = Vec::new();
+            for &(id, slot) in &sp.slots {
+                if !touched.contains(&id) || !kept.insert(id) {
+                    continue;
+                }
+                if let Some(enc) = self.cache.get(&Self::staged_key(project, name, &id, false)) {
+                    cached_entries.push((id, enc));
+                } else {
+                    uncached.push((id, slot));
+                }
+            }
+            if !cached_entries.is_empty()
+                && self.staged_slots(project, name, &[]).await.map_err(KeepError::Store)?.is_none()
+            {
+                return Err(KeepError::Discarded);
+            }
+            for (id, enc) in cached_entries {
+                self.enqueue_keep_write(cx, false, &mut set, id, enc, None).await?;
+            }
+            if uncached.is_empty() {
+                continue;
+            }
+            uncached.sort_by_key(|(_, s)| s.offset);
+            let uncached_bytes: u64 = uncached.iter().map(|(_, s)| u64::from(s.len)).sum();
+            let read_whole = sp.size <= WHOLE_CONTAINER_MAX
+                && (uncached.len() == sp.objects || (uncached.len() > 1 && uncached_bytes.saturating_mul(2) >= sp.size));
+            if read_whole {
+                self.drain_keep_writes(project, cx.gce, &mut set).await?;
+                let run_held = if !opts.already_held {
+                    Some(ReadAhead::wait(sp.size).await)
+                } else {
+                    ReadAhead::try_take(sp.size)
+                };
+                bump(&self.reads);
+                let bytes = self
+                    .store
+                    .get(&crate::pack::key(project, name))
+                    .await
+                    .map_err(KeepError::Store)?
+                    .ok_or(KeepError::Discarded)?;
+                if bytes.len() as u64 != sp.size {
+                    return Err(KeepError::Store(anyhow!(
+                        "staged pack {name} has length {}, expected {}",
+                        bytes.len(),
+                        sp.size
+                    )));
+                }
+                crate::pack::parse_index(&bytes, Some(sp.size)).map_err(KeepError::Store)?;
+                self.keep_uncached_entries(
+                    cx,
+                    (name, sp.size),
+                    &uncached,
+                    Some(((0, bytes), run_held)),
+                    &mut set,
+                )
+                .await?;
+            } else {
+                let mut runs: Vec<Run> = Vec::new();
+                let mut run: Run = Vec::new();
+                for (id, s) in uncached {
+                    if let (Some(first), Some(last)) = (run.first(), run.last()) {
+                        let near = s.offset <= last.1.last() + 1 + PREFETCH_GAP;
+                        if !(near && s.last() + 1 - first.1.offset <= WHOLE_CONTAINER_MAX) {
+                            runs.push(std::mem::take(&mut run));
+                        }
+                    }
+                    run.push((id, s));
+                }
+                if !run.is_empty() {
+                    runs.push(run);
+                }
+                for run in runs {
+                    self.keep_uncached_entries(cx, (name, sp.size), &run, None, &mut set)
+                        .await?;
+                }
+            }
+        }
+
+        let mut chunk: Vec<(ObjectId, Bytes)> = Vec::new();
+        let mut chunk_bytes = 0usize;
+        for (id, raw) in made {
+            if !kept.insert(id) {
+                continue;
+            }
+            chunk_bytes += raw.len();
+            chunk.push((id, raw));
+            if chunk.len() >= MADE_CHUNK_OBJECTS || chunk_bytes >= MADE_CHUNK_BYTES {
+                let encoded = encode_many(std::mem::take(&mut chunk), opts.encode_threads)
+                    .await
+                    .map_err(KeepError::Store)?;
+                chunk_bytes = 0;
+                for (id, raw, enc) in encoded {
+                    let raw_small = (raw.len() <= RAW_CACHE_MAX_OBJECT).then_some(raw);
+                    self.enqueue_keep_write(cx, false, &mut set, id, enc, raw_small).await?;
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            let encoded = encode_many(chunk, opts.encode_threads).await.map_err(KeepError::Store)?;
+            for (id, raw, enc) in encoded {
+                let raw_small = (raw.len() <= RAW_CACHE_MAX_OBJECT).then_some(raw);
+                self.enqueue_keep_write(cx, false, &mut set, id, enc, raw_small).await?;
+            }
+        }
+
+        self.drain_keep_writes(project, cx.gce, &mut set).await
+    }
+
+    async fn keep_uncached_entries(
+        &self,
+        cx: KeepWriteCtx,
+        (name, pack_size): (&str, u64),
+        entries: &[(ObjectId, Slot)],
+        initial: Option<((u64, Bytes), Option<ReadAhead>)>,
+        set: &mut KeepWriteSet,
+    ) -> std::result::Result<(), KeepError> {
+        let (mut loaded, mut run_held) = match initial {
+            Some((b, h)) => (Some(b), h),
+            None => (None, None),
+        };
+        let pack_key = crate::pack::key(cx.project, name);
+        let end = entries.last().expect("non-empty entries").1.last();
+        for (idx, &(id, s)) in entries.iter().enumerate() {
+            if loaded.is_none() {
+                let span = end - s.offset + 1;
+                self.drain_keep_writes(cx.project, cx.gce, set).await?;
+                run_held = if !cx.already_held {
+                    Some(ReadAhead::wait(span).await)
+                } else {
+                    ReadAhead::try_take(span)
+                };
+                bump(&self.reads);
+                let (bytes, total_size) = self
+                    .store
+                    .get_range(&pack_key, s.offset, end)
+                    .await
+                    .map_err(KeepError::Store)?
+                    .ok_or(KeepError::Discarded)?;
+                if total_size != pack_size || bytes.len() as u64 != span {
+                    return Err(KeepError::Store(anyhow!("staged pack {name} is shorter than its index")));
+                }
+                loaded = Some((s.offset, bytes));
+            }
+            let enc = {
+                let (buf_start, buf) = loaded.as_ref().expect("loaded");
+                if s.offset < *buf_start {
+                    return Err(KeepError::Store(anyhow!("staged pack {name} slots out of order")));
+                }
+                let (from, to) = ((s.offset - buf_start) as usize, (s.last() - buf_start) as usize);
+                if to >= buf.len() {
+                    return Err(KeepError::Store(anyhow!("staged pack {name} is shorter than its index")));
+                }
+                Bytes::copy_from_slice(crate::pack::entry(&id, s, &buf[from..=to]).map_err(KeepError::Store)?)
+            };
+            if idx + 1 == entries.len() {
+                loaded = None;
+            }
+            let prefix = &enc[..enc.len().min(encoding::HEADER)];
+            let declared = encoding::declared_len(prefix, enc.len() as u64)
+                .filter(|&d| d <= MAX_OBJECT)
+                .ok_or_else(|| KeepError::Store(anyhow!("stored object {} does not match its id", id.short())))?;
+            let window = encoding::declared_window(prefix)
+                .filter(|&w| w <= encoding::MAX_WINDOW)
+                .ok_or_else(|| KeepError::Store(anyhow!("stored object {} does not match its id", id.short())))?;
+            let need = declared.max(window);
+            let decode_held = if cx.already_held {
+                ReadAhead::try_take(need)
+            } else if let Some(p) = ReadAhead::try_take(need) {
+                Some(p)
+            } else {
+                // Drop the buffered span before releasing `run_held` so waiting
+                // tasks never retain unpermitted span bytes (`BUG-2662`), and
+                // hold zero permits before `ReadAhead::wait` so requests never
+                // deadlock.
+                loaded = None;
+                self.drain_keep_writes(cx.project, cx.gce, set).await?;
+                run_held = None;
+                let enc_cost = enc.len() as u64;
+                Some(ReadAhead::wait(enc_cost.saturating_add(need)).await)
+            };
+            let raw_small = if (declared as usize) <= RAW_CACHE_MAX_OBJECT {
+                let raw = decoded(&id, &enc).map_err(KeepError::Store)?;
+                Some(raw)
+            } else {
+                let enc_chk = enc.clone();
+                tokio::task::spawn_blocking(move || verified(&id, &enc_chk))
+                    .await
+                    .map_err(|e| KeepError::Store(e.into()))?
+                    .map_err(KeepError::Store)?;
+                None
+            };
+            drop(decode_held);
+            self.enqueue_keep_write(cx, run_held.is_some(), set, id, enc, raw_small).await?;
+        }
+        drop(loaded);
+        self.drain_keep_writes(cx.project, cx.gce, set).await
+    }
+
+    async fn enqueue_keep_write(
+        &self,
+        cx: KeepWriteCtx,
+        covered_by_run: bool,
+        set: &mut KeepWriteSet,
+        id: ObjectId,
+        enc: Bytes,
+        raw_small: Option<Bytes>,
+    ) -> std::result::Result<(), KeepError> {
+        while set.len() >= cx.at_once {
+            self.join_one_keep_write(cx.project, cx.gce, set).await?;
+        }
+        let cost = enc.len() as u64;
+        let permit = if covered_by_run {
+            None
+        } else if set.is_empty() && !cx.already_held {
+            Some(ReadAhead::wait(cost).await)
+        } else {
+            loop {
+                if let Some(p) = ReadAhead::try_take(cost) {
+                    break Some(p);
+                }
+                if !set.is_empty() {
+                    self.join_one_keep_write(cx.project, cx.gce, set).await?;
+                } else {
+                    break None;
+                }
+            }
+        };
+        let enc = owned(&enc);
+        count_write(self, enc.len());
+        bump(&self.objects_kept);
+        let store = self.store.clone();
+        let key = object_key(cx.project, &id);
+        set.spawn(async move {
+            store.put(&key, enc.clone()).await?;
+            Ok((id, enc, raw_small, permit))
+        });
+        Ok(())
+    }
+
+    async fn join_one_keep_write(
+        &self,
+        project: i64,
+        gce: i64,
+        set: &mut KeepWriteSet,
+    ) -> std::result::Result<(), KeepError> {
+        let Some(done) = set.join_next().await else { return Ok(()) };
+        let (id, enc, raw_small, _permit) = done.map_err(|e| KeepError::Store(e.into()))?.map_err(KeepError::Store)?;
+        let ck = Self::cache_key_at(project, gce, &id);
+        self.cache.insert(ck, enc.clone(), enc.len());
+        if let Some(raw) = raw_small {
+            self.raw_cache.insert(ck, raw.clone(), raw.len());
+        }
+        Ok(())
+    }
+
+    async fn drain_keep_writes(
+        &self,
+        project: i64,
+        gce: i64,
+        set: &mut KeepWriteSet,
+    ) -> std::result::Result<(), KeepError> {
+        while !set.is_empty() {
+            self.join_one_keep_write(project, gce, set).await?;
+        }
+        Ok(())
     }
 
     /// Of staged packs `names`, those `person` uploaded and nobody
     /// discarded ([`crate::pack::Packs::usable`]).
     pub async fn usable(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<std::collections::HashSet<Arc<str>>> {
         self.packs.usable(project, person, names).await
+    }
+
+    /// Classify receipted containers `names` for `person` (`BUG-2661`).
+    pub async fn usable_for_receipts(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<crate::pack::ReceiptPacks> {
+        self.packs.usable_for_receipts(project, person, names).await
+    }
+
+    /// Claim `names` out of `person`'s `recent` upload list in `objects` mode
+    /// while a request using them is in flight (`BUG-2661`).
+    pub fn claim_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {
+        if self.layout == ObjectLayout::Objects {
+            self.packs.claim_recent(project, person, names);
+        }
+    }
+
+    /// Return `names` to `person`'s `recent` upload list in `objects` mode when
+    /// a request ends without discarding them (`BUG-1157`, `BUG-2661`).
+    pub fn release_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {
+        if self.layout == ObjectLayout::Objects {
+            self.packs.release_recent(project, person, names);
+        }
     }
 
     /// The index and length of staged pack `name` of `project`, held under
@@ -1141,6 +1704,9 @@ impl Objects {
     /// encoding and the object, checked against its id; `None` if the pack
     /// is gone (discarded).
     pub async fn get_staged(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<(Bytes, Bytes)>> {
+        if self.layout == ObjectLayout::Objects && self.packs.is_discarded_here(project, name) {
+            return Ok(None);
+        }
         let ck = Self::staged_key(project, name, id, false);
         if let Some(enc) = self.cache.get(&ck) {
             let raw = decoded(id, &enc)?;
@@ -1251,15 +1817,26 @@ impl Objects {
     /// only (or the cache), its entry's head checked; `None` if the pack is
     /// gone.
     pub async fn staged_declared(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<u64>> {
+        if self.layout == ObjectLayout::Objects && self.packs.is_discarded_here(project, name) {
+            return Ok(None);
+        }
         if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
-            return Ok(encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64));
+            let len = encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64);
+            if self.layout == ObjectLayout::Objects {
+                return len.map(Some).ok_or_else(|| anyhow::anyhow!("corrupt staged object {id} in {name}"));
+            }
+            return Ok(len);
         }
         bump(&self.reads);
         let last = s.last().min(s.offset + crate::pack::ENTRY_HEAD + encoding::HEADER as u64 - 1);
         let Some((b, _)) = self.store.get_range(&crate::pack::key(project, name), s.offset, last).await? else {
             return Ok(None);
         };
-        Ok(encoding::declared_len(crate::pack::entry(id, s, &b)?, s.encoding_len()))
+        let len = encoding::declared_len(crate::pack::entry(id, s, &b)?, s.encoding_len());
+        if self.layout == ObjectLayout::Objects {
+            return len.map(Some).ok_or_else(|| anyhow::anyhow!("corrupt staged object {id} in {name}"));
+        }
+        Ok(len)
     }
 
     /// The encoding of object `id` at slot `s` of staged pack `name` of
@@ -1267,6 +1844,9 @@ impl Objects {
     /// decodes it, checked against the id, within its share of the bound on
     /// decoded bytes); `None` if the pack is gone.
     pub async fn staged_encoding(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<Bytes>> {
+        if self.layout == ObjectLayout::Objects && self.packs.is_discarded_here(project, name) {
+            return Ok(None);
+        }
         if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
             return Ok(Some(enc));
         }
@@ -1312,7 +1892,49 @@ impl Objects {
     /// Discard packs `names` of `project` that no transaction listed
     /// ([`crate::pack::Packs::discard`]).
     pub async fn discard(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
-        self.packs.discard(&*self.store, project, names).await
+        self.packs.discard_counted(&*self.store, project, names, &self.deletes).await
+    }
+
+    /// Discard staged containers `names` after a push or API commit was
+    /// refused by its checks (`BUG-930`, `BUG-1155`): keeps `objects >= 0` on
+    /// the `DISCARDED` row so re-presenting those receipts still answers `400`.
+    pub async fn discard_refused(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
+        self.packs
+            .discard_with(&*self.store, project, names, (false, false), (&self.deletes, &self.pack_rows))
+            .await
+    }
+
+    /// Discard staged containers `names` consumed by a committing push or API
+    /// commit in `objects` mode (`BUG-2661`), marking `objects = -1` and
+    /// purging the `packs` row once deleted from storage so a concurrent or
+    /// replayed request naming them answers `409 Conflict`.
+    pub async fn discard_consumed(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
+        if self.layout == ObjectLayout::Objects {
+            self.packs
+                .discard_with(&*self.store, project, names, (true, true), (&self.deletes, &self.pack_rows))
+                .await
+        } else {
+            self.discard(project, names).await
+        }
+    }
+
+    /// Delete containers `names` (marked `DISCARDED` in a push's transaction)
+    /// from storage and remove their `packs` rows.
+    pub async fn purge_discarded(&self, project: i64, names: &[String]) -> Result<()> {
+        self.packs
+            .purge_discarded(&*self.store, project, names, &self.deletes, &self.pack_rows)
+            .await
+    }
+
+    /// Remove `key` from the blob store, counting the delete request.
+    pub async fn delete_key(&self, key: &str) -> Result<()> {
+        bump(&self.deletes);
+        self.store.delete(key).await
+    }
+
+    /// List keys starting with `prefix`, counting each listing request.
+    pub async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        self.store.list_counted(prefix, &self.lists).await
     }
 
     /// Bytes `start..=end` of object `id` of `project` (its canonical
@@ -2309,5 +2931,261 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn objects_keep_writes_only_touched_and_made_always_overwriting_and_counting() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(FsStore::new(dir.path()));
+        let objects = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
+
+        let mk = |label: &[u8]| {
+            let mut v = b"veil:blob\n".to_vec();
+            v.extend_from_slice(label);
+            let b = Bytes::from(v);
+            (ObjectId::hash(&b), b)
+        };
+        let (a_id, a_raw) = mk(b"KEEP-OBJECT-A-101");
+        let (b_id, b_raw) = mk(b"KEEP-OBJECT-B-102");
+        let (unread_id, unread_raw) = mk(b"KEEP-UNREAD-OBJECT-103");
+        let (made_id, made_raw) = mk(b"KEEP-MADE-OBJECT-104");
+
+        let cname = objects
+            .stage(
+                1,
+                7,
+                vec![
+                    (a_id, encode(a_raw.clone())),
+                    (b_id, encode(b_raw.clone())),
+                    (unread_id, encode(unread_raw)),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(objects.uploads.load(Ordering::Relaxed), 1);
+
+        let slots = objects.staged_slots(1, &cname, &[a_id, b_id, unread_id]).await.unwrap().unwrap();
+        let staged = [(cname, slots)];
+        let touched: std::collections::HashSet<ObjectId> = [a_id, b_id].into_iter().collect();
+        let opts = KeepOpts { person: 7, encode_threads: 1, already_held: false };
+        let mut written = Vec::new();
+        let listed = own(objects.keep(1, &staged, &touched, vec![(made_id, made_raw.clone())], opts, &mut written))
+            .await
+            .unwrap();
+        assert!(listed.is_empty() && written.is_empty(), "objects layout lists and writes no pack");
+        assert_eq!(objects.objects_kept.load(Ordering::Relaxed), 3);
+        assert_eq!(objects.own_writes.load(Ordering::Relaxed), 3, "stage was outside own; 3 kept objects inside own");
+        assert!(fs.exists(&object_key(1, &a_id)).await.unwrap());
+        assert!(fs.exists(&object_key(1, &b_id)).await.unwrap());
+        assert!(fs.exists(&object_key(1, &made_id)).await.unwrap());
+        assert!(!fs.exists(&object_key(1, &unread_id)).await.unwrap(), "untouched upload is never written loose");
+
+        // Always-write rule (object-layout.md §3.2 fact 2 & §5.2 threat 4):
+        // even when the file already exists on disk (here replaced with sentinel bytes),
+        // `keep` writes it unconditionally and increments `own_writes` and `objects_kept`.
+        std::fs::write(dir.path().join(object_key(1, &a_id)), b"stale-bytes").unwrap();
+        std::fs::write(dir.path().join(object_key(1, &made_id)), b"stale-bytes").unwrap();
+        let touched_again: std::collections::HashSet<ObjectId> = [a_id].into_iter().collect();
+        let listed2 = own(objects.keep(
+            1,
+            &staged,
+            &touched_again,
+            vec![(made_id, made_raw.clone())],
+            opts,
+            &mut written,
+        ))
+        .await
+        .unwrap();
+        assert!(listed2.is_empty());
+        assert_eq!(objects.objects_kept.load(Ordering::Relaxed), 5);
+        assert_eq!(objects.own_writes.load(Ordering::Relaxed), 5);
+        let cold = Objects::with_layout(fs, 1 << 20, None, ObjectLayout::Objects);
+        assert_eq!(cold.get(1, &a_id).await.unwrap().as_deref(), Some(&a_raw[..]));
+        assert_eq!(cold.get(1, &b_id).await.unwrap().as_deref(), Some(&b_raw[..]));
+        assert_eq!(cold.get(1, &made_id).await.unwrap().as_deref(), Some(&made_raw[..]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn objects_keep_uncached_reads_whole_small_ranged_large_and_refuses_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(FsStore::new(dir.path()));
+        let writer = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
+        let opts = KeepOpts { person: 7, encode_threads: 1, already_held: false };
+
+        let mk = |seed: u64, payload_len: usize| {
+            let mut v = Vec::with_capacity(10 + payload_len);
+            v.extend_from_slice(b"veil:blob\n");
+            let mut x = seed;
+            for _ in 0..payload_len / 8 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+            let b = Bytes::from(v);
+            (ObjectId::hash(&b), b)
+        };
+
+        // 1. Small uncached container (<= 16 MiB) with all slots touched: read whole in 1 read.
+        let (s1_id, s1_raw) = mk(0x1111_2222_3333_4444, 256);
+        let (s2_id, s2_raw) = mk(0x5555_6666_7777_8888, 256);
+        let small_name = writer
+            .stage(1, 7, vec![(s1_id, encode(s1_raw.clone())), (s2_id, encode(s2_raw.clone()))])
+            .await
+            .unwrap();
+        let small_slots = writer.staged_slots(1, &small_name, &[s1_id, s2_id]).await.unwrap().unwrap();
+        let small_staged = [(small_name, small_slots)];
+
+        let cold = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
+        let reads_before = cold.reads.load(Ordering::Relaxed);
+        let mut written = Vec::new();
+        let touched_small: std::collections::HashSet<ObjectId> = [s1_id, s2_id].into_iter().collect();
+        cold.keep(1, &small_staged, &touched_small, Vec::new(), opts, &mut written)
+            .await
+            .unwrap();
+        assert_eq!(cold.reads.load(Ordering::Relaxed) - reads_before, 1, "small container read whole in 1 read");
+        assert_eq!(cold.get(1, &s1_id).await.unwrap().as_deref(), Some(&s1_raw[..]));
+        assert_eq!(cold.get(1, &s2_id).await.unwrap().as_deref(), Some(&s2_raw[..]));
+
+        // 2. Large uncached container (> 16 MiB) with 1 small touched slot and 1 large untouched slot:
+        //    ranged read fetches only the touched slot, never the whole >16 MiB container.
+        let (l_keep_id, l_keep_raw) = mk(0x9999_aaaa_bbbb_cccc, 512);
+        let (l_skip_id, l_skip_raw) = mk(0xdddd_eeee_ffff_1234, 17 << 20);
+        let large_name = writer
+            .stage(2, 7, vec![(l_keep_id, encode(l_keep_raw.clone())), (l_skip_id, encode(l_skip_raw))])
+            .await
+            .unwrap();
+        let large_slots = writer.staged_slots(2, &large_name, &[l_keep_id]).await.unwrap().unwrap();
+        assert!(large_slots.size > (16 << 20));
+        let cold2 = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
+        let touched_large: std::collections::HashSet<ObjectId> = [l_keep_id].into_iter().collect();
+        cold2
+            .keep(2, &[(large_name, large_slots)], &touched_large, Vec::new(), opts, &mut written)
+            .await
+            .unwrap();
+        assert!(fs.exists(&object_key(2, &l_keep_id)).await.unwrap());
+        assert!(!fs.exists(&object_key(2, &l_skip_id)).await.unwrap());
+        assert_eq!(cold2.get(2, &l_keep_id).await.unwrap().as_deref(), Some(&l_keep_raw[..]));
+
+        // 3. Discarded / missing container returns Err(KeepError::Discarded) whether cached or uncached.
+        writer.discard(1, std::slice::from_ref(&small_staged[0].0)).await.unwrap();
+        let Err(err_cached) = writer
+            .keep(1, &small_staged, &touched_small, Vec::new(), opts, &mut written)
+            .await
+        else {
+            panic!("deleted container must fail even when staged entries are cached");
+        };
+        assert!(matches!(err_cached, KeepError::Discarded), "expected Discarded, got {err_cached:?}");
+        let cold3 = Objects::with_layout(fs, 1 << 20, None, ObjectLayout::Objects);
+        let Err(err_uncached) = cold3
+            .keep(1, &small_staged, &touched_small, Vec::new(), opts, &mut written)
+            .await
+        else {
+            panic!("deleted container must fail when uncached");
+        };
+        assert!(matches!(err_uncached, KeepError::Discarded), "expected Discarded, got {err_uncached:?}");
+    }
+
+    /// BUG-2662 (`t3/object-layout` cycle-1 review; BUG-1159's class): in
+    /// `objects` mode, `Objects::keep_objects` must bound decoded bytes under
+    /// `DECODED_IN_FLIGHT` (for `encoding::declared_len`, not just the
+    /// compressed span) across both its whole-container and ranged-run paths,
+    /// and verify large objects off the async worker threads.
+    #[test]
+    fn bug_2662_keep_objects_decodes_within_the_servers_bound() {
+        const CHILD: &str = "VEIL_TEST_KEEP_OBJECTS_CHILD";
+        const NAME: &str = "store::tests::bug_2662_keep_objects_decodes_within_the_servers_bound";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let whole = mode == "whole";
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(16).enable_all().build().unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let fs: Arc<dyn BlobStore> = Arc::new(FsStore::new(dir.path()));
+                let writer = Objects::with_layout(fs.clone(), 64 << 20, None, ObjectLayout::Objects);
+                let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+                let mut encs = Vec::new();
+                for side in *b"ab" {
+                    let mut raw = b"veil:blob\n".to_vec();
+                    raw.resize(48 << 20, 0);
+                    for i in (16..raw.len()).step_by(80) {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        raw[i] = x as u8;
+                    }
+                    raw[12] = side;
+                    let raw = Bytes::from(raw);
+                    let enc = encode(raw.clone());
+                    assert!(
+                        encoding::is_compressed(&enc) && encoding::within_ratio(&enc),
+                        "compressed within ratio: {}",
+                        enc.len()
+                    );
+                    encs.push((ObjectId::hash(&raw), enc));
+                }
+                let ids: Vec<ObjectId> = encs.iter().map(|(id, _)| *id).collect();
+                let wanted: Vec<ObjectId> = if whole { ids.clone() } else { vec![ids[0]] };
+                let touched: std::collections::HashSet<ObjectId> = wanted.iter().copied().collect();
+                let mut staged = Vec::with_capacity(32);
+                let mut seen_names = std::collections::HashSet::new();
+                for _ in 0..32 {
+                    let name = writer.stage(1, 7, encs.clone()).await.unwrap();
+                    assert!(seen_names.insert(name.clone()), "distinct staged container per concurrent keep");
+                    let slots = writer.staged_slots(1, &name, &wanted).await.unwrap().unwrap();
+                    staged.push((name, slots));
+                }
+                drop((writer, encs));
+
+                let fresh = Arc::new(Objects::with_layout(fs, 64 << 20, None, ObjectLayout::Objects));
+                let vm = |field: &str| -> u64 {
+                    let s = std::fs::read_to_string("/proc/self/status").unwrap();
+                    let l = s.lines().find(|l| l.starts_with(field)).unwrap();
+                    l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() << 10
+                };
+                std::fs::write("/proc/self/clear_refs", "5").unwrap();
+                let before = vm("VmRSS:");
+                let mut set = tokio::task::JoinSet::new();
+                let opts = KeepOpts { person: 7, encode_threads: 1, already_held: false };
+                for pair in staged {
+                    let (f, t) = (fresh.clone(), touched.clone());
+                    set.spawn(async move {
+                        let mut written = Vec::new();
+                        f.keep(1, &[pair], &t, Vec::new(), opts, &mut written).await.unwrap();
+                    });
+                }
+                while let Some(r) = set.join_next().await {
+                    r.unwrap();
+                }
+                let grew = vm("VmHWM:").saturating_sub(before);
+                let reads = fresh.reads.load(Ordering::Relaxed);
+                assert!(fresh.get(1, &ids[0]).await.unwrap().is_some(), "kept object readable");
+                println!("KEEP_OBJECTS mode={} grew={grew} reads={reads}", if whole { "whole" } else { "ranged" });
+            });
+            return;
+        }
+        for mode in ["whole", "ranged"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--nocapture", "--include-ignored", "--test-threads=1"])
+                .env(CHILD, mode)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert!(
+                out.status.success(),
+                "child ({mode}) failed: {text}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let line = text
+                .lines()
+                .find_map(|l| l.find("KEEP_OBJECTS").map(|at| &l[at..]))
+                .unwrap_or_else(|| panic!("no measurement in {text}"));
+            let grew: u64 = line.split_whitespace().find_map(|w| w.strip_prefix("grew=")).unwrap().parse().unwrap();
+            assert!(
+                grew <= u64::from(DECODED_IN_FLIGHT) + (64 << 20),
+                "32 concurrent keep_objects ({mode}) held {} MiB, past the {} MiB bound on decoded bytes ({line})",
+                grew >> 20,
+                DECODED_IN_FLIGHT >> 20
+            );
+        }
     }
 }

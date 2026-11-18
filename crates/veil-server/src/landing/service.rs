@@ -543,34 +543,26 @@ async fn store(hub: &Arc<Hub>, project: i64, person: i64, objects: Vec<(ObjectId
     if objects.is_empty() {
         return Ok(Vec::new());
     }
-    // Compressed on the batch's threads (the server's own encoding).
-    let mut encoded = tokio::task::spawn_blocking(move || on_threads(&objects, build_threads(), 64, |(id, raw)| (*id, crate::store::encode(raw.clone()))))
+    let mut written = Vec::new();
+    let opts = crate::store::KeepOpts { person, encode_threads: build_threads(), already_held: false };
+    match hub
+        .objects
+        .keep(project, &[], &HashSet::new(), objects, opts, &mut written)
         .await
-        .map_err(|e| Error::Other(e.into()))?;
-    let mut packs = Vec::new();
-    while !encoded.is_empty() {
-        let rest = if encoded.len() > crate::pack::MAX_OBJECTS { encoded.split_off(crate::pack::MAX_OBJECTS) } else { Vec::new() };
-        match hub.objects.put_pack(project, person, encoded).await {
-            Ok((name, mut held)) => {
-                held.unproject();
-                packs.push((name, held));
-            }
-            // A later pack's write failed: the earlier ones, which nothing
-            // will list or name, are discarded now and not left staged for
-            // the sweep (the error drops their names; a store that keeps
-            // failing is tried again every `STORE_RETRY`), as an API
-            // commit's are (`changes::store_packed`).
-            Err(e) => {
-                let names: Vec<Arc<str>> = packs.iter().map(|(n, _)| n.clone()).collect();
-                if let Err(d) = hub.objects.discard(project, &names).await {
+    {
+        Ok(kept) => Ok(kept.into_iter().filter_map(|p| Some((p.name, p.held?))).collect()),
+        Err(crate::store::KeepError::Discarded) => {
+            Err(Error::conflict("a landing batch's upload was discarded"))
+        }
+        Err(crate::store::KeepError::Store(e)) => {
+            if !written.is_empty() {
+                if let Err(d) = hub.objects.discard(project, &written).await {
                     eprintln!("veil-server: discarding a landing batch's packs of project {project}: {d:?}");
                 }
-                return Err(Error::Other(e));
             }
+            Err(Error::Other(e))
         }
-        encoded = rest;
     }
-    Ok(packs)
 }
 
 /// `f` as [`crate::db::transaction`] takes it, so that it can be passed by

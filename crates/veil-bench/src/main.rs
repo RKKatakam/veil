@@ -4,11 +4,12 @@
 //! ```text
 //! veil-bench gen    --profile tiny|small|1g|5g [--cloaked] --seed N --dir DIR --vl PATH
 //! veil-bench run    --profile … --seed N --dir DIR --vl PATH --out RESULTS.json [--agents 4,16,64] …
-//!                   [--server PATH --database-url URL [--s3-endpoint URL --s3-bucket B]]
-//! veil-bench report RESULTS.json
-//! veil-bench openscion --vl PATH --server PATH --database-url URL [--s3-…] --dir DIR --out RESULTS.json
+//!                   [--server PATH --database-url URL [--object-layout packs|objects] [--s3-endpoint URL --s3-bucket B]]
+//! veil-bench report RESULTS.json [--against BASELINE.json]
+//! veil-bench compare BEFORE.json AFTER.json
+//! veil-bench openscion --vl PATH --server PATH --database-url URL [--object-layout …] [--s3-…] --dir DIR --out RESULTS.json
 //! veil-bench openscion-memory --out RESULTS.json
-//! veil-bench load --mode pull|land|branches|api|landing|objects|agents [--via server,cache] (--server PATH --database-url URL | --url URL [--ca PEM])
+//! veil-bench load --mode pull|land|branches|api|landing|objects|agents [--via server,cache] (--server PATH --database-url URL [--object-layout …] | --url URL [--ca PEM])
 //!                 --projects 1,10 --clients 10,100 [--rates 0.35,3.5,max] --out RESULTS.json
 //! ```
 //!
@@ -306,8 +307,17 @@ enum Cmd {
         #[arg(long)]
         exact_dir: PathBuf,
     },
-    /// Render RESULTS.json as Markdown on stdout.
-    Report { results: PathBuf },
+    /// Render RESULTS.json as Markdown on stdout (or compare against BASELINE.json).
+    Report {
+        results: PathBuf,
+        #[arg(long)]
+        against: Option<PathBuf>,
+    },
+    /// Compare AFTER.json against BEFORE.json for regressions (refuses if object layouts differ).
+    Compare {
+        before: PathBuf,
+        after: PathBuf,
+    },
 }
 
 fn log_line(s: &str) {
@@ -505,9 +515,28 @@ fn main() -> Result<()> {
             print!("{md}");
             Ok(())
         }
-        Cmd::Report { results } => {
+        Cmd::Report { results, against } => {
             let r: serde_json::Value = serde_json::from_slice(&std::fs::read(&results)?)?;
-            print!("{}", report::markdown(&r));
+            if let Some(before_path) = against {
+                let b: serde_json::Value = serde_json::from_slice(&std::fs::read(&before_path)?)?;
+                let (md, reg) = report::compare(&b, &r)?;
+                print!("{md}");
+                if !reg.is_empty() {
+                    return Err(anyhow!("regressions:\n  {}", reg.join("\n  ")));
+                }
+            } else {
+                print!("{}", report::any_markdown(&r)?);
+            }
+            Ok(())
+        }
+        Cmd::Compare { before, after } => {
+            let b: serde_json::Value = serde_json::from_slice(&std::fs::read(&before)?)?;
+            let a: serde_json::Value = serde_json::from_slice(&std::fs::read(&after)?)?;
+            let (md, reg) = report::compare(&b, &a)?;
+            print!("{md}");
+            if !reg.is_empty() {
+                return Err(anyhow!("regressions:\n  {}", reg.join("\n  ")));
+            }
             Ok(())
         }
         Cmd::GenInto { gen: g, exact_dir } => {
@@ -573,6 +602,7 @@ fn main() -> Result<()> {
             let me = absolute(&std::env::current_exe()?)?;
             let started = Instant::now();
             let machine = run::machine_facts(&env.vl, src.as_deref());
+            let mut server_layout: Option<String> = None;
             let result = (|| -> Result<run::Bench> {
                 // In a child: the generator's memory must not become the
                 // harness's (every child's ru_maxrss starts at the
@@ -624,8 +654,10 @@ fn main() -> Result<()> {
                         run::local(&mut b, label, true)?;
                     }
                     if phase("server") && server.server.is_some() {
-                        let srv = server::Server::start(&server, &b.dir.join("server"), 32)?;
+                        let srv_dir = b.dir.join("server");
+                        let srv = server::Server::start(&server, &srv_dir, 32)?;
                         run::server(&mut b, &srv)?;
+                        server_layout = server::stats_layout(&srv_dir).or_else(|| server.object_layout.clone());
                     }
                     if phase("gc") {
                         run::gc(&mut b)?;
@@ -659,6 +691,7 @@ fn main() -> Result<()> {
                 "schema": "veil.bench/1",
                 "machine": machine,
                 "fs": run::fs_type(&dir),
+                "object_layout": server_layout,
                 "manifest": b.manifest,
                 "cases": b.cases,
                 "agents": agents,

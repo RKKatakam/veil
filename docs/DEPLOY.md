@@ -405,6 +405,8 @@ so a database reached by an address its certificate does not carry is
 accepted when its CA is the one given. Proven against PostgreSQL 17 with `ssl = on` and
 only `hostssl` lines; not yet run against a managed service.
 
+**Object layout (`--object-layout`, `VEIL_OBJECT_LAYOUT`).** `--object-layout packs|objects` (or `VEIL_OBJECT_LAYOUT`, default `packs`; `docs/HUB.md` §13.42, `docs/design/server/object-layout.md`) chooses whether kept objects are stored in packs or one object per key (`p/<project>/<2 hex>/<62 hex>`). Every read checks both layouts, so switching the flag and restarting needs no migration and converts nothing; `stats.json` records `object_layout`, `storage_deletes`, `storage_lists`, `objects_kept` and `uploads`. In `objects`, a push makes roughly three times as many `PUT`/`DELETE` requests to the object store as in `packs`, so a project that suddenly turns busy meets S3's or Cloud Storage's per-prefix warm-up (~3,500 writes/s before automatic prefix splitting) about three times sooner—and DigitalOcean Spaces' 800 requests/s bucket limit (§2.3) proportionately sooner too. Watch `s3_slow_down` (`503 Slow Down` / `429` retries) and `s3_gave_up` in `stats.json`.
+
 ## 4. Local rehearsal
 
 The paid topology on one machine, small, in Docker Compose

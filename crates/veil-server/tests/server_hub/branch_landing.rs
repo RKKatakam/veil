@@ -234,7 +234,7 @@ fn bug_2221_is_below_answers_as_is_ancestor_whatever_was_remembered() {
 /// them in the background, without anyone running it.
 #[test]
 fn bug_2230_small_packs_are_merged_in_the_background_once_they_pile_up() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id_of(&hub, &p.name);
     let h = hub.hub();

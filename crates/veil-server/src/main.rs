@@ -3,6 +3,7 @@
 //! ```text
 //! veil-server --database-url postgres://… --data ./hub [--listen 127.0.0.1:8443]
 //!             [--storage DIR | --s3-endpoint URL --s3-bucket B]
+//!             [--object-layout packs|objects]
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
 //!             [--device-rate 200/50000] [--anonymous-rate 20/1000]
 //!             [--max-connections 1024] [--request-memory 512M]   (docs/HUB.md §13.25)
@@ -18,14 +19,11 @@
 //! On `SIGUSR1` the server writes its request-path counters (storage
 //! writes and reads, cache hits and misses) to `DATA/stats.json`, for the
 //! benchmarks' cost gates (`docs/design/server/storage-and-cost.md` §9).
-// The stats answer's `serde_json::json!` has more fields than the default
-// macro recursion limit allows (BUG-2220's and BUG-2221's counters).
-#![recursion_limit = "256"]
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand};
-use veil_server::{tls::TlsSource, Config, Storage};
+use veil_server::{tls::TlsSource, Config, ObjectLayout, Storage};
 
 #[derive(Parser)]
 #[command(name = "veil-server", about = "The Veil server (the Hub)", args_conflicts_with_subcommands = true)]
@@ -53,6 +51,10 @@ struct Args {
     s3_bucket: Option<String>,
     #[arg(long, default_value = "us-east-1")]
     s3_region: String,
+    /// How this server keeps new objects: `packs` or `objects` (default:
+    /// VEIL_OBJECT_LAYOUT, or `packs`).
+    #[arg(long)]
+    object_layout: Option<ObjectLayout>,
     /// TLS certificate chain (PEM); without it, a self-signed certificate.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -192,6 +194,14 @@ fn database_url(given: Option<String>) -> anyhow::Result<String> {
     match given {
         Some(u) => Ok(u),
         None => std::env::var("VEIL_DATABASE_URL").map_err(|_| anyhow::anyhow!("give --database-url or VEIL_DATABASE_URL")),
+    }
+}
+
+fn object_layout(given: Option<ObjectLayout>, env: Option<&str>) -> anyhow::Result<ObjectLayout> {
+    match (given, env) {
+        (Some(l), _) => Ok(l),
+        (None, Some(s)) => s.parse::<ObjectLayout>().map_err(|e| anyhow::anyhow!("VEIL_OBJECT_LAYOUT: {e}")),
+        (None, None) => Ok(ObjectLayout::Packs),
     }
 }
 
@@ -367,6 +377,12 @@ async fn serve() -> anyhow::Result<()> {
         .await;
     }
     let data = a.data.expect("clap requires --data");
+    let env_layout = match std::env::var("VEIL_OBJECT_LAYOUT") {
+        Ok(s) => Some(s),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => anyhow::bail!("VEIL_OBJECT_LAYOUT: {e}"),
+    };
+    let object_layout = object_layout(a.object_layout, env_layout.as_deref())?;
     let storage = match a.s3_endpoint {
         Some(endpoint) => Storage::S3 {
             endpoint,
@@ -385,6 +401,7 @@ async fn serve() -> anyhow::Result<()> {
         listen: a.listen,
         database_url: database_url(a.database_url)?,
         storage,
+        object_layout,
         tls,
         data_dir: data.clone(),
         session_ttl: Duration::from_secs(a.session_seconds),
@@ -400,6 +417,7 @@ async fn serve() -> anyhow::Result<()> {
     })
     .await?;
     println!("veil-server listening on https://{}", running.addr);
+    println!("object layout: {}", running.hub.objects.layout());
     if matches!(running.cert_pem.as_str(), s if !s.is_empty()) {
         println!("certificate: {}", data.join("self-signed-cert.pem").display());
     }
@@ -409,7 +427,7 @@ async fn serve() -> anyhow::Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut n = 0u64;
     // Written once at start: it says this server answers SIGUSR1.
-    let _ = std::fs::write(data.join("stats.json"), serde_json::to_vec(&stats(&hub, 0))?);
+    let _ = std::fs::write(data.join("stats.json"), serde_json::to_vec(&veil_server::stats_json(&hub, 0))?);
     loop {
         tokio::select! {
             r = tokio::signal::ctrl_c() => { r?; break; }
@@ -418,7 +436,7 @@ async fn serve() -> anyhow::Result<()> {
                 n += 1;
                 let path = data.join("stats.json");
                 let tmp = data.join("stats.json.tmp");
-                let written = std::fs::write(&tmp, serde_json::to_vec(&stats(&hub, n))?).and_then(|_| std::fs::rename(&tmp, &path));
+                let written = std::fs::write(&tmp, serde_json::to_vec(&veil_server::stats_json(&hub, n))?).and_then(|_| std::fs::rename(&tmp, &path));
                 if let Err(e) = written {
                     eprintln!("veil-server: writing {}: {e}", path.display());
                 }
@@ -456,63 +474,6 @@ async fn cache(config: veil_server::cache::Config) -> anyhow::Result<()> {
     }
     running.stop().await;
     Ok(())
-}
-
-/// The counters `SIGUSR1` writes (`n` counts the signals).
-fn stats(hub: &veil_server::Hub, n: u64) -> serde_json::Value {
-    use std::sync::atomic::Ordering::Relaxed;
-    let c = &hub.caches.stats;
-    serde_json::json!({
-        "n": n,
-        "storage_writes": hub.objects.writes.load(Relaxed),
-        "storage_written_bytes": hub.objects.written_bytes.load(Relaxed),
-        "storage_reads": hub.objects.reads.load(Relaxed),
-        "object_cache_hits": hub.objects.cache_hits.load(Relaxed),
-        "object_cache_misses": hub.objects.cache_misses.load(Relaxed),
-        "storage_own_writes": hub.objects.own_writes.load(Relaxed),
-        "pack_row_commits": hub.objects.pack_rows.load(Relaxed),
-        "commits": hub.commits.by_kind(),
-        "s3_slow_down": veil_server::store::S3_SLOW_DOWN.load(Relaxed),
-        "s3_gave_up": veil_server::store::S3_GAVE_UP.load(Relaxed),
-        "session_hits": c.session_hits.load(Relaxed),
-        "embargo_asks": c.embargo_asks.load(Relaxed),
-        "session_misses": c.session_misses.load(Relaxed),
-        "permission_hits": c.permission_hits.load(Relaxed),
-        "permission_misses": c.permission_misses.load(Relaxed),
-        "tips_hits": c.tips_hits.load(Relaxed),
-        "tips_misses": c.tips_misses.load(Relaxed),
-        "notices": hub.caches.notices.load(Relaxed),
-        "landing_batches": hub.landing.stats.batches.load(Relaxed),
-        "landing_landed": hub.landing.stats.landed.load(Relaxed),
-        "landing_conflicts": hub.landing.stats.conflicts.load(Relaxed),
-        "landing_rejected": hub.landing.stats.rejected.load(Relaxed),
-        "landing_build_us": hub.landing.stats.build_us.load(Relaxed),
-        "landing_prepare_us": hub.landing.stats.prepare_us.load(Relaxed),
-        "landing_projected": hub.landing.stats.projected.load(Relaxed),
-        "landing_attached": hub.landing.stats.attached.load(Relaxed),
-        "landing_prefilled": hub.landing.stats.prefilled.load(Relaxed),
-        "landing_dropped": hub.landing.stats.dropped.load(Relaxed),
-        "landing_memo_races": hub.landing.stats.memo_races.load(Relaxed),
-        "landing_kept": hub.landing.stats.kept.load(Relaxed),
-        "landing_rechecked": hub.landing.stats.rechecked.load(Relaxed),
-        "landing_classified": hub.landing.stats.classified.load(Relaxed),
-        "landing_store_us": hub.landing.stats.store_us.load(Relaxed),
-        "landing_commit_us": hub.landing.stats.commit_us.load(Relaxed),
-        "landing_pick_statements": hub.landing.stats.pick_statements.load(Relaxed),
-        "landing_pick_rows": hub.landing.stats.pick_rows.load(Relaxed),
-        "landing_review_asks": hub.landing.stats.review_asks.load(Relaxed),
-        "landing_queue_full": hub.landing.stats.queue_full.load(Relaxed),
-        "landing_merging": hub.landing.stats.merging.load(Relaxed),
-        "landing_read_us": hub.landing.stats.read_us.load(Relaxed),
-        "landing_write_rule_us": hub.landing.stats.write_rule_us.load(Relaxed),
-        "landing_merge_us": hub.landing.stats.merge_us.load(Relaxed),
-        "landing_conflict_us": hub.landing.stats.conflict_us.load(Relaxed),
-        "landing_apply_us": hub.landing.stats.apply_us.load(Relaxed),
-        "landing_recheck_us": hub.landing.stats.recheck_us.load(Relaxed),
-        "landing_project_us": hub.landing.stats.project_us.load(Relaxed),
-        "landing_walks": hub.landing.stats.walks.load(Relaxed),
-        "landing_graph_reads": hub.landing.stats.graph_reads.load(Relaxed),
-    })
 }
 
 #[cfg(test)]
@@ -557,5 +518,23 @@ mod tests {
             }
         }
         assert!(small >= 20 && above == 1, "{small} classes up to 1,280 bytes, {above} at 1,536");
+    }
+
+    #[test]
+    fn object_layout_flag_and_env() {
+        use clap::Parser;
+        use veil_server::ObjectLayout::{Objects, Packs};
+
+        assert_eq!(super::object_layout(None, None).unwrap(), Packs);
+        assert_eq!(super::object_layout(None, Some("packs")).unwrap(), Packs);
+        assert_eq!(super::object_layout(None, Some("objects")).unwrap(), Objects);
+        assert_eq!(super::object_layout(Some(Objects), Some("packs")).unwrap(), Objects);
+        assert_eq!(super::object_layout(Some(Packs), Some("objects")).unwrap(), Packs);
+        let err = super::object_layout(None, Some("blobs")).unwrap_err().to_string();
+        assert_eq!(err, "VEIL_OBJECT_LAYOUT: blobs: expected `packs` or `objects`");
+
+        let parsed = super::Args::try_parse_from(["veil-server", "--data", "/tmp/h", "--object-layout", "objects"]).unwrap();
+        assert_eq!(parsed.object_layout, Some(Objects));
+        assert!(super::Args::try_parse_from(["veil-server", "--data", "/tmp/h", "--object-layout", "blobs"]).is_err());
     }
 }

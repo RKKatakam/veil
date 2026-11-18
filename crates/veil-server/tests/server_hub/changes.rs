@@ -581,7 +581,7 @@ fn a_sealed_object_at_a_path_that_is_not_a_secret_is_refused() {
 fn bug_1948_an_api_commit_stores_what_it_made_as_one_pack_its_commit_lists() {
     use crate::landing_hold::{packs_in, whole_tree_beside};
     use std::sync::atomic::Ordering::Relaxed;
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let token = p.dev.token();
@@ -622,7 +622,7 @@ fn bug_1948_an_api_commit_stores_what_it_made_as_one_pack_its_commit_lists() {
 fn bug_1948_an_api_commit_racing_another_for_its_branch_stores_as_before() {
     use crate::landing_hold::packs_in;
     use std::sync::atomic::Ordering::Relaxed;
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let token = p.dev.token();
