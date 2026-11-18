@@ -1944,8 +1944,10 @@ mod tests {
         .unwrap();
         drop(plan);
 
-        std::env::set_var("VEIL_HOME", &home);
-        let id = crate::ctx::load_identity().unwrap();
+        // Create identity directly in `home` (never mutating the test runner's
+        // process-global `VEIL_HOME`, so parallel tests cannot race).
+        let id = veil_core::identity::Identity::generate("kittu");
+        std::fs::write(home.join("identity.json"), id.to_json()).unwrap();
         let user = crate::ctx::user_for(&id);
         let fs = Arc::new(DiskBackend::new(&proj));
         let mut repo = Repo::init(fs.clone(), Some(id), &user).unwrap();
@@ -1975,14 +1977,31 @@ mod tests {
 
     #[test]
     fn bug_2650_recorder_fails_closed_at_16_mib_guard_limit() {
+        const CHILD_ENV: &str = "VEIL_TEST_BUG_2650_LIMIT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("veil-home");
+            std::fs::create_dir_all(&home).unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mount::tests::bug_2650_recorder_fails_closed_at_16_mib_guard_limit", "--nocapture"])
+                .env("VEIL_HOME", &home)
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "child failed ({}):\n{}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("veil-home");
-        std::fs::create_dir_all(&home).unwrap();
         let proj = tmp.path().join("proj");
         std::fs::create_dir_all(proj.join("internal")).unwrap();
         std::fs::write(proj.join("README.md"), "hello\n").unwrap();
 
-        std::env::set_var("VEIL_HOME", &home);
         let id = crate::ctx::load_identity().unwrap();
         let user = crate::ctx::user_for(&id);
         let fs = Arc::new(DiskBackend::new(&proj));

@@ -1304,6 +1304,29 @@ fn bug_2652_control_or_bidi_characters_never_print_a_wrong_command_to_paste() {
 #[cfg(target_os = "linux")]
 #[test]
 fn bug_2650_exec_beside_a_large_sealed_file_keeps_memory_bounded_and_quarantines_copies() {
+    // Run in a dedicated single-test process so `fork()` before `execve(vl)`
+    // does not inherit a parallel test runner's multi-hundred-MiB `hiwater_rss`
+    // into `wait4`'s `ru_maxrss`.
+    const CHILD_ENV: &str = "VEIL_TEST_BUG_2650_EXEC_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ws_sandbox_cli::bug_2650_exec_beside_a_large_sealed_file_keeps_memory_bounded_and_quarantines_copies",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed ({}):\n{}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
     let env = Env::new();
     let proj = env.dir("proj");
     write(&proj, "README.md", "hello\n");
