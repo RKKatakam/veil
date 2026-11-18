@@ -73,7 +73,7 @@
 //!   also meets as a directory or a root is read and expanded.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -1372,7 +1372,7 @@ async fn run_with_lock(hub: &Arc<Hub>, project: i64, opts: &Options) -> Result<R
                             return Ok(None);
                         }
                         let expired_hexes: Vec<String> = gc.expired_unreferenced.iter().map(ObjectId::hex).collect();
-                        purge_expired_db_records(c, project, &expired_hexes).await?;
+                        purge_expired_db_records(&hub, c, project, &expired_hexes).await?;
                         for chunk in expired_hexes.chunks(500) {
                             sqlx::query(
                                 "DELETE FROM unreferenced_objects WHERE project_id = $1 AND object_id = ANY($2)",
@@ -2139,7 +2139,7 @@ async fn compact_batch(
                     }
                 }
                 if !all_expired_hexes.is_empty() {
-                    purge_expired_db_records(c, project, &all_expired_hexes).await?;
+                    purge_expired_db_records(&hub, c, project, &all_expired_hexes).await?;
                 }
                 if !new_names.is_empty() {
                     sqlx::query(
@@ -2506,7 +2506,7 @@ async fn mark_and_sweep_loose(
                     return Ok(None);
                 }
                 let expired_hexes: Vec<String> = gc.expired_unreferenced.iter().map(ObjectId::hex).collect();
-                purge_expired_db_records(c, project, &expired_hexes).await?;
+                purge_expired_db_records(&hub, c, project, &expired_hexes).await?;
                 let gce = bump_gc_epoch_tx(c, project).await?;
                 // The purge moved the stamp; the roots are those just read,
                 // less what it purged.
@@ -2812,11 +2812,222 @@ async fn notify_gc_epoch(hub: &Hub, project: i64, epoch: i64) {
     }
 }
 
-async fn purge_expired_db_records(
+/// Keep only `raw_cands` whose real first parent does NOT also project to
+/// `projected_id` under `view_key` (BUG-2671: excludes collapsed single-parent
+/// commits from pre-0011 rows and collapsed multi-parent hidden merges that may
+/// carry `collapsed = FALSE`).
+async fn filter_uncollapsed_candidates(
+    hub: &Hub,
+    c: &mut PgConnection,
+    project: i64,
+    view_key: &str,
+    projected_id: &str,
+    raw_cands: Vec<String>,
+) -> Result<Vec<String>> {
+    if raw_cands.is_empty() {
+        return Ok(Vec::new());
+    }
+    let graph_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT snapshot, parents FROM graph WHERE project_id = $1 AND snapshot = ANY($2)",
+    )
+    .bind(project)
+    .bind(&raw_cands)
+    .fetch_all(&mut *c)
+    .await?;
+    let graph_map: HashMap<String, String> = graph_rows.into_iter().collect();
+
+    let mut first_parents: Vec<(String, Option<String>)> = Vec::with_capacity(raw_cands.len());
+    let mut fp_set: HashSet<String> = HashSet::new();
+    for r in raw_cands {
+        let fp = if let Some(parents_json) = graph_map.get(&r) {
+            match serde_json::from_str::<Vec<ObjectId>>(parents_json) {
+                Ok(ps) => ps.first().map(ObjectId::hex),
+                Err(_) => continue,
+            }
+        } else {
+            // Un-derived snapshot: fall back to decoded Snapshot.parents.first().
+            let Ok(oid) = ObjectId::from_hex(&r) else { continue };
+            let Some(raw) = hub.objects.get(project, &oid).await? else { continue };
+            match Object::decode(&raw) {
+                Ok(Object::Snapshot(s)) => s.parents.first().map(ObjectId::hex),
+                _ => continue,
+            }
+        };
+        if let Some(ref p) = fp {
+            fp_set.insert(p.clone());
+        }
+        first_parents.push((r, fp));
+    }
+
+    let fp_proj: HashMap<String, String> = if fp_set.is_empty() {
+        HashMap::new()
+    } else {
+        let fp_vec: Vec<String> = fp_set.into_iter().collect();
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT real_id, projected_id FROM projections \
+             WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3)",
+        )
+        .persistent(false)
+        .bind(project)
+        .bind(view_key)
+        .bind(&fp_vec)
+        .fetch_all(&mut *c)
+        .await?;
+        rows.into_iter().collect()
+    };
+
+    let root_hex = crate::sync::root_snapshot_id().hex();
+    let mut out = Vec::with_capacity(first_parents.len());
+    for (r, fp) in first_parents {
+        let collapses_into_p0 = match fp.as_deref() {
+            Some(p) => {
+                fp_proj.get(p).map(String::as_str) == Some(projected_id)
+                    || (p == root_hex.as_str() && projected_id == root_hex.as_str())
+            }
+            None => false,
+        };
+        if !collapses_into_p0 {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+/// Before deleting `view_graph` rows whose `real_id` is expiring, repoint any
+/// `(view_key, snapshot)` row that still has a surviving uncollapsed real
+/// snapshot projecting to `snapshot` (BUG-2670 & BUG-2671,
+/// `docs/design/server/change-sized-cleanup.md` §5.3 item 2).
+///
+/// Queries `projections_own` (`NOT collapsed`) first, falling back to
+/// `projections_by_view` (`collapsed`) for pre-0011 rows when no uncollapsed
+/// survivor is found; drops any candidate whose real first parent also projects
+/// to `snapshot`; and orders surviving candidates by `(is_withheld ASC, real_id ASC)`
+/// so unembargoed survivors always win over embargoed siblings.
+async fn repoint_surviving_view_graph(
+    hub: &Hub,
     c: &mut PgConnection,
     project: i64,
     expired_hexes: &[String],
 ) -> Result<()> {
+    if expired_hexes.is_empty() {
+        return Ok(());
+    }
+    let expired_set: HashSet<&str> = expired_hexes.iter().map(String::as_str).collect();
+    let mut affected: BTreeSet<(String, String)> = BTreeSet::new();
+    for chunk in expired_hexes.chunks(500) {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT view_key, snapshot FROM view_graph WHERE project_id = $1 AND real_id = ANY($2)",
+        )
+        .persistent(false)
+        .bind(project)
+        .bind(chunk)
+        .fetch_all(&mut *c)
+        .await?;
+        for (vk, snap) in rows {
+            if !expired_set.contains(snap.as_str()) {
+                affected.insert((vk, snap));
+            }
+        }
+    }
+    if affected.is_empty() {
+        return Ok(());
+    }
+
+    let mut cand_vks: Vec<String> = Vec::new();
+    let mut cand_ps: Vec<String> = Vec::new();
+    let mut cand_rs: Vec<String> = Vec::new();
+
+    for (vk, p0) in affected {
+        let own_raw: Vec<String> = sqlx::query_scalar(
+            "SELECT real_id FROM projections \
+             WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed",
+        )
+        .persistent(false)
+        .bind(project)
+        .bind(&vk)
+        .bind(&p0)
+        .fetch_all(&mut *c)
+        .await?
+        .into_iter()
+        .filter(|r: &String| !expired_set.contains(r.as_str()))
+        .collect();
+
+        let mut survivors = filter_uncollapsed_candidates(hub, c, project, &vk, &p0, own_raw).await?;
+        if survivors.is_empty() {
+            // Pre-0011 fallback: rows written before `0011_landing.sql`
+            // defaulted to `collapsed = TRUE` even when uncollapsed.
+            let legacy_raw: Vec<String> = sqlx::query_scalar(
+                "SELECT real_id FROM projections \
+                 WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND collapsed",
+            )
+            .persistent(false)
+            .bind(project)
+            .bind(&vk)
+            .bind(&p0)
+            .fetch_all(&mut *c)
+            .await?
+            .into_iter()
+            .filter(|r: &String| !expired_set.contains(r.as_str()))
+            .collect();
+            survivors = filter_uncollapsed_candidates(hub, c, project, &vk, &p0, legacy_raw).await?;
+        }
+        for r in survivors {
+            cand_vks.push(vk.clone());
+            cand_ps.push(p0.clone());
+            cand_rs.push(r);
+        }
+    }
+
+    if !cand_vks.is_empty() {
+        sqlx::query(
+            "UPDATE view_graph vg \
+             SET real_id = chosen.real_id \
+             FROM ( \
+                 SELECT DISTINCT ON (c.view_key, c.projected_id) c.view_key, c.projected_id, c.real_id \
+                 FROM UNNEST($2::text[], $3::text[], $4::text[]) AS c(view_key, projected_id, real_id) \
+                 WHERE NOT (c.real_id = ANY($5)) \
+                 ORDER BY c.view_key, c.projected_id, \
+                          EXISTS ( \
+                              SELECT 1 \
+                              FROM embargo_snapshots es \
+                              JOIN embargo_lines el \
+                                ON el.project_id = es.project_id AND el.embargo_id = es.embargo_id \
+                              WHERE es.project_id = $1 \
+                                AND es.snapshot = c.real_id \
+                                AND el.released_at IS NULL \
+                          ) ASC, \
+                          c.real_id ASC \
+             ) chosen \
+             WHERE vg.project_id = $1 \
+               AND vg.view_key = chosen.view_key \
+               AND vg.snapshot = chosen.projected_id \
+               AND vg.real_id = ANY($5)",
+        )
+        .persistent(false)
+        .bind(project)
+        .bind(&cand_vks)
+        .bind(&cand_ps)
+        .bind(&cand_rs)
+        .bind(expired_hexes)
+        .execute(&mut *c)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn purge_expired_db_records(
+    hub: &Hub,
+    c: &mut PgConnection,
+    project: i64,
+    expired_hexes: &[String],
+) -> Result<()> {
+    // Repoint any surviving shared projections in `view_graph` BEFORE deleting
+    // `projections`, `graph`, or `view_graph` rows (BUG-2670).
+    repoint_surviving_view_graph(hub, c, project, expired_hexes).await?;
+
+    let expired_set: HashSet<&str> = expired_hexes.iter().map(String::as_str).collect();
+    let mut deleted_vg_pairs: BTreeSet<(String, String)> = BTreeSet::new();
+
     for chunk in expired_hexes.chunks(500) {
         for q in [
             "DELETE FROM snapshots WHERE project_id = $1 AND id = ANY($2)",
@@ -2828,7 +3039,31 @@ async fn purge_expired_db_records(
             "DELETE FROM file_history WHERE project_id = $1 AND snapshot = ANY($2)",
             "DELETE FROM rule_history WHERE project_id = $1 AND snapshot = ANY($2)",
             "DELETE FROM derive_progress WHERE project_id = $1 AND through_snapshot = ANY($2)",
-            "DELETE FROM view_graph WHERE project_id = $1 AND (snapshot = ANY($2) OR real_id = ANY($2))",
+        ] {
+            sqlx::query(q).bind(project).bind(chunk).execute(&mut *c).await?;
+        }
+        // Delete `view_graph` rows whose snapshot or remaining (un-repointed)
+        // `real_id` expired, recording `(view_key, snapshot)` so derived view
+        // rows (`view_file_history`, `view_changes`, `blame_*`) are never orphaned.
+        let del_by_snap: Vec<(String, String)> = sqlx::query_as(
+            "DELETE FROM view_graph WHERE project_id = $1 AND snapshot = ANY($2) RETURNING view_key, snapshot",
+        )
+        .bind(project)
+        .bind(chunk)
+        .fetch_all(&mut *c)
+        .await?;
+        deleted_vg_pairs.extend(del_by_snap);
+        let del_by_real: Vec<(String, String)> = sqlx::query_as(
+            "DELETE FROM view_graph WHERE project_id = $1 AND real_id = ANY($2) RETURNING view_key, snapshot",
+        )
+        .persistent(false)
+        .bind(project)
+        .bind(chunk)
+        .fetch_all(&mut *c)
+        .await?;
+        deleted_vg_pairs.extend(del_by_real);
+
+        for q in [
             "DELETE FROM view_changes WHERE project_id = $1 AND snapshot = ANY($2)",
             "DELETE FROM view_file_history WHERE project_id = $1 AND snapshot = ANY($2)",
             "DELETE FROM blame_memo WHERE project_id = $1 AND snapshot = ANY($2)",
@@ -2839,6 +3074,32 @@ async fn purge_expired_db_records(
             sqlx::query(q).bind(project).bind(chunk).execute(&mut *c).await?;
         }
     }
+
+    // Clean up derived viewer rows for any `view_graph` row deleted via its
+    // expiring `real_id` whose projected `snapshot` was not itself in `expired_hexes`.
+    let extra_pairs: Vec<(String, String)> = deleted_vg_pairs
+        .into_iter()
+        .filter(|(_, snap)| !expired_set.contains(snap.as_str()))
+        .collect();
+    for chunk in extra_pairs.chunks(500) {
+        let vks: Vec<&str> = chunk.iter().map(|(vk, _)| vk.as_str()).collect();
+        let snaps: Vec<&str> = chunk.iter().map(|(_, s)| s.as_str()).collect();
+        for q in [
+            "DELETE FROM view_changes t USING UNNEST($2::text[], $3::text[]) AS d(vk, snap) \
+             WHERE t.project_id = $1 AND t.view_key = d.vk AND t.snapshot = d.snap",
+            "DELETE FROM view_file_history t USING UNNEST($2::text[], $3::text[]) AS d(vk, snap) \
+             WHERE t.project_id = $1 AND t.view_key = d.vk AND t.snapshot = d.snap",
+            "DELETE FROM blame_memo t USING UNNEST($2::text[], $3::text[]) AS d(vk, snap) \
+             WHERE t.project_id = $1 AND t.view_key = d.vk AND t.snapshot = d.snap",
+            "DELETE FROM blame_ends t USING UNNEST($2::text[], $3::text[]) AS d(vk, snap) \
+             WHERE t.project_id = $1 AND t.view_key = d.vk AND t.snapshot = d.snap",
+            "DELETE FROM blame_jobs t USING UNNEST($2::text[], $3::text[]) AS d(vk, snap) \
+             WHERE t.project_id = $1 AND t.view_key = d.vk AND t.snapshot = d.snap",
+        ] {
+            sqlx::query(q).bind(project).bind(&vks).bind(&snaps).execute(&mut *c).await?;
+        }
+    }
+
     sqlx::query(
         "DELETE FROM derive_progress WHERE project_id = $1 AND branch <> '' \
          AND branch NOT IN (SELECT name FROM branches WHERE project_id = $1)",

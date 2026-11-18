@@ -3580,3 +3580,377 @@ fn bug_2770_discard_on_listed_pack_does_not_tombstone_staged_cache() {
         "already-listed pack must still resolve via staged_slots"
     );
 }
+
+/// BUG-2670: purging an expired real snapshot `R_1` whose projected snapshot
+/// `P` is shared with another surviving real snapshot `R_2` (`R_1 != R_2`,
+/// differing only in hidden `BILL_DIR/`) must repoint `view_graph(vk, P).real_id`
+/// to surviving uncollapsed, unembargoed `R_2` (never deleting `view_graph(vk, P)`,
+/// never choosing a collapsed hidden merge `R_merge` even with pre-BUG-2671
+/// `collapsed = false`, never choosing an embargoed sibling `R_emb`, and
+/// falling back to pre-0011 `collapsed = true` rows when needed), so `q/log`,
+/// `q/file`, and `q/blame` on the surviving branch keep answering `200`; once
+/// every surviving branch is deleted, `view_graph` and `view_file_history` for
+/// `(vk, P)` are both purged cleanly with zero orphaned rows.
+#[test]
+fn bug_2670_gc_repoints_shared_view_graph_row_instead_of_breaking_surviving_branch() {
+    use veil_core::object::{Object as O, Snapshot, Text};
+
+    let mut hub = TestHub::start_own();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let admin_tok = p.admin.token();
+    let dev_tok = p.dev.token();
+
+    let wait_200 = |api: &Api, tok: &str, path: &str| -> Reply {
+        for _ in 0..80 {
+            let r = api.get(Some(tok), path);
+            if r.status == 200 {
+                return r;
+            }
+            if r.status == 503 || r.status == 202 {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            return r;
+        }
+        api.get(Some(tok), path)
+    };
+
+    let shared_cid = veil_core::ChangeId::random();
+    let shared_ts = veil_core::now_millis();
+
+    let api = hub.api();
+    let main_real = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
+    let main_proj = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+
+    // 1. Branch `b1`: hidden commit `S_1`, then real commit `R_1` touching `src/shared.rs`.
+    let mut c_s1 = Craft::new(&api, &p.admin, &p.name, "main");
+    c_s1.file(&format!("{BILL_DIR}/b1.txt"), "hidden b1\n");
+    let (s1, rep) = c_s1.push_edited("b1", None, |_| {});
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["b1"], main_proj);
+
+    let mut c_r1 = Craft::new(&api, &p.admin, &p.name, "b1");
+    c_r1.file("src/shared.rs", "shared line 1\n");
+    let (r1, rep) = c_r1.push_edited("b1", Some(s1), |s| {
+        s.change_id = shared_cid;
+        s.description = Text::Plain("shared visible change".into());
+        s.timestamp = shared_ts;
+    });
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+    let p_shared = api.tips(Some(&dev_tok), &p.name).unwrap().branches["b1"];
+    assert_ne!(p_shared, r1, "dev sees a projected snapshot P != R_1");
+    assert_ne!(p_shared, main_proj, "R_1 did not collapse");
+
+    // Warm `view_graph(vk_dev, P)` and `view_file_history` from `b1` FIRST so
+    // `view_graph(vk_dev, P).real_id == R_1`.
+    assert_eq!(wait_200(&api, &dev_tok, &format!("/v1/projects/{}/q/log?rev=b1", p.name)).status, 200);
+    assert_eq!(wait_200(&api, &dev_tok, &format!("/v1/projects/{}/q/file?rev=b1&path=src/shared.rs", p.name)).status, 200);
+    assert_eq!(wait_200(&api, &dev_tok, &format!("/v1/projects/{}/q/blame?rev=b1&path=src/shared.rs", p.name)).status, 200);
+
+    let h = hub.hub();
+    let vk_dev: String = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar(
+                "SELECT view_key FROM projections WHERE project_id = $1 AND real_id = $2 AND projected_id = $3 AND view_key <> 'admin'",
+            )
+            .bind(pid)
+            .bind(r1.hex())
+            .bind(p_shared.hex())
+            .fetch_one(&h.db),
+        )
+        .unwrap();
+
+    let vg_real_before: String = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT real_id FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+                .bind(pid)
+                .bind(&vk_dev)
+                .bind(p_shared.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert_eq!(vg_real_before, r1.hex(), "b1 populated view_graph(vk_dev, P) with real_id = R_1");
+
+    // 2. Branch `b2`: distinct hidden commit `S_2`, then real commit `R_2 != R_1`
+    //    with identical visible changes/metadata, deterministically projecting to the same `P`.
+    let mut c_s2 = Craft::new(&api, &p.admin, &p.name, "main");
+    c_s2.file(&format!("{BILL_DIR}/b2.txt"), "hidden b2\n");
+    let (s2, rep) = c_s2.push_edited("b2", None, |_| {});
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+
+    let mut c_r2 = Craft::new(&api, &p.admin, &p.name, "b2");
+    c_r2.file("src/shared.rs", "shared line 1\n");
+    let (r2, rep) = c_r2.push_edited("b2", Some(s2), |s| {
+        s.change_id = shared_cid;
+        s.description = Text::Plain("shared visible change".into());
+        s.timestamp = shared_ts;
+    });
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+    assert_ne!(r2, r1, "R_2 and R_1 are distinct real snapshots");
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["b2"], p_shared, "R_2 shares projection P");
+
+    // Add a collapsed hidden multi-parent merge `R_merge -> [R_2, R_sec]` on `b2`,
+    // then a visible child `R_3` projecting to `P_3` with parent `P`.
+    let mut c_merge = Craft::new(&api, &p.admin, &p.name, "b2");
+    c_merge.file(&format!("{BILL_DIR}/side.txt"), "hidden side\n");
+    let mut sec_snap = Snapshot {
+        parents: vec![r2],
+        change_id: veil_core::ChangeId::random(),
+        tree: c_merge.root,
+        description: Text::Plain("hidden side".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    sec_snap.sign(&c_merge.identity);
+    let r_sec = c_merge.put(O::Snapshot(sec_snap));
+    let (r_merge, rep) = c_merge.push_edited("b2", Some(r2), move |s| s.parents = vec![r2, r_sec]);
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["b2"], p_shared, "R_merge collapses to P");
+
+    let mut c_r3 = Craft::new(&api, &p.admin, &p.name, "b2");
+    c_r3.file("src/shared.rs", "shared line 1\nshared line 2\n");
+    let (_, rep) = c_r3.push_edited("b2", Some(r_merge), |_| {});
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+    let p3 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["b2"];
+    assert_ne!(p3, p_shared);
+
+    // Warm `b2` as `dev`: writes `view_graph(vk_dev, P_3, parents = [P])` and stops at `P`.
+    assert_eq!(wait_200(&api, &dev_tok, &format!("/v1/projects/{}/q/log?rev=b2", p.name)).status, 200);
+    assert_eq!(wait_200(&api, &dev_tok, &format!("/v1/projects/{}/q/blame?rev=b2&path=src/shared.rs", p.name)).status, 200);
+
+    // 3. Branch `b_emb`: another sibling `R_emb` sharing `P`, marked withheld
+    //    under an unreleased embargo line, so repointing must prefer unembargoed `R_2`.
+    let mut c_semb = Craft::new(&api, &p.admin, &p.name, "main");
+    c_semb.file(&format!("{BILL_DIR}/emb.txt"), "hidden emb\n");
+    let (s_emb, rep) = c_semb.push_edited("b_emb", None, |_| {});
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    let mut c_remb = Craft::new(&api, &p.admin, &p.name, "b_emb");
+    c_remb.file("src/shared.rs", "shared line 1\n");
+    let (r_emb, rep) = c_remb.push_edited("b_emb", Some(s_emb), |s| {
+        s.change_id = shared_cid;
+        s.description = Text::Plain("shared visible change".into());
+        s.timestamp = shared_ts;
+    });
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["b_emb"], p_shared);
+    assert_ne!(r_emb, r1);
+    assert_ne!(r_emb, r2);
+
+    // Poison `R_merge` with pre-BUG-2671 `collapsed = FALSE` AND mark `R_emb`
+    // withheld under an unreleased embargo line.
+    hub.rt.block_on(async {
+        sqlx::query("UPDATE projections SET collapsed = FALSE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(pid)
+            .bind(&vk_dev)
+            .bind(r_merge.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO embargo_lines (project_id, embargo_id, group_names, target_branch, embargo_branch, until_ms, released_at, record_json, created_by, created_at) \
+             VALUES ($1, 'emb-2670', ARRAY['admins']::text[], 'main', 'embargo/emb-2670', NULL, NULL, '{}', 'admin', $2) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(pid)
+        .bind(veil_core::now_millis())
+        .execute(&h.db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO embargo_snapshots (project_id, snapshot, embargo_id) VALUES ($1, $2, 'emb-2670') ON CONFLICT DO NOTHING")
+            .bind(pid)
+            .bind(r_emb.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+    });
+
+    // Confirm `view_graph(vk_dev, P)` still points at `R_1` before GC.
+    let vg_real_pre: String = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT real_id FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+                .bind(pid)
+                .bind(&vk_dev)
+                .bind(p_shared.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert_eq!(vg_real_pre, r1.hex());
+
+    // 4. Delete `b1` (leaving `R_1` unreferenced) and run offline GC.
+    let del = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &serde_json::json!({"updates": [{"branch": "b1", "expected": r1.hex(), "new": null}]}),
+    );
+    assert_eq!(del.status, 200, "{}", String::from_utf8_lossy(&del.body));
+
+    let gc_opts = Options {
+        run_gc: true,
+        retention_window_ms: 0,
+        pack_grace_ms: 0,
+        staged_grace_ms: 0,
+        ..Options::default()
+    };
+    hub.offline_gc(pid, &gc_opts).unwrap();
+
+    // `view_graph(vk_dev, P)` must have survived and repointed to unembargoed,
+    // uncollapsed `R_2` (never deleted, never `R_merge`, never `R_emb`).
+    let h = hub.hub();
+    let vg_real_after: Option<String> = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT real_id FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+                .bind(pid)
+                .bind(&vk_dev)
+                .bind(p_shared.hex())
+                .fetch_optional(&h.db),
+        )
+        .unwrap();
+    assert_eq!(
+        vg_real_after.as_deref(),
+        Some(r2.hex().as_str()),
+        "view_graph(vk_dev, P) must repoint to surviving uncollapsed unembargoed R_2 (got {vg_real_after:?})"
+    );
+
+    // Every query on surviving `b2` as `dev` must answer 200 (never 500!).
+    let api = hub.api();
+    let r_log = wait_200(&api, &dev_tok, &format!("/v1/projects/{}/q/log?rev=b2", p.name));
+    assert_eq!(r_log.status, 200, "q/log on b2 after GC: {}", String::from_utf8_lossy(&r_log.body));
+    let r_file = wait_200(&api, &dev_tok, &format!("/v1/projects/{}/q/file?rev=b2&path=src/shared.rs", p.name));
+    assert_eq!(r_file.status, 200, "q/file on b2 after GC: {}", String::from_utf8_lossy(&r_file.body));
+    let r_blame = wait_200(&api, &dev_tok, &format!("/v1/projects/{}/q/blame?rev=b2&path=src/shared.rs", p.name));
+    assert_eq!(r_blame.status, 200, "q/blame on b2 after GC: {}", String::from_utf8_lossy(&r_blame.body));
+
+    // 5. Pre-0011 fallback: even when `R_2` has `collapsed = TRUE` (legacy row)
+    //    and `R_merge` still has `collapsed = FALSE`, repointing must fall back
+    //    to `collapsed = TRUE`, reject `R_merge` via first-parent check, and
+    //    repoint to `R_2`.
+    let mut c_scopy = Craft::new(&api, &p.admin, &p.name, "main");
+    c_scopy.file(&format!("{BILL_DIR}/copy.txt"), "hidden copy\n");
+    let (s_copy, rep) = c_scopy.push_edited("b2_copy", None, |_| {});
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    let mut c_rcopy = Craft::new(&api, &p.admin, &p.name, "b2_copy");
+    c_rcopy.file("src/shared.rs", "shared line 1\n");
+    let (r_copy, rep) = c_rcopy.push_edited("b2_copy", Some(s_copy), |s| {
+        s.change_id = shared_cid;
+        s.description = Text::Plain("shared visible change".into());
+        s.timestamp = shared_ts;
+    });
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(api.tips(Some(&dev_tok), &p.name).unwrap().branches["b2_copy"], p_shared);
+
+    hub.rt.block_on(async {
+        sqlx::query("UPDATE view_graph SET real_id = $4 WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+            .bind(pid)
+            .bind(&vk_dev)
+            .bind(p_shared.hex())
+            .bind(r_copy.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE projections SET collapsed = TRUE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(pid)
+            .bind(&vk_dev)
+            .bind(r2.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE projections SET collapsed = FALSE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(pid)
+            .bind(&vk_dev)
+            .bind(r_merge.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+    });
+    // Delete `b2_copy` and `b_emb`, run offline GC -> must repoint to pre-0011 `R_2`.
+    let del2 = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &serde_json::json!({"updates": [
+            {"branch": "b2_copy", "expected": r_copy.hex(), "new": null},
+            {"branch": "b_emb", "expected": r_emb.hex(), "new": null}
+        ]}),
+    );
+    assert_eq!(del2.status, 200, "{}", String::from_utf8_lossy(&del2.body));
+    hub.rt.block_on(
+        sqlx::query("DELETE FROM embargo_snapshots WHERE project_id = $1 AND embargo_id = 'emb-2670'")
+            .bind(pid)
+            .execute(&h.db),
+    ).unwrap();
+    hub.rt.block_on(
+        sqlx::query("DELETE FROM embargo_lines WHERE project_id = $1 AND embargo_id = 'emb-2670'")
+            .bind(pid)
+            .execute(&h.db),
+    ).unwrap();
+    hub.offline_gc(pid, &gc_opts).unwrap();
+
+    let h = hub.hub();
+    let vg_real_pre0011: Option<String> = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT real_id FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+                .bind(pid)
+                .bind(&vk_dev)
+                .bind(p_shared.hex())
+                .fetch_optional(&h.db),
+        )
+        .unwrap();
+    assert_eq!(
+        vg_real_pre0011.as_deref(),
+        Some(r2.hex().as_str()),
+        "pre-0011 collapsed=true fallback must repoint to R_2 even with poisoned R_merge"
+    );
+
+    // 6. Delete `b2` as well and run offline GC -> `view_graph` AND
+    //    `view_file_history` for `(vk_dev, P)` must both have 0 rows.
+    let api = hub.api();
+    let r3 = api.tips(Some(&admin_tok), &p.name).unwrap().branches["b2"];
+    let _ = main_real;
+    let del3 = api.post_json(
+        Some(&admin_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &serde_json::json!({"updates": [{"branch": "b2", "expected": r3.hex(), "new": null}]}),
+    );
+    assert_eq!(del3.status, 200, "{}", String::from_utf8_lossy(&del3.body));
+    hub.offline_gc(pid, &gc_opts).unwrap();
+
+    let h = hub.hub();
+    let vg_left: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+                .bind(pid)
+                .bind(&vk_dev)
+                .bind(p_shared.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    let vfh_left: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM view_file_history WHERE project_id = $1 AND view_key = $2 AND snapshot = $3")
+                .bind(pid)
+                .bind(&vk_dev)
+                .bind(p_shared.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert_eq!(vg_left, 0, "view_graph row must be deleted once no real snapshot for P survives");
+    assert_eq!(vfh_left, 0, "view_file_history rows for deleted view_graph row must not be orphaned");
+}
+
