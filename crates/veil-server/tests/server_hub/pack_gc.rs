@@ -172,7 +172,7 @@ fn iso_utc(ms: i64) -> String {
 /// servers (`TestHub::beside`) and a crash mid-merge (resumed or rolled back).
 #[test]
 fn guarantee_1_merging_never_loses_or_changes_an_object_across_servers_and_crashes() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let other = TestHub::beside(&hub);
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
@@ -786,7 +786,7 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
 /// windows, and the embargoed line releases cleanly onto `main` afterwards.
 #[test]
 fn guarantee_3_embargoed_objects_never_deleted_before_release() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -886,7 +886,7 @@ fn guarantee_3_embargoed_objects_never_deleted_before_release() {
 /// `limits::DERIVE_PAUSE`).
 #[test]
 fn guarantee_4_merge_and_gc_are_bounded_and_yield_to_landings_and_pushes() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -998,7 +998,12 @@ fn guarantee_5_cost_of_merging_10000_small_pushes() {
     // database numbers its projects from 1 again, and the run's bucket holds
     // other such tests' `p/1/` keys, which the counts below would include.
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let hub = TestHub::start_with_s3(&crate::grants::fresh_database(&rt), Duration::from_secs(3600), None);
+    let hub = TestHub::start_with_s3_and_layout(
+        &crate::grants::fresh_database(&rt),
+        Duration::from_secs(3600),
+        None,
+        veil_server::ObjectLayout::Packs,
+    );
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -1172,7 +1177,7 @@ pub(crate) fn gc_pass(hub: &TestHub, pid: i64, opts: &Options) -> pack_gc::Repor
 /// shared blobs/ancestors alive until its own window expires).
 #[test]
 fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let hub2 = TestHub::beside(&hub);
@@ -3288,7 +3293,7 @@ fn bug_1898_every_read_that_finds_its_pack_merged_and_swept_reads_the_listing_ag
         ("exists", 0, |o, rt, p, id, _, _| assert!(rt.block_on(o.exists(p, id)).expect("exists must not fail"), "exists must never see a missing object")),
     ];
 
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();

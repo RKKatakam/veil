@@ -2788,4 +2788,166 @@ mod tests {
         .await
         .unwrap();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn objects_keep_writes_only_touched_and_made_always_overwriting_and_counting() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(FsStore::new(dir.path()));
+        let objects = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
+
+        let mk = |label: &[u8]| {
+            let mut v = b"veil:blob\n".to_vec();
+            v.extend_from_slice(label);
+            let b = Bytes::from(v);
+            (ObjectId::hash(&b), b)
+        };
+        let (a_id, a_raw) = mk(b"KEEP-OBJECT-A-101");
+        let (b_id, b_raw) = mk(b"KEEP-OBJECT-B-102");
+        let (unread_id, unread_raw) = mk(b"KEEP-UNREAD-OBJECT-103");
+        let (made_id, made_raw) = mk(b"KEEP-MADE-OBJECT-104");
+
+        let cname = objects
+            .stage(
+                1,
+                7,
+                vec![
+                    (a_id, encode(a_raw.clone())),
+                    (b_id, encode(b_raw.clone())),
+                    (unread_id, encode(unread_raw)),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(objects.uploads.load(Ordering::Relaxed), 1);
+
+        let slots = objects.staged_slots(1, &cname, &[a_id, b_id, unread_id]).await.unwrap().unwrap();
+        let staged = [(cname, slots)];
+        let touched: std::collections::HashSet<ObjectId> = [a_id, b_id].into_iter().collect();
+        let mut written = Vec::new();
+        let listed = own(objects.keep(
+            1,
+            7,
+            &staged,
+            &touched,
+            vec![(made_id, made_raw.clone())],
+            1,
+            false,
+            &mut written,
+        ))
+        .await
+        .unwrap();
+        assert!(listed.is_empty() && written.is_empty(), "objects layout lists and writes no pack");
+        assert_eq!(objects.objects_kept.load(Ordering::Relaxed), 3);
+        assert_eq!(objects.own_writes.load(Ordering::Relaxed), 3, "stage was outside own; 3 kept objects inside own");
+        assert!(fs.exists(&object_key(1, &a_id)).await.unwrap());
+        assert!(fs.exists(&object_key(1, &b_id)).await.unwrap());
+        assert!(fs.exists(&object_key(1, &made_id)).await.unwrap());
+        assert!(!fs.exists(&object_key(1, &unread_id)).await.unwrap(), "untouched upload is never written loose");
+
+        // Always-write rule (object-layout.md §3.2 fact 2 & §5.2 threat 4):
+        // even when the file already exists on disk (here replaced with sentinel bytes),
+        // `keep` writes it unconditionally and increments `own_writes` and `objects_kept`.
+        std::fs::write(dir.path().join(object_key(1, &a_id)), b"stale-bytes").unwrap();
+        std::fs::write(dir.path().join(object_key(1, &made_id)), b"stale-bytes").unwrap();
+        let touched_again: std::collections::HashSet<ObjectId> = [a_id].into_iter().collect();
+        let listed2 = own(objects.keep(
+            1,
+            7,
+            &staged,
+            &touched_again,
+            vec![(made_id, made_raw.clone())],
+            1,
+            false,
+            &mut written,
+        ))
+        .await
+        .unwrap();
+        assert!(listed2.is_empty());
+        assert_eq!(objects.objects_kept.load(Ordering::Relaxed), 5);
+        assert_eq!(objects.own_writes.load(Ordering::Relaxed), 5);
+        let cold = Objects::with_layout(fs, 1 << 20, None, ObjectLayout::Objects);
+        assert_eq!(cold.get(1, &a_id).await.unwrap().as_deref(), Some(&a_raw[..]));
+        assert_eq!(cold.get(1, &b_id).await.unwrap().as_deref(), Some(&b_raw[..]));
+        assert_eq!(cold.get(1, &made_id).await.unwrap().as_deref(), Some(&made_raw[..]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn objects_keep_uncached_reads_whole_small_ranged_large_and_refuses_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(FsStore::new(dir.path()));
+        let writer = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
+
+        let mk = |seed: u64, payload_len: usize| {
+            let mut v = Vec::with_capacity(10 + payload_len);
+            v.extend_from_slice(b"veil:blob\n");
+            let mut x = seed;
+            for _ in 0..payload_len / 8 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+            let b = Bytes::from(v);
+            (ObjectId::hash(&b), b)
+        };
+
+        // 1. Small uncached container (<= 16 MiB) with all slots touched: read whole in 1 read.
+        let (s1_id, s1_raw) = mk(0x1111_2222_3333_4444, 256);
+        let (s2_id, s2_raw) = mk(0x5555_6666_7777_8888, 256);
+        let small_name = writer
+            .stage(1, 7, vec![(s1_id, encode(s1_raw.clone())), (s2_id, encode(s2_raw.clone()))])
+            .await
+            .unwrap();
+        let small_slots = writer.staged_slots(1, &small_name, &[s1_id, s2_id]).await.unwrap().unwrap();
+        let small_staged = [(small_name, small_slots)];
+
+        let cold = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
+        let reads_before = cold.reads.load(Ordering::Relaxed);
+        let mut written = Vec::new();
+        let touched_small: std::collections::HashSet<ObjectId> = [s1_id, s2_id].into_iter().collect();
+        cold.keep(1, 7, &small_staged, &touched_small, Vec::new(), 1, false, &mut written)
+            .await
+            .unwrap();
+        assert_eq!(cold.reads.load(Ordering::Relaxed) - reads_before, 1, "small container read whole in 1 read");
+        assert_eq!(cold.get(1, &s1_id).await.unwrap().as_deref(), Some(&s1_raw[..]));
+        assert_eq!(cold.get(1, &s2_id).await.unwrap().as_deref(), Some(&s2_raw[..]));
+
+        // 2. Large uncached container (> 16 MiB) with 1 small touched slot and 1 large untouched slot:
+        //    ranged read fetches only the touched slot, never the whole >16 MiB container.
+        let (l_keep_id, l_keep_raw) = mk(0x9999_aaaa_bbbb_cccc, 512);
+        let (l_skip_id, l_skip_raw) = mk(0xdddd_eeee_ffff_1234, 17 << 20);
+        let large_name = writer
+            .stage(2, 7, vec![(l_keep_id, encode(l_keep_raw.clone())), (l_skip_id, encode(l_skip_raw))])
+            .await
+            .unwrap();
+        let large_slots = writer.staged_slots(2, &large_name, &[l_keep_id]).await.unwrap().unwrap();
+        assert!(large_slots.size > (16 << 20));
+        let cold2 = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
+        let touched_large: std::collections::HashSet<ObjectId> = [l_keep_id].into_iter().collect();
+        cold2
+            .keep(2, 7, &[(large_name, large_slots)], &touched_large, Vec::new(), 1, false, &mut written)
+            .await
+            .unwrap();
+        assert!(fs.exists(&object_key(2, &l_keep_id)).await.unwrap());
+        assert!(!fs.exists(&object_key(2, &l_skip_id)).await.unwrap());
+        assert_eq!(cold2.get(2, &l_keep_id).await.unwrap().as_deref(), Some(&l_keep_raw[..]));
+
+        // 3. Discarded / missing container returns Err(KeepError::Discarded) whether cached or uncached.
+        writer.discard(1, std::slice::from_ref(&small_staged[0].0)).await.unwrap();
+        let Err(err_cached) = writer
+            .keep(1, 7, &small_staged, &touched_small, Vec::new(), 1, false, &mut written)
+            .await
+        else {
+            panic!("deleted container must fail even when staged entries are cached");
+        };
+        assert!(matches!(err_cached, KeepError::Discarded), "expected Discarded, got {err_cached:?}");
+        let cold3 = Objects::with_layout(fs, 1 << 20, None, ObjectLayout::Objects);
+        let Err(err_uncached) = cold3
+            .keep(1, 7, &small_staged, &touched_small, Vec::new(), 1, false, &mut written)
+            .await
+        else {
+            panic!("deleted container must fail when uncached");
+        };
+        assert!(matches!(err_uncached, KeepError::Discarded), "expected Discarded, got {err_uncached:?}");
+    }
 }

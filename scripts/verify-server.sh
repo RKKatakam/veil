@@ -57,7 +57,7 @@ export VEIL_TEST_DB_PREFIX=r${RUN}x
 # one directory per object, so buckets left behind fill the disk's inodes
 # (all 244 million, 2026-11-08): each run removes its own, and the next run
 # removes those of runs that died first.
-BUCKETS="veil-pg veil-yb veil-hpg veil-hyb veil-load-pg veil-load-yb"
+BUCKETS="veil-pg veil-yb veil-opg veil-oyb veil-hpg veil-hyb veil-load-pg veil-load-yb"
 remove_buckets() { # names in the shared MinIO's data directory
   [ $# -gt 0 ] && D exec "$S3" sh -c 'cd /bitnami/minio/data && for b; do case "$b" in ""|.*|*/*) continue;; esac; rm -rf -- "$b" ".minio.sys/buckets/$b"; done' sh "$@" >/dev/null 2>&1
 }
@@ -122,7 +122,7 @@ drop_dead_runs() {
   done
   local b dead=()
   for b in $(D exec "$S3" ls /bitnami/minio/data 2>/dev/null); do
-    pid=$(echo "$b" | sed -nE 's/^veil-(pg|yb|hpg|hyb|load-pg|load-yb)-([0-9]+)$/\2/p')
+    pid=$(echo "$b" | sed -nE 's/^veil-(pg|yb|opg|oyb|hpg|hyb|load-pg|load-yb)-([0-9]+)$/\2/p')
     [ -n "$pid" ] && [ ! -d "/proc/$pid" ] && dead+=("$b")
   done
   remove_buckets "${dead[@]}"
@@ -183,11 +183,23 @@ echo "== container suite"
 # SERIALIZABLE) and nothing else counts in their memory.
 HOSTILE=(derived::s12_adversarial packs::hostile_)
 SKIP_HOSTILE=(--skip derived::s12_adversarial --skip packs::hostile_)
+OBJECTS_MODULES=(sync:: packs:: pack_gc:: grants:: leaks:: changes:: commits:: embargo:: embargo_prs:: cache:: thin:: branch_landing:: landing_hold:: rv_core2:: object_layout::)
 step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg-$RUN "$BIN" "${SKIP_HOSTILE[@]}"
+step objects-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-opg-$RUN VEIL_TEST_OBJECT_LAYOUT=objects "$BIN" "${OBJECTS_MODULES[@]}" "${SKIP_HOSTILE[@]}"
 # YugabyteDB is shared by every run on the machine: 8 tests at a time, so
 # several runs at once do not drown it in servers and pools (each test
 # starts its own); results stay trustworthy under load.
 STEP_LIMIT=1800 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" "${SKIP_HOSTILE[@]}" --test-threads=8
+objects_yb=${VEIL_VERIFY_OBJECTS_YB:-auto}
+if [ "$objects_yb" = auto ]; then
+  base=$(git merge-base HEAD integration 2>/dev/null)
+  if [ -n "$base" ] && git diff --name-only "$base" HEAD -- crates/veil-server/src/store.rs crates/veil-server/src/sync.rs crates/veil-server/src/pack_gc.rs crates/veil-server/src/changes.rs crates/veil-server/src/landing/service.rs | grep -q .; then objects_yb=1; else objects_yb=0; fi
+fi
+if [ "$objects_yb" = 1 ]; then
+  STEP_LIMIT=1800 step objects-yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-oyb-$RUN VEIL_TEST_OBJECT_LAYOUT=objects "$BIN" "${OBJECTS_MODULES[@]}" "${SKIP_HOSTILE[@]}" --test-threads=8
+else
+  echo "   skip  objects-yugabyte (no store/sync/pack_gc/changes/landing changes; VEIL_VERIFY_OBJECTS_YB=1 runs it)"
+fi
 # One at a time: on a database other runs share, three at once could keep
 # a statement past its timeout.
 # The hostile-size sets take about half an hour and touch only S12/S13's

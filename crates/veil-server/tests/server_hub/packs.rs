@@ -49,7 +49,7 @@ fn blob(text: &str) -> (ObjectId, Vec<u8>) {
 /// database).
 #[test]
 fn a_push_is_one_storage_write_and_reads_come_from_its_pack() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let (listed0, _) = pack_rows(&hub, pid);
@@ -501,7 +501,7 @@ fn bug_1157_a_push_that_lost_a_race_leaves_no_copy_of_its_upload() {
 /// it counts, and `veil-bench load`'s writes-per-push gate counts them.
 #[test]
 fn bug_1153_background_indexing_is_not_counted_as_a_pushs_writes() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let settle = || {
         // Until the background work is done: no write for 3 s.
@@ -654,7 +654,7 @@ fn hostile_bug_1156_api_commits_hold_their_uploads_within_the_servers_bound() {
 #[test]
 #[ignore = "BUG-1158 (closed by decision: the upgrade to S28 is not rolling, HUB.md §13.20): a server before S28 cannot find what an S28 server stored"]
 fn bug_1158_a_server_before_s28_finds_what_an_s28_server_stored() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     write_files(&p.dir, &[("src/rolling.rs", "MARKER-ROLLING-UPGRADE-0f4b")]);
@@ -832,7 +832,7 @@ fn a_guess_gets_one_answer_whatever_receipt_it_shows() {
 #[test]
 fn every_pack_in_storage_has_a_row_after_refusals_races_and_api_commits() {
     // Whatever the storage (S3 or a directory: listed from the store).
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -896,7 +896,7 @@ fn every_pack_in_storage_has_a_row_after_refusals_races_and_api_commits() {
 /// transaction, so the client's 3 s run out within it.
 #[test]
 fn bug_1399_a_push_whose_client_goes_away_leaves_no_pack_without_a_row() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -1173,7 +1173,7 @@ fn bug_1624_a_push_projecting_a_committed_tip_does_not_count_it_as_its_own_stora
 /// index shares when it ends, whether the push succeeds or fails.
 #[test]
 fn a_push_of_more_than_max_objects_lands_and_releases_every_share() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -1530,7 +1530,7 @@ fn a_push_of_a_stack_with_attempts_across_windows_keeps_every_attempt_and_lands_
 /// and none on `main` until release, and its objects are in the push's pack.
 #[test]
 fn embargoed_stack_across_guess_windows_stays_on_hidden_line_until_release_and_packs_its_objects() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
     let pid = project_id(&hub, &p.name);
