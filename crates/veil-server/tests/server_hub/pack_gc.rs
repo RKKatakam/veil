@@ -3954,3 +3954,161 @@ fn bug_2670_gc_repoints_shared_view_graph_row_instead_of_breaking_surviving_bran
     assert_eq!(vfh_left, 0, "view_file_history rows for deleted view_graph row must not be orphaned");
 }
 
+/// BUG-2635: a clean server stop (`Running::stop`) must stop and wait for
+/// background `derive` (`landed` and `resume`) and `query::graph` fills (both
+/// row fills and leased file-history fills) before returning and releasing
+/// `ServingLock`, so no background writer keeps running or writing to the
+/// database after `Running::stop` returns.
+#[test]
+fn bug_2635_clean_stop_stops_and_waits_for_deriver_and_viewer_graph_fills() {
+    let mut hub = TestHub::start_own();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let h = hub.hub();
+    let api = hub.api();
+
+    // Hold the project's derive advisory lock on a separate connection before
+    // pushing a new branch so `snap_b` stays underived until we unblock it.
+    const DERIVE_LOCK_BASE: i64 = 0x7665_696c_6472_0000;
+    let lock_key = DERIVE_LOCK_BASE ^ pid;
+    let mut derive_lock = hub.rt.block_on(h.db.acquire()).unwrap();
+    let got_lock: bool = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(lock_key).fetch_one(&mut *derive_lock))
+        .unwrap();
+    assert!(got_lock, "test acquired project derive advisory lock");
+
+    let mut c = Craft::new(&api, &p.admin, &p.name, "main");
+    c.file("src/stop-2635.txt", "hello-2635\n");
+    let (snap_b, r) = c.push_edited("b_stop", None, |_| {});
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], serde_json::json!(true));
+
+    // Confirm `snap_b` is not derived yet.
+    let pre_graph: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM graph WHERE project_id = $1 AND snapshot = $2")
+                .bind(pid)
+                .bind(snap_b.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert_eq!(pre_graph, 0, "snap_b must start underived while derive lock is held");
+
+    // Start both `derive::landed` and `derive::resume` in the background while
+    // the derive lock is held.
+    veil_server::derive::landed(&h, pid, vec!["b_stop".to_string()]);
+    let resume_handle = hub.rt.spawn(veil_server::derive::resume(h.clone(), Some(pid)));
+
+    // Load project and a fresh uncached viewer (`Viewer::default()`), block
+    // row fills via `hold_row_fills()` and file-history fills via an external
+    // `view_fills` lease, then start both background fills.
+    let project = hub
+        .rt
+        .block_on(async {
+            let mut c = h.db.acquire().await.unwrap();
+            veil_server::perm::load_project(&mut c, &p.name).await.unwrap().unwrap()
+        });
+    let anyone = veil_server::perm::Viewer::default();
+    let vk = project.view(&anyone).key();
+    let row_hold = hub.rt.block_on(h.query.hold_row_fills());
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO view_fills (project_id, view_key, holder, expires_at) VALUES ($1, $2, 'external-blocker', $3) \
+                 ON CONFLICT (project_id, view_key) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at",
+            )
+            .bind(pid)
+            .bind(&vk)
+            .bind(veil_core::now_millis() + 60_000)
+            .execute(&h.db),
+        )
+        .unwrap();
+
+    hub.rt
+        .block_on(veil_server::query::graph::prefill_rows(&h, &project, &anyone, &[snap_b]))
+        .unwrap();
+    hub.rt
+        .block_on(veil_server::query::graph::prefill(&h, &project, &anyone, &[snap_b]))
+        .unwrap();
+
+    let wait_until = std::time::Instant::now() + Duration::from_secs(5);
+    while h.query.fills_started(pid) == 0 || h.query.file_fills_started(pid) == 0 {
+        assert!(std::time::Instant::now() < wait_until, "both row and file fills must start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Give `derive::landed` / `derive::resume` time to enter `locked_landing`.
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Clean stop: must stop and wait for all derive and viewer-graph fill tasks
+    // promptly (well under 5 s) before releasing ServingLock.
+    let stop_started = std::time::Instant::now();
+    hub.stop_serving();
+    let stop_took = stop_started.elapsed();
+    assert!(stop_took < Duration::from_secs(5), "clean stop took too long: {stop_took:?}");
+
+    // `derive::resume` must already have exited by the time `Running::stop` returned.
+    assert!(
+        resume_handle.is_finished(),
+        "derive::resume was still running after Running::stop returned"
+    );
+
+    // Release every external blocker after `Running::stop` returned. If any
+    // zombie derive or viewer-graph fill task survived `Running::stop`, it will
+    // wake up and write rows now.
+    let unlocked: bool = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT pg_advisory_unlock($1)").bind(lock_key).fetch_one(&mut *derive_lock))
+        .unwrap();
+    assert!(unlocked);
+    drop(derive_lock);
+    drop(row_hold);
+    let offline = hub.offline_hub();
+    hub.rt
+        .block_on(
+            sqlx::query("DELETE FROM view_fills WHERE project_id = $1 AND view_key = $2 AND holder = 'external-blocker'")
+                .bind(pid)
+                .bind(&vk)
+                .execute(&offline.db),
+        )
+        .unwrap();
+
+    // Wait past locked_landing's 100 ms sleep and leased_fill's 250 ms sleep.
+    std::thread::sleep(Duration::from_millis(450));
+
+    let post_graph: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM graph WHERE project_id = $1 AND snapshot = $2")
+                .bind(pid)
+                .bind(snap_b.hex())
+                .fetch_one(&offline.db),
+        )
+        .unwrap();
+    let post_vg: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM view_graph WHERE project_id = $1 AND view_key = $2")
+                .bind(pid)
+                .bind(&vk)
+                .fetch_one(&offline.db),
+        )
+        .unwrap();
+    let post_vf: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT COUNT(*) FROM view_fills WHERE project_id = $1 AND view_key = $2")
+                .bind(pid)
+                .bind(&vk)
+                .fetch_one(&offline.db),
+        )
+        .unwrap();
+    hub.rt.block_on(offline.db.close());
+
+    assert_eq!(post_graph, 0, "zombie deriver wrote graph rows after Running::stop returned");
+    assert_eq!(post_vg, 0, "zombie viewer-graph fill wrote view_graph rows after Running::stop returned");
+    assert_eq!(post_vf, 0, "zombie file-history fill took view_fills lease after Running::stop returned");
+}
+
+
