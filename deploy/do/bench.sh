@@ -2,12 +2,16 @@
 # Run one gate against the deployment and fetch its results (docs/DEPLOY.md
 # §6; the gates themselves are in deploy/gates.sh, shared with the
 # rehearsal). Results land in deploy/results/NAME/<stamp>-<gate>/:
-#   run.txt        the commit, the image tag, the gate's settings, the address
+#   run.txt        the commit, the image tag, the gate's settings, the address, and the
+#                  servers' object layout (object_layout=, as every server reported it
+#                  before the gate; object_layout_changed= when one did not after it)
 #   topology.env   deploy/do/.env's topology, without a single secret
 #   images.txt     the image ids on every machine, the pinned third-party digests
 #   commands.txt   every veil-bench command line, and on which machine
 #   *.json, *.md   the tool's raw results and its tables; LABEL.log its output
 #   hub<N>-stats.json, hub<N>-docker-stats.log   each server's counters and samples
+#   hub<N>-stats-before.json   its counters before the gate (the difference is the gate's:
+#                  storage writes, reads, deletes and listings, objects kept, uploads)
 #   db<N>-docker-stats.log   each database machine's samples (PostgreSQL's, or YugabyteDB's nodes)
 #   minio-docker-stats.log   the MinIO storage droplet's samples (VEIL_DO_OBJECTS=minio)
 #   minio-restarts.txt       MinIO's restart count before and after the gate (a change fails it)
@@ -44,7 +48,6 @@ STEP_LIMIT=${STEP_LIMIT:-3600}
 STAMP=${BENCH_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}
 [[ "$STAMP" =~ ^[0-9A-Za-z-]+$ ]] || { echo "bench: invalid BENCH_STAMP '$STAMP'" >&2; exit 2; }
 OUT=$DO_ROOT/deploy/results/$NAME/$STAMP-$GATE
-[ $APPROVED = 1 ] && mkdir -p "$OUT"
 DRY=$((1 - APPROVED))
 R=/work/results/$STAMP-$GATE
 URL=https://$(front_host private):8443
@@ -119,7 +122,23 @@ db_sql() { # SQL on stdin -> rows, | between columns
 # What runs where, and the record of it.
 HUB_IPS=(); for i in $(seq "$HUBS"); do HUB_IPS+=("$(addr "$(hub_name "$i")")"); done
 DRIVER_IPS=(); for i in $(seq "$DRIVERS"); do DRIVER_IPS+=("$(addr "$NAME-driver$i")"); done
-{ gate_meta "$COMMIT" "$TAG"; echo "args=$*"; } | record run.txt
+# The object layout (docs/DEPLOY.md §12.11): a gate runs only when every
+# server says it is in the layout the kit is set to, so a result is never
+# recorded under a layout its servers were not in; nothing is written for
+# a gate refused here. The counters each server gave are kept
+# (hub<N>-stats-before.json): with those after the gate they give its
+# storage requests.
+if [ $APPROVED = 1 ]; then
+    BEFORE=()
+    for i in $(seq "$HUBS"); do
+        BEFORE[i]=$(hub_stats "$i")
+        l=$(layout_of <<<"${BEFORE[i]}")
+        [ "$l" = "$OBJECT_LAYOUT" ] || { echo "bench: server $i reports object layout '${l:-none}', the kit is set to '$OBJECT_LAYOUT': no gate is run on servers in another layout (deploy/$KIT/layout.sh --approve $OBJECT_LAYOUT restarts them in it; docs/DEPLOY.md §12.11)" >&2; exit 2; }
+    done
+    mkdir -p "$OUT"
+    for i in $(seq "$HUBS"); do printf '%s\n' "${BEFORE[i]}" > "$OUT/hub$i-stats-before.json"; done
+else echo "would check that every server reports object layout $OBJECT_LAYOUT (its stats.json), and keep its counters before the gate" >&2; fi
+{ gate_meta "$COMMIT" "$TAG"; echo "object_layout=$OBJECT_LAYOUT"; echo "args=$*"; } | record run.txt
 topology | record topology.env
 {
     echo "# built here (deploy/docker/build.sh), shipped by configure.sh: the ids are the images' config digests,"
@@ -158,7 +177,9 @@ minio_restarts() { remote "$(addr "$NAME-minio")" "docker inspect -f '{{.Restart
 
 echo "== $GATE against $URL ($HUBS server(s), $DRIVERS driver(s)), limit ${STEP_LIMIT}s per command"
 rc=0
-run_gate "$GATE" "$@" || rc=$?
+# The tool is told the layout: a server it starts itself (objects,
+# openscion, scale) runs in it, and every result's json and table name it.
+run_gate "$GATE" --object-layout "$OBJECT_LAYOUT" "$@" || rc=$?
 if [ $WATCH_MINIO = 1 ]; then
     R1=$(minio_restarts)
     [ $APPROVED = 1 ] && echo "before=$R0 after=$R1" > "$OUT/minio-restarts.txt"
@@ -170,7 +191,16 @@ fi
 for i in $(seq "${#SAMPLED[@]}"); do
     h=${SAMPLED[$((i - 1))]}; label=${LABELS[$((i - 1))]}
     if [ $APPROVED = 1 ]; then
-        [ "$i" -gt "$HUBS" ] || hub_stats "$i" > "$OUT/hub$i-stats.json" || true
+        if [ "$i" -le "$HUBS" ]; then
+            hub_stats "$i" > "$OUT/hub$i-stats.json" || true
+            # Still in the layout the gate started in? (A server started again
+            # in the other one during the gate; one that gives no counters.)
+            l=$(layout_of < "$OUT/hub$i-stats.json")
+            if [ "$l" != "$OBJECT_LAYOUT" ]; then
+                echo "object_layout_changed=server $i reports '${l:-none}' after the gate" >> "$OUT/run.txt"
+                echo "bench: after the gate server $i reports object layout '${l:-none}', not '$OBJECT_LAYOUT': the gate's results are not valid" >&2; rc=1
+            fi
+        fi
         remote "$h" "kill \$(cat /srv/metrics/$STAMP-$GATE.pid) 2>/dev/null" || true
     else [ "$i" -gt "$HUBS" ] || hub_stats "$i"; remote "$h" "kill \$(cat /srv/metrics/$STAMP-$GATE.pid)"; fi
     copy_from "$h" "/srv/metrics/$STAMP-$GATE.stats" "$OUT/$label-docker-stats.log" || true

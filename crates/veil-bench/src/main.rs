@@ -754,4 +754,52 @@ mod tests {
             assert!(alone.is_err(), "{} without --cache-url is refused", flag[0]);
         }
     }
+
+    /// The deployment kit (`deploy/do/bench.sh`, `docs/DEPLOY.md` §12.11)
+    /// ends every gate's command with `--object-layout LAYOUT`: a gate
+    /// against the deployment (`--url`) only records it (the kit has asked
+    /// the servers), a gate that starts its own server starts it in it.
+    /// Each of the gates' command shapes (`deploy/gates.sh`) takes the flag.
+    #[test]
+    fn the_kits_gate_commands_take_the_object_layout() {
+        let own = ["--server", "/usr/local/bin/veil-server", "--s3-endpoint", "https://10.42.0.10:9000", "--s3-bucket", "b-objects"];
+        let layout = ["--object-layout", "objects"];
+        let land = ["veil-bench", "load", "--url", "https://10.42.0.4:8443", "--ca", "/tls/ca.pem", "--warmup", "3", "--duration", "20", "--mode", "land"]
+            .into_iter()
+            .chain(["--projects", "1,10,100", "--clients", "1,50", "--rates", "max", "--dir", "/work/land", "--out", "/work/results/land.json"])
+            .chain(layout);
+        let parsed = Cli::try_parse_from(land);
+        let Ok(Cli { cmd: Cmd::Load { url, server, .. } }) = parsed else { panic!("{:?}", parsed.err().map(|e| e.to_string())) };
+        assert_eq!(url.as_deref(), Some("https://10.42.0.4:8443"));
+        assert_eq!((server.server, server.object_layout.as_deref()), (None, Some("objects")));
+
+        let objects = ["veil-bench", "load"]
+            .into_iter()
+            .chain(own)
+            .chain(["--mode", "objects", "--via", "server,cache", "--projects", "1", "--clients", "10,100,1000", "--background", "20"])
+            .chain(["--duration", "20", "--warmup", "3", "--dir", "/work/objects", "--out", "/work/results/objects.json"])
+            .chain(layout);
+        let parsed = Cli::try_parse_from(objects);
+        let Ok(Cli { cmd: Cmd::Load { url, server, .. } }) = parsed else { panic!("{:?}", parsed.err().map(|e| e.to_string())) };
+        assert_eq!(url, None);
+        assert_eq!((server.server.as_deref(), server.object_layout.as_deref()), (Some(std::path::Path::new("/usr/local/bin/veil-server")), Some("objects")));
+
+        let openscion = ["veil-bench", "openscion", "--vl", "/usr/local/bin/vl"]
+            .into_iter()
+            .chain(own)
+            .chain(["--files", "1000,10000", "--runs", "5", "--dir", "/work/openscion", "--out", "/work/results/openscion.json"])
+            .chain(layout);
+        let parsed = Cli::try_parse_from(openscion);
+        let Ok(Cli { cmd: Cmd::Openscion { server, .. } }) = parsed else { panic!("{:?}", parsed.err().map(|e| e.to_string())) };
+        assert_eq!(server.object_layout.as_deref(), Some("objects"));
+
+        let scale = ["veil-bench", "run", "--profile", "1g", "--runs", "3", "--vl", "/usr/local/bin/vl"]
+            .into_iter()
+            .chain(own)
+            .chain(["--dir", "/work/scale", "--out", "/work/results/scale-1g.json", "--skip-phase", "import,local,remote-path,packed,sftp,agents"])
+            .chain(layout);
+        let parsed = Cli::try_parse_from(scale);
+        let Ok(Cli { cmd: Cmd::Run { server, .. } }) = parsed else { panic!("{:?}", parsed.err().map(|e| e.to_string())) };
+        assert_eq!(server.object_layout.as_deref(), Some("objects"));
+    }
 }

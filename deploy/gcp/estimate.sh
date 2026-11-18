@@ -4,7 +4,7 @@
 # on-demand as VEIL_GCP_SPOT says), the boot disks, the storage machine's
 # local SSD and the external addresses; the hourly rate and the total for
 # VEIL_GCP_HOURS (and the database machines' data disks); what a teardown forgotten for a day and for a month would
-# cost; what stopped (reclaimed) Spot VMs cost a month, their disks alone;
+# cost; what measuring both object layouts adds (§12.11); what stopped (reclaimed) Spot VMs cost a month, their disks alone;
 # and the same for all three models (on-demand, hybrid, all Spot).
 # Refuses a plan of $100 or more, and any machine type it has no price for.
 #
@@ -114,6 +114,7 @@ if [ $unknown = 1 ]; then echo "estimate: cannot bound the total cost with unkno
 planned=$(echo "$total * $HOURS" | bc -l)
 printf 'hourly rate:                 $%.3f  (VEIL_GCP_SPOT=%s)\n' "$total" "$SPOT"
 printf 'planned %s hours:            $%.2f\n' "$HOURS" "$planned"
+printf 'both object layouts, +%s h: $%.2f  (docs/DEPLOY.md §12.11: its gates again in the other layout; count it in VEIL_GCP_HOURS)\n' "$LAYOUT_COMPARE_HOURS" "$(echo "$total * $LAYOUT_COMPARE_HOURS" | bc -l)"
 printf '24 hours left running:       $%.2f\n' "$(echo "$total * 24" | bc -l)"
 printf 'a whole month forgotten:     $%.2f  <- why destroy.sh and its check matter\n' "$(echo "$total * $MONTH_HOURS" | bc -l)"
 printf 'stopped VMs, a month:        $%.2f  (reclaimed Spot VMs stop: their disks still bill until destroy.sh)\n' "$(disks_monthly)"

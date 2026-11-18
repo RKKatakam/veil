@@ -66,6 +66,15 @@ YB_TABLETS=${VEIL_GCP_YB_TABLETS:-1}
 DB_DISK_TYPE=${VEIL_GCP_DB_DISK_TYPE:-pd-ssd}
 DB_DISK_GB=${VEIL_GCP_DB_DISK_GB:-500}
 HOURS=${VEIL_GCP_HOURS:-8}
+# The servers' object layout (docs/HUB.md §13.42): packs, the server's
+# default, or objects (one object per key). configure.sh starts every
+# server in it; layout.sh switches a configured run's servers to the other
+# between gates and saves that in the run's state, which from then on wins
+# over this setting (docs/DEPLOY.md §12.11).
+OBJECT_LAYOUT=${VEIL_GCP_OBJECT_LAYOUT:-packs}
+# What comparing the two layouts adds to a run, in hours (§12.11: the
+# second layout's gates and the two switches), for estimate.sh.
+LAYOUT_COMPARE_HOURS=1.25
 # Boot disks (pd-balanced, GB): the servers' and drivers' hold the images,
 # the benchmarks' working trees and the same-machine gates' data.
 DISK_HUB=${VEIL_GCP_DISK_HUB:-200}
@@ -91,6 +100,7 @@ bad() { echo "gcp: $*" >&2; exit 2; }
 [[ "$REGION" =~ ^[a-z]+-[a-z]+[0-9]+$ ]] || bad "invalid VEIL_GCP_REGION '$REGION'"
 [[ "$ZONE" =~ ^${REGION}-[a-z]$ ]] || bad "invalid VEIL_GCP_ZONE '$ZONE' (a zone of $REGION: all machines in one zone)"
 [[ "$SPOT" =~ ^(all|hybrid|none)$ ]] || bad "invalid VEIL_GCP_SPOT '$SPOT' (all, hybrid or none)"
+[[ "$OBJECT_LAYOUT" =~ ^(packs|objects)$ ]] || bad "invalid VEIL_GCP_OBJECT_LAYOUT '$OBJECT_LAYOUT' (packs or objects)"
 for v in SIZE_HUB SIZE_LB SIZE_DRIVER SIZE_DB SIZE_OBJECTS SIZE_CACHE; do
     [[ "${!v}" =~ ^[a-z][a-z0-9]*-[a-z]+-[0-9]+$ ]] || bad "invalid VEIL_GCP_$v '${!v}' (a predefined machine type, as c2d-standard-16)"
 done
@@ -210,7 +220,7 @@ db_disk_mount() { # mount point
 topology() {
     local v
     for v in NAME REGION ZONE SPOT SIZE_HUB HUBS SIZE_LB SIZE_DB YB_NODES YB_LAYOUT YB_TABLETS DB_DISK_TYPE DB_DISK_GB SIZE_DRIVER DRIVERS SIZE_OBJECTS LOCAL_SSD_GB WITH_CACHE SIZE_CACHE \
-             DB_CONNECTIONS OBJECTS DISK_HUB DISK_DRIVER DISK_DB HOURS IMAGE_FAMILY PG_IMAGE YB_IMAGE HAPROXY_IMAGE MINIO_IMAGE; do
+             DB_CONNECTIONS OBJECTS OBJECT_LAYOUT DISK_HUB DISK_DRIVER DISK_DB HOURS IMAGE_FAMILY PG_IMAGE YB_IMAGE HAPROXY_IMAGE MINIO_IMAGE; do
         printf '%s=%s\n' "$v" "${!v}"
     done
 }

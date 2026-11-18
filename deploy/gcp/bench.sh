@@ -17,6 +17,10 @@
 # server's health awaited. A database or storage machine (Spot only with
 # VEIL_GCP_SPOT=all), or any private address that changed, means
 # configure.sh --approve again (MinIO's local SSD comes back empty).
+# The servers' object layout (packs or objects; layout.sh switches it
+# between gates, docs/DEPLOY.md §12.11) is checked on every server before
+# and after the gate by the shared steps, and recorded in run.txt
+# (object_layout=); a recovery starts the servers in the run's layout.
 #
 #   bench.sh [--approve] GATE [veil-bench flags...]     (gates: deploy/gates.sh, not `spaces`)
 set -euo pipefail
@@ -113,7 +117,9 @@ rc=0; attempt=1; prev=""; S=$(stamp)
 while :; do
     rc=0; run_once "$S" "$@" || rc=$?
     OUT=$RESULTS/$S-$GATE
-    [ $APPROVED = 0 ] || [ -d "$OUT" ] || { echo "bench: the gate left no results directory ($OUT)" >&2; exit 1; }
+    # No directory: the shared steps refused before the gate (they said why,
+    # e.g. servers in another object layout than the kit's, §12.11).
+    [ $APPROVED = 0 ] || [ -d "$OUT" ] || { echo "bench: $GATE did not run: no results directory ($OUT)" >&2; [ $rc != 0 ] || rc=1; exit $rc; }
     for l in "${NOTES[@]+"${NOTES[@]}"}"; do note "$OUT" "$l"; done; NOTES=()
     [ -z "$prev" ] || note "$OUT" "rerun_of=$prev"
     # Reclaimed during the gate: a preemption operation not seen before it, or a Spot VM down now.
@@ -125,7 +131,15 @@ while :; do
     hit=$( { awk -v seen=" $(echo $seen) " 'index(seen, " " $1 " ") == 0 {print $2}' <<<"$now"; echo "$down"; } | awk 'NF && !s[$0]++' | tr '\n' ' ')
     seen=$(awk '{print $1}' <<<"$now")
     if [ -z "${hit// /}" ]; then
-        note "$OUT" "spot_reclaimed_during=none"; note "$OUT" "result_valid=yes"
+        note "$OUT" "spot_reclaimed_during=none"
+        # A server in another object layout after the gate, or giving no
+        # counters (the shared steps say which, object_layout_changed=),
+        # with no reclaim to explain it: not a result of this layout.
+        if [ $APPROVED = 1 ] && grep -q '^object_layout_changed=' "$OUT/run.txt"; then
+            note "$OUT" "result_valid=no (a server was not in the run's object layout after the gate)"
+            exit 1
+        fi
+        note "$OUT" "result_valid=yes"
         [ $APPROVED = 1 ] && echo "== spot: no Spot VM was reclaimed during $GATE; the result stands (exit $rc)"
         exit $rc
     fi
