@@ -75,12 +75,26 @@ pub fn spawn_scoped<'s, 'e, T: Send + 's>(s: &'s std::thread::Scope<'s, 'e>, f: 
     std::thread::Builder::new().stack_size(THREAD_STACK).spawn_scoped(s, f).expect("failed to spawn a thread")
 }
 
+/// Combined ceiling on [`Hub::objects`], [`Hub::trees`], and [`Hub::segments`]
+/// (BUG-2663): `objects` and `trees` each keep their 256 MiB cap, `segments`
+/// is capped at [`SEGMENT_CACHE_BYTES`] (160 MiB, so `objects` + `trees`
+/// always retain at least 352 MiB under competing search + pull load), and
+/// their sum stays at or below 512 MiB regardless of background indexing or
+/// query order.
+pub const HUB_CACHE_BYTES: usize = 512 << 20;
+/// Individual ceiling on [`Hub::segments`] within [`HUB_CACHE_BYTES`]
+/// (BUG-2663).
+pub const SEGMENT_CACHE_BYTES: usize = 160 << 20;
+
 /// Shared server state.
 pub struct Hub {
     pub db: sqlx::PgPool,
     pub objects: Arc<store::Objects>,
     /// Decoded trees, by [`store::Objects::tree_key`].
     pub trees: LruCache<(Arc<Tree>, TreeEncoding)>,
+    /// Decoded search segments, capped at [`SEGMENT_CACHE_BYTES`] and sharing
+    /// [`HUB_CACHE_BYTES`] with [`Hub::objects`] and [`Hub::trees`] (BUG-2663).
+    pub segments: LruCache<Arc<search::segment::Segment>>,
     /// The server's own signing identity: projected snapshots are signed
     /// with it.
     pub identity: Identity,
@@ -241,10 +255,12 @@ pub async fn start(config: Config) -> Result<Running> {
             Arc::new(s)
         }
     };
+    let cache_budget = veil_core::cache::CacheBudget::new(HUB_CACHE_BYTES);
     let hub = Arc::new(Hub {
         db: db.clone(),
-        objects: Arc::new(store::Objects::with_db(blob, 256 << 20, Some(db.clone()))),
-        trees: LruCache::new(256 << 20),
+        objects: Arc::new(store::Objects::with_db_and_budget(blob, 256 << 20, Some(db.clone()), Some(&cache_budget))),
+        trees: LruCache::with_budget(256 << 20, &cache_budget),
+        segments: LruCache::with_budget(SEGMENT_CACHE_BYTES, &cache_budget),
         identity,
         receipt_key,
         grants,

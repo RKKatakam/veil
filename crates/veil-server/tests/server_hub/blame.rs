@@ -3645,6 +3645,7 @@ fn fault_hub_for_blame(
         db: first.db.clone(),
         objects: std::sync::Arc::new(veil_server::store::Objects::with_db(store, 256 << 20, Some(first.db.clone()))),
         trees: veil_core::cache::LruCache::new(256 << 20),
+        segments: veil_core::cache::LruCache::new(256 << 20),
         identity: first.identity.clone(),
         receipt_key: first.receipt_key,
         grants: veil_server::grant::Grants::load(dir).unwrap(),

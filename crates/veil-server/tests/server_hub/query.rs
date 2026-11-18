@@ -2489,6 +2489,7 @@ fn bug_2681_a_missing_stored_object_under_server_side_routes_answers_internal_er
             db: h.hub.db.clone(),
             objects: Arc::new(veil_server::store::Objects::with_db(store.clone(), 0, Some(h.hub.db.clone()))),
             trees: veil_core::cache::LruCache::new(0),
+            segments: veil_core::cache::LruCache::new(0),
             identity: h.hub.identity.clone(),
             receipt_key: h.hub.receipt_key,
             grants: veil_server::grant::Grants::load(dir.path()).unwrap(),
