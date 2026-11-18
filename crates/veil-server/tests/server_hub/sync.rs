@@ -1000,3 +1000,296 @@ fn compressed_uploads_decode_within_a_server_wide_bound() {
     println!("BUG-1009: 16 uploads decoding 48 MiB each at once: memory rose {} MiB", grew >> 20);
     assert!(grew < 512 << 20, "memory rose {} MiB", grew >> 20);
 }
+
+struct CollapsedMergeFixture {
+    p: Project,
+    pid: i64,
+    r0: ObjectId,
+    p0: ObjectId,
+    r_sec: ObjectId,
+    r_merge: ObjectId,
+    vk: String,
+}
+
+/// Build `R_next -> R_merge -> [R_0, R_sec]` (`R_sec -> R_0`) on `main`, where
+/// `R_0` changes `src/` (visible to `dev`), `R_sec` and `R_merge` change only
+/// `BILL_DIR/` (hidden from `dev`, so both collapse to `P_0 != R_0`), and
+/// `R_next` advances `main` past `P_0`.
+fn setup_collapsed_merge(hub: &TestHub) -> CollapsedMergeFixture {
+    use veil_core::object::{Object as O, Snapshot, Text};
+    let p = setup_project(hub);
+    let pid = project_id(hub, &p.name);
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+
+    let mut c0 = Craft::new(&api, &p.admin, &p.name, "main");
+    let c0_tip = c0.tip;
+    c0.file("src/a.rs", "visible base\n");
+    let (r0, rep) = c0.push_edited("main", Some(c0_tip), |_| {});
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+
+    let p0 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_ne!(p0, r0, "dev sees a projected snapshot because billing/ is hidden");
+
+    let mut c_merge = Craft::new(&api, &p.admin, &p.name, "main");
+    assert_eq!(c_merge.tip, r0);
+    c_merge.file(&format!("{BILL_DIR}/secret_branch.txt"), "hidden side branch\n");
+    let mut sec_snap = Snapshot {
+        parents: vec![r0],
+        change_id: veil_core::ChangeId::random(),
+        tree: c_merge.root,
+        description: Text::Plain("hidden side".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    sec_snap.sign(&c_merge.identity);
+    let r_sec = c_merge.put(O::Snapshot(sec_snap));
+    let (r_merge, rep) = c_merge.push_edited("main", Some(r0), move |s| s.parents = vec![r0, r_sec]);
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+
+    let seen_merge = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_eq!(seen_merge, p0, "the hidden merge collapses into P_0 in dev's view");
+
+    let mut c_next = Craft::new(&api, &p.admin, &p.name, "main");
+    assert_eq!(c_next.tip, r_merge);
+    c_next.file("src/b.rs", "visible next\n");
+    let (_, rep) = c_next.push_edited("main", Some(r_merge), |_| {});
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+
+    let p_next = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_ne!(p_next, p0, "main has moved past P_0 in dev's view");
+
+    let h = hub.hub();
+    let vk: String = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT view_key FROM projections WHERE project_id = $1 AND real_id = $2 AND projected_id = $3")
+                .bind(pid)
+                .bind(r0.hex())
+                .bind(p0.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+
+    CollapsedMergeFixture { p, pid, r0, p0, r_sec, r_merge, vk }
+}
+
+/// BUG-2671 (1): A multi-parent merge whose changes are hidden from `dev`
+/// collapses to `P_0` in `project_one`, yet `projected_inner` recorded
+/// `projections.collapsed = false` (`sync.rs:580`). Once `main` moves past
+/// `P_0`, `projections_own` (`NOT collapsed`) returns `[R_0, R_merge]` instead
+/// of `[R_0]`, so non-landing `POST /changes` and `vl push` on `P_0` fail with
+/// `409 Conflict`, and past `NEWEST_BOUND` even landing `POST /land` on `P_0`
+/// fails with `404 Not Found`.
+#[test]
+#[ignore = "BUG-2671: collapsed multi-parent merge records projections.collapsed = false, breaking base resolution"]
+fn bug_2671_collapsed_hidden_merge_breaks_base_resolution() {
+    use serde_json::json;
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+
+    // 1a. Non-landing `POST /changes` on `P_0` as `dev` must succeed (`200`), not `409`.
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change on P_0",
+            "edits": [{"path": "src/dev_change.rs", "put": {"text": "from dev\n"}}],
+        }),
+    );
+    assert_eq!(r.status, 200, "non-landing POST /changes on P_0: {}", String::from_utf8_lossy(&r.body));
+
+    // 1b. `push` of a new branch based on `P_0` must succeed (`200`, `ok == true`),
+    // grafted onto `R_0`.
+    let mut m = Craft::new(&api, &f.p.dev, &f.p.name, "main");
+    m.tip = f.p0;
+    m.root = m.tree_of(f.p0);
+    m.file("src/dev_pushed.rs", "pushed by dev\n");
+    let r = m.push_to("dev-on-p0", None);
+    assert_eq!(r.status, 200, "push on P_0: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+
+    // 1c. Past `NEWEST_BOUND` (4,096), even landing `POST /land` on `P_0` relies on
+    // `projections_own` (`sync.rs:975-976`) and must return `200`, not `404`.
+    let h = hub.hub();
+    hub.rt.block_on(async {
+        sqlx::query(
+            "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+             SELECT $1, $2, md5('b2671r' || i) || md5('b2671s' || i), $3, i, TRUE FROM generate_series(1, 4100) i",
+        )
+        .bind(f.pid)
+        .bind(&f.vk)
+        .bind(f.p0.hex())
+        .execute(&h.db)
+        .await
+        .unwrap();
+    });
+    let r_land = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", f.p.name),
+        &json!({
+            "onto": "main",
+            "base": f.p0.hex(),
+            "description": "land on P_0 past NEWEST_BOUND",
+            "edits": [{"path": "src/dev_landed.rs", "put": {"text": "landed\n"}}],
+            "wait": true,
+        }),
+    );
+    assert_eq!(r_land.status, 200, "POST /land on P_0 past NEWEST_BOUND: {}", String::from_utf8_lossy(&r_land.body));
+    assert_eq!(r_land.json()["state"], "landed", "{}", String::from_utf8_lossy(&r_land.body));
+
+    let collapsed: bool = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                .bind(f.pid)
+                .bind(&f.vk)
+                .bind(f.r_merge.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert!(collapsed, "projections(vk, R_merge).collapsed must be true");
+}
+
+/// BUG-2671 (2): A narrowed CI runner session posting a check on historical
+/// `P_0` (`sync::resolve_exact_for` -> `ci::resolve_snapshot`) must attach the
+/// check to the uncollapsed commit `R_0`, not to the hidden collapsed commits
+/// `R_merge` or `R_sec`, so `GET /checks?rev=<R_0>` finds it.
+#[test]
+#[ignore = "BUG-2671: collapsed multi-parent merge misattaches narrowed CI checks onto hidden commit"]
+fn bug_2671_collapsed_hidden_merge_misattaches_narrowed_ci_checks() {
+    use serde_json::json;
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+    let admin_tok = f.p.admin.token();
+
+    let sess = api.post_json(
+        Some(&dev_tok),
+        "/v1/sessions/ci",
+        &json!({"project": f.p.name, "only": ["src/"]}),
+    );
+    assert_eq!(sess.status, 200, "{}", String::from_utf8_lossy(&sess.body));
+    let runner_tok = sess.json()["token"].as_str().unwrap().to_string();
+
+    let post = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/src",
+            "state": "pass",
+            "summary": "src checks green",
+        }),
+    );
+    assert_eq!(post.status, 200, "{}", String::from_utf8_lossy(&post.body));
+
+    let got = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    let body = String::from_utf8_lossy(&got.body).into_owned();
+    assert_eq!(got.status, 200, "{body}");
+    let checks = got.json()["checks"].as_array().unwrap().clone();
+    assert_eq!(
+        checks.len(),
+        1,
+        "GET /checks?rev=<R_0> must see the narrowed check on R_0 (not hidden {} or {}): {body}",
+        f.r_merge.short(),
+        f.r_sec.short()
+    );
+    assert_eq!(checks[0]["name"], "ci/src");
+    assert_eq!(checks[0]["state"], "pass");
+}
+
+/// BUG-2671 (3): `landing::Ancestry::below_hidden` relies on `projections_own`
+/// (`NOT collapsed`) to step over a hidden run in O(1). A single collapsed
+/// hidden merge inside a hidden run of `> WALK_BUDGET` (4,096) commits poisoned
+/// `projections_own`, degrading `below_hidden` to `None` and failing `POST /land`
+/// permanently with `503 warming`.
+#[test]
+#[ignore = "BUG-2671: collapsed multi-parent merge breaks Ancestry::below_hidden step-over past WALK_BUDGET"]
+fn bug_2671_collapsed_hidden_merge_breaks_below_hidden_step_over() {
+    use serde_json::json;
+    use veil_core::object::{Object as O, Snapshot, Text};
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+
+    // Build 4,101 (> WALK_BUDGET = 4,096) hidden commits on top of `R_merge`
+    // on branch `hidden-merge-run`, alternating two hidden trees so every step
+    // changes `BILL_DIR/run.txt` without O(N^2) tree construction.
+    let mut c = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+    c.tip = f.r_merge;
+    c.root = c.tree_of(f.r_merge);
+    c.file(&format!("{BILL_DIR}/run.txt"), "step a\n");
+    let tree_a = c.root;
+    c.file(&format!("{BILL_DIR}/run.txt"), "step b\n");
+    let tree_b = c.root;
+    let mut parent = f.r_merge;
+    for i in 0..4_100usize {
+        let mut s = Snapshot {
+            parents: vec![parent],
+            change_id: veil_core::ChangeId::random(),
+            tree: if i % 2 == 0 { tree_a } else { tree_b },
+            description: Text::Plain(format!("hidden {i}")),
+            author: "admin".into(),
+            timestamp: veil_core::now_millis(),
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
+            signature: None,
+        };
+        s.sign(&c.identity);
+        parent = c.put(O::Snapshot(s));
+    }
+    c.root = tree_a; // parent (i = 4099) has tree_b, so this commit changes BILL_DIR/run.txt too
+    let (_, rep) = c.push_edited("hidden-merge-run", None, move |s| {
+        s.parents = vec![parent];
+    });
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+
+    // `dev` sees the entire 4,102-commit hidden run (including `R_merge`) as `P_0`.
+    let seen_run = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["hidden-merge-run"];
+    assert_eq!(seen_run, f.p0);
+
+    // `dev` pushes one visible commit onto `hidden-merge-run`, then lands it onto `main`.
+    let mut m = Craft::new(&api, &f.p.dev, &f.p.name, "hidden-merge-run");
+    assert_eq!(m.tip, f.p0);
+    m.file("src/after_hidden_run.rs", "dev after hidden merge run\n");
+    let r_push = m.push_to("hidden-merge-run", Some(f.p0));
+    assert_eq!(r_push.status, 200, "{}", String::from_utf8_lossy(&r_push.body));
+    assert_eq!(r_push.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r_push.body));
+    let dev_tip = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["hidden-merge-run"];
+
+    let r_land = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", f.p.name),
+        &json!({
+            "onto": "main",
+            "snapshot": dev_tip.hex(),
+            "receipts": {},
+            "wait": true,
+        }),
+    );
+    let body = String::from_utf8_lossy(&r_land.body).into_owned();
+    assert_eq!(r_land.status, 200, "landing across hidden run containing merge: {body}");
+    assert_eq!(r_land.json()["state"], "landed", "{body}");
+}
+
