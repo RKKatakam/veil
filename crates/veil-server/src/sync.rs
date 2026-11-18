@@ -133,8 +133,6 @@ pub struct Staged {
     vanished: Arc<HashSet<ObjectId>>,
     /// The staged objects read through this one: what the checks read.
     touched: Mutex<HashSet<ObjectId>>,
-    /// Active reader guard in `packs` layout (`BUG-2665`).
-    _readers: Arc<crate::pack::StagedReaders>,
 }
 
 impl Staged {
@@ -150,7 +148,6 @@ impl Staged {
             made: Arc::new(Mutex::new(made)),
             vanished: Arc::new(HashSet::new()),
             touched: Mutex::new(HashSet::new()),
-            _readers: Arc::new(crate::pack::StagedReaders::none()),
         }
     }
 
@@ -165,7 +162,6 @@ impl Staged {
             made: Arc::new(Mutex::new(HashMap::new())),
             vanished: Arc::new(HashSet::new()),
             touched: Mutex::new(HashSet::new()),
-            _readers: Arc::new(crate::pack::StagedReaders::none()),
         })
     }
 
@@ -194,7 +190,6 @@ impl Staged {
             made: self.made.clone(),
             vanished: self.vanished.clone(),
             touched: Mutex::new(HashSet::new()),
-            _readers: self._readers.clone(),
         })
     }
 
@@ -3055,67 +3050,75 @@ async fn push_to_its_end(
     let receipts = std::mem::take(&mut req.receipts);
     let staged = receipted(hub, project.id, person, &receipts);
     drop(receipts);
-    let mut receipt_names: Vec<Arc<str>> = staged.values().cloned().collect();
-    receipt_names.sort();
-    receipt_names.dedup();
-    let st = match staging(hub, project.id, person, &staged).await {
-        Ok(st) => Arc::new(st),
-        Err(e) => {
-            if let Err(le) = hub.objects.release_staged_leases(project.id, &receipt_names, false).await {
-                eprintln!("veil-server: settling staged upload leases: {le:#}");
+    if hub.objects.layout() == crate::store::ObjectLayout::Objects {
+        let mut receipt_names: Vec<Arc<str>> = staged.values().cloned().collect();
+        receipt_names.sort();
+        receipt_names.dedup();
+        let st = match staging(hub, project.id, person, &staged).await {
+            Ok(st) => Arc::new(st),
+            Err(e) => {
+                hub.objects.release_recent(project.id, person, &receipt_names);
+                return Err(e);
             }
-            hub.objects.release_recent(project.id, person, &receipt_names);
-            return Err(e);
+        };
+        drop(staged);
+        let uploaded: HashSet<ObjectId> = st.at.keys().chain(st.vanished.iter()).copied().collect();
+        let progress = Mutex::new(Progress::default());
+        let r = push_staged(hub, project, viewer, who, req, land_all, wait, uploaded, st, &progress).await;
+        let p = progress.into_inner().unwrap();
+        match &r {
+            Ok((_, _, Some(kept))) => {
+                let unkept: Vec<Arc<str>> = receipt_names.into_iter().filter(|n| !kept.contains(n)).collect();
+                if let Err(e) = hub.objects.discard_consumed(project.id, &unkept).await {
+                    eprintln!("veil-server: discarding what a push did not list: {e:#}");
+                }
+            }
+            Ok((_, _, None)) => {
+                hub.objects.release_recent(project.id, person, &receipt_names);
+            }
+            Err(Error::Api { status, .. }) if !p.transaction && is_check_refusal(*status) => {
+                if let Err(e) = hub.objects.discard_refused(project.id, &receipt_names).await {
+                    eprintln!("veil-server: discarding what a refused push uploaded: {e:#}");
+                }
+                if let Err(e) = hub.objects.discard(project.id, &p.written).await {
+                    eprintln!("veil-server: discarding what a push did not list: {e:#}");
+                }
+            }
+            Err(_) => {
+                hub.objects.release_recent(project.id, person, &receipt_names);
+                if let Err(e) = hub.objects.discard(project.id, &p.written).await {
+                    eprintln!("veil-server: discarding what a push did not list: {e:#}");
+                }
+            }
         }
-    };
+        return r.map(|(res, landings, _)| (res, landings));
+    }
+    let st = Arc::new(staging(hub, project.id, person, &staged).await?);
     drop(staged);
-    let uploaded: HashSet<ObjectId> = st.at.keys().chain(st.vanished.iter()).copied().collect();
+    let uploaded: HashSet<ObjectId> = st.at.keys().copied().collect();
     let progress = Mutex::new(Progress::default());
     let r = push_staged(hub, project, viewer, who, req, land_all, wait, uploaded, st.clone(), &progress).await;
-    drop(st);
     let p = progress.into_inner().unwrap();
-    match &r {
+    let (staged_gone, own_gone): (Vec<Arc<str>>, Vec<Arc<str>>) = match &r {
         // Landed: every upload it did not list (one its checks did not read
         // all of: what they read was copied into its own pack).
-        Ok((_, _, Some(kept))) => {
-            let unkept: Vec<Arc<str>> = receipt_names.into_iter().filter(|n| !kept.contains(n)).collect();
-            if let Err(e) = hub.objects.discard_consumed(project.id, &unkept).await {
-                eprintln!("veil-server: discarding what a push did not list: {e:#}");
-            }
-        }
+        Ok((_, _, Some(kept))) => (st.names().into_iter().filter(|n| !kept.contains(n)).collect(), Vec::new()),
         // Every update lost a race (not on the tip): every check passed, and
         // the uploads stay for the next try, which gets their receipts again
         // (BUG-1157). Nothing written, nothing committed (BUG-910).
-        Ok((_, _, None)) => {
-            if let Err(e) = hub.objects.release_staged_leases(project.id, &receipt_names, true).await {
-                eprintln!("veil-server: settling staged upload leases: {e:#}");
-            }
-            hub.objects.release_recent(project.id, person, &receipt_names);
-        }
+        Ok((_, _, None)) => (Vec::new(), Vec::new()),
         // Refused by its checks, before its transaction: what it was
-        // refused for is deleted (BUG-930); sibling containers stay on 409
-        // (`BUG-2661`).
-        Err(Error::Api { status, .. }) if !p.transaction && is_check_refusal(*status) => {
-            if let Err(e) = hub.objects.discard_refused(project.id, &receipt_names).await {
-                eprintln!("veil-server: discarding what a refused push uploaded: {e:#}");
-            }
-            if let Err(e) = hub.objects.discard(project.id, &p.written).await {
-                eprintln!("veil-server: discarding what a push did not list: {e:#}");
-            }
-        }
-        // A lost race or vanished upload (409), or an error the request may
+        // refused for is deleted (BUG-930).
+        Err(Error::Api { .. }) if !p.transaction => (st.names(), p.written),
+        // A lost race in its transaction (409), or an error the request may
         // be run again for: the uploads stay (as above); its own pack goes
         // (it was recorded staged before it was written: a discard leaves
         // it alone if its transaction listed it after all).
-        Err(_) => {
-            if let Err(e) = hub.objects.release_staged_leases(project.id, &receipt_names, false).await {
-                eprintln!("veil-server: settling staged upload leases: {e:#}");
-            }
-            hub.objects.release_recent(project.id, person, &receipt_names);
-            if let Err(e) = hub.objects.discard(project.id, &p.written).await {
-                eprintln!("veil-server: discarding what a push did not list: {e:#}");
-            }
-        }
+        Err(_) => (Vec::new(), p.written),
+    };
+    let gone: Vec<Arc<str>> = staged_gone.into_iter().chain(own_gone).collect();
+    if let Err(e) = hub.objects.discard(project.id, &gone).await {
+        eprintln!("veil-server: discarding what a push did not list: {e:#}");
     }
     r.map(|(res, landings, _)| (res, landings))
 }
@@ -4107,7 +4110,7 @@ async fn push_staged(
             let (stored_keys, stored_reals, updated_packs, discarded_names): (Vec<String>, Vec<String>, i64, Vec<String>) = sqlx::query_as(
                 "WITH k AS (UPDATE packs \
                    SET state = CASE WHEN $16 AND state = $17 THEN $14 ELSE $13 END, \
-                       discarded_at = CASE WHEN $16 AND state = $17 THEN $6 ELSE NULL END, \
+                       discarded_at = CASE WHEN $16 AND state = $17 THEN $6 ELSE discarded_at END, \
                        objects = CASE WHEN $16 AND state = $17 THEN -1 ELSE objects END \
                    WHERE project_id = $1 AND name = ANY($15) AND state <> $14 \
                    RETURNING CASE WHEN state = $14 THEN name ELSE '' END AS discarded_name), \
@@ -4526,7 +4529,7 @@ async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<Obj
     names.sort();
     let in_objects = hub.objects.layout() == crate::store::ObjectLayout::Objects;
     let mut vanished_ids: HashSet<ObjectId> = HashSet::new();
-    let (readers, usable) = if in_objects {
+    let usable = if in_objects {
         hub.objects.claim_recent(project, person, &names);
         let rp = hub.objects.usable_for_receipts(project, person, &names).await.map_err(Error::Other)?;
         for v in &rp.vanished {
@@ -4534,11 +4537,9 @@ async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<Obj
                 vanished_ids.extend(ids);
             }
         }
-        (Arc::new(crate::pack::StagedReaders::none()), rp.usable)
+        rp.usable
     } else {
-        let readers = Arc::new(hub.objects.hold_staged_readers(project, &names));
-        let usable = hub.objects.usable(project, person, &names).await.map_err(Error::Other)?;
-        (readers, usable)
+        hub.objects.usable(project, person, &names).await.map_err(Error::Other)?
     };
     let mut packs: Vec<StagedPack> = Vec::new();
     let mut set = tokio::task::JoinSet::new();
@@ -4581,7 +4582,6 @@ async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<Obj
         made: Default::default(),
         vanished: Arc::new(vanished_ids),
         touched: Mutex::new(HashSet::new()),
-        _readers: readers,
     })
 }
 
@@ -4590,14 +4590,6 @@ async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<Obj
 /// together (BUG-1156): a commit naming more than that takes all of it, so
 /// one at a time.
 pub const MAX_API_UPLOADS: u64 = MAX_FRAME_OBJECT as u64;
-
-/// Guards held while an API commit checks and stores its uploaded objects:
-/// the decoded-bytes bound share (`BUG-1156`) and the active reader guard on
-/// its staged packs in `packs` layout (`BUG-2665`).
-pub(crate) struct UploadHold {
-    _decoded: Option<crate::store::ReadAhead>,
-    _readers: Arc<crate::pack::StagedReaders>,
-}
 
 /// The objects an API commit's `receipts` name in its staged packs (S28),
 /// read into memory for its checks (`changes`: what the commit keeps is
@@ -4611,14 +4603,13 @@ pub(crate) async fn take_uploads(
     project: i64,
     person: i64,
     receipts: &std::collections::BTreeMap<ObjectId, String>,
-) -> Result<(HashSet<ObjectId>, HashMap<ObjectId, Bytes>, UploadHold)> {
+) -> Result<(HashSet<ObjectId>, HashMap<ObjectId, Bytes>, Option<crate::store::ReadAhead>)> {
     let in_objects = hub.objects.layout() == crate::store::ObjectLayout::Objects;
     let staged = receipted(hub, project, person, receipts);
     let st = staging(hub, project, person, &staged).await?;
     if in_objects && !st.vanished.is_empty() {
         return Err(Error::conflict(DISCARDED_UPLOAD));
     }
-    let readers = st._readers.clone();
     // What they decode to, from their first bytes, before anything is read
     // whole: the share is taken first (BUG-1397).
     let mut total = 0u64;
@@ -4663,21 +4654,15 @@ pub(crate) async fn take_uploads(
         .map_err(Error::client_object)?;
         out.insert(id, raw);
     }
-    Ok((
-        out.keys().copied().collect(),
-        out,
-        UploadHold {
-            _decoded: held,
-            _readers: readers,
-        },
-    ))
+    Ok((out.keys().copied().collect(), out, held))
 }
 
 /// After an API commit with `receipts` was answered with `outcome`: its
 /// staged packs are discarded when it landed (what it kept was stored) or
-/// its checks refused it (BUG-930); not after a lost race or vanished upload
-/// (409: sibling uploads stay, and the caller may try again) or a
-/// database/transient error (`BUG-2661`).
+/// its checks refused it (BUG-930); not after a lost race (409: every check
+/// passed, and the caller may try again with the same receipts) or a
+/// database error the request is run again for (`db::retry_requests`
+/// reads them again).
 pub(crate) async fn settle_uploads<T>(
     hub: &Arc<Hub>,
     project: i64,
@@ -4685,26 +4670,37 @@ pub(crate) async fn settle_uploads<T>(
     receipts: &std::collections::BTreeMap<ObjectId, String>,
     outcome: &Result<T>,
 ) {
+    if hub.objects.layout() == crate::store::ObjectLayout::Objects {
+        let mut names: Vec<Arc<str>> = receipted(hub, project, person, receipts).into_values().collect();
+        names.sort();
+        names.dedup();
+        match outcome {
+            Ok(_) => {
+                if let Err(e) = hub.objects.discard_consumed(project, &names).await {
+                    eprintln!("veil-server: discarding staged uploads: {e:#}");
+                }
+            }
+            Err(Error::Api { status, .. }) if is_check_refusal(*status) => {
+                if let Err(e) = hub.objects.discard_refused(project, &names).await {
+                    eprintln!("veil-server: discarding staged uploads: {e:#}");
+                }
+            }
+            Err(_) => {
+                hub.objects.release_recent(project, person, &names);
+            }
+        }
+        return;
+    }
+    match outcome {
+        Ok(_) => {}
+        Err(Error::Api { status, .. }) if *status != axum::http::StatusCode::CONFLICT => {}
+        Err(_) => return,
+    }
     let mut names: Vec<Arc<str>> = receipted(hub, project, person, receipts).into_values().collect();
     names.sort();
     names.dedup();
-    match outcome {
-        Ok(_) => {
-            if let Err(e) = hub.objects.discard_consumed(project, &names).await {
-                eprintln!("veil-server: discarding staged uploads: {e:#}");
-            }
-        }
-        Err(Error::Api { status, .. }) if is_check_refusal(*status) => {
-            if let Err(e) = hub.objects.discard_refused(project, &names).await {
-                eprintln!("veil-server: discarding staged uploads: {e:#}");
-            }
-        }
-        Err(_) => {
-            if let Err(e) = hub.objects.release_staged_leases(project, &names, false).await {
-                eprintln!("veil-server: settling staged upload leases: {e:#}");
-            }
-            hub.objects.release_recent(project, person, &names);
-        }
+    if let Err(e) = hub.objects.discard(project, &names).await {
+        eprintln!("veil-server: discarding staged uploads: {e:#}");
     }
 }
 
