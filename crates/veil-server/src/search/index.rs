@@ -659,7 +659,7 @@ pub fn updates_at_work(hub: &Arc<Hub>) -> usize {
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The server is stopping (`landing::stop` has said so): wait for this
-/// hub's updates at work to end, at most [`STOP_WAIT`]. None starts from
+/// hub's updates at work to end, at most `STOP_WAIT`. None starts from
 /// then on, and one at work ends at its next step (before its turn, its
 /// next branch, the next segment it would store). An update runs on a blocking
 /// thread and stores its segments through the runtime; one still at it
