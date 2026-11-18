@@ -424,6 +424,21 @@ pub fn maybe_schedule(hub: &Arc<Hub>, project: i64) {
     });
 }
 
+/// In [`crate::store::ObjectLayout::Objects`], merge a project's leftover
+/// small packs once when its listing is loaded and holds at least
+/// [`MERGE_MIN_PACKS`] small packs (`object-layout.md` §5.1).
+pub fn wire_leftover_merges(hub: &Arc<Hub>) {
+    if hub.objects.layout() != crate::store::ObjectLayout::Objects {
+        return;
+    }
+    let weak = Arc::downgrade(hub);
+    hub.objects.packs().set_leftover_merge(Arc::new(move |project| {
+        if let Some(hub) = weak.upgrade() {
+            maybe_schedule(&hub, project);
+        }
+    }));
+}
+
 /// One background merge-only pass on `project` if its small listed packs
 /// reach [`MERGE_MIN_PACKS`]: whether it merged any (so another may follow).
 async fn merge_small_packs(hub: &Arc<Hub>, project: i64) -> bool {
@@ -444,14 +459,24 @@ async fn merge_small_packs(hub: &Arc<Hub>, project: i64) -> bool {
     if (count as usize) < MERGE_MIN_PACKS {
         return false;
     }
-    let opts = Options {
-        min_packs_to_merge: TIER_MIN_PACKS,
-        max_packs_per_run: BACKGROUND_PACKS_PER_RUN,
-        run_gc: false,
-        size_tiers: true,
-        ..Options::default()
+    // In `objects` mode no push lists packs to fill intermediate size classes
+    // later: merge leftover small packs across classes in one pass.
+    let opts = if hub.objects.layout() == crate::store::ObjectLayout::Objects {
+        Options {
+            max_packs_per_run: BACKGROUND_PACKS_PER_RUN,
+            ..Options::merge_only()
+        }
+    } else {
+        Options {
+            min_packs_to_merge: TIER_MIN_PACKS,
+            max_packs_per_run: BACKGROUND_PACKS_PER_RUN,
+            run_gc: false,
+            size_tiers: true,
+            ..Options::default()
+        }
     };
-    match run_project(hub, project, &opts).await {
+    let res = run_project(hub, project, &opts).await;
+    match res {
         Ok(r) if !r.skipped && r.packs_merged > 0 => {
             hub.pack_gc.background_merges.fetch_add(1, Ordering::Relaxed);
             // The packs it replaced are deleted once their grace period

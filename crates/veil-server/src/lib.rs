@@ -269,6 +269,7 @@ pub async fn start(config: Config) -> Result<Running> {
         limits: limits::Limits::new(config.limits, config.db_connections),
         commits: Default::default(),
     });
+    pack_gc::wire_leftover_merges(&hub);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::watch::channel(false);

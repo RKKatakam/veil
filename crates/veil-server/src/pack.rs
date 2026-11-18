@@ -757,6 +757,17 @@ pub struct Packs {
     /// holding its share of `bound`; `None` once discarded here.
     staged: LruCache<Option<Arc<Held>>>,
     recent: LruCache<Recent>,
+    leftover: LruCache<()>,
+    on_leftover: std::sync::OnceLock<Arc<dyn Fn(i64) + Send + Sync>>,
+}
+
+const LEFTOVER_BUDGET: usize = 64 << 10;
+
+fn leftover_key(project: i64) -> ObjectId {
+    let mut h = blake3::Hasher::new();
+    h.update(b"leftover packs");
+    h.update(&project.to_le_bytes());
+    ObjectId(*h.finalize().as_bytes())
 }
 
 fn name_key(project: i64, name: &str) -> ObjectId {
@@ -797,7 +808,16 @@ impl Packs {
             bound: Bound { most: INDEXES_HELD - STAGED_INDEXES, ..Bound::new(INDEXES_HELD) },
             staged: LruCache::new(STAGED_INDEXES),
             recent: LruCache::new(RECENT_BUDGET),
+            leftover: LruCache::new(LEFTOVER_BUDGET),
+            on_leftover: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Register a callback invoked once per project when a loaded listing has
+    /// at least [`crate::pack_gc::MERGE_MIN_PACKS`] small packs
+    /// (`object-layout.md` §5.1).
+    pub fn set_leftover_merge(&self, f: Arc<dyn Fn(i64) + Send + Sync>) {
+        let _ = self.on_leftover.set(f);
     }
 
     /// The server's bound on indexes held outside the lookup maps.
@@ -1101,18 +1121,32 @@ impl Packs {
         // `packs_listed` (migration 41) serves it under a generic plan too:
         // the rows of packs merges replaced are not read (BUG-2462).
         const _: () = assert!(LISTED == 1);
-        let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = 1 ORDER BY created_at, name")
+        let rows: Vec<(String, i64)> = sqlx::query_as("SELECT name, size FROM packs WHERE project_id = $1 AND state = 1 ORDER BY created_at, name")
             .bind(project)
             .fetch_all(db)
             .await?;
+        let small = rows
+            .iter()
+            .filter(|(_, sz)| (*sz).max(0) as u64 <= crate::pack_gc::SMALL_PACK_BYTES)
+            .count();
+        let names: Vec<String> = rows.into_iter().map(|(n, _)| n).collect();
         {
             let mut m = p.map.write().unwrap();
-            let current: HashSet<Arc<str>> = rows.iter().map(|n| Arc::<str>::from(n.as_str())).collect();
+            let current: HashSet<Arc<str>> = names.iter().map(|n| Arc::<str>::from(n.as_str())).collect();
             m.names.retain(|n| current.contains(n));
             m.retain(|l| current.contains(&l.name));
         }
-        self.load_listed(p, store, project, rows, reads).await?;
+        self.load_listed(p, store, project, names, reads).await?;
         *last = Some(began);
+        if small >= crate::pack_gc::MERGE_MIN_PACKS {
+            if let Some(f) = self.on_leftover.get() {
+                let k = leftover_key(project);
+                if self.leftover.get(&k).is_none() {
+                    self.leftover.insert(k, (), 48);
+                    f(project);
+                }
+            }
+        }
         Ok(())
     }
 
