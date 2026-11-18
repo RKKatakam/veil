@@ -33,7 +33,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsString,
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -222,10 +222,560 @@ fn normal(p: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+// ---- file identity & mount-table aliases (BUG-1519) ------------------------
+
+/// Unix file identity: `(st_dev, st_ino)`.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+fn file_id(p: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p).ok()?;
+    Some(FileId { dev: m.dev(), ino: m.ino() })
+}
+
+#[cfg(unix)]
+fn symlink_file_id(p: &Path) -> Option<(FileId, u64, bool)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(p).ok()?;
+    Some((FileId { dev: m.dev(), ino: m.ino() }, m.nlink(), m.file_type().is_file()))
+}
+
+fn join_rel(base: &Path, rel: &Path) -> PathBuf {
+    if rel.as_os_str().is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(rel)
+    }
+}
+
+/// Deepest existing ancestor of `p`, resolved with `canonicalize()`, plus the
+/// remaining non-existent tail components (empty when `p` exists). Follows
+/// dangling symlinks up to 40 hops so a symlink to a not-yet-created Veil
+/// folder resolves to its real parent too.
+fn split_existing(p: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut cur = p.to_path_buf();
+    let mut tail: Vec<OsString> = Vec::new();
+    let mut hops = 0usize;
+    loop {
+        if let Ok(real) = cur.canonicalize() {
+            let mut rem = PathBuf::new();
+            for comp in tail.into_iter().rev() {
+                rem.push(comp);
+            }
+            return Some((real, rem));
+        }
+        if hops < 40 {
+            if let Ok(target) = std::fs::read_link(&cur) {
+                hops += 1;
+                cur = match target.is_absolute() {
+                    true => target,
+                    false => cur.parent()?.join(target),
+                };
+                continue;
+            }
+        }
+        let name = cur.file_name()?.to_os_string();
+        tail.push(name);
+        cur = cur.parent()?.to_path_buf();
+    }
+}
+
+/// `(dev, ino)` of `p` (or its deepest existing ancestor) and every ancestor
+/// directory up to `/`.
+#[cfg(unix)]
+fn ancestor_ids(p: &Path) -> HashSet<FileId> {
+    let mut out = HashSet::new();
+    let Some((mut cur, _)) = split_existing(p) else { return out };
+    loop {
+        if let Some(id) = file_id(&cur) {
+            out.insert(id);
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn make_dev(maj: u32, min: u32) -> u64 {
+    libc::makedev(maj, min) as u64
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn make_dev(maj: u32, min: u32) -> u64 {
+    ((maj as u64) << 32) | (min as u64)
+}
+
+#[cfg(unix)]
+fn unescape_mountinfo(raw: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'\\'
+            && i + 3 < raw.len()
+            && (b'0'..=b'3').contains(&raw[i + 1])
+            && (b'0'..=b'7').contains(&raw[i + 2])
+            && (b'0'..=b'7').contains(&raw[i + 3])
+        {
+            let v = ((raw[i + 1] - b'0') << 6) | ((raw[i + 2] - b'0') << 3) | (raw[i + 3] - b'0');
+            out.push(v);
+            i += 4;
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    PathBuf::from(OsString::from_vec(out))
+}
+
+#[cfg(unix)]
+fn split_escaped_colons(raw: &[u8]) -> Vec<Vec<u8>> {
+    let mut parts = Vec::new();
+    let mut cur = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'\\' && i + 1 < raw.len() && (raw[i + 1] == b':' || raw[i + 1] == b'\\') {
+            cur.push(raw[i + 1]);
+            i += 2;
+        } else if raw[i] == b':' {
+            parts.push(std::mem::take(&mut cur));
+            i += 1;
+        } else {
+            cur.push(raw[i]);
+            i += 1;
+        }
+    }
+    parts.push(cur);
+    parts
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct MountEntry {
+    dev: u64,
+    root: PathBuf,
+    mount_point: PathBuf,
+    /// Backing host directories visible in `mountinfo` (`overlay` lowerdir /
+    /// upperdir, or `fuse.*` whose mount source is an absolute directory path,
+    /// such as `fuse.bindfs`).
+    backing: Vec<PathBuf>,
+}
+
+/// Mounts of the current mount namespace (from `/proc/self/mountinfo` on
+/// Linux; empty on non-Linux, where confinement is not built yet).
+#[cfg(unix)]
+#[derive(Clone, Debug, Default)]
+struct MountTable {
+    entries: Vec<MountEntry>,
+}
+
+#[cfg(unix)]
+impl MountTable {
+    fn load() -> Result<MountTable> {
+        #[cfg(target_os = "linux")]
+        {
+            let raw = std::fs::read("/proc/self/mountinfo").context("reading /proc/self/mountinfo")?;
+            Ok(Self::parse(&raw, |p| p.is_dir()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(MountTable::default())
+        }
+    }
+
+    fn parse(raw: &[u8], source_is_dir: impl Fn(&Path) -> bool) -> MountTable {
+        let mut entries = Vec::new();
+        for line in raw.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&[u8]> = line.split(|&b| b == b' ').collect();
+            let Some(sep) = fields.iter().position(|f| *f == b"-") else { continue };
+            if sep < 6 || sep + 3 >= fields.len() {
+                continue;
+            }
+            let Ok(dev_s) = std::str::from_utf8(fields[2]) else { continue };
+            let Some((maj_s, min_s)) = dev_s.split_once(':') else { continue };
+            let (Ok(maj), Ok(min)) = (maj_s.parse::<u32>(), min_s.parse::<u32>()) else { continue };
+            let dev = make_dev(maj, min);
+            let root = unescape_mountinfo(fields[3]);
+            let mount_point = unescape_mountinfo(fields[4]);
+            let fs_type = fields[sep + 1];
+            let mount_source = fields[sep + 2];
+            let super_opts = fields[sep + 3];
+            let mut backing = Vec::new();
+            if fs_type == b"overlay" {
+                for opt in super_opts.split(|&b| b == b',') {
+                    if let Some(val) = opt.strip_prefix(b"lowerdir=") {
+                        for part in split_escaped_colons(val) {
+                            let p = unescape_mountinfo(&part);
+                            if p.is_absolute() {
+                                backing.push(p);
+                            }
+                        }
+                    } else if let Some(val) = opt.strip_prefix(b"upperdir=") {
+                        let p = unescape_mountinfo(val);
+                        if p.is_absolute() {
+                            backing.push(p);
+                        }
+                    }
+                }
+            } else if fs_type.starts_with(b"fuse.") && mount_source.starts_with(b"/") {
+                let p = unescape_mountinfo(mount_source);
+                if source_is_dir(&p) {
+                    backing.push(p);
+                }
+            }
+            entries.push(MountEntry { dev, root, mount_point, backing });
+        }
+        MountTable { entries }
+    }
+
+    fn active_mount(&self, path: &Path, dev: Option<u64>) -> Option<&MountEntry> {
+        let pick = |match_dev: bool| {
+            let mut best: Option<&MountEntry> = None;
+            let mut best_len = 0usize;
+            for m in &self.entries {
+                if match_dev && dev.is_some_and(|d| m.dev != d) {
+                    continue;
+                }
+                if !path.starts_with(&m.mount_point) {
+                    continue;
+                }
+                let len = m.mount_point.as_os_str().len();
+                if best.is_none() || len >= best_len {
+                    best = Some(m);
+                    best_len = len;
+                }
+            }
+            best
+        };
+        pick(true).or_else(|| pick(false))
+    }
+
+    /// Every path under which `target` appears across the mount table, split
+    /// into `(exact, subtrees)`: `exact` are full views of `target` (always
+    /// including `target` itself), and `subtrees` are mount points of strict
+    /// subdirectories or files bind-mounted from inside `target`.
+    fn aliases(&self, target: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let Some((ex, rem)) = split_existing(target) else {
+            return (normal(target).into_iter().collect(), Vec::new());
+        };
+        self.aliases_with(&ex, &rem, |p| file_id(p).map(|id| id.dev))
+    }
+
+    fn aliases_with(&self, ex: &Path, rem: &Path, dev_of: impl Fn(&Path) -> Option<u64>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let initial = join_rel(ex, rem);
+        let mut exact = vec![initial.clone()];
+        let mut subtrees = Vec::new();
+        let mut seen_exact: HashSet<PathBuf> = HashSet::from([initial.clone()]);
+        let mut seen_sub: HashSet<PathBuf> = HashSet::new();
+        let mut seen_fs: HashSet<(u64, PathBuf, bool)> = HashSet::new();
+        // `(path, dev, is_subtree)`
+        let mut queue: VecDeque<(PathBuf, Option<u64>, bool)> = VecDeque::from([(initial, dev_of(ex), false)]);
+        while let Some((cur_full, cur_dev, is_sub)) = queue.pop_front() {
+            let mut push = |alias: PathBuf, dev: Option<u64>, sub: bool| {
+                let inserted = if sub {
+                    seen_sub.insert(alias.clone()) && !seen_exact.contains(&alias)
+                } else {
+                    seen_exact.insert(alias.clone())
+                };
+                if inserted {
+                    if sub {
+                        subtrees.push(alias.clone());
+                    } else {
+                        exact.push(alias.clone());
+                    }
+                    queue.push_back((alias, dev, sub));
+                }
+            };
+            // Always check backing-directory mounts (`overlay`, `fuse.bindfs`)
+            // against every discovered alias path.
+            for m in &self.entries {
+                for b in &m.backing {
+                    if let Ok(sub) = cur_full.strip_prefix(b) {
+                        push(join_rel(&m.mount_point, sub), Some(m.dev), is_sub);
+                    } else if *b != cur_full && b.starts_with(&cur_full) {
+                        push(m.mount_point.clone(), Some(m.dev), true);
+                    }
+                }
+            }
+            let Some(m0) = self.active_mount(&cur_full, cur_dev) else { continue };
+            let Ok(rel_full) = cur_full.strip_prefix(&m0.mount_point) else { continue };
+            let fs_path = join_rel(&m0.root, rel_full);
+            if seen_fs.insert((m0.dev, fs_path.clone(), is_sub)) {
+                for m in &self.entries {
+                    if m.dev != m0.dev {
+                        continue;
+                    }
+                    if let Ok(sub) = fs_path.strip_prefix(&m.root) {
+                        push(join_rel(&m.mount_point, sub), Some(m.dev), is_sub);
+                    } else if m.root != fs_path && m.root.starts_with(&fs_path) {
+                        // A bind mount of a subdirectory or file inside `target`.
+                        push(m.mount_point.clone(), Some(m.dev), true);
+                    }
+                }
+                for b in &m0.backing {
+                    let back = join_rel(b, rel_full);
+                    push(back.clone(), dev_of(&back), is_sub);
+                }
+            }
+        }
+        (exact, subtrees)
+    }
+
+    fn all_aliases(&self, target: &Path) -> Vec<PathBuf> {
+        let (mut exact, subtrees) = self.aliases(target);
+        exact.extend(subtrees);
+        exact
+    }
+}
+
+/// A host directory (existing or not-yet-created) that must stay out of
+/// `--allow` and `--seed` under every name, symlink, file identity, or mount
+/// alias (BUG-1516, BUG-1519).
+#[cfg(unix)]
+struct ProtectedDir {
+    exact: Vec<PathBuf>,
+    subtrees: Vec<PathBuf>,
+    named: Option<PathBuf>,
+    self_id: Option<FileId>,
+    ancestors: HashSet<FileId>,
+}
+
+#[cfg(unix)]
+impl ProtectedDir {
+    fn new(target: &Path, mounts: &MountTable) -> ProtectedDir {
+        let (mut exact, subtrees) = mounts.aliases(target);
+        let named = normal(target);
+        if let Some(n) = &named {
+            if !exact.contains(n) {
+                exact.push(n.clone());
+            }
+        }
+        ProtectedDir {
+            exact,
+            subtrees,
+            named,
+            self_id: file_id(target),
+            ancestors: ancestor_ids(target),
+        }
+    }
+
+    fn all_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.exact.iter().chain(self.subtrees.iter())
+    }
+
+    /// Is `src` equal to or inside this protected directory (by path, mount
+    /// alias, subtree bind mount, or `(st_dev, st_ino)` ancestor walk)?
+    fn contains_path(&self, src: &Path, src_ancestors: &HashSet<FileId>) -> bool {
+        self.all_paths().any(|a| src.starts_with(a)) || self.self_id.is_some_and(|id| src_ancestors.contains(&id))
+    }
+
+    /// Does `(dest, src)` hold this protected directory (by path, mount alias,
+    /// or `(st_dev, st_ino)` ancestor identity)? When `include_subtrees` is
+    /// true, holding a bind mount of a strict subdirectory/file inside this
+    /// protected directory also matches.
+    fn held_by(&self, dest: &Path, src: &Path, src_id: Option<FileId>, include_subtrees: bool) -> Option<PathBuf> {
+        if let Some(a) = self.exact.iter().find(|a| a.starts_with(src)) {
+            return Some(a.clone());
+        }
+        if include_subtrees {
+            if let Some(a) = self.subtrees.iter().find(|a| a.starts_with(src)) {
+                return Some(a.clone());
+            }
+        }
+        if let Some(n) = &self.named {
+            if n.starts_with(dest) || n.starts_with(src) {
+                return Some(n.clone());
+            }
+        }
+        if src_id.is_some_and(|id| self.ancestors.contains(&id)) {
+            return Some(src.to_path_buf());
+        }
+        None
+    }
+}
+
+/// Hard-link index of regular files in Veil's private dirs (`veil_home` and
+/// `daemon::run`) and masked credential files. Walking an allowed directory
+/// only runs when a protected file actually has `st_nlink > 1` on a reachable
+/// device (zero extra stat work in normal operation).
+#[cfg(unix)]
+struct HardLinkedSecrets {
+    /// Every regular file in `veil_home()` and `daemon::run` (for O(1) checks
+    /// when `--allow` names a file directly).
+    veil_files: HashMap<FileId, PathBuf>,
+    /// Subset of `veil_files` with `st_nlink > 1`.
+    veil_hardlinked: HashMap<FileId, PathBuf>,
+    /// Masked credential files (`~/.cargo/credentials*`, etc.).
+    cred_files: HashSet<FileId>,
+    /// Subset of `cred_files` with `st_nlink > 1`.
+    cred_hardlinked: HashSet<FileId>,
+}
+
+#[cfg(unix)]
+impl HardLinkedSecrets {
+    fn collect(veil_dirs: &[PathBuf], cred_paths: &[PathBuf]) -> HardLinkedSecrets {
+        let mut veil_files = HashMap::new();
+        let mut veil_hardlinked = HashMap::new();
+        let vh = crate::ctx::veil_home();
+        let daemon_run = crate::daemon::paths().run;
+        for dir in veil_dirs {
+            // Walk `veil_home` and `daemon::run` (tiny directories: identity,
+            // device keys, socket/pid). Skip `daemon::store` (may hold 100k+
+            // hash-addressed blobs).
+            if *dir != vh && *dir != daemon_run {
+                continue;
+            }
+            let Ok(real) = dir.canonicalize() else { continue };
+            let mut stack = vec![(real, 0usize)];
+            while let Some((d, depth)) = stack.pop() {
+                if depth > 8 {
+                    continue;
+                }
+                let Ok(rd) = std::fs::read_dir(&d) else { continue };
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    let Ok(ft) = entry.file_type() else { continue };
+                    if ft.is_dir() {
+                        stack.push((p, depth + 1));
+                    } else if ft.is_file() {
+                        if let Some((id, nlink, true)) = symlink_file_id(&p) {
+                            veil_files.insert(id, dir.clone());
+                            if nlink > 1 {
+                                veil_hardlinked.insert(id, dir.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut cred_files = HashSet::new();
+        let mut cred_hardlinked = HashSet::new();
+        for p in cred_paths {
+            if let Ok(c) = p.canonicalize() {
+                if let Some((id, nlink, true)) = symlink_file_id(&c) {
+                    cred_files.insert(id);
+                    if nlink > 1 {
+                        cred_hardlinked.insert(id);
+                    }
+                }
+            }
+        }
+        HardLinkedSecrets { veil_files, veil_hardlinked, cred_files, cred_hardlinked }
+    }
+
+    fn device_reachable_under(&self, dir: &Path, dir_dev: u64, mounts: &MountTable, devs: &HashSet<u64>) -> bool {
+        devs.contains(&dir_dev) || mounts.entries.iter().any(|m| devs.contains(&m.dev) && m.mount_point.starts_with(dir))
+    }
+
+    /// If `src` (file or directory) is or holds a hard link to a file in
+    /// `veil_home()` / `daemon::run`, returns `(owning_veil_dir, linked_path)`.
+    fn find_veil_link(&self, src: &Path, mounts: &MountTable) -> Option<(PathBuf, PathBuf)> {
+        let Some((id, _, is_file)) = symlink_file_id(src) else { return None };
+        if is_file {
+            return self.veil_files.get(&id).map(|v| (v.clone(), src.to_path_buf()));
+        }
+        if self.veil_hardlinked.is_empty() {
+            return None;
+        }
+        let devs: HashSet<u64> = self.veil_hardlinked.keys().map(|k| k.dev).collect();
+        if !self.device_reachable_under(src, id.dev, mounts, &devs) {
+            return None;
+        }
+        let mut stack = vec![(src.to_path_buf(), id.dev)];
+        while let Some((d, dev)) = stack.pop() {
+            if !self.device_reachable_under(&d, dev, mounts, &devs) {
+                continue;
+            }
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_file() {
+                    if let Some((fid, nlink, true)) = symlink_file_id(&p) {
+                        if nlink > 1 {
+                            if let Some(v) = self.veil_hardlinked.get(&fid) {
+                                return Some((v.clone(), p));
+                            }
+                        }
+                    }
+                } else if ft.is_dir() {
+                    if let Some((did, _, _)) = symlink_file_id(&p) {
+                        stack.push((p, did.dev));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Every path under `dest` (shown from `src`) that is a hard link to a
+    /// masked credential file.
+    fn find_cred_links(&self, dest: &Path, src: &Path, mounts: &MountTable) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Some((id, _, is_file)) = symlink_file_id(src) else { return out };
+        if is_file {
+            if self.cred_files.contains(&id) {
+                out.push(dest.to_path_buf());
+            }
+            return out;
+        }
+        if self.cred_hardlinked.is_empty() {
+            return out;
+        }
+        let devs: HashSet<u64> = self.cred_hardlinked.iter().map(|k| k.dev).collect();
+        if !self.device_reachable_under(src, id.dev, mounts, &devs) {
+            return out;
+        }
+        let mut stack = vec![(src.to_path_buf(), id.dev)];
+        while let Some((d, dev)) = stack.pop() {
+            if !self.device_reachable_under(&d, dev, mounts, &devs) {
+                continue;
+            }
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_file() {
+                    if let Some((fid, nlink, true)) = symlink_file_id(&p) {
+                        if nlink > 1 && self.cred_hardlinked.contains(&fid) {
+                            if let Ok(rel) = p.strip_prefix(src) {
+                                out.push(join_rel(dest, rel));
+                            }
+                        }
+                    }
+                } else if ft.is_dir() {
+                    if let Some((did, _, _)) = symlink_file_id(&p) {
+                        stack.push((p, did.dev));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// One `--seed SRC:DEST`, checked: `SRC` an existing directory of its own,
 /// never the whole machine, the home or anything holding it, the Veil home
-/// or the project (inside or holding them); `DEST` an absolute path
-/// without `..`, never `/` and never where the sandbox appears.
+/// or the project (inside or holding them, by path, file identity, mount
+/// alias, or hard link); `DEST` an absolute path without `..`, never `/` and
+/// never where the sandbox appears.
 fn seed(spec: &str, root: &Path, home: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
     let shown = safe(spec);
     let (src, dest) = match spec.split(':').collect::<Vec<_>>()[..] {
@@ -240,20 +790,50 @@ fn seed(spec: &str, root: &Path, home: Option<&Path>) -> Result<(PathBuf, PathBu
         Ok(_) => bail!("--seed {shown}: SRC is not a directory"),
         Err(_) => bail!("--seed {shown}: SRC: no such directory"),
     };
-    let overlaps = |p: &Path| src.starts_with(p) || p.starts_with(&src);
     if src == Path::new("/") {
         bail!("--seed {shown}: SRC is the whole machine");
     }
-    if home.and_then(|h| h.canonicalize().ok()).is_some_and(|h| h.starts_with(&src)) {
-        bail!("--seed {shown}: SRC is your home, or holds it (keys, other projects); seed a directory of its own");
-    }
-    for vh in crate::ctx::veil_private_dirs() {
-        if [Some(vh.clone()), vh.canonicalize().ok()].iter().flatten().any(|v| overlaps(v)) {
-            bail!("--seed {shown}: SRC is the Veil home or the Veil daemon's folder, inside one, or holds one");
+    #[cfg(unix)]
+    {
+        let mounts = MountTable::load()?;
+        let src_id = file_id(&src);
+        let src_ancestors = ancestor_ids(&src);
+        if let Some(h) = home {
+            let ph = ProtectedDir::new(h, &mounts);
+            if ph.held_by(&src, &src, src_id, false).is_some() {
+                bail!("--seed {shown}: SRC is your home, or holds it (keys, other projects); seed a directory of its own");
+            }
+        }
+        let private_dirs = crate::ctx::veil_private_dirs();
+        for vh in &private_dirs {
+            let pv = ProtectedDir::new(vh, &mounts);
+            if pv.contains_path(&src, &src_ancestors) || pv.held_by(&src, &src, src_id, true).is_some() {
+                bail!("--seed {shown}: SRC is the Veil home or the Veil daemon's folder, inside one, or holds one");
+            }
+        }
+        let hardlinks = HardLinkedSecrets::collect(&private_dirs, &[]);
+        if hardlinks.find_veil_link(&src, &mounts).is_some() {
+            bail!("--seed {shown}: SRC holds a hard link to a file in the Veil home or the Veil daemon's folder");
+        }
+        let pr = ProtectedDir::new(root, &mounts);
+        if pr.contains_path(&src, &src_ancestors) || pr.held_by(&src, &src, src_id, true).is_some() {
+            bail!("--seed {shown}: SRC is the project, inside it, or holds it; the sandbox already shows the project's files");
         }
     }
-    if overlaps(root) {
-        bail!("--seed {shown}: SRC is the project, inside it, or holds it; the sandbox already shows the project's files");
+    #[cfg(not(unix))]
+    {
+        let overlaps = |p: &Path| src.starts_with(p) || p.starts_with(&src);
+        if home.and_then(|h| h.canonicalize().ok()).is_some_and(|h| h.starts_with(&src)) {
+            bail!("--seed {shown}: SRC is your home, or holds it (keys, other projects); seed a directory of its own");
+        }
+        for vh in crate::ctx::veil_private_dirs() {
+            if [Some(vh.clone()), vh.canonicalize().ok()].iter().flatten().any(|v| overlaps(v)) {
+                bail!("--seed {shown}: SRC is the Veil home or the Veil daemon's folder, inside one, or holds one");
+            }
+        }
+        if overlaps(root) {
+            bail!("--seed {shown}: SRC is the project, inside it, or holds it; the sandbox already shows the project's files");
+        }
     }
     let dest = normal(dest).ok_or_else(|| anyhow!("--seed {shown}: DEST must be an absolute path without '..'"))?;
     if dest == Path::new("/") {
@@ -604,16 +1184,19 @@ impl Confine {
 }
 
 /// A suggestion of narrower `--allow`s for allowed folder `dest` (resolved:
-/// `src`) that holds Veil's private folder `private`: up to three of its
-/// other entries.
-fn narrower(dest: &Path, src: &Path, private: &Path) -> String {
-    let on_the_way = private.strip_prefix(src).ok().and_then(|r| r.components().next()).map(|c| c.as_os_str().to_owned());
+/// `src`) that holds Veil's private folders (by path or mount alias): up to
+/// three of its other entries.
+fn narrower(dest: &Path, src: &Path, private_aliases: &[PathBuf]) -> String {
+    let blocked: Vec<OsString> = private_aliases
+        .iter()
+        .filter_map(|p| p.strip_prefix(src).ok()?.components().next().map(|c| c.as_os_str().to_owned()))
+        .collect();
     let mut others: Vec<String> = std::fs::read_dir(src)
         .into_iter()
         .flatten()
         .flatten()
         .map(|e| e.file_name())
-        .filter(|n| Some(n) != on_the_way.as_ref())
+        .filter(|n| !blocked.contains(n))
         .map(|n| dest.join(n).to_string_lossy().into_owned())
         .collect();
     others.sort();
@@ -921,17 +1504,32 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], seeds:
     }
     push(&["--tmpfs".as_ref(), home.as_os_str()]);
     // Veil's own state (the Veil home, the daemon's folders: one list,
-    // `ctx::veil_private_dirs`), as named and resolved.
+    // `ctx::veil_private_dirs`), checked by name, symlink, file identity
+    // `(st_dev, st_ino)`, mount-table aliases (`/proc/self/mountinfo` on
+    // Linux), and hard links (BUG-1516, BUG-1519).
     let vh = crate::ctx::veil_home();
-    let named: Vec<(PathBuf, Option<PathBuf>)> =
-        crate::ctx::veil_private_dirs().into_iter().map(|v| (v.clone(), v.canonicalize().ok().filter(|r| r != Path::new("/")))).collect();
-    let private: Vec<(PathBuf, PathBuf)> = named.iter().filter_map(|(v, r)| Some((v.clone(), r.clone().filter(|r| r.is_dir())?))).collect();
-    // What an allowed path may not be inside of.
-    let inside: Vec<(&Path, &str)> = private
+    let veil_dirs = crate::ctx::veil_private_dirs();
+    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from).filter(|c| c.is_absolute());
+    let cred_paths: Vec<PathBuf> = [Some(home.join(".cargo")), cargo_home]
         .iter()
-        .map(|(_, real)| (real.as_path(), "inside the Veil home or the Veil daemon's folders, which stay hidden"))
-        .chain(root.map(|r| (r, "inside the project, where the command sees its sandbox")))
+        .flatten()
+        .flat_map(|c| MASKED.iter().map(|m| c.join(m)))
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
         .collect();
+    #[cfg(unix)]
+    let mounts = MountTable::load()?;
+    #[cfg(unix)]
+    let protected_veil: Vec<(PathBuf, ProtectedDir)> = veil_dirs.iter().map(|v| (v.clone(), ProtectedDir::new(v, &mounts))).collect();
+    #[cfg(unix)]
+    let all_private_aliases: Vec<PathBuf> = protected_veil.iter().flat_map(|(_, pv)| pv.all_paths().cloned()).collect();
+    #[cfg(unix)]
+    let protected_root: Option<ProtectedDir> = root.map(|r| ProtectedDir::new(r, &mounts));
+    #[cfg(unix)]
+    let hardlinks = HardLinkedSecrets::collect(&veil_dirs, &cred_paths);
+
+    let named: Vec<(PathBuf, Option<PathBuf>)> =
+        veil_dirs.iter().map(|v| (v.clone(), v.canonicalize().ok().filter(|r| r != Path::new("/")))).collect();
+    let private: Vec<(PathBuf, PathBuf)> = named.iter().filter_map(|(v, r)| Some((v.clone(), r.clone().filter(|r| r.is_dir())?))).collect();
     // `(dest, src)`: where each allowed path appears, and what it shows.
     let mut bound: Vec<(PathBuf, PathBuf)> = Vec::new();
     'allow: for (p, explicit) in allow {
@@ -949,77 +1547,150 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], seeds:
             Err(e) if *explicit => bail!("--allow {}: {e}", safe(&p.to_string_lossy())),
             _ => continue,
         };
-        for (h, why) in &inside {
-            if src.starts_with(h) {
+        #[cfg(unix)]
+        {
+            let src_id = file_id(&src);
+            let src_ancestors = ancestor_ids(&src);
+            for (_, pv) in &protected_veil {
+                if pv.contains_path(&src, &src_ancestors) {
+                    match explicit {
+                        true => bail!("--allow {}: that is inside the Veil home or the Veil daemon's folders, which stay hidden", safe(&p.to_string_lossy())),
+                        false => continue 'allow,
+                    }
+                }
+            }
+            if protected_root.as_ref().is_some_and(|pr| pr.contains_path(&src, &src_ancestors)) {
                 match explicit {
-                    true => bail!("--allow {}: that is {why}", safe(&p.to_string_lossy())),
+                    true => bail!("--allow {}: that is inside the project, where the command sees its sandbox", safe(&p.to_string_lossy())),
                     false => continue 'allow,
                 }
             }
+            // A folder that holds one of Veil's own, as named, resolved, by
+            // file identity `(st_dev, st_ino)`, or via a mount-table alias, is
+            // never shown (BUG-1516, BUG-1519): a mask covers a folder as it is
+            // at the start, and one removed and made again during the run (the
+            // daemon's, in a cleared `~/.cache`) would show through.
+            for (v, pv) in &protected_veil {
+                if pv.held_by(&dest, &src, src_id, true).is_none() {
+                    continue;
+                }
+                if !*explicit {
+                    continue 'allow;
+                }
+                let what = if *v == vh { "the Veil home" } else { "the Veil daemon's folder" };
+                bail!(
+                    "--allow {}: that folder holds {what} ({}), which stays hidden from the command; allow only the folders inside it that the command needs{}",
+                    safe(&p.to_string_lossy()),
+                    safe(&v.to_string_lossy()),
+                    narrower(&dest, &src, &all_private_aliases)
+                );
+            }
+            if let Some((v, _)) = hardlinks.find_veil_link(&src, &mounts) {
+                if !*explicit {
+                    continue 'allow;
+                }
+                let what = if v == vh { "the Veil home" } else { "the Veil daemon's folder" };
+                bail!(
+                    "--allow {}: that path holds a hard link to a file in {what} ({}), which stays hidden from the command",
+                    safe(&p.to_string_lossy()),
+                    safe(&v.to_string_lossy())
+                );
+            }
         }
-        // A folder that holds one of Veil's own, as named or resolved, is
-        // never shown (BUG-1516): a mask covers a folder as it is at the
-        // start, and one removed and made again during the run (the
-        // daemon's, in a cleared `~/.cache`) would show through. Refused
-        // by name, for the whole run.
-        for (v, real) in &named {
-            let held = real.as_ref().is_some_and(|r| r.starts_with(&src)) || normal(v).is_some_and(|n| n.starts_with(&dest) || n.starts_with(&src));
-            if !held {
-                continue;
+        #[cfg(not(unix))]
+        {
+            let inside: Vec<(&Path, &str)> = private
+                .iter()
+                .map(|(_, real)| (real.as_path(), "inside the Veil home or the Veil daemon's folders, which stay hidden"))
+                .chain(root.map(|r| (r, "inside the project, where the command sees its sandbox")))
+                .collect();
+            for (h, why) in &inside {
+                if src.starts_with(h) {
+                    match explicit {
+                        true => bail!("--allow {}: that is {why}", safe(&p.to_string_lossy())),
+                        false => continue 'allow,
+                    }
+                }
             }
-            if !*explicit {
-                continue 'allow;
+            for (v, real) in &named {
+                let held = real.as_ref().is_some_and(|r| r.starts_with(&src)) || normal(v).is_some_and(|n| n.starts_with(&dest) || n.starts_with(&src));
+                if !held {
+                    continue;
+                }
+                if !*explicit {
+                    continue 'allow;
+                }
+                let what = if *v == vh { "the Veil home" } else { "the Veil daemon's folder" };
+                let blocked: Vec<PathBuf> = vec![real.clone().unwrap_or_else(|| v.clone())];
+                bail!(
+                    "--allow {}: that folder holds {what} ({}), which stays hidden from the command; allow only the folders inside it that the command needs{}",
+                    safe(&p.to_string_lossy()),
+                    safe(&v.to_string_lossy()),
+                    narrower(&dest, &src, &blocked)
+                );
             }
-            let what = if *v == vh { "the Veil home" } else { "the Veil daemon's folder" };
-            bail!(
-                "--allow {}: that folder holds {what} ({}), which stays hidden from the command; allow only the folders inside it that the command needs{}",
-                safe(&p.to_string_lossy()),
-                safe(&v.to_string_lossy()),
-                narrower(&dest, &src, real.as_deref().unwrap_or(v))
-            );
         }
         if bound.iter().any(|(d, _)| *d == dest) {
             continue;
         }
         bound.push((dest, src));
     }
-    // Every name under which the sandbox shows `real` (canonical): through
-    // the allow-list and through every seed. The masks below apply to every
-    // way a host path enters the sandbox (BUG-1363).
+    // Every name under which the sandbox shows `real` (canonical) or any of
+    // its mount aliases: through the allow-list, through every seed, and
+    // through `READ_ONLY`. The masks below apply to every way a host path
+    // enters the sandbox (BUG-1363, BUG-1519).
     let shown: Vec<(PathBuf, PathBuf)> = bound.iter().cloned().chain(seeds.iter().map(|(src, dest)| (dest.clone(), src.clone()))).collect();
-    let aliases = |real: &Path| -> Vec<PathBuf> {
-        shown.iter().filter_map(|(dest, src)| real.strip_prefix(src).ok().map(|rel| dest.join(rel))).collect()
+    let aliases = |real: &Path, expect_file: bool| -> Vec<PathBuf> {
+        #[cfg(unix)]
+        let host_aliases = mounts.all_aliases(real);
+        #[cfg(not(unix))]
+        let host_aliases = vec![real.to_path_buf()];
+        let mut out = Vec::new();
+        for host in host_aliases {
+            for (dest, src) in &shown {
+                if let Ok(rel) = host.strip_prefix(src) {
+                    out.push(join_rel(dest, rel));
+                }
+            }
+            if READ_ONLY.iter().any(|r| host.starts_with(r)) {
+                let exists = match expect_file {
+                    true => host.is_file(),
+                    false => host.is_dir(),
+                };
+                if exists {
+                    out.push(host);
+                }
+            }
+        }
+        out
     };
     let mut masks: Vec<(&str, PathBuf)> = Vec::new();
-    // Credential files, as named and wherever an allowed path shows them.
-    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from).filter(|c| c.is_absolute());
-    for p in [Some(home.join(".cargo")), cargo_home].iter().flatten().flat_map(|c| MASKED.iter().map(|m| c.join(m))) {
-        if !std::fs::metadata(&p).is_ok_and(|m| m.is_file()) {
-            continue;
-        }
+    // Credential files, as named and wherever an allowed path, seed, bind
+    // mount, or hard link shows them.
+    for p in &cred_paths {
         // A link (a dotfiles manager's) is never bound over: `bwrap` would
         // follow it to where the sandbox shows nothing and fail (BUG-1369).
         // Its target is masked wherever the sandbox shows it (below); where
         // it does not, the link leads nowhere inside.
-        let linked = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
+        let linked = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
         if !linked && bound.iter().any(|(d, _)| p.starts_with(d)) {
             masks.push(("/dev/null", p.clone()));
         }
         if let Ok(c) = p.canonicalize() {
-            masks.extend(aliases(&c).into_iter().map(|a| ("/dev/null", a)));
-            // Under a folder the sandbox shows read-only, as itself.
-            if linked && READ_ONLY.iter().any(|r| c.starts_with(r)) {
-                masks.push(("/dev/null", c));
-            }
+            masks.extend(aliases(&c, true).into_iter().map(|a| ("/dev/null", a)));
         }
+    }
+    #[cfg(unix)]
+    for (dest, src) in &shown {
+        masks.extend(hardlinks.find_cred_links(dest, src, &mounts).into_iter().map(|a| ("/dev/null", a)));
     }
     // The Veil identity and keys, the daemon's store and socket, and the
     // real project.
     for (vh, v) in &private {
-        masks.extend(normal(vh).into_iter().chain([v.clone()]).chain(aliases(v)).map(|v| ("", v)));
+        masks.extend(normal(vh).into_iter().chain([v.clone()]).chain(aliases(v, false)).map(|v| ("", v)));
     }
     if let Some(r) = root {
-        masks.extend(aliases(r).into_iter().filter(|a| a != r).map(|a| ("", a)));
+        masks.extend(aliases(r, false).into_iter().filter(|a| a != r).map(|a| ("", a)));
     }
     let mut done: Vec<PathBuf> = Vec::new();
     let mut hide: Vec<OsString> = Vec::new();
@@ -1036,6 +1707,9 @@ fn base_args(home: &Path, root: Option<&Path>, allow: &[(PathBuf, bool)], seeds:
     let allowed = bound
         .into_iter()
         .map(|(dest, src)| {
+            #[cfg(unix)]
+            let holds_project = protected_root.as_ref().is_some_and(|pr| pr.held_by(&dest, &src, file_id(&src), true).is_some());
+            #[cfg(not(unix))]
             let holds_project = root.is_some_and(|r| r.starts_with(&src));
             let hidden_below = done.iter().any(|m| m.starts_with(&dest) && m.parent() != Some(dest.as_path()));
             let kind = match std::fs::metadata(&src) {
@@ -2239,5 +2913,202 @@ mod tests {
             }
             assert!(*d != ".local/share" && *d != ".local", "{d} shows keyrings");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bug_1519_mountinfo_parser_and_alias_resolution_cover_bind_reverse_subtree_overlay_and_bindfs() {
+        let raw = concat!(
+            "20 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n",
+            "21 20 8:1 /data/alice /home/alice rw,relatime shared:1 - ext4 /dev/sda1 rw\n",
+            "22 20 8:1 / /mnt/disk2 rw,relatime shared:1 - ext4 /dev/sda1 rw\n",
+            "23 20 0:44 / /tmp/space\\040dir rw,nosuid - tmpfs tmpfs rw\n",
+            "24 23 8:1 /data/alice/.config /tmp/space\\040dir/cfg rw - ext4 /dev/sda1 rw\n",
+            "25 20 8:1 /data/alice/.config/veil/keys /tmp/subkeys rw - ext4 /dev/sda1 rw\n",
+            "26 20 8:1 /data/alice/.cache/pip /tmp/safe_pip rw - ext4 /dev/sda1 rw\n",
+            "27 20 0:99 / /tmp/bindfs_home rw - fuse.bindfs /home/alice rw\n",
+            "28 20 0:100 / /tmp/ov rw - overlay overlay lowerdir=/data/alice/.config:/var/empty,upperdir=/tmp/up\n",
+        );
+        let table = MountTable::parse(raw.as_bytes(), |p| p == Path::new("/home/alice"));
+        let dev_disk = make_dev(8, 1);
+        let dev_of = |p: &Path| {
+            if p.starts_with("/tmp/bindfs_home") {
+                Some(make_dev(0, 99))
+            } else if p.starts_with("/tmp/ov") {
+                Some(make_dev(0, 100))
+            } else if p.starts_with("/tmp/space dir/cfg") {
+                Some(dev_disk)
+            } else if p.starts_with("/tmp/space dir") {
+                Some(make_dev(0, 44))
+            } else {
+                Some(dev_disk)
+            }
+        };
+
+        // 1. Reverse bind mount (/data/alice -> /home/alice), double-mounted disk,
+        //    submount inside tmpfs with space in path, subtree bind mount, bindfs, and overlay.
+        let (exact, subtrees) = table.aliases_with(Path::new("/home/alice/.config/veil"), Path::new(""), dev_of);
+        for expected in [
+            "/home/alice/.config/veil",
+            "/data/alice/.config/veil",
+            "/mnt/disk2/data/alice/.config/veil",
+            "/tmp/space dir/cfg/veil",
+            "/tmp/bindfs_home/.config/veil",
+            "/tmp/ov/veil",
+        ] {
+            assert!(
+                exact.iter().any(|a| a == Path::new(expected)),
+                "missing exact alias {expected} in {exact:?}"
+            );
+        }
+        assert!(subtrees.iter().any(|a| a == Path::new("/tmp/subkeys")), "missing subtree alias in {subtrees:?}");
+        // Safe sibling bind mount must NOT appear as an alias of veil.
+        assert!(!exact.iter().chain(&subtrees).any(|a| a.starts_with("/tmp/safe_pip")), "false positive alias: {exact:?} {subtrees:?}");
+
+        // 2. Non-existent daemon folder under ~/.cache resolves through reverse mount too.
+        let (daemon_exact, daemon_sub) = table.aliases_with(Path::new("/home/alice/.cache"), Path::new("veil/daemon"), dev_of);
+        assert!(daemon_exact.iter().any(|a| a == Path::new("/data/alice/.cache/veil/daemon")), "{daemon_exact:?}");
+        assert!(daemon_exact.iter().any(|a| a == Path::new("/tmp/bindfs_home/.cache/veil/daemon")), "{daemon_exact:?}");
+        assert!(!daemon_exact.iter().chain(&daemon_sub).any(|a| a.starts_with("/tmp/safe_pip")), "{daemon_exact:?} {daemon_sub:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bug_1519_real_kernel_bind_mounts_are_refused_without_root() {
+        const CHILD_ENV: &str = "VEIL_TEST_BUG_1519_ROOT";
+        if let Ok(base_str) = std::env::var(CHILD_ENV) {
+            let base = PathBuf::from(base_str);
+            let home = base.join("home");
+            let proj = base.join("proj-wrap/proj");
+            let alias_root = base.join("alias-root");
+            let alias_veil = base.join("alias-veil");
+            let alias_sub = base.join("alias-sub");
+            let alias_file_dir = base.join("alias-file-dir");
+            let alias_file = alias_file_dir.join("id.json");
+            let alias_cache = base.join("alias-cache");
+            let alias_cargo = base.join("alias-cargo");
+            let alias_proj = base.join("alias-proj");
+            let alias_pip = base.join("alias-pip");
+            let alias_proj_parent = base.join("alias-proj-parent");
+
+            // (a) Ancestor bind mount holding Veil home & daemon dir: refused by allow & seed,
+            //     and `narrower` must not suggest subdirectories holding Veil's folders.
+            let e = base_args(&home, Some(&proj), &[(alias_root.clone(), true)], &[], false).unwrap_err();
+            let msg = format!("{e:#}");
+            assert!(msg.contains("holds the Veil"), "{msg}");
+            assert!(!msg.contains("alias-root/config"), "narrower suggested alias holding Veil home: {msg}");
+            let se = seed(&format!("{}:/tmp/s", alias_root.display()), &proj, Some(&home)).unwrap_err();
+            assert!(format!("{se:#}").contains("Veil") || format!("{se:#}").contains("home"), "{se:#}");
+
+            // (b) Bind mount of Veil home itself: refused.
+            let e = base_args(&home, Some(&proj), &[(alias_veil.clone(), true)], &[], false).unwrap_err();
+            assert!(format!("{e:#}").contains("Veil home or the Veil daemon's folders"), "{e:#}");
+
+            // (c) Bind mount of a subdirectory inside Veil home: refused.
+            let e = base_args(&home, Some(&proj), &[(alias_sub.clone(), true)], &[], false).unwrap_err();
+            assert!(format!("{e:#}").contains("Veil home or the Veil daemon's folders"), "{e:#}");
+
+            // (d) File bind mount of identity.json: both the file and its parent directory refused.
+            let e = base_args(&home, Some(&proj), &[(alias_file.clone(), true)], &[], false).unwrap_err();
+            assert!(format!("{e:#}").contains("Veil home"), "{e:#}");
+            let e = base_args(&home, Some(&proj), &[(alias_file_dir.clone(), true)], &[], false).unwrap_err();
+            assert!(format!("{e:#}").contains("holds the Veil"), "{e:#}");
+
+            // (e) Bind mount of ~/.cache when daemon folder does not exist yet: refused.
+            let e = base_args(&home, Some(&proj), &[(alias_cache.clone(), true)], &[], false).unwrap_err();
+            assert!(format!("{e:#}").contains("holds the Veil daemon's folder"), "{e:#}");
+
+            // (f) Bind mount of ~/.cargo: allowed, and credentials.toml is masked through the alias.
+            let m = base_args(&home, Some(&proj), &[(alias_cargo.clone(), true)], &[], false).unwrap();
+            assert!(
+                m.hidden.iter().any(|h| h == &alias_cargo.join("credentials.toml")),
+                "credentials.toml not masked under bind mount: {:?}",
+                m.hidden
+            );
+
+            // (g) Bind mount of the project root: refused by allow & seed; bind mount of a
+            //     parent holding ONLY the project (no Veil dir) masks the project alias.
+            let e = base_args(&home, Some(&proj), &[(alias_proj.clone(), true)], &[], false).unwrap_err();
+            assert!(format!("{e:#}").contains("inside the project"), "{e:#}");
+            let se = seed(&format!("{}:/tmp/s", alias_proj.display()), &proj, Some(&home)).unwrap_err();
+            assert!(format!("{se:#}").contains("project"), "{se:#}");
+            let m = base_args(&home, Some(&proj), &[(alias_proj_parent.clone(), true)], &[], false).unwrap();
+            assert!(
+                m.hidden.iter().any(|h| h == &alias_proj_parent.join("proj")),
+                "project root not masked under bind mount: {:?}",
+                m.hidden
+            );
+
+            // (h) Bind mount of a safe sibling directory: allowed by both allow and seed.
+            base_args(&home, Some(&proj), &[(alias_pip.clone(), true)], &[], false).unwrap();
+            seed(&format!("{}:/tmp/s", alias_pip.display()), &proj, Some(&home)).unwrap();
+            return;
+        }
+
+        let Some(bwrap) = find_program("bwrap", None) else {
+            eprintln!("skipping: bubblewrap is not installed");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let config = base.join("config");
+        let veil_sub = config.join("veil/sub");
+        let cache_pip = home.join(".cache/pip");
+        let cargo = home.join(".cargo");
+        let proj_wrap = base.join("proj-wrap");
+        let proj = proj_wrap.join("proj");
+        for d in [
+            &veil_sub,
+            &cache_pip,
+            &cargo,
+            &proj,
+            &base.join("sibling"),
+            &base.join("alias-root"),
+            &base.join("alias-veil"),
+            &base.join("alias-sub"),
+            &base.join("alias-file-dir"),
+            &base.join("alias-cache"),
+            &base.join("alias-cargo"),
+            &base.join("alias-proj"),
+            &base.join("alias-pip"),
+            &base.join("alias-proj-parent"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(config.join("veil/identity.json"), "{\"secret\":\"id\"}\n").unwrap();
+        std::fs::write(base.join("alias-file-dir/id.json"), "").unwrap();
+        std::fs::write(cargo.join("credentials.toml"), "token = \"secret\"\n").unwrap();
+        std::fs::write(cache_pip.join("ok.txt"), "ok\n").unwrap();
+
+        let out = std::process::Command::new(&bwrap)
+            .args(["--dev-bind", "/", "/"])
+            .args(["--bind"]).arg(&base).arg(base.join("alias-root"))
+            .args(["--bind"]).arg(config.join("veil")).arg(base.join("alias-veil"))
+            .args(["--bind"]).arg(&veil_sub).arg(base.join("alias-sub"))
+            .args(["--bind"]).arg(config.join("veil/identity.json")).arg(base.join("alias-file-dir/id.json"))
+            .args(["--bind"]).arg(home.join(".cache")).arg(base.join("alias-cache"))
+            .args(["--bind"]).arg(&cargo).arg(base.join("alias-cargo"))
+            .args(["--bind"]).arg(&proj).arg(base.join("alias-proj"))
+            .args(["--bind"]).arg(&cache_pip).arg(base.join("alias-pip"))
+            .args(["--bind"]).arg(&proj_wrap).arg(base.join("alias-proj-parent"))
+            .arg("--")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "confine::tests::bug_1519_real_kernel_bind_mounts_are_refused_without_root", "--nocapture"])
+            .env(CHILD_ENV, &base)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env_remove("VEIL_HOME")
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_RUNTIME_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed ({}):\n{}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
