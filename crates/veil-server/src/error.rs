@@ -154,6 +154,18 @@ impl Error {
             source: std::io::Error::other(CarriedError(self)),
         }
     }
+
+    /// Map [`veil_core::VeilError`] from validating or decoding an object a
+    /// client uploaded or named in a write (`upload`, `push`, `changes`);
+    /// server-side reads of already-stored objects convert through `From`,
+    /// which treats `Missing` and `Corrupt` as `500 internal` (BUG-2681).
+    pub(crate) fn client_object(e: veil_core::VeilError) -> Error {
+        match e {
+            veil_core::VeilError::Corrupt(_, m) => Error::bad_request(format!("invalid object: {m}")),
+            veil_core::VeilError::Missing(id) => Error::bad_request(format!("missing object {}", id.short())),
+            other => Error::from(other),
+        }
+    }
 }
 
 /// How [`Answer`] participates in server-side retries.
@@ -307,11 +319,13 @@ impl From<veil_core::VeilError> for Error {
     fn from(e: veil_core::VeilError) -> Error {
         match e {
             veil_core::VeilError::Policy(m) => Error::forbidden(m),
-            veil_core::VeilError::Corrupt(_, m) => Error::bad_request(format!("invalid object: {m}")),
-            veil_core::VeilError::Missing(id) => Error::bad_request(format!("missing object {}", id.short())),
             veil_core::VeilError::Io { source, .. } if source.get_ref().is_some_and(|i| i.is::<CarriedError>()) => {
                 source.into_inner().unwrap().downcast::<CarriedError>().unwrap().0
             }
+            // Server-side reads and decodes of stored objects go through `?`:
+            // `Missing` and `Corrupt` here are server storage faults (logged,
+            // 500 internal, naming no object id: BUG-2681). Client uploads use
+            // `Error::client_object`.
             other => Error::Other(other.into()),
         }
     }
@@ -444,5 +458,32 @@ mod tests {
             }
             other => panic!("expected Error::Api deadline, got {other:?}"),
         }
+    }
+
+    /// BUG-2681: `VeilError::Missing` and `VeilError::Corrupt` default through
+    /// `From` to `500 internal` without object ids, while `Error::client_object`
+    /// preserves the `400 bad_request` answers for client uploads and writes.
+    #[test]
+    fn bug_2681_stored_veil_errors_default_to_internal_while_client_object_maps_to_400() {
+        let id = veil_core::ObjectId::hash(b"hidden-stored-object");
+        for stored in [
+            Error::from(veil_core::VeilError::Missing(id)).answer(),
+            Error::from(veil_core::VeilError::Corrupt(id.hex(), "bad header".into())).answer(),
+        ] {
+            assert_eq!(stored.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(stored.code, "internal");
+            assert_eq!(stored.message, "internal error");
+            assert!(!stored.message.contains(&id.short()));
+        }
+
+        let client_missing = Error::client_object(veil_core::VeilError::Missing(id)).answer();
+        assert_eq!(client_missing.status, StatusCode::BAD_REQUEST);
+        assert_eq!(client_missing.code, "bad_request");
+        assert_eq!(client_missing.message, format!("missing object {}", id.short()));
+
+        let client_corrupt = Error::client_object(veil_core::VeilError::Corrupt(id.hex(), "bad tree".into())).answer();
+        assert_eq!(client_corrupt.status, StatusCode::BAD_REQUEST);
+        assert_eq!(client_corrupt.code, "bad_request");
+        assert_eq!(client_corrupt.message, "invalid object: bad tree");
     }
 }
