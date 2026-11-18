@@ -117,7 +117,7 @@ impl Error {
             // time (BUG-1496, BUG-1622): the caller may try again.
             Error::Other(e) if crate::pack::indexes_full(&e) => {
                 eprintln!("veil-server: {e:#}");
-                Answer { status: StatusCode::SERVICE_UNAVAILABLE, code: "busy", message: e.to_string(), retry: Retry::None }
+                Answer { status: StatusCode::SERVICE_UNAVAILABLE, code: "busy", message: crate::pack::IndexesFull.to_string(), retry: Retry::None }
             }
             // The object store stayed busy (429, 503) or unreachable for all
             // of its retries (BUG-2430: a MinIO restarting under load gave
@@ -399,6 +399,18 @@ mod tests {
         assert_eq!(store.code, "busy");
         assert_eq!(store.message, "the object store is busy; try again");
         assert_eq!(store.retry, Retry::None);
+
+        let wrapped_idx = Error::from(veil_core::VeilError::Io {
+            path: "object store".into(),
+            source: std::io::Error::other(AnyhowCause(
+                anyhow::Error::new(crate::pack::IndexesFull).context("CANARY-INDEXES-CONTEXT-2680"),
+            )),
+        })
+        .answer();
+        assert_eq!(wrapped_idx.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(wrapped_idx.code, "busy");
+        assert_eq!(wrapped_idx.message, crate::pack::IndexesFull.to_string());
+        assert_eq!(wrapped_idx.retry, Retry::None);
 
         // `GcEpochChanged` wrapped inside `VeilError::Io` (as `sync::Source` wraps object reads).
         let wrapped_gc = Error::from(veil_core::VeilError::Io {

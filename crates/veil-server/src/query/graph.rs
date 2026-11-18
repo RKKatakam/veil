@@ -1612,7 +1612,12 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
             true => leased_fill(&hub, &project, &viewer, &key.1, &tips, &at).await,
             false => walk_tips(&hub, &project, &viewer, &tips, false, &at, Some(&hub.query.row_slots)).await.map(|_| ()),
         };
-        let out = r.map_err(Error::answer);
+        let out = r.map_err(|e| match e {
+            Error::Api { status, code, message } => {
+                Error::Other(anyhow::anyhow!("filling a viewer graph of project {}: unexpected {status} ({code}): {message}", project.id)).answer()
+            }
+            other => other.answer(),
+        });
         hub.query.fills.lock().unwrap().remove(&key);
         let rows_done = !files && out.is_ok();
         let _ = tx.send(Some(out));

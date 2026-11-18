@@ -3547,6 +3547,7 @@ fn consolidated_landing_pass_file_history_and_blame_memos_match_projected_files(
 enum BlameFault {
     Pass,
     Internal,
+    Missing,
     StoreBusy,
     GcEpochOnce,
     GcEpochAlways,
@@ -3557,17 +3558,20 @@ struct FaultBlobStore {
     target_key: String,
     blob_hex: String,
     mode: std::sync::Mutex<BlameFault>,
-    hold: Duration,
+    gate: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
     faulted: std::sync::atomic::AtomicU64,
 }
 
 impl FaultBlobStore {
-    async fn maybe_fail(&self, key: &str) -> anyhow::Result<()> {
+    async fn maybe_fail(&self, key: &str) -> anyhow::Result<bool> {
         if key != self.target_key {
-            return Ok(());
+            return Ok(false);
         }
-        if !self.hold.is_zero() {
-            tokio::time::sleep(self.hold).await;
+        if self.gate.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
         }
         let m = {
             let mut g = self.mode.lock().unwrap();
@@ -3578,7 +3582,11 @@ impl FaultBlobStore {
             cur
         };
         match m {
-            BlameFault::Pass => Ok(()),
+            BlameFault::Pass => Ok(false),
+            BlameFault::Missing => {
+                self.faulted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(true)
+            }
             BlameFault::Internal => {
                 self.faulted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(anyhow::anyhow!("CANARY-INTERNAL-2680-SECRET-{}", self.blob_hex))
@@ -3598,7 +3606,9 @@ impl FaultBlobStore {
 #[async_trait::async_trait]
 impl veil_server::store::BlobStore for FaultBlobStore {
     async fn get(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
-        self.maybe_fail(key).await?;
+        if self.maybe_fail(key).await? {
+            return Ok(None);
+        }
         self.inner.get(key).await
     }
     async fn put(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
@@ -3611,7 +3621,9 @@ impl veil_server::store::BlobStore for FaultBlobStore {
         self.inner.len(key).await
     }
     async fn get_range(&self, key: &str, start: u64, end: u64) -> anyhow::Result<Option<(bytes::Bytes, u64)>> {
-        self.maybe_fail(key).await?;
+        if self.maybe_fail(key).await? {
+            return Ok(None);
+        }
         self.inner.get_range(key, start, end).await
     }
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
@@ -3651,9 +3663,10 @@ fn fault_hub_for_blame(
     })
 }
 
-/// BUG-2680: when a blame job fails with an internal error, the route must
-/// answer `500` with code `internal` and message `"internal error"`, never
-/// leaking the internal error's `Debug` text or object ids to any waiter.
+/// BUG-2680: when a blame job (or viewer-graph fill) fails with an internal or
+/// missing-stored-object error, the route must answer `500` with code
+/// `internal` and message `"internal error"`, never leaking the internal
+/// error's `Debug` text or object ids to any waiter.
 #[test]
 fn bug_2680_a_blame_jobs_internal_error_answers_internal_error_without_detail() {
     use std::sync::{atomic::Ordering::SeqCst, Arc};
@@ -3675,7 +3688,9 @@ fn bug_2680_a_blame_jobs_internal_error_answers_internal_error_without_detail() 
         target_key: veil_server::store::object_key(h.id, &blob_id),
         blob_hex: blob_id.hex(),
         mode: std::sync::Mutex::new(BlameFault::Internal),
-        hold: Duration::from_millis(30),
+        gate: std::sync::atomic::AtomicBool::new(true),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
         faulted: Default::default(),
     });
     let dir = tempfile::tempdir().unwrap();
@@ -3683,16 +3698,34 @@ fn bug_2680_a_blame_jobs_internal_error_answers_internal_error_without_detail() 
     let app = veil_server::api::router(hub.clone());
     let uri = format!("/v1/projects/{}/q/blame?rev=main&path=pub/a.txt", h.name);
 
-    // Two concurrent callers join the same blame job (`JobEnd` cloned across waiters).
+    // Two concurrent callers deterministically join the same blame job via Notify (`entered` -> `joined` -> `release`).
     let (r1, r2) = th.rt.block_on(async {
-        let req1 = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
-        let req2 = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
-        let (a, b) = tokio::join!(app.clone().oneshot(req1), app.clone().oneshot(req2));
-        let (a, b) = (a.unwrap(), b.unwrap());
-        let (s1, s2) = (a.status(), b.status());
-        let b1 = String::from_utf8(axum::body::to_bytes(a.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
-        let b2 = String::from_utf8(axum::body::to_bytes(b.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
-        ((s1, b1), (s2, b2))
+        let entered = store.entered.notified();
+        let joined = hub.query.jobs.joined.notified();
+        let f1 = tokio::spawn({
+            let (app, uri) = (app.clone(), uri.clone());
+            async move {
+                let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let s = resp.status();
+                let b = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+                (s, b)
+            }
+        });
+        entered.await;
+        let f2 = tokio::spawn({
+            let (app, uri) = (app.clone(), uri.clone());
+            async move {
+                let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let s = resp.status();
+                let b = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+                (s, b)
+            }
+        });
+        joined.await;
+        store.release.notify_one();
+        (f1.await.unwrap(), f2.await.unwrap())
     });
 
     for (which, (status, body)) in [("waiter 1", r1), ("waiter 2", r2)] {
@@ -3701,10 +3734,25 @@ fn bug_2680_a_blame_jobs_internal_error_answers_internal_error_without_detail() 
         assert_eq!(json["code"], "internal", "{which}: {body}");
         assert_eq!(json["message"], "internal error", "{which}: {body}");
         assert!(!body.contains("CANARY-INTERNAL-2680"), "{which} leaked internal error text: {body}");
-        assert!(!body.contains(&blob_id.hex()), "{which} leaked blob id: {body}");
+        assert!(!body.contains(&blob_id.short()), "{which} leaked blob id: {body}");
     }
     assert_eq!(hub.query.jobs.started.load(SeqCst), 1, "both waiters shared the one blame job");
     assert_eq!(store.faulted.load(SeqCst), 1, "the blame job hit the injected fault once");
+
+    // Stored blob missing (`VeilError::Missing`) during a blame job must also answer 500 internal, never 400 naming the short id.
+    *store.mode.lock().unwrap() = BlameFault::Missing;
+    let (status, body) = th.rt.block_on(async {
+        let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+        (status, body)
+    });
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing stored blob in blame job: {body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["code"], "internal", "{body}");
+    assert_eq!(json["message"], "internal error", "{body}");
+    assert!(!body.contains(&blob_id.short()), "missing stored blob leaked short id: {body}");
 
     // Once the fault clears, the same route succeeds.
     *store.mode.lock().unwrap() = BlameFault::Pass;
@@ -3718,6 +3766,36 @@ fn bug_2680_a_blame_jobs_internal_error_answers_internal_error_without_detail() 
     assert_eq!(status, axum::http::StatusCode::OK, "after fault clears: {body}");
     let json: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["line_count"], 2, "{body}");
+
+    // Stored snapshot missing (`VeilError::Missing`) during a viewer-graph fill must also answer 500 internal, never 400 naming the short id.
+    let tip2 = h.commit(&th, &[tip], Files::from([("pub/a.txt".to_string(), b"alpha\nbeta\ngamma\n".to_vec())]), [10; 16], 1_700_000_002_000, None);
+    h.set_branch(&th, "main", tip2);
+    assert_eq!(h.derive(&th).snapshots, 1);
+    let store_fill = Arc::new(FaultBlobStore {
+        inner: h.hub.objects.blob_store().clone(),
+        target_key: veil_server::store::object_key(h.id, &tip2),
+        blob_hex: tip2.hex(),
+        mode: std::sync::Mutex::new(BlameFault::Missing),
+        gate: std::sync::atomic::AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        faulted: Default::default(),
+    });
+    let dir_fill = tempfile::tempdir().unwrap();
+    let hub_fill = fault_hub_for_blame(&th, &h.hub, store_fill, dir_fill.path());
+    let app_fill = veil_server::api::router(hub_fill);
+    let (status, body) = th.rt.block_on(async {
+        let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
+        let resp = app_fill.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
+        (status, body)
+    });
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "missing stored snapshot in viewer-graph fill: {body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["code"], "internal", "{body}");
+    assert_eq!(json["message"], "internal error", "{body}");
+    assert!(!body.contains(&tip2.short()), "missing stored snapshot in fill leaked short id: {body}");
 }
 
 /// BUG-2680: a busy object store (`StoreUnavailable`) or a GC epoch change
@@ -3745,7 +3823,9 @@ fn bug_2680_a_busy_store_or_gc_epoch_change_in_a_blame_job_answers_busy_retryabl
         target_key: veil_server::store::object_key(h.id, &blob_id),
         blob_hex: blob_id.hex(),
         mode: std::sync::Mutex::new(BlameFault::StoreBusy),
-        hold: Duration::ZERO,
+        gate: std::sync::atomic::AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
         faulted: Default::default(),
     });
     let dir = tempfile::tempdir().unwrap();
@@ -3826,7 +3906,9 @@ fn bug_2680_a_busy_store_or_gc_epoch_change_in_a_blame_job_answers_busy_retryabl
         target_key: veil_server::store::object_key(h.id, &tip2),
         blob_hex: tip2.hex(),
         mode: std::sync::Mutex::new(BlameFault::StoreBusy),
-        hold: Duration::ZERO,
+        gate: std::sync::atomic::AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
         faulted: Default::default(),
     });
     let dir2 = tempfile::tempdir().unwrap();
