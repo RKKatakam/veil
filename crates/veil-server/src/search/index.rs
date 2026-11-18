@@ -31,11 +31,11 @@
 //! under the accepted policy, queries answer `indexing` (never a result
 //! outside the new access).
 //!
-//! **Bounded.** A segment is written once it holds 16 MiB of content, 2
+//! **Bounded.** A segment is written once it holds 32 MiB of content, 4
 //! million postings or 100,000 documents; segments are merged when the
 //! newest two are of similar size (sizes stay geometric), when a shard
 //! has more than 64, and a shard is rewritten when more of its documents
-//! are dead than half its live ones; a merge's inputs stay under 16 MiB,
+//! are dead than half its live ones; a merge's inputs stay under 64 MiB,
 //! and a rewrite holds one group of them and the shard's paths.
 //!
 //! **Consistent.** Segments are immutable objects (content-addressed,
@@ -78,11 +78,11 @@ pub const WALK: &str = "walk";
 
 /// A segment is written once it holds this much content, postings or
 /// documents.
-pub const FLUSH_BYTES: u64 = 16 << 20;
-pub const FLUSH_POSTINGS: usize = 2 << 20;
+pub const FLUSH_BYTES: u64 = 32 << 20;
+pub const FLUSH_POSTINGS: usize = 4 << 20;
 pub const FLUSH_DOCS: usize = 100_000;
 /// Most encoded bytes a merge writes (and so its inputs hold).
-pub const MERGE_CAP: u64 = 16 << 20;
+pub const MERGE_CAP: u64 = 64 << 20;
 /// Most segments a shard keeps before its smallest neighbours merge.
 pub const MAX_SEGMENTS: usize = 64;
 /// Names gathered by a walk before they are written as segments.

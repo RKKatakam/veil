@@ -76,9 +76,15 @@ pub fn spawn_scoped<'s, 'e, T: Send + 's>(s: &'s std::thread::Scope<'s, 'e>, f: 
 }
 
 /// Combined ceiling on [`Hub::objects`], [`Hub::trees`], and [`Hub::segments`]
-/// (BUG-2663): each sub-cache keeps its 256 MiB cap, and their sum stays at or
-/// below 512 MiB regardless of background indexing or query order.
+/// (BUG-2663): `objects` and `trees` each keep their 256 MiB cap, `segments`
+/// is capped at [`SEGMENT_CACHE_BYTES`] (160 MiB, so `objects` + `trees`
+/// always retain at least 352 MiB under competing search + pull load), and
+/// their sum stays at or below 512 MiB regardless of background indexing or
+/// query order.
 pub const HUB_CACHE_BYTES: usize = 512 << 20;
+/// Individual ceiling on [`Hub::segments`] within [`HUB_CACHE_BYTES`]
+/// (BUG-2663).
+pub const SEGMENT_CACHE_BYTES: usize = 160 << 20;
 
 /// Shared server state.
 pub struct Hub {
@@ -86,8 +92,8 @@ pub struct Hub {
     pub objects: Arc<store::Objects>,
     /// Decoded trees, by [`store::Objects::tree_key`].
     pub trees: LruCache<(Arc<Tree>, TreeEncoding)>,
-    /// Decoded search segments, sharing [`HUB_CACHE_BYTES`] with
-    /// [`Hub::objects`] and [`Hub::trees`] (BUG-2663).
+    /// Decoded search segments, capped at [`SEGMENT_CACHE_BYTES`] and sharing
+    /// [`HUB_CACHE_BYTES`] with [`Hub::objects`] and [`Hub::trees`] (BUG-2663).
     pub segments: LruCache<Arc<search::segment::Segment>>,
     /// The server's own signing identity: projected snapshots are signed
     /// with it.
@@ -254,7 +260,7 @@ pub async fn start(config: Config) -> Result<Running> {
         db: db.clone(),
         objects: Arc::new(store::Objects::with_db_and_budget(blob, 256 << 20, Some(db.clone()), Some(&cache_budget))),
         trees: LruCache::with_budget(256 << 20, &cache_budget),
-        segments: LruCache::with_budget(256 << 20, &cache_budget),
+        segments: LruCache::with_budget(SEGMENT_CACHE_BYTES, &cache_budget),
         identity,
         receipt_key,
         grants,

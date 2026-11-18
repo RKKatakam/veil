@@ -199,6 +199,7 @@ fn finish_encoded(mut out: Vec<u8>, gram_count: u32, table: Vec<u8>, postings: V
 /// A decoded segment.
 pub struct Segment {
     pub docs: Vec<Doc>,
+    by_path: HashMap<String, u32>,
     pub dead: HashSet<String>,
     /// `(trigram, offset, length, count)`, sorted by trigram.
     grams: Vec<(u32, u32, u32, u32)>,
@@ -246,7 +247,7 @@ impl Segment {
             let id = ObjectId(r.take(32)?.try_into().unwrap());
             let size = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
             let flags = r.take(1)?[0];
-            weight += path.len() + 64;
+            weight += 2 * path.len() + 120;
             docs.push(Doc { path, id, size, flags });
         }
         let nd = r.u32()? as usize;
@@ -267,9 +268,11 @@ impl Segment {
                 return Err(corrupt());
             }
         }
+        let by_path = docs.iter().enumerate().map(|(i, d)| (d.path.clone(), i as u32)).collect();
         weight += grams.len() * 16 + postings.len() + 256;
         Ok(Segment {
             docs,
+            by_path,
             dead,
             grams,
             postings,
@@ -280,12 +283,12 @@ impl Segment {
     /// Does this segment hold a document or a tombstone at `path` (so that
     /// every older segment's document there is dead)?
     pub fn shadows(&self, path: &str) -> bool {
-        self.find(path).is_some() || self.dead.contains(path)
+        self.by_path.contains_key(path) || self.dead.contains(path)
     }
 
     /// The ordinal of the document at `path`.
     pub fn find(&self, path: &str) -> Option<u32> {
-        self.docs.binary_search_by(|d| tree_cmp(&d.path, path)).ok().map(|i| i as u32)
+        self.by_path.get(path).copied()
     }
 
     /// How many documents hold trigram `g` (a cost estimate).

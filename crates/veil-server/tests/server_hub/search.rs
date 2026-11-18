@@ -1704,9 +1704,17 @@ fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
         .unwrap();
     assert!(loaded_weight >= 140 << 20, "expected >= 140 MiB of decoded segments, got {} MiB", loaded_weight >> 20);
     assert!(
-        srv.hub().segments.stats().weight >= 140 << 20,
-        "expected segments cached in Hub::segments, got {} MiB",
+        srv.hub().segments.stats().weight >= 140 << 20
+            && srv.hub().segments.stats().weight <= veil_server::SEGMENT_CACHE_BYTES,
+        "expected segments cached in Hub::segments within 140..=160 MiB, got {} MiB",
         srv.hub().segments.stats().weight >> 20,
+    );
+    assert!(
+        srv.hub().objects.cached_bytes() + srv.hub().trees.stats().weight
+            >= veil_server::HUB_CACHE_BYTES - veil_server::SEGMENT_CACHE_BYTES - (8 << 20),
+        "expected objects ({} MiB) + trees ({} MiB) to retain ~352 MiB under 160 MiB segment cap",
+        srv.hub().objects.cached_bytes() >> 20,
+        srv.hub().trees.stats().weight >> 20,
     );
     assert!(
         total_cached() <= veil_server::HUB_CACHE_BYTES,
