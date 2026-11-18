@@ -342,18 +342,33 @@ const GROUP_SEC: i64 = 900_002;
 const GROUP_FIN: i64 = 900_003;
 
 /// The policy and bindings of a generated project; `carol` is a person id.
+/// The groups' ids are fixed: no row is made for them (a test that makes
+/// the rows takes ids of its own, [`policy_of`]).
 pub fn policy(carol: i64) -> (String, BTreeMap<String, Binding>) {
+    policy_of([GROUP_DEVS, GROUP_SEC, GROUP_FIN], carol)
+}
+
+/// [`policy`] with these ids for the groups `devs`, `security` and
+/// `finance`.
+pub fn policy_of([devs, security, finance]: [i64; 3], carol: i64) -> (String, BTreeMap<String, Binding>) {
     let text = "pub/ public devs\npub/sec/ security\nfin/ finance\ncarol-d/ carol\n".to_string();
     let b = BTreeMap::from([
-        ("devs".to_string(), Binding::Group(GROUP_DEVS)),
-        ("security".to_string(), Binding::Group(GROUP_SEC)),
-        ("finance".to_string(), Binding::Group(GROUP_FIN)),
+        ("devs".to_string(), Binding::Group(devs)),
+        ("security".to_string(), Binding::Group(security)),
+        ("finance".to_string(), Binding::Group(finance)),
         ("carol".to_string(), Binding::Person(carol)),
     ]);
     (text, b)
 }
 
 pub fn viewers(carol: i64) -> Vec<(&'static str, Viewer)> {
+    viewers_of([GROUP_DEVS, GROUP_SEC, GROUP_FIN], [800_001, 800_002, 800_003, 800_004], carol)
+}
+
+/// [`viewers`] with these ids for the groups (`devs`, `security`,
+/// `finance`) and for the four people in them (a dev, security, finance,
+/// finance and security).
+pub fn viewers_of([devs, security, finance]: [i64; 3], [dev, sec, fin, both]: [i64; 4], carol: i64) -> Vec<(&'static str, Viewer)> {
     let v = |person: i64, groups: &[i64]| Viewer {
         person: Some(person),
         admin: false,
@@ -363,11 +378,11 @@ pub fn viewers(carol: i64) -> Vec<(&'static str, Viewer)> {
     };
     vec![
         ("anyone on Earth", Viewer::default()),
-        ("a dev", v(800_001, &[GROUP_DEVS])),
-        ("security", v(800_002, &[GROUP_SEC])),
-        ("finance", v(800_003, &[GROUP_FIN])),
+        ("a dev", v(dev, &[devs])),
+        ("security", v(sec, &[security])),
+        ("finance", v(fin, &[finance])),
         ("carol", v(carol, &[])),
-        ("finance and security", v(800_004, &[GROUP_FIN, GROUP_SEC])),
+        ("finance and security", v(both, &[finance, security])),
     ]
 }
 

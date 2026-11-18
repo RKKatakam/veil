@@ -34,6 +34,22 @@ fn body_str(r: &Reply) -> String {
     String::from_utf8_lossy(&r.body).into_owned()
 }
 
+/// A read as a client makes it (BUG-2582): asked again while the answer is
+/// `503 warming` (the caller's history is being prepared; `vl` waits it
+/// out, `hub.rs` `Waits`), for up to two minutes. The answer that is not
+/// `warming` is returned as it is, for the caller's own assertions.
+fn settled_get(api: &Api, token: &str, path: &str) -> Reply {
+    let end = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let r = api.get(Some(token), path);
+        let warming = r.status == 503 && serde_json::from_slice::<Value>(&r.body).is_ok_and(|v| v["code"] == "warming");
+        if !warming || std::time::Instant::now() >= end {
+            return r;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn assert_no_str(text: &str, markers: &[&str], where_: &str) {
     for m in markers {
         assert!(!text.contains(m), "found forbidden marker {m:?} in {where_}: {text}");
@@ -826,13 +842,15 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     ord_c.file("src/ord_ref.rs", "pub const ORD: u8 = 1;\n");
     let ord_ch = ord_c.push_to("ord-ref", None);
     assert_eq!(ord_ch.status, 200, "{}", body_str(&ord_ch));
-    let ord_pr = api1
-        .post_json(
-            Some(&dev_tok),
-            &format!("/v1/projects/{}/prs", p.name),
-            &json!({"head": "ord-ref", "title": "Ordinary reference PR"}),
-        )
-        .json();
+    let ord_pr = api1.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"head": "ord-ref", "title": "Ordinary reference PR"}),
+    );
+    // BUG-2581: a refusal's keys (shed under load) must not become the
+    // "ordinary PR" shape.
+    assert_eq!(ord_pr.status, 200, "the ordinary reference PR is opened: {}", body_str(&ord_pr));
+    let ord_pr = ord_pr.json();
     let mut ord_keys: Vec<String> = ord_pr.as_object().unwrap().keys().cloned().collect();
     ord_keys.sort();
 
@@ -930,23 +948,23 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     // The line landed on `main`, once, under `pr_a`'s approval: the release never drops it (BUG-1875).
     let main_after_a = api1.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
     assert_ne!(main_after_a, main_before_a, "the released line must land on main");
-    let main_file_a = api1.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/release_ordinary.rs", p.name));
+    let main_file_a = settled_get(&api1, &dev_tok, &format!("/v1/projects/{}/q/file?rev=main&path=src/release_ordinary.rs", p.name));
     assert_eq!(main_file_a.status, 200, "{}", body_str(&main_file_a));
     assert!(body_str(&main_file_a).contains("CASE-A-3301"));
     // The follow-up did not land with it (not armed, not approved).
-    let no_follow = api1.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/release_followup.rs", p.name));
+    let no_follow = settled_get(&api1, &dev_tok, &format!("/v1/projects/{}/q/file?rev=main&path=src/release_followup.rs", p.name));
     assert_eq!(no_follow.status, 404, "{}", body_str(&no_follow));
     assert!(!api1.tips(Some(&sec_tok), &p.name).unwrap().branches.contains_key(&format!("embargo/{eid_a}")), "the line is retired");
 
     for (srv, api) in [("hub1", &api1), ("hub2", &api2)] {
         // `pr_a` landed with the line.
-        let sh = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_a_id}", p.name));
+        let sh = settled_get(api, &dev_tok, &format!("/v1/projects/{}/prs/{pr_a_id}", p.name));
         assert_eq!(sh.status, 200, "{srv} outsider show after release: {}", body_str(&sh));
         assert_eq!(sh.json()["state"], "landed", "{srv}: {}", body_str(&sh));
         assert!(sh.json().get("embargo").is_none(), "{srv}: {}", body_str(&sh));
 
         // Outsider `p.dev` now sees the follow-up PR, with the exact keys of an ordinary PR!
-        let sh = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_a2_id}", p.name));
+        let sh = settled_get(api, &dev_tok, &format!("/v1/projects/{}/prs/{pr_a2_id}", p.name));
         assert_eq!(sh.status, 200, "{srv} outsider show after release: {}", body_str(&sh));
         let sj = sh.json();
         let mut keys: Vec<String> = sj.as_object().unwrap().keys().cloned().collect();
@@ -957,7 +975,7 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
         assert_eq!(sj["review"]["ready"], false, "{srv}");
         assert_eq!(sj["patch"], patch_a2.as_str(), "{srv}: the PR's revision is the one that was reviewable before release");
 
-        let df = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_a2_id}/diff", p.name));
+        let df = settled_get(api, &dev_tok, &format!("/v1/projects/{}/prs/{pr_a2_id}/diff", p.name));
         assert_eq!(df.status, 200, "{srv} diff after release: {}", body_str(&df));
         assert!(body_str(&df).contains("CASE-A-FOLLOWUP-3304"), "{srv}");
         assert!(!body_str(&df).contains("CASE-A-3301"), "{srv}: the follow-up PR is its own change only");
@@ -981,7 +999,7 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     );
     assert_eq!(land_a.status, 200, "ordinary land after release failed: {}", body_str(&land_a));
     assert_eq!(land_a.json()["state"], "landed");
-    let log_a = api2.get(Some(&dev_tok), &format!("/v1/projects/{}/q/log?rev=main&n=2", p.name)).json();
+    let log_a = settled_get(&api2, &dev_tok, &format!("/v1/projects/{}/q/log?rev=main&n=2", p.name)).json();
     assert_eq!(
         log_a["entries"][1]["snapshot_id"].as_str().unwrap(),
         main_after_a.hex(),
@@ -1066,10 +1084,7 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
 
     let main_after_b = api1.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
     assert_ne!(main_after_b, main_before_b, "main must advance when land_at_release PR releases");
-    let main_file_b = api1.get(
-        Some(&dev_tok),
-        &format!("/v1/projects/{}/q/file?rev=main&path=src/land_at_release.rs", p.name),
-    );
+    let main_file_b = settled_get(&api1, &dev_tok, &format!("/v1/projects/{}/q/file?rev=main&path=src/land_at_release.rs", p.name));
     assert_eq!(main_file_b.status, 200, "{}", body_str(&main_file_b));
     assert!(body_str(&main_file_b).contains("CASE-B-3302"));
 
@@ -1097,9 +1112,7 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
         .unwrap();
     assert!(author_id.unwrap_or(0) > 0, "S17 server-signed snapshot must record snapshots.author: {author_id:?}");
 
-    let log_b = api2
-        .get(Some(&dev_tok), &format!("/v1/projects/{}/q/log?rev=main&n=2", p.name))
-        .json();
+    let log_b = settled_get(&api2, &dev_tok, &format!("/v1/projects/{}/q/log?rev=main&n=2", p.name)).json();
     assert_eq!(
         log_b["entries"][1]["snapshot_id"].as_str().unwrap(),
         main_before_b.hex(),
@@ -1107,7 +1120,7 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     );
 
     for (srv, api) in [("hub1", &api1), ("hub2", &api2)] {
-        let sh = api.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_b_id}", p.name)).json();
+        let sh = settled_get(api, &dev_tok, &format!("/v1/projects/{}/prs/{pr_b_id}", p.name)).json();
         assert_eq!(sh["state"], "landed", "{srv}: {sh}");
         assert!(sh.get("embargo").is_none(), "{srv} landed ordinary PR must have no embargo field: {sh}");
     }
@@ -1167,9 +1180,9 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     let dev_tips = api2.tips(Some(&dev_tok), &p.name).unwrap();
     assert!(dev_tips.embargoes.is_empty(), "an outsider saw the held embargo: {:?}", dev_tips.embargoes);
     assert!(!dev_tips.branches.contains_key(&format!("embargo/{eid_c}")));
-    let hidden_pr = api2.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_c_id}", p.name));
+    let hidden_pr = settled_get(&api2, &dev_tok, &format!("/v1/projects/{}/prs/{pr_c_id}", p.name));
     assert_eq!(hidden_pr.status, 404, "a held embargo's PR stays hidden: {}", body_str(&hidden_pr));
-    let hidden_file = api2.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/unapproved_release.rs", p.name));
+    let hidden_file = settled_get(&api2, &dev_tok, &format!("/v1/projects/{}/q/file?rev=main&path=src/unapproved_release.rs", p.name));
     assert_eq!(hidden_file.status, 404, "{}", body_str(&hidden_file));
     // The embargo's groups are told why it waits (on both servers).
     let sec_tips = api2.tips(Some(&sec_tok), &p.name).unwrap();
@@ -1192,10 +1205,10 @@ fn guarantee_3_release_turns_pr_ordinary_or_lands_once_across_two_servers() {
     );
     assert_eq!(app_c.status, 200, "{}", body_str(&app_c));
     assert!(released_c().is_some(), "an approved, held release lands at once");
-    let main_file_c = api1.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev=main&path=src/unapproved_release.rs", p.name));
+    let main_file_c = settled_get(&api1, &dev_tok, &format!("/v1/projects/{}/q/file?rev=main&path=src/unapproved_release.rs", p.name));
     assert_eq!(main_file_c.status, 200, "{}", body_str(&main_file_c));
     assert!(body_str(&main_file_c).contains("CASE-C-3303"));
-    let sh_c = api1.get(Some(&dev_tok), &format!("/v1/projects/{}/prs/{pr_c_id}", p.name)).json();
+    let sh_c = settled_get(&api1, &dev_tok, &format!("/v1/projects/{}/prs/{pr_c_id}", p.name)).json();
     assert_eq!(sh_c["state"], "landed", "{sh_c}");
     assert!(sh_c.get("embargo").is_none());
     let sec_after = api1.tips(Some(&sec_tok), &p.name).unwrap();

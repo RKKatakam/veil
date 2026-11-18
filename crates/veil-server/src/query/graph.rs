@@ -817,7 +817,12 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
     let mut deferred = sync::Deferred::default();
     let mut ps = Vec::with_capacity(tips.len());
     for t in tips {
-        ps.push(crate::store::not_own(Box::pin(sync::projected_inner(hub, project, viewer, *t, Some(&mut deferred)))).await?);
+        // Each projection worked out is a step of the fill's progress
+        // (`projected_one`), as when they are stored one at a time: a
+        // viewer's first fill of a long history spends most of its time
+        // here, and a `warming` answer that does not change tells a client
+        // the server is not getting on (BUG-2627).
+        ps.push(FILLING.scope(progress.clone(), crate::store::not_own(Box::pin(sync::projected_inner(hub, project, viewer, *t, Some(&mut deferred))))).await?);
     }
     let now = veil_core::now_millis();
     let mut tx = hub.db.begin().await?;
@@ -868,7 +873,6 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
     }
     for (k, r, p) in &deferred.rows {
         hub.caches.put_memo(project.id, k, r, p);
-        progress.step();
     }
     Ok(Some(ps))
 }

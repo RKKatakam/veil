@@ -902,23 +902,29 @@ fn bug_2482_an_interrupted_index_build_is_built_again_on_the_next_start() {
 /// `url`, a session of its own), as YugabyteDB left an index whose build lost
 /// a stage and returned success (there `indisvalid`, the last stage's).
 async fn lose_stage(url: &str, index: &str, flag: &str, yb: bool) {
+    set_stage(url, index, flag, false, yb).await
+}
+
+/// Set `flag` of index `index` to `to` in `pg_index`, in a session of its
+/// own.
+async fn set_stage(url: &str, index: &str, flag: &str, to: bool, yb: bool) {
     let db = veil_server::db::connect(url, 1).await.unwrap();
     // YugabyteDB writes its catalog by hand only when asked to. (`index`
     // and `flag` are the tests' own lower-case names.)
-    let update = format!("UPDATE pg_index SET {flag} = false WHERE indexrelid = to_regclass('{index}')");
+    let update = format!("UPDATE pg_index SET {flag} = {to} WHERE indexrelid = to_regclass('{index}')");
     let q = if yb { format!("SET yb_non_ddl_txn_for_sys_tables_allowed = on; {update}; RESET yb_non_ddl_txn_for_sys_tables_allowed") } else { update };
     let mut tries = 0;
     loop {
         match sqlx::raw_sql(&q).execute(&db).await {
             Ok(done) => {
-                assert_eq!(done.rows_affected(), 1, "index {index}'s {flag} set false");
+                assert_eq!(done.rows_affected(), 1, "index {index}'s {flag} set {to}");
                 break;
             }
             Err(e) if retryable(&e) && tries < 50 => {
                 tries += 1;
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            Err(e) => panic!("setting {index}'s {flag} false: {e}"),
+            Err(e) => panic!("setting {index}'s {flag} {to}: {e}"),
         }
     }
     db.close().await;
@@ -1011,8 +1017,8 @@ fn bug_2571_an_index_no_build_made_whole_fails_the_start_unrecorded_and_the_next
         let e = veil_server::db::migrate_with(&db, Some(&*hook)).await.expect_err("no build made packs_listed whole: the start fails");
         assert_eq!(
             e.to_string(),
-            "index packs_listed is not built (live, ready and valid) 15s after its build, in 5 builds: \
-             the migration is not recorded, and the next start drops the index and builds it again"
+            "index packs_listed is not built whole (live, ready and valid within 15s of its build, and holding its table's \
+             rows) in 5 builds: the migration is not recorded, and the next start builds the index again"
         );
         assert!(!veil_server::db::schema_current(&db).await.unwrap(), "migration 41 is not applied");
         let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
@@ -1032,6 +1038,209 @@ fn bug_2571_an_index_no_build_made_whole_fails_the_start_unrecorded_and_the_next
     assert_eq!(rt.block_on(index_stages(&url, "packs_listed")), Some((true, true, true)), "packs_listed is live, ready and valid");
     let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
     assert_eq!(with.len(), 20_000, "two thirds of the 30,000 packs are listed");
+    assert!(with == without, "the index built again holds exactly the listed rows");
+    drop_database(&rt, &name);
+}
+
+/// Whether the test database is YugabyteDB.
+fn on_yugabyte(rt: &tokio::runtime::Runtime) -> bool {
+    rt.block_on(async {
+        let db = veil_server::db::connect(&std::env::var("VEIL_TEST_DATABASE_URL").unwrap(), 1).await.unwrap();
+        let v: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
+        db.close().await;
+        veil_server::db::is_yugabyte(&v)
+    })
+}
+
+/// BUG-2626: the indexes the runner built for its wait for every session
+/// (`db::wait_for_every_session`: on `schema_migrations`, named
+/// `veil_settle_` and sixteen hex digits) that are still in the catalog.
+async fn settle_indexes_left(url: &str) -> Vec<String> {
+    let db = veil_server::db::connect(url, 1).await.unwrap();
+    let left = sqlx::query_scalar("SELECT c.relname::text FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname LIKE 'veil\\_settle\\_%'")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    left
+}
+
+/// BUG-2626: leave `packs_listed` as a YugabyteDB build left it: built by
+/// its flags, and without rows other sessions wrote beside the build. A
+/// session that reads the index not ready for writes inserts `rows` listed
+/// packs named `<tag><i>` in `project`; then the index reads ready again.
+/// Checked: the index is built, and exactly those rows are missing from it.
+async fn rows_written_beside_the_build_are_missing(url: &str, project: i64, tag: &str, rows: usize) {
+    let before = listed_with_and_without_the_index(url, project).await;
+    assert!(before.0 == before.1, "the build itself left packs_listed whole");
+    set_stage(url, "packs_listed", "indisready", false, true).await;
+    // A new session: it reads the index as the catalog now has it.
+    let db = veil_server::db::connect(url, 1).await.unwrap();
+    exec_retrying(
+        &db,
+        &format!(
+            "INSERT INTO packs (project_id, name, state, size, objects, created_at) \
+             SELECT {project}, '{tag}' || i, 1, i, 1, i FROM generate_series(1, {rows}) i"
+        ),
+    )
+    .await;
+    db.close().await;
+    set_stage(url, "packs_listed", "indisready", true, true).await;
+    assert_eq!(index_stages(url, "packs_listed").await, Some((true, true, true)), "packs_listed reads live, ready and valid");
+    let (with, without) = listed_with_and_without_the_index(url, project).await;
+    let missing: Vec<&String> = without.iter().filter(|n| with.binary_search(n).is_err()).collect();
+    assert_eq!(missing.len(), rows, "the rows written beside the build are missing from packs_listed");
+    assert!(missing.iter().all(|n| n.starts_with(tag)), "only those rows are missing");
+    assert_eq!(with.len() + rows, without.len(), "and the index holds no other row");
+}
+
+/// [`rows_written_beside_the_build_are_missing`], run to its end from a
+/// migration hook (whose future must be `Send`; that one's is not, for
+/// sqlx's executors).
+fn miss_rows_written_beside_the_build(url: &str, project: i64, tag: &str, rows: usize) {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(rows_written_beside_the_build_are_missing(url, project, tag, rows)))
+}
+
+/// BUG-2626: on YugabyteDB an online build ended with its index live, ready
+/// and valid, and without the rows two sessions inserted during its
+/// backfill (42,471 of 698,266 in one build of twelve, beside DDL in other
+/// databases; in `bug_2482_…holds_every_row`, 1,504 of 9,011): the runner
+/// read the three flags, recorded the migration, and the listing read an
+/// index that did not hold every listed pack. Here the first build of
+/// migration 41's index returns so (50 listed packs written by a session
+/// that did not write the index, the flags all set); the second is left
+/// whole. The start succeeds, the index was built twice, and only then was
+/// the migration recorded: once, with an index that holds every listed
+/// row, those 50 among them.
+///
+/// YugabyteDB only: PostgreSQL's online build waits for every transaction
+/// that could write the table without the index, and the runner checks
+/// nothing there.
+#[test]
+fn bug_2626_an_index_built_without_rows_written_beside_its_build_is_built_again_before_the_migration_is_recorded() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name, project, _) = before_migration_41(&rt, 30_000);
+    let builds = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = builds.clone();
+    let at = url.clone();
+    let hook: Box<veil_server::db::AfterBuild> = Box::new(move |index: String| {
+        let n = if index == "packs_listed" { counted.fetch_add(1, Ordering::SeqCst) } else { usize::MAX };
+        let at = at.clone();
+        Box::pin(async move {
+            if n == 0 {
+                miss_rows_written_beside_the_build(&at, project, "beside-", 50);
+            }
+        })
+    });
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate_with(&db, Some(&*hook)).await.expect("the start migrates");
+        assert!(veil_server::db::schema_current(&db).await.unwrap(), "every migration is applied");
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
+        assert_eq!(applied, 1, "migration 41 is recorded once");
+        db.close().await;
+    });
+    assert_eq!(builds.load(Ordering::SeqCst), 2, "packs_listed was built twice: the first build missed rows");
+    assert_eq!(rt.block_on(index_stages(&url, "packs_listed")), Some((true, true, true)), "packs_listed is live, ready and valid");
+    let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
+    assert_eq!(with.len(), 20_050, "two thirds of the 30,000 packs are listed, and the 50 written beside the first build");
+    assert!(with == without, "the index built again holds exactly the listed rows");
+    // The indexes built for the waits before the two checks are dropped.
+    // (The runner's drop is as far as it goes: one that fails, which the
+    // server logs, leaves its index for a later start. None failed in a
+    // start that migrated, as this one: none is left.)
+    assert_eq!(rt.block_on(settle_indexes_left(&url)), Vec::<String>::new(), "an index the runner built for its wait is left");
+    drop_database(&rt, &name);
+}
+
+/// BUG-2626: no start records the migration over an index that misses rows.
+/// A build that misses rows every time fails the start after a bounded
+/// number of builds, the migration unrecorded and the index dropped. A
+/// start that ends after its build returned, before the record (it died),
+/// leaves an index that reads built and misses rows: the next start finds
+/// that by checking the index against its table, not by its flags (a built
+/// index is kept by `IF NOT EXISTS`), drops it, builds it again and records
+/// the migration with an index that holds every listed row.
+///
+/// YugabyteDB only, as the test before.
+#[test]
+fn bug_2626_an_index_that_misses_rows_is_never_recorded_and_the_next_start_checks_one_it_finds_built() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name, project, _) = before_migration_41(&rt, 30_000);
+    // 1. Every build misses rows.
+    let builds = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = builds.clone();
+    let at = url.clone();
+    let hook: Box<veil_server::db::AfterBuild> = Box::new(move |index: String| {
+        let n = if index == "packs_listed" { counted.fetch_add(1, Ordering::SeqCst) } else { usize::MAX };
+        let at = at.clone();
+        Box::pin(async move {
+            if n != usize::MAX {
+                miss_rows_written_beside_the_build(&at, project, &format!("build{n}-"), 10);
+            }
+        })
+    });
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        let e = veil_server::db::migrate_with(&db, Some(&*hook)).await.expect_err("no build made packs_listed whole: the start fails");
+        assert_eq!(
+            e.to_string(),
+            "index packs_listed is not built whole (live, ready and valid within 15s of its build, and holding its table's \
+             rows) in 5 builds: the migration is not recorded, and the next start builds the index again"
+        );
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "migration 41 is not applied");
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
+        assert_eq!(applied, 0, "migration 41 is not recorded");
+        db.close().await;
+    });
+    assert_eq!(builds.load(Ordering::SeqCst), 5, "packs_listed was built five times");
+    assert_eq!(rt.block_on(index_stages(&url, "packs_listed")), None, "the failed start dropped the index that missed rows");
+
+    // 2. A start that dies after its build returned an index missing rows.
+    let died = std::sync::Arc::new(tokio::sync::Notify::new());
+    let dies = died.clone();
+    let at = url.clone();
+    let hook: Box<veil_server::db::AfterBuild> = Box::new(move |index: String| {
+        let (at, dies) = (at.clone(), dies.clone());
+        Box::pin(async move {
+            if index == "packs_listed" {
+                miss_rows_written_beside_the_build(&at, project, "died-", 10);
+                dies.notify_one();
+                std::future::pending::<()>().await;
+            }
+        })
+    });
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        tokio::select! {
+            r = veil_server::db::migrate_with(&db, Some(&*hook)) => panic!("the start ended before its build of packs_listed returned: {r:?}"),
+            () = died.notified() => {}
+        }
+        // Its session ends, and with it the migrations' lock.
+        db.close().await;
+    });
+    assert_eq!(rt.block_on(index_stages(&url, "packs_listed")), Some((true, true, true)), "the start that died left packs_listed reading built");
+    let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
+    assert_eq!((with.len(), without.len()), (20_050, 20_060), "and missing the 10 rows written beside its build");
+
+    // 3. The next start.
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate(&db).await.expect("the next start migrates");
+        assert!(veil_server::db::schema_current(&db).await.unwrap(), "every migration is applied");
+        let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
+        assert_eq!(applied, 1, "migration 41 is recorded once");
+        db.close().await;
+    });
+    assert_eq!(rt.block_on(index_stages(&url, "packs_listed")), Some((true, true, true)), "packs_listed is live, ready and valid");
+    let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
+    assert_eq!(with.len(), 20_060, "two thirds of the 30,000 packs are listed, and the 60 written beside the builds");
     assert!(with == without, "the index built again holds exactly the listed rows");
     drop_database(&rt, &name);
 }

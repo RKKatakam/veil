@@ -324,9 +324,7 @@ async fn migrate_once(c: &mut PgConnection, deadline: tokio::time::Instant, afte
                 *yugabyte.insert(yb)
             }
         };
-        for step in &parts.online {
-            online_index_step(&mut *c, yb, step, deadline, after_build).await?;
-        }
+        online_index_steps(&mut *c, yb, &parts.online, deadline, after_build).await?;
         sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
     }
     Ok(())
@@ -363,6 +361,22 @@ async fn migrate_once(c: &mut PgConnection, deadline: tokio::time::Instant, afte
 ///   step's catalog version increment lost a race with another database's
 ///   DDL, and `indisvalid` stayed false). An index that no build made
 ///   built fails the migration, which is not recorded.
+/// * On YugabyteDB the indexes a migration's steps built are then checked
+///   against their tables (`yb_index_check`, `checked_on_yugabyte`),
+///   whoever built them: an online build there ended live, ready and valid
+///   without the rows other sessions wrote during its backfill (BUG-2626).
+///   Every session of the database is waited for first (one more online
+///   build, of an index on the migrations' own table, made for its wait
+///   and dropped): a session that writes without the index does so until
+///   it takes in the build's last stage. An index that misses a row, or
+///   holds one its table does not, is dropped and built again, up to
+///   `BUILD_ATTEMPTS` builds; a migration is recorded only over indexes
+///   that passed. The check reads the whole index and its table rows
+///   (200,000 rows in 1.2 s on the test cluster; 5.1 million in 33 s beside
+///   two inserting sessions), under the steps' timeouts: one that does not
+///   finish fails the start, and the next start checks again with the
+///   whole deadline. PostgreSQL's online build waits out every transaction
+///   that could write the table without the index, and is not checked.
 /// * An index step runs under statement and lock timeouts of what is left
 ///   of the migrations' deadline (at least [`STATEMENT_TIMEOUT`]), not the
 ///   pool's: a large table's build takes longer than 15 s, and the
@@ -478,6 +492,156 @@ async fn drop_index(c: &mut PgConnection, yugabyte: bool, name: &str) -> Result<
     Ok(())
 }
 
+/// Apply a migration's [`ONLINE_INDEXES`] steps, one by one; then, on
+/// YugabyteDB, check the indexes they built against their tables
+/// ([`checked_on_yugabyte`]), and build again those that miss rows (dropped
+/// as that was found), up to `BUILD_ATTEMPTS` builds of an index, while
+/// the deadline lasts (BUG-2626). It returns only with every index whole.
+async fn online_index_steps(
+    c: &mut PgConnection,
+    yugabyte: bool,
+    steps: &[IndexStep],
+    deadline: tokio::time::Instant,
+    after_build: Option<&AfterBuild>,
+) -> Result<()> {
+    let mut pending: Vec<&IndexStep> = steps.iter().collect();
+    let mut builds = 0;
+    loop {
+        builds += 1;
+        for step in &pending {
+            online_index_step(&mut *c, yugabyte, step, deadline, after_build).await?;
+        }
+        pending.retain(|step| matches!(step, IndexStep::Create { .. }));
+        if !yugabyte || pending.is_empty() {
+            return Ok(());
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(STATEMENT_TIMEOUT);
+        let ms = left.as_millis();
+        sqlx::raw_sql(&format!("SET statement_timeout = {ms}; SET lock_timeout = {ms}")).execute(&mut *c).await?;
+        let r = checked_on_yugabyte(&mut *c, &pending).await;
+        let reset = sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout").execute(&mut *c).await;
+        let whole = r?;
+        reset?;
+        pending = pending.into_iter().zip(whole).filter(|(_, whole)| !whole).map(|(step, _)| step).collect();
+        let Some(IndexStep::Create { name, .. }) = pending.first() else {
+            return Ok(());
+        };
+        if builds >= BUILD_ATTEMPTS || tokio::time::Instant::now() >= deadline {
+            return Err(not_built_whole(name, builds));
+        }
+        eprintln!("veil-server: index {name} is not built whole after build {builds} returned: building it again");
+    }
+}
+
+/// What a start says of an index no build made whole.
+fn not_built_whole(name: &str, builds: u32) -> Error {
+    Error::Other(anyhow::anyhow!(
+        "index {name} is not built whole (live, ready and valid within {VALID_WAIT:?} of its build, and holding its \
+         table's rows) in {builds} builds: the migration is not recorded, and the next start builds the index again"
+    ))
+}
+
+/// On YugabyteDB: whether each of `built` (index steps whose indexes read
+/// built) holds a row for every row of its table, and no other; one that
+/// does not is dropped ([`index_holds_every_row`]).
+///
+/// First every session of the database is waited for (BUG-2626): one that
+/// writes the table without the index goes on until it takes in the
+/// build's last stage (seen: at its next statement on the build's own
+/// node, within 2 ms of the stage being written; on another node, once
+/// that node has heard of the stage; a statement already running, until
+/// it ends),
+/// and rows it writes after the check has read are not seen by it.
+/// YugabyteDB waits for every backend only inside an online index build
+/// (after its first stage, for every backend of the database to be at that
+/// stage's catalog version, which is past the last of the builds before
+/// it), so one is made here for that wait alone
+/// ([`wait_for_every_session`]). The wait covers a transaction that wrote without the
+/// index and has not ended: a session keeps its catalog version for the
+/// whole of a transaction, and is waited for until the transaction ends
+/// (measured: a build on another table did not return while a session
+/// was idle in a transaction that had written, nor while that
+/// transaction ran another statement and stayed open). So what was
+/// written without the index is committed, or gone, when the check reads.
+async fn checked_on_yugabyte(c: &mut PgConnection, built: &[&IndexStep]) -> Result<Vec<bool>> {
+    wait_for_every_session(&mut *c).await?;
+    let mut whole = Vec::with_capacity(built.len());
+    for step in built {
+        whole.push(match step {
+            IndexStep::Create { name, .. } => index_holds_every_row(&mut *c, name).await?,
+            IndexStep::Drop { .. } => true,
+        });
+    }
+    Ok(whole)
+}
+
+/// On YugabyteDB: wait until every backend of the database has taken in
+/// every catalog change made so far, by an online build made for that wait
+/// alone ([`checked_on_yugabyte`]): of an index on the migrations' own
+/// table, under a name of its own, dropped at once.
+///
+/// The wait is done when the index reads **ready**: an online build sets
+/// `indisready` only after its wait for every backend at its first stage.
+/// That is what is looked at, not the statement's answer: under other
+/// databases' DDL the statement was seen to commit its live and ready
+/// stages and then fail with "relation … already exists", of its own index
+/// (13 ms after the ready stage; the database running the statement again
+/// from its start is the likely reason), and a build can also answer
+/// success with a stage lost (BUG-2571). An index that does not read ready
+/// is dropped and another is built, up to `BUILD_ATTEMPTS`; then the start
+/// fails, unrecorded.
+async fn wait_for_every_session(c: &mut PgConnection) -> Result<()> {
+    drop_settle_indexes(&mut *c).await;
+    let mut last = None;
+    for _ in 0..BUILD_ATTEMPTS {
+        let name = format!("{SETTLE_PREFIX}{}", hex::encode(veil_core::crypto::random_bytes::<8>()));
+        let built = sqlx::raw_sql(&format!("CREATE INDEX CONCURRENTLY {name} ON schema_migrations (version)")).execute(&mut *c).await;
+        // Read from the catalog itself, not through the session's names.
+        let ready: Option<bool> =
+            sqlx::query_scalar("SELECT i.indisready FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = $1").bind(&name).fetch_optional(&mut *c).await?;
+        drop_settle_indexes(&mut *c).await;
+        match (built, ready) {
+            (_, Some(true)) => return Ok(()),
+            // Its own name taken: the statement was run again before its wait.
+            (Err(e), _) if e.as_database_error().and_then(|d| d.code()).is_some_and(|code| code == "42P07") => last = Some(e.to_string()),
+            (Err(e), _) => return Err(e.into()),
+            (Ok(_), _) => last = Some("the build answered, and its index does not read ready".into()),
+        }
+        eprintln!("veil-server: the build made to wait for every session did not reach its ready stage ({}): another", last.as_deref().unwrap_or_default());
+    }
+    Err(Error::Other(anyhow::anyhow!(
+        "no online build reached its ready stage in {BUILD_ATTEMPTS} tries ({}), so the sessions that may write without a new index were not \
+         waited for and the index cannot be checked: the migration is not recorded, and the next start tries again",
+        last.unwrap_or_default()
+    )))
+}
+
+/// Drop the indexes [`wait_for_every_session`] made (this one's, one a
+/// start that died left, one whose drop the database lost). As far as it
+/// goes: one left is a small index on the migrations' table, dropped by a
+/// later start.
+async fn drop_settle_indexes(c: &mut PgConnection) {
+    let names: std::result::Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid \
+         WHERE i.indrelid = to_regclass('schema_migrations') AND c.relname LIKE $1",
+    )
+    .bind(format!("{}%", SETTLE_PREFIX.replace('_', "\\_")))
+    .fetch_all(&mut *c)
+    .await;
+    for name in names.unwrap_or_default() {
+        // Its own names only: the prefix and sixteen hex digits.
+        let own = name.strip_prefix(SETTLE_PREFIX).is_some_and(|rest| rest.len() == 16 && rest.bytes().all(|b| b.is_ascii_hexdigit()));
+        if own {
+            if let Err(e) = sqlx::raw_sql(&format!("DROP INDEX IF EXISTS {name}")).execute(&mut *c).await {
+                eprintln!("veil-server: dropping {name}, an index made to wait for every session: {e} (a later start drops it)");
+            }
+        }
+    }
+}
+
+/// What the name of an index [`wait_for_every_session`] builds begins with.
+const SETTLE_PREFIX: &str = "veil_settle_";
+
 /// Apply one [`ONLINE_INDEXES`] step, outside any transaction, under
 /// statement and lock timeouts of what is left of the migrations' deadline
 /// (at least the pool's own statement timeout), then the connection's own
@@ -506,10 +670,7 @@ async fn online_index_step(
             (false, IndexStep::Create { name, .. }) => name,
         };
         if attempt >= BUILD_ATTEMPTS || tokio::time::Instant::now() >= deadline {
-            return Err(Error::Other(anyhow::anyhow!(
-                "index {name} is not built (live, ready and valid) {VALID_WAIT:?} after its build, in {attempt} builds: \
-                 the migration is not recorded, and the next start drops the index and builds it again"
-            )));
+            return Err(not_built_whole(name, attempt));
         }
         // Dropped by the next build, before it begins.
         eprintln!("veil-server: index {name} is not built (live, ready and valid) {VALID_WAIT:?} after build {attempt} returned: building it again");
@@ -539,11 +700,16 @@ async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &Inde
         // and begun again (BUG-2520). Say how to build it by hand instead.
         let timed_out = e.as_database_error().and_then(|d| d.code()).is_some_and(|code| code == "57014" || code == "55P03");
         if timed_out {
+            // On YugabyteDB the start that finds it built still checks it
+            // against its table before it records anything (BUG-2626).
+            let then = match yugabyte {
+                true => "it finds the index built, checks it against its table (`yb_index_check`, which reads all of both, within the same time), and records the migration",
+                false => "it finds the index built and records the migration",
+            };
             return Err(Error::Other(anyhow::anyhow!(
                 "building index {name} did not finish within what was left of the migrations' {MIGRATION_DEADLINE:?} ({e}): \
                  build it by hand, as long as it takes, with `{sql}` (if that build fails, first drop the invalid index it \
-                 leaves with `DROP INDEX IF EXISTS {name}`), then start the server again: it finds the index built and \
-                 records the migration"
+                 leaves with `DROP INDEX IF EXISTS {name}`), then start the server again: {then}"
             )));
         }
         return Err(e.into());
@@ -570,6 +736,44 @@ async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &Inde
             Some(Some(false)) | None => return Ok(false),
             Some(None) => return Err(Error::Other(anyhow::anyhow!("{name} is not an index, so the index of that name was not built"))),
         }
+    }
+}
+
+/// On YugabyteDB: whether index `name`, which reads built, holds a row for
+/// every row of its table and no other (`yb_index_check`: every index row
+/// against its table row, and the two counts). One that does not is dropped
+/// here, and `false` is the answer: it is built again.
+///
+/// BUG-2626: an online build there ended live, ready and valid with the
+/// rows sessions inserted during its backfill missing (2 builds of 40,
+/// beside DDL in other databases: 42,471 of 698,266 rows, 12,527 of
+/// 221,002): its flags say what the build did, not what the other
+/// sessions wrote. A built index that was dropped only for its flags would
+/// stay (`IF NOT EXISTS`), so it is dropped by what the check finds.
+async fn index_holds_every_row(c: &mut PgConnection, name: &str) -> Result<bool> {
+    let e = match sqlx::query("SELECT yb_index_check(to_regclass($1))").bind(name).execute(&mut *c).await {
+        Ok(_) => return Ok(true),
+        Err(e) => e,
+    };
+    let code = e.as_database_error().and_then(|d| d.code()).map(|code| code.into_owned());
+    match code.as_deref() {
+        // `index_corrupted`: a row missing from the index, or one in it
+        // that its table does not hold.
+        Some("XX002") => {
+            eprintln!("veil-server: index {name} reads built and does not hold its table's rows ({e}): dropping it to build it again");
+            drop_index(&mut *c, true, name).await?;
+            Ok(false)
+        }
+        // Under what was left of the migrations' deadline, as the build.
+        Some("57014" | "55P03") => Err(Error::Other(anyhow::anyhow!(
+            "checking index {name} against its table did not finish within what was left of the migrations' {MIGRATION_DEADLINE:?} \
+             ({e}): the migration is not recorded, and the next start checks the index again, with the whole of that time"
+        ))),
+        Some("42883") => Err(Error::Other(anyhow::anyhow!(
+            "this YugabyteDB has no yb_index_check ({e}), so an index built online cannot be checked against its table, and \
+             the migration is not recorded: YugabyteDB 2025.2 has it"
+        ))),
+        _ => Err(e.into()),
     }
 }
 

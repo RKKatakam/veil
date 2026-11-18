@@ -22,7 +22,7 @@ use veil_server::{
 };
 
 use crate::{
-    derived::{copy_for, policy, projections, random_history, text, viewers, Files, Hist, Rng},
+    derived::{copy_for, policy, policy_of, projections, random_history, text, viewers, viewers_of, Files, Hist, Rng},
     query::{admin, ask, forget_blames, model_log, seeds, warm_up},
     support::*,
 };
@@ -3448,44 +3448,43 @@ mod s14rd3_review {
 #[test]
 fn consolidated_landing_pass_file_history_and_blame_memos_match_projected_files() {
     let th = TestHub::start();
-    let carol = 720_999;
-    let (policy_text, bindings) = policy(carol);
+    // The groups and people of this test are rows (so that `derive::landing`'s
+    // `viewers_of` enumerates every viewer's view key and writes their
+    // `projections`, `view_file_history` and `view_graph` rows in its one
+    // transaction), with ids of their own (BUG-2600: with the generator's
+    // fixed ids, a second run in one database found the first run's groups,
+    // of another project, and its project had no viewers).
+    let db = th.hub().db.clone();
+    let (group_ids, people_ids): ([i64; 3], [i64; 5]) = th.rt.block_on(async {
+        let mut groups = [0i64; 3];
+        for g in &mut groups {
+            *g = sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('groups', 'id'))").fetch_one(&db).await.unwrap();
+        }
+        let mut people = [0i64; 5];
+        for p in &mut people {
+            *p = sqlx::query_scalar("INSERT INTO people (name, created_at) VALUES ($1, 0) RETURNING id").bind(unique("test-viewer-")).fetch_one(&db).await.unwrap();
+        }
+        (groups, people)
+    });
+    let [dev, sec, fin, both, carol] = people_ids;
+    let (policy_text, bindings) = policy_of(group_ids, carol);
     let mut h = Hist::new(&th, &policy_text, &bindings);
     let mut rng = Rng::new(309);
     // 10 commits with ≤ 64 file changes total so `derive::landing` takes the
     // inline consolidated transaction path (`prepare_memo` + `write_prepared_memo`)
     // rather than falling back to `prefill`.
     random_history(&th, &mut h, &mut rng, 10);
-    let all_viewers: Vec<(&str, Viewer)> = viewers(carol).into_iter().chain([("admin", admin())]).collect();
-    // Register the test groups (`900_001..=900_003`) and members (`700_001..=700_005`) in
-    // `people`, `groups` and `group_members` so `derive::landing`'s `viewers_of` enumerates
-    // every viewer's view key and writes their `projections`, `view_file_history`, and
-    // `view_graph` rows inside the single consolidated transaction!
+    let all_viewers: Vec<(&str, Viewer)> = viewers_of(group_ids, [dev, sec, fin, both], carol).into_iter().chain([("admin", admin())]).collect();
     th.rt.block_on(async {
-        for (gid, gname) in [(900_001_i64, "devs"), (900_002, "security"), (900_003, "finance")] {
-            sqlx::query("INSERT INTO groups (id, project_id, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-                .bind(gid)
-                .bind(h.id)
-                .bind(gname)
-                .execute(&h.hub.db)
-                .await
-                .unwrap();
+        for (gid, gname) in group_ids.into_iter().zip(["devs", "security", "finance"]) {
+            let made = sqlx::query("INSERT INTO groups (id, project_id, name) VALUES ($1, $2, $3)").bind(gid).bind(h.id).bind(gname).execute(&h.hub.db).await.unwrap();
+            assert_eq!(made.rows_affected(), 1, "the group {gname} of this test's project is made");
         }
-        for (who, v) in &all_viewers {
+        for (_, v) in &all_viewers {
             if let Some(pid) = v.person {
-                sqlx::query("INSERT INTO people (id, name, created_at) VALUES ($1, $2, 0) ON CONFLICT DO NOTHING")
-                    .bind(pid)
-                    .bind(format!("test-viewer-{who}-{pid}"))
-                    .execute(&h.hub.db)
-                    .await
-                    .unwrap();
                 for &gid in &v.groups {
-                    sqlx::query("INSERT INTO group_members (group_id, person_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-                        .bind(gid)
-                        .bind(pid)
-                        .execute(&h.hub.db)
-                        .await
-                        .unwrap();
+                    let made = sqlx::query("INSERT INTO group_members (group_id, person_id) VALUES ($1, $2)").bind(gid).bind(pid).execute(&h.hub.db).await.unwrap();
+                    assert_eq!(made.rows_affected(), 1, "the member of group {gid} is made");
                 }
             }
         }

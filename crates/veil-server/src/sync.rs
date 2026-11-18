@@ -611,6 +611,10 @@ pub(crate) async fn projected_inner(
                 if collapsed {
                     d.collapsed.insert(x);
                 }
+                // A fill's progress, as it is worked out (BUG-2627: a fill
+                // that stores its memos together stepped only once they
+                // were all committed).
+                crate::query::graph::projected_one();
                 result
             }
             None => {
