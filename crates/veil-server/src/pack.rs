@@ -1382,6 +1382,57 @@ impl Packs {
             None => Ok(()),
         }
     }
+
+    /// Delete containers `names` (already marked `DISCARDED` in a push's
+    /// transaction) from storage, then delete the `packs` rows of those whose
+    /// storage delete succeeded (`object-layout.md` §3). Any container whose
+    /// storage delete fails keeps its `DISCARDED` row for
+    /// `pack_gc::sweep_discarded`.
+    pub async fn purge_discarded(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        names: &[String],
+        deletes: &AtomicU64,
+        pack_rows: &AtomicU64,
+    ) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        for n in names {
+            self.staged.insert(name_key(project, n), None, 64);
+        }
+        let mut deleted = Vec::with_capacity(names.len());
+        let (mut first, mut failed) = (None, 0);
+        for n in names {
+            deletes.fetch_add(1, Ordering::Relaxed);
+            match store.delete(&key(project, n)).await {
+                Ok(()) => deleted.push(n.clone()),
+                Err(e) => {
+                    failed += 1;
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        if let (Some(db), false) = (&self.db, deleted.is_empty()) {
+            let r = sqlx::query("DELETE FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3")
+                .bind(project)
+                .bind(&deleted)
+                .bind(DISCARDED)
+                .execute(db)
+                .await?;
+            if r.rows_affected() > 0 {
+                pack_rows.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        match first {
+            Some(e) => Err(e.context(format!(
+                "{failed} of {} discarded containers of project {project} are still stored",
+                names.len()
+            ))),
+            None => Ok(()),
+        }
+    }
 }
 
 const WINDOW_ENTRIES: usize = (FIRST_READ as usize) / ENTRY;

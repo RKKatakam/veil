@@ -48,7 +48,7 @@ use veil_core::{
 
 use crate::{
     error::{Error, Result},
-    pack::{Held, Slot, StagedSlots},
+    pack::{Slot, StagedSlots},
     perm::{Project, Viewer},
     Hub,
 };
@@ -114,18 +114,7 @@ pub struct Source {
 /// and the slots of the objects the receipts name.
 type StagedPack = (Arc<str>, StagedSlots);
 
-/// A pack a landing push lists: its name, its length and, for the pack
-/// it wrote itself, its index (held under its share of the server's bound
-/// on indexes until it joins the lookup maps: BUG-1496). A staged pack
-/// listed as it is has no index in hand: the lookup maps take the
-/// staged-index cache's, or read it when a lookup needs it.
-pub(crate) struct ListedPack {
-    pub(crate) name: Arc<str>,
-    pub(crate) size: u64,
-    /// How many objects it holds.
-    pub(crate) objects: usize,
-    pub(crate) held: Option<Held>,
-}
+pub(crate) use crate::store::KeptPack as ListedPack;
 
 /// What a push's receipts name in staged packs, and the objects the server
 /// made for it (S28). None of it is the project's until the push's
@@ -3483,11 +3472,14 @@ async fn push_staged(
     let embargo_snaps2 = embargo_snaps.clone();
     // Whoever lands here hears at once (registered before the commit).
     let waiters: Vec<crate::landing::Waiter> = queued.iter().map(|q| hub.landing.register(&q.ticket)).collect();
-    let packs: (Vec<String>, Vec<i64>, Vec<i64>) = (
-        listed.iter().map(|p| p.name.to_string()).collect(),
-        listed.iter().map(|p| p.size as i64).collect(),
-        listed.iter().map(|p| p.objects as i64).collect(),
-    );
+    let objects_mode = hub.objects.layout() == crate::store::ObjectLayout::Objects;
+    let mut tx_packs: Vec<String> = if objects_mode {
+        st.names().into_iter().map(|n| n.to_string()).collect()
+    } else {
+        listed.iter().map(|p| p.name.to_string()).collect()
+    };
+    tx_packs.sort();
+    tx_packs.dedup();
     let default_branch = project.default_branch.clone();
     // A merged branch goes only while the default branch it was judged
     // against is in the same lineage (not rewound since: BUG-1885).
@@ -3496,8 +3488,8 @@ async fn push_staged(
     // Nothing to move (every update refused: the pusher pulls and tries
     // again): no commit, and nothing recorded as history no branch reaches.
     progress.lock().unwrap().transaction = commits;
-    let (moved, memo_stored) = if !commits {
-        (Vec::new(), Vec::new())
+    let (moved, memo_stored, discarded_containers) = if !commits {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
         let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
         let plans = plans2.clone();
@@ -3510,7 +3502,7 @@ async fn push_staged(
         let (queued, who) = (queued2.clone(), who2.clone());
         let embargo_upserts = embargo_upserts2.clone();
         let embargo_snaps = embargo_snaps2.clone();
-        let packs = packs.clone();
+        let tx_packs = tx_packs.clone();
         Box::pin(async move {
             crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             for q in &queued {
@@ -3638,28 +3630,15 @@ async fn push_staged(
                 }
             }
             crate::embargo::record_in_tx(&mut *c, pid, &embargo_upserts, &embargo_snaps).await?;
-            // The packs that hold what this push stored (S28): an upload's
-            // staged pack, or the push's own. A pack a refused push of the
-            // same person discarded first cannot be listed: nothing lands,
-            // and `vl` uploads again. Every pack was recorded staged before
-            // it was written; a row gone was discarded and then deleted with
-            // its storage object (a sweep of an upload past its grace period,
-            // by a server without this push's index in hand: BUG-2310). The
-            // update locks them: a racing discard or delete waits, then finds
-            // them listed. A row missing is one state fewer back (no row is
-            // ever made here); a discarded one stays discarded.
-            // In the same statement, the push's rows: its snapshots (a row
-            // stored first by another push keeps its author unless it had
-            // none), their origins, its memos (a row stored first by another
-            // request wins, and is not cached here from this push's answer:
-            // those this one stored come back) and its audit row. The notice
-            // to every server (drop your tips) goes after the commit.
+            // The packs that hold what this push stored (S28): in `packs`,
+            // turned `LISTED`; in `objects`, upload containers turned
+            // `DISCARDED` (keeping any already `LISTED` pack from an earlier
+            // `packs` server). A row missing or already `DISCARDED` is
+            // excluded by `state <> $14`, returning fewer rows and aborting
+            // with 409 Conflict.
             let mut authors: Vec<(String, i64)> = Vec::with_capacity(new_reals.len());
             let mut author_at: HashMap<&str, usize> = HashMap::with_capacity(new_reals.len());
             for (r, author) in &new_reals {
-                // Each id once (one statement cannot update a row twice): the
-                // first author that is not 0, as one insert after another.
-                // Found by a map: a push may hold `MAX_PUSH_SNAPSHOTS`.
                 match author_at.get(r.as_str()) {
                     Some(&i) if authors[i].1 == 0 => authors[i].1 = *author,
                     Some(_) => {}
@@ -3675,9 +3654,12 @@ async fn push_staged(
             let memo_reals: Vec<String> = memos.iter().map(|m| m.1.clone()).collect();
             let memo_projected: Vec<String> = memos.iter().map(|m| m.2.clone()).collect();
             let memo_collapsed: Vec<bool> = memos.iter().map(|m| m.3).collect();
-            let (stored_keys, stored_reals, pack_states): (Vec<String>, Vec<String>, Vec<i16>) = sqlx::query_as(
-                "WITH k AS (UPDATE packs SET state = CASE WHEN state = $14 THEN state ELSE $13 END \
-                   WHERE project_id = $1 AND name = ANY($15) RETURNING state), \
+            let (stored_keys, stored_reals, updated_packs, discarded_names): (Vec<String>, Vec<String>, i64, Vec<String>) = sqlx::query_as(
+                "WITH k AS (UPDATE packs \
+                   SET state = CASE WHEN $16 AND state = $17 THEN $14 ELSE $13 END, \
+                       discarded_at = CASE WHEN $16 AND state = $17 THEN $6 ELSE discarded_at END \
+                   WHERE project_id = $1 AND name = ANY($15) AND state <> $14 \
+                   RETURNING CASE WHEN state = $14 THEN name ELSE '' END AS discarded_name), \
                  s AS (INSERT INTO snapshots (project_id, id, author) SELECT $1, i, a FROM UNNEST($2::text[], $3::bigint[]) AS t(i, a) \
                    ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0), \
                  o AS (INSERT INTO origins (project_id, real_id, origin_id) SELECT $1, r, g FROM UNNEST($4::text[], $5::text[]) AS t(r, g) \
@@ -3686,8 +3668,9 @@ async fn push_staged(
                    SELECT $1, k, r, p, $6, c FROM UNNEST($7::text[], $8::text[], $9::text[], $10::bool[]) AS t(k, r, p, c) \
                    ON CONFLICT DO NOTHING RETURNING view_key, real_id), \
                  l AS (INSERT INTO audit_log (project_id, at, actor, action, details) VALUES ($1, $6, $11, 'push', $12)) \
-                 SELECT x.k, x.r, COALESCE((SELECT array_agg(state) FROM k), '{}') FROM \
-                   (SELECT COALESCE(array_agg(view_key), '{}') AS k, COALESCE(array_agg(real_id), '{}') AS r FROM m) x",
+                 SELECT x.k, x.r, (SELECT count(*) FROM k)::bigint, \
+                   COALESCE((SELECT array_agg(discarded_name) FROM k WHERE discarded_name <> ''), '{}') \
+                 FROM (SELECT COALESCE(array_agg(view_key), '{}') AS k, COALESCE(array_agg(real_id), '{}') AS r FROM m) x",
             )
             .bind(pid)
             .bind(&snap_ids)
@@ -3703,25 +3686,20 @@ async fn push_staged(
             .bind(format!("moved {moved:?}"))
             .bind(crate::pack::LISTED)
             .bind(crate::pack::DISCARDED)
-            .bind(&packs.0)
+            .bind(&tx_packs)
+            .bind(objects_mode)
+            .bind(crate::pack::STAGED)
             .fetch_one(&mut *c)
             .await?;
-            if pack_states.len() != packs.0.len() || pack_states.contains(&crate::pack::DISCARDED) {
+            if updated_packs != tx_packs.len() as i64 {
                 return Err(Error::conflict("an upload this push names was discarded; push again"));
             }
             let stored: HashSet<(&str, &str)> = stored_keys.iter().map(|k| k.as_str()).zip(stored_reals.iter().map(|r| r.as_str())).collect();
             let memo_stored: Vec<bool> = memos.iter().map(|m| stored.contains(&(m.0.as_str(), m.1.as_str()))).collect();
-            // New review rules, or a new access policy (an approval counts
-            // while its reviewer may write the PR's paths: BUG-2111), wait
-            // for every batch already re-reading them and are read by every
-            // batch after (BUG-2061): the review gate, exclusively, last,
-            // holding every row the push writes.
             if rules_changed {
                 crate::prs::close_review_gate(&mut *c, pid).await?;
             }
             match policy {
-                // Bumps the project's access epoch (a trigger): every
-                // server's cached permissions for it are void.
                 Some((Some(text), _)) => crate::perm::accept_policy(&mut *c, pid, &text).await?,
                 Some((None, Some(text))) => {
                     sqlx::query("UPDATE projects SET policy_text = $1 WHERE id = $2")
@@ -3732,7 +3710,7 @@ async fn push_staged(
                 }
                 _ => {}
             }
-            Ok((moved, memo_stored))
+            Ok((moved, memo_stored, discarded_names))
         })
     })
     .await;
@@ -3750,20 +3728,29 @@ async fn push_staged(
         }
     };
     let kept = if commits {
-        // Before anything reads what it stored; the push's share of the
-        // index bound goes back as soon as its index enters the lookup map.
-        let (for_cache, names): (Vec<_>, HashSet<_>) = listed
-            .into_iter()
-            .map(|p| ((p.name.clone(), p.held.map(|h| h.index)), p.name))
-            .unzip();
-        let listed_any = !for_cache.is_empty();
-        hub.objects.listed(project.id, for_cache);
-        // Merge the project's small packs in the background once they pile
-        // up (BUG-2230): every push lists one, and each lookup and listing
-        // grows with them.
-        if listed_any {
-            crate::pack_gc::maybe_schedule(hub, project.id);
-        }
+        let settled = if objects_mode {
+            drop(listed);
+            if let Err(e) = hub.objects.purge_discarded(project.id, &discarded_containers).await {
+                eprintln!("veil-server: deleting what a push discarded: {e:#}");
+            }
+            st.names().into_iter().collect()
+        } else {
+            // Before anything reads what it stored; the push's share of the
+            // index bound goes back as soon as its index enters the lookup map.
+            let (for_cache, names): (Vec<_>, HashSet<_>) = listed
+                .into_iter()
+                .map(|p| ((p.name.clone(), p.held.map(|h| h.index)), p.name))
+                .unzip();
+            let listed_any = !for_cache.is_empty();
+            hub.objects.listed(project.id, for_cache);
+            // Merge the project's small packs in the background once they pile
+            // up (BUG-2230): every push lists one, and each lookup and listing
+            // grows with them.
+            if listed_any {
+                crate::pack_gc::maybe_schedule(hub, project.id);
+            }
+            names
+        };
         // Every server's copy too, by a notice sent after the commit
         // (never in the push's transaction: BUG-2459).
         if !moved.is_empty() || !embargo_upserts.is_empty() {
@@ -3772,7 +3759,7 @@ async fn push_staged(
         for c in &completed {
             hub.caches.put_committed(project.id, &c.real);
         }
-        Some(names)
+        Some(settled)
     } else {
         drop(listed);
         None
@@ -3972,12 +3959,12 @@ async fn complete_one(
     Ok((c, st.touched(), rows))
 }
 
-/// The packs a landing push lists (S28): each staged pack every object of
-/// which its checks read (`touched`), as it is; and, if anything is left,
-/// one pack of its own (written now, named in `written`) with the objects
-/// it read from any other staged pack and those the server made for it
-/// (`made`). Nothing a check did not read is kept. `progress` records the
-/// pack it writes.
+/// Keep what a landing push retains ([`crate::store::Objects::keep`]): in
+/// `packs`, each staged pack every object of which its checks read
+/// (`touched`), as it is, plus one pack of its own (recorded in `progress`)
+/// with the rest and `made`; in `objects`, each kept object written under
+/// its own key, returning an empty `Vec`. Nothing a check did not read is
+/// kept.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn packs_to_list(
     hub: &Arc<Hub>,
@@ -3988,56 +3975,24 @@ pub(crate) async fn packs_to_list(
     made: &[ObjectId],
     progress: &Mutex<Progress>,
 ) -> Result<Vec<ListedPack>> {
-    let mut listed = Vec::new();
-    let mut kept: HashSet<ObjectId> = HashSet::new();
-    for (name, sp) in st.packs.iter() {
-        // Every object of the pack: one the receipts name here, and read.
-        if sp.objects > 0 && sp.slots.len() == sp.objects && sp.slots.iter().all(|(id, _)| touched.contains(id)) {
-            if hub.objects.staged_index(project, name).await.map_err(Error::Other)?.is_none() {
-                return Err(Error::conflict("an upload this push names was discarded; push again"));
-            }
-            kept.extend(sp.slots.iter().map(|(id, _)| *id));
-            listed.push(ListedPack { name: name.clone(), size: sp.size, objects: sp.objects, held: None });
-        }
-    }
-    let mut own: Vec<(ObjectId, Bytes)> = Vec::new();
-    for (name, sp) in st.packs.iter() {
-        for (id, slot) in sp.slots.iter() {
-            if touched.contains(id) && kept.insert(*id) {
-                let (enc, _) = hub
-                    .objects
-                    .get_staged(project, name, *slot, id)
-                    .await
-                    .map_err(Error::Other)?
-                    .ok_or_else(|| Error::conflict("an upload this push names was discarded; push again"))?;
-                own.push((*id, enc));
-            }
-        }
-    }
     let made_objects: Vec<(ObjectId, Bytes)> = {
         let m = st.made.lock().unwrap();
-        made.iter().filter(|id| !kept.contains(*id)).filter_map(|id| Some((*id, m.get(id)?.clone()))).collect()
+        made.iter().filter_map(|id| Some((*id, m.get(id)?.clone()))).collect()
     };
-    if !made_objects.is_empty() {
-        // Compressed on a blocking thread (the server's own encoding).
-        let enc = tokio::task::spawn_blocking(move || made_objects.into_iter().map(|(id, raw)| (id, crate::store::encode(raw))).collect::<Vec<_>>())
-            .await
-            .map_err(|e| Error::Other(e.into()))?;
-        own.extend(enc);
+    let mut written = Vec::new();
+    let res = hub
+        .objects
+        .keep(project, person, &st.packs, touched, made_objects, 1, false, &mut written)
+        .await;
+    if !written.is_empty() {
+        progress.lock().unwrap().written.extend(written);
     }
-    while !own.is_empty() {
-        let rest = if own.len() > crate::pack::MAX_OBJECTS {
-            own.split_off(crate::pack::MAX_OBJECTS)
-        } else {
-            Vec::new()
-        };
-        let (name, mut held) = hub.objects.put_pack(project, person, own).await.map_err(Error::Other)?;
-        held.unproject();
-        progress.lock().unwrap().written.push(name.clone());
-        listed.push(ListedPack { name, size: held.size, objects: held.index.len(), held: Some(held) });
-        own = rest;
-    }
-    Ok(listed)
+    res.map_err(|e| match e {
+        crate::store::KeepError::Discarded => {
+            Error::conflict("an upload this push names was discarded; push again")
+        }
+        crate::store::KeepError::Store(e) => Error::Other(e),
+    })
 }
 
 /// Is `a` an ancestor of (or equal to) `b` in the real history (a push's

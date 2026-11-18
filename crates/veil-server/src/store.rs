@@ -1774,6 +1774,14 @@ impl Objects {
         self.packs.discard_counted(&*self.store, project, names, &self.deletes).await
     }
 
+    /// Delete containers `names` (marked `DISCARDED` in a push's transaction)
+    /// from storage and remove their `packs` rows.
+    pub async fn purge_discarded(&self, project: i64, names: &[String]) -> Result<()> {
+        self.packs
+            .purge_discarded(&*self.store, project, names, &self.deletes, &self.pack_rows)
+            .await
+    }
+
     /// Remove `key` from the blob store, counting the delete request.
     pub async fn delete_key(&self, key: &str) -> Result<()> {
         bump(&self.deletes);
