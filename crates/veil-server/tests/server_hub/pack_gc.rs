@@ -1780,6 +1780,21 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
         .rt
         .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
         .unwrap();
+    let now = veil_core::now_millis();
+    // BUG-2660: hold `main`'s landing lease so another test's `landing::resume`
+    // on the shared database does not start a landing service on `(pid, 'main')`
+    // that cleans or lands the synthetic rows written below.
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at, lock_epoch) \
+                 VALUES ($1, 'main', 'test-2602', 1, $2, NULL)",
+            )
+            .bind(pid)
+            .bind(now + 3_600_000)
+            .execute(&h.db),
+        )
+        .unwrap();
     let exists = |id: &ObjectId| {
         let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
         hub.rt.block_on(fresh.exists(pid, id)).unwrap()
@@ -1820,7 +1835,7 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
         }),
         ("landings", {
             let m = m.clone();
-            Box::new(move |s| format!("INSERT INTO landings (project_id, branch, lineage, submitted, landed, at) VALUES ({pid}, 'main', 0, '{m}', '{s}', 1000)"))
+            Box::new(move |s| format!("INSERT INTO landings (project_id, branch, lineage, submitted, landed, at) VALUES ({pid}, 'main', 0, '{m}', '{s}', {now})"))
         }),
         ("embargo_snapshots", Box::new(move |s| format!("INSERT INTO embargo_snapshots (project_id, snapshot, embargo_id) VALUES ({pid}, '{s}', 'e2602snap')"))),
         (
@@ -1988,6 +2003,15 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
         at += 400_000;
     }
 
+    // BUG-2660: a peer server running `landing::resume` on the shared database
+    // (as `rv_core2::bug_1883_…` does) leaves `(pid, 'main')`'s synthetic
+    // `'queued'` and `landings` rows untouched.
+    let peer = TestHub::beside(&hub);
+    peer.rt.block_on(async {
+        veil_server::landing::resume(peer.hub()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
     // Later passes, far past every window: the roots written keep what they name.
     for off in [at + 1_000_000, at + 2_000_000] {
         let rep = gc_pass(
@@ -2007,13 +2031,19 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
                  UNION ALL SELECT snapshot FROM tested WHERE project_id = $1 AND branch = 'racing-tested-2602' \
                  UNION ALL SELECT head FROM pr_revisions WHERE project_id = $1 AND pr = 'pr-2602' \
                  UNION ALL SELECT snapshot FROM embargo_snapshots WHERE project_id = $1 AND embargo_id = 'e2602snap' \
-                 UNION ALL SELECT landed FROM landings WHERE project_id = $1 AND landed <> submitted AND at = 1000",
+                 UNION ALL SELECT landed FROM landings WHERE project_id = $1 AND landed <> submitted AND at = $2",
             )
             .bind(pid)
+            .bind(now)
             .fetch_all(&h.db),
         )
         .unwrap();
     assert_eq!(named.len(), 7, "the roots written are still there: {named:?}");
+    let queued_state: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = 't-2602-stack'").bind(pid).fetch_one(&h.db))
+        .unwrap();
+    assert_eq!(queued_state, "queued", "t-2602-stack stays queued across peer landing::resume");
     for s in named {
         assert_closure_stored(&hub, pid, ObjectId::from_hex(&s).unwrap(), "after later passes");
     }
