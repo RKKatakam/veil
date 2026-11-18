@@ -1278,15 +1278,32 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
         if let Some(c) = r["db_branch_landing_commits_per_landing"].as_f64().filter(|c| c * merges > GATE_COMMITS_PER_BRANCH_LANDING * merges * 1.02 + 20.0) {
             out.push(format!("{mode}: {c:.2} database commits per branch landing (gate: {GATE_COMMITS_PER_BRANCH_LANDING})"));
         }
-        // An API commit too: it stores what it made as one pack (BUG-1948;
-        // stored loose, as S10 did, its writes were only reported).
-        let tries = 1.0 + r["collisions_per_op"].as_f64().unwrap_or(0.0);
-        let over = |w: f64| w * ops > GATE_STORAGE_WRITES_PER_PUSH * tries * ops * 1.02 + 20.0;
-        if let Some(w) = r["storage_push_writes_per_op"].as_f64().filter(|w| over(*w)) {
-            out.push(format!(
-                "{mode}: {:.2} storage writes per push ({w:.2} per landing of {tries:.2} pushes), the deriver's aside (gate: {GATE_STORAGE_WRITES_PER_PUSH})",
-                w / tries
-            ));
+        // An API commit too: it stores what it made as one pack in `packs`
+        // (BUG-1948) and under its keys in `objects`. In `objects`, a push's
+        // own writes are at most its upload requests plus the objects it kept
+        // (`storage_own_writes <= uploads + objects_kept`, `object-layout.md` §8.2).
+        if r["object_layout"].as_str() == Some("objects") {
+            if let Some(w) = r["storage_push_writes_per_op"].as_f64() {
+                match r["uploads_per_op"].as_f64().zip(r["objects_kept_per_op"].as_f64()) {
+                    Some((u, k)) if w * ops <= (u + k) * ops * 1.02 + 20.0 => {}
+                    Some((u, k)) => out.push(format!(
+                        "{mode}: {w:.2} own storage writes per op, the deriver's aside (gate in `objects`: <= {:.2}, uploads {u:.2} + objects kept {k:.2})",
+                        u + k
+                    )),
+                    None => out.push(format!(
+                        "{mode}: {w:.2} own storage writes per op in `objects` without `uploads` and `objects_kept` counters"
+                    )),
+                }
+            }
+        } else {
+            let tries = 1.0 + r["collisions_per_op"].as_f64().unwrap_or(0.0);
+            let over = |w: f64| w * ops > GATE_STORAGE_WRITES_PER_PUSH * tries * ops * 1.02 + 20.0;
+            if let Some(w) = r["storage_push_writes_per_op"].as_f64().filter(|w| over(*w)) {
+                out.push(format!(
+                    "{mode}: {:.2} storage writes per push ({w:.2} per landing of {tries:.2} pushes), the deriver's aside (gate: {GATE_STORAGE_WRITES_PER_PUSH})",
+                    w / tries
+                ));
+            }
         }
     }
     if mode == "objects" && r["via"] == "cache" {
@@ -1869,6 +1886,11 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         let (sent, received) = (BYTES_SENT.load(Ordering::Relaxed) - sent0, BYTES_RECEIVED.load(Ordering::Relaxed) - received0);
         let server_stats = cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f)).zip(before_server_stats);
         let stat = |k: &str| server_stats.as_ref().and_then(|(b, a)| Some(b[k].as_f64()? - a[k].as_f64()?));
+        let object_layout = server_stats
+            .as_ref()
+            .and_then(|(b, _)| b["object_layout"].as_str().map(str::to_owned))
+            .or_else(|| cx.server_stats.as_ref().and_then(|(_, f)| f.parent().and_then(crate::server::stats_layout)))
+            .or_else(|| a.server.object_layout.clone());
         let dml_both = cx.stats.and_then(|(rt, url)| db_writes(rt, url)).zip(before_dml);
         let dml = dml_both.map(|((_, bw), (_, aw))| bw - aw);
         // Explicit `COMMIT`s, counted on YugabyteDB too (it has no
@@ -1903,7 +1925,6 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         });
         result = json!({
             "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Branches => "branches", Mode::Api => "api", Mode::Landing => "landing", Mode::Objects => "objects", Mode::Agents => "agents" },
-
             "projects": projects,
             "clients": clients,
             "rate": match rate { Rate::Max => json!("max"), Rate::PerSecond(r) => json!(r) },
@@ -1946,6 +1967,11 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "background_landings": bg.ops.load(Ordering::Relaxed),
             "background_errors": bg.errors.load(Ordering::Relaxed),
         });
+        result["object_layout"] = json!(object_layout);
+        result["storage_deletes_per_op"] = json!(stat("storage_deletes").map(per_op));
+        result["storage_lists_per_op"] = json!(stat("storage_lists").map(per_op));
+        result["objects_kept_per_op"] = json!(stat("objects_kept").map(per_op));
+        result["uploads_per_op"] = json!(stat("uploads").map(per_op));
         // The measured window's wall-clock edges, to line up samples taken
         // elsewhere (the servers' and the database's CPU: deploy/gates.sh `onerepo`).
         result["window_start_unix_ms"] = json!(window_start);
@@ -2546,13 +2572,19 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         }
     }
     }
-    Ok(json!({ "profile": "load", "server": base, "runs": runs }))
+    let object_layout = runs
+        .iter()
+        .find_map(|r| r["object_layout"].as_str().map(str::to_owned))
+        .or_else(|| _server.as_ref().and_then(|_| crate::server::stats_layout(&a.dir.join("server"))))
+        .or_else(|| a.server.object_layout.clone());
+    Ok(json!({ "profile": "load", "server": base, "object_layout": object_layout, "runs": runs }))
 }
 
 fn line(r: &serde_json::Value) -> String {
     let f = |k: &str| r[k].as_f64().map(|v| format!("{v:.2}")).unwrap_or_else(|| "–".into());
     format!(
-        "{} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, told to come back {} (busy {}, branch landings {}), server ms/op {}, db ms/op {}, db/op {}, commits/op {}, writes/op {}, derived {} s later ({} branches behind), storage reads/op {}, object cache hits {}",
+        "layout {}, {} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, told to come back {} (busy {}, branch landings {}), server ms/op {}, db ms/op {}, db/op {}, commits/op {}, writes/op {}, derived {} s later ({} branches behind), storage writes/op {} ({}), reads/op {}, deletes/op {}, lists/op {}, object cache hits {}",
+        r["object_layout"].as_str().unwrap_or("–"),
         f("ops_per_s"),
         r["agents_finishing"],
         f("p50_ms"),
@@ -2569,22 +2601,35 @@ fn line(r: &serde_json::Value) -> String {
         f("db_writes_per_op"),
         f("derive_lag_s"),
         r["derive_behind"],
+        f("storage_writes_per_op"),
+        f("storage_push_writes_per_op"),
         f("storage_reads_per_op"),
+        f("storage_deletes_per_op"),
+        f("storage_lists_per_op"),
         f("object_cache_hit_share")
     )
 }
 
 /// The runs as a Markdown table.
 pub fn markdown(v: &serde_json::Value) -> Result<String> {
-    let mut out = String::from(
-        "| Mode | Projects | Clients | Agents finishing | Target rate (/s) | Done (/s) | p50 (ms) | p99 (ms) | Collisions per landing | Requests per op | Server CPU (ms/op) | Server cores | DB CPU (ms/op) | DB cores | DB statements per op | DB commits per op | DB writes per op | Load tool cores | Errors |\n\
-         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+    let mut out = String::new();
+    let top_layout = v["object_layout"]
+        .as_str()
+        .or_else(|| v["runs"].as_array().and_then(|rs| rs.iter().find_map(|r| r["object_layout"].as_str())));
+    if let Some(l) = top_layout {
+        out.push_str(&format!("Object layout: `{l}`.\n\n"));
+    }
+    let layout_of = |r: &serde_json::Value| r["object_layout"].as_str().or(top_layout).unwrap_or("–").to_string();
+    out.push_str(
+        "| Mode | Layout | Projects | Clients | Agents finishing | Target rate (/s) | Done (/s) | p50 (ms) | p99 (ms) | Collisions per landing | Requests per op | Server CPU (ms/op) | Server cores | DB CPU (ms/op) | DB cores | DB statements per op | DB commits per op | DB writes per op | Load tool cores | Errors |\n\
+         |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     let f = |x: &serde_json::Value, d: usize| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{v:.d$}")).unwrap_or_else(|| "–".into());
     for r in v["runs"].as_array().ok_or_else(|| anyhow!("no runs"))? {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             r["mode"].as_str().unwrap_or(""),
+            layout_of(r),
             r["projects"],
             r["clients"],
             r["agents_finishing"],
@@ -2624,8 +2669,8 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         }
     }
     out.push_str(
-        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed | Gates not measured |\n\
-         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n",
+        "\n| Mode | Layout | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | Storage deletes per op | Storage listings per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed | Gates not measured |\n\
+         |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n",
     );
     let pct = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.0} %", v * 100.0)).unwrap_or_else(|| "–".into());
     let kib = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.1}", v / 1024.0)).unwrap_or_else(|| "–".into());
@@ -2635,8 +2680,9 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         // column of their own, so "none missed" is never read as "all met".
         let unmeasured = r["gates_unmeasured"].as_array().map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} / {} / {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} | {} |\n",
             r["mode"].as_str().unwrap_or(""),
+            layout_of(r),
             r["projects"],
             r["clients"],
             r["rate"].as_str().map(str::to_string).unwrap_or_else(|| f(&r["rate"], 2)),
@@ -2647,6 +2693,8 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             f(&r["storage_writes_per_op"], 1),
             f(&r["storage_push_writes_per_op"], 1),
             f(&r["storage_reads_per_op"], 1),
+            f(&r["storage_deletes_per_op"], 1),
+            f(&r["storage_lists_per_op"], 2),
             kib(&r["storage_written_bytes_per_op"]),
             kib(&r["bytes_sent_per_op"]),
             kib(&r["bytes_received_per_op"]),
@@ -2660,13 +2708,14 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
     let landing: Vec<&serde_json::Value> = v["runs"].as_array().map(|r| r.iter().filter(|r| r["mode"] == "landing").collect()).unwrap_or_default();
     if !landing.is_empty() {
         out.push_str(
-            "\n| Landing service: clients | Target rate (/s) | Done (/s) | Batches | Landings per batch | Prepare (ms/batch) | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) |\n\
-             |---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+            "\n| Landing service: clients | Layout | Target rate (/s) | Done (/s) | Batches | Landings per batch | Prepare (ms/batch) | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) |\n\
+             |---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
         );
         for r in landing {
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 r["clients"],
+                layout_of(r),
                 r["rate"].as_str().map(str::to_string).unwrap_or_else(|| f(&r["rate"], 2)),
                 f(&r["ops_per_s"], 1),
                 f(&r["landing_batches"], 0),
@@ -2699,13 +2748,14 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
     let objects: Vec<&serde_json::Value> = v["runs"].as_array().into_iter().flatten().filter(|r| r["mode"] == "objects").collect();
     if !objects.is_empty() {
         out.push_str(
-            "\n| Via | Projects | Clients | Reads (/s) | Objects per read | p50 (ms) | p99 (ms) | Server CPU (ms/read) | Cache hits | Cache requests to the server per read | Cache CPU (ms/read) | Cache peak (MiB) | Errors |\n\
-             |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+            "\n| Via | Layout | Projects | Clients | Reads (/s) | Objects per read | p50 (ms) | p99 (ms) | Server CPU (ms/read) | Cache hits | Cache requests to the server per read | Cache CPU (ms/read) | Cache peak (MiB) | Errors |\n\
+             |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
         );
         for r in objects {
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 r["via"].as_str().unwrap_or(""),
+                layout_of(r),
                 r["projects"],
                 r["clients"],
                 f(&r["ops_per_s"], 1),
@@ -2730,7 +2780,8 @@ mod tests {
 
     /// S28's gate: a landing's own storage writes (the deriver's aside), for
     /// pushes and, since it stores what it made as one pack (BUG-1948), for
-    /// an API commit.
+    /// an API commit; in `objects` mode, bounded by `uploads + objects_kept`
+    /// (`object-layout.md` §8.2).
     #[test]
     fn storage_writes_per_push_are_gated() {
         let run = |mode: &str, push_writes: f64| json!({"mode": mode, "ops": 1000.0, "storage_push_writes_per_op": push_writes});
@@ -2744,6 +2795,32 @@ mod tests {
         let raced = |w: f64| json!({"mode": "land", "ops": 1000.0, "collisions_per_op": 4.0, "storage_push_writes_per_op": w});
         assert!(missed_gates(&raced(9.0), 0.0).is_empty());
         assert_eq!(missed_gates(&raced(12.0), 0.0).len(), 1);
+
+        // `objects` layout: own writes <= uploads + objects_kept.
+        let obj_run = |mode: &str, own_writes: f64, uploads: f64, kept: f64| {
+            json!({
+                "mode": mode,
+                "object_layout": "objects",
+                "ops": 1000.0,
+                "storage_push_writes_per_op": own_writes,
+                "uploads_per_op": uploads,
+                "objects_kept_per_op": kept,
+                "storage_deletes_per_op": uploads,
+                "storage_lists_per_op": 0.0,
+            })
+        };
+        assert!(missed_gates(&obj_run("branches", 7.0, 1.0, 6.0), 0.0).is_empty());
+        assert!(missed_gates(&obj_run("land", 21.0, 3.0, 18.0), 0.0).is_empty());
+        assert!(missed_gates(&obj_run("api", 6.0, 0.0, 6.0), 0.0).is_empty());
+        assert_eq!(missed_gates(&obj_run("branches", 8.0, 1.0, 6.0), 0.0).len(), 1, "extra write per push misses gate");
+        assert_eq!(missed_gates(&obj_run("api", 7.0, 0.0, 6.0), 0.0).len(), 1, "extra write on API commit misses gate");
+        let missing_counters = json!({"mode": "branches", "object_layout": "objects", "ops": 1000.0, "storage_push_writes_per_op": 7.0});
+        assert_eq!(missed_gates(&missing_counters, 0.0).len(), 1);
+
+        let md = markdown(&json!({"object_layout": "objects", "runs": [obj_run("branches", 7.0, 1.0, 6.0)]})).expect("table");
+        assert!(md.starts_with("Object layout: `objects`.\n\n"), "{md}");
+        assert!(md.contains("| Storage deletes per op | Storage listings per op |"), "{md}");
+        assert!(md.contains("| branches | objects |"), "{md}");
     }
 
     /// BUG-2350: the commits the server counts by kind are charged where

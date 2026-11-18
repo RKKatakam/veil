@@ -214,15 +214,22 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         }
     }
     run(vl(&a.dir).args(["daemon", "stop"]))?;
-    Ok(json!({ "profile": "daemon", "cases": cases }))
+    let object_layout = crate::server::stats_layout(&a.dir.join("server")).or_else(|| a.server.object_layout.clone());
+    Ok(json!({ "profile": "daemon", "object_layout": object_layout, "cases": cases }))
 }
 
 pub fn markdown(v: &serde_json::Value) -> Result<String> {
-    let mut out = String::from("| Files | Case | Mode | Median (ms) | Target (ms) |\n|---:|---|---|---:|---:|\n");
+    let mut out = String::new();
+    let layout = v["object_layout"].as_str().unwrap_or("–");
+    if let Some(l) = v["object_layout"].as_str() {
+        out.push_str(&format!("Object layout: `{l}`.\n\n"));
+    }
+    out.push_str("| Files | Layout | Case | Mode | Median (ms) | Target (ms) |\n|---:|---|---|---|---:|---:|\n");
     for c in v["cases"].as_array().ok_or_else(|| anyhow!("no cases"))? {
         out.push_str(&format!(
-            "| {} | {} | {} | {:.1} | {} |\n",
+            "| {} | {} | {} | {} | {:.1} | {} |\n",
             c["files"],
+            layout,
             c["case"].as_str().unwrap_or(""),
             c["mode"].as_str().unwrap_or(""),
             c["ms"].as_f64().unwrap_or(f64::NAN),
