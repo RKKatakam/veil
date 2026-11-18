@@ -1910,7 +1910,7 @@ async fn sweep_discarded(
         let mut deletes = tokio::task::JoinSet::new();
         for name in chunk {
             let (hub, k) = (hub.clone(), pack::key(project, name));
-            deletes.spawn(async move { hub.objects.blob_store().delete(&k).await });
+            deletes.spawn(async move { hub.objects.delete_key(&k).await });
         }
         while let Some(r) = deletes.join_next().await {
             r.map_err(|e| Error::Other(e.into()))?.map_err(Error::Other)?;
@@ -1994,7 +1994,7 @@ async fn mark_and_sweep_loose(
     }
 
     let prefix = format!("p/{project}/");
-    let keys = store.list(&prefix).await.map_err(Error::Other)?;
+    let keys = hub.objects.list_keys(&prefix).await.map_err(Error::Other)?;
     let mut loose_ids: Vec<ObjectId> = Vec::new();
     for k in keys {
         let Some(rest) = k.strip_prefix(&prefix) else { continue };
@@ -2348,7 +2348,7 @@ async fn loose_chunk_under_gate(
                 if let Some(fault) = &fault {
                     (fault.0)(FaultPoint::LooseDelete, id).await?;
                 }
-                hub.objects.blob_store().delete(&k).await.map_err(Error::Other)
+                hub.objects.delete_key(&k).await.map_err(Error::Other)
             });
         }
         while let Some(r) = set.join_next().await {

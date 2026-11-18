@@ -24,6 +24,47 @@ use veil_core::{cache::LruCache, hub::encoding, ObjectId};
 
 use crate::pack::{Found, Held, Index, Slot, StagedSlots};
 
+/// How this server keeps the objects a push, an API commit or a landing
+/// batch keeps (`--object-layout`, `VEIL_OBJECT_LAYOUT`;
+/// `docs/design/server/object-layout.md`). Reads never depend on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ObjectLayout {
+    /// Listed packs (S28), the default.
+    #[default]
+    Packs,
+    /// One object per key (`p/<project>/ab/cdef…`), with uploads still
+    /// staged in a container that is deleted when its push answers.
+    Objects,
+}
+
+impl ObjectLayout {
+    /// Its flag, environment variable and `stats.json` name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ObjectLayout::Packs => "packs",
+            ObjectLayout::Objects => "objects",
+        }
+    }
+}
+
+impl std::fmt::Display for ObjectLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ObjectLayout {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<ObjectLayout, String> {
+        match s {
+            "packs" => Ok(ObjectLayout::Packs),
+            "objects" => Ok(ObjectLayout::Objects),
+            _ => Err(format!("{s}: expected `packs` or `objects`")),
+        }
+    }
+}
+
 #[async_trait]
 pub trait BlobStore: Send + Sync {
     /// The object at `key`, `None` if there is none.
@@ -60,12 +101,19 @@ pub trait BlobStore: Send + Sync {
         None
     }
     /// Remove the object at `key` (no error if there is none): only packs
-    /// that were discarded (`pack::Packs::discard`) are ever removed.
+    /// that were discarded (`pack::Packs::discard`) and expired loose
+    /// objects (`pack_gc`) are ever removed.
     async fn delete(&self, key: &str) -> Result<()>;
     /// Every key that starts with `prefix` (a folder of keys, `…/`): what
     /// the store holds, to compare with the database's rows (the tests;
     /// S29's job).
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    /// [`BlobStore::list`], counting each listing request in `lists`
+    /// (each page on S3).
+    async fn list_counted(&self, prefix: &str, lists: &AtomicU64) -> Result<Vec<String>> {
+        bump(lists);
+        self.list(prefix).await
+    }
 }
 
 /// Bytes `start..=end` of `b`, clamped.
@@ -436,6 +484,10 @@ impl BlobStore for S3Store {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.list_counted(prefix, &AtomicU64::new(0)).await
+    }
+
+    async fn list_counted(&self, prefix: &str, lists: &AtomicU64) -> Result<Vec<String>> {
         use rusty_s3::S3Action;
         let mut out = Vec::new();
         let mut token: Option<String> = None;
@@ -446,6 +498,7 @@ impl BlobStore for S3Store {
                 action.with_continuation_token(t.clone());
             }
             let url = action.sign(S3_SIGN_FOR);
+            bump(lists);
             let (status, body) = s3_send(|| self.http.get(url.clone())).await?;
             if status != 200 {
                 bail!("S3 LIST: HTTP {status}");
@@ -538,6 +591,7 @@ impl ReadAhead {
 /// is ever answered as the project's.
 pub struct Objects {
     store: Arc<dyn BlobStore>,
+    layout: ObjectLayout,
     /// Encodings, checked against their ids.
     cache: LruCache<Bytes>,
     /// Decoded canonical bytes for objects up to [`RAW_CACHE_MAX_OBJECT`],
@@ -548,19 +602,27 @@ pub struct Objects {
     /// Per-project GC epoch observed from `access_epochs (project_id, -1)`.
     gc_epochs: std::sync::RwLock<std::collections::HashMap<i64, i64>>,
     /// Requests to the store, for the benchmarks' cost gates
-    /// (`storage-and-cost.md` §9): writes, bytes written, reads; of the
-    /// writes, a push's and an upload's own (`own_writes`: those made in
-    /// their scope, [`own`], counted where they are made: BUG-1398).
+    /// (`storage-and-cost.md` §9): writes, bytes written, reads, deletes,
+    /// listings; of the writes, a push's and an upload's own (`own_writes`:
+    /// those made in their scope, [`own`], counted where they are made:
+    /// BUG-1398).
     pub writes: AtomicU64,
     pub written_bytes: AtomicU64,
     pub reads: AtomicU64,
+    pub deletes: AtomicU64,
+    pub lists: AtomicU64,
+    /// Objects kept by pushes, API commits and landing batches.
+    pub objects_kept: AtomicU64,
+    /// Upload containers staged (`POST …/objects`).
+    pub uploads: AtomicU64,
     /// Project object lookups answered from the object caches, and those
     /// that were not (BUG-2271).
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
     pub own_writes: AtomicU64,
-    /// Database commits that record a pack before it is written (an
-    /// upload's, a push's own: S28), apart from a push's transaction.
+    /// Database commits that record or remove an unlisted pack row (an
+    /// upload's, a push's own: S28; a discarded container's in `objects`),
+    /// apart from a push's transaction.
     pub pack_rows: AtomicU64,
 }
 
@@ -655,10 +717,16 @@ impl Objects {
 
     /// Objects in `store`, with the packs listed in `db`.
     pub fn with_db(store: Arc<dyn BlobStore>, cache_bytes: usize, db: Option<sqlx::PgPool>) -> Objects {
+        Objects::with_layout(store, cache_bytes, db, ObjectLayout::Packs)
+    }
+
+    /// Objects in `store`, keeping new objects in `layout`.
+    pub fn with_layout(store: Arc<dyn BlobStore>, cache_bytes: usize, db: Option<sqlx::PgPool>, layout: ObjectLayout) -> Objects {
         let raw_bytes = (cache_bytes / 4).max(1);
         let enc_bytes = cache_bytes.saturating_sub(raw_bytes).max(1);
         Objects {
             store,
+            layout,
             cache: LruCache::new(enc_bytes),
             raw_cache: LruCache::new(raw_bytes),
             packs: crate::pack::Packs::new(db),
@@ -666,11 +734,20 @@ impl Objects {
             writes: Default::default(),
             written_bytes: Default::default(),
             reads: Default::default(),
+            deletes: Default::default(),
+            lists: Default::default(),
+            objects_kept: Default::default(),
+            uploads: Default::default(),
             cache_hits: Default::default(),
             cache_misses: Default::default(),
             own_writes: Default::default(),
             pack_rows: Default::default(),
         }
+    }
+
+    /// How this server keeps new objects.
+    pub fn layout(&self) -> ObjectLayout {
+        self.layout
     }
 
     pub fn gc_epoch(&self, project: i64) -> i64 {
@@ -1090,6 +1167,9 @@ impl Objects {
             self.packs.record_staged_by(project, staged_by, &name, size, index.len()).await?;
             bump(&self.pack_rows);
         }
+        if staged_by.is_some() {
+            bump(&self.uploads);
+        }
         count_write(self, size as usize);
         self.store.put(&crate::pack::key(project, &name), bytes).await?;
         Ok((name, Held::new(Arc::new(index), size, share)))
@@ -1306,7 +1386,18 @@ impl Objects {
     /// Discard packs `names` of `project` that no transaction listed
     /// ([`crate::pack::Packs::discard`]).
     pub async fn discard(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
-        self.packs.discard(&*self.store, project, names).await
+        self.packs.discard_counted(&*self.store, project, names, &self.deletes).await
+    }
+
+    /// Remove `key` from the blob store, counting the delete request.
+    pub async fn delete_key(&self, key: &str) -> Result<()> {
+        bump(&self.deletes);
+        self.store.delete(key).await
+    }
+
+    /// List keys starting with `prefix`, counting each listing request.
+    pub async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        self.store.list_counted(prefix, &self.lists).await
     }
 
     /// Bytes `start..=end` of object `id` of `project` (its canonical

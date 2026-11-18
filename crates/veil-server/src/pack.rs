@@ -1343,6 +1343,10 @@ impl Packs {
     /// (a failed delete, a server stopped in between) is S29's job's to
     /// delete (`storage-and-cost.md` §8).
     pub async fn discard(&self, store: &dyn BlobStore, project: i64, names: &[Arc<str>]) -> Result<()> {
+        self.discard_counted(store, project, names, &AtomicU64::new(0)).await
+    }
+
+    pub async fn discard_counted(&self, store: &dyn BlobStore, project: i64, names: &[Arc<str>], deletes: &AtomicU64) -> Result<()> {
         if names.is_empty() {
             return Ok(());
         }
@@ -1367,6 +1371,7 @@ impl Packs {
         };
         let (mut first, mut failed) = (None, 0);
         for n in &gone {
+            deletes.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = store.delete(&key(project, n)).await {
                 failed += 1;
                 first.get_or_insert(e);

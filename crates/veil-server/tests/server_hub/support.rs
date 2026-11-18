@@ -154,6 +154,7 @@ impl TestHub {
             listen,
             database_url,
             storage,
+            object_layout: veil_server::ObjectLayout::default(),
             tls: TlsSource::SelfSigned,
             data_dir: dir.path().join("data"),
             session_ttl: ttl,

@@ -23,6 +23,10 @@
 //! | [`pack`] | packs: a push's objects in one storage object, read by range (S28) |
 //! | [`tls`] | TLS configuration |
 
+// `stats_json`'s `serde_json::json!` has more fields than the default macro
+// recursion limit allows (BUG-2220's and BUG-2221's counters).
+#![recursion_limit = "256"]
+
 pub mod api;
 pub mod auth;
 pub mod bisect;
@@ -51,6 +55,8 @@ pub mod sync;
 pub mod subtree;
 pub mod tls;
 pub mod web;
+
+pub use store::ObjectLayout;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -147,6 +153,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub database_url: String,
     pub storage: Storage,
+    /// How this server keeps new objects (`packs` or `objects`).
+    pub object_layout: ObjectLayout,
     pub tls: tls::TlsSource,
     /// The server's identity and the self-signed certificate live here.
     pub data_dir: PathBuf,
@@ -243,7 +251,7 @@ pub async fn start(config: Config) -> Result<Running> {
     };
     let hub = Arc::new(Hub {
         db: db.clone(),
-        objects: Arc::new(store::Objects::with_db(blob, 256 << 20, Some(db.clone()))),
+        objects: Arc::new(store::Objects::with_layout(blob, 256 << 20, Some(db.clone()), config.object_layout)),
         trees: LruCache::new(256 << 20),
         identity,
         receipt_key,
@@ -601,4 +609,66 @@ pub async fn audit(db: &sqlx::PgPool, project: Option<i64>, actor: Option<i64>, 
         .bind(details)
         .execute(db)
         .await;
+}
+
+/// The counters `SIGUSR1` writes to `stats.json` (`n` counts the signals).
+pub fn stats_json(hub: &Hub, n: u64) -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &hub.caches.stats;
+    serde_json::json!({
+        "n": n,
+        "object_layout": hub.objects.layout().as_str(),
+        "storage_writes": hub.objects.writes.load(Relaxed),
+        "storage_written_bytes": hub.objects.written_bytes.load(Relaxed),
+        "storage_reads": hub.objects.reads.load(Relaxed),
+        "storage_deletes": hub.objects.deletes.load(Relaxed),
+        "storage_lists": hub.objects.lists.load(Relaxed),
+        "objects_kept": hub.objects.objects_kept.load(Relaxed),
+        "uploads": hub.objects.uploads.load(Relaxed),
+        "object_cache_hits": hub.objects.cache_hits.load(Relaxed),
+        "object_cache_misses": hub.objects.cache_misses.load(Relaxed),
+        "storage_own_writes": hub.objects.own_writes.load(Relaxed),
+        "pack_row_commits": hub.objects.pack_rows.load(Relaxed),
+        "commits": hub.commits.by_kind(),
+        "s3_slow_down": crate::store::S3_SLOW_DOWN.load(Relaxed),
+        "s3_gave_up": crate::store::S3_GAVE_UP.load(Relaxed),
+        "session_hits": c.session_hits.load(Relaxed),
+        "embargo_asks": c.embargo_asks.load(Relaxed),
+        "session_misses": c.session_misses.load(Relaxed),
+        "permission_hits": c.permission_hits.load(Relaxed),
+        "permission_misses": c.permission_misses.load(Relaxed),
+        "tips_hits": c.tips_hits.load(Relaxed),
+        "tips_misses": c.tips_misses.load(Relaxed),
+        "notices": hub.caches.notices.load(Relaxed),
+        "landing_batches": hub.landing.stats.batches.load(Relaxed),
+        "landing_landed": hub.landing.stats.landed.load(Relaxed),
+        "landing_conflicts": hub.landing.stats.conflicts.load(Relaxed),
+        "landing_rejected": hub.landing.stats.rejected.load(Relaxed),
+        "landing_build_us": hub.landing.stats.build_us.load(Relaxed),
+        "landing_prepare_us": hub.landing.stats.prepare_us.load(Relaxed),
+        "landing_projected": hub.landing.stats.projected.load(Relaxed),
+        "landing_attached": hub.landing.stats.attached.load(Relaxed),
+        "landing_prefilled": hub.landing.stats.prefilled.load(Relaxed),
+        "landing_dropped": hub.landing.stats.dropped.load(Relaxed),
+        "landing_memo_races": hub.landing.stats.memo_races.load(Relaxed),
+        "landing_kept": hub.landing.stats.kept.load(Relaxed),
+        "landing_rechecked": hub.landing.stats.rechecked.load(Relaxed),
+        "landing_classified": hub.landing.stats.classified.load(Relaxed),
+        "landing_store_us": hub.landing.stats.store_us.load(Relaxed),
+        "landing_commit_us": hub.landing.stats.commit_us.load(Relaxed),
+        "landing_pick_statements": hub.landing.stats.pick_statements.load(Relaxed),
+        "landing_pick_rows": hub.landing.stats.pick_rows.load(Relaxed),
+        "landing_review_asks": hub.landing.stats.review_asks.load(Relaxed),
+        "landing_queue_full": hub.landing.stats.queue_full.load(Relaxed),
+        "landing_merging": hub.landing.stats.merging.load(Relaxed),
+        "landing_read_us": hub.landing.stats.read_us.load(Relaxed),
+        "landing_write_rule_us": hub.landing.stats.write_rule_us.load(Relaxed),
+        "landing_merge_us": hub.landing.stats.merge_us.load(Relaxed),
+        "landing_conflict_us": hub.landing.stats.conflict_us.load(Relaxed),
+        "landing_apply_us": hub.landing.stats.apply_us.load(Relaxed),
+        "landing_recheck_us": hub.landing.stats.recheck_us.load(Relaxed),
+        "landing_project_us": hub.landing.stats.project_us.load(Relaxed),
+        "landing_walks": hub.landing.stats.walks.load(Relaxed),
+        "landing_graph_reads": hub.landing.stats.graph_reads.load(Relaxed),
+    })
 }
