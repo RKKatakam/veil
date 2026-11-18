@@ -1052,6 +1052,19 @@ fn on_yugabyte(rt: &tokio::runtime::Runtime) -> bool {
     })
 }
 
+/// BUG-2626: the indexes the runner built for its wait for every session
+/// (`db::wait_for_every_session`: on `schema_migrations`, named
+/// `veil_settle_` and sixteen hex digits) that are still in the catalog.
+async fn settle_indexes_left(url: &str) -> Vec<String> {
+    let db = veil_server::db::connect(url, 1).await.unwrap();
+    let left = sqlx::query_scalar("SELECT c.relname::text FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname LIKE 'veil\\_settle\\_%'")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    left
+}
+
 /// BUG-2626: leave `packs_listed` as a YugabyteDB build left it: built by
 /// its flags, and without rows other sessions wrote beside the build. A
 /// session that reads the index not ready for writes inserts `rows` listed
@@ -1135,6 +1148,11 @@ fn bug_2626_an_index_built_without_rows_written_beside_its_build_is_built_again_
     let (with, without) = rt.block_on(listed_with_and_without_the_index(&url, project));
     assert_eq!(with.len(), 20_050, "two thirds of the 30,000 packs are listed, and the 50 written beside the first build");
     assert!(with == without, "the index built again holds exactly the listed rows");
+    // The indexes built for the waits before the two checks are dropped.
+    // (The runner's drop is as far as it goes: one that fails, which the
+    // server logs, leaves its index for a later start. None failed in a
+    // start that migrated, as this one: none is left.)
+    assert_eq!(rt.block_on(settle_indexes_left(&url)), Vec::<String>::new(), "an index the runner built for its wait is left");
     drop_database(&rt, &name);
 }
 
