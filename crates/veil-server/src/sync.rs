@@ -302,7 +302,7 @@ fn store_err(e: anyhow::Error) -> VeilError {
             Ok(full) => std::io::Error::other(full),
             Err(e) => match e.downcast::<std::io::Error>() {
                 Ok(io) => io,
-                Err(e) => std::io::Error::other(e),
+                Err(e) => std::io::Error::other(crate::error::AnyhowCause(e)),
             },
         },
     }

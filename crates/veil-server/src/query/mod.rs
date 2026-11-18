@@ -1274,7 +1274,7 @@ pub async fn blame(hub: &Arc<Hub>, ask: &Ask, q: BlameParams, limits: Limits) ->
     match files::wait_for_blame(hub, &ask.project, &ask.viewer, &start, follow, limits.blame, deadline, win).await? {
         files::JobEnd::Kept => {}
         files::JobEnd::NoText => return Err(not_text()),
-        files::JobEnd::Failed(status, code, message) => return Err(Error::Api { status, code, message }),
+        files::JobEnd::Failed(a) => return Err(a.into_error()),
     }
     let v = answer(path, false).await?;
     if v.get("pending").is_some() {
