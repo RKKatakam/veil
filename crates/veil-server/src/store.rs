@@ -637,6 +637,12 @@ fn decoded(id: &ObjectId, enc: &Bytes) -> Result<Bytes> {
     }
 }
 
+/// Check that encoding `enc` decodes within [`MAX_OBJECT`] to `id` without
+/// materializing the decoded buffer (`BUG-2662`).
+fn verified(id: &ObjectId, enc: &Bytes) -> Result<()> {
+    encoding::verify(id, enc, MAX_OBJECT).map_err(|_| anyhow!("stored object {} does not match its id", id.short()))
+}
+
 /// [`decoded`] for an entry in [`Objects::cache`], which was already checked
 /// against `id` before insertion.
 fn decoded_cached(id: &ObjectId, enc: &Bytes) -> Result<Bytes> {
@@ -1407,7 +1413,7 @@ impl Objects {
                 && (uncached.len() == sp.objects || (uncached.len() > 1 && uncached_bytes.saturating_mul(2) >= sp.size));
             if read_whole {
                 self.drain_keep_writes(project, cx.gce, &mut set).await?;
-                let _run_held = if !opts.already_held {
+                let run_held = if !opts.already_held {
                     Some(ReadAhead::wait(sp.size).await)
                 } else {
                     ReadAhead::try_take(sp.size)
@@ -1427,18 +1433,14 @@ impl Objects {
                     )));
                 }
                 crate::pack::parse_index(&bytes, Some(sp.size)).map_err(KeepError::Store)?;
-                for (id, s) in uncached {
-                    let (from, to) = (s.offset as usize, s.last() as usize);
-                    if to >= bytes.len() {
-                        return Err(KeepError::Store(anyhow!("staged pack {name} is shorter than its index")));
-                    }
-                    let enc = Bytes::copy_from_slice(crate::pack::entry(&id, s, &bytes[from..=to]).map_err(KeepError::Store)?);
-                    let raw = decoded(&id, &enc).map_err(KeepError::Store)?;
-                    let raw_small = (raw.len() <= RAW_CACHE_MAX_OBJECT).then_some(raw);
-                    self.enqueue_keep_write(cx, true, &mut set, id, enc, raw_small).await?;
-                }
-                drop(bytes);
-                self.drain_keep_writes(project, cx.gce, &mut set).await?;
+                self.keep_uncached_entries(
+                    cx,
+                    (name, sp.size),
+                    &uncached,
+                    Some(((0, bytes), run_held)),
+                    &mut set,
+                )
+                .await?;
             } else {
                 let mut runs: Vec<Run> = Vec::new();
                 let mut run: Run = Vec::new();
@@ -1454,36 +1456,9 @@ impl Objects {
                 if !run.is_empty() {
                     runs.push(run);
                 }
-                let pack_key = crate::pack::key(project, name);
                 for run in runs {
-                    let (start, end) = (run[0].1.offset, run.last().expect("a run").1.last());
-                    let span = end - start + 1;
-                    self.drain_keep_writes(project, cx.gce, &mut set).await?;
-                    let _run_held = if !opts.already_held {
-                        Some(ReadAhead::wait(span).await)
-                    } else {
-                        ReadAhead::try_take(span)
-                    };
-                    bump(&self.reads);
-                    let (bytes, total_size) = self
-                        .store
-                        .get_range(&pack_key, start, end)
-                        .await
-                        .map_err(KeepError::Store)?
-                        .ok_or(KeepError::Discarded)?;
-                    if total_size != sp.size || bytes.len() as u64 != span {
-                        return Err(KeepError::Store(anyhow!("staged pack {name} is shorter than its index")));
-                    }
-                    for (id, s) in run {
-                        let (from, to) = ((s.offset - start) as usize, (s.last() - start) as usize);
-                        let enc =
-                            Bytes::copy_from_slice(crate::pack::entry(&id, s, &bytes[from..=to]).map_err(KeepError::Store)?);
-                        let raw = decoded(&id, &enc).map_err(KeepError::Store)?;
-                        let raw_small = (raw.len() <= RAW_CACHE_MAX_OBJECT).then_some(raw);
-                        self.enqueue_keep_write(cx, true, &mut set, id, enc, raw_small).await?;
-                    }
-                    drop(bytes);
-                    self.drain_keep_writes(project, cx.gce, &mut set).await?;
+                    self.keep_uncached_entries(cx, (name, sp.size), &run, None, &mut set)
+                        .await?;
                 }
             }
         }
@@ -1516,6 +1491,96 @@ impl Objects {
         }
 
         self.drain_keep_writes(project, cx.gce, &mut set).await
+    }
+
+    async fn keep_uncached_entries(
+        &self,
+        cx: KeepWriteCtx,
+        (name, pack_size): (&str, u64),
+        entries: &[(ObjectId, Slot)],
+        initial: Option<((u64, Bytes), Option<ReadAhead>)>,
+        set: &mut KeepWriteSet,
+    ) -> std::result::Result<(), KeepError> {
+        let (mut loaded, mut run_held) = match initial {
+            Some((b, h)) => (Some(b), h),
+            None => (None, None),
+        };
+        let pack_key = crate::pack::key(cx.project, name);
+        let end = entries.last().expect("non-empty entries").1.last();
+        for (idx, &(id, s)) in entries.iter().enumerate() {
+            if loaded.is_none() {
+                let span = end - s.offset + 1;
+                self.drain_keep_writes(cx.project, cx.gce, set).await?;
+                run_held = if !cx.already_held {
+                    Some(ReadAhead::wait(span).await)
+                } else {
+                    ReadAhead::try_take(span)
+                };
+                bump(&self.reads);
+                let (bytes, total_size) = self
+                    .store
+                    .get_range(&pack_key, s.offset, end)
+                    .await
+                    .map_err(KeepError::Store)?
+                    .ok_or(KeepError::Discarded)?;
+                if total_size != pack_size || bytes.len() as u64 != span {
+                    return Err(KeepError::Store(anyhow!("staged pack {name} is shorter than its index")));
+                }
+                loaded = Some((s.offset, bytes));
+            }
+            let enc = {
+                let (buf_start, buf) = loaded.as_ref().expect("loaded");
+                if s.offset < *buf_start {
+                    return Err(KeepError::Store(anyhow!("staged pack {name} slots out of order")));
+                }
+                let (from, to) = ((s.offset - buf_start) as usize, (s.last() - buf_start) as usize);
+                if to >= buf.len() {
+                    return Err(KeepError::Store(anyhow!("staged pack {name} is shorter than its index")));
+                }
+                Bytes::copy_from_slice(crate::pack::entry(&id, s, &buf[from..=to]).map_err(KeepError::Store)?)
+            };
+            if idx + 1 == entries.len() {
+                loaded = None;
+            }
+            let prefix = &enc[..enc.len().min(encoding::HEADER)];
+            let declared = encoding::declared_len(prefix, enc.len() as u64)
+                .filter(|&d| d <= MAX_OBJECT)
+                .ok_or_else(|| KeepError::Store(anyhow!("stored object {} does not match its id", id.short())))?;
+            let window = encoding::declared_window(prefix)
+                .filter(|&w| w <= encoding::MAX_WINDOW)
+                .ok_or_else(|| KeepError::Store(anyhow!("stored object {} does not match its id", id.short())))?;
+            let need = declared.max(window);
+            let decode_held = if cx.already_held {
+                ReadAhead::try_take(need)
+            } else if let Some(p) = ReadAhead::try_take(need) {
+                Some(p)
+            } else {
+                // Drop the buffered span before releasing `run_held` so waiting
+                // tasks never retain unpermitted span bytes (`BUG-2662`), and
+                // hold zero permits before `ReadAhead::wait` so requests never
+                // deadlock.
+                loaded = None;
+                self.drain_keep_writes(cx.project, cx.gce, set).await?;
+                run_held = None;
+                let enc_cost = enc.len() as u64;
+                Some(ReadAhead::wait(enc_cost.saturating_add(need)).await)
+            };
+            let raw_small = if (declared as usize) <= RAW_CACHE_MAX_OBJECT {
+                let raw = decoded(&id, &enc).map_err(KeepError::Store)?;
+                Some(raw)
+            } else {
+                let enc_chk = enc.clone();
+                tokio::task::spawn_blocking(move || verified(&id, &enc_chk))
+                    .await
+                    .map_err(|e| KeepError::Store(e.into()))?
+                    .map_err(KeepError::Store)?;
+                None
+            };
+            drop(decode_held);
+            self.enqueue_keep_write(cx, run_held.is_some(), set, id, enc, raw_small).await?;
+        }
+        drop(loaded);
+        self.drain_keep_writes(cx.project, cx.gce, set).await
     }
 
     async fn enqueue_keep_write(
@@ -1825,7 +1890,7 @@ impl Objects {
     /// the `DISCARDED` row so re-presenting those receipts still answers `400`.
     pub async fn discard_refused(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
         self.packs
-            .discard_with(&*self.store, project, names, true, false, &self.deletes, &self.pack_rows)
+            .discard_with(&*self.store, project, names, (true, false), (&self.deletes, &self.pack_rows))
             .await
     }
 
@@ -1836,7 +1901,7 @@ impl Objects {
     pub async fn discard_consumed(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
         let purge_row = self.layout == ObjectLayout::Objects;
         self.packs
-            .discard_with(&*self.store, project, names, false, purge_row, &self.deletes, &self.pack_rows)
+            .discard_with(&*self.store, project, names, (false, purge_row), (&self.deletes, &self.pack_rows))
             .await
     }
 
@@ -3006,5 +3071,108 @@ mod tests {
             panic!("deleted container must fail when uncached");
         };
         assert!(matches!(err_uncached, KeepError::Discarded), "expected Discarded, got {err_uncached:?}");
+    }
+
+    /// BUG-2662 (`t3/object-layout` cycle-1 review; BUG-1159's class): in
+    /// `objects` mode, `Objects::keep_objects` must bound decoded bytes under
+    /// `DECODED_IN_FLIGHT` (for `encoding::declared_len`, not just the
+    /// compressed span) across both its whole-container and ranged-run paths,
+    /// and verify large objects off the async worker threads.
+    #[test]
+    fn bug_2662_keep_objects_decodes_within_the_servers_bound() {
+        const CHILD: &str = "VEIL_TEST_KEEP_OBJECTS_CHILD";
+        const NAME: &str = "store::tests::bug_2662_keep_objects_decodes_within_the_servers_bound";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let whole = mode == "whole";
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(16).enable_all().build().unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let fs: Arc<dyn BlobStore> = Arc::new(FsStore::new(dir.path()));
+                let writer = Objects::with_layout(fs.clone(), 64 << 20, None, ObjectLayout::Objects);
+                let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+                let mut encs = Vec::new();
+                for side in *b"ab" {
+                    let mut raw = b"veil:blob\n".to_vec();
+                    raw.resize(48 << 20, 0);
+                    for i in (16..raw.len()).step_by(80) {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        raw[i] = x as u8;
+                    }
+                    raw[12] = side;
+                    let raw = Bytes::from(raw);
+                    let enc = encode(raw.clone());
+                    assert!(
+                        encoding::is_compressed(&enc) && encoding::within_ratio(&enc),
+                        "compressed within ratio: {}",
+                        enc.len()
+                    );
+                    encs.push((ObjectId::hash(&raw), enc));
+                }
+                let ids: Vec<ObjectId> = encs.iter().map(|(id, _)| *id).collect();
+                let wanted: Vec<ObjectId> = if whole { ids.clone() } else { vec![ids[0]] };
+                let touched: std::collections::HashSet<ObjectId> = wanted.iter().copied().collect();
+                let mut staged = Vec::with_capacity(32);
+                let mut seen_names = std::collections::HashSet::new();
+                for _ in 0..32 {
+                    let name = writer.stage(1, 7, encs.clone()).await.unwrap();
+                    assert!(seen_names.insert(name.clone()), "distinct staged container per concurrent keep");
+                    let slots = writer.staged_slots(1, &name, &wanted).await.unwrap().unwrap();
+                    staged.push((name, slots));
+                }
+                drop((writer, encs));
+
+                let fresh = Arc::new(Objects::with_layout(fs, 64 << 20, None, ObjectLayout::Objects));
+                let vm = |field: &str| -> u64 {
+                    let s = std::fs::read_to_string("/proc/self/status").unwrap();
+                    let l = s.lines().find(|l| l.starts_with(field)).unwrap();
+                    l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() << 10
+                };
+                std::fs::write("/proc/self/clear_refs", "5").unwrap();
+                let before = vm("VmRSS:");
+                let mut set = tokio::task::JoinSet::new();
+                let opts = KeepOpts { person: 7, encode_threads: 1, already_held: false };
+                for pair in staged {
+                    let (f, t) = (fresh.clone(), touched.clone());
+                    set.spawn(async move {
+                        let mut written = Vec::new();
+                        f.keep(1, &[pair], &t, Vec::new(), opts, &mut written).await.unwrap();
+                    });
+                }
+                while let Some(r) = set.join_next().await {
+                    r.unwrap();
+                }
+                let grew = vm("VmHWM:").saturating_sub(before);
+                let reads = fresh.reads.load(Ordering::Relaxed);
+                assert!(fresh.get(1, &ids[0]).await.unwrap().is_some(), "kept object readable");
+                println!("KEEP_OBJECTS mode={} grew={grew} reads={reads}", if whole { "whole" } else { "ranged" });
+            });
+            return;
+        }
+        for mode in ["whole", "ranged"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--nocapture", "--include-ignored", "--test-threads=1"])
+                .env(CHILD, mode)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert!(
+                out.status.success(),
+                "child ({mode}) failed: {text}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let line = text
+                .lines()
+                .find_map(|l| l.find("KEEP_OBJECTS").map(|at| &l[at..]))
+                .unwrap_or_else(|| panic!("no measurement in {text}"));
+            let grew: u64 = line.split_whitespace().find_map(|w| w.strip_prefix("grew=")).unwrap().parse().unwrap();
+            assert!(
+                grew <= u64::from(DECODED_IN_FLIGHT) + (64 << 20),
+                "32 concurrent keep_objects ({mode}) held {} MiB, past the {} MiB bound on decoded bytes ({line})",
+                grew >> 20,
+                DECODED_IN_FLIGHT >> 20
+            );
+        }
     }
 }

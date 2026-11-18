@@ -1511,7 +1511,8 @@ impl Packs {
     }
 
     pub async fn discard_counted(&self, store: &dyn BlobStore, project: i64, names: &[Arc<str>], deletes: &AtomicU64) -> Result<()> {
-        self.discard_with(store, project, names, false, false, deletes, &AtomicU64::new(0)).await
+        self.discard_with(store, project, names, (false, false), (deletes, &AtomicU64::new(0)))
+            .await
     }
 
     pub async fn discard_with(
@@ -1519,10 +1520,8 @@ impl Packs {
         store: &dyn BlobStore,
         project: i64,
         names: &[Arc<str>],
-        refused: bool,
-        purge_row: bool,
-        deletes: &AtomicU64,
-        pack_rows: &AtomicU64,
+        (refused, purge_row): (bool, bool),
+        (deletes, pack_rows): (&AtomicU64, &AtomicU64),
     ) -> Result<()> {
         if names.is_empty() {
             return Ok(());

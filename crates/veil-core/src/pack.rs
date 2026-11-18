@@ -757,6 +757,19 @@ impl StandIn {
     }
 }
 
+/// Verify one zstd frame of `raw_len` bytes (optionally against `dict`)
+/// against `id` by streaming into BLAKE3 without materializing the output.
+pub(crate) fn verify_zstd(data: &[u8], raw_len: u64, dict: Option<&[u8]>, id: &ObjectId) -> std::result::Result<(), String> {
+    let mut hasher = blake3::Hasher::new();
+    stream(data, raw_len, dict, &mut |chunk| {
+        hasher.update(chunk);
+    })?;
+    if hasher.finalize().as_bytes() != &id.0 {
+        return Err("content does not match its id".into());
+    }
+    Ok(())
+}
+
 /// Decode one zstd frame of exactly `raw_len` bytes (optionally against
 /// `dict`) that must hash to `id`. Small objects are decoded into a buffer
 /// of their size at once; above [`BULK_LIMIT`] the frame is first streamed
@@ -766,13 +779,7 @@ pub(crate) fn decompress(data: &[u8], raw_len: u64, dict: Option<&[u8]>, id: &Ob
     if raw_len <= BULK_LIMIT {
         return decompress_bulk(data, raw_len, dict);
     }
-    let mut hasher = blake3::Hasher::new();
-    stream(data, raw_len, dict, &mut |chunk| {
-        hasher.update(chunk);
-    })?;
-    if hasher.finalize().as_bytes() != &id.0 {
-        return Err("content does not match its id".into());
-    }
+    verify_zstd(data, raw_len, dict, id)?;
     let limit = usize::try_from(raw_len).map_err(|_| "object too large for this platform".to_string())?;
     let mut out = Vec::with_capacity(limit);
     stream(data, raw_len, dict, &mut |chunk| out.extend_from_slice(chunk))?;
