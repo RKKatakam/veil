@@ -1120,3 +1120,183 @@ fn bug_2200_a_directory_unlistable_before_any_command_keeps_what_it_holds() {
     assert_eq!(read(&dir, "mine/notes.txt"), "by hand\n");
 }
 
+fn extract_between<'a>(haystack: &'a str, before: &str, after: &str) -> &'a str {
+    let rest = haystack.split_once(before).unwrap_or_else(|| panic!("missing {before:?} in:\n{haystack}")).1;
+    rest.split_once(after).unwrap_or_else(|| panic!("missing {after:?} in:\n{haystack}")).0
+}
+
+fn run_chmod_as_written(cwd: &Path, chmod_cmd: &str) {
+    assert!(chmod_cmd.starts_with("chmod u+rwx "), "unexpected chmod command: {chmod_cmd}");
+    let out = std::process::Command::new("sh").arg("-c").arg(chmod_cmd).current_dir(cwd).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "chmod failed ({chmod_cmd}): {}", text(&out));
+}
+
+/// BUG-2652: the commands the shut-directory refusal gives (`chmod` and `vl
+/// ws exec`) run as written through a shell in every case where names hold
+/// printable UTF-8: `--only` paths starting with `-` (first or after `+x`
+/// where `-m` would otherwise become `--message`), `=` (expanded by zsh if
+/// unquoted), shell metacharacters (`$()`, backticks, `;`, quotes), runs
+/// invoked from a subdirectory (including the `--only` directory itself) or
+/// from outside the repository with `-R`, and workspace names starting with
+/// `-` (`-`, `-agent`, `--ephemeral`).
+#[test]
+fn bug_2652_the_refusals_command_runs_as_written_for_hyphens_metacharacters_and_subdirectories() {
+    let env = Env::new();
+    let sentinel = env.root.join("INJECTED");
+    let inj_sub = format!("$(touch {})", sentinel.display());
+    let inj_bt = "`touch INJECTED`";
+    let proj = env.project(
+        "alice",
+        "proj",
+        &[
+            ("-d/src/lib.rs", "pub fn f() {}\n"),
+            ("+x/a.txt", "x\n"),
+            ("-m/b.txt", "m\n"),
+            ("=true/c.txt", "eq\n"),
+            (&format!("{inj_sub}/d.txt"), "sub\n"),
+            (&format!("{inj_bt}/e.txt"), "bt\n"),
+            ("sub/deep/here.txt", "here\n"),
+        ],
+    );
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "main"]);
+
+    // (1) Leading `-` (`-d/src`), `+x` then `-m` (must not set `-m` message),
+    // `=true` (must be quoted for zsh), and shell command-substitution names.
+    let shut_cmd = "mkdir -- -shut && echo stray > -shut/f && chmod 000 -- -shut";
+    let out = env.vl(
+        "alice",
+        &proj,
+        &[
+            "ws",
+            "exec",
+            "agent",
+            "--only",
+            "./-d/src",
+            "+x",
+            "./-m",
+            "=true",
+            &inj_sub,
+            inj_bt,
+            "--",
+            "sh",
+            "-c",
+            shut_cmd,
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "true"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    let chmod_cmd = extract_between(&t, "Make the directory listable (`", "`) and run `");
+    let vl_cmd = extract_between(&t, "`) and run `", "`, which removes");
+    assert!(vl_cmd.contains("'='") || vl_cmd.contains("'=true'"), "=true must be quoted for zsh: {vl_cmd}");
+    run_chmod_as_written(&proj, chmod_cmd);
+    let out = run_as_written(&env, &proj, vl_cmd);
+    let rt = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{vl_cmd}\n{rt}");
+    assert!(rt.contains("(removed from the sandbox): -shut/f"), "{rt}");
+    assert!(!sentinel.exists() && !proj.join("INJECTED").exists(), "shell syntax injected!");
+
+    // (2) Invoked from a subdirectory (`sub/deep`), from inside the `--only`
+    // directory itself (`-d/src`), and from outside the repository (`-R`).
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "./-d/src", "--", "sh", "-c", shut_cmd]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+
+    for (cwd, extra_args) in [
+        (proj.join("sub/deep"), &[][..]),
+        (proj.join("-d/src"), &[][..]),
+        (env.root.clone(), &["-R", proj.to_str().unwrap()][..]),
+    ] {
+        let mut args: Vec<&str> = extra_args.to_vec();
+        args.extend_from_slice(&["ws", "exec", "agent", "--", "true"]);
+        let out = env.vl("alice", &cwd, &args);
+        let t = text(&out);
+        assert_eq!(out.status.code(), Some(1), "cwd={}: {t}", cwd.display());
+        let chmod_cmd = extract_between(&t, "Make the directory listable (`", "`) and run `");
+        let vl_cmd = extract_between(&t, "`) and run `", "`, which removes");
+        run_chmod_as_written(&cwd, chmod_cmd);
+        let out = run_as_written(&env, &cwd, vl_cmd);
+        assert_eq!(out.status.code(), Some(0), "cwd={}, cmd={vl_cmd}:\n{}", cwd.display(), text(&out));
+        // Re-shut for the next `cwd` case.
+        let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "./-d/src", "--", "sh", "-c", shut_cmd]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    }
+    // Clean up `agent`.
+    chmod(&files_dir(&proj, "agent").join("-shut"), 0o700);
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "./-d/src", "--", "true"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+
+    // (3) Workspace names starting with `-`: `-`, `-agent`, and `--ephemeral`
+    // (must never inject `--ephemeral` or flags).
+    for ws in ["-", "-agent", "--ephemeral"] {
+        env.ok("alice", &proj, &["ws", "new", "-r", "main", "--", ws]);
+        let ws_flag = format!("--workspace={ws}");
+        let out = env.vl("alice", &proj, &["ws", "exec", &ws_flag, "--only", "./-d/src", "--", "sh", "-c", shut_cmd]);
+        assert_eq!(out.status.code(), Some(0), "ws={ws}: {}", text(&out));
+
+        let out = env.vl("alice", &proj, &["ws", "exec", &ws_flag, "--", "true"]);
+        let t = text(&out);
+        assert_eq!(out.status.code(), Some(1), "ws={ws}: {t}");
+        let chmod_cmd = extract_between(&t, "Make the directory listable (`", "`) and run `");
+        let vl_cmd = extract_between(&t, "`) and run `", "`, which removes");
+        run_chmod_as_written(&proj, chmod_cmd);
+        let out = run_as_written(&env, &proj, vl_cmd);
+        let rt = text(&out);
+        assert_eq!(out.status.code(), Some(0), "ws={ws}, cmd={vl_cmd}:\n{rt}");
+        assert!(rt.contains("(removed from the sandbox): -shut/f"), "ws={ws}: {rt}");
+    }
+}
+
+/// BUG-2652: when the shut directory or an `--only` path holds control or
+/// bidirectional characters (which `safe()` escapes), no runnable command
+/// naming a wrong path is printed, and raw control/bidi bytes never reach
+/// stderr; the message explains why instead.
+#[test]
+fn bug_2652_control_or_bidi_characters_never_print_a_wrong_command_to_paste() {
+    let env = Env::new();
+    let tab_dir = "x\ty";
+    let bidi_dir = "rtl\u{202e}txt";
+    let proj = env.project(
+        "alice",
+        "proj",
+        &[
+            (&format!("{tab_dir}/src/lib.rs"), "pub fn f() {}\n"),
+            (&format!("{bidi_dir}/lib.rs"), "pub fn g() {}\n"),
+            ("plain/lib.rs", "pub fn h() {}\n"),
+        ],
+    );
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "main"]);
+    let dir = files_dir(&proj, "agent");
+
+    // Case A: `--only` path contains a tab (`\t`), shut directory is plain.
+    let tab_only = format!("{tab_dir}/src");
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", &tab_only, "--", "sh", "-c", "mkdir shut && chmod 000 shut"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "true"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert!(!t.contains('\t'), "raw tab leaked to stderr: {t:?}");
+    assert!(t.contains(r"x\ty/src"), "escaped path missing: {t}");
+    assert!(!t.contains("chmod u+rwx "), "printed a runnable chmod command alongside escaped path: {t}");
+    assert!(!t.contains("-- true`"), "printed a runnable vl ws exec command naming escaped path: {t}");
+    assert!(t.contains("control") || t.contains("escaped"), "did not explain why no command is printed: {t}");
+    chmod(&dir.join("shut"), 0o700);
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", &tab_only, "--", "true"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+
+    // Case B: shut directory itself contains a bidi override (`\u{202e}`).
+    let cmd = format!("mkdir '{bidi_dir}_shut' && chmod 000 '{bidi_dir}_shut'");
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "plain", "--", "sh", "-c", &cmd]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "true"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert!(!t.contains('\u{202e}'), "raw bidi char leaked to stderr: {t:?}");
+    assert!(t.contains(r"\u{202e}"), "escaped bidi char missing: {t}");
+    assert!(!t.contains("chmod u+rwx "), "printed a runnable chmod naming escaped dir: {t}");
+    assert!(!t.contains("-- true`"), "printed a runnable vl ws exec alongside escaped dir: {t}");
+    chmod(&dir.join(format!("{bidi_dir}_shut")), 0o700);
+    let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "plain", "--", "true"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+}

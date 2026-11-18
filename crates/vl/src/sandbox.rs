@@ -139,19 +139,48 @@ fn show_set(set: Option<&SparseSet>) -> String {
     }
 }
 
+/// Does `safe(s)` leave `s` unchanged (no control or bidirectional characters)?
+fn verbatim(s: &str) -> bool {
+    safe(s).as_ref() == s
+}
+
 /// `word` as a shell takes it for one argument: as it is when it holds
-/// nothing a shell reads, in single quotes otherwise.
+/// nothing a shell (including zsh's leading `=`) reads, in single quotes
+/// otherwise.
 fn shell_word(word: &str) -> String {
-    let plain = !word.is_empty() && word.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./-@%+=:,".contains(&b));
+    let plain = !word.is_empty() && word.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./-@%+:,".contains(&b));
     match plain {
         true => word.to_string(),
         false => format!("'{}'", safe(word).replace('\'', "'\\''")),
     }
 }
 
-/// A sparse set as `--only` takes it on a command line: `src tests/unit.rs`.
+/// Workspace `name` as an argument to `vl ws exec`: `--workspace=NAME` when
+/// `name` starts with `-` so clap never reads it as an option.
+fn ws_exec_arg(name: &str) -> String {
+    match name.starts_with('-') {
+        true => format!("--workspace={}", shell_word(name)),
+        false => shell_word(name),
+    }
+}
+
+/// A sparse set as `--only` takes it at the workspace root: `src tests/unit.rs`,
+/// with `./` before any path starting with `-`.
 fn set_args(set: Option<&SparseSet>) -> String {
-    set.map(|s| s.paths().iter().map(|p| shell_word(p.as_str())).collect::<Vec<_>>().join(" ")).unwrap_or_default()
+    set.map(|s| {
+        s.paths()
+            .iter()
+            .map(|p| {
+                let s = p.as_str();
+                match s.starts_with('-') {
+                    true => shell_word(&format!("./{s}")),
+                    false => shell_word(s),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+    .unwrap_or_default()
 }
 
 /// Say which files the command wrote outside the `--only` paths (they are
@@ -273,8 +302,9 @@ fn exec_mounted(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confin
     if let Loaded::Found(m) = paths.load_manifest() {
         if m.pending.is_some() {
             bail!(
-                "the sandbox of workspace {n} holds the output of an earlier run that is not recorded; `vl ws exec {n} --record-only` records it first",
-                n = safe(name)
+                "the sandbox of workspace {n} holds the output of an earlier run that is not recorded; `vl ws exec {w} --record-only` records it first",
+                n = safe(name),
+                w = ws_exec_arg(name),
             );
         }
     }
@@ -528,16 +558,55 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     // could add its own where nothing tells it from the sandbox's.
     m.shut_by_command.retain(|d| VPath::new(&d.dir).is_ok_and(|p| !matches!(fs.metadata(&p), Ok(None))));
     if let Some(shut) = m.shut_by_command.iter().find(|d| d.refuses(set.as_ref())) {
-        let (d, was) = (&shut.dir, set_args(shut.only_set().as_ref()));
+        let only_set = shut.only_set();
+        let (d, was) = (&shut.dir, set_args(only_set.as_ref()));
+        let at_path = paths.files.join(d);
+        let repo_flag = ctx.needs_repo_flag();
+        let runnable = std::env::current_dir().is_ok()
+            && verbatim(name)
+            && verbatim(d)
+            && at_path.to_str().is_some_and(verbatim)
+            && repo_flag.as_ref().is_none_or(|r| r.to_str().is_some_and(verbatim))
+            && only_set.as_ref().is_some_and(|s| s.paths().iter().all(|p| verbatim(p.as_str())));
+        if runnable {
+            let at_raw = at_path.to_str().expect("checked");
+            let at = match at_raw.starts_with('-') {
+                true => shell_word(&format!("./{at_raw}")),
+                false => shell_word(at_raw),
+            };
+            let r_opt = match &repo_flag {
+                Some(r) => format!("-R={} ", shell_word(r.to_str().expect("checked"))),
+                None => String::new(),
+            };
+            let w = ws_exec_arg(name);
+            let cmd_only = only_set
+                .as_ref()
+                .expect("checked")
+                .paths()
+                .iter()
+                .map(|p| shell_word(&ctx.only_arg(p)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            bail!(
+                "the sandbox of workspace '{n}' holds {d}, which a command of an earlier `--only {was}` run made unlistable: what is \
+                 in it outside those paths was written outside `--only` and is not the workspace's. Until it is removed, only a \
+                 run with exactly those paths at or below {d} starts. Make the directory listable (`chmod u+rwx {at}`) and run \
+                 `vl ws exec {r_opt}{w} --only {cmd_only} -- true`, which removes what was written there; or delete the directory. Then run \
+                 again",
+                n = safe(name),
+                d = safe(d),
+            );
+        }
         bail!(
             "the sandbox of workspace '{n}' holds {d}, which a command of an earlier `--only {was}` run made unlistable: what is \
              in it outside those paths was written outside `--only` and is not the workspace's. Until it is removed, only a \
-             run with exactly those paths at or below {d} starts. Make the directory listable (`chmod u+rwx {at}`) and run \
-             `vl ws exec {n} --only {was} -- true`, which removes what was written there; or delete the directory. Then run \
-             again",
+             run with exactly those paths at or below {d} starts. Make the directory ({at}) listable (`u+rwx`) and run `vl ws exec` \
+             in workspace '{n}' with those `--only` paths, passing `true` after `--`, which removes what was written there (no \
+             command to paste is printed because a path holds control, bidirectional or non-UTF-8 characters, shown escaped here); \
+             or delete the directory. Then run again",
             n = safe(name),
             d = safe(d),
-            at = shell_word(&paths.files.join(d).display().to_string()),
+            at = safe(&at_path.display().to_string()),
         );
     }
     let run_id = hex::encode(veil_core::crypto::random_bytes::<8>());

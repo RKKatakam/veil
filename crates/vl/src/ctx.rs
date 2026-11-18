@@ -1240,6 +1240,74 @@ impl Ctx {
         let rel = rel.to_str().ok_or_else(outside)?;
         Ok(VPath::new(rel)?)
     }
+
+    /// Repository path to pass via `-R` when a command run in the current
+    /// directory without `-R` would not open `self.root` (`None` when it
+    /// would).
+    pub fn needs_repo_flag(&self) -> Option<PathBuf> {
+        let mut roots = vec![normalize(&self.root)];
+        if let Ok(c) = std::fs::canonicalize(&self.root) {
+            if c != roots[0] {
+                roots.push(c);
+            }
+        }
+        let same = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| find_root(&cwd))
+            .is_some_and(|found| {
+                roots.contains(&normalize(&found))
+                    || std::fs::canonicalize(&found).is_ok_and(|cf| roots.contains(&cf))
+            });
+        match same {
+            true => None,
+            false => Some(std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone())),
+        }
+    }
+
+    /// Format repository path `path` as an `--only` argument that
+    /// [`Ctx::repo_path`] resolves back to `path` from the current directory,
+    /// prefixed with `./` if it would start with `-`.
+    pub fn only_arg(&self, path: &VPath) -> String {
+        let mut roots = vec![normalize(&self.root)];
+        if let Ok(c) = std::fs::canonicalize(&self.root) {
+            if c != roots[0] {
+                roots.push(c);
+            }
+        }
+        let inside = |p: &Path| roots.iter().find_map(|r| p.strip_prefix(r).ok().map(Path::to_path_buf));
+        let rel = match std::env::current_dir().ok().and_then(|cwd| inside(&normalize(&cwd))) {
+            Some(cwd_rel) => {
+                let cwd_comps: Vec<&std::ffi::OsStr> = cwd_rel
+                    .components()
+                    .filter_map(|c| match c {
+                        std::path::Component::Normal(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+                let p_comps: Vec<&str> = path.components().collect();
+                let k = cwd_comps
+                    .iter()
+                    .zip(p_comps.iter())
+                    .take_while(|(a, b)| **a == std::ffi::OsStr::new(**b))
+                    .count();
+                let up = cwd_comps.len() - k;
+                if up == 0 && k == p_comps.len() {
+                    ".".to_string()
+                } else {
+                    std::iter::repeat_n("..", up)
+                        .chain(p_comps[k..].iter().copied())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                }
+            }
+            None => path.as_str().to_string(),
+        };
+        if rel.starts_with('-') {
+            format!("./{rel}")
+        } else {
+            rel
+        }
+    }
 }
 
 /// Things in the working copy a snapshot could not record. Never fatal, never

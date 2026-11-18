@@ -2423,6 +2423,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
         WsCmd::Unmount { name } => mount::cmd_unmount(ctx, name)?,
         WsCmd::Exec {
             name,
+            workspace,
             ephemeral,
             rev,
             message,
@@ -2441,7 +2442,7 @@ fn cmd_ws(ctx: &mut Ctx, c: &WsCmd) -> Result<ExitCode> {
             return sandbox::exec(
                 ctx,
                 &sandbox::Exec {
-                    name: name.as_deref(),
+                    name: name.as_deref().or(workspace.as_deref()),
                     ephemeral: *ephemeral,
                     rev,
                     message,
