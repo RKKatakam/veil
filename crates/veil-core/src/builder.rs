@@ -178,34 +178,67 @@ const CONFLICT_COPY: &str = ":conflict";
 /// windows over *distinctive* bytes count (at least 3/4 distinct bytes in
 /// the source span): padding and the ASN.1 structure every key of a kind
 /// shares (OIDs, length headers) never match unrelated files. Memory and
-/// time are bounded: windows are matched with a rolling hash behind a bit
-/// filter (one pass over each checked file), each file contributes at most
-/// about 74 000 windows (the stride grows for larger files) and all files
-/// together at most [`MAX_WINDOWS`].
+/// time are bounded: total secret-file input is capped at [`MAX_GUARD_BYTES`]
+/// (16 MiB) and binary windows at [`MAX_WINDOWS`], failing closed (`Err`)
+/// when either is reached so no recording ever runs with a skipped or
+/// weakened guard (BUG-2650); short text needles are compiled into a bounded
+/// automaton while long needles are searched with `memmem`.
 #[derive(Debug, Default, Clone)]
 pub struct InjectedSecrets {
-    /// (needle, the secret files it came from)
+    /// (needle, the secret files it came from), sorted longest-first.
     needles: Vec<(Vec<u8>, Vec<String>)>,
     matcher: Option<regex::bytes::Regex>,
+    /// Indices into `needles` not included in `matcher` (when `matcher` is
+    /// `Some`), searched with `memmem` so large unbroken files never blow up
+    /// regex compilation memory (BUG-2650).
+    long_needles: Vec<usize>,
     /// Whole contents of binary secret files (and DER decoded from PEM),
     /// matched as raw bytes.
     raw: Vec<(Vec<u8>, Vec<String>)>,
     windows: WindowIndex,
 }
 
+/// Hard cap on the total plaintext bytes of secret files held by a
+/// workspace's secret-value guard ([`InjectedSecrets`], `Guard`; BUG-2650).
+/// Above this limit, mounting or recording fails closed rather than
+/// skipping or weakening the guard or growing unbounded in memory.
+pub const MAX_GUARD_BYTES: usize = 16 << 20;
 /// Length of a binary window (bytes of raw content, or characters of its
 /// base64 / hex encoding).
 pub const WINDOW: usize = 32;
 /// Distance between consecutive windows of one encoding (for files up to
 /// 128 KiB; larger files use a proportionally larger stride).
 pub const STRIDE: usize = 16;
-/// Upper bound on the windows of all injected files together.
+/// Upper bound on the windows of all injected files together; reaching it
+/// fails closed rather than dropping windows (BUG-2650).
 pub const MAX_WINDOWS: usize = 1 << 18;
-/// Binary files contribute at most this many bytes of content.
-const MAX_BINARY: usize = 16 << 20;
 /// Bits of the window filter (2^20 bits = 128 KiB).
 const FILTER_BITS: u32 = 20;
 const HASH_BASE: u64 = 0x100_0000_01b3;
+
+pub(crate) fn guard_bytes_limit_error(path: Option<&str>, bytes: u64) -> VeilError {
+    let mib = bytes as f64 / (1u64 << 20) as f64;
+    let max_mib = MAX_GUARD_BYTES >> 20;
+    match path {
+        Some(p) => VeilError::Policy(format!(
+            "the secret-value guard exceeds the {max_mib} MiB limit ({p} brings it to {mib:.1} MiB): \
+             sealed and injected secret files in a mounted or `vl ws exec` workspace may total at most {max_mib} MiB \
+             so every recording can check for copied secrets in bounded memory; uncloak large data files (`vl uncloak` / `.veilpolicy`)"
+        )),
+        None => VeilError::Policy(format!(
+            "the secret-value guard exceeds the {max_mib} MiB limit ({mib:.1} MiB): \
+             sealed and injected secret files in a mounted or `vl ws exec` workspace may total at most {max_mib} MiB \
+             so every recording can check for copied secrets in bounded memory; uncloak large data files (`vl uncloak` / `.veilpolicy`)"
+        )),
+    }
+}
+
+pub(crate) fn guard_windows_limit_error(path: &str) -> VeilError {
+    VeilError::Policy(format!(
+        "the secret-value guard exceeds the {MAX_WINDOWS}-window limit for binary secrets (at {path}); \
+         uncloak large binary files (`vl uncloak` / `.veilpolicy`) so every recording can check for copied secrets in bounded memory"
+    ))
+}
 
 /// How a window encodes the injected bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,16 +285,17 @@ impl WindowIndex {
     }
 
     fn add(&mut self, w: &[u8], src: u32, enc: Encoding) -> bool {
+        let arr: [u8; WINDOW] = w.try_into().expect("window length");
+        let h = window_hash(&arr);
+        if let Some(bucket) = self.by_hash.get(&h) {
+            if bucket.iter().any(|&i| self.windows[i as usize].0 == arr && self.windows[i as usize].1 == src) {
+                return true;
+            }
+        }
         if self.windows.len() >= MAX_WINDOWS {
             return false;
         }
-        let arr: [u8; WINDOW] = w.try_into().expect("window length");
-        let h = window_hash(&arr);
-        let bucket = self.by_hash.entry(h).or_default();
-        if bucket.iter().any(|&i| self.windows[i as usize].0 == arr && self.windows[i as usize].1 == src) {
-            return true;
-        }
-        bucket.push(self.windows.len() as u32);
+        self.by_hash.entry(h).or_default().push(self.windows.len() as u32);
         self.windows.push((arr, src, enc));
         if self.filter.is_empty() {
             self.filter = vec![0; (1usize << FILTER_BITS) / 64];
@@ -272,11 +306,11 @@ impl WindowIndex {
         true
     }
 
-    /// Windows of `data` (one binary secret) in every encoding.
-    fn add_source(&mut self, data: &[u8], src: u32) {
-        let data = &data[..data.len().min(MAX_BINARY)];
+    /// Windows of `data` (one binary secret) in every encoding; returns
+    /// `false` if [`MAX_WINDOWS`] was reached so the caller can fail closed.
+    fn add_source(&mut self, data: &[u8], src: u32) -> bool {
         if data.len() < WINDOW / 2 {
-            return;
+            return true;
         }
         // ~9 windows per STRIDE bytes over all encodings: keep one file
         // under ~74k windows.
@@ -285,7 +319,7 @@ impl WindowIndex {
         let mut i = 0;
         while i + WINDOW <= data.len() {
             if distinctive(&data[i..i + WINDOW]) && !self.add(&data[i..i + WINDOW], src, Encoding::Raw) {
-                return;
+                return false;
             }
             i += stride;
         }
@@ -298,7 +332,7 @@ impl WindowIndex {
                 let from = align + i / 4 * 3;
                 let to = (align + (i + WINDOW).div_ceil(4) * 3).min(data.len());
                 if distinctive(&data[from..to]) && !self.add(&text[i..i + WINDOW], src, Encoding::Base64) {
-                    return;
+                    return false;
                 }
                 i += stride;
             }
@@ -312,11 +346,12 @@ impl WindowIndex {
             let mut i = 0;
             while i + WINDOW <= text.len() {
                 if distinctive(&data[i / 2..(i + WINDOW) / 2]) && !self.add(&text[i..i + WINDOW], src, Encoding::Hex) {
-                    return;
+                    return false;
                 }
                 i += stride;
             }
         }
+        true
     }
 
     /// Every place of `data` where a window may be: `at(position, the
@@ -437,83 +472,147 @@ fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-impl InjectedSecrets {
-    pub fn from_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> InjectedSecrets {
-        let mut needles: Vec<(Vec<u8>, Vec<String>)> = Vec::new();
-        let mut raw: Vec<(Vec<u8>, Vec<String>)> = Vec::new();
-        let mut windows = WindowIndex::default();
-        let mut add = |v: &str, src: &str| {
-            let v = v.trim();
-            if !secret_like(v) {
-                return;
-            }
-            if let Some((_, srcs)) = needles.iter_mut().find(|(n, _)| n == v.as_bytes()) {
+#[derive(Default)]
+pub(crate) struct InjectedSecretsBuilder {
+    total_bytes: usize,
+    needles: Vec<(Vec<u8>, Vec<String>)>,
+    needle_index: std::collections::HashMap<ObjectId, usize>,
+    raw: Vec<(Vec<u8>, Vec<String>)>,
+    raw_index: std::collections::HashMap<ObjectId, usize>,
+    windows: WindowIndex,
+}
+
+impl InjectedSecretsBuilder {
+    fn add_needle(&mut self, v: &str, src: &str) {
+        let v = v.trim();
+        if !secret_like(v) {
+            return;
+        }
+        let bytes = v.as_bytes();
+        let digest = ObjectId::hash(bytes);
+        if let Some(&idx) = self.needle_index.get(&digest) {
+            if self.needles[idx].0 == bytes {
+                let srcs = &mut self.needles[idx].1;
                 if !srcs.iter().any(|s| s == src) {
                     srcs.push(src.to_string());
                 }
-            } else {
-                needles.push((v.as_bytes().to_vec(), vec![src.to_string()]));
+                return;
             }
+        }
+        let idx = self.needles.len();
+        self.needles.push((bytes.to_vec(), vec![src.to_string()]));
+        self.needle_index.insert(digest, idx);
+    }
+
+    pub(crate) fn try_add_file(&mut self, src: &str, data: &[u8]) -> Result<()> {
+        let next = self.total_bytes.saturating_add(data.len());
+        if next > MAX_GUARD_BYTES {
+            return Err(guard_bytes_limit_error(Some(src), next as u64));
+        }
+        self.total_bytes = next;
+        let text = String::from_utf8_lossy(data);
+        if text.trim().len() >= LONG_NEEDLE {
+            self.add_needle(&text, src);
+        }
+        for line in text.lines() {
+            // Whole lines only when long and unbroken (key material,
+            // tokens), not ordinary `MODE=production` or code lines.
+            let line_t = line.trim();
+            if line_t.len() >= LONG_NEEDLE && !line_t.contains(char::is_whitespace) {
+                self.add_needle(line_t, src);
+            }
+            if let Some(v) = assignment_value(line) {
+                self.add_needle(v, src);
+            }
+        }
+        // Binary content (BUG-099), and the DER of PEM blocks (a key
+        // converted to DER by the command).
+        let binary: Vec<Vec<u8>> = match std::str::from_utf8(data) {
+            Err(_) => vec![data.to_vec()],
+            Ok(t) => pem_bodies(t),
         };
-        for (src, data) in files {
-            let text = String::from_utf8_lossy(data);
-            if text.trim().len() >= LONG_NEEDLE {
-                add(&text, src);
+        for b in binary {
+            if b.len() < WINDOW / 2 {
+                continue;
             }
-            for line in text.lines() {
-                // Whole lines only when long and unbroken (key material,
-                // tokens), not ordinary `MODE=production` or code lines.
-                let line_t = line.trim();
-                if line_t.len() >= LONG_NEEDLE && !line_t.contains(char::is_whitespace) {
-                    add(line_t, src);
-                }
-                if let Some(v) = assignment_value(line) {
-                    add(v, src);
-                }
+            self.windows.sources.push(src.to_string());
+            let id = (self.windows.sources.len() - 1) as u32;
+            if !self.windows.add_source(&b, id) {
+                return Err(guard_windows_limit_error(src));
             }
-            // Binary content (BUG-099), and the DER of PEM blocks (a key
-            // converted to DER by the command).
-            let binary: Vec<Vec<u8>> = match std::str::from_utf8(data) {
-                Err(_) => vec![data[..data.len().min(MAX_BINARY)].to_vec()],
-                Ok(t) => pem_bodies(t),
-            };
-            for b in binary {
-                if b.len() < WINDOW / 2 {
-                    continue;
-                }
-                windows.sources.push(src.to_string());
-                let id = (windows.sources.len() - 1) as u32;
-                windows.add_source(&b, id);
-                if let Some((_, srcs)) = raw.iter_mut().find(|(n, _)| *n == b) {
+            let digest = ObjectId::hash(&b);
+            if let Some(&idx) = self.raw_index.get(&digest) {
+                if self.raw[idx].0 == b {
+                    let srcs = &mut self.raw[idx].1;
                     if !srcs.iter().any(|s| s == src) {
                         srcs.push(src.to_string());
                     }
-                } else {
-                    raw.push((b, vec![src.to_string()]));
+                    continue;
                 }
             }
+            let idx = self.raw.len();
+            self.raw.push((b, vec![src.to_string()]));
+            self.raw_index.insert(digest, idx);
         }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> InjectedSecrets {
+        drop(self.needle_index);
+        drop(self.raw_index);
         // Longest first, so the leftmost match reports the most specific value.
-        needles.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
-        let matcher = (!needles.is_empty())
+        self.needles.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        let mut pattern = String::new();
+        let mut long_needles = Vec::new();
+        for (idx, (n, _)) in self.needles.iter().enumerate() {
+            if n.len() > MAX_REGEX_NEEDLE {
+                long_needles.push(idx);
+                continue;
+            }
+            let esc = regex::escape(std::str::from_utf8(n).expect("needles are UTF-8"));
+            let sep = usize::from(!pattern.is_empty());
+            if pattern.len() + sep + esc.len() > MAX_REGEX_PATTERN {
+                long_needles.push(idx);
+                continue;
+            }
+            if sep != 0 {
+                pattern.push('|');
+            }
+            pattern.push_str(&esc);
+        }
+        let matcher = (!pattern.is_empty())
             .then(|| {
-                let alts: Vec<String> = needles
-                    .iter()
-                    .map(|(n, _)| regex::escape(std::str::from_utf8(n).expect("needles are UTF-8")))
-                    .collect();
-                regex::bytes::RegexBuilder::new(&alts.join("|"))
-                    .size_limit(256 << 20)
-                    .dfa_size_limit(64 << 20)
+                regex::bytes::RegexBuilder::new(&pattern)
+                    .size_limit(4 << 20)
+                    .dfa_size_limit(2 << 20)
                     .build()
                     .ok()
             })
             .flatten();
-        InjectedSecrets {
-            needles,
-            matcher,
-            raw,
-            windows,
+        if matcher.is_none() {
+            long_needles.clear();
         }
+        InjectedSecrets {
+            needles: self.needles,
+            matcher,
+            long_needles,
+            raw: self.raw,
+            windows: self.windows,
+        }
+    }
+}
+
+impl InjectedSecrets {
+    pub fn try_from_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Result<InjectedSecrets> {
+        let mut builder = InjectedSecretsBuilder::default();
+        for (src, data) in files {
+            builder.try_add_file(src, data)?;
+        }
+        Ok(builder.finish())
+    }
+
+    pub fn from_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> InjectedSecrets {
+        Self::try_from_files(files).expect("guard input within MAX_GUARD_BYTES and MAX_WINDOWS")
     }
 
     pub fn is_empty(&self) -> bool {
@@ -554,12 +653,24 @@ impl InjectedSecrets {
             allow_source.is_some_and(|a| n.1.iter().any(|s| s == a)) || prior.is_some_and(|p| memchr::memmem::find(p, &n.0).is_some())
         };
         let text = match (&self.matcher, allow_source, prior) {
-            (Some(re), None, None) => re
-                .find(data)
-                .and_then(|m| Some((m.start(), self.needles.iter().find(|(n, _)| n == m.as_bytes())?))),
-            // Pattern too large for the regex engine, or filtering out one
-            // sealed file's own needles or the values the recorded version
-            // held: plain substring search.
+            (Some(re), None, None) => {
+                let mut best: Option<(usize, usize)> = re.find(data).and_then(|m| {
+                    let idx = self.needles.iter().position(|(n, _)| n == m.as_bytes())?;
+                    Some((m.start(), idx))
+                });
+                for &idx in &self.long_needles {
+                    if let Some(pos) = memchr::memmem::find(data, &self.needles[idx].0) {
+                        if best.is_none_or(|(b_pos, b_idx)| (pos, idx) < (b_pos, b_idx)) {
+                            best = Some((pos, idx));
+                        }
+                    }
+                }
+                best.map(|(pos, idx)| (pos, &self.needles[idx]))
+            }
+            // No compiled regex (all needles are long, or the pattern exceeded
+            // the engine's limits), or filtering out one sealed file's own
+            // needles or the values the recorded version held: plain substring
+            // search.
             _ => self
                 .needles
                 .iter()
@@ -593,6 +704,12 @@ impl InjectedSecrets {
 
 /// Minimum length of whole-file and whole-line needles.
 const LONG_NEEDLE: usize = 24;
+/// Longest needle compiled into the regex automaton; longer needles are
+/// searched with `memmem` so large unbroken text files keep memory bounded
+/// (BUG-2650).
+const MAX_REGEX_NEEDLE: usize = 1024;
+/// Maximum escaped pattern size compiled into the regex automaton.
+const MAX_REGEX_PATTERN: usize = 64 << 10;
 
 /// Long enough, and not a plain word or number.
 fn secret_like(v: &str) -> bool {
@@ -3030,4 +3147,109 @@ impl<'a> Builder<'a> {
 /// not)?
 fn matches_quietly(store: &ObjectStore, id: &ObjectId, raw: &[u8]) -> bool {
     store.matches_encoding(id, raw).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bug_2650_long_needles_bypass_regex_without_missing_or_reordering_matches() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut huge = String::with_capacity(1 << 20);
+        while huge.len() < 1 << 20 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            huge.push_str(&format!("{x:016x}"));
+        }
+        let long_tok: String = (0..128).map(|i| format!("{:016x}", x.wrapping_add(i))).collect(); // 2048 chars (> MAX_REGEX_NEEDLE)
+        let dup_lines = format!("API_KEY=sk-live-shortSecretValue99\n{}", "tok_repeated_secret_line_1234567890\n".repeat(4000));
+        let inj = InjectedSecrets::from_files([
+            ("internal/.env.plan", huge.as_bytes()),
+            ("internal/.env.long", long_tok.as_bytes()),
+            ("internal/.env.short", dup_lines.as_bytes()),
+        ]);
+        assert!(inj.matcher.is_some(), "short needles must compile into the bounded regex");
+        assert!(!inj.long_needles.is_empty(), "needles > 1 KiB must be routed to memmem");
+
+        // Plain small edit: fast negative path.
+        assert!(inj.find(b"edited\n").is_none());
+
+        // Whole 1 MiB copy, >1 KiB line copy, and short token copy are all caught.
+        assert_eq!(inj.find(huge.as_bytes()).unwrap().excerpt, "content of internal/.env.plan injected into the sandbox");
+        assert_eq!(
+            inj.find(format!("a\n{long_tok}\nb").as_bytes()).unwrap().excerpt,
+            "content of internal/.env.long injected into the sandbox"
+        );
+        assert_eq!(
+            inj.find(b"x\nsk-live-shortSecretValue99\n").unwrap().excerpt,
+            "content of internal/.env.short injected into the sandbox"
+        );
+
+        // Leftmost wins between a long needle and a short needle.
+        let long_first = format!("hdr\n{long_tok}\nlater sk-live-shortSecretValue99\n");
+        let f1 = inj.find(long_first.as_bytes()).unwrap();
+        assert_eq!((f1.line, f1.excerpt.as_str()), (2, "content of internal/.env.long injected into the sandbox"));
+
+        let short_first = format!("sk-live-shortSecretValue99\n{long_tok}\n");
+        let f2 = inj.find(short_first.as_bytes()).unwrap();
+        assert_eq!((f2.line, f2.excerpt.as_str()), (1, "content of internal/.env.short injected into the sandbox"));
+
+        // At the exact same offset, longest wins even when the longer needle is in long_needles
+        // and its prefix is in the compiled regex.
+        let prefix = &long_tok[..40];
+        let inj_tie = InjectedSecrets::from_files([
+            ("a.env", long_tok.as_bytes()),
+            ("b.env", format!("K={prefix}\n").as_bytes()),
+        ]);
+        assert_eq!(inj_tie.find(long_tok.as_bytes()).unwrap().excerpt, "content of a.env injected into the sandbox");
+
+        // allow_source and find_new keep working across both short and long needles.
+        assert!(inj.find_for(Some("internal/.env.plan"), huge.as_bytes()).is_none());
+        assert!(inj.find_for(Some("internal/.env.short"), long_tok.as_bytes()).is_some());
+        assert!(inj.find_new(None, format!("{long_tok}\nextra\n").as_bytes(), long_tok.as_bytes()).is_none());
+        assert!(
+            inj.find_new(
+                None,
+                format!("{long_tok}\nsk-live-shortSecretValue99\n").as_bytes(),
+                long_tok.as_bytes()
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn bug_2650_guard_limits_fail_closed_instead_of_dropping_values() {
+        let exact = vec![b'a'; MAX_GUARD_BYTES];
+        assert!(InjectedSecrets::try_from_files([("ok.env", exact.as_slice())]).is_ok());
+
+        let over = vec![b'a'; MAX_GUARD_BYTES + 1];
+        let err = InjectedSecrets::try_from_files([("internal/.env.plan", over.as_slice())]).unwrap_err().to_string();
+        assert!(err.contains("16 MiB limit") && err.contains("internal/.env.plan"), "{err}");
+
+        // Cumulative bytes across multiple files also fail closed at MAX_GUARD_BYTES.
+        let half = vec![b'b'; (MAX_GUARD_BYTES / 2) + 1];
+        let err2 = InjectedSecrets::try_from_files([("a.env", half.as_slice()), ("b.env", half.as_slice())]).unwrap_err().to_string();
+        assert!(err2.contains("16 MiB limit") && err2.contains("b.env"), "{err2}");
+
+        // Five distinct 128 KiB random binary files (~365k windows > MAX_WINDOWS) fail closed
+        // instead of silently dropping windows, while stay well under 16 MiB total (640 KiB).
+        let mut blobs = Vec::new();
+        for seed in 1u64..=5 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut b = vec![0xffu8]; // invalid UTF-8 -> binary path
+            b.extend((0..128 << 10).map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 32) as u8
+            }));
+            blobs.push((format!("key-{seed}.p12"), b));
+        }
+        let err_win = InjectedSecrets::try_from_files(blobs.iter().map(|(p, b)| (p.as_str(), b.as_slice())))
+            .unwrap_err()
+            .to_string();
+        assert!(err_win.contains("window limit") && err_win.contains("key-"), "{err_win}");
+    }
 }

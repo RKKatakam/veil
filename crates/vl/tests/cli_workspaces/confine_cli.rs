@@ -1897,17 +1897,17 @@ fn s6r2_a_daemon_folder_made_again_during_a_run_stays_hidden() {
     assert!(!out.contains(&name), "the daemon's new store's names are visible in the sandbox: {out}");
 }
 
-/// Guarantee 1, a bind-mount alias: the folder holding the Veil home and
-/// the daemon's store is mounted a second time elsewhere (an fstab `bind`
-/// entry, a data disk mounted twice), and the run allows the second path.
-/// The masks know names and links, not mounts: the Veil identity and the
-/// store must stay hidden there too. Needs root, to make the second mount
-/// (in a mount namespace of the test's own).
+/// Guarantee 1, a bind-mount alias (BUG-1519): the folder holding the Veil
+/// home and the daemon's store is mounted a second time elsewhere (an fstab
+/// `bind` entry, a data disk mounted twice), and the run allows or seeds the
+/// second path. Under BUG-1516 + BUG-1519, any allowed or seeded folder that
+/// holds or lies inside a Veil private folder via a bind mount is refused by
+/// file identity and `/proc/self/mountinfo` before the command runs; allowing
+/// a narrower sibling through the bind mount still works (verified end-to-end
+/// when root can run nested namespaces via `unshare -m`, and refusals verified
+/// with real kernel bind mounts via `bwrap` without root too).
 #[test]
-#[ignore = "BUG-1519: a second mount of a folder holding Veil's private folders shows them to a confined command; needs root"]
 fn s6r2_a_bind_mount_alias_never_shows_veils_folders() {
-    let root = Command::new("id").arg("-u").output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&root.stdout).trim(), "0", "this reproduction needs root (a second mount): run it with sudo -E");
     let t = T::new();
     let config = s6r2_config(&t);
     let identity = std::fs::read_to_string(config.join("veil/identity.json")).unwrap();
@@ -1917,32 +1917,165 @@ fn s6r2_a_bind_mount_alias_never_shows_veils_folders() {
     let alias = t.env.dir("alias");
     let a = alias.display().to_string();
     let rel = |p: &Path| p.strip_prefix(&t.env.root).unwrap().display().to_string();
-    let script = format!(
-        "cat {a}/{h}/.cache/pip/shown.txt {a}/{h}/.cache/veil/daemon/store/objects/ab/{name} {a}/{c}/veil/identity.json; ls -AR {a}/{h}/.cache/veil {a}/{c}/veil; echo end",
-        h = rel(&t.home),
-        c = rel(&config)
+    let h = rel(&t.home);
+    let c = rel(&config);
+    let is_root = Command::new("id").arg("-u").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
+
+    let run_in_bind = |args: &[&str]| {
+        let vl = t.cmd(&t.proj, args);
+        let mut cmd = if is_root {
+            let mut c = Command::new("unshare");
+            c.args(["-m", "--propagation", "private", "sh", "-c", "mount --bind \"$1\" \"$2\" && shift 2 && exec \"$@\"", "sh"])
+                .arg(&t.env.root)
+                .arg(&alias);
+            c
+        } else {
+            let mut c = Command::new("bwrap");
+            c.args(["--dev-bind", "/", "/", "--bind"]).arg(&t.env.root).arg(&alias).arg("--");
+            c
+        };
+        cmd.arg(vl.get_program())
+            .args(vl.get_args())
+            .envs(vl.get_envs().filter_map(|(k, v)| Some((k, v?))))
+            .env("XDG_CONFIG_HOME", &config)
+            .env_remove("VEIL_HOME")
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_RUNTIME_DIR")
+            .current_dir(&t.proj)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    // 1. Allowing the bind-mount alias that holds Veil's home and daemon store
+    //    is refused before the command runs.
+    let o = run_in_bind(&["ws", "exec", "agent", "--allow", &a, "--", "sh", "-c", "echo RAN-INSIDE"]);
+    assert!(!o.status.success(), "--allow bind-mount alias was accepted: {}", text(&o));
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("RAN-INSIDE"), "command ran despite bind-mount refusal");
+    assert!(text(&o).contains("holds the Veil"), "refusal did not name Veil's folder: {}", text(&o));
+
+    // 2. Allowing a path inside the daemon's store or Veil home via the bind
+    //    mount is refused too.
+    let inside_store = format!("{a}/{h}/.cache/veil/daemon/store");
+    let o = run_in_bind(&["ws", "exec", "agent", "--allow", &inside_store, "--", "sh", "-c", "echo RAN-INSIDE"]);
+    assert!(!o.status.success(), "--allow inside store via bind mount was accepted: {}", text(&o));
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("RAN-INSIDE"));
+    assert!(text(&o).contains("Veil home or the Veil daemon's folders"), "{}", text(&o));
+
+    let inside_vh = format!("{a}/{c}/veil");
+    let o = run_in_bind(&["ws", "exec", "agent", "--allow", &inside_vh, "--", "sh", "-c", "echo RAN-INSIDE"]);
+    assert!(!o.status.success(), "--allow Veil home via bind mount was accepted: {}", text(&o));
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("RAN-INSIDE"));
+    assert!(text(&o).contains("Veil home or the Veil daemon's folders"), "{}", text(&o));
+
+    // 3. Seeding through the bind-mount alias is refused too.
+    let seed_spec = format!("{a}:/tmp/seeded");
+    let o = run_in_bind(&["ws", "exec", "agent", "--seed", &seed_spec, "--", "sh", "-c", "echo RAN-INSIDE"]);
+    assert!(!o.status.success(), "--seed bind-mount alias was accepted: {}", text(&o));
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("RAN-INSIDE"));
+    assert!(text(&o).contains("Veil") || text(&o).contains("home"), "{}", text(&o));
+
+    // 4. When running as root (nested mount namespaces allowed), a narrower
+    //    sibling through the bind mount still runs and hides Veil's folders.
+    if is_root {
+        let pip = format!("{a}/{h}/.cache/pip");
+        let script = format!(
+            "cat {a}/{h}/.cache/pip/shown.txt {a}/{h}/.cache/veil/daemon/store/objects/ab/{name} {a}/{c}/veil/identity.json; ls -AR {a}/{h}/.cache/veil {a}/{c}/veil; echo end"
+        );
+        let o = run_in_bind(&["ws", "exec", "agent", "--allow", &pip, "--", "sh", "-c", &script]);
+        assert!(o.status.success(), "{}", text(&o));
+        let out = String::from_utf8_lossy(&o.stdout).into_owned();
+        assert!(out.trim_end().ends_with("end") && out.contains(S6R2_SHOWN), "the sibling alias is not shown: {out}");
+        assert!(!out.contains(identity.trim()) && !out.contains("identity.json"), "the Veil home is visible: {out}");
+        assert!(!out.contains(S6R2_STORED) && !out.contains(&name), "the daemon's store is visible: {out}");
+    }
+}
+
+/// BUG-1519: hard links to Veil's identity or masked credential files,
+/// symlinks to not-yet-created Veil folders, and renamed parent directories
+/// never expose Veil's private folders or credentials inside `vl ws exec`.
+#[test]
+fn bug_1519_hard_links_symlinks_and_renamed_parents_never_expose_veils_folders_or_credentials() {
+    let t = T::new();
+    let config = s6r2_config(&t);
+    let default_env: Vec<(&str, Option<&Path>)> = vec![
+        ("VEIL_HOME", None),
+        ("XDG_CACHE_HOME", None),
+        ("XDG_RUNTIME_DIR", None),
+        ("XDG_CONFIG_HOME", Some(&config)),
+    ];
+
+    // 1. Hard link to Veil's identity.json inside an unrelated allowed folder:
+    //    both the folder, the file itself, and --seed of the folder are refused.
+    let hl_dir = t.env.dir("hardlinks");
+    let hl_id = hl_dir.join("id-copy.json");
+    std::fs::hard_link(config.join("veil/identity.json"), &hl_id).unwrap();
+    s6r2_refused(&t, &hl_dir.display().to_string(), &default_env, "hard link to a file in the Veil home");
+    s6r2_refused(&t, &hl_id.display().to_string(), &default_env, "hard link to a file in the Veil home");
+    let mut seed_cmd = t.cmd(
+        &t.proj,
+        &["ws", "exec", "agent", "--seed", &format!("{}:/tmp/hl-seed", hl_dir.display()), "--", "sh", "-c", "echo RAN-INSIDE"],
     );
-    let vl = t.cmd(&t.proj, &["ws", "exec", "agent", "--allow", &a, "--", "sh", "-c", &script]);
-    let o = Command::new("unshare")
-        .args(["-m", "--propagation", "private", "sh", "-c", "mount --bind \"$1\" \"$2\" && shift 2 && exec \"$@\"", "sh"])
-        .arg(&t.env.root)
-        .arg(&alias)
-        .arg(vl.get_program())
-        .args(vl.get_args())
-        .envs(vl.get_envs().filter_map(|(k, v)| Some((k, v?))))
+    seed_cmd
         .env("XDG_CONFIG_HOME", &config)
         .env_remove("VEIL_HOME")
         .env_remove("XDG_CACHE_HOME")
-        .env_remove("XDG_RUNTIME_DIR")
-        .current_dir(&t.proj)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "{}", text(&o));
-    let out = String::from_utf8_lossy(&o.stdout).into_owned();
-    assert!(out.trim_end().ends_with("end") && out.contains(S6R2_SHOWN), "the alias is not shown: {out}");
-    assert!(!out.contains(identity.trim()) && !out.contains("identity.json"), "the Veil home is visible through a second mount: {out}");
-    assert!(!out.contains(S6R2_STORED) && !out.contains(&name), "the daemon's store is visible through a second mount: {out}");
+        .env_remove("XDG_RUNTIME_DIR");
+    let so = seed_cmd.stdin(Stdio::null()).output().unwrap();
+    assert!(!so.status.success(), "--seed with hard link to identity.json accepted: {}", text(&so));
+    assert!(!String::from_utf8_lossy(&so.stdout).contains("RAN-INSIDE"));
+    assert!(text(&so).contains("hard link"), "{}", text(&so));
+    std::fs::remove_file(&hl_id).unwrap();
+
+    // 2. Hard link to ~/.cargo/credentials.toml inside an allowed folder:
+    //    the folder is allowed, sibling files stay readable, and the hard link
+    //    is masked with /dev/null so the token never leaks into the sandbox.
+    let token = "cio-bug1519-secret-cargo-token-9999";
+    write(&t.home, ".cargo/credentials.toml", &format!("[registry]\ntoken = \"{token}\"\n"));
+    let cred_dir = t.env.dir("cred-hl");
+    write(&cred_dir, "ok.txt", S6R2_SHOWN);
+    std::fs::hard_link(t.home.join(".cargo/credentials.toml"), cred_dir.join("loot.toml")).unwrap();
+    let out = s6r2_run(
+        &t,
+        &[cred_dir.display().to_string()],
+        &default_env,
+        &format!("cat {d}/ok.txt {d}/loot.toml", d = cred_dir.display()),
+    );
+    assert!(out.contains(S6R2_SHOWN), "sibling file not shown: {out}");
+    assert!(!out.contains(token), "hard-linked cargo credentials leaked: {out}");
+
+    // 3. Dangling symlink to a not-yet-created Veil folder: allowing the
+    //    symlink target's parent is refused even before the folder exists.
+    let fresh_parent = t.env.dir("fresh-parent");
+    let link_root = t.env.dir("link-root");
+    let dangling_cache = link_root.join("cache-target");
+    std::os::unix::fs::symlink(fresh_parent.join("future-cache"), &dangling_cache).unwrap();
+    let env_dangling: Vec<(&str, Option<&Path>)> = vec![
+        ("VEIL_HOME", None),
+        ("XDG_CACHE_HOME", Some(&dangling_cache)),
+        ("XDG_RUNTIME_DIR", None),
+        ("XDG_CONFIG_HOME", Some(&config)),
+    ];
+    s6r2_refused(&t, &fresh_parent.display().to_string(), &env_dangling, "holds the Veil daemon's folder");
+
+    // 4. Renamed parent directory: moving the parent holding Veil's config
+    //    still refuses the renamed parent while allowing a sibling beside it.
+    let orig_parent = t.env.dir("orig-parent");
+    let moved_parent = t.env.root.join("renamed-parent");
+    let cp = Command::new("cp").arg("-a").arg(config.join("veil")).arg(orig_parent.join("veil")).status().unwrap();
+    assert!(cp.success());
+    write(&orig_parent, "sibling/ok.txt", S6R2_SHOWN);
+    std::fs::rename(&orig_parent, &moved_parent).unwrap();
+    let moved_vh = moved_parent.join("veil");
+    let env_moved: Vec<(&str, Option<&Path>)> = vec![
+        ("VEIL_HOME", Some(&moved_vh)),
+        ("XDG_CACHE_HOME", None),
+        ("XDG_RUNTIME_DIR", None),
+    ];
+    s6r2_refused(&t, &moved_parent.display().to_string(), &env_moved, "holds the Veil home");
+    let sib = moved_parent.join("sibling");
+    let out = s6r2_run(&t, &[sib.display().to_string()], &env_moved, &format!("cat {}/ok.txt", sib.display()));
+    assert!(out.contains(S6R2_SHOWN), "sibling beside renamed parent not shown: {out}");
 }
 
 /// Guarantees 1 and 2 of the S6 review, cycle 3, the routes the other

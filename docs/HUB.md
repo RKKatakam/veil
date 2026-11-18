@@ -4738,20 +4738,23 @@ vl daemon status | start [--cache-size SIZE] | stop
   request is still checked by its own grant and device signature, which is
   what keeps another Veil home's device, and later a narrower agent
   session (S11), to its own projection through the socket. **Sandboxed
-  commands (`vl ws exec`) see neither the socket nor the store**: the
+  commands (`vl ws exec`, Linux) see neither the socket nor the store**: the
   daemon's folders are Veil's own private folders, listed with the Veil
   home in one place (`ctx::veil_private_dirs`), which the confinement
-  never shows: an allowed folder or seed that holds one, as named or
-  resolved (`--allow ~/.cache`, `--allow ~`), is refused, naming narrower
-  folders to allow, and so is an allowed path inside one (BUG-1512:
-  `--allow ~/.cache` showed the store; BUG-1516: a mask covers a folder
-  as it is at the start, so one removed and made again during a run
-  showed through; refusing by name holds for the whole run). Veil's
-  sandboxes never write through a link into one. **Residual
-  (BUG-1519):** a second view of a folder that holds them (a bind mount, a
-  disk mounted twice, a FUSE mirror such as `bindfs`: made by the person or
-  by root, both inside the trust boundary; a confined command cannot make
-  one) is not known by name, and an allowed path through it shows them.
+  never shows: an allowed folder or seed that holds or lies inside one —
+  as named, resolved through symlinks, by Unix `(st_dev, st_ino)` file
+  identity, via Linux `/proc/self/mountinfo` aliases (bind mounts,
+  reverse/subtree/file bind mounts, submounts, double-mounted disks,
+  `overlay`, and `fuse.bindfs` with its backing path in `mountinfo`), or
+  via hard links to files in the Veil home or daemon runtime folder — is
+  refused before the command runs, naming narrower folders to allow
+  (BUG-1512, BUG-1516, BUG-1519). Veil's sandboxes never write through a
+  link into one. Residual: only a mount whose backing path is opaque to
+  `/proc/self/mountinfo` (an arbitrary custom FUSE mirror or loopback
+  network mount) or a mount created concurrently after `bwrap` starts
+  (by the person or root, inside the trust boundary; a confined command
+  cannot mount); on macOS `vl ws exec` confinement is not yet built and
+  warns that plain runs are unconfined (BUG-2455).
 
 #### The decision, per request
 
@@ -4912,7 +4915,7 @@ minutes by whoever saw it"; the daemon saw it), and returns no object.
 | 2 | Same | a real grant with a chain through another snapshot's or the admin's trees | chains start at the grant's root, each step from the hash-checked store | guarantee 1 |
 | 3 | A same-user process | hands the daemon its own grant key and a grant it signed | no such field: the daemon checks under the key it fetched from the server | by construction; guarantee 1 (a grant signed by another key) |
 | 4 | A person or device removed | keeps using a grant | refused within 5 s | guarantee 2 |
-| 5 | A sandboxed agent (`vl ws exec`) | connects to the socket, reads the store, also through an allowed folder that holds them (`--allow ~/.cache`), or after the folder is removed and made again during the run | an allowed folder or seed holding one of Veil's folders is refused, so none is ever shown (BUG-1512, BUG-1516); a second view made by the person or by root (both inside the trust boundary; a confined command cannot make one) is residual (BUG-1519); without the device key it could not sign a request anyway | `cli_workspaces` `confine_cli::the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them`, `s6r2_the_daemons_folders_stay_hidden_by_every_route`, `s6r2_a_daemon_folder_made_again_during_a_run_stays_hidden`, `s6r3_a_linked_home_and_unusual_xdg_values_never_show_or_misplace_the_daemon` (a `HOME` through a link; a relative `XDG_CACHE_HOME`; an `XDG_RUNTIME_DIR` not this user's 0700 folder) |
+| 5 | A sandboxed agent (`vl ws exec`, Linux) | connects to the socket, reads the store, also through an allowed folder that holds them (`--allow ~/.cache`), through a bind mount / double-mounted disk / `overlay` / `fuse.bindfs` / hard link / symlink / renamed parent, or after the folder is removed and made again during the run | an allowed folder or seed holding or lying inside one of Veil's folders (by name, symlink, Unix `(st_dev, st_ino)` identity, Linux `/proc/self/mountinfo` aliases, or hard links) is refused before the command runs, so none is ever shown (BUG-1512, BUG-1516, BUG-1519); only a mount opaque to `/proc/self/mountinfo` or made concurrently after `bwrap` starts remains (requiring the person or root, inside the trust boundary; a confined command cannot mount); without the device key it could not sign a request anyway | `cli_workspaces` `confine_cli::the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them`, `s6r2_the_daemons_folders_stay_hidden_by_every_route`, `s6r2_a_daemon_folder_made_again_during_a_run_stays_hidden`, `s6r2_a_bind_mount_alias_never_shows_veils_folders`, `bug_1519_hard_links_symlinks_and_renamed_parents_never_expose_veils_folders_or_credentials`, `s6r3_a_linked_home_and_unusual_xdg_values_never_show_or_misplace_the_daemon`; `vl` `confine::tests::bug_1519_*` |
 | 5b | Another OS user | listens first at the daemon's socket path (a shared `XDG_RUNTIME_DIR`) | a `vl` checks its peer's uid and sends nothing; a runtime folder not this user's 0700 one is not used (BUG-1515) | `s6r2_a_vl_never_asks_another_os_users_daemon` (needs root) |
 | 6 | Another OS user | connects to the socket, reads the store | the directories are 0700 and the peer's uid is checked | guarantee 6 (modes; a second uid needs root to test) |
 | 7 | A local process, a torn write | changes bytes in the store | the object fails its id check, is removed, comes from the server | guarantee 6, `store::tests` |
