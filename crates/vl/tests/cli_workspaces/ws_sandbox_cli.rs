@@ -1300,3 +1300,78 @@ fn bug_2652_control_or_bidi_characters_never_print_a_wrong_command_to_paste() {
     let out = env.vl("alice", &proj, &["ws", "exec", "agent", "--only", "plain", "--", "true"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bug_2650_exec_beside_a_large_sealed_file_keeps_memory_bounded_and_quarantines_copies() {
+    let env = Env::new();
+    let proj = env.dir("proj");
+    write(&proj, "README.md", "hello\n");
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut plan = String::with_capacity(4 << 20);
+    while plan.len() < (4 << 20) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        plan.push_str(&format!("{x:016x}"));
+    }
+    write(&proj, "internal/.env.plan", &plan);
+    drop(plan);
+    env.ok("alice", &proj, &["init"]);
+    env.ok("alice", &proj, &["cloak", "internal/.env.plan"]);
+    env.ok("alice", &proj, &["commit", "-m", "initial"]);
+    env.ok("alice", &proj, &["ws", "new", "agent", "-r", "@-"]);
+
+    // First run materialises the sandbox; second run edits README.md beside the
+    // 4 MiB sealed file. Measure the second run's whole-tree ru_maxrss (before
+    // BUG-2650's fix: > 900 MiB).
+    exec(&env, &proj, &["--", "true"]);
+    let child = env
+        .cmd("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", "echo edited > README.md"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut status: libc::c_int = 0;
+    let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
+    let waited = unsafe { libc::wait4(child.id() as libc::pid_t, &mut status, 0, &mut rusage) };
+    assert_eq!(waited, child.id() as libc::pid_t);
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "status={status}");
+    let peak_mib = rusage.ru_maxrss / 1024;
+    assert!(
+        peak_mib < 192,
+        "vl ws exec beside a 4 MiB sealed file used {peak_mib} MiB peak RSS"
+    );
+    assert_eq!(env.stdout("alice", &proj, &["ws", "cat", "agent", "README.md"]), "edited\n");
+
+    // Copying the 4 MiB sealed secret into a plain file is still quarantined
+    // and scrubbed out of the sandbox.
+    let leak = env.vl("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", "cp internal/.env.plan leak.txt"]);
+    let leak_out = text(&leak);
+    assert!(leak.status.success(), "{leak_out}");
+    assert!(leak_out.contains("leak.txt quarantined") && leak_out.contains("cleaned leak.txt"), "{leak_out}");
+    assert!(!paths(&env, &proj, "agent@").iter().any(|p| p == "leak.txt"));
+    assert!(!files_dir(&proj, "agent").join("leak.txt").exists());
+
+    // Above MAX_GUARD_BYTES (16 MiB), both persistent and ephemeral `vl ws exec`
+    // fail closed before running the command rather than skipping or weakening
+    // the guard.
+    let big = "a".repeat((16 << 20) + 1024);
+    write(&proj, "internal/.env.plan", &big);
+    drop(big);
+    env.ok("alice", &proj, &["commit", "-m", "oversize"]);
+    env.ok("alice", &proj, &["ws", "new", "over", "-r", "@-"]);
+    let marker = proj.join(".scratch-ran");
+    let run_cmd = format!("touch '{}'", marker.display());
+    for args in [
+        vec!["ws", "exec", "over", "--", "sh", "-c", run_cmd.as_str()],
+        vec!["ws", "exec", "--ephemeral", "-r", "@-", "--", "sh", "-c", run_cmd.as_str()],
+    ] {
+        let out = env.vl("alice", &proj, &args);
+        let t = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {t}");
+        assert!(t.contains("16 MiB limit") && t.contains("internal/.env.plan"), "{args:?}: {t}");
+        assert!(!marker.exists(), "command ran despite oversized guard: {args:?}");
+    }
+}

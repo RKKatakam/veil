@@ -60,7 +60,7 @@ use veil_core::{
     builder::{BuildReport, InjectedSecrets, INJECTED_RULE},
     checkout::Materialised,
     object::EntryKind,
-    sandbox::{dir_name, sealed_files_in_tree, sealed_leaf, workspace_of, Guard, SandboxPaths},
+    sandbox::{dir_name, sealed_leaf, workspace_of, Guard, SandboxPaths},
     tree::{diff_trees, lookup},
     vfs::{private_dir, remove_tree, walk_files, DiskBackend, NodeKind, SandboxLock, StorageBackend},
     workspace::{mount_record_op_description, SnapshotOptions},
@@ -162,8 +162,12 @@ impl Paths {
             return Ok(());
         }
         let key = repo.keys().require(veil_core::keychain::LOCAL_SCOPE)?;
-        let env = veil_core::crypto::Envelope::seal(&key, veil_core::keychain::LOCAL_SCOPE, &serde_json::to_vec(g)?, false)?;
-        self.backend().write(&VPath::new(GUARD_FILE)?, &env.to_bytes())?;
+        let plain = serde_json::to_vec(g)?;
+        let env = veil_core::crypto::Envelope::seal(&key, veil_core::keychain::LOCAL_SCOPE, &plain, false)?;
+        drop(plain);
+        let bytes = env.to_bytes();
+        drop(env);
+        self.backend().write(&VPath::new(GUARD_FILE)?, &bytes)?;
         Ok(())
     }
 
@@ -352,6 +356,9 @@ struct Recorder {
     report: BuildReport,
     /// Secrets shown by this mount (and any sandbox guard of the workspace).
     guard: Guard,
+    /// Compiled [`InjectedSecrets`] for `(guard.files.len(), secrets)`, reused
+    /// across recordings until `guard.files` grows (BUG-2650).
+    cached_secrets: Option<(usize, Arc<InjectedSecrets>)>,
     /// The workspace is gone: the overlay was saved, the mount should go.
     orphaned: bool,
 }
@@ -363,11 +370,12 @@ impl Recorder {
         private_dir(&paths.dir).with_context(|| format!("creating {}", paths.dir.display()))?;
         private_dir(&paths.upper)?;
         let repo = open_repo(root)?;
-        let state = match paths.load_state()? {
-            Some(st) => st,
+        let existing_state = paths.load_state()?;
+        let state = match &existing_state {
+            Some(st) => st.clone(),
             None => {
                 let wc = repo.workspace_wc(ws)?;
-                let st = State {
+                State {
                     version: STATE_VERSION,
                     workspace: ws.to_string(),
                     base: wc.hex(),
@@ -375,9 +383,7 @@ impl Recorder {
                     pid: None,
                     boot: None,
                     socket: None,
-                };
-                paths.save_state(&st)?;
-                st
+                }
             }
         };
         if state.workspace != ws {
@@ -394,14 +400,37 @@ impl Recorder {
                 (wc, lower_of(&repo, &wc)?)
             }
         };
-        let mut guard = SandboxPaths::new(root, ws).load_guard(&repo)?.unwrap_or_default();
-        if let Some(mg) = paths.load_guard(&repo)? {
-            guard.merge(&mg);
-        }
+        let sp_guard = SandboxPaths::new(root, ws).load_guard(&repo)?;
+        let (mut guard, mut changed) = match paths.load_guard(&repo)? {
+            Some(mut mg) => {
+                let c = match &sp_guard {
+                    Some(sg) => mg.try_merge(sg)?,
+                    None => false,
+                };
+                (mg, c)
+            }
+            None => {
+                let mut g = Guard::default();
+                let c = match &sp_guard {
+                    Some(sg) => g.try_merge(sg)?,
+                    None => false,
+                };
+                (g, c)
+            }
+        };
         if let Ok(snap) = repo.snapshot(&shown_snap) {
-            guard.add(&sealed_files_in_tree(repo.store(), &snap.tree, None));
+            changed |= guard.absorb_tree(repo.store(), &snap.tree, None)?;
         }
-        let _ = paths.save_guard(&repo, &guard);
+        let cached_secrets = match guard.files.is_empty() {
+            true => None,
+            false => Some((guard.files.len(), Arc::new(guard.try_secrets()?))),
+        };
+        if existing_state.is_none() {
+            paths.save_state(&state)?;
+        }
+        if changed {
+            paths.save_guard(&repo, &guard)?;
+        }
         let upper: Arc<dyn StorageBackend> = Arc::new(DiskBackend::new(&paths.upper));
         // Large open files' content: anonymous files here, never in memory
         // (BUG-1365).
@@ -425,6 +454,7 @@ impl Recorder {
             said: String::new(),
             report: BuildReport::default(),
             guard,
+            cached_secrets,
             orphaned: false,
         })
     }
@@ -438,17 +468,39 @@ impl Recorder {
         self.paths.save_state(&self.state)
     }
 
-    /// Secrets the mount has shown (plus any sandbox guard of the workspace),
-    /// refreshed from `snapshot` (what `repo`'s store holds locally).
-    fn secrets(&mut self, repo: &Repo, snapshot: &ObjectId) -> Result<Option<InjectedSecrets>> {
+    /// Refresh [`Self::guard`] from the workspace's sandbox guard and from
+    /// `snapshot`'s sealed entries, failing closed if the guard limit is
+    /// exceeded (BUG-2650).
+    fn absorb_guard(&mut self, repo: &Repo, snapshot: &ObjectId) -> Result<()> {
+        let mut changed = false;
         if let Some(g) = SandboxPaths::new(&self.root, &self.ws).load_guard(repo)? {
-            self.guard.merge(&g);
+            changed |= self.guard.try_merge(&g)?;
         }
         if let Ok(snap) = repo.snapshot(snapshot) {
-            self.guard.add(&sealed_files_in_tree(repo.store(), &snap.tree, None));
+            changed |= self.guard.absorb_tree(repo.store(), &snap.tree, None)?;
         }
-        let _ = self.paths.save_guard(repo, &self.guard);
-        Ok((!self.guard.files.is_empty()).then(|| self.guard.secrets()))
+        if changed {
+            self.paths.save_guard(repo, &self.guard)?;
+        }
+        Ok(())
+    }
+
+    /// Secrets the mount has shown (plus any sandbox guard of the workspace),
+    /// refreshed from `snapshot` (what `repo`'s store holds locally).
+    fn secrets(&mut self, repo: &Repo, snapshot: &ObjectId) -> Result<Option<Arc<InjectedSecrets>>> {
+        self.absorb_guard(repo, snapshot)?;
+        if self.guard.files.is_empty() {
+            return Ok(None);
+        }
+        let len = self.guard.files.len();
+        if let Some((cached_len, s)) = &self.cached_secrets {
+            if *cached_len == len {
+                return Ok(Some(s.clone()));
+            }
+        }
+        let s = Arc::new(self.guard.try_secrets()?);
+        self.cached_secrets = Some((len, s.clone()));
+        Ok(Some(s))
     }
 
     /// Read the overlay's base again with `repo`'s keys: a grant or an
@@ -470,6 +522,7 @@ impl Recorder {
     /// recorded or rewrote it): put the overlay over `wc`'s tree.
     fn follow(&mut self, repo: &mut Repo, wc: ObjectId, notes: &mut Vec<String>) -> Result<()> {
         let old = self.base()?;
+        self.absorb_guard(repo, &old)?;
         self.refresh(repo)?;
         let new_tree = repo.snapshot(&wc)?.tree;
         let old_tree = repo.snapshot(&old).ok().map(|s| s.tree);
@@ -504,7 +557,7 @@ impl Recorder {
             let desc = format!("edits made in the mount of workspace {} (they conflicted with a change to the workspace)", self.ws);
             let shown = self.shown(repo, &old)?;
             let secrets = self.secrets(repo, &old)?;
-            let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(old, ov, &desc, secrets.as_ref(), Some(&shown), &[], true))?;
+            let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(old, ov, &desc, secrets.as_deref(), Some(&shown), &[], true))?;
             let change = repo.snapshot(&id)?.change_id.short();
             // Give up only what the saved change holds: an upper file it
             // left out (quarantined, held back) stays, over the new tree.
@@ -539,7 +592,7 @@ impl Recorder {
                 ));
             }
         }
-        let _ = self.secrets(repo, &wc);
+        self.absorb_guard(repo, &wc)?;
         self.fs.switch_lower(lower_of(repo, &wc)?, &changed, &drop).map_err(fs_err)?;
         self.set_base(wc)
     }
@@ -580,7 +633,7 @@ impl Recorder {
                     ov,
                     SnapshotOptions {
                         expected_wc: Some(wc),
-                        injected: secrets.as_ref(),
+                        injected: secrets.as_deref(),
                         // Never a command of the user's: `vl undo` skips it
                         // and keeps what it recorded (BUG-538).
                         description: Some(mount_record_op_description(&ws)),
@@ -603,7 +656,7 @@ impl Recorder {
                 // finds the overlay agreeing with it and saves nothing
                 // (BUG-539).
                 self.set_base(out.snapshot)?;
-                let _ = self.secrets(&repo, &out.snapshot);
+                let _ = self.absorb_guard(&repo, &out.snapshot);
                 notes.push(format!("Recorded {}", one_line(&repo, &out.snapshot)));
             }
             self.left_out(&out.report, &mut notes);
@@ -723,7 +776,7 @@ impl Recorder {
                 self.refresh(repo)?;
                 let shown = self.shown(repo, &base)?;
                 let secrets = self.secrets(repo, &base)?;
-                let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(base, ov, &desc, secrets.as_ref(), Some(&shown), &[], true))?;
+                let (id, _) = self.fs.with_view(|ov| repo.commit_fs_as_child_with(base, ov, &desc, secrets.as_deref(), Some(&shown), &[], true))?;
                 Ok(repo.snapshot(&id)?.change_id.short())
             })();
             notes.push(match saved {
@@ -1767,5 +1820,226 @@ mod tests {
         std::fs::create_dir_all(nested.join(".VEIL")).unwrap();
         assert!(mountpoint(&root, &nested.join("mnt")).is_err());
         assert!(mountpoint(&root, &tmp.path().join("plain/mnt")).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bug_2650_recorder_keeps_memory_bounded_and_still_quarantines_copied_secrets() {
+        const CHILD_ENV: &str = "VEIL_TEST_BUG_2650_RECORDER_CHILD";
+        let self_hwm_mib = || -> u64 {
+            let s = std::fs::read_to_string("/proc/self/status").unwrap();
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                / 1024
+        };
+        let fs_ino = |fs: &MountFs, path: &str| -> u64 {
+            if path.is_empty() {
+                return fs::ROOT;
+            }
+            let mut ino = fs::ROOT;
+            for c in VPath::new(path).unwrap().components() {
+                ino = fs.lookup(ino, std::ffi::OsStr::new(c)).unwrap().ino;
+            }
+            ino
+        };
+        let fs_cat = |fs: &MountFs, path: &str| -> Vec<u8> {
+            let ino = fs_ino(fs, path);
+            let fh = fs.open(ino, false, false).unwrap();
+            let mut out = Vec::new();
+            loop {
+                let chunk = fs.read(fh, out.len() as u64, 64 << 10).unwrap();
+                if chunk.is_empty() {
+                    break;
+                }
+                out.extend_from_slice(&chunk);
+            }
+            fs.release(fh).unwrap();
+            out
+        };
+        let fs_put = |fs: &MountFs, path: &str, data: &[u8]| {
+            let vp = VPath::new(path).unwrap();
+            let parent = fs_ino(fs, vp.parent().unwrap().as_str());
+            let name = std::ffi::OsStr::new(vp.file_name());
+            let fh = match fs.lookup(parent, name) {
+                Ok(attr) => fs.open(attr.ino, true, true).unwrap(),
+                Err(_) => fs.create(parent, name, false, false).unwrap().1,
+            };
+            fs.write(fh, 0, data).unwrap();
+            fs.flush(fh).unwrap();
+            fs.release(fh).unwrap();
+        };
+        if let Ok(proj_str) = std::env::var(CHILD_ENV) {
+            let proj = PathBuf::from(proj_str);
+            let mut rec = Recorder::open(&proj, "view").unwrap();
+            assert!(rec.record().unwrap().is_empty());
+            let start = self_hwm_mib();
+
+            // 1. Plain edit beside the 4 MiB sealed file (and a second edit to
+            // exercise repeated recordings).
+            for body in [b"edited\n".as_slice(), b"edited twice\n".as_slice()] {
+                fs_put(&rec.fs, "README.md", body);
+                let notes = rec.record().unwrap();
+                assert!(notes.iter().any(|n| n.starts_with("Recorded ")), "{notes:?}");
+            }
+            let peak = self_hwm_mib();
+            assert!(
+                peak < start + 64,
+                "recording edits beside a 4 MiB sealed file grew Recorder VmHWM from {start} to {peak} MiB"
+            );
+
+            // 2. Copying the 4 MiB unbroken secret, a 2 KiB line secret, or a
+            // short KEY=value secret from sealed files into plain files MUST
+            // all be quarantined, while editing the sealed file itself in place
+            // is permitted.
+            let plan = fs_cat(&rec.fs, "internal/.env.plan");
+            let extra = fs_cat(&rec.fs, "internal/.env.extra");
+            let extra_str = std::str::from_utf8(&extra).unwrap();
+            let long_line = extra_str.lines().next().unwrap();
+            fs_put(&rec.fs, "leak_whole.txt", &plan);
+            fs_put(&rec.fs, "leak_line.txt", format!("prefix {long_line} suffix\n").as_bytes());
+            fs_put(&rec.fs, "leak_short.txt", b"copied sk-live-shortSecretValue99 here\n");
+            let mut edited_plan = plan;
+            edited_plan.extend_from_slice(b"\n");
+            fs_put(&rec.fs, "internal/.env.plan", &edited_plan);
+            let _ = rec.record().unwrap();
+            let q: Vec<&str> = rec.report.quarantined.iter().map(|f| f.0.as_str()).collect();
+            assert!(q.contains(&"leak_whole.txt"), "4 MiB secret copy missed: {q:?}");
+            assert!(q.contains(&"leak_line.txt"), "2 KiB line secret copy missed: {q:?}");
+            assert!(q.contains(&"leak_short.txt"), "short secret copy missed: {q:?}");
+            assert!(!q.contains(&"internal/.env.plan"), "in-place edit of sealed file quarantined: {q:?}");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("veil-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join("internal")).unwrap();
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut plan = String::with_capacity(4 << 20);
+        while plan.len() < 4 << 20 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            plan.push_str(&format!("{x:016x}"));
+        }
+        let long_tok: String = (0..128).map(|i| format!("{:016x}", x.wrapping_add(i))).collect(); // 2048 hex chars (> 1 KiB)
+        std::fs::write(proj.join("README.md"), "hello\n").unwrap();
+        std::fs::write(
+            proj.join(veil_core::policy::POLICY_FILE),
+            "internal/.env.plan cloak team\ninternal/.env.extra cloak team\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("internal/.env.plan"), &plan).unwrap();
+        std::fs::write(
+            proj.join("internal/.env.extra"),
+            format!("{long_tok}\nAPI_KEY=sk-live-shortSecretValue99\n"),
+        )
+        .unwrap();
+        drop(plan);
+
+        std::env::set_var("VEIL_HOME", &home);
+        let id = crate::ctx::load_identity().unwrap();
+        let user = crate::ctx::user_for(&id);
+        let fs = Arc::new(DiskBackend::new(&proj));
+        let mut repo = Repo::init(fs.clone(), Some(id), &user).unwrap();
+        if repo.keys().ring_state("team").unwrap().is_none() {
+            repo.keys().create_scope("team").unwrap();
+        }
+        repo.snapshot_workspace("default", &*fs).unwrap();
+        let committed = repo.commit("default", "initial", false).unwrap();
+        repo.set_tag("main", committed.committed, false).unwrap();
+        repo.create_workspace("view", vec![committed.committed]).unwrap();
+        drop(repo);
+
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "mount::tests::bug_2650_recorder_keeps_memory_bounded_and_still_quarantines_copied_secrets", "--nocapture"])
+            .env("VEIL_HOME", &home)
+            .env(CHILD_ENV, &proj)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed ({}):\n{}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn bug_2650_recorder_fails_closed_at_16_mib_guard_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("veil-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join("internal")).unwrap();
+        std::fs::write(proj.join("README.md"), "hello\n").unwrap();
+
+        std::env::set_var("VEIL_HOME", &home);
+        let id = crate::ctx::load_identity().unwrap();
+        let user = crate::ctx::user_for(&id);
+        let fs = Arc::new(DiskBackend::new(&proj));
+        let mut repo = Repo::init(fs.clone(), Some(id), &user).unwrap();
+        if repo.keys().ring_state("team").unwrap().is_none() {
+            repo.keys().create_scope("team").unwrap();
+        }
+        repo.snapshot_workspace("default", &*fs).unwrap();
+        let base = repo.commit("default", "base", false).unwrap().committed;
+        repo.create_workspace("live", vec![base]).unwrap();
+
+        // Open a Recorder on the small base snapshot.
+        let mut live = Recorder::open(&proj, "live").unwrap();
+        assert!(live.record().unwrap().is_empty());
+
+        // Commit a 17 MiB cloaked file (> MAX_GUARD_BYTES = 16 MiB).
+        std::fs::write(proj.join(veil_core::policy::POLICY_FILE), "internal/.env.plan cloak team\n").unwrap();
+        std::fs::write(proj.join("internal/.env.plan"), vec![b'a'; 17 << 20]).unwrap();
+        repo.snapshot_workspace("default", &*fs).unwrap();
+        let over = repo.commit("default", "oversize sealed", false).unwrap().committed;
+        repo.create_workspace("over", vec![over]).unwrap();
+
+        // 1. Opening a Recorder on `over` fails closed before creating state.json.
+        let err = match Recorder::open(&proj, "over") {
+            Ok(_) => panic!("expected Recorder::open to fail closed above 16 MiB"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("16 MiB limit") && err.contains("internal/.env.plan"), "{err}");
+        assert!(Paths::new(&proj, "over").load_state().unwrap().is_none(), "refused open must not leave state.json");
+
+        // 2. Moving `live` onto `over` while `live` has an unrecorded edit makes
+        // `record()` fail closed inside `follow()` without switching the lower
+        // layer or recording without the guard.
+        let readme = live.fs.lookup(1, std::ffi::OsStr::new("README.md")).unwrap();
+        let fh = live.fs.open(readme.ino, true, true).unwrap();
+        live.fs.write(fh, 0, b"live edit\n").unwrap();
+        live.fs.flush(fh).unwrap();
+        live.fs.release(fh).unwrap();
+        repo.new_change("live", vec![over], "").unwrap();
+        let follow_err = format!("{:#}", live.record().unwrap_err());
+        assert!(follow_err.contains("16 MiB limit") && follow_err.contains("internal/.env.plan"), "{follow_err}");
+        assert!(
+            live.fs.lookup(1, std::ffi::OsStr::new("internal")).is_err(),
+            "follow() must not switch the lower layer to an unguarded oversize secret"
+        );
+
+        // 3. Uncloaking the oversized data file lets `live` follow and record its edit.
+        std::fs::write(proj.join(veil_core::policy::POLICY_FILE), "internal/.env.plan public\n").unwrap();
+        repo.snapshot_workspace("default", &*fs).unwrap();
+        let uncloaked = repo.commit("default", "uncloak dump", false).unwrap().committed;
+        repo.new_change("live", vec![uncloaked], "").unwrap();
+        let notes = live.record().unwrap();
+        assert!(notes.iter().any(|n| n.starts_with("Recorded ")), "{notes:?}");
+        repo.reload().unwrap();
+        let wc = repo.workspace_wc("live").unwrap();
+        let tree = repo.snapshot(&wc).unwrap().tree;
+        let entry = lookup(repo.store(), &tree, &VPath::new("README.md").unwrap()).unwrap().unwrap();
+        assert_eq!(repo.store().read_entry(&entry).unwrap(), b"live edit\n");
     }
 }
