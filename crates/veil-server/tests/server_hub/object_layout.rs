@@ -1549,3 +1549,516 @@ fn guarantee_11_pushes_schedule_no_merge_leftover_small_packs_merge_once_and_sta
     }
     assert_eq!(pack_counts(&hub, pid_left), (0, 1, 0), "later pushes in objects layout list no pack");
 }
+
+/// BUG-2661 (part 1): in `objects` mode, a staged container `C1` that an
+/// in-flight request is using is never handed out by `staged_holding` to a
+/// concurrent upload by the same person — tested across push+push,
+/// push+API commit and push+land (both snapshot-based `vl land` and
+/// edits-based `POST …/land`), where the first push commits and purges `C1`.
+#[test]
+fn bug_2661_concurrent_uploads_by_one_person_do_not_share_in_flight_containers() {
+    let hub = TestHub::start_objects();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+
+    // Helper: start a push by `p.dev` uploading `c1`, hold `c1`'s `packs` row `FOR UPDATE` so the
+    // push enters its commit transaction and blocks right on `UPDATE packs`, run `concurrent` while
+    // that first push is in-flight, then release the row lock so the first push commits and purges
+    // `c1`, and return `(c1_pack, concurrent_out)`.
+    let while_push_in_flight = |branch1: &str, shared_path: &str, shared_body: &str, concurrent: &dyn Fn(&str, ObjectId, &[u8])| {
+        let mut c1 = Craft::new(&api, &p.dev, &p.name, "main");
+        let (shared_id, shared_raw) = blob(shared_body);
+        c1.file(shared_path, shared_body);
+        let s1 = {
+            let t = c1.tip;
+            snap(&mut c1, vec![t], &format!("first push {branch1}"), None)
+        };
+        let (map1, pack1) = upload_all(&api, &c1);
+
+        let mut lock = hub.rt.block_on(hub.hub().db.begin()).unwrap();
+        hub.rt
+            .block_on(
+                sqlx::query("SELECT 1 FROM packs WHERE project_id = $1 AND name = $2 FOR UPDATE")
+                    .bind(pid)
+                    .bind(&pack1)
+                    .execute(&mut *lock),
+            )
+            .unwrap();
+
+        let writes_before = hub.hub().objects.writes.load(Relaxed);
+        std::thread::scope(|sc| {
+            let api1 = hub.api();
+            let pname = p.name.clone();
+            let tok1 = dev_tok.clone();
+            let b1 = branch1.to_string();
+            let map1_c = map1.clone();
+            let h1 = sc.spawn(move || push_body(&api1, &tok1, &pname, &b1, None, s1, &map1_c));
+
+            // Wait until the first push has kept its loose objects and is blocked on `UPDATE packs`.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while hub.hub().objects.writes.load(Relaxed) <= writes_before {
+                assert!(Instant::now() < deadline, "first push never reached its commit transaction");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(30));
+
+            // While the first push is in-flight, run the same person's second upload, then let the
+            // first push commit and purge `pack1`, then finish the second request inside `concurrent`.
+            let up2 = api.upload(&dev_tok, &p.name, &[(shared_id, shared_raw.clone())]);
+            assert_eq!(up2.status, 200, "{}", String::from_utf8_lossy(&up2.body));
+            let recs2: Vec<String> = serde_json::from_value(up2.json()["receipts"].clone()).unwrap();
+            let pack2 = recs2[0].split_once('.').unwrap().1.to_string();
+
+            hub.rt.block_on(lock.rollback()).unwrap();
+            let r1 = h1.join().unwrap();
+            assert_eq!(r1.status, 200, "{}", String::from_utf8_lossy(&r1.body));
+            assert_eq!(r1.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r1.body));
+            assert!(
+                !hub.rt.block_on(hub.blob_store().exists(&veil_server::pack::key(pid, &pack1))).unwrap(),
+                "committing first push purged {pack1}"
+            );
+
+            concurrent(&recs2[0], shared_id, &shared_raw);
+            assert_ne!(
+                pack2, pack1,
+                "concurrent upload by the same person must not be handed in-flight container {pack1}"
+            );
+        });
+    };
+
+    // 1. push + push
+    while_push_in_flight(
+        "dev/b2661-p1",
+        "src/b2661_shared_1.txt",
+        "MARKER-B2661-SHARED-PUSH-PUSH-01\n",
+        &|shared_receipt, shared_id, _| {
+            let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
+            c2.file("src/b2661_push2.txt", "MARKER-B2661-SHARED-PUSH-PUSH-01\n");
+            c2.file("src/b2661_push2_own.txt", "own sibling file\n");
+            c2.objects.retain(|(id, _)| *id != shared_id);
+            let s2 = {
+                let t = c2.tip;
+                snap(&mut c2, vec![t], "second push", None)
+            };
+            let (mut map2, _) = upload_all(&api, &c2);
+            map2.insert(shared_id.hex(), json!(shared_receipt));
+            let r2 = push_body(&api, &dev_tok, &p.name, "dev/b2661-p2", None, s2, &map2);
+            assert_eq!(r2.status, 200, "push+push failed: {}", String::from_utf8_lossy(&r2.body));
+            assert_eq!(r2.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r2.body));
+            let got = api.get(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/q/file?rev=dev/b2661-p2&path=src/b2661_push2.txt", p.name),
+            );
+            assert_eq!((got.status, got.body.as_slice()), (200, &b"MARKER-B2661-SHARED-PUSH-PUSH-01\n"[..]));
+        },
+    );
+
+    // 2. push + API commit (`POST /v1/projects/{p}/changes`)
+    while_push_in_flight(
+        "dev/b2661-api-p1",
+        "src/b2661_shared_2.txt",
+        "MARKER-B2661-SHARED-PUSH-API-02\n",
+        &|shared_receipt, shared_id, _| {
+            let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+            let r_api = api.post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/changes", p.name),
+                &json!({
+                    "base": base.hex(),
+                    "description": "concurrent api commit",
+                    "edits": [{"path": "src/b2661_api.txt", "put": {"object": shared_id.hex()}}],
+                    "receipts": {shared_id.hex(): shared_receipt},
+                }),
+            );
+            assert_eq!(r_api.status, 200, "push+API commit failed: {}", String::from_utf8_lossy(&r_api.body));
+            let snap_hex = r_api.json()["snapshot"].as_str().unwrap().to_string();
+            let got = api.get(Some(&dev_tok), &format!("/v1/projects/{}/q/file?rev={snap_hex}&path=src/b2661_api.txt", p.name));
+            assert_eq!((got.status, got.body.as_slice()), (200, &b"MARKER-B2661-SHARED-PUSH-API-02\n"[..]));
+        },
+    );
+
+    // 3a. push + snapshot-based land (`vl land` -> `POST /v1/projects/{p}/land` with `snapshot`)
+    while_push_in_flight(
+        "dev/b2661-land-p1",
+        "src/b2661_shared_3.txt",
+        "MARKER-B2661-SHARED-PUSH-LAND-SNAP-03\n",
+        &|shared_receipt, shared_id, _| {
+            let mut cl = Craft::new(&api, &p.dev, &p.name, "main");
+            cl.file("src/b2661_land_snap.txt", "MARKER-B2661-SHARED-PUSH-LAND-SNAP-03\n");
+            cl.objects.retain(|(id, _)| *id != shared_id);
+            let sl = {
+                let t = cl.tip;
+                snap(&mut cl, vec![t], "concurrent snapshot land", None)
+            };
+            let (mut map_l, _) = upload_all(&api, &cl);
+            map_l.insert(shared_id.hex(), json!(shared_receipt));
+            let r_land = api.post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/land", p.name),
+                &json!({
+                    "onto": "main",
+                    "snapshot": sl.hex(),
+                    "receipts": map_l,
+                    "wait": true,
+                }),
+            );
+            assert_eq!(r_land.status, 200, "push+snapshot land failed: {}", String::from_utf8_lossy(&r_land.body));
+            assert_eq!(r_land.json()["state"], json!("landed"), "{}", String::from_utf8_lossy(&r_land.body));
+            assert_eq!(
+                read_file(&api, &dev_tok, &p.name, "src/b2661_land_snap.txt").as_deref(),
+                Some(&b"MARKER-B2661-SHARED-PUSH-LAND-SNAP-03\n"[..])
+            );
+        },
+    );
+
+    // 3b. push + edits-based land (`POST /v1/projects/{p}/land` with `base` + `edits`)
+    while_push_in_flight(
+        "dev/b2661-land-ed-p1",
+        "src/b2661_shared_4.txt",
+        "MARKER-B2661-SHARED-PUSH-LAND-EDITS-04\n",
+        &|shared_receipt, shared_id, _| {
+            let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+            let r_land = api.post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/land", p.name),
+                &json!({
+                    "onto": "main",
+                    "base": base.hex(),
+                    "description": "concurrent edits land",
+                    "edits": [{"path": "src/b2661_land_edits.txt", "put": {"object": shared_id.hex()}}],
+                    "receipts": {shared_id.hex(): shared_receipt},
+                    "wait": true,
+                }),
+            );
+            assert_eq!(r_land.status, 200, "push+edits land failed: {}", String::from_utf8_lossy(&r_land.body));
+            assert_eq!(r_land.json()["state"], json!("landed"), "{}", String::from_utf8_lossy(&r_land.body));
+            assert_eq!(
+                read_file(&api, &dev_tok, &p.name, "src/b2661_land_edits.txt").as_deref(),
+                Some(&b"MARKER-B2661-SHARED-PUSH-LAND-EDITS-04\n"[..])
+            );
+        },
+    );
+
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "all staged containers purged cleanly");
+}
+
+/// BUG-2661 (part 2): whenever a request's receipted container has vanished
+/// (consumed & purged by an earlier committing push, missing at `staged_slots`,
+/// or gone after `staging()` at `Source::raw` / `take_uploads`), push, API
+/// commit and `POST …/land` all answer `409 Conflict` (`"an upload this push
+/// names was discarded; push again"`) instead of `400`, and **never** discard
+/// sibling staged containers (`C2`), so retrying after re-uploading only the
+/// vanished container succeeds without re-uploading `C2`.
+#[test]
+fn bug_2661_vanished_receipted_container_answers_409_and_keeps_sibling_uploads() {
+    let hub = TestHub::start_objects();
+    let cold = TestHub::beside_with_layout(&hub, ObjectLayout::Objects);
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let cold_api = cold.api();
+    let dev_tok = p.dev.token();
+    let store = hub.blob_store();
+
+    let assert_sibling_intact = |sibling_pack: &str| {
+        let state: Option<i16> = hub
+            .rt
+            .block_on(
+                sqlx::query_scalar("SELECT state FROM packs WHERE project_id = $1 AND name = $2")
+                    .bind(pid)
+                    .bind(sibling_pack)
+                    .fetch_optional(&hub.hub().db),
+            )
+            .unwrap();
+        assert_eq!(state, Some(0), "sibling container {sibling_pack} must remain STAGED (0), got {state:?}");
+        assert!(
+            hub.rt.block_on(store.exists(&veil_server::pack::key(pid, sibling_pack))).unwrap(),
+            "sibling container {sibling_pack} must remain stored"
+        );
+    };
+
+    // Helper: create `C1` (holding `shared_body`) and consume+purge `C1` via a committing push by `p.dev`,
+    // returning `(shared_id, shared_raw, vanished_receipt)`.
+    let make_purged_receipt = |tag: &str| -> (ObjectId, Vec<u8>, String) {
+        let (sid, sraw) = blob(tag);
+        let mut c1 = Craft::new(&api, &p.dev, &p.name, "main");
+        c1.file("src/b2661_consume.txt", tag);
+        c1.objects.retain(|(id, _)| *id != sid);
+        let snap1 = {
+            let t = c1.tip;
+            snap(&mut c1, vec![t], "consume c1", None)
+        };
+        let up_c1 = api.upload(&dev_tok, &p.name, &[(sid, sraw.clone())]);
+        assert_eq!(up_c1.status, 200);
+        let c1_rec: Vec<String> = serde_json::from_value(up_c1.json()["receipts"].clone()).unwrap();
+        let c1_pack = c1_rec[0].split_once('.').unwrap().1.to_string();
+        let (mut m1, _) = upload_all(&api, &c1);
+        m1.insert(sid.hex(), json!(c1_rec[0]));
+        let bname = format!("dev/consume-{}", &c1_pack[..10]);
+        let r1 = push_body(&api, &dev_tok, &p.name, &bname, None, snap1, &m1);
+        assert_eq!(r1.status, 200, "{}", String::from_utf8_lossy(&r1.body));
+        assert_eq!(r1.json()["results"][0]["ok"], json!(true));
+        assert!(!hub.rt.block_on(store.exists(&veil_server::pack::key(pid, &c1_pack))).unwrap());
+        (sid, sraw, c1_rec[0].clone())
+    };
+
+    // 1a. Push with purged `C1` + live sibling `C2` -> 409 Conflict, `C2` preserved, retry lands!
+    {
+        let (sid, sraw, c1_rec) = make_purged_receipt("MARKER-B2661-VANISHED-PUSH-1A\n");
+        let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
+        c2.file("src/b2661_v_push.txt", "MARKER-B2661-VANISHED-PUSH-1A\n");
+        c2.file("src/b2661_v_push_sib.txt", "sibling push content\n");
+        c2.objects.retain(|(id, _)| *id != sid);
+        let s2 = {
+            let t = c2.tip;
+            snap(&mut c2, vec![t], "push with vanished c1", None)
+        };
+        let (mut map2, sib_pack) = upload_all(&api, &c2);
+        map2.insert(sid.hex(), json!(c1_rec));
+
+        let r_vanished = push_body(&api, &dev_tok, &p.name, "dev/b2661-v-push", None, s2, &map2);
+        let body = String::from_utf8_lossy(&r_vanished.body);
+        assert_eq!(r_vanished.status, 409, "expected 409 for vanished container in push, got {}: {body}", r_vanished.status);
+        assert!(body.contains("an upload this push names was discarded; push again"), "unexpected body: {body}");
+        assert_sibling_intact(&sib_pack);
+
+        // Re-upload ONLY `sid`, keeping `sib_pack`'s receipts untouched, and retry!
+        let up_re = api.upload(&dev_tok, &p.name, &[(sid, sraw)]);
+        assert_eq!(up_re.status, 200);
+        let re_rec: Vec<String> = serde_json::from_value(up_re.json()["receipts"].clone()).unwrap();
+        map2.insert(sid.hex(), json!(re_rec[0]));
+        let r_retry = push_body(&api, &dev_tok, &p.name, "dev/b2661-v-push", None, s2, &map2);
+        assert_eq!(r_retry.status, 200, "{}", String::from_utf8_lossy(&r_retry.body));
+        assert_eq!(r_retry.json()["results"][0]["ok"], json!(true));
+    }
+
+    // 1b. API commit (`POST /changes`) with purged `C1` + live sibling `C2` -> 409 Conflict, `C2` preserved!
+    {
+        let (sid, sraw, c1_rec) = make_purged_receipt("MARKER-B2661-VANISHED-API-1B\n");
+        let (sib_id, sib_raw) = blob("MARKER-B2661-API-SIBLING-1B\n");
+        let up_sib = api.upload(&dev_tok, &p.name, &[(sib_id, sib_raw)]);
+        assert_eq!(up_sib.status, 200);
+        let sib_rec: Vec<String> = serde_json::from_value(up_sib.json()["receipts"].clone()).unwrap();
+        let sib_pack = sib_rec[0].split_once('.').unwrap().1.to_string();
+        let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+
+        let r_vanished = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({
+                "base": base.hex(),
+                "description": "api commit vanished c1",
+                "edits": [
+                    {"path": "src/b2661_v_api1.txt", "put": {"object": sid.hex()}},
+                    {"path": "src/b2661_v_api2.txt", "put": {"object": sib_id.hex()}},
+                ],
+                "receipts": {sid.hex(): c1_rec, sib_id.hex(): sib_rec[0]},
+            }),
+        );
+        let body = String::from_utf8_lossy(&r_vanished.body);
+        assert_eq!(r_vanished.status, 409, "expected 409 for vanished container in API commit, got {}: {body}", r_vanished.status);
+        assert!(body.contains("an upload this push names was discarded; push again"), "unexpected body: {body}");
+        assert_sibling_intact(&sib_pack);
+
+        let up_re = api.upload(&dev_tok, &p.name, &[(sid, sraw)]);
+        let re_rec: Vec<String> = serde_json::from_value(up_re.json()["receipts"].clone()).unwrap();
+        let r_retry = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/changes", p.name),
+            &json!({
+                "base": base.hex(),
+                "description": "api commit retry",
+                "edits": [
+                    {"path": "src/b2661_v_api1.txt", "put": {"object": sid.hex()}},
+                    {"path": "src/b2661_v_api2.txt", "put": {"object": sib_id.hex()}},
+                ],
+                "receipts": {sid.hex(): re_rec[0], sib_id.hex(): sib_rec[0]},
+            }),
+        );
+        assert_eq!(r_retry.status, 200, "{}", String::from_utf8_lossy(&r_retry.body));
+    }
+
+    // 1c. `POST /land` (edits-based) with purged `C1` + live sibling `C2` -> 409 Conflict, `C2` preserved!
+    {
+        let (sid, sraw, c1_rec) = make_purged_receipt("MARKER-B2661-VANISHED-LAND-1C\n");
+        let (sib_id, sib_raw) = blob("MARKER-B2661-LAND-SIBLING-1C\n");
+        let up_sib = api.upload(&dev_tok, &p.name, &[(sib_id, sib_raw)]);
+        let sib_rec: Vec<String> = serde_json::from_value(up_sib.json()["receipts"].clone()).unwrap();
+        let sib_pack = sib_rec[0].split_once('.').unwrap().1.to_string();
+        let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+
+        let r_vanished = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({
+                "onto": "main",
+                "base": base.hex(),
+                "description": "land vanished c1",
+                "edits": [
+                    {"path": "src/b2661_v_land1.txt", "put": {"object": sid.hex()}},
+                    {"path": "src/b2661_v_land2.txt", "put": {"object": sib_id.hex()}},
+                ],
+                "receipts": {sid.hex(): c1_rec, sib_id.hex(): sib_rec[0]},
+                "wait": true,
+            }),
+        );
+        let body = String::from_utf8_lossy(&r_vanished.body);
+        assert_eq!(r_vanished.status, 409, "expected 409 for vanished container in land, got {}: {body}", r_vanished.status);
+        assert!(body.contains("an upload this push names was discarded; push again"), "unexpected body: {body}");
+        assert_sibling_intact(&sib_pack);
+
+        let up_re = api.upload(&dev_tok, &p.name, &[(sid, sraw)]);
+        let re_rec: Vec<String> = serde_json::from_value(up_re.json()["receipts"].clone()).unwrap();
+        let r_retry = api.post_json(
+            Some(&dev_tok),
+            &format!("/v1/projects/{}/land", p.name),
+            &json!({
+                "onto": "main",
+                "base": base.hex(),
+                "description": "land retry",
+                "edits": [
+                    {"path": "src/b2661_v_land1.txt", "put": {"object": sid.hex()}},
+                    {"path": "src/b2661_v_land2.txt", "put": {"object": sib_id.hex()}},
+                ],
+                "receipts": {sid.hex(): re_rec[0], sib_id.hex(): sib_rec[0]},
+                "wait": true,
+            }),
+        );
+        assert_eq!(r_retry.status, 200, "{}", String::from_utf8_lossy(&r_retry.body));
+        assert_eq!(r_retry.json()["state"], json!("landed"));
+    }
+
+    // 2a. Vanished right between `usable` and `staged_slots` (`staged_slots -> Ok(None)` on cold server):
+    //     row is still STAGED in DB, storage object gone -> 409 Conflict, sibling preserved!
+    {
+        let (sid, sraw) = blob("MARKER-B2661-STAGED-SLOTS-NONE-2A\n");
+        let up_c1 = api.upload(&dev_tok, &p.name, &[(sid, sraw)]);
+        let c1_rec: Vec<String> = serde_json::from_value(up_c1.json()["receipts"].clone()).unwrap();
+        let c1_pack = c1_rec[0].split_once('.').unwrap().1.to_string();
+        hub.rt.block_on(store.delete(&veil_server::pack::key(pid, &c1_pack))).unwrap();
+
+        let mut c2 = Craft::new(&cold_api, &p.dev, &p.name, "main");
+        c2.file("src/b2661_slots_none.txt", "MARKER-B2661-STAGED-SLOTS-NONE-2A\n");
+        c2.objects.retain(|(id, _)| *id != sid);
+        let s2 = {
+            let t = c2.tip;
+            snap(&mut c2, vec![t], "slots none push", None)
+        };
+        let (mut map2, sib_pack) = upload_all(&cold_api, &c2);
+        map2.insert(sid.hex(), json!(c1_rec[0]));
+
+        let r = push_body(&cold_api, &dev_tok, &p.name, "dev/b2661-slots-none", None, s2, &map2);
+        assert_eq!(r.status, 409, "staged_slots -> None must answer 409, got {}: {}", r.status, String::from_utf8_lossy(&r.body));
+        assert_sibling_intact(&sib_pack);
+        hub.rt.block_on(hub.hub().objects.discard(pid, &[Arc::<str>::from(c1_pack.as_str()), Arc::<str>::from(sib_pack.as_str())])).unwrap();
+    }
+
+    // 2b. Vanished AFTER `staging()` succeeded (`Source::raw` `get_staged -> None` in push, and
+    //     `take_uploads` `staged_encoding -> None` in API commit), paused deterministically on
+    //     `ReadAhead::wait` after `staging()` read the index -> 409 Conflict, sibling preserved!
+    {
+        // Push path (`Source::raw` `get_staged -> None`):
+        let (sid, sraw) = blob("MARKER-B2661-AFTER-STAGING-PUSH-2B\n");
+        let up_c1 = api.upload(&dev_tok, &p.name, &[(sid, sraw)]);
+        let c1_rec: Vec<String> = serde_json::from_value(up_c1.json()["receipts"].clone()).unwrap();
+        let c1_pack = c1_rec[0].split_once('.').unwrap().1.to_string();
+
+        let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
+        c2.file("src/b2661_after_staging.txt", "MARKER-B2661-AFTER-STAGING-PUSH-2B\n");
+        c2.objects.retain(|(id, _)| *id != sid);
+        let s2 = {
+            let t = c2.tip;
+            snap(&mut c2, vec![t], "after staging push", None)
+        };
+        let (mut map2, sib_pack) = upload_all(&api, &c2);
+        map2.insert(sid.hex(), json!(c1_rec[0]));
+
+        let held_all = hub.rt.block_on(veil_server::store::ReadAhead::wait(u64::from(veil_server::store::DECODED_IN_FLIGHT)));
+        let cold_reads_before = cold.hub().objects.reads.load(Relaxed);
+        let r_push = std::thread::scope(|sc| {
+            let cold_api_c = cold.api();
+            let pname = p.name.clone();
+            let tok = dev_tok.clone();
+            let map2_c = map2.clone();
+            let handle = sc.spawn(move || push_body(&cold_api_c, &tok, &pname, "dev/b2661-after-staging", None, s2, &map2_c));
+            // Wait until `cold` has read the snapshot & trees after `staging()` and is waiting on `ReadAhead::wait`.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while cold.hub().objects.reads.load(Relaxed) <= cold_reads_before {
+                assert!(Instant::now() < deadline, "cold push never passed staging()");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            hub.rt.block_on(store.delete(&veil_server::pack::key(pid, &c1_pack))).unwrap();
+            drop(held_all);
+            handle.join().unwrap()
+        });
+        assert_eq!(
+            r_push.status,
+            409,
+            "Source::raw get_staged -> None must answer 409, got {}: {}",
+            r_push.status,
+            String::from_utf8_lossy(&r_push.body)
+        );
+        assert_sibling_intact(&sib_pack);
+        hub.rt.block_on(hub.hub().objects.discard(pid, &[Arc::<str>::from(c1_pack.as_str()), Arc::<str>::from(sib_pack.as_str())])).unwrap();
+
+        // API commit path (`take_uploads` `staged_encoding -> None`):
+        let (sid_a, sraw_a) = blob("MARKER-B2661-AFTER-STAGING-API-2B\n");
+        let up_a1 = api.upload(&dev_tok, &p.name, &[(sid_a, sraw_a)]);
+        let a1_rec: Vec<String> = serde_json::from_value(up_a1.json()["receipts"].clone()).unwrap();
+        let a1_pack = a1_rec[0].split_once('.').unwrap().1.to_string();
+        let (sib_a, sib_a_raw) = blob("MARKER-B2661-AFTER-STAGING-API-SIB\n");
+        let up_asib = api.upload(&dev_tok, &p.name, &[(sib_a, sib_a_raw)]);
+        let asib_rec: Vec<String> = serde_json::from_value(up_asib.json()["receipts"].clone()).unwrap();
+        let asib_pack = asib_rec[0].split_once('.').unwrap().1.to_string();
+        let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+
+        let held_all = hub.rt.block_on(veil_server::store::ReadAhead::wait(u64::from(veil_server::store::DECODED_IN_FLIGHT)));
+        let cold_reads_before = cold.hub().objects.reads.load(Relaxed);
+        let r_api = std::thread::scope(|sc| {
+            let cold_api_c = cold.api();
+            let pname = p.name.clone();
+            let tok = dev_tok.clone();
+            let r0 = a1_rec[0].clone();
+            let rs = asib_rec[0].clone();
+            let handle = sc.spawn(move || {
+                cold_api_c.post_json(
+                    Some(&tok),
+                    &format!("/v1/projects/{pname}/changes"),
+                    &json!({
+                        "base": base.hex(),
+                        "description": "after staging api",
+                        "edits": [
+                            {"path": "src/b2661_as_a1.txt", "put": {"object": sid_a.hex()}},
+                            {"path": "src/b2661_as_a2.txt", "put": {"object": sib_a.hex()}},
+                        ],
+                        "receipts": {sid_a.hex(): r0, sib_a.hex(): rs},
+                    }),
+                )
+            });
+            // `take_uploads` runs `staging()` + `staged_declared` (bumping `reads`) and pauses on `ReadAhead::wait`.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while cold.hub().objects.reads.load(Relaxed) < cold_reads_before + 2 {
+                assert!(Instant::now() < deadline, "cold API commit never reached ReadAhead::wait");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            hub.rt.block_on(store.delete(&veil_server::pack::key(pid, &a1_pack))).unwrap();
+            drop(held_all);
+            handle.join().unwrap()
+        });
+        assert_eq!(
+            r_api.status,
+            409,
+            "take_uploads staged_encoding -> None must answer 409, got {}: {}",
+            r_api.status,
+            String::from_utf8_lossy(&r_api.body)
+        );
+        assert_sibling_intact(&asib_pack);
+        hub.rt.block_on(hub.hub().objects.discard(pid, &[Arc::<str>::from(a1_pack.as_str()), Arc::<str>::from(asib_pack.as_str())])).unwrap();
+    }
+}
+
+

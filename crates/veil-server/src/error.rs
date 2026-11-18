@@ -133,6 +133,9 @@ impl From<veil_core::VeilError> for Error {
             veil_core::VeilError::Policy(m) => Error::forbidden(m),
             veil_core::VeilError::Corrupt(_, m) => Error::bad_request(format!("invalid object: {m}")),
             veil_core::VeilError::Missing(id) => Error::bad_request(format!("missing object {}", id.short())),
+            veil_core::VeilError::Io { source, .. } if crate::sync::staged_upload_discarded(&source) => {
+                Error::conflict(crate::sync::DISCARDED_UPLOAD)
+            }
             other => Error::Other(other.into()),
         }
     }

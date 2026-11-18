@@ -1249,12 +1249,17 @@ impl Objects {
     /// lost a race uploads the same objects again (BUG-1157).
     pub async fn stage(&self, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<Arc<str>> {
         let ids: Vec<ObjectId> = objects.iter().map(|(id, _)| *id).collect();
-        if let Some(name) = self.packs.staged_holding(project, person, &ids).await? {
+        let in_objects = self.layout == ObjectLayout::Objects;
+        if let Some(name) = self.packs.staged_holding(project, person, &ids, in_objects).await? {
             return Ok(name);
         }
         bump(&self.uploads);
         let (name, held) = self.write_pack(project, objects, true, Some(person)).await?;
-        self.packs.staged_here(project, person, &name, held);
+        if in_objects {
+            self.packs.staged_index_here(project, &name, held);
+        } else {
+            self.packs.staged_here(project, person, &name, held);
+        }
         Ok(name)
     }
 
@@ -1588,6 +1593,27 @@ impl Objects {
         self.packs.usable(project, person, names).await
     }
 
+    /// Classify receipted containers `names` for `person` (`BUG-2661`).
+    pub async fn usable_for_receipts(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<crate::pack::ReceiptPacks> {
+        self.packs.usable_for_receipts(project, person, names).await
+    }
+
+    /// Claim `names` out of `person`'s `recent` upload list in `objects` mode
+    /// while a request using them is in flight (`BUG-2661`).
+    pub fn claim_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {
+        if self.layout == ObjectLayout::Objects {
+            self.packs.claim_recent(project, person, names);
+        }
+    }
+
+    /// Return `names` to `person`'s `recent` upload list in `objects` mode when
+    /// a request ends without discarding them (`BUG-1157`, `BUG-2661`).
+    pub fn release_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {
+        if self.layout == ObjectLayout::Objects {
+            self.packs.release_recent(project, person, names);
+        }
+    }
+
     /// The index and length of staged pack `name` of `project`, held under
     /// its share of the bound on indexes; `None` if it is not in the store
     /// (discarded).
@@ -1607,6 +1633,9 @@ impl Objects {
     /// encoding and the object, checked against its id; `None` if the pack
     /// is gone (discarded).
     pub async fn get_staged(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<(Bytes, Bytes)>> {
+        if self.packs.is_discarded_here(project, name) {
+            return Ok(None);
+        }
         let ck = Self::staged_key(project, name, id, false);
         if let Some(enc) = self.cache.get(&ck) {
             let raw = decoded(id, &enc)?;
@@ -1717,15 +1746,22 @@ impl Objects {
     /// only (or the cache), its entry's head checked; `None` if the pack is
     /// gone.
     pub async fn staged_declared(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<u64>> {
+        if self.packs.is_discarded_here(project, name) {
+            return Ok(None);
+        }
         if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
-            return Ok(encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64));
+            let len = encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("corrupt staged object {id} in {name}"))?;
+            return Ok(Some(len));
         }
         bump(&self.reads);
         let last = s.last().min(s.offset + crate::pack::ENTRY_HEAD + encoding::HEADER as u64 - 1);
         let Some((b, _)) = self.store.get_range(&crate::pack::key(project, name), s.offset, last).await? else {
             return Ok(None);
         };
-        Ok(encoding::declared_len(crate::pack::entry(id, s, &b)?, s.encoding_len()))
+        let len = encoding::declared_len(crate::pack::entry(id, s, &b)?, s.encoding_len())
+            .ok_or_else(|| anyhow::anyhow!("corrupt staged object {id} in {name}"))?;
+        Ok(Some(len))
     }
 
     /// The encoding of object `id` at slot `s` of staged pack `name` of
@@ -1733,6 +1769,9 @@ impl Objects {
     /// decodes it, checked against the id, within its share of the bound on
     /// decoded bytes); `None` if the pack is gone.
     pub async fn staged_encoding(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<Bytes>> {
+        if self.packs.is_discarded_here(project, name) {
+            return Ok(None);
+        }
         if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
             return Ok(Some(enc));
         }
@@ -1779,6 +1818,26 @@ impl Objects {
     /// ([`crate::pack::Packs::discard`]).
     pub async fn discard(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
         self.packs.discard_counted(&*self.store, project, names, &self.deletes).await
+    }
+
+    /// Discard staged containers `names` after a push or API commit was
+    /// refused by its checks (`BUG-930`, `BUG-1155`): keeps `objects >= 0` on
+    /// the `DISCARDED` row so re-presenting those receipts still answers `400`.
+    pub async fn discard_refused(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
+        self.packs
+            .discard_with(&*self.store, project, names, true, false, &self.deletes, &self.pack_rows)
+            .await
+    }
+
+    /// Discard staged containers `names` consumed by a committing push or API
+    /// commit (`BUG-2661`): marks `objects = -1` (and purges the `packs` row in
+    /// `objects` mode once deleted from storage) so a concurrent or replayed
+    /// request naming them answers `409 Conflict`.
+    pub async fn discard_consumed(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
+        let purge_row = self.layout == ObjectLayout::Objects;
+        self.packs
+            .discard_with(&*self.store, project, names, false, purge_row, &self.deletes, &self.pack_rows)
+            .await
     }
 
     /// Delete containers `names` (marked `DISCARDED` in a push's transaction)

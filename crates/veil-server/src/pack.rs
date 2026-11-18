@@ -757,6 +757,7 @@ pub struct Packs {
     /// holding its share of `bound`; `None` once discarded here.
     staged: LruCache<Option<Arc<Held>>>,
     recent: LruCache<Recent>,
+    recent_lock: Mutex<()>,
     leftover: LruCache<()>,
     on_leftover: std::sync::OnceLock<Arc<dyn Fn(i64) + Send + Sync>>,
 }
@@ -795,6 +796,16 @@ pub struct StagedSlots {
     pub slots: Vec<(ObjectId, Slot)>,
 }
 
+/// Outcome of checking receipted upload containers (`BUG-2661`).
+pub enum ReceiptPacks {
+    /// Containers still `STAGED` or `LISTED`; any container absent from the set
+    /// was discarded by an earlier check refusal (`BUG-930`, `BUG-1155`).
+    Usable(HashSet<Arc<str>>),
+    /// At least one receipted container was consumed or swept (not refused by
+    /// checks), so the caller should retry (`409 Conflict`).
+    Vanished,
+}
+
 impl Packs {
     pub fn new(db: Option<sqlx::PgPool>) -> Packs {
         Packs {
@@ -808,6 +819,7 @@ impl Packs {
             bound: Bound { most: INDEXES_HELD - STAGED_INDEXES, ..Bound::new(INDEXES_HELD) },
             staged: LruCache::new(STAGED_INDEXES),
             recent: LruCache::new(RECENT_BUDGET),
+            recent_lock: Mutex::new(()),
             leftover: LruCache::new(LEFTOVER_BUDGET),
             on_leftover: std::sync::OnceLock::new(),
         }
@@ -1236,14 +1248,59 @@ impl Packs {
 
     /// Remember the index of a pack staged here, by `person`, with its
     /// share of the bound (given back when the cache drops it, or now if
-    /// the cache does not keep it).
-    pub fn staged_here(&self, project: i64, person: i64, name: &Arc<str>, mut held: Held) {
+    /// the cache does not keep it), and list it in `recent` for `person`.
+    pub fn staged_here(&self, project: i64, person: i64, name: &Arc<str>, held: Held) {
+        self.staged_index_here(project, name, held);
+        self.release_recent(project, person, std::slice::from_ref(name));
+    }
+
+    /// Cache the index of a newly staged upload container without adding it to
+    /// `recent` yet (`objects` layout: added to `recent` only if the request
+    /// ends without discarding the container, `BUG-2661`).
+    pub fn staged_index_here(&self, project: i64, name: &Arc<str>, mut held: Held) {
         held.unproject();
         let w = held.index.weight();
         self.staged.insert(name_key(project, name), Some(Arc::new(held)), w);
+    }
+
+    /// Whether `name` was marked discarded in this server's staged-index cache.
+    pub fn is_discarded_here(&self, project: i64, name: &str) -> bool {
+        matches!(self.staged.get(&name_key(project, name)), Some(None))
+    }
+
+    /// Remove `names` from `person`'s `recent` upload list so no concurrent
+    /// upload is handed an in-flight container (`BUG-2661`).
+    pub fn claim_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {
+        if names.is_empty() {
+            return;
+        }
+        let _g = self.recent_lock.lock().unwrap();
+        let k = person_key(project, person);
+        let Some(mut q) = self.recent.get(&k) else { return };
+        let before = q.len();
+        q.retain(|n| !names.iter().any(|m| m == n));
+        if q.len() != before {
+            let w = 96 + q.len() * 48;
+            self.recent.insert(k, q, w);
+        }
+    }
+
+    /// Return `names` (those not discarded here) to `person`'s `recent` upload
+    /// list when a request ends without discarding them (`BUG-1157`, `BUG-2661`).
+    pub fn release_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {
+        if names.is_empty() {
+            return;
+        }
+        let _g = self.recent_lock.lock().unwrap();
         let k = person_key(project, person);
         let mut q = self.recent.get(&k).unwrap_or_default();
-        q.push_front(name.clone());
+        for name in names {
+            if self.is_discarded_here(project, name) {
+                continue;
+            }
+            q.retain(|n| n != name);
+            q.push_front(name.clone());
+        }
         q.truncate(RECENT_UPLOADS);
         let w = 96 + q.len() * 48;
         self.recent.insert(k, q, w);
@@ -1257,9 +1314,46 @@ impl Packs {
 
     /// A pack `person` staged here recently that holds every one of `ids`
     /// and is still staged or listed (asked of the database): an upload of
-    /// those objects again gets its receipts instead of a new pack.
-    pub async fn staged_holding(&self, project: i64, person: i64, ids: &[ObjectId]) -> Result<Option<Arc<str>>> {
-        let names: Vec<Arc<str>> = self.recent.get(&person_key(project, person)).map(|q| q.into_iter().collect()).unwrap_or_default();
+    /// those objects again gets its receipts instead of a new pack. When `take`
+    /// is set (`objects` layout, `BUG-2661`), a candidate is atomically removed
+    /// from `recent` before `usable` is awaited so no concurrent upload can be
+    /// handed the same container.
+    pub async fn staged_holding(&self, project: i64, person: i64, ids: &[ObjectId], take: bool) -> Result<Option<Arc<str>>> {
+        if take {
+            let k = person_key(project, person);
+            loop {
+                let candidate = {
+                    let _g = self.recent_lock.lock().unwrap();
+                    let Some(mut q) = self.recent.get(&k) else { return Ok(None) };
+                    let mut picked = None;
+                    let mut idx = 0;
+                    while idx < q.len() {
+                        let matches = match self.staged.get(&name_key(project, &q[idx])) {
+                            Some(Some(held)) => ids.iter().all(|id| held.index.get(id).is_some()),
+                            _ => false,
+                        };
+                        if matches {
+                            picked = q.remove(idx);
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    if picked.is_some() {
+                        let w = 96 + q.len() * 48;
+                        self.recent.insert(k, q, w);
+                    }
+                    picked
+                };
+                let Some(name) = candidate else { return Ok(None) };
+                if self.usable(project, person, std::slice::from_ref(&name)).await?.contains(&name) {
+                    return Ok(Some(name));
+                }
+            }
+        }
+        let names: Vec<Arc<str>> = {
+            let _g = self.recent_lock.lock().unwrap();
+            self.recent.get(&person_key(project, person)).map(|q| q.into_iter().collect()).unwrap_or_default()
+        };
         for name in names {
             let Some(Some(held)) = self.staged.get(&name_key(project, &name)) else { continue };
             if !ids.iter().all(|id| held.index.get(id).is_some()) {
@@ -1292,6 +1386,42 @@ impl Packs {
         .await?;
         let rows: HashSet<String> = rows.into_iter().collect();
         Ok(names.iter().filter(|n| rows.contains(&***n)).cloned().collect())
+    }
+
+    /// Classify `names` (all verified by `sync::receipted` as issued to `person`
+    /// in `project`): containers still `STAGED` or `LISTED` are usable;
+    /// containers discarded by an earlier check refusal (`state = DISCARDED`
+    /// with `objects >= 0`, `BUG-930` / `BUG-1155`) are omitted so checks
+    /// answer `400`; containers consumed by a committing request or swept
+    /// (`objects < 0` or row deleted, `BUG-2661`) answer [`ReceiptPacks::Vanished`].
+    pub async fn usable_for_receipts(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<ReceiptPacks> {
+        let Some(db) = &self.db else {
+            return Ok(ReceiptPacks::Usable(names.iter().cloned().collect()));
+        };
+        if names.is_empty() {
+            return Ok(ReceiptPacks::Usable(HashSet::new()));
+        }
+        let asked: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let rows: Vec<(String, i16, i64)> = sqlx::query_as(
+            "SELECT name, state, objects FROM packs WHERE project_id = $1 AND name = ANY($2) AND person_id = $3",
+        )
+        .bind(project)
+        .bind(&asked)
+        .bind(person)
+        .fetch_all(db)
+        .await?;
+        let by_name: HashMap<String, (i16, i64)> = rows.into_iter().map(|(n, s, o)| (n, (s, o))).collect();
+        let mut usable = HashSet::with_capacity(names.len());
+        for n in names {
+            match by_name.get(&**n) {
+                Some(&(s, _)) if s == STAGED || s == LISTED => {
+                    usable.insert(n.clone());
+                }
+                Some(&(s, objs)) if s == DISCARDED && objs >= 0 => {}
+                _ => return Ok(ReceiptPacks::Vanished),
+            }
+        }
+        Ok(ReceiptPacks::Usable(usable))
     }
 
     /// The index and length of staged pack `name`, with its share of the
@@ -1381,6 +1511,19 @@ impl Packs {
     }
 
     pub async fn discard_counted(&self, store: &dyn BlobStore, project: i64, names: &[Arc<str>], deletes: &AtomicU64) -> Result<()> {
+        self.discard_with(store, project, names, false, false, deletes, &AtomicU64::new(0)).await
+    }
+
+    pub async fn discard_with(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        names: &[Arc<str>],
+        refused: bool,
+        purge_row: bool,
+        deletes: &AtomicU64,
+        pack_rows: &AtomicU64,
+    ) -> Result<()> {
         if names.is_empty() {
             return Ok(());
         }
@@ -1391,24 +1534,47 @@ impl Packs {
             Some(db) => {
                 let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
                 sqlx::query_scalar(
-                    "UPDATE packs SET state = $3, discarded_at = $5 WHERE project_id = $1 AND name = ANY($2) AND state = $4 RETURNING name",
+                    "UPDATE packs \
+                       SET state = $3, \
+                           discarded_at = $5, \
+                           objects = CASE WHEN $6 THEN objects ELSE -1 END \
+                     WHERE project_id = $1 AND name = ANY($2) AND state = $4 \
+                     RETURNING name",
                 )
                 .bind(project)
                 .bind(&names)
                 .bind(DISCARDED)
                 .bind(STAGED)
                 .bind(veil_core::now_millis())
+                .bind(refused)
                 .fetch_all(db)
                 .await?
             }
             None => names.iter().map(|n| n.to_string()).collect(),
         };
+        let mut deleted = Vec::with_capacity(gone.len());
         let (mut first, mut failed) = (None, 0);
         for n in &gone {
             deletes.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = store.delete(&key(project, n)).await {
-                failed += 1;
-                first.get_or_insert(e);
+            match store.delete(&key(project, n)).await {
+                Ok(()) => deleted.push(n.clone()),
+                Err(e) => {
+                    failed += 1;
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        if purge_row {
+            if let (Some(db), false) = (&self.db, deleted.is_empty()) {
+                let r = sqlx::query("DELETE FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3")
+                    .bind(project)
+                    .bind(&deleted)
+                    .bind(DISCARDED)
+                    .execute(db)
+                    .await?;
+                if r.rows_affected() > 0 {
+                    pack_rows.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         match first {
