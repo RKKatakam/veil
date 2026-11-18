@@ -1751,16 +1751,82 @@ fn bug_2661_concurrent_uploads_by_one_person_do_not_share_in_flight_containers()
 /// names was discarded; push again"`) instead of `400`, and **never** discard
 /// sibling staged containers (`C2`), so retrying after re-uploading only the
 /// vanished container succeeds without re-uploading `C2`.
+struct VanishOnEntryStore {
+    inner: Arc<dyn veil_server::store::BlobStore>,
+    /// Map of `key -> remaining entry reads (start > 0)` before deleting `key`.
+    vanish_at: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+}
+
+impl VanishOnEntryStore {
+    fn wrap(inner: Arc<dyn veil_server::store::BlobStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            vanish_at: Default::default(),
+        })
+    }
+
+    fn schedule(&self, key: String, entry_read: usize) {
+        self.vanish_at.lock().unwrap().insert(key, entry_read);
+    }
+}
+
+#[async_trait::async_trait]
+impl veil_server::store::BlobStore for VanishOnEntryStore {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, data: Bytes) -> anyhow::Result<()> {
+        self.inner.put(key, data).await
+    }
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        self.inner.exists(key).await
+    }
+    async fn len(&self, key: &str) -> anyhow::Result<Option<u64>> {
+        self.inner.len(key).await
+    }
+    async fn get_range(&self, key: &str, start: u64, end: u64) -> anyhow::Result<Option<(Bytes, u64)>> {
+        // Pack index reads in `staging()` start at byte 0; entry reads in
+        // `get_staged`, `staged_declared` and `staged_encoding` always have `start > 0`.
+        if start > 0 {
+            let delete_now = {
+                let mut g = self.vanish_at.lock().unwrap();
+                match g.get_mut(key) {
+                    Some(n) if *n <= 1 => {
+                        g.remove(key);
+                        true
+                    }
+                    Some(n) => {
+                        *n -= 1;
+                        false
+                    }
+                    None => false,
+                }
+            };
+            if delete_now {
+                self.inner.delete(key).await?;
+            }
+        }
+        self.inner.get_range(key, start, end).await
+    }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+}
+
 #[test]
 fn bug_2661_vanished_receipted_container_answers_409_and_keeps_sibling_uploads() {
     let hub = TestHub::start_objects();
-    let cold = TestHub::beside_with_layout(&hub, ObjectLayout::Objects);
+    let store = hub.blob_store();
+    let vanish = VanishOnEntryStore::wrap(store.clone());
+    let cold = TestHub::beside_with_store(&hub, ObjectLayout::Objects, vanish.clone());
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
     let cold_api = cold.api();
     let dev_tok = p.dev.token();
-    let store = hub.blob_store();
 
     let assert_sibling_intact = |sibling_pack: &str| {
         let state: Option<i16> = hub
@@ -1956,10 +2022,11 @@ fn bug_2661_vanished_receipted_container_answers_409_and_keeps_sibling_uploads()
     }
 
     // 2b. Vanished AFTER `staging()` succeeded (`Source::raw` `get_staged -> None` in push, and
-    //     `take_uploads` `staged_encoding -> None` in API commit), paused deterministically on
-    //     `ReadAhead::wait` after `staging()` read the index -> 409 Conflict, sibling preserved!
+    //     `take_uploads` `staged_declared -> None` and `staged_encoding -> None` in API commit),
+    //     triggered deterministically on the Nth entry read (`start > 0`) after `staging()`'s
+    //     index read (`start == 0`) -> 409 Conflict, sibling preserved!
     {
-        // Push path (`Source::raw` `get_staged -> None`):
+        // Push path (`Source::raw` `get_staged -> None`, 1st entry read):
         let (sid, sraw) = blob("MARKER-B2661-AFTER-STAGING-PUSH-2B\n");
         let up_c1 = api.upload(&dev_tok, &p.name, &[(sid, sraw)]);
         let c1_rec: Vec<String> = serde_json::from_value(up_c1.json()["receipts"].clone()).unwrap();
@@ -1975,25 +2042,8 @@ fn bug_2661_vanished_receipted_container_answers_409_and_keeps_sibling_uploads()
         let (mut map2, sib_pack) = upload_all(&api, &c2);
         map2.insert(sid.hex(), json!(c1_rec[0]));
 
-        let held_all = hub.rt.block_on(veil_server::store::ReadAhead::wait(u64::from(veil_server::store::DECODED_IN_FLIGHT)));
-        let cold_reads_before = cold.hub().objects.reads.load(Relaxed);
-        let r_push = std::thread::scope(|sc| {
-            let cold_api_c = cold.api();
-            let pname = p.name.clone();
-            let tok = dev_tok.clone();
-            let map2_c = map2.clone();
-            let handle = sc.spawn(move || push_body(&cold_api_c, &tok, &pname, "dev/b2661-after-staging", None, s2, &map2_c));
-            // Wait until `cold` has read the snapshot & trees after `staging()` and is waiting on `ReadAhead::wait`.
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while cold.hub().objects.reads.load(Relaxed) <= cold_reads_before {
-                assert!(Instant::now() < deadline, "cold push never passed staging()");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-            hub.rt.block_on(store.delete(&veil_server::pack::key(pid, &c1_pack))).unwrap();
-            drop(held_all);
-            handle.join().unwrap()
-        });
+        vanish.schedule(veil_server::pack::key(pid, &c1_pack), 1);
+        let r_push = push_body(&cold_api, &dev_tok, &p.name, "dev/b2661-after-staging", None, s2, &map2);
         assert_eq!(
             r_push.status,
             409,
@@ -2004,60 +2054,43 @@ fn bug_2661_vanished_receipted_container_answers_409_and_keeps_sibling_uploads()
         assert_sibling_intact(&sib_pack);
         hub.rt.block_on(hub.hub().objects.discard(pid, &[Arc::<str>::from(c1_pack.as_str()), Arc::<str>::from(sib_pack.as_str())])).unwrap();
 
-        // API commit path (`take_uploads` `staged_encoding -> None`):
-        let (sid_a, sraw_a) = blob("MARKER-B2661-AFTER-STAGING-API-2B\n");
-        let up_a1 = api.upload(&dev_tok, &p.name, &[(sid_a, sraw_a)]);
-        let a1_rec: Vec<String> = serde_json::from_value(up_a1.json()["receipts"].clone()).unwrap();
-        let a1_pack = a1_rec[0].split_once('.').unwrap().1.to_string();
-        let (sib_a, sib_a_raw) = blob("MARKER-B2661-AFTER-STAGING-API-SIB\n");
-        let up_asib = api.upload(&dev_tok, &p.name, &[(sib_a, sib_a_raw)]);
-        let asib_rec: Vec<String> = serde_json::from_value(up_asib.json()["receipts"].clone()).unwrap();
-        let asib_pack = asib_rec[0].split_once('.').unwrap().1.to_string();
-        let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+        // API commit path (`take_uploads` `staged_declared -> None` on 1st entry read, and
+        // `staged_encoding -> None` on 2nd entry read):
+        for (entry_read, tag) in [(1usize, "DECLARED"), (2usize, "ENCODING")] {
+            let (sid_a, sraw_a) = blob(&format!("MARKER-B2661-AFTER-STAGING-API-{tag}\n"));
+            let up_a1 = api.upload(&dev_tok, &p.name, &[(sid_a, sraw_a)]);
+            let a1_rec: Vec<String> = serde_json::from_value(up_a1.json()["receipts"].clone()).unwrap();
+            let a1_pack = a1_rec[0].split_once('.').unwrap().1.to_string();
+            let (sib_a, sib_a_raw) = blob(&format!("MARKER-B2661-AFTER-STAGING-API-SIB-{tag}\n"));
+            let up_asib = api.upload(&dev_tok, &p.name, &[(sib_a, sib_a_raw)]);
+            let asib_rec: Vec<String> = serde_json::from_value(up_asib.json()["receipts"].clone()).unwrap();
+            let asib_pack = asib_rec[0].split_once('.').unwrap().1.to_string();
+            let base = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
 
-        let held_all = hub.rt.block_on(veil_server::store::ReadAhead::wait(u64::from(veil_server::store::DECODED_IN_FLIGHT)));
-        let cold_reads_before = cold.hub().objects.reads.load(Relaxed);
-        let r_api = std::thread::scope(|sc| {
-            let cold_api_c = cold.api();
-            let pname = p.name.clone();
-            let tok = dev_tok.clone();
-            let r0 = a1_rec[0].clone();
-            let rs = asib_rec[0].clone();
-            let handle = sc.spawn(move || {
-                cold_api_c.post_json(
-                    Some(&tok),
-                    &format!("/v1/projects/{pname}/changes"),
-                    &json!({
-                        "base": base.hex(),
-                        "description": "after staging api",
-                        "edits": [
-                            {"path": "src/b2661_as_a1.txt", "put": {"object": sid_a.hex()}},
-                            {"path": "src/b2661_as_a2.txt", "put": {"object": sib_a.hex()}},
-                        ],
-                        "receipts": {sid_a.hex(): r0, sib_a.hex(): rs},
-                    }),
-                )
-            });
-            // `take_uploads` runs `staging()` + `staged_declared` (bumping `reads`) and pauses on `ReadAhead::wait`.
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while cold.hub().objects.reads.load(Relaxed) < cold_reads_before + 2 {
-                assert!(Instant::now() < deadline, "cold API commit never reached ReadAhead::wait");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            std::thread::sleep(Duration::from_millis(30));
-            hub.rt.block_on(store.delete(&veil_server::pack::key(pid, &a1_pack))).unwrap();
-            drop(held_all);
-            handle.join().unwrap()
-        });
-        assert_eq!(
-            r_api.status,
-            409,
-            "take_uploads staged_encoding -> None must answer 409, got {}: {}",
-            r_api.status,
-            String::from_utf8_lossy(&r_api.body)
-        );
-        assert_sibling_intact(&asib_pack);
-        hub.rt.block_on(hub.hub().objects.discard(pid, &[Arc::<str>::from(a1_pack.as_str()), Arc::<str>::from(asib_pack.as_str())])).unwrap();
+            vanish.schedule(veil_server::pack::key(pid, &a1_pack), entry_read);
+            let r_api = cold_api.post_json(
+                Some(&dev_tok),
+                &format!("/v1/projects/{}/changes", p.name),
+                &json!({
+                    "base": base.hex(),
+                    "description": format!("after staging api {tag}"),
+                    "edits": [
+                        {"path": "src/b2661_as_a1.txt", "put": {"object": sid_a.hex()}},
+                        {"path": "src/b2661_as_a2.txt", "put": {"object": sib_a.hex()}},
+                    ],
+                    "receipts": {sid_a.hex(): a1_rec[0], sib_a.hex(): asib_rec[0]},
+                }),
+            );
+            assert_eq!(
+                r_api.status,
+                409,
+                "take_uploads ({tag}) -> None must answer 409, got {}: {}",
+                r_api.status,
+                String::from_utf8_lossy(&r_api.body)
+            );
+            assert_sibling_intact(&asib_pack);
+            hub.rt.block_on(hub.hub().objects.discard(pid, &[Arc::<str>::from(a1_pack.as_str()), Arc::<str>::from(asib_pack.as_str())])).unwrap();
+        }
     }
 }
 

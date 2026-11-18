@@ -223,6 +223,11 @@ fn receipt_key(data_dir: &std::path::Path) -> Result<[u8; 32]> {
 
 /// Connect, migrate and start serving.
 pub async fn start(config: Config) -> Result<Running> {
+    start_with_store(config, None).await
+}
+
+/// [`start`], optionally overriding the blob store (for fault-injection tests).
+pub async fn start_with_store(config: Config, store_override: Option<Arc<dyn store::BlobStore>>) -> Result<Running> {
     std::fs::create_dir_all(&config.data_dir)?;
     let identity = server_identity(&config.data_dir)?;
     let receipt_key = receipt_key(&config.data_dir)?;
@@ -235,19 +240,22 @@ pub async fn start(config: Config) -> Result<Running> {
     // The background deriver's own connections (BUG-911), opened when a
     // run first needs one.
     let derive_db = db::connect_lazy(&config.database_url, derive::DERIVE_CONNECTIONS)?;
-    let blob: Arc<dyn store::BlobStore> = match &config.storage {
-        Storage::Dir(d) => Arc::new(store::FsStore::new(d)),
-        Storage::S3 {
-            endpoint,
-            bucket,
-            region,
-            key,
-            secret,
-        } => {
-            let s = store::S3Store::new(endpoint, bucket, region, key, secret)?;
-            s.ensure_bucket().await?;
-            Arc::new(s)
-        }
+    let blob: Arc<dyn store::BlobStore> = match store_override {
+        Some(s) => s,
+        None => match &config.storage {
+            Storage::Dir(d) => Arc::new(store::FsStore::new(d)),
+            Storage::S3 {
+                endpoint,
+                bucket,
+                region,
+                key,
+                secret,
+            } => {
+                let s = store::S3Store::new(endpoint, bucket, region, key, secret)?;
+                s.ensure_bucket().await?;
+                Arc::new(s)
+            }
+        },
     };
     let hub = Arc::new(Hub {
         db: db.clone(),

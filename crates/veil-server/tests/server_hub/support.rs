@@ -255,6 +255,21 @@ impl TestHub {
         TestHub::run(config, dir)
     }
 
+    /// [`TestHub::beside_with_layout`] over a custom `BlobStore` wrapper.
+    pub fn beside_with_store(
+        other: &TestHub,
+        object_layout: veil_server::ObjectLayout,
+        store: Arc<dyn veil_server::store::BlobStore>,
+    ) -> TestHub {
+        let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            object_layout,
+            ..other.config.clone()
+        };
+        TestHub::run_with_store(config, dir, Some(store))
+    }
+
     /// This server stopped and started again on the same port, data
     /// directory and storage, its memory empty (as after an upgrade);
     /// `between` runs while it is down (a migration).
@@ -279,13 +294,21 @@ impl TestHub {
     }
 
     fn run(config: Config, dir: tempfile::TempDir) -> TestHub {
+        TestHub::run_with_store(config, dir, None)
+    }
+
+    fn run_with_store(
+        config: Config,
+        dir: tempfile::TempDir,
+        store: Option<Arc<dyn veil_server::store::BlobStore>>,
+    ) -> TestHub {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(8)
             .thread_stack_size(veil_server::THREAD_STACK)
             .build()
             .unwrap();
-        let running = rt.block_on(veil_server::start(config.clone())).expect("server starts");
+        let running = rt.block_on(veil_server::start_with_store(config.clone(), store)).expect("server starts");
         let ca = config.data_dir.join("self-signed-cert.pem");
         TestHub {
             port: running.addr.port(),
