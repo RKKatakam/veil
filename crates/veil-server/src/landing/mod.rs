@@ -2019,19 +2019,7 @@ impl Ancestry {
     /// changes alike for the view): the caller reads `x` itself.
     async fn below_hidden(&mut self, project: &crate::perm::Project, viewer: &crate::perm::Viewer, key: &str, x: ObjectId) -> Result<Option<ObjectId>> {
         let px = crate::sync::projected(&self.hub, project, viewer, x).await?;
-        let own: Vec<String> = sqlx::query_scalar(
-            "SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed \
-             ORDER BY real_id LIMIT 2",
-        )
-        .bind(self.project)
-        .bind(key)
-        .bind(px.hex())
-        .fetch_all(&self.hub.db)
-        .await?;
-        let Some(v) = (match own.as_slice() {
-            [v] => ObjectId::from_hex(v).ok(),
-            _ => None,
-        }) else {
+        let Some(v) = crate::sync::own_projection(&self.hub, project, viewer, key, &px).await? else {
             return Ok(None);
         };
         if v == x {

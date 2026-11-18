@@ -427,7 +427,7 @@ pub(crate) struct Deferred {
     pub(crate) rows: Vec<(String, ObjectId, ObjectId)>,
     /// `rows` by view key and real snapshot.
     index: HashMap<(String, ObjectId), ObjectId>,
-    /// Those of them whose real snapshot collapsed into its first parent's
+    /// Those of them whose real snapshot collapsed into its parent's
     /// projection (a change hidden from that view).
     pub(crate) collapsed: HashSet<ObjectId>,
     /// The push's uploads and made objects (its new snapshots are there).
@@ -577,7 +577,7 @@ pub(crate) async fn projected_inner(
         let pattempts: Vec<ObjectId> = s.attempts.iter().map(|a| done[a]).collect();
         let (proj_text, bindings, viewer2) = (project.policy_text.clone(), project.bindings.clone(), viewer.clone());
         let hub2 = hub.clone();
-        let first_pp = (s.parents.len() == 1).then(|| pparents.first().copied()).flatten();
+        let first_pp = (pparents.len() == 1).then(|| pparents[0]);
         let (result, new_obj) = blocking_staged(hub, project.id, staged.clone(), move |src| {
             let policy = AccessPolicy::parse(&proj_text);
             let p = Project {
@@ -856,6 +856,204 @@ pub(crate) async fn resolve_exact_for(
     resolve_for_mode(hub, project, viewer, id, &[], true, true, None).await
 }
 
+/// The one real snapshot of `project` whose projection for `viewer` (view key
+/// `key`) is `projected_id` and that did not collapse into its parent's
+/// projection (`projections_own`, BUG-1468), or `None` when there is none or
+/// more than one.
+///
+/// Before BUG-2671, `projected_inner` recorded `collapsed = false` for every
+/// multi-parent merge even when `project_one` collapsed it into its single
+/// projected parent (`pparents == [projected_id]`). A multi-parent candidate
+/// from `projections_own` is checked against its first parent's projection; one
+/// that collapsed is repaired in place (`SET collapsed = TRUE`, bounded per
+/// call) so `projections_own` drops it from then on.
+pub(crate) async fn own_projection(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    key: &str,
+    projected_id: &ObjectId,
+) -> Result<Option<ObjectId>> {
+    const REPAIR_BATCH: usize = 256;
+    const MAX_REPAIR_BATCHES: usize = 16;
+
+    let classify_and_repair = |batch: Vec<(String, Option<String>)>, mut keep: Vec<ObjectId>| async move {
+        let mut merges: Vec<(ObjectId, String, ObjectId)> = Vec::new();
+        let mut unread: Vec<(ObjectId, String)> = Vec::new();
+        for (r_hex, g_parents) in batch {
+            let Ok(r) = ObjectId::from_hex(&r_hex) else { continue };
+            match g_parents {
+                Some(ps) if !ps.contains(',') => keep.push(r),
+                Some(ps) => match serde_json::from_str::<Vec<ObjectId>>(&ps) {
+                    Ok(v) if v.len() > 1 => merges.push((r, r_hex, v[0])),
+                    Ok(_) => keep.push(r),
+                    Err(_) => unread.push((r, r_hex)),
+                },
+                None => unread.push((r, r_hex)),
+            }
+        }
+        if !unread.is_empty() {
+            let read = blocking(hub, project.id, move |src| {
+                let mut out = Vec::with_capacity(unread.len());
+                for (r, r_hex) in unread {
+                    let parents = match src.snapshot(&r) {
+                        Ok(s) => s.parents.clone(),
+                        Err(VeilError::Missing(_)) => Vec::new(),
+                        Err(e) => return Err(e.into()),
+                    };
+                    out.push((r, r_hex, parents));
+                }
+                Ok(out)
+            })
+            .await?;
+            for (r, r_hex, parents) in read {
+                if parents.len() > 1 {
+                    merges.push((r, r_hex, parents[0]));
+                } else {
+                    keep.push(r);
+                }
+            }
+        }
+        if merges.is_empty() {
+            return Ok::<Vec<ObjectId>, Error>(keep);
+        }
+
+        let root = root_snapshot_id();
+        let mut p0_proj: HashMap<ObjectId, ObjectId> = HashMap::new();
+        let mut need_db: Vec<ObjectId> = Vec::new();
+        for &(_, _, p0) in &merges {
+            if p0 == root {
+                p0_proj.insert(p0, root);
+            } else if let Some(pp) = hub.caches.memo(project.id, key, &p0) {
+                p0_proj.insert(p0, pp);
+            } else if !need_db.contains(&p0) {
+                need_db.push(p0);
+            }
+        }
+        if !need_db.is_empty() {
+            let gce = hub.caches.gc_epoch(project.id);
+            let need_hex: Vec<String> = need_db.iter().map(ObjectId::hex).collect();
+            let stored: Vec<(String, String)> = sqlx::query_as(
+                "SELECT real_id, projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3)",
+            )
+            .bind(project.id)
+            .bind(key)
+            .bind(&need_hex)
+            .fetch_all(&hub.db)
+            .await?;
+            for (r_hex, pp_hex) in stored {
+                if let (Ok(p0), Ok(pp)) = (ObjectId::from_hex(&r_hex), ObjectId::from_hex(&pp_hex)) {
+                    hub.caches.put_memo_at(project.id, gce, key, &p0, &pp);
+                    p0_proj.insert(p0, pp);
+                }
+            }
+            if !viewer.admin {
+                for p0 in need_db {
+                    if let std::collections::hash_map::Entry::Vacant(entry) = p0_proj.entry(p0) {
+                        match projected(hub, project, viewer, p0).await {
+                            Ok(pp) => {
+                                entry.insert(pp);
+                            }
+                            Err(Error::Other(e)) if e.downcast_ref::<VeilError>().is_some_and(|v| matches!(v, VeilError::Missing(_))) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut stale: Vec<String> = Vec::new();
+        for (r, r_hex, p0) in merges {
+            if p0_proj.get(&p0) == Some(projected_id) {
+                stale.push(r_hex);
+            } else {
+                keep.push(r);
+            }
+        }
+        if !stale.is_empty() {
+            stale.sort();
+            let updated = sqlx::query(
+                "UPDATE projections SET collapsed = TRUE \
+                 WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3) AND NOT collapsed",
+            )
+            .bind(project.id)
+            .bind(key)
+            .bind(&stale)
+            .execute(&hub.db)
+            .await?
+            .rows_affected();
+            if updated > 0 {
+                hub.commits.count(crate::db::Commit::Memo);
+            }
+        }
+        Ok(keep)
+    };
+
+    let initial: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT p.real_id, g.parents \
+         FROM (SELECT real_id FROM projections \
+               WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed \
+               ORDER BY real_id LIMIT 2) p \
+         LEFT JOIN graph g ON g.project_id = $1 AND g.snapshot = p.real_id \
+         ORDER BY p.real_id",
+    )
+    .persistent(false)
+    .bind(project.id)
+    .bind(key)
+    .bind(projected_id.hex())
+    .fetch_all(&hub.db)
+    .await?;
+    if initial.is_empty() {
+        return Ok(None);
+    }
+    let initial_len = initial.len();
+    let mut after = initial.last().unwrap().0.clone();
+    let mut keep = classify_and_repair(initial, Vec::new()).await?;
+    if keep.len() >= 2 || initial_len < 2 {
+        return Ok(match keep.as_slice() {
+            [o] => Some(*o),
+            _ => None,
+        });
+    }
+    for _ in 0..MAX_REPAIR_BATCHES {
+        let batch: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT p.real_id, g.parents \
+             FROM (SELECT real_id FROM projections \
+                   WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed AND real_id > $4 \
+                   ORDER BY real_id LIMIT $5) p \
+             LEFT JOIN graph g ON g.project_id = $1 AND g.snapshot = p.real_id \
+             ORDER BY p.real_id",
+        )
+        .persistent(false)
+        .bind(project.id)
+        .bind(key)
+        .bind(projected_id.hex())
+        .bind(&after)
+        .bind(REPAIR_BATCH as i64)
+        .fetch_all(&hub.db)
+        .await?;
+        if batch.is_empty() {
+            return Ok(match keep.as_slice() {
+                [o] => Some(*o),
+                _ => None,
+            });
+        }
+        let batch_len = batch.len();
+        after = batch.last().unwrap().0.clone();
+        keep = classify_and_repair(batch, keep).await?;
+        if keep.len() >= 2 {
+            return Ok(None);
+        }
+        if batch_len < REPAIR_BATCH {
+            return Ok(match keep.as_slice() {
+                [o] => Some(*o),
+                _ => None,
+            });
+        }
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_for_mode(
     hub: &Arc<Hub>,
@@ -956,20 +1154,7 @@ async fn resolve_for_mode(
     .bind(NEWEST_BOUND as i64 + 1)
     .fetch_all(&hub.db)
     .await?;
-    let own = || async {
-        let own: Vec<String> = sqlx::query_scalar(
-            "SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed ORDER BY real_id LIMIT 2",
-        )
-        .bind(project.id)
-        .bind(&key)
-        .bind(id.hex())
-        .fetch_all(&hub.db)
-        .await?;
-        Ok::<Option<ObjectId>, Error>(match own.as_slice() {
-            [o] => ObjectId::from_hex(o).ok(),
-            _ => None,
-        })
-    };
+    let own = || own_projection(hub, project, viewer, &key, id);
     let pick = if rows.is_empty() {
         None
     } else if rows.len() > NEWEST_BOUND {

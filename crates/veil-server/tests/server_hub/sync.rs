@@ -1092,7 +1092,6 @@ fn setup_collapsed_merge(hub: &TestHub) -> CollapsedMergeFixture {
 /// `409 Conflict`, and past `NEWEST_BOUND` even landing `POST /land` on `P_0`
 /// fails with `404 Not Found`.
 #[test]
-#[ignore = "BUG-2671: collapsed multi-parent merge records projections.collapsed = false, breaking base resolution"]
 fn bug_2671_collapsed_hidden_merge_breaks_base_resolution() {
     use serde_json::json;
     let hub = TestHub::start();
@@ -1169,7 +1168,6 @@ fn bug_2671_collapsed_hidden_merge_breaks_base_resolution() {
 /// check to the uncollapsed commit `R_0`, not to the hidden collapsed commits
 /// `R_merge` or `R_sec`, so `GET /checks?rev=<R_0>` finds it.
 #[test]
-#[ignore = "BUG-2671: collapsed multi-parent merge misattaches narrowed CI checks onto hidden commit"]
 fn bug_2671_collapsed_hidden_merge_misattaches_narrowed_ci_checks() {
     use serde_json::json;
     let hub = TestHub::start();
@@ -1219,7 +1217,6 @@ fn bug_2671_collapsed_hidden_merge_misattaches_narrowed_ci_checks() {
 /// `projections_own`, degrading `below_hidden` to `None` and failing `POST /land`
 /// permanently with `503 warming`.
 #[test]
-#[ignore = "BUG-2671: collapsed multi-parent merge breaks Ancestry::below_hidden step-over past WALK_BUDGET"]
 fn bug_2671_collapsed_hidden_merge_breaks_below_hidden_step_over() {
     use serde_json::json;
     use veil_core::object::{Object as O, Snapshot, Text};
@@ -1292,4 +1289,226 @@ fn bug_2671_collapsed_hidden_merge_breaks_below_hidden_step_over() {
     assert_eq!(r_land.status, 200, "landing across hidden run containing merge: {body}");
     assert_eq!(r_land.json()["state"], "landed", "{body}");
 }
+
+/// BUG-2671 (4): Deployments upgraded from before the fix already hold
+/// `projections` rows for collapsed hidden merges with `collapsed = false`
+/// (including multiple merges sorting before `R_0` in `ORDER BY real_id LIMIT 2`,
+/// rows without `graph` derived yet, and pre-`0011` histories where `R_0` has
+/// `collapsed = true` so a stale merge is the sole `projections_own` row).
+/// `sync::own_projection` detects and repairs them in place (`collapsed = true`).
+#[test]
+fn bug_2671_preexisting_false_collapsed_merge_row_is_repaired() {
+    use serde_json::json;
+    use veil_core::object::{Object as O, Snapshot, Text};
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+    let admin_tok = f.p.admin.token();
+
+    // Push two more collapsed hidden merges onto side branches so `projections`
+    // holds 3 distinct collapsed merges for `(vk, P_0)` (exercising > LIMIT 2
+    // even when merges sort before `R_0`).
+    let mut extra_merges = Vec::new();
+    for idx in 0..2 {
+        let mut cm = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+        cm.tip = f.r0;
+        cm.root = cm.tree_of(f.r0);
+        cm.file(&format!("{BILL_DIR}/extra_{idx}.txt"), &format!("extra hidden {idx}\n"));
+        let (rm, rep) = cm.push_edited(&format!("hidden-m-{idx}"), None, |s| {
+            s.parents = vec![f.r0, f.r_sec];
+        });
+        assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+        assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+        let seen = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches[&format!("hidden-m-{idx}")];
+        assert_eq!(seen, f.p0);
+        extra_merges.push(rm);
+    }
+
+    let all_merges: Vec<String> = std::iter::once(f.r_merge).chain(extra_merges.iter().copied()).map(|id| id.hex()).collect();
+    let h = hub.hub();
+
+    let corrupt_merges = |clear_graph: bool| {
+        hub.rt.block_on(async {
+            if clear_graph {
+                sqlx::query("DELETE FROM graph WHERE project_id = $1 AND snapshot = ANY($2)")
+                    .bind(f.pid)
+                    .bind(&all_merges)
+                    .execute(&h.db)
+                    .await
+                    .unwrap();
+            }
+            let updated = sqlx::query("UPDATE projections SET collapsed = FALSE WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3)")
+                .bind(f.pid)
+                .bind(&f.vk)
+                .bind(&all_merges)
+                .execute(&h.db)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(updated, 3, "all 3 collapsed merges reset to legacy collapsed = false");
+        });
+    };
+
+    let false_merge_count = || -> i64 {
+        hub.rt.block_on(
+            sqlx::query_scalar(
+                "SELECT count(*) FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3) AND NOT collapsed",
+            )
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(&all_merges)
+            .fetch_one(&h.db),
+        )
+        .unwrap()
+    };
+
+    // (a) Without `graph` rows (object-store parent fallback) and with the
+    // in-memory memo cache invalidated (`gc_epoch` bumped), non-landing
+    // `POST /changes` succeeds and heals the stored rows.
+    corrupt_merges(true);
+    let next_ep: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar(
+                "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 1, 0) \
+                 ON CONFLICT (project_id, person_id) DO UPDATE SET epoch = access_epochs.epoch + 1 RETURNING epoch",
+            )
+            .bind(f.pid)
+            .fetch_one(&h.db),
+        )
+        .unwrap();
+    h.caches.set_gc_epoch(f.pid, next_ep);
+    assert_eq!(false_merge_count(), 3);
+    let r_chg = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change with legacy false-collapsed merges",
+            "edits": [{"path": "src/repaired_base.rs", "put": {"text": "ok\n"}}],
+        }),
+    );
+    assert_eq!(r_chg.status, 200, "{}", String::from_utf8_lossy(&r_chg.body));
+    let r_merge_collapsed: bool = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                .bind(f.pid)
+                .bind(&f.vk)
+                .bind(f.r_merge.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert!(r_merge_collapsed, "legacy R_merge row must be repaired to collapsed = true");
+    assert_eq!(false_merge_count(), 0, "all 3 legacy merge rows must be repaired to collapsed = true");
+
+    // (b) Derive `graph`, re-plant legacy `collapsed = false` on all 3 merges, and
+    // verify narrowed CI check resolution (`resolve_exact_for`) attaches to `R_0`
+    // and repairs all 3 rows via the `graph.parents` path.
+    hub.rt
+        .block_on(veil_server::derive::landing(
+            &h,
+            f.pid,
+            vec!["main".into(), "hidden-m-0".into(), "hidden-m-1".into()],
+        ))
+        .unwrap();
+    corrupt_merges(false);
+    assert_eq!(false_merge_count(), 3);
+
+    let sess = api.post_json(
+        Some(&dev_tok),
+        "/v1/sessions/ci",
+        &json!({"project": f.p.name, "only": ["src/"]}),
+    );
+    assert_eq!(sess.status, 200, "{}", String::from_utf8_lossy(&sess.body));
+    let runner_tok = sess.json()["token"].as_str().unwrap().to_string();
+
+    let post = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/repaired",
+            "state": "pass",
+            "summary": "repaired check",
+        }),
+    );
+    assert_eq!(post.status, 200, "{}", String::from_utf8_lossy(&post.body));
+    assert_eq!(false_merge_count(), 0, "resolve_exact_for must repair all 3 legacy merge rows");
+
+    let got = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    assert_eq!(got.json()["checks"].as_array().unwrap().len(), 1);
+
+    // (c) Pre-`0011` `R_0` (`collapsed = true` default) + post-`0011` legacy
+    // `R_merge` (`collapsed = false`): `projections_own` has ONLY 1 row (`[R_merge]`),
+    // yet `own_projection` must still recognize `R_merge` as collapsed, repair it to
+    // `collapsed = true`, and return `None` rather than falsely returning `Some(R_merge)`.
+    hub.rt.block_on(async {
+        sqlx::query("UPDATE projections SET collapsed = TRUE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.r0.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE projections SET collapsed = FALSE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.r_merge.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+    });
+    let mut c = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+    c.tip = f.r_merge;
+    c.root = c.tree_of(f.r_merge);
+    c.file(&format!("{BILL_DIR}/after_pre0011.txt"), "step\n");
+    let mut s = Snapshot {
+        parents: vec![f.r_merge],
+        change_id: veil_core::ChangeId::random(),
+        tree: c.root,
+        description: Text::Plain("hidden step".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let r_after = c.put(O::Snapshot(s));
+    c.file(&format!("{BILL_DIR}/after_pre0011.txt"), "step 2\n");
+    let (_, rep) = c.push_edited("pre0011-branch", None, move |sn| sn.parents = vec![r_after]);
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true);
+    assert_eq!(api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["pre0011-branch"], f.p0);
+
+    let mut m = Craft::new(&api, &f.p.dev, &f.p.name, "pre0011-branch");
+    m.file("src/pre0011_dev.rs", "dev\n");
+    let r_push = m.push_to("pre0011-branch", Some(f.p0));
+    assert_eq!(r_push.status, 200, "{}", String::from_utf8_lossy(&r_push.body));
+    assert_eq!(r_push.json()["results"][0]["ok"], true);
+    let dev_tip = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["pre0011-branch"];
+
+    let r_land = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", f.p.name),
+        &json!({
+            "onto": "main",
+            "snapshot": dev_tip.hex(),
+            "receipts": {},
+            "wait": true,
+        }),
+    );
+    let body = String::from_utf8_lossy(&r_land.body).into_owned();
+    assert_eq!(r_land.status, 200, "landing with pre-0011 R_0 + legacy R_merge: {body}");
+    assert_eq!(r_land.json()["state"], "landed", "{body}");
+    assert_eq!(false_merge_count(), 0, "below_hidden must repair sole legacy R_merge row too");
+}
+
 
