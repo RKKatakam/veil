@@ -1326,6 +1326,7 @@ fn bug_2650_exec_beside_a_large_sealed_file_keeps_memory_bounded_and_quarantines
     // 4 MiB sealed file. Measure the second run's whole-tree ru_maxrss (before
     // BUG-2650's fix: > 900 MiB).
     exec(&env, &proj, &["--", "true"]);
+    #[allow(clippy::zombie_processes)] // reaped via libc::wait4 below to capture ru_maxrss
     let child = env
         .cmd("alice", &proj, &["ws", "exec", "agent", "--", "sh", "-c", "echo edited > README.md"])
         .stdin(Stdio::null())

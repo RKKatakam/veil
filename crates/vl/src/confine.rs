@@ -681,7 +681,7 @@ impl HardLinkedSecrets {
     /// If `src` (file or directory) is or holds a hard link to a file in
     /// `veil_home()` / `daemon::run`, returns `(owning_veil_dir, linked_path)`.
     fn find_veil_link(&self, src: &Path, mounts: &MountTable) -> Option<(PathBuf, PathBuf)> {
-        let Some((id, _, is_file)) = symlink_file_id(src) else { return None };
+        let (id, _, is_file) = symlink_file_id(src)?;
         if is_file {
             return self.veil_files.get(&id).map(|v| (v.clone(), src.to_path_buf()));
         }
