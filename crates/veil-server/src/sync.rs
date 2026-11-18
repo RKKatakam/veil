@@ -217,6 +217,17 @@ impl Staged {
     }
 }
 
+#[derive(Debug)]
+struct StoredMissing(ObjectId);
+
+impl std::fmt::Display for StoredMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stored object {} is missing", self.0)
+    }
+}
+
+impl std::error::Error for StoredMissing {}
+
 impl Source {
     /// Is `id` an object uploaded in this request (`pending` or a staged pack)?
     /// Server-side reads of objects already in `hub.objects` return `store_err`
@@ -228,7 +239,7 @@ impl Source {
     }
 
     fn stored_missing(id: &ObjectId) -> VeilError {
-        store_err(anyhow::anyhow!("stored object {id} is missing"))
+        store_err(anyhow::Error::new(StoredMissing(*id)))
     }
 
     fn stored_corrupt(id: &ObjectId, m: impl std::fmt::Display) -> VeilError {
@@ -236,7 +247,7 @@ impl Source {
     }
 
     /// Object `id` when absence in the store is a valid `None` (`ChainSource`,
-    /// `narrowing_gate`, `resolve_for_in`).
+    /// `narrowing_gate`, `own_projection`, `resolve_for_mode`).
     pub(crate) fn present_raw(&self, id: &ObjectId) -> veil_core::Result<Option<Bytes>> {
         if let Some(raw) = self.pending.get(id) {
             return Ok(Some(raw.clone()));
@@ -336,7 +347,7 @@ impl Source {
     }
 
     /// Stored or staged snapshot `id` when absence in the store is a valid
-    /// `None` (`resolve_for_in`).
+    /// `None` (`own_projection`, `resolve_for_mode`).
     pub(crate) fn present_snapshot(&self, id: &ObjectId) -> veil_core::Result<Option<Arc<Snapshot>>> {
         let Some(raw) = self.present_raw(id)? else {
             return Ok(None);
@@ -946,7 +957,9 @@ pub(crate) async fn resolve_exact_for(
 /// projected parent (`pparents == [projected_id]`). A multi-parent candidate
 /// from `projections_own` is checked against its first parent's projection; one
 /// that collapsed is repaired in place (`SET collapsed = TRUE`, bounded per
-/// call) so `projections_own` drops it from then on.
+/// call) so `projections_own` drops it from then on. A candidate whose snapshot
+/// or first parent was swept by a concurrent GC pass is dropped (neither kept
+/// nor marked `collapsed`).
 pub(crate) async fn own_projection(
     hub: &Arc<Hub>,
     project: &Project,
@@ -958,44 +971,56 @@ pub(crate) async fn own_projection(
     const MAX_REPAIR_BATCHES: usize = 16;
 
     let classify_and_repair = |batch: Vec<(String, Option<String>)>, mut keep: Vec<ObjectId>| async move {
-        let mut merges: Vec<(ObjectId, String, ObjectId)> = Vec::new();
+        let mut derived_merges: Vec<(ObjectId, String, ObjectId)> = Vec::new();
         let mut unread: Vec<(ObjectId, String)> = Vec::new();
         for (r_hex, g_parents) in batch {
             let Ok(r) = ObjectId::from_hex(&r_hex) else { continue };
             match g_parents {
                 Some(ps) if !ps.contains(',') => keep.push(r),
                 Some(ps) => match serde_json::from_str::<Vec<ObjectId>>(&ps) {
-                    Ok(v) if v.len() > 1 => merges.push((r, r_hex, v[0])),
+                    Ok(v) if v.len() > 1 => derived_merges.push((r, r_hex, v[0])),
                     Ok(_) => keep.push(r),
                     Err(_) => unread.push((r, r_hex)),
                 },
                 None => unread.push((r, r_hex)),
             }
         }
-        if !unread.is_empty() {
-            let read = blocking(hub, project.id, move |src| {
-                let mut out = Vec::with_capacity(unread.len());
-                for (r, r_hex) in unread {
-                    let parents = match src.snapshot(&r) {
-                        Ok(s) => s.parents.clone(),
-                        Err(VeilError::Missing(_)) => Vec::new(),
-                        Err(e) => return Err(e.into()),
-                    };
-                    out.push((r, r_hex, parents));
+        if unread.is_empty() && derived_merges.is_empty() {
+            return Ok::<Vec<ObjectId>, Error>(keep);
+        }
+
+        // `projections` was read on `&hub.db` with autocommit, so a concurrent
+        // GC pass may have swept an expired candidate's snapshot or first
+        // parent since then. GC retains every parent of any live snapshot, so
+        // a candidate whose snapshot or first parent is absent from the store
+        // cannot be live: drop it into neither `keep` nor `stale`.
+        let (single, merges) = blocking(hub, project.id, move |src| {
+            let mut single = Vec::new();
+            let mut merges = Vec::with_capacity(derived_merges.len() + unread.len());
+            for (r, r_hex) in unread {
+                let Some(s) = src.present_snapshot(&r)? else { continue };
+                if let Some(p0) = s.parents.first() {
+                    if src.present_raw(p0)?.is_none() {
+                        continue;
+                    }
                 }
-                Ok(out)
-            })
-            .await?;
-            for (r, r_hex, parents) in read {
-                if parents.len() > 1 {
-                    merges.push((r, r_hex, parents[0]));
+                if s.parents.len() > 1 {
+                    merges.push((r, r_hex, s.parents[0]));
                 } else {
-                    keep.push(r);
+                    single.push(r);
                 }
             }
-        }
+            for (r, r_hex, p0) in derived_merges {
+                if src.present_raw(&r)?.is_some() && src.present_raw(&p0)?.is_some() {
+                    merges.push((r, r_hex, p0));
+                }
+            }
+            Ok((single, merges))
+        })
+        .await?;
+        keep.extend(single);
         if merges.is_empty() {
-            return Ok::<Vec<ObjectId>, Error>(keep);
+            return Ok(keep);
         }
 
         let root = root_snapshot_id();
@@ -1027,14 +1052,18 @@ pub(crate) async fn own_projection(
                     p0_proj.insert(p0, pp);
                 }
             }
-            if !viewer.admin {
+            if viewer.admin {
+                for p0 in need_db {
+                    p0_proj.entry(p0).or_insert(p0);
+                }
+            } else {
                 for p0 in need_db {
                     if let std::collections::hash_map::Entry::Vacant(entry) = p0_proj.entry(p0) {
                         match projected(hub, project, viewer, p0).await {
                             Ok(pp) => {
                                 entry.insert(pp);
                             }
-                            Err(Error::Other(e)) if e.downcast_ref::<VeilError>().is_some_and(|v| matches!(v, VeilError::Missing(_))) => {}
+                            Err(Error::Other(e)) if crate::error::caused_by::<StoredMissing>(&e) => {}
                             Err(e) => return Err(e),
                         }
                     }
@@ -1044,10 +1073,10 @@ pub(crate) async fn own_projection(
 
         let mut stale: Vec<String> = Vec::new();
         for (r, r_hex, p0) in merges {
-            if p0_proj.get(&p0) == Some(projected_id) {
-                stale.push(r_hex);
-            } else {
-                keep.push(r);
+            match p0_proj.get(&p0) {
+                Some(pp) if pp == projected_id => stale.push(r_hex),
+                Some(_) => keep.push(r),
+                None => {}
             }
         }
         if !stale.is_empty() {
@@ -1252,11 +1281,23 @@ async fn resolve_for_mode(
                 None => unread.push(r),
             }
         }
-        let read = blocking(hub, project.id, move |src| {
-            unread.iter().map(|r| Ok((*r, src.snapshot(r)?.parents.first().copied()))).collect::<Result<Vec<_>>>()
-        })
-        .await?;
-        cands.extend(read);
+        if !unread.is_empty() {
+            let read = blocking(hub, project.id, move |src| {
+                let mut out = Vec::with_capacity(unread.len());
+                for r in &unread {
+                    let Some(s) = src.present_snapshot(r)? else { continue };
+                    if let Some(p0) = s.parents.first() {
+                        if src.present_raw(p0)?.is_none() {
+                            continue;
+                        }
+                    }
+                    out.push((*r, s.parents.first().copied()));
+                }
+                Ok(out)
+            })
+            .await?;
+            cands.extend(read);
+        }
         let firsts: HashSet<ObjectId> = cands.iter().filter_map(|c| c.1).collect();
         let mut leaves: Vec<ObjectId> = cands.iter().map(|c| c.0).filter(|c| !firsts.contains(c)).collect();
         leaves.sort();
@@ -1264,12 +1305,52 @@ async fn resolve_for_mode(
             [one] => Some(*one),
             _ => match own().await? {
                 Some(o) => Some(o),
-                None if landing => leaves.first().copied(),
                 None => {
-                    return Err(Error::conflict(format!(
-                        "snapshot {} stands for changes on different lines as you see them: make the change on a branch's tip, or land it",
-                        id.short()
-                    )))
+                    if !leaves.is_empty() {
+                        let first_of: HashMap<ObjectId, Option<ObjectId>> = cands.into_iter().collect();
+                        let candidates = leaves;
+                        let present = blocking(hub, project.id, move |src| {
+                            let mut out = Vec::with_capacity(candidates.len());
+                            for r in candidates {
+                                if src.present_raw(&r)?.is_none() {
+                                    continue;
+                                }
+                                if let Some(Some(p0)) = first_of.get(&r) {
+                                    if src.present_raw(p0)?.is_none() {
+                                        continue;
+                                    }
+                                }
+                                out.push((r, first_of.get(&r).copied().flatten()));
+                            }
+                            Ok(out)
+                        })
+                        .await?;
+                        let root = root_snapshot_id();
+                        leaves = Vec::with_capacity(present.len());
+                        for (r, p0) in present {
+                            if !viewer.admin {
+                                if let Some(p0) = p0.filter(|p| *p != root && hub.caches.memo(project.id, &key, p).is_none()) {
+                                    match projected(hub, project, viewer, p0).await {
+                                        Ok(_) => {}
+                                        Err(Error::Other(e)) if crate::error::caused_by::<StoredMissing>(&e) => continue,
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                            }
+                            leaves.push(r);
+                        }
+                    }
+                    match leaves.as_slice() {
+                        [] => None,
+                        [one] => Some(*one),
+                        _ if landing => leaves.first().copied(),
+                        _ => {
+                            return Err(Error::conflict(format!(
+                                "snapshot {} stands for changes on different lines as you see them: make the change on a branch's tip, or land it",
+                                id.short()
+                            )))
+                        }
+                    }
                 }
             },
         }

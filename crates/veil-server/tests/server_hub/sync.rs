@@ -1511,4 +1511,500 @@ fn bug_2671_preexisting_false_collapsed_merge_row_is_repaired() {
     assert_eq!(false_merge_count(), 0, "below_hidden must repair sole legacy R_merge row too");
 }
 
+fn assert_no_swept_id(ctx: &str, body: &[u8], ids: &[ObjectId]) {
+    let text = String::from_utf8_lossy(body);
+    for id in ids {
+        assert!(!text.contains(&id.hex()), "{ctx} leaked swept full id {}: {text}", id.hex());
+        assert!(!text.contains(&id.short()), "{ctx} leaked swept short id {}: {text}", id.short());
+    }
+}
 
+/// BUG-2671 (cycle 1, Subcase A): `own_projection` and `resolve_for_mode` read
+/// `projections` on `&hub.db` with autocommit, so a concurrent GC pass may have
+/// swept an expired legacy merge `R_dead` (`g.parents` NULL, snapshot object
+/// absent from `hub.objects`) between the `SELECT` and object reads. Such a
+/// candidate must be dropped into neither `keep` nor `stale` — never causing a
+/// false `409`, `400`, or `500`, never misattaching checks or returning
+/// `Some(R_dead)` on pre-`0011` `R_0` (`collapsed = true`), and never naming
+/// the swept id in any response body.
+#[test]
+fn bug_2671_gc_swept_merge_with_null_graph_parents_is_dropped_without_error_or_id_leak() {
+    use serde_json::json;
+    use veil_core::object::{Object as O, Snapshot, Text};
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+    let admin_tok = f.p.admin.token();
+    let h = hub.hub();
+
+    // `dead_lo` sorts before every real snapshot in `ORDER BY real_id LIMIT 2`;
+    // `dead_hi` sorts after every real snapshot. Neither exists in `hub.objects`
+    // or `graph` (`g.parents` is NULL).
+    let dead_lo = ObjectId::from_hex("000000002671a000000000000000000000000000000000000000000000000001").unwrap();
+    let dead_hi = ObjectId::from_hex("ffffffff2671a000000000000000000000000000000000000000000000000002").unwrap();
+    let swept = [dead_lo, dead_hi];
+    let swept_hex: Vec<String> = swept.iter().map(ObjectId::hex).collect();
+
+    hub.rt.block_on(async {
+        for dead in &swept {
+            sqlx::query(
+                "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+                 VALUES ($1, $2, $3, $4, 0, FALSE)",
+            )
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(dead.hex())
+            .bind(f.p0.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+        }
+    });
+
+    let swept_uncollapsed_count = || -> i64 {
+        hub.rt
+            .block_on(
+                sqlx::query_scalar(
+                    "SELECT count(*) FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3) AND NOT collapsed",
+                )
+                .bind(f.pid)
+                .bind(&f.vk)
+                .bind(&swept_hex)
+                .fetch_one(&h.db),
+            )
+            .unwrap()
+    };
+
+    // (a) Live post-`0011` `R_0` (`collapsed = false`):
+    let r_chg = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change beside swept Subcase A rows",
+            "edits": [{"path": "src/swept_a.rs", "put": {"text": "ok a\n"}}],
+        }),
+    );
+    assert_no_swept_id("Subcase A POST /changes", &r_chg.body, &swept);
+    assert_eq!(r_chg.status, 200, "{}", String::from_utf8_lossy(&r_chg.body));
+
+    let sess = api.post_json(
+        Some(&dev_tok),
+        "/v1/sessions/ci",
+        &json!({"project": f.p.name, "only": ["src/"]}),
+    );
+    assert_eq!(sess.status, 200, "{}", String::from_utf8_lossy(&sess.body));
+    let runner_tok = sess.json()["token"].as_str().unwrap().to_string();
+
+    let post_chk = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/swept-a",
+            "state": "pass",
+            "summary": "green a",
+        }),
+    );
+    assert_no_swept_id("Subcase A POST /checks", &post_chk.body, &swept);
+    assert_eq!(post_chk.status, 200, "{}", String::from_utf8_lossy(&post_chk.body));
+
+    let got_chk = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    assert_eq!(got_chk.status, 200, "{}", String::from_utf8_lossy(&got_chk.body));
+    assert_eq!(got_chk.json()["checks"].as_array().unwrap().len(), 1);
+
+    let mut c = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+    c.tip = f.r_merge;
+    c.root = c.tree_of(f.r_merge);
+    c.file(&format!("{BILL_DIR}/swept_a_step.txt"), "step 1\n");
+    let mut s = Snapshot {
+        parents: vec![f.r_merge],
+        change_id: veil_core::ChangeId::random(),
+        tree: c.root,
+        description: Text::Plain("hidden step a".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let r_after = c.put(O::Snapshot(s));
+    c.file(&format!("{BILL_DIR}/swept_a_step.txt"), "step 2\n");
+    let (_, rep) = c.push_edited("swept-a-branch", None, move |sn| sn.parents = vec![r_after]);
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["swept-a-branch"], f.p0);
+
+    let mut m = Craft::new(&api, &f.p.dev, &f.p.name, "swept-a-branch");
+    m.file("src/swept_a_land.rs", "land a\n");
+    let r_push = m.push_to("swept-a-branch", Some(f.p0));
+    assert_no_swept_id("Subcase A push", &r_push.body, &swept);
+    assert_eq!(r_push.status, 200, "{}", String::from_utf8_lossy(&r_push.body));
+    let dev_tip = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["swept-a-branch"];
+
+    let r_land = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", f.p.name),
+        &json!({
+            "onto": "main",
+            "snapshot": dev_tip.hex(),
+            "receipts": {},
+            "wait": true,
+        }),
+    );
+    assert_no_swept_id("Subcase A POST /land", &r_land.body, &swept);
+    assert_eq!(r_land.status, 200, "{}", String::from_utf8_lossy(&r_land.body));
+    assert_eq!(r_land.json()["state"], "landed");
+    assert_eq!(swept_uncollapsed_count(), 2, "swept rows must not be pushed into stale (collapsed stays false)");
+
+    // (b) Pre-`0011` `R_0` (`collapsed = true`), leaving `[dead_lo, dead_hi]` as
+    // the ONLY `projections_own` (`NOT collapsed`) rows alongside live `R_0`:
+    let keep_rows: Vec<String> = vec![f.r0.hex(), dead_lo.hex(), dead_hi.hex()];
+    hub.rt.block_on(async {
+        sqlx::query("DELETE FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT (real_id = ANY($4))")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.p0.hex())
+            .bind(&keep_rows)
+            .execute(&h.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE projections SET collapsed = TRUE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.r0.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+    });
+
+    let r_chg_pre = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change on pre-0011 R_0 beside swept Subcase A rows",
+            "edits": [{"path": "src/swept_a_pre0011.rs", "put": {"text": "ok pre0011 a\n"}}],
+        }),
+    );
+    assert_no_swept_id("Subcase A pre-0011 POST /changes", &r_chg_pre.body, &swept);
+    assert_eq!(r_chg_pre.status, 200, "{}", String::from_utf8_lossy(&r_chg_pre.body));
+
+    let post_chk_pre = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/swept-a-pre0011",
+            "state": "pass",
+            "summary": "green pre0011 a",
+        }),
+    );
+    assert_no_swept_id("Subcase A pre-0011 POST /checks", &post_chk_pre.body, &swept);
+    assert_eq!(post_chk_pre.status, 200, "{}", String::from_utf8_lossy(&post_chk_pre.body));
+
+    let got_chk_pre = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    assert_eq!(got_chk_pre.status, 200, "{}", String::from_utf8_lossy(&got_chk_pre.body));
+    assert_eq!(got_chk_pre.json()["checks"].as_array().unwrap().len(), 2);
+    assert_eq!(swept_uncollapsed_count(), 2, "swept rows must remain untouched in pre-0011 fallback");
+}
+
+/// BUG-2671 (cycle 1, Subcase B): When a legacy merge row `R_dead` in
+/// `projections_own` has `g.parents = [p0_dead, p1_dead]` (or its snapshot is
+/// still in `hub.objects` mid-sweep) while `p0_dead` has no `projections` memo
+/// and `p0_dead` (or an unmemoised ancestor of `p0_dead`, or `R_dead` itself)
+/// was swept from `hub.objects`, `own_projection` and `resolve_for_mode` must
+/// drop `R_dead` into neither `keep` nor `stale`, never fail `400`/`500`, and
+/// never leak any swept id in a response body.
+#[test]
+fn bug_2671_gc_swept_merge_with_missing_first_parent_is_dropped_without_error_or_id_leak() {
+    use bytes::Bytes;
+    use serde_json::json;
+    use veil_core::object::{Object as O, Snapshot, Text};
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+    let admin_tok = f.p.admin.token();
+    let h = hub.hub();
+
+    let c_tree = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+    let r0_tree = c_tree.tree_of(f.r0);
+
+    // 1. `dead_b1`: snapshot PRESENT in `hub.objects`, `g.parents` populated,
+    //    `dead_p0_1` has NO `projections` memo and is ABSENT from `hub.objects`.
+    let dead_p0_1 = ObjectId::from_hex("111111112671b100000000000000000000000000000000000000000000000001").unwrap();
+    let dead_p1_1 = ObjectId::from_hex("111111112671b100000000000000000000000000000000000000000000000002").unwrap();
+    let mut s_b1 = Snapshot {
+        parents: vec![dead_p0_1, dead_p1_1],
+        change_id: veil_core::ChangeId::random(),
+        tree: r0_tree,
+        description: Text::Plain("swept merge b1".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s_b1.sign(&c_tree.identity);
+    let raw_b1 = O::Snapshot(s_b1).encode();
+    let dead_b1 = ObjectId::hash(&raw_b1);
+
+    // 2. `dead_b2` (`0000...`, sorts first in `ORDER BY real_id LIMIT 2`):
+    //    `g.parents` populated in `graph`, BOTH `dead_b2` and `dead_p0_2` ABSENT
+    //    from `hub.objects`.
+    let dead_b2 = ObjectId::from_hex("000000002671b200000000000000000000000000000000000000000000000001").unwrap();
+    let dead_p0_2 = ObjectId::from_hex("222222222671b200000000000000000000000000000000000000000000000002").unwrap();
+    let dead_p1_2 = ObjectId::from_hex("222222222671b200000000000000000000000000000000000000000000000003").unwrap();
+
+    // 3. `dead_b3`: both `dead_b3` and `dead_p0_3` PRESENT in `hub.objects`
+    //    (unmemoised), while `dead_p0_3`'s parent `dead_anc_3` was already swept
+    //    (ABSENT from `hub.objects`), exercising `StoredMissing` mid-`projected`.
+    let dead_anc_3 = ObjectId::from_hex("333333332671b300000000000000000000000000000000000000000000000001").unwrap();
+    let dead_p1_3 = ObjectId::from_hex("333333332671b300000000000000000000000000000000000000000000000002").unwrap();
+    let mut s_p0_3 = Snapshot {
+        parents: vec![dead_anc_3],
+        change_id: veil_core::ChangeId::random(),
+        tree: r0_tree,
+        description: Text::Plain("swept parent p0_3".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s_p0_3.sign(&c_tree.identity);
+    let raw_p0_3 = O::Snapshot(s_p0_3).encode();
+    let dead_p0_3 = ObjectId::hash(&raw_p0_3);
+
+    let mut s_b3 = Snapshot {
+        parents: vec![dead_p0_3, dead_p1_3],
+        change_id: veil_core::ChangeId::random(),
+        tree: r0_tree,
+        description: Text::Plain("swept merge b3".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s_b3.sign(&c_tree.identity);
+    let raw_b3 = O::Snapshot(s_b3).encode();
+    let dead_b3 = ObjectId::hash(&raw_b3);
+
+    let all_swept_ids = [
+        dead_b1, dead_p0_1, dead_p1_1, dead_b2, dead_p0_2, dead_p1_2, dead_b3, dead_p0_3, dead_p1_3, dead_anc_3,
+    ];
+    let swept_merges = [(dead_b1, [dead_p0_1, dead_p1_1]), (dead_b2, [dead_p0_2, dead_p1_2]), (dead_b3, [dead_p0_3, dead_p1_3])];
+    let swept_merge_hex: Vec<String> = swept_merges.iter().map(|(m, _)| m.hex()).collect();
+
+    hub.rt.block_on(async {
+        h.objects.put(f.pid, &dead_b1, Bytes::from(raw_b1)).await.unwrap();
+        h.objects.put(f.pid, &dead_p0_3, Bytes::from(raw_p0_3)).await.unwrap();
+        h.objects.put(f.pid, &dead_b3, Bytes::from(raw_b3)).await.unwrap();
+        for (m, ps) in &swept_merges {
+            let parents_json = serde_json::to_string(&ps.to_vec()).unwrap();
+            sqlx::query(
+                "INSERT INTO graph (project_id, snapshot, generation, depth, parents, change_id, flags, skip, changed) \
+                 VALUES ($1, $2, 2, 2, $3, $4, 0, $5, NULL)",
+            )
+            .bind(f.pid)
+            .bind(m.hex())
+            .bind(parents_json)
+            .bind(veil_core::ChangeId::random().to_string())
+            .bind(ps[0].hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+                 VALUES ($1, $2, $3, $4, 0, FALSE)",
+            )
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(m.hex())
+            .bind(f.p0.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+        }
+        let next_ep: i64 = sqlx::query_scalar(
+            "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 1, 0) \
+             ON CONFLICT (project_id, person_id) DO UPDATE SET epoch = access_epochs.epoch + 1 RETURNING epoch",
+        )
+        .bind(f.pid)
+        .fetch_one(&h.db)
+        .await
+        .unwrap();
+        h.caches.set_gc_epoch(f.pid, next_ep);
+    });
+
+    let swept_uncollapsed_count = || -> i64 {
+        hub.rt
+            .block_on(
+                sqlx::query_scalar(
+                    "SELECT count(*) FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3) AND NOT collapsed",
+                )
+                .bind(f.pid)
+                .bind(&f.vk)
+                .bind(&swept_merge_hex)
+                .fetch_one(&h.db),
+            )
+            .unwrap()
+    };
+
+    // (a) Live post-`0011` `R_0` (`collapsed = false`):
+    let r_chg = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change beside swept Subcase B rows",
+            "edits": [{"path": "src/swept_b.rs", "put": {"text": "ok b\n"}}],
+        }),
+    );
+    assert_no_swept_id("Subcase B POST /changes", &r_chg.body, &all_swept_ids);
+    assert_eq!(r_chg.status, 200, "{}", String::from_utf8_lossy(&r_chg.body));
+
+    let sess = api.post_json(
+        Some(&dev_tok),
+        "/v1/sessions/ci",
+        &json!({"project": f.p.name, "only": ["src/"]}),
+    );
+    assert_eq!(sess.status, 200, "{}", String::from_utf8_lossy(&sess.body));
+    let runner_tok = sess.json()["token"].as_str().unwrap().to_string();
+
+    let post_chk = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/swept-b",
+            "state": "pass",
+            "summary": "green b",
+        }),
+    );
+    assert_no_swept_id("Subcase B POST /checks", &post_chk.body, &all_swept_ids);
+    assert_eq!(post_chk.status, 200, "{}", String::from_utf8_lossy(&post_chk.body));
+
+    let got_chk = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    assert_eq!(got_chk.status, 200, "{}", String::from_utf8_lossy(&got_chk.body));
+    assert_eq!(got_chk.json()["checks"].as_array().unwrap().len(), 1);
+
+    let mut c = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+    c.tip = f.r_merge;
+    c.root = c.tree_of(f.r_merge);
+    c.file(&format!("{BILL_DIR}/swept_b_step.txt"), "step 1\n");
+    let mut s = Snapshot {
+        parents: vec![f.r_merge],
+        change_id: veil_core::ChangeId::random(),
+        tree: c.root,
+        description: Text::Plain("hidden step b".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let r_after = c.put(O::Snapshot(s));
+    c.file(&format!("{BILL_DIR}/swept_b_step.txt"), "step 2\n");
+    let (_, rep) = c.push_edited("swept-b-branch", None, move |sn| sn.parents = vec![r_after]);
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["swept-b-branch"], f.p0);
+
+    let mut m = Craft::new(&api, &f.p.dev, &f.p.name, "swept-b-branch");
+    m.file("src/swept_b_land.rs", "land b\n");
+    let r_push = m.push_to("swept-b-branch", Some(f.p0));
+    assert_no_swept_id("Subcase B push", &r_push.body, &all_swept_ids);
+    assert_eq!(r_push.status, 200, "{}", String::from_utf8_lossy(&r_push.body));
+    let dev_tip = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["swept-b-branch"];
+
+    let r_land = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", f.p.name),
+        &json!({
+            "onto": "main",
+            "snapshot": dev_tip.hex(),
+            "receipts": {},
+            "wait": true,
+        }),
+    );
+    assert_no_swept_id("Subcase B POST /land", &r_land.body, &all_swept_ids);
+    assert_eq!(r_land.status, 200, "{}", String::from_utf8_lossy(&r_land.body));
+    assert_eq!(r_land.json()["state"], "landed");
+    assert_eq!(swept_uncollapsed_count(), 3, "swept Subcase B rows must not be marked collapsed = true");
+
+    // (b) Pre-`0011` `R_0` (`collapsed = true`), leaving `[dead_b1, dead_b2, dead_b3]`
+    // as the ONLY `projections_own` rows alongside live `R_0`:
+    let mut keep_rows = vec![f.r0.hex()];
+    keep_rows.extend(swept_merge_hex.iter().cloned());
+    hub.rt.block_on(async {
+        sqlx::query("DELETE FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT (real_id = ANY($4))")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.p0.hex())
+            .bind(&keep_rows)
+            .execute(&h.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE projections SET collapsed = TRUE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.r0.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+    });
+
+    let r_chg_pre = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change on pre-0011 R_0 beside swept Subcase B rows",
+            "edits": [{"path": "src/swept_b_pre0011.rs", "put": {"text": "ok pre0011 b\n"}}],
+        }),
+    );
+    assert_no_swept_id("Subcase B pre-0011 POST /changes", &r_chg_pre.body, &all_swept_ids);
+    assert_eq!(r_chg_pre.status, 200, "{}", String::from_utf8_lossy(&r_chg_pre.body));
+
+    let post_chk_pre = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/swept-b-pre0011",
+            "state": "pass",
+            "summary": "green pre0011 b",
+        }),
+    );
+    assert_no_swept_id("Subcase B pre-0011 POST /checks", &post_chk_pre.body, &all_swept_ids);
+    assert_eq!(post_chk_pre.status, 200, "{}", String::from_utf8_lossy(&post_chk_pre.body));
+
+    let got_chk_pre = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    assert_eq!(got_chk_pre.status, 200, "{}", String::from_utf8_lossy(&got_chk_pre.body));
+    assert_eq!(got_chk_pre.json()["checks"].as_array().unwrap().len(), 2);
+    assert_eq!(swept_uncollapsed_count(), 3, "swept Subcase B rows must remain untouched in pre-0011 fallback");
+}
