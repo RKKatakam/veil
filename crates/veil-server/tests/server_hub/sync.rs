@@ -1000,3 +1000,1011 @@ fn compressed_uploads_decode_within_a_server_wide_bound() {
     println!("BUG-1009: 16 uploads decoding 48 MiB each at once: memory rose {} MiB", grew >> 20);
     assert!(grew < 512 << 20, "memory rose {} MiB", grew >> 20);
 }
+
+struct CollapsedMergeFixture {
+    p: Project,
+    pid: i64,
+    r0: ObjectId,
+    p0: ObjectId,
+    r_sec: ObjectId,
+    r_merge: ObjectId,
+    vk: String,
+}
+
+/// Build `R_next -> R_merge -> [R_0, R_sec]` (`R_sec -> R_0`) on `main`, where
+/// `R_0` changes `src/` (visible to `dev`), `R_sec` and `R_merge` change only
+/// `BILL_DIR/` (hidden from `dev`, so both collapse to `P_0 != R_0`), and
+/// `R_next` advances `main` past `P_0`.
+fn setup_collapsed_merge(hub: &TestHub) -> CollapsedMergeFixture {
+    use veil_core::object::{Object as O, Snapshot, Text};
+    let p = setup_project(hub);
+    let pid = project_id(hub, &p.name);
+    let api = hub.api();
+    let dev_tok = p.dev.token();
+
+    let mut c0 = Craft::new(&api, &p.admin, &p.name, "main");
+    let c0_tip = c0.tip;
+    c0.file("src/a.rs", "visible base\n");
+    let (r0, rep) = c0.push_edited("main", Some(c0_tip), |_| {});
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+
+    let p0 = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_ne!(p0, r0, "dev sees a projected snapshot because billing/ is hidden");
+
+    let mut c_merge = Craft::new(&api, &p.admin, &p.name, "main");
+    assert_eq!(c_merge.tip, r0);
+    c_merge.file(&format!("{BILL_DIR}/secret_branch.txt"), "hidden side branch\n");
+    let mut sec_snap = Snapshot {
+        parents: vec![r0],
+        change_id: veil_core::ChangeId::random(),
+        tree: c_merge.root,
+        description: Text::Plain("hidden side".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    sec_snap.sign(&c_merge.identity);
+    let r_sec = c_merge.put(O::Snapshot(sec_snap));
+    let (r_merge, rep) = c_merge.push_edited("main", Some(r0), move |s| s.parents = vec![r0, r_sec]);
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+
+    let seen_merge = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_eq!(seen_merge, p0, "the hidden merge collapses into P_0 in dev's view");
+
+    let mut c_next = Craft::new(&api, &p.admin, &p.name, "main");
+    assert_eq!(c_next.tip, r_merge);
+    c_next.file("src/b.rs", "visible next\n");
+    let (_, rep) = c_next.push_edited("main", Some(r_merge), |_| {});
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+
+    let p_next = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    assert_ne!(p_next, p0, "main has moved past P_0 in dev's view");
+
+    let h = hub.hub();
+    let vk: String = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT view_key FROM projections WHERE project_id = $1 AND real_id = $2 AND projected_id = $3")
+                .bind(pid)
+                .bind(r0.hex())
+                .bind(p0.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+
+    CollapsedMergeFixture { p, pid, r0, p0, r_sec, r_merge, vk }
+}
+
+/// BUG-2671 (1): A multi-parent merge whose changes are hidden from `dev`
+/// collapses to `P_0` in `project_one`, yet `projected_inner` recorded
+/// `projections.collapsed = false` (`sync.rs:580`). Once `main` moves past
+/// `P_0`, `projections_own` (`NOT collapsed`) returns `[R_0, R_merge]` instead
+/// of `[R_0]`, so non-landing `POST /changes` and `vl push` on `P_0` fail with
+/// `409 Conflict`, and past `NEWEST_BOUND` even landing `POST /land` on `P_0`
+/// fails with `404 Not Found`.
+#[test]
+fn bug_2671_collapsed_hidden_merge_breaks_base_resolution() {
+    use serde_json::json;
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+
+    // 1a. Non-landing `POST /changes` on `P_0` as `dev` must succeed (`200`), not `409`.
+    let r = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change on P_0",
+            "edits": [{"path": "src/dev_change.rs", "put": {"text": "from dev\n"}}],
+        }),
+    );
+    assert_eq!(r.status, 200, "non-landing POST /changes on P_0: {}", String::from_utf8_lossy(&r.body));
+
+    // 1b. `push` of a new branch based on `P_0` must succeed (`200`, `ok == true`),
+    // grafted onto `R_0`.
+    let mut m = Craft::new(&api, &f.p.dev, &f.p.name, "main");
+    m.tip = f.p0;
+    m.root = m.tree_of(f.p0);
+    m.file("src/dev_pushed.rs", "pushed by dev\n");
+    let r = m.push_to("dev-on-p0", None);
+    assert_eq!(r.status, 200, "push on P_0: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r.body));
+
+    // 1c. Past `NEWEST_BOUND` (4,096), even landing `POST /land` on `P_0` relies on
+    // `projections_own` (`sync.rs:975-976`) and must return `200`, not `404`.
+    let h = hub.hub();
+    hub.rt.block_on(async {
+        sqlx::query(
+            "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+             SELECT $1, $2, md5('b2671r' || i) || md5('b2671s' || i), $3, i, TRUE FROM generate_series(1, 4100) i",
+        )
+        .bind(f.pid)
+        .bind(&f.vk)
+        .bind(f.p0.hex())
+        .execute(&h.db)
+        .await
+        .unwrap();
+    });
+    let r_land = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", f.p.name),
+        &json!({
+            "onto": "main",
+            "base": f.p0.hex(),
+            "description": "land on P_0 past NEWEST_BOUND",
+            "edits": [{"path": "src/dev_landed.rs", "put": {"text": "landed\n"}}],
+            "wait": true,
+        }),
+    );
+    assert_eq!(r_land.status, 200, "POST /land on P_0 past NEWEST_BOUND: {}", String::from_utf8_lossy(&r_land.body));
+    assert_eq!(r_land.json()["state"], "landed", "{}", String::from_utf8_lossy(&r_land.body));
+
+    let collapsed: bool = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                .bind(f.pid)
+                .bind(&f.vk)
+                .bind(f.r_merge.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert!(collapsed, "projections(vk, R_merge).collapsed must be true");
+}
+
+/// BUG-2671 (2): A narrowed CI runner session posting a check on historical
+/// `P_0` (`sync::resolve_exact_for` -> `ci::resolve_snapshot`) must attach the
+/// check to the uncollapsed commit `R_0`, not to the hidden collapsed commits
+/// `R_merge` or `R_sec`, so `GET /checks?rev=<R_0>` finds it.
+#[test]
+fn bug_2671_collapsed_hidden_merge_misattaches_narrowed_ci_checks() {
+    use serde_json::json;
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+    let admin_tok = f.p.admin.token();
+
+    let sess = api.post_json(
+        Some(&dev_tok),
+        "/v1/sessions/ci",
+        &json!({"project": f.p.name, "only": ["src/"]}),
+    );
+    assert_eq!(sess.status, 200, "{}", String::from_utf8_lossy(&sess.body));
+    let runner_tok = sess.json()["token"].as_str().unwrap().to_string();
+
+    let post = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/src",
+            "state": "pass",
+            "summary": "src checks green",
+        }),
+    );
+    assert_eq!(post.status, 200, "{}", String::from_utf8_lossy(&post.body));
+
+    let got = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    let body = String::from_utf8_lossy(&got.body).into_owned();
+    assert_eq!(got.status, 200, "{body}");
+    let checks = got.json()["checks"].as_array().unwrap().clone();
+    assert_eq!(
+        checks.len(),
+        1,
+        "GET /checks?rev=<R_0> must see the narrowed check on R_0 (not hidden {} or {}): {body}",
+        f.r_merge.short(),
+        f.r_sec.short()
+    );
+    assert_eq!(checks[0]["name"], "ci/src");
+    assert_eq!(checks[0]["state"], "pass");
+}
+
+/// BUG-2671 (3): `landing::Ancestry::below_hidden` relies on `projections_own`
+/// (`NOT collapsed`) to step over a hidden run in O(1). A single collapsed
+/// hidden merge inside a hidden run of `> WALK_BUDGET` (4,096) commits poisoned
+/// `projections_own`, degrading `below_hidden` to `None` and failing `POST /land`
+/// permanently with `503 warming`.
+#[test]
+fn bug_2671_collapsed_hidden_merge_breaks_below_hidden_step_over() {
+    use serde_json::json;
+    use veil_core::object::{Object as O, Snapshot, Text};
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+
+    // Build 4,101 (> WALK_BUDGET = 4,096) hidden commits on top of `R_merge`
+    // on branch `hidden-merge-run`, alternating two hidden trees so every step
+    // changes `BILL_DIR/run.txt` without O(N^2) tree construction.
+    let mut c = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+    c.tip = f.r_merge;
+    c.root = c.tree_of(f.r_merge);
+    c.file(&format!("{BILL_DIR}/run.txt"), "step a\n");
+    let tree_a = c.root;
+    c.file(&format!("{BILL_DIR}/run.txt"), "step b\n");
+    let tree_b = c.root;
+    let mut parent = f.r_merge;
+    for i in 0..4_100usize {
+        let mut s = Snapshot {
+            parents: vec![parent],
+            change_id: veil_core::ChangeId::random(),
+            tree: if i % 2 == 0 { tree_a } else { tree_b },
+            description: Text::Plain(format!("hidden {i}")),
+            author: "admin".into(),
+            timestamp: veil_core::now_millis(),
+            predecessors: vec![],
+            conflicts: vec![],
+            embargo: None,
+            agent: None,
+            abandoned: None,
+            attempts: vec![],
+            signature: None,
+        };
+        s.sign(&c.identity);
+        parent = c.put(O::Snapshot(s));
+    }
+    c.root = tree_a; // parent (i = 4099) has tree_b, so this commit changes BILL_DIR/run.txt too
+    let (_, rep) = c.push_edited("hidden-merge-run", None, move |s| {
+        s.parents = vec![parent];
+    });
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+
+    // `dev` sees the entire 4,102-commit hidden run (including `R_merge`) as `P_0`.
+    let seen_run = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["hidden-merge-run"];
+    assert_eq!(seen_run, f.p0);
+
+    // `dev` pushes one visible commit onto `hidden-merge-run`, then lands it onto `main`.
+    let mut m = Craft::new(&api, &f.p.dev, &f.p.name, "hidden-merge-run");
+    assert_eq!(m.tip, f.p0);
+    m.file("src/after_hidden_run.rs", "dev after hidden merge run\n");
+    let r_push = m.push_to("hidden-merge-run", Some(f.p0));
+    assert_eq!(r_push.status, 200, "{}", String::from_utf8_lossy(&r_push.body));
+    assert_eq!(r_push.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&r_push.body));
+    let dev_tip = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["hidden-merge-run"];
+
+    let r_land = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", f.p.name),
+        &json!({
+            "onto": "main",
+            "snapshot": dev_tip.hex(),
+            "receipts": {},
+            "wait": true,
+        }),
+    );
+    let body = String::from_utf8_lossy(&r_land.body).into_owned();
+    assert_eq!(r_land.status, 200, "landing across hidden run containing merge: {body}");
+    assert_eq!(r_land.json()["state"], "landed", "{body}");
+}
+
+/// BUG-2671 (4): Deployments upgraded from before the fix already hold
+/// `projections` rows for collapsed hidden merges with `collapsed = false`
+/// (including multiple merges sorting before `R_0` in `ORDER BY real_id LIMIT 2`,
+/// rows without `graph` derived yet, and pre-`0011` histories where `R_0` has
+/// `collapsed = true` so a stale merge is the sole `projections_own` row).
+/// `sync::own_projection` detects and repairs them in place (`collapsed = true`).
+#[test]
+fn bug_2671_preexisting_false_collapsed_merge_row_is_repaired() {
+    use serde_json::json;
+    use veil_core::object::{Object as O, Snapshot, Text};
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+    let admin_tok = f.p.admin.token();
+
+    // Push two more collapsed hidden merges onto side branches so `projections`
+    // holds 3 distinct collapsed merges for `(vk, P_0)` (exercising > LIMIT 2
+    // even when merges sort before `R_0`).
+    let mut extra_merges = Vec::new();
+    for idx in 0..2 {
+        let mut cm = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+        cm.tip = f.r0;
+        cm.root = cm.tree_of(f.r0);
+        cm.file(&format!("{BILL_DIR}/extra_{idx}.txt"), &format!("extra hidden {idx}\n"));
+        let (rm, rep) = cm.push_edited(&format!("hidden-m-{idx}"), None, |s| {
+            s.parents = vec![f.r0, f.r_sec];
+        });
+        assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+        assert_eq!(rep.json()["results"][0]["ok"], true, "{}", String::from_utf8_lossy(&rep.body));
+        let seen = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches[&format!("hidden-m-{idx}")];
+        assert_eq!(seen, f.p0);
+        extra_merges.push(rm);
+    }
+
+    let all_merges: Vec<String> = std::iter::once(f.r_merge).chain(extra_merges.iter().copied()).map(|id| id.hex()).collect();
+    let h = hub.hub();
+
+    let corrupt_merges = |clear_graph: bool| {
+        hub.rt.block_on(async {
+            if clear_graph {
+                sqlx::query("DELETE FROM graph WHERE project_id = $1 AND snapshot = ANY($2)")
+                    .bind(f.pid)
+                    .bind(&all_merges)
+                    .execute(&h.db)
+                    .await
+                    .unwrap();
+            }
+            let updated = sqlx::query("UPDATE projections SET collapsed = FALSE WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3)")
+                .bind(f.pid)
+                .bind(&f.vk)
+                .bind(&all_merges)
+                .execute(&h.db)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(updated, 3, "all 3 collapsed merges reset to legacy collapsed = false");
+        });
+    };
+
+    let false_merge_count = || -> i64 {
+        hub.rt.block_on(
+            sqlx::query_scalar(
+                "SELECT count(*) FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3) AND NOT collapsed",
+            )
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(&all_merges)
+            .fetch_one(&h.db),
+        )
+        .unwrap()
+    };
+
+    // (a) Without `graph` rows (object-store parent fallback) and with the
+    // in-memory memo cache invalidated (`gc_epoch` bumped), non-landing
+    // `POST /changes` succeeds and heals the stored rows.
+    corrupt_merges(true);
+    let next_ep: i64 = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar(
+                "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 1, 0) \
+                 ON CONFLICT (project_id, person_id) DO UPDATE SET epoch = access_epochs.epoch + 1 RETURNING epoch",
+            )
+            .bind(f.pid)
+            .fetch_one(&h.db),
+        )
+        .unwrap();
+    h.caches.set_gc_epoch(f.pid, next_ep);
+    assert_eq!(false_merge_count(), 3);
+    let r_chg = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change with legacy false-collapsed merges",
+            "edits": [{"path": "src/repaired_base.rs", "put": {"text": "ok\n"}}],
+        }),
+    );
+    assert_eq!(r_chg.status, 200, "{}", String::from_utf8_lossy(&r_chg.body));
+    let r_merge_collapsed: bool = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                .bind(f.pid)
+                .bind(&f.vk)
+                .bind(f.r_merge.hex())
+                .fetch_one(&h.db),
+        )
+        .unwrap();
+    assert!(r_merge_collapsed, "legacy R_merge row must be repaired to collapsed = true");
+    assert_eq!(false_merge_count(), 0, "all 3 legacy merge rows must be repaired to collapsed = true");
+
+    // (b) Derive `graph`, re-plant legacy `collapsed = false` on all 3 merges, and
+    // verify narrowed CI check resolution (`resolve_exact_for`) attaches to `R_0`
+    // and repairs all 3 rows via the `graph.parents` path.
+    hub.rt
+        .block_on(veil_server::derive::landing(
+            &h,
+            f.pid,
+            vec!["main".into(), "hidden-m-0".into(), "hidden-m-1".into()],
+        ))
+        .unwrap();
+    corrupt_merges(false);
+    assert_eq!(false_merge_count(), 3);
+
+    let sess = api.post_json(
+        Some(&dev_tok),
+        "/v1/sessions/ci",
+        &json!({"project": f.p.name, "only": ["src/"]}),
+    );
+    assert_eq!(sess.status, 200, "{}", String::from_utf8_lossy(&sess.body));
+    let runner_tok = sess.json()["token"].as_str().unwrap().to_string();
+
+    let post = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/repaired",
+            "state": "pass",
+            "summary": "repaired check",
+        }),
+    );
+    assert_eq!(post.status, 200, "{}", String::from_utf8_lossy(&post.body));
+    assert_eq!(false_merge_count(), 0, "resolve_exact_for must repair all 3 legacy merge rows");
+
+    let got = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    assert_eq!(got.json()["checks"].as_array().unwrap().len(), 1);
+
+    // (c) Pre-`0011` `R_0` (`collapsed = true` default) + post-`0011` legacy
+    // `R_merge` (`collapsed = false`): `projections_own` has ONLY 1 row (`[R_merge]`),
+    // yet `own_projection` must still recognize `R_merge` as collapsed, repair it to
+    // `collapsed = true`, and return `None` rather than falsely returning `Some(R_merge)`.
+    hub.rt.block_on(async {
+        sqlx::query("UPDATE projections SET collapsed = TRUE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.r0.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE projections SET collapsed = FALSE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.r_merge.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+    });
+    let mut c = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+    c.tip = f.r_merge;
+    c.root = c.tree_of(f.r_merge);
+    c.file(&format!("{BILL_DIR}/after_pre0011.txt"), "step\n");
+    let mut s = Snapshot {
+        parents: vec![f.r_merge],
+        change_id: veil_core::ChangeId::random(),
+        tree: c.root,
+        description: Text::Plain("hidden step".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let r_after = c.put(O::Snapshot(s));
+    c.file(&format!("{BILL_DIR}/after_pre0011.txt"), "step 2\n");
+    let (_, rep) = c.push_edited("pre0011-branch", None, move |sn| sn.parents = vec![r_after]);
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(rep.json()["results"][0]["ok"], true);
+    assert_eq!(api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["pre0011-branch"], f.p0);
+
+    let mut m = Craft::new(&api, &f.p.dev, &f.p.name, "pre0011-branch");
+    m.file("src/pre0011_dev.rs", "dev\n");
+    let r_push = m.push_to("pre0011-branch", Some(f.p0));
+    assert_eq!(r_push.status, 200, "{}", String::from_utf8_lossy(&r_push.body));
+    assert_eq!(r_push.json()["results"][0]["ok"], true);
+    let dev_tip = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["pre0011-branch"];
+
+    let r_land = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", f.p.name),
+        &json!({
+            "onto": "main",
+            "snapshot": dev_tip.hex(),
+            "receipts": {},
+            "wait": true,
+        }),
+    );
+    let body = String::from_utf8_lossy(&r_land.body).into_owned();
+    assert_eq!(r_land.status, 200, "landing with pre-0011 R_0 + legacy R_merge: {body}");
+    assert_eq!(r_land.json()["state"], "landed", "{body}");
+    assert_eq!(false_merge_count(), 0, "below_hidden must repair sole legacy R_merge row too");
+}
+
+fn assert_no_swept_id(ctx: &str, body: &[u8], ids: &[ObjectId]) {
+    let text = String::from_utf8_lossy(body);
+    for id in ids {
+        assert!(!text.contains(&id.hex()), "{ctx} leaked swept full id {}: {text}", id.hex());
+        assert!(!text.contains(&id.short()), "{ctx} leaked swept short id {}: {text}", id.short());
+    }
+}
+
+/// BUG-2671 (cycle 1, Subcase A): `own_projection` and `resolve_for_mode` read
+/// `projections` on `&hub.db` with autocommit, so a concurrent GC pass may have
+/// swept an expired legacy merge `R_dead` (`g.parents` NULL, snapshot object
+/// absent from `hub.objects`) between the `SELECT` and object reads. Such a
+/// candidate must be dropped into neither `keep` nor `stale` — never causing a
+/// false `409`, `400`, or `500`, never misattaching checks or returning
+/// `Some(R_dead)` on pre-`0011` `R_0` (`collapsed = true`), and never naming
+/// the swept id in any response body.
+#[test]
+fn bug_2671_gc_swept_merge_with_null_graph_parents_is_dropped_without_error_or_id_leak() {
+    use serde_json::json;
+    use veil_core::object::{Object as O, Snapshot, Text};
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+    let admin_tok = f.p.admin.token();
+    let h = hub.hub();
+
+    // `dead_lo` sorts before every real snapshot in `ORDER BY real_id LIMIT 2`;
+    // `dead_hi` sorts after every real snapshot. Neither exists in `hub.objects`
+    // or `graph` (`g.parents` is NULL).
+    let dead_lo = ObjectId::from_hex("000000002671a000000000000000000000000000000000000000000000000001").unwrap();
+    let dead_hi = ObjectId::from_hex("ffffffff2671a000000000000000000000000000000000000000000000000002").unwrap();
+    let swept = [dead_lo, dead_hi];
+    let swept_hex: Vec<String> = swept.iter().map(ObjectId::hex).collect();
+
+    hub.rt.block_on(async {
+        for dead in &swept {
+            sqlx::query(
+                "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+                 VALUES ($1, $2, $3, $4, 0, FALSE)",
+            )
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(dead.hex())
+            .bind(f.p0.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+        }
+    });
+
+    let swept_uncollapsed_count = || -> i64 {
+        hub.rt
+            .block_on(
+                sqlx::query_scalar(
+                    "SELECT count(*) FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3) AND NOT collapsed",
+                )
+                .bind(f.pid)
+                .bind(&f.vk)
+                .bind(&swept_hex)
+                .fetch_one(&h.db),
+            )
+            .unwrap()
+    };
+
+    // (a) Live post-`0011` `R_0` (`collapsed = false`):
+    let r_chg = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change beside swept Subcase A rows",
+            "edits": [{"path": "src/swept_a.rs", "put": {"text": "ok a\n"}}],
+        }),
+    );
+    assert_no_swept_id("Subcase A POST /changes", &r_chg.body, &swept);
+    assert_eq!(r_chg.status, 200, "{}", String::from_utf8_lossy(&r_chg.body));
+
+    let sess = api.post_json(
+        Some(&dev_tok),
+        "/v1/sessions/ci",
+        &json!({"project": f.p.name, "only": ["src/"]}),
+    );
+    assert_eq!(sess.status, 200, "{}", String::from_utf8_lossy(&sess.body));
+    let runner_tok = sess.json()["token"].as_str().unwrap().to_string();
+
+    let post_chk = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/swept-a",
+            "state": "pass",
+            "summary": "green a",
+        }),
+    );
+    assert_no_swept_id("Subcase A POST /checks", &post_chk.body, &swept);
+    assert_eq!(post_chk.status, 200, "{}", String::from_utf8_lossy(&post_chk.body));
+
+    let got_chk = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    assert_eq!(got_chk.status, 200, "{}", String::from_utf8_lossy(&got_chk.body));
+    assert_eq!(got_chk.json()["checks"].as_array().unwrap().len(), 1);
+
+    let mut c = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+    c.tip = f.r_merge;
+    c.root = c.tree_of(f.r_merge);
+    c.file(&format!("{BILL_DIR}/swept_a_step.txt"), "step 1\n");
+    let mut s = Snapshot {
+        parents: vec![f.r_merge],
+        change_id: veil_core::ChangeId::random(),
+        tree: c.root,
+        description: Text::Plain("hidden step a".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let r_after = c.put(O::Snapshot(s));
+    c.file(&format!("{BILL_DIR}/swept_a_step.txt"), "step 2\n");
+    let (_, rep) = c.push_edited("swept-a-branch", None, move |sn| sn.parents = vec![r_after]);
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["swept-a-branch"], f.p0);
+
+    let mut m = Craft::new(&api, &f.p.dev, &f.p.name, "swept-a-branch");
+    m.file("src/swept_a_land.rs", "land a\n");
+    let r_push = m.push_to("swept-a-branch", Some(f.p0));
+    assert_no_swept_id("Subcase A push", &r_push.body, &swept);
+    assert_eq!(r_push.status, 200, "{}", String::from_utf8_lossy(&r_push.body));
+    let dev_tip = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["swept-a-branch"];
+
+    let r_land = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", f.p.name),
+        &json!({
+            "onto": "main",
+            "snapshot": dev_tip.hex(),
+            "receipts": {},
+            "wait": true,
+        }),
+    );
+    assert_no_swept_id("Subcase A POST /land", &r_land.body, &swept);
+    assert_eq!(r_land.status, 200, "{}", String::from_utf8_lossy(&r_land.body));
+    assert_eq!(r_land.json()["state"], "landed");
+    assert_eq!(swept_uncollapsed_count(), 2, "swept rows must not be pushed into stale (collapsed stays false)");
+
+    // (b) Pre-`0011` `R_0` (`collapsed = true`), leaving `[dead_lo, dead_hi]` as
+    // the ONLY `projections_own` (`NOT collapsed`) rows alongside live `R_0`:
+    let keep_rows: Vec<String> = vec![f.r0.hex(), dead_lo.hex(), dead_hi.hex()];
+    hub.rt.block_on(async {
+        sqlx::query("DELETE FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT (real_id = ANY($4))")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.p0.hex())
+            .bind(&keep_rows)
+            .execute(&h.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE projections SET collapsed = TRUE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.r0.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+    });
+
+    let r_chg_pre = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change on pre-0011 R_0 beside swept Subcase A rows",
+            "edits": [{"path": "src/swept_a_pre0011.rs", "put": {"text": "ok pre0011 a\n"}}],
+        }),
+    );
+    assert_no_swept_id("Subcase A pre-0011 POST /changes", &r_chg_pre.body, &swept);
+    assert_eq!(r_chg_pre.status, 200, "{}", String::from_utf8_lossy(&r_chg_pre.body));
+
+    let post_chk_pre = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/swept-a-pre0011",
+            "state": "pass",
+            "summary": "green pre0011 a",
+        }),
+    );
+    assert_no_swept_id("Subcase A pre-0011 POST /checks", &post_chk_pre.body, &swept);
+    assert_eq!(post_chk_pre.status, 200, "{}", String::from_utf8_lossy(&post_chk_pre.body));
+
+    let got_chk_pre = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    assert_eq!(got_chk_pre.status, 200, "{}", String::from_utf8_lossy(&got_chk_pre.body));
+    assert_eq!(got_chk_pre.json()["checks"].as_array().unwrap().len(), 2);
+    assert_eq!(swept_uncollapsed_count(), 2, "swept rows must remain untouched in pre-0011 fallback");
+}
+
+/// BUG-2671 (cycle 1, Subcase B): When a legacy merge row `R_dead` in
+/// `projections_own` has `g.parents = [p0_dead, p1_dead]` (or its snapshot is
+/// still in `hub.objects` mid-sweep) while `p0_dead` has no `projections` memo
+/// and `p0_dead` (or an unmemoised ancestor of `p0_dead`, or `R_dead` itself)
+/// was swept from `hub.objects`, `own_projection` and `resolve_for_mode` must
+/// drop `R_dead` into neither `keep` nor `stale`, never fail `400`/`500`, and
+/// never leak any swept id in a response body.
+#[test]
+fn bug_2671_gc_swept_merge_with_missing_first_parent_is_dropped_without_error_or_id_leak() {
+    use bytes::Bytes;
+    use serde_json::json;
+    use veil_core::object::{Object as O, Snapshot, Text};
+    let hub = TestHub::start();
+    let f = setup_collapsed_merge(&hub);
+    let api = hub.api();
+    let dev_tok = f.p.dev.token();
+    let admin_tok = f.p.admin.token();
+    let h = hub.hub();
+
+    let c_tree = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+    let r0_tree = c_tree.tree_of(f.r0);
+
+    // 1. `dead_b1`: snapshot PRESENT in `hub.objects`, `g.parents` populated,
+    //    `dead_p0_1` has NO `projections` memo and is ABSENT from `hub.objects`.
+    let dead_p0_1 = ObjectId::from_hex("111111112671b100000000000000000000000000000000000000000000000001").unwrap();
+    let dead_p1_1 = ObjectId::from_hex("111111112671b100000000000000000000000000000000000000000000000002").unwrap();
+    let mut s_b1 = Snapshot {
+        parents: vec![dead_p0_1, dead_p1_1],
+        change_id: veil_core::ChangeId::random(),
+        tree: r0_tree,
+        description: Text::Plain("swept merge b1".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s_b1.sign(&c_tree.identity);
+    let raw_b1 = O::Snapshot(s_b1).encode();
+    let dead_b1 = ObjectId::hash(&raw_b1);
+
+    // 2. `dead_b2` (`0000...`, sorts first in `ORDER BY real_id LIMIT 2`):
+    //    `g.parents` populated in `graph`, BOTH `dead_b2` and `dead_p0_2` ABSENT
+    //    from `hub.objects`.
+    let dead_b2 = ObjectId::from_hex("000000002671b200000000000000000000000000000000000000000000000001").unwrap();
+    let dead_p0_2 = ObjectId::from_hex("222222222671b200000000000000000000000000000000000000000000000002").unwrap();
+    let dead_p1_2 = ObjectId::from_hex("222222222671b200000000000000000000000000000000000000000000000003").unwrap();
+
+    // 3. `dead_b3`: both `dead_b3` and `dead_p0_3` PRESENT in `hub.objects`
+    //    (unmemoised), while `dead_p0_3`'s parent `dead_anc_3` was already swept
+    //    (ABSENT from `hub.objects`), exercising `StoredMissing` mid-`projected`.
+    let dead_anc_3 = ObjectId::from_hex("333333332671b300000000000000000000000000000000000000000000000001").unwrap();
+    let dead_p1_3 = ObjectId::from_hex("333333332671b300000000000000000000000000000000000000000000000002").unwrap();
+    let mut s_p0_3 = Snapshot {
+        parents: vec![dead_anc_3],
+        change_id: veil_core::ChangeId::random(),
+        tree: r0_tree,
+        description: Text::Plain("swept parent p0_3".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s_p0_3.sign(&c_tree.identity);
+    let raw_p0_3 = O::Snapshot(s_p0_3).encode();
+    let dead_p0_3 = ObjectId::hash(&raw_p0_3);
+
+    let mut s_b3 = Snapshot {
+        parents: vec![dead_p0_3, dead_p1_3],
+        change_id: veil_core::ChangeId::random(),
+        tree: r0_tree,
+        description: Text::Plain("swept merge b3".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s_b3.sign(&c_tree.identity);
+    let raw_b3 = O::Snapshot(s_b3).encode();
+    let dead_b3 = ObjectId::hash(&raw_b3);
+
+    let all_swept_ids = [
+        dead_b1, dead_p0_1, dead_p1_1, dead_b2, dead_p0_2, dead_p1_2, dead_b3, dead_p0_3, dead_p1_3, dead_anc_3,
+    ];
+    let swept_merges = [(dead_b1, [dead_p0_1, dead_p1_1]), (dead_b2, [dead_p0_2, dead_p1_2]), (dead_b3, [dead_p0_3, dead_p1_3])];
+    let swept_merge_hex: Vec<String> = swept_merges.iter().map(|(m, _)| m.hex()).collect();
+
+    hub.rt.block_on(async {
+        h.objects.put(f.pid, &dead_b1, Bytes::from(raw_b1)).await.unwrap();
+        h.objects.put(f.pid, &dead_p0_3, Bytes::from(raw_p0_3)).await.unwrap();
+        h.objects.put(f.pid, &dead_b3, Bytes::from(raw_b3)).await.unwrap();
+        for (m, ps) in &swept_merges {
+            let parents_json = serde_json::to_string(&ps.to_vec()).unwrap();
+            sqlx::query(
+                "INSERT INTO graph (project_id, snapshot, generation, depth, parents, change_id, flags, skip, changed) \
+                 VALUES ($1, $2, 2, 2, $3, $4, 0, $5, NULL)",
+            )
+            .bind(f.pid)
+            .bind(m.hex())
+            .bind(parents_json)
+            .bind(veil_core::ChangeId::random().to_string())
+            .bind(ps[0].hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+                 VALUES ($1, $2, $3, $4, 0, FALSE)",
+            )
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(m.hex())
+            .bind(f.p0.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+        }
+        let next_ep: i64 = sqlx::query_scalar(
+            "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 1, 0) \
+             ON CONFLICT (project_id, person_id) DO UPDATE SET epoch = access_epochs.epoch + 1 RETURNING epoch",
+        )
+        .bind(f.pid)
+        .fetch_one(&h.db)
+        .await
+        .unwrap();
+        h.caches.set_gc_epoch(f.pid, next_ep);
+    });
+
+    let swept_uncollapsed_count = || -> i64 {
+        hub.rt
+            .block_on(
+                sqlx::query_scalar(
+                    "SELECT count(*) FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3) AND NOT collapsed",
+                )
+                .bind(f.pid)
+                .bind(&f.vk)
+                .bind(&swept_merge_hex)
+                .fetch_one(&h.db),
+            )
+            .unwrap()
+    };
+
+    // (a) Live post-`0011` `R_0` (`collapsed = false`):
+    let r_chg = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change beside swept Subcase B rows",
+            "edits": [{"path": "src/swept_b.rs", "put": {"text": "ok b\n"}}],
+        }),
+    );
+    assert_no_swept_id("Subcase B POST /changes", &r_chg.body, &all_swept_ids);
+    assert_eq!(r_chg.status, 200, "{}", String::from_utf8_lossy(&r_chg.body));
+
+    let sess = api.post_json(
+        Some(&dev_tok),
+        "/v1/sessions/ci",
+        &json!({"project": f.p.name, "only": ["src/"]}),
+    );
+    assert_eq!(sess.status, 200, "{}", String::from_utf8_lossy(&sess.body));
+    let runner_tok = sess.json()["token"].as_str().unwrap().to_string();
+
+    let post_chk = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/swept-b",
+            "state": "pass",
+            "summary": "green b",
+        }),
+    );
+    assert_no_swept_id("Subcase B POST /checks", &post_chk.body, &all_swept_ids);
+    assert_eq!(post_chk.status, 200, "{}", String::from_utf8_lossy(&post_chk.body));
+
+    let got_chk = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    assert_eq!(got_chk.status, 200, "{}", String::from_utf8_lossy(&got_chk.body));
+    assert_eq!(got_chk.json()["checks"].as_array().unwrap().len(), 1);
+
+    let mut c = Craft::new(&api, &f.p.admin, &f.p.name, "main");
+    c.tip = f.r_merge;
+    c.root = c.tree_of(f.r_merge);
+    c.file(&format!("{BILL_DIR}/swept_b_step.txt"), "step 1\n");
+    let mut s = Snapshot {
+        parents: vec![f.r_merge],
+        change_id: veil_core::ChangeId::random(),
+        tree: c.root,
+        description: Text::Plain("hidden step b".into()),
+        author: "admin".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        agent: None,
+        abandoned: None,
+        attempts: vec![],
+        signature: None,
+    };
+    s.sign(&c.identity);
+    let r_after = c.put(O::Snapshot(s));
+    c.file(&format!("{BILL_DIR}/swept_b_step.txt"), "step 2\n");
+    let (_, rep) = c.push_edited("swept-b-branch", None, move |sn| sn.parents = vec![r_after]);
+    assert_eq!(rep.status, 200, "{}", String::from_utf8_lossy(&rep.body));
+    assert_eq!(api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["swept-b-branch"], f.p0);
+
+    let mut m = Craft::new(&api, &f.p.dev, &f.p.name, "swept-b-branch");
+    m.file("src/swept_b_land.rs", "land b\n");
+    let r_push = m.push_to("swept-b-branch", Some(f.p0));
+    assert_no_swept_id("Subcase B push", &r_push.body, &all_swept_ids);
+    assert_eq!(r_push.status, 200, "{}", String::from_utf8_lossy(&r_push.body));
+    let dev_tip = api.tips(Some(&dev_tok), &f.p.name).unwrap().branches["swept-b-branch"];
+
+    let r_land = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", f.p.name),
+        &json!({
+            "onto": "main",
+            "snapshot": dev_tip.hex(),
+            "receipts": {},
+            "wait": true,
+        }),
+    );
+    assert_no_swept_id("Subcase B POST /land", &r_land.body, &all_swept_ids);
+    assert_eq!(r_land.status, 200, "{}", String::from_utf8_lossy(&r_land.body));
+    assert_eq!(r_land.json()["state"], "landed");
+    assert_eq!(swept_uncollapsed_count(), 3, "swept Subcase B rows must not be marked collapsed = true");
+
+    // (b) Pre-`0011` `R_0` (`collapsed = true`), leaving `[dead_b1, dead_b2, dead_b3]`
+    // as the ONLY `projections_own` rows alongside live `R_0`:
+    let mut keep_rows = vec![f.r0.hex()];
+    keep_rows.extend(swept_merge_hex.iter().cloned());
+    hub.rt.block_on(async {
+        sqlx::query("DELETE FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT (real_id = ANY($4))")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.p0.hex())
+            .bind(&keep_rows)
+            .execute(&h.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE projections SET collapsed = TRUE WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+            .bind(f.pid)
+            .bind(&f.vk)
+            .bind(f.r0.hex())
+            .execute(&h.db)
+            .await
+            .unwrap();
+    });
+
+    let r_chg_pre = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/changes", f.p.name),
+        &json!({
+            "base": f.p0.hex(),
+            "description": "dev change on pre-0011 R_0 beside swept Subcase B rows",
+            "edits": [{"path": "src/swept_b_pre0011.rs", "put": {"text": "ok pre0011 b\n"}}],
+        }),
+    );
+    assert_no_swept_id("Subcase B pre-0011 POST /changes", &r_chg_pre.body, &all_swept_ids);
+    assert_eq!(r_chg_pre.status, 200, "{}", String::from_utf8_lossy(&r_chg_pre.body));
+
+    let post_chk_pre = api.post_json(
+        Some(&runner_tok),
+        &format!("/v1/projects/{}/checks", f.p.name),
+        &json!({
+            "snapshot": f.p0.hex(),
+            "name": "ci/swept-b-pre0011",
+            "state": "pass",
+            "summary": "green pre0011 b",
+        }),
+    );
+    assert_no_swept_id("Subcase B pre-0011 POST /checks", &post_chk_pre.body, &all_swept_ids);
+    assert_eq!(post_chk_pre.status, 200, "{}", String::from_utf8_lossy(&post_chk_pre.body));
+
+    let got_chk_pre = api.get(Some(&admin_tok), &format!("/v1/projects/{}/checks?rev={}", f.p.name, f.r0.hex()));
+    assert_eq!(got_chk_pre.status, 200, "{}", String::from_utf8_lossy(&got_chk_pre.body));
+    assert_eq!(got_chk_pre.json()["checks"].as_array().unwrap().len(), 2);
+    assert_eq!(swept_uncollapsed_count(), 3, "swept Subcase B rows must remain untouched in pre-0011 fallback");
+}

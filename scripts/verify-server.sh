@@ -48,6 +48,9 @@ else
 fi
 PG=$TAG-pg YB=$TAG-yb S3=$TAG-minio
 PG_DB=veil YB_DB=yugabyte
+# Veil v1 supports PostgreSQL only (owner, 2026-11-18): YugabyteDB is
+# experimental, and its steps run only with VEIL_VERIFY_YB=1.
+WITH_YB=${VEIL_VERIFY_YB:-0}
 
 ysql() { D exec "$YB" sh -c "bin/ysqlsh -h \$(hostname -i) -c \"$1\""; }
 ysql_at() { D exec "$YB" sh -c "bin/ysqlsh -h \$(hostname -i) -tAc \"$1\""; }
@@ -69,9 +72,11 @@ cleanup() {
     for db in $PG_DB $(D exec "$PG" psql -U veil -d veil -tAc "$q" 2>/dev/null); do
       D exec "$PG" psql -U veil -d veil -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
     done
-    for db in $YB_DB $(ysql_at "$q" 2>/dev/null); do
-      ysql "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
-    done
+    if [ "$WITH_YB" = 1 ]; then
+      for db in $YB_DB $(ysql_at "$q" 2>/dev/null); do
+        ysql "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
+      done
+    fi
   else
     D rm -f "$PG" "$YB" "$S3" >/dev/null 2>&1
   fi
@@ -92,6 +97,7 @@ start_services() {
   # A one-node database needs no YSQL operation lease; on a busy machine its
   # renewal comes late, and YugabyteDB then kills every connection and
   # restarts (seen on 8-vCPU Boat machines: 370 of 425 tests failed).
+  [ "$WITH_YB" = 1 ] || { PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=-; for i in $(seq 120); do D exec "$PG" pg_isready -h 127.0.0.1 -U veil >/dev/null 2>&1 && break; sleep 1; done; for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done; return 0; }
   running "$YB" || { D rm -f "$YB" >/dev/null 2>&1; D run -d --name "$YB" -p 127.0.0.1::5433 "$YB_IMAGE" bin/yugabyted start --background=false \
     --tserver_flags=yb_enable_read_committed_isolation=true,memory_limit_hard_bytes=3221225472,ysql_num_shards_per_tserver=1,enable_ysql_operation_lease=false \
     --master_flags=memory_limit_hard_bytes=1073741824,enforce_tablet_replica_limits=false,enable_ysql_operation_lease=false >/dev/null || return 1; }
@@ -116,7 +122,7 @@ drop_dead_runs() {
     pid=$(echo "$db" | sed -E 's/^r([0-9]+)x.*/\1/; s/^veil_run_([0-9]+)$/\1/')
     [ -d "/proc/$pid" ] || D exec "$PG" psql -U veil -d veil -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
   done
-  for db in $(ysql_at "$q" 2>/dev/null); do
+  [ "$WITH_YB" = 1 ] && for db in $(ysql_at "$q" 2>/dev/null); do
     pid=$(echo "$db" | sed -E 's/^r([0-9]+)x.*/\1/; s/^veil_run_([0-9]+)$/\1/')
     [ -d "/proc/$pid" ] || ysql "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1
   done
@@ -138,7 +144,7 @@ if [ $SHARED = 1 ]; then
   flock -u 9
   PG_DB=veil_run_$RUN YB_DB=veil_run_$RUN
   D exec "$PG" psql -U veil -d veil -c "CREATE DATABASE $PG_DB" >/dev/null || { echo "creating $PG_DB failed"; exit 1; }
-  ysql "CREATE DATABASE $YB_DB" >/dev/null || { echo "creating $YB_DB on YugabyteDB failed"; exit 1; }
+  [ "$WITH_YB" = 1 ] && { ysql "CREATE DATABASE $YB_DB" >/dev/null || { echo "creating $YB_DB on YugabyteDB failed"; exit 1; }; }
 else
   echo "== starting containers"
   start_services || { echo "starting containers failed"; exit 1; }
@@ -157,7 +163,8 @@ YB_URL=postgres://yugabyte@127.0.0.1:$YB_PORT/$YB_DB
 # Migrate each database once, before any server starts (BUG-838): servers
 # that find the schema current run no DDL, so the suites' many servers
 # never change the catalog under one another.
-for url in "$PG_URL" "$YB_URL"; do
+URLS=("$PG_URL"); [ "$WITH_YB" = 1 ] && URLS+=("$YB_URL")
+for url in "${URLS[@]}"; do
   timeout 300 target/debug/veil-server migrate --database-url "$url" || { echo "migrating $url failed"; exit 1; }
 done
 
@@ -189,16 +196,19 @@ step objects-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=v
 # YugabyteDB is shared by every run on the machine: 8 tests at a time, so
 # several runs at once do not drown it in servers and pools (each test
 # starts its own); results stay trustworthy under load.
-STEP_LIMIT=1800 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" "${SKIP_HOSTILE[@]}" --test-threads=8
-objects_yb=${VEIL_VERIFY_OBJECTS_YB:-auto}
-if [ "$objects_yb" = auto ]; then
-  base=$(git merge-base HEAD integration 2>/dev/null)
-  if [ -n "$base" ] && git diff --name-only "$base" HEAD -- crates/veil-server/src/store.rs crates/veil-server/src/sync.rs crates/veil-server/src/pack_gc.rs crates/veil-server/src/changes.rs crates/veil-server/src/landing/service.rs | grep -q .; then objects_yb=1; else objects_yb=0; fi
-fi
-if [ "$objects_yb" = 1 ]; then
-  STEP_LIMIT=1800 step objects-yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-oyb-$RUN VEIL_TEST_OBJECT_LAYOUT=objects "$BIN" "${OBJECTS_MODULES[@]}" "${SKIP_HOSTILE[@]}" --test-threads=8
-else
-  echo "   skip  objects-yugabyte (no store/sync/pack_gc/changes/landing changes; VEIL_VERIFY_OBJECTS_YB=1 runs it)"
+[ "$WITH_YB" = 1 ] || echo "   skip  yugabyte (v1 supports PostgreSQL only; VEIL_VERIFY_YB=1 runs it)"
+[ "$WITH_YB" = 1 ] && STEP_LIMIT=1800 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" "${SKIP_HOSTILE[@]}" --test-threads=8
+if [ "$WITH_YB" = 1 ]; then
+  objects_yb=${VEIL_VERIFY_OBJECTS_YB:-auto}
+  if [ "$objects_yb" = auto ]; then
+    base=$(git merge-base HEAD integration 2>/dev/null)
+    if [ -n "$base" ] && git diff --name-only "$base" HEAD -- crates/veil-server/src/store.rs crates/veil-server/src/sync.rs crates/veil-server/src/pack_gc.rs crates/veil-server/src/changes.rs crates/veil-server/src/landing/service.rs | grep -q .; then objects_yb=1; else objects_yb=0; fi
+  fi
+  if [ "$objects_yb" = 1 ]; then
+    STEP_LIMIT=1800 step objects-yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-oyb-$RUN VEIL_TEST_OBJECT_LAYOUT=objects "$BIN" "${OBJECTS_MODULES[@]}" "${SKIP_HOSTILE[@]}" --test-threads=8
+  else
+    echo "   skip  objects-yugabyte (no store/sync/pack_gc/changes/landing changes; VEIL_VERIFY_OBJECTS_YB=1 runs it)"
+  fi
 fi
 # One at a time: on a database other runs share, three at once could keep
 # a statement past its timeout.
@@ -214,7 +224,7 @@ if [ "$hostile" = auto ]; then
 fi
 if [ "$hostile" = 1 ]; then
   STEP_LIMIT=2400 step hostile-postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-hpg-$RUN "$BIN" "${HOSTILE[@]}" --test-threads=1
-  STEP_LIMIT=9000 step hostile-yugabyte flock -w 7200 "${XDG_RUNTIME_DIR:-/tmp}/veil-yb-hostile.lock" env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "${HOSTILE[@]}" --test-threads=1
+  [ "$WITH_YB" = 1 ] && STEP_LIMIT=9000 step hostile-yugabyte flock -w 7200 "${XDG_RUNTIME_DIR:-/tmp}/veil-yb-hostile.lock" env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-hyb-$RUN "$BIN" "${HOSTILE[@]}" --test-threads=1
 else
   echo "   skip  hostile sets (no derive/ or query/ changes; VEIL_VERIFY_HOSTILE=1 runs them)"
 fi
@@ -236,7 +246,7 @@ load_step() { # name, url, bucket, copies: the copies are bounded, not the funct
   cat "$LOGS/$name.log" | sed 's/^/         /'
 }
 load_step load-postgres "$PG_URL" veil-load-pg-$RUN 8
-load_step load-yugabyte "$YB_URL" veil-load-yb-$RUN 3
+[ "$WITH_YB" = 1 ] && load_step load-yugabyte "$YB_URL" veil-load-yb-$RUN 3
 
 echo "== result"
 if [ $status = 0 ]; then echo "verify-server: all green"; else echo "verify-server: FAILED (logs in $LOGS)"; fi
