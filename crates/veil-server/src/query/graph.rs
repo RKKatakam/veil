@@ -1374,7 +1374,7 @@ pub struct State {
     pub blame_steps: std::sync::atomic::AtomicU64,
 }
 
-type Fill = watch::Receiver<Option<std::result::Result<(), (bool, String)>>>;
+type Fill = watch::Receiver<Option<std::result::Result<(), crate::error::Answer>>>;
 
 impl Default for State {
     fn default() -> Self {
@@ -1503,11 +1503,8 @@ async fn filled(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[Obje
                 .map_err(|_| warming_at(&progress))?,
             None => done.await,
         };
-        if let Some(Err((full, e))) = outcome {
-            if full {
-                return Err(Error::Other(anyhow::Error::new(crate::pack::IndexesFull)));
-            }
-            return Err(Error::Other(anyhow::anyhow!("filling a viewer graph: {e}")));
+        if let Some(Err(a)) = outcome {
+            return Err(a.into_error());
         }
         ours_done = started;
     }
@@ -1615,15 +1612,15 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
             true => leased_fill(&hub, &project, &viewer, &key.1, &tips, &at).await,
             false => walk_tips(&hub, &project, &viewer, &tips, false, &at, Some(&hub.query.row_slots)).await.map(|_| ()),
         };
-        if let Err(e) = &r {
-            eprintln!("veil-server: filling a viewer graph of project {}: {e:?}", project.id);
-        }
+        let out = r.map_err(|e| match e {
+            Error::Api { status, code, message } => {
+                Error::Other(anyhow::anyhow!("filling a viewer graph of project {}: unexpected {status} ({code}): {message}", project.id)).answer()
+            }
+            other => other.answer(),
+        });
         hub.query.fills.lock().unwrap().remove(&key);
-        let rows_done = !files && r.is_ok();
-        let _ = tx.send(Some(r.map_err(|e| {
-            let full = matches!(&e, Error::Other(a) if crate::pack::indexes_full(a));
-            (full, format!("{e:?}"))
-        })));
+        let rows_done = !files && out.is_ok();
+        let _ = tx.send(Some(out));
         // The rows are there: their file history next, in the background
         // (nobody waits for it but blame and the history of a path).
         if rows_done {

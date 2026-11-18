@@ -38,12 +38,12 @@ use veil_core::{
     cache::LruCache,
     hub::{
         grant::{request_signed, BatchRequest, ChainSource, Chains, Epochs, Grant, GrantBody, GRANT_TTL_MS},
-        project::{Node, Projector, TreeSource},
+        project::Projector,
         wire::{put_frame, MAX_WANTS},
     },
     identity::SeedSigner,
     object::{Object, Tree},
-    ObjectId, VeilError,
+    ObjectId,
 };
 
 use crate::{
@@ -232,22 +232,15 @@ async fn grant_root(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snap: Ob
 
 impl ChainSource for Source {
     fn tree(&self, id: &ObjectId) -> veil_core::Result<Option<Arc<Tree>>> {
-        match self.node(id) {
-            Ok(Node::Tree(t, _)) => Ok(Some(t)),
-            Ok(Node::Leaf) | Err(VeilError::Missing(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.present_tree(id)
     }
 
     fn conflict_terms(&self, id: &ObjectId) -> veil_core::Result<Option<Vec<(ObjectId, u64)>>> {
-        match self.raw(id) {
-            Ok(raw) => Ok(match Object::decode(&raw)? {
-                Object::Conflict(c) => Some(c.interleaved().flatten().map(|t| (t.id, t.size)).collect()),
-                _ => None,
-            }),
-            Err(VeilError::Missing(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
+        let Some(raw) = self.present_raw(id)? else { return Ok(None) };
+        Ok(match self.decode_bytes(id, &raw)? {
+            Object::Conflict(c) => Some(c.interleaved().flatten().map(|t| (t.id, t.size)).collect()),
+            _ => None,
+        })
     }
 }
 

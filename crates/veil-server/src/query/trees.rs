@@ -396,7 +396,7 @@ pub fn pairs(changes: &[Change], from: &[Vec<changes::From>]) -> (Vec<Option<Pai
 
 impl TreeSource for Trees<'_, '_> {
     fn node(&self, id: &ObjectId) -> veil_core::Result<Node> {
-        self.g.tick().map_err(|e| veil_core::VeilError::Repo(format!("{e:?}")))?;
+        self.g.tick().map_err(crate::error::Error::into_veil)?;
         if let Some((t, _)) = self.pr.borrow().created.get(id) {
             return Ok(Node::Tree(t.clone(), TreeEncoding::Json));
         }
