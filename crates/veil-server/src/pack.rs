@@ -757,12 +757,60 @@ pub struct Packs {
     /// holding its share of `bound`; `None` once discarded here.
     staged: LruCache<Option<Arc<Held>>>,
     recent: LruCache<Recent>,
-    recent_lock: Mutex<()>,
+    shares: Arc<Mutex<StagedShares>>,
     leftover: LruCache<()>,
     on_leftover: std::sync::OnceLock<Arc<dyn Fn(i64) + Send + Sync>>,
 }
 
 const LEFTOVER_BUDGET: usize = 64 << 10;
+const STAGED_LEASES_BUDGET: usize = 4 << 20;
+const LISTED_LEASE: u32 = u32::MAX;
+
+struct StagedShares {
+    /// Outstanding upload grants per `name_key(project, name)` in `packs`
+    /// layout when running without a database, plus [`LISTED_LEASE`] once
+    /// listed (`BUG-1157`, `BUG-2665`). With a database, `packs.discarded_at`
+    /// holds the staged upload lease count while `state = STAGED`.
+    leases: LruCache<u32>,
+    /// In-flight requests reading staged pack `name_key(project, name)` in
+    /// `packs` layout; entries exist only while `> 0`.
+    readers: HashMap<ObjectId, u32>,
+    /// Consumed-pack settlements deferred while `readers` still holds an
+    /// active in-flight reader on this server (`BUG-2665`).
+    pending_consumes: HashMap<ObjectId, u32>,
+}
+
+/// Active reader guard on staged packs in `packs` layout (`BUG-2665`): keeps a
+/// concurrent sharer's `settle_uploads` / unkept-push discard from deleting a
+/// staged pack while another in-flight request is still reading it.
+pub struct StagedReaders {
+    shares: Option<Arc<Mutex<StagedShares>>>,
+    keys: Vec<ObjectId>,
+}
+
+impl StagedReaders {
+    pub fn none() -> StagedReaders {
+        StagedReaders { shares: None, keys: Vec::new() }
+    }
+}
+
+impl Drop for StagedReaders {
+    fn drop(&mut self) {
+        let Some(shares) = &self.shares else { return };
+        if self.keys.is_empty() {
+            return;
+        }
+        let mut s = shares.lock().unwrap();
+        for k in &self.keys {
+            if let Some(n) = s.readers.get_mut(k) {
+                *n -= 1;
+                if *n == 0 {
+                    s.readers.remove(k);
+                }
+            }
+        }
+    }
+}
 
 fn leftover_key(project: i64) -> ObjectId {
     let mut h = blake3::Hasher::new();
@@ -796,14 +844,16 @@ pub struct StagedSlots {
     pub slots: Vec<(ObjectId, Slot)>,
 }
 
-/// Outcome of checking receipted upload containers (`BUG-2661`).
-pub enum ReceiptPacks {
-    /// Containers still `STAGED` or `LISTED`; any container absent from the set
-    /// was discarded by an earlier check refusal (`BUG-930`, `BUG-1155`).
-    Usable(HashSet<Arc<str>>),
-    /// At least one receipted container was consumed or swept (not refused by
-    /// checks), so the caller should retry (`409 Conflict`).
-    Vanished,
+/// Classification of receipted upload containers (`BUG-2661`).
+pub struct ReceiptPacks {
+    /// Containers still `STAGED` or `LISTED`; any container absent from both
+    /// `usable` and `vanished` was discarded by an earlier check refusal
+    /// (`BUG-930`, `BUG-1155`).
+    pub usable: HashSet<Arc<str>>,
+    /// Containers consumed by a committing request or swept (`objects < 0` or
+    /// row deleted, not refused by checks), whose objects answer `409 Conflict`
+    /// when read (`BUG-2661`).
+    pub vanished: HashSet<Arc<str>>,
 }
 
 impl Packs {
@@ -819,7 +869,11 @@ impl Packs {
             bound: Bound { most: INDEXES_HELD - STAGED_INDEXES, ..Bound::new(INDEXES_HELD) },
             staged: LruCache::new(STAGED_INDEXES),
             recent: LruCache::new(RECENT_BUDGET),
-            recent_lock: Mutex::new(()),
+            shares: Arc::new(Mutex::new(StagedShares {
+                leases: LruCache::new(STAGED_LEASES_BUDGET),
+                readers: HashMap::new(),
+                pending_consumes: HashMap::new(),
+            })),
             leftover: LruCache::new(LEFTOVER_BUDGET),
             on_leftover: std::sync::OnceLock::new(),
         }
@@ -1209,6 +1263,12 @@ impl Packs {
     /// Packs this server listed in a transaction that committed (an index
     /// `None`: loaded when a lookup needs it).
     pub fn listed(&self, project: i64, packs: Vec<(Arc<str>, Option<Arc<Index>>)>) {
+        if !packs.is_empty() {
+            let s = self.shares.lock().unwrap();
+            for (name, _) in &packs {
+                s.leases.insert(name_key(project, name), LISTED_LEASE, 48);
+            }
+        }
         // Only into a map that is loaded: an unloaded one reads the whole
         // listing when first used. Without a database, what this process
         // lists is the listing.
@@ -1248,10 +1308,19 @@ impl Packs {
 
     /// Remember the index of a pack staged here, by `person`, with its
     /// share of the bound (given back when the cache drops it, or now if
-    /// the cache does not keep it), and list it in `recent` for `person`.
+    /// the cache does not keep it), record its initial upload lease, and
+    /// list it in `recent` for `person`.
     pub fn staged_here(&self, project: i64, person: i64, name: &Arc<str>, held: Held) {
         self.staged_index_here(project, name, held);
-        self.release_recent(project, person, std::slice::from_ref(name));
+        let s = self.shares.lock().unwrap();
+        s.leases.insert(name_key(project, name), 1, 48);
+        let k = person_key(project, person);
+        let mut q = self.recent.get(&k).unwrap_or_default();
+        q.retain(|n| n != name);
+        q.push_front(name.clone());
+        q.truncate(RECENT_UPLOADS);
+        let w = 96 + q.len() * 48;
+        self.recent.insert(k, q, w);
     }
 
     /// Cache the index of a newly staged upload container without adding it to
@@ -1274,7 +1343,7 @@ impl Packs {
         if names.is_empty() {
             return;
         }
-        let _g = self.recent_lock.lock().unwrap();
+        let _g = self.shares.lock().unwrap();
         let k = person_key(project, person);
         let Some(mut q) = self.recent.get(&k) else { return };
         let before = q.len();
@@ -1291,7 +1360,7 @@ impl Packs {
         if names.is_empty() {
             return;
         }
-        let _g = self.recent_lock.lock().unwrap();
+        let _g = self.shares.lock().unwrap();
         let k = person_key(project, person);
         let mut q = self.recent.get(&k).unwrap_or_default();
         for name in names {
@@ -1306,6 +1375,164 @@ impl Packs {
         self.recent.insert(k, q, w);
     }
 
+    /// Hold an active reader guard on `names` in `packs` layout (`BUG-2665`).
+    pub fn hold_staged_readers(&self, project: i64, names: &[Arc<str>]) -> StagedReaders {
+        if names.is_empty() {
+            return StagedReaders::none();
+        }
+        let keys: Vec<ObjectId> = names.iter().map(|n| name_key(project, n)).collect();
+        let mut s = self.shares.lock().unwrap();
+        for k in &keys {
+            *s.readers.entry(*k).or_insert(0) += 1;
+        }
+        StagedReaders {
+            shares: Some(self.shares.clone()),
+            keys,
+        }
+    }
+
+    /// Settle consumed upload leases on `names` in `packs` layout (`BUG-2665`):
+    /// `consume_each` is `1` when a committing request did not list `names`
+    /// (`0` when flushing consumes deferred while an in-flight local reader
+    /// was active). Packs still holding remaining upload leases or active
+    /// local readers stay `STAGED`; only packs reaching zero leases with no
+    /// active readers turn `DISCARDED` and are deleted from storage.
+    pub async fn discard_consumed_packs(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        names: &[Arc<str>],
+        consume_each: u32,
+        deletes: &AtomicU64,
+    ) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let mut ask_names = Vec::new();
+        let mut ask_counts = Vec::new();
+        let mut gone_no_db = Vec::new();
+        {
+            let mut s = self.shares.lock().unwrap();
+            for n in names {
+                let k = name_key(project, n);
+                if s.leases.get(&k) == Some(LISTED_LEASE) {
+                    s.pending_consumes.remove(&k);
+                    continue;
+                }
+                if s.readers.contains_key(&k) {
+                    if consume_each > 0 {
+                        *s.pending_consumes.entry(k).or_insert(0) += consume_each;
+                    }
+                    continue;
+                }
+                let c = consume_each + s.pending_consumes.remove(&k).unwrap_or(0);
+                if c == 0 {
+                    continue;
+                }
+                if self.db.is_some() {
+                    ask_names.push(n.to_string());
+                    ask_counts.push(c as i64);
+                } else {
+                    let rem = s.leases.get(&k).unwrap_or(0).saturating_sub(c);
+                    s.leases.insert(k, rem, 48);
+                    if rem == 0 {
+                        self.staged.insert(k, None, 64);
+                        gone_no_db.push(n.to_string());
+                    }
+                }
+            }
+        }
+        let gone: Vec<String> = match &self.db {
+            Some(db) => {
+                if ask_names.is_empty() {
+                    return Ok(());
+                }
+                let rows: Vec<(String, i16)> = sqlx::query_as(
+                    "UPDATE packs p \
+                        SET state = CASE WHEN COALESCE(p.discarded_at, 1) <= v.c THEN $3 ELSE p.state END, \
+                            discarded_at = CASE WHEN COALESCE(p.discarded_at, 1) <= v.c THEN $5 ELSE COALESCE(p.discarded_at, 1) - v.c END \
+                       FROM UNNEST($2::text[], $6::bigint[]) AS v(n, c) \
+                      WHERE p.project_id = $1 AND p.name = v.n AND p.state = $4 \
+                      RETURNING p.name, p.state",
+                )
+                .bind(project)
+                .bind(&ask_names)
+                .bind(DISCARDED)
+                .bind(STAGED)
+                .bind(veil_core::now_millis())
+                .bind(&ask_counts)
+                .fetch_all(db)
+                .await?;
+                let mut discarded = Vec::new();
+                for (n, st) in rows {
+                    if st == DISCARDED {
+                        self.staged.insert(name_key(project, &n), None, 64);
+                        discarded.push(n);
+                    }
+                }
+                discarded
+            }
+            None => gone_no_db,
+        };
+        let (mut first, mut failed) = (None, 0);
+        for n in &gone {
+            deletes.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = store.delete(&key(project, n)).await {
+                failed += 1;
+                first.get_or_insert(e);
+            }
+        }
+        match first {
+            Some(e) => Err(e.context(format!("{failed} of {} discarded packs of project {project} are still stored", gone.len()))),
+            None => Ok(()),
+        }
+    }
+
+    /// Flush any deferred consumes once local readers finish, and when
+    /// `release_one` is set (a push in `packs` layout that lost a non-error
+    /// branch race, `BUG-1157`), release one upload lease without discarding so
+    /// `vl push`'s retry re-acquires a balanced lease.
+    pub async fn release_staged_leases(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        names: &[Arc<str>],
+        release_one: bool,
+        deletes: &AtomicU64,
+    ) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        self.discard_consumed_packs(store, project, names, 0, deletes).await?;
+        if !release_one {
+            return Ok(());
+        }
+        if let Some(db) = &self.db {
+            let asked: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            sqlx::query(
+                "UPDATE packs \
+                    SET discarded_at = GREATEST(COALESCE(discarded_at, 1) - 1, 0) \
+                  WHERE project_id = $1 AND name = ANY($2) AND state = $3",
+            )
+            .bind(project)
+            .bind(&asked)
+            .bind(STAGED)
+            .execute(db)
+            .await?;
+        } else {
+            let s = self.shares.lock().unwrap();
+            for n in names {
+                let k = name_key(project, n);
+                if let Some(cur) = s.leases.get(&k) {
+                    if cur > 0 && cur != LISTED_LEASE {
+                        s.leases.insert(k, cur - 1, 48);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The index of pack `name` of `project` if the staged-index cache
     /// holds it (a listed upload's, for the lookup maps).
     pub fn staged_cached(&self, project: i64, name: &str) -> Option<Arc<Index>> {
@@ -1317,13 +1544,16 @@ impl Packs {
     /// those objects again gets its receipts instead of a new pack. When `take`
     /// is set (`objects` layout, `BUG-2661`), a candidate is atomically removed
     /// from `recent` before `usable` is awaited so no concurrent upload can be
-    /// handed the same container.
+    /// handed the same container. When `take` is false (`packs` layout,
+    /// `BUG-1157` / `BUG-2665`), the database check atomically increments the
+    /// staged pack's upload lease (`packs.discarded_at` while `state = STAGED`)
+    /// so no concurrent sharer on any server replica discards it early.
     pub async fn staged_holding(&self, project: i64, person: i64, ids: &[ObjectId], take: bool) -> Result<Option<Arc<str>>> {
         if take {
             let k = person_key(project, person);
             loop {
                 let candidate = {
-                    let _g = self.recent_lock.lock().unwrap();
+                    let _g = self.shares.lock().unwrap();
                     let Some(mut q) = self.recent.get(&k) else { return Ok(None) };
                     let mut picked = None;
                     let mut idx = 0;
@@ -1351,15 +1581,41 @@ impl Packs {
             }
         }
         let names: Vec<Arc<str>> = {
-            let _g = self.recent_lock.lock().unwrap();
+            let _g = self.shares.lock().unwrap();
             self.recent.get(&person_key(project, person)).map(|q| q.into_iter().collect()).unwrap_or_default()
         };
         for name in names {
-            let Some(Some(held)) = self.staged.get(&name_key(project, &name)) else { continue };
+            let k = name_key(project, &name);
+            let Some(Some(held)) = self.staged.get(&k) else { continue };
             if !ids.iter().all(|id| held.index.get(id).is_some()) {
                 continue;
             }
-            if self.usable(project, person, std::slice::from_ref(&name)).await?.contains(&name) {
+            if let Some(db) = &self.db {
+                let kept: Option<String> = sqlx::query_scalar(
+                    "UPDATE packs \
+                        SET discarded_at = CASE WHEN state = $4 THEN COALESCE(discarded_at, 1) + 1 ELSE NULL END \
+                      WHERE project_id = $1 AND name = $2 AND person_id = $3 AND state IN ($4, $5) \
+                      RETURNING name",
+                )
+                .bind(project)
+                .bind(&*name)
+                .bind(person)
+                .bind(STAGED)
+                .bind(LISTED)
+                .fetch_optional(db)
+                .await?;
+                if kept.is_some() {
+                    return Ok(Some(name));
+                }
+            } else {
+                let s = self.shares.lock().unwrap();
+                if self.staged.get(&k).flatten().is_none() {
+                    continue;
+                }
+                let cur = s.leases.get(&k).unwrap_or(0);
+                if cur != LISTED_LEASE {
+                    s.leases.insert(k, cur.saturating_add(1), 48);
+                }
                 return Ok(Some(name));
             }
         }
@@ -1389,17 +1645,23 @@ impl Packs {
     }
 
     /// Classify `names` (all verified by `sync::receipted` as issued to `person`
-    /// in `project`): containers still `STAGED` or `LISTED` are usable;
+    /// in `project`): containers still `STAGED` or `LISTED` go into `usable`;
     /// containers discarded by an earlier check refusal (`state = DISCARDED`
-    /// with `objects >= 0`, `BUG-930` / `BUG-1155`) are omitted so checks
-    /// answer `400`; containers consumed by a committing request or swept
-    /// (`objects < 0` or row deleted, `BUG-2661`) answer [`ReceiptPacks::Vanished`].
+    /// with `objects >= 0`, `BUG-930` / `BUG-1155`) are omitted from both sets
+    /// so checks answer `400`; containers consumed by a committing request or
+    /// swept (`objects < 0` or row deleted, `BUG-2661`) go into `vanished`.
     pub async fn usable_for_receipts(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<ReceiptPacks> {
         let Some(db) = &self.db else {
-            return Ok(ReceiptPacks::Usable(names.iter().cloned().collect()));
+            return Ok(ReceiptPacks {
+                usable: names.iter().cloned().collect(),
+                vanished: HashSet::new(),
+            });
         };
         if names.is_empty() {
-            return Ok(ReceiptPacks::Usable(HashSet::new()));
+            return Ok(ReceiptPacks {
+                usable: HashSet::new(),
+                vanished: HashSet::new(),
+            });
         }
         let asked: Vec<String> = names.iter().map(|n| n.to_string()).collect();
         let rows: Vec<(String, i16, i64)> = sqlx::query_as(
@@ -1412,16 +1674,19 @@ impl Packs {
         .await?;
         let by_name: HashMap<String, (i16, i64)> = rows.into_iter().map(|(n, s, o)| (n, (s, o))).collect();
         let mut usable = HashSet::with_capacity(names.len());
+        let mut vanished = HashSet::new();
         for n in names {
             match by_name.get(&**n) {
                 Some(&(s, _)) if s == STAGED || s == LISTED => {
                     usable.insert(n.clone());
                 }
                 Some(&(s, objs)) if s == DISCARDED && objs >= 0 => {}
-                _ => return Ok(ReceiptPacks::Vanished),
+                _ => {
+                    vanished.insert(n.clone());
+                }
             }
         }
-        Ok(ReceiptPacks::Usable(usable))
+        Ok(ReceiptPacks { usable, vanished })
     }
 
     /// The index and length of staged pack `name`, with its share of the
@@ -1520,14 +1785,23 @@ impl Packs {
         store: &dyn BlobStore,
         project: i64,
         names: &[Arc<str>],
-        (refused, purge_row): (bool, bool),
+        (mark_consumed, purge_row): (bool, bool),
         (deletes, pack_rows): (&AtomicU64, &AtomicU64),
     ) -> Result<()> {
         if names.is_empty() {
             return Ok(());
         }
-        for n in names {
-            self.staged.insert(name_key(project, n), None, 64);
+        {
+            let mut s = self.shares.lock().unwrap();
+            for n in names {
+                let k = name_key(project, n);
+                s.pending_consumes.remove(&k);
+                let cur = s.leases.get(&k);
+                if cur != Some(LISTED_LEASE) && cur.is_some_and(|c| c > 0) {
+                    s.leases.insert(k, 0, 48);
+                }
+                self.staged.insert(k, None, 64);
+            }
         }
         let gone: Vec<String> = match &self.db {
             Some(db) => {
@@ -1536,7 +1810,7 @@ impl Packs {
                     "UPDATE packs \
                        SET state = $3, \
                            discarded_at = $5, \
-                           objects = CASE WHEN $6 THEN objects ELSE -1 END \
+                           objects = CASE WHEN $6 THEN -1 ELSE objects END \
                      WHERE project_id = $1 AND name = ANY($2) AND state = $4 \
                      RETURNING name",
                 )
@@ -1545,7 +1819,7 @@ impl Packs {
                 .bind(DISCARDED)
                 .bind(STAGED)
                 .bind(veil_core::now_millis())
-                .bind(refused)
+                .bind(mark_consumed)
                 .fetch_all(db)
                 .await?
             }

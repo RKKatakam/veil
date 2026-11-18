@@ -731,7 +731,7 @@ async fn encode_many(objects: Vec<(ObjectId, Bytes)>, threads: usize) -> Result<
             let handles: Vec<_> = objects
                 .chunks(chunk_len)
                 .map(|part| {
-                    s.spawn(move || -> Vec<(ObjectId, Bytes, Bytes)> {
+                    crate::spawn_scoped(s, move || -> Vec<(ObjectId, Bytes, Bytes)> {
                         part.iter()
                             .map(|(id, raw)| (*id, raw.clone(), encode(raw.clone())))
                             .collect()
@@ -1685,6 +1685,28 @@ impl Objects {
         }
     }
 
+    /// Hold an active reader guard on `names` in `packs` mode while an
+    /// in-flight push or API commit reads them (`BUG-2665`).
+    pub fn hold_staged_readers(&self, project: i64, names: &[Arc<str>]) -> crate::pack::StagedReaders {
+        if self.layout == ObjectLayout::Packs {
+            self.packs.hold_staged_readers(project, names)
+        } else {
+            crate::pack::StagedReaders::none()
+        }
+    }
+
+    /// Flush any deferred consumes in `packs` mode once local readers finish,
+    /// and when `release_one` is set (lost non-error branch race, `BUG-1157`),
+    /// release one upload lease without discarding (`BUG-2665`).
+    pub async fn release_staged_leases(&self, project: i64, names: &[Arc<str>], release_one: bool) -> Result<()> {
+        if self.layout == ObjectLayout::Packs {
+            self.packs
+                .release_staged_leases(&*self.store, project, names, release_one, &self.deletes)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// The index and length of staged pack `name` of `project`, held under
     /// its share of the bound on indexes; `None` if it is not in the store
     /// (discarded).
@@ -1704,7 +1726,7 @@ impl Objects {
     /// encoding and the object, checked against its id; `None` if the pack
     /// is gone (discarded).
     pub async fn get_staged(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<(Bytes, Bytes)>> {
-        if self.packs.is_discarded_here(project, name) {
+        if self.layout == ObjectLayout::Objects && self.packs.is_discarded_here(project, name) {
             return Ok(None);
         }
         let ck = Self::staged_key(project, name, id, false);
@@ -1817,7 +1839,7 @@ impl Objects {
     /// only (or the cache), its entry's head checked; `None` if the pack is
     /// gone.
     pub async fn staged_declared(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<u64>> {
-        if self.packs.is_discarded_here(project, name) {
+        if self.layout == ObjectLayout::Objects && self.packs.is_discarded_here(project, name) {
             return Ok(None);
         }
         if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
@@ -1840,7 +1862,7 @@ impl Objects {
     /// decodes it, checked against the id, within its share of the bound on
     /// decoded bytes); `None` if the pack is gone.
     pub async fn staged_encoding(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<Bytes>> {
-        if self.packs.is_discarded_here(project, name) {
+        if self.layout == ObjectLayout::Objects && self.packs.is_discarded_here(project, name) {
             return Ok(None);
         }
         if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
@@ -1896,19 +1918,26 @@ impl Objects {
     /// the `DISCARDED` row so re-presenting those receipts still answers `400`.
     pub async fn discard_refused(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
         self.packs
-            .discard_with(&*self.store, project, names, (true, false), (&self.deletes, &self.pack_rows))
+            .discard_with(&*self.store, project, names, (false, false), (&self.deletes, &self.pack_rows))
             .await
     }
 
     /// Discard staged containers `names` consumed by a committing push or API
-    /// commit (`BUG-2661`): marks `objects = -1` (and purges the `packs` row in
-    /// `objects` mode once deleted from storage) so a concurrent or replayed
-    /// request naming them answers `409 Conflict`.
+    /// commit: in `objects` mode (`BUG-2661`), marks `objects = -1` and purges
+    /// the `packs` row once deleted from storage so a concurrent or replayed
+    /// request naming them answers `409 Conflict`; in `packs` mode
+    /// (`BUG-2665`), releases one upload lease per pack and discards only
+    /// packs with no remaining upload leases or active readers.
     pub async fn discard_consumed(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
-        let purge_row = self.layout == ObjectLayout::Objects;
-        self.packs
-            .discard_with(&*self.store, project, names, (false, purge_row), (&self.deletes, &self.pack_rows))
-            .await
+        if self.layout == ObjectLayout::Objects {
+            self.packs
+                .discard_with(&*self.store, project, names, (true, true), (&self.deletes, &self.pack_rows))
+                .await
+        } else {
+            self.packs
+                .discard_consumed_packs(&*self.store, project, names, 1, &self.deletes)
+                .await
+        }
     }
 
     /// Delete containers `names` (marked `DISCARDED` in a push's transaction)

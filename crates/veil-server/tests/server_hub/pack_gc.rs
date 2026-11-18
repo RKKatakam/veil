@@ -1826,7 +1826,7 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
             Box::new(move |s| {
                 format!(
                     "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch, state, created_at) \
-                     VALUES ({pid}, 'main', 't-2602-stack', {admin_pid}, 'admin', 'k', '[[\"{s}\", \"{m}\"]]', 0, 0, 0, 'queued', 1000)"
+                     VALUES ({pid}, 'main', 't-2602-stack-{pid}', {admin_pid}, 'admin', 'k', '[[\"{s}\", \"{m}\"]]', 0, 0, 0, 'queued', 1000)"
                 )
             })
         }),
@@ -1834,7 +1834,7 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
             Box::new(move |s| {
                 format!(
                     "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, result, lineage, person_epoch, project_epoch, state, created_at) \
-                     VALUES ({pid}, 'main', 't-2602-result', {admin_pid}, 'admin', 'k', '[]', '{{\"landed\": \"{s}\"}}', 0, 0, 0, 'landed', 1000)"
+                     VALUES ({pid}, 'main', 't-2602-result-{pid}', {admin_pid}, 'admin', 'k', '[]', '{{\"landed\": \"{s}\"}}', 0, 0, 0, 'landed', 1000)"
                 )
             })
         }),
@@ -2046,7 +2046,7 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
     assert_eq!(named.len(), 7, "the roots written are still there: {named:?}");
     let queued_state: String = hub
         .rt
-        .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = 't-2602-stack'").bind(pid).fetch_one(&h.db))
+        .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(format!("t-2602-stack-{pid}")).fetch_one(&h.db))
         .unwrap();
     assert_eq!(queued_state, "queued", "t-2602-stack stays queued across peer landing::resume");
     for s in named {

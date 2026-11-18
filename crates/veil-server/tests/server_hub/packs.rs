@@ -1824,3 +1824,190 @@ fn bug_2370_racing_pushes_leave_no_pack_of_their_own_behind() {
         }
     }
 }
+
+/// BUG-2665: in `packs` layout, uploading the same objects multiple times as
+/// one person deduplicates to one staged pack (`BUG-1157`). Concurrent API
+/// commits (`POST …/changes`) naming those receipts — whether all in flight on
+/// one server or staggered across a cold server replica after the first sharer
+/// settles — all answer `200`, keep `objects >= 0`, and discard + delete the
+/// shared staged pack only once the last sharer settles.
+#[test]
+fn bug_2665_concurrent_api_commits_sharing_a_deduplicated_upload_all_succeed() {
+    use std::collections::HashSet;
+    use veil_core::hub::encoding;
+
+    let hub = TestHub::start_packs();
+    let other = TestHub::beside_with_layout(&hub, veil_server::ObjectLayout::Packs);
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let other_api = other.api();
+    let token = p.dev.token();
+    let base = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+
+    let make_frames = |seed: u8| -> Vec<(ObjectId, Vec<u8>, Vec<u8>)> {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15 ^ u64::from(seed);
+        (0..4u8)
+            .map(|k| {
+                let mut content = vec![0u8; 64 << 10];
+                for i in (0..content.len()).step_by(16) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    content[i] = x as u8;
+                }
+                content[0] = seed;
+                content[1] = k;
+                let raw = O::Blob(content.clone()).encode();
+                let id = ObjectId::hash(&raw);
+                let enc = encoding::encode(&raw).into_owned();
+                (id, content, enc)
+            })
+            .collect()
+    };
+
+    // Case 1: 3 uploads deduplicated to 1 staged pack on `hub`, followed by 3
+    // simultaneous API commits on `hub`.
+    let frames_a = make_frames(0x41);
+    let w0 = writes(&hub);
+    let mut packs_a = HashSet::new();
+    let commits_a: Vec<serde_json::Value> = (0..3)
+        .map(|n| {
+            let mut body = Vec::new();
+            for (id, _, enc) in &frames_a {
+                put_frame(&mut body, id, enc);
+            }
+            let up = api.upload_encoded_body(&token, &p.name, &body);
+            assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+            let receipts: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
+            for r in &receipts {
+                packs_a.insert(r.split_once('.').unwrap().1.to_string());
+            }
+            let edits: Vec<serde_json::Value> = frames_a
+                .iter()
+                .enumerate()
+                .map(|(i, (id, _, _))| json!({"path": format!("src/c2665_a{n}/f{i}.bin"), "put": {"object": id.hex()}}))
+                .collect();
+            let rmap: serde_json::Map<String, serde_json::Value> = frames_a
+                .iter()
+                .zip(&receipts)
+                .map(|((id, _, _), r)| (id.hex(), json!(r)))
+                .collect();
+            json!({"base": base.hex(), "description": format!("c2665 a{n}"), "edits": edits, "receipts": rmap})
+        })
+        .collect();
+    assert_eq!(packs_a.len(), 1, "all 3 uploads must share one deduplicated pack: {packs_a:?}");
+    assert_eq!(writes(&hub) - w0, 1, "deduplicated uploads write one staged pack");
+    let pack_a = packs_a.into_iter().next().unwrap();
+
+    let replies_a: Vec<Reply> = std::thread::scope(|s| {
+        let hs: Vec<_> = commits_a
+            .iter()
+            .map(|c| s.spawn(|| api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), c)))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (n, r) in replies_a.iter().enumerate() {
+        assert_eq!(r.status, 200, "commit a{n}: {}", String::from_utf8_lossy(&r.body));
+        let snap_id = ObjectId::from_hex(r.json()["snapshot"].as_str().unwrap()).unwrap();
+        let fetched = other_api.post_json(
+            Some(&token),
+            &format!("/v1/projects/{}/fetch", p.name),
+            &json!({"snapshot": snap_id.hex(), "objects": [{"path": format!("src/c2665_a{n}/f0.bin"), "id": frames_a[0].0.hex()}]}),
+        );
+        assert_eq!(fetched.status, 200, "fetch a{n}: {}", String::from_utf8_lossy(&fetched.body));
+        assert_eq!(O::decode(&fetched.frames()[0].1).unwrap(), O::Blob(frames_a[0].1.clone()));
+    }
+    let row_a: (i16, i64) = hub
+        .rt
+        .block_on(
+            sqlx::query_as("SELECT state, objects FROM packs WHERE project_id = $1 AND name = $2")
+                .bind(pid)
+                .bind(&pack_a)
+                .fetch_one(&hub.hub().db),
+        )
+        .unwrap();
+    assert_eq!(row_a, (2, 4), "shared pack_a must be DISCARDED with objects intact after all 3 sharers settle");
+    assert!(
+        !hub.rt.block_on(hub.hub().objects.blob_store().exists(&veil_server::pack::key(pid, &pack_a))).unwrap(),
+        "discarded pack_a must be deleted from storage"
+    );
+
+    // Case 2: 3 uploads deduplicated to 1 staged pack `pack_b` on `hub`; Commit 0
+    // settles on `hub` first, then Commits 1 and 2 run concurrently on cold
+    // replica `other` (must read `pack_b` from storage, not in-memory cache).
+    let frames_b = make_frames(0x73);
+    let w1 = writes(&hub);
+    let mut packs_b = HashSet::new();
+    let commits_b: Vec<serde_json::Value> = (0..3)
+        .map(|n| {
+            let mut body = Vec::new();
+            for (id, _, enc) in &frames_b {
+                put_frame(&mut body, id, enc);
+            }
+            let up = api.upload_encoded_body(&token, &p.name, &body);
+            assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
+            let receipts: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
+            for r in &receipts {
+                packs_b.insert(r.split_once('.').unwrap().1.to_string());
+            }
+            let edits: Vec<serde_json::Value> = frames_b
+                .iter()
+                .enumerate()
+                .map(|(i, (id, _, _))| json!({"path": format!("src/c2665_b{n}/f{i}.bin"), "put": {"object": id.hex()}}))
+                .collect();
+            let rmap: serde_json::Map<String, serde_json::Value> = frames_b
+                .iter()
+                .zip(&receipts)
+                .map(|((id, _, _), r)| (id.hex(), json!(r)))
+                .collect();
+            json!({"base": base.hex(), "description": format!("c2665 b{n}"), "edits": edits, "receipts": rmap})
+        })
+        .collect();
+    assert_eq!(packs_b.len(), 1, "all 3 uploads must share one deduplicated pack: {packs_b:?}");
+    assert_eq!(writes(&hub) - w1, 1, "deduplicated uploads write one staged pack");
+    let pack_b = packs_b.into_iter().next().unwrap();
+
+    let first = api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), &commits_b[0]);
+    assert_eq!(first.status, 200, "commit b0: {}", String::from_utf8_lossy(&first.body));
+    let mid_b: (i16, i64) = hub
+        .rt
+        .block_on(
+            sqlx::query_as("SELECT state, objects FROM packs WHERE project_id = $1 AND name = $2")
+                .bind(pid)
+                .bind(&pack_b)
+                .fetch_one(&hub.hub().db),
+        )
+        .unwrap();
+    assert_eq!(mid_b, (0, 4), "pack_b must stay STAGED while 2 upload leases remain");
+    assert!(
+        hub.rt.block_on(hub.hub().objects.blob_store().exists(&veil_server::pack::key(pid, &pack_b))).unwrap(),
+        "pack_b must stay stored for remaining sharers"
+    );
+
+    let rest_b: Vec<Reply> = std::thread::scope(|s| {
+        let hs: Vec<_> = commits_b[1..]
+            .iter()
+            .map(|c| s.spawn(|| other_api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), c)))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (idx, r) in rest_b.iter().enumerate() {
+        assert_eq!(r.status, 200, "cold commit b{}: {}", idx + 1, String::from_utf8_lossy(&r.body));
+    }
+    let end_b: (i16, i64) = hub
+        .rt
+        .block_on(
+            sqlx::query_as("SELECT state, objects FROM packs WHERE project_id = $1 AND name = $2")
+                .bind(pid)
+                .bind(&pack_b)
+                .fetch_one(&hub.hub().db),
+        )
+        .unwrap();
+    assert_eq!(end_b, (2, 4), "shared pack_b must be DISCARDED with objects intact after last sharer settles");
+    assert!(
+        !hub.rt.block_on(hub.hub().objects.blob_store().exists(&veil_server::pack::key(pid, &pack_b))).unwrap(),
+        "discarded pack_b must be deleted from storage"
+    );
+}
+
