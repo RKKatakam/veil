@@ -83,9 +83,35 @@ pub struct TestHub {
     pub _dir: tempfile::TempDir,
 }
 
+/// Object layout for tests that do not pin one: `VEIL_TEST_OBJECT_LAYOUT`
+/// (`packs` or `objects`), defaulting to `packs`.
+pub fn env_object_layout() -> veil_server::ObjectLayout {
+    match std::env::var("VEIL_TEST_OBJECT_LAYOUT") {
+        Ok(v) if !v.is_empty() => v.parse().unwrap_or_else(|e| panic!("VEIL_TEST_OBJECT_LAYOUT={v:?}: {e}")),
+        _ => veil_server::ObjectLayout::Packs,
+    }
+}
+
 impl TestHub {
     pub fn start() -> TestHub {
         TestHub::start_with_ttl(Duration::from_secs(3600))
+    }
+
+    /// A server pinned to [`veil_server::ObjectLayout::Packs`], for tests
+    /// whose assertions are about packs (one storage write a push, listed
+    /// packs, background merges).
+    pub fn start_packs() -> TestHub {
+        TestHub::start_with_layout(veil_server::ObjectLayout::Packs)
+    }
+
+    /// A server pinned to [`veil_server::ObjectLayout::Objects`].
+    pub fn start_objects() -> TestHub {
+        TestHub::start_with_layout(veil_server::ObjectLayout::Objects)
+    }
+
+    pub fn start_with_layout(layout: veil_server::ObjectLayout) -> TestHub {
+        let url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
+        TestHub::start_with_s3_and_layout(&url, Duration::from_secs(3600), std::env::var("VEIL_TEST_S3_ENDPOINT").ok(), layout)
     }
 
     /// A server on a new database of its own, for a test that changes the
@@ -95,6 +121,17 @@ impl TestHub {
     pub fn start_own() -> TestHub {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         TestHub::start_on(&crate::grants::fresh_database(&rt), Duration::from_secs(3600))
+    }
+
+    /// [`TestHub::start_own`] pinned to [`veil_server::ObjectLayout::Objects`].
+    pub fn start_own_objects() -> TestHub {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        TestHub::start_with_s3_and_layout(
+            &crate::grants::fresh_database(&rt),
+            Duration::from_secs(3600),
+            std::env::var("VEIL_TEST_S3_ENDPOINT").ok(),
+            veil_server::ObjectLayout::Objects,
+        )
     }
 
     pub fn start_with_ttl(ttl: Duration) -> TestHub {
@@ -109,7 +146,17 @@ impl TestHub {
     /// A server whose objects are in the S3 store at `endpoint` (MinIO, or
     /// something in front of it), or in a temporary directory.
     pub fn start_with_s3(database_url: &str, ttl: Duration, endpoint: Option<String>) -> TestHub {
-        TestHub::start_with(database_url, ttl, endpoint, TestHub::limits(), "127.0.0.1:0".parse().unwrap())
+        TestHub::start_with_s3_and_layout(database_url, ttl, endpoint, env_object_layout())
+    }
+
+    /// [`TestHub::start_with_s3`] with an explicit [`veil_server::ObjectLayout`].
+    pub fn start_with_s3_and_layout(
+        database_url: &str,
+        ttl: Duration,
+        endpoint: Option<String>,
+        layout: veil_server::ObjectLayout,
+    ) -> TestHub {
+        TestHub::start_with(database_url, ttl, endpoint, TestHub::limits(), "127.0.0.1:0".parse().unwrap(), layout)
     }
 
     /// A server with `limits` (S24's tests).
@@ -121,10 +168,17 @@ impl TestHub {
     /// an IPv6 address).
     pub fn start_with_limits_on(listen: std::net::SocketAddr, limits: veil_server::limits::Settings) -> TestHub {
         let url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
-        TestHub::start_with(&url, Duration::from_secs(3600), std::env::var("VEIL_TEST_S3_ENDPOINT").ok(), limits, listen)
+        TestHub::start_with(&url, Duration::from_secs(3600), std::env::var("VEIL_TEST_S3_ENDPOINT").ok(), limits, listen, env_object_layout())
     }
 
-    fn start_with(database_url: &str, ttl: Duration, endpoint: Option<String>, limits: veil_server::limits::Settings, listen: std::net::SocketAddr) -> TestHub {
+    fn start_with(
+        database_url: &str,
+        ttl: Duration,
+        endpoint: Option<String>,
+        limits: veil_server::limits::Settings,
+        listen: std::net::SocketAddr,
+        object_layout: veil_server::ObjectLayout,
+    ) -> TestHub {
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let storage = match endpoint {
             Some(endpoint) => Storage::S3 {
@@ -155,6 +209,7 @@ impl TestHub {
             listen,
             database_url,
             storage,
+            object_layout,
             tls: TlsSource::SelfSigned,
             data_dir: dir.path().join("data"),
             session_ttl: ttl,
@@ -186,24 +241,53 @@ impl TestHub {
     /// same database, data directory (identity, certificate, receipt key)
     /// and object storage.
     pub fn beside(other: &TestHub) -> TestHub {
+        TestHub::beside_with_layout(other, other.config.object_layout)
+    }
+
+    /// [`TestHub::beside`] with `object_layout` (mixed deployments,
+    /// `object-layout.md` §5.1).
+    pub fn beside_with_layout(other: &TestHub, object_layout: veil_server::ObjectLayout) -> TestHub {
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
+            object_layout,
             ..other.config.clone()
         };
         TestHub::run(config, dir)
     }
 
+    /// [`TestHub::beside_with_layout`] over a custom `BlobStore` wrapper.
+    pub fn beside_with_store(
+        other: &TestHub,
+        object_layout: veil_server::ObjectLayout,
+        store: Arc<dyn veil_server::store::BlobStore>,
+    ) -> TestHub {
+        let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            object_layout,
+            ..other.config.clone()
+        };
+        TestHub::run_with_store(config, dir, Some(store))
+    }
+
     /// This server stopped and started again on the same port, data
     /// directory and storage, its memory empty (as after an upgrade);
     /// `between` runs while it is down (a migration).
-    pub fn restart(mut self, between: impl FnOnce(&str)) -> TestHub {
+    pub fn restart(self, between: impl FnOnce(&str)) -> TestHub {
+        let layout = self.config.object_layout;
+        self.restart_with_layout(layout, between)
+    }
+
+    /// [`TestHub::restart`] switching `object_layout`.
+    pub fn restart_with_layout(mut self, object_layout: veil_server::ObjectLayout, between: impl FnOnce(&str)) -> TestHub {
         if let Some(r) = self.running.take() {
             self.rt.block_on(r.stop());
         }
         between(&self.config.database_url);
         let config = Config {
             listen: format!("127.0.0.1:{}", self.port).parse().unwrap(),
+            object_layout,
             ..self.config.clone()
         };
         let dir = std::mem::replace(&mut self._dir, tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap());
@@ -211,13 +295,21 @@ impl TestHub {
     }
 
     fn run(config: Config, dir: tempfile::TempDir) -> TestHub {
+        TestHub::run_with_store(config, dir, None)
+    }
+
+    fn run_with_store(
+        config: Config,
+        dir: tempfile::TempDir,
+        store: Option<Arc<dyn veil_server::store::BlobStore>>,
+    ) -> TestHub {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(8)
             .thread_stack_size(veil_server::THREAD_STACK)
             .build()
             .unwrap();
-        let running = rt.block_on(veil_server::start(config.clone())).expect("server starts");
+        let running = rt.block_on(veil_server::start_with_store(config.clone(), store)).expect("server starts");
         let port = running.addr.port();
         let ca = config.data_dir.join("self-signed-cert.pem");
         let watch_id = watchdog::enter(format!("hub 127.0.0.1:{port}"));
@@ -243,6 +335,22 @@ impl TestHub {
         drop(running);
         rt.shutdown_timeout(Duration::from_secs(5));
         watchdog::leave(self.watch_id);
+    }
+
+    /// [`TestHub::crash`] followed by a fresh start on the same data
+    /// directory, database and object storage (`between` runs while down).
+    pub fn crash_and_restart(mut self, between: impl FnOnce(&str)) -> TestHub {
+        let running = self.running.take();
+        let rt = std::mem::replace(&mut self.rt, tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
+        drop(running);
+        rt.shutdown_timeout(Duration::from_secs(5));
+        between(&self.config.database_url);
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..self.config.clone()
+        };
+        let dir = std::mem::replace(&mut self._dir, tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap());
+        TestHub::run(config, dir)
     }
 
     pub fn authority(&self) -> String {

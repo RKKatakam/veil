@@ -237,7 +237,15 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
         extra(*files, "status, clean (daemon stopped: a scan)", vs, gs);
         extra(*files, "commit one changed file (daemon stopped: a scan)", vc, gc);
     }
-    Ok(json!({ "profile": "openscion", "objects": if a.server.s3_endpoint.is_some() { "s3" } else { "directory" }, "daemon": daemon, "cases": cases, "bytes": bytes }))
+    let object_layout = crate::server::stats_layout(&a.dir.join("server")).or_else(|| a.server.object_layout.clone());
+    Ok(json!({
+        "profile": "openscion",
+        "objects": if a.server.s3_endpoint.is_some() { "s3" } else { "directory" },
+        "object_layout": object_layout,
+        "daemon": daemon,
+        "cases": cases,
+        "bytes": bytes,
+    }))
 }
 
 /// The workloads measured as OpenScion measures its own numbers
@@ -369,13 +377,19 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
 
 /// The results as a Markdown table.
 pub fn markdown(v: &serde_json::Value) -> Result<String> {
-    let mut out = String::from(
-        "| Files | Workload | Veil (ms) | Git (ms) | Target (ms) | Meets target | Beats Git |\n|---:|---|---:|---:|---:|---|---|\n",
+    let mut out = String::new();
+    let layout = v["object_layout"].as_str().unwrap_or("–");
+    if let Some(l) = v["object_layout"].as_str() {
+        out.push_str(&format!("Object layout: `{l}`.\n\n"));
+    }
+    out.push_str(
+        "| Files | Layout | Workload | Veil (ms) | Git (ms) | Target (ms) | Meets target | Beats Git |\n|---:|---|---|---:|---:|---:|---|---|\n",
     );
     for c in v["cases"].as_array().ok_or_else(|| anyhow!("no cases"))? {
         out.push_str(&format!(
-            "| {} | {} | {:.1} | {:.1} | {} | {} | {} |\n",
+            "| {} | {} | {} | {:.1} | {:.1} | {} | {} | {} |\n",
             c["files"],
+            layout,
             c["case"].as_str().unwrap_or(""),
             c["veil_ms"].as_f64().unwrap_or(f64::NAN),
             c["git_ms"].as_f64().unwrap_or(f64::NAN),
@@ -385,11 +399,12 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         ));
     }
     let mib = |b: &serde_json::Value| b.as_f64().unwrap_or(f64::NAN) / 1048576.0;
-    out.push_str("\n| Files | Server read by the push (MiB) | Server wrote by the push | Server wrote by a clone |\n|---:|---:|---:|---:|\n");
+    out.push_str("\n| Files | Layout | Server read by the push (MiB) | Server wrote by the push | Server wrote by a clone |\n|---:|---|---:|---:|---:|\n");
     for b in v["bytes"].as_array().into_iter().flatten() {
         out.push_str(&format!(
-            "| {} | {:.2} | {:.2} | {:.2} |\n",
+            "| {} | {} | {:.2} | {:.2} | {:.2} |\n",
             b["files"],
+            layout,
             mib(&b["push_server_read_bytes"]),
             mib(&b["push_server_written_bytes"]),
             mib(&b["clone_server_written_bytes"]),

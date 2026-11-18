@@ -123,6 +123,16 @@ fn frame_window(frame: &[u8]) -> Option<u64> {
     Some(base + (base / 8) * u64::from(wd & 7))
 }
 
+fn header_window(header: &[u8]) -> Option<u64> {
+    let fhd = *header.get(4)?;
+    if fhd & 0x20 != 0 {
+        return header_content_size(header);
+    }
+    let wd = *header.get(5)?;
+    let base = 1u64 << (10 + u32::from(wd >> 3));
+    Some(base + (base / 8) * u64::from(wd & 7))
+}
+
 /// Is `enc` a compressed encoding?
 pub fn is_compressed(enc: &[u8]) -> bool {
     enc.first() == Some(&ZSTD)
@@ -141,6 +151,18 @@ pub fn declared_len(prefix: &[u8], stored_len: u64) -> Option<u64> {
     match *prefix.first()? {
         PLAIN => Some(stored_len),
         ZSTD => header_content_size(&prefix[1..]),
+        _ => None,
+    }
+}
+
+/// The decoder window an encoding's header declares (`0` for a plain
+/// encoding), from its first bytes alone (`prefix`, at least [`HEADER`]
+/// bytes of it or all of it). Not checked: for bounding what streaming
+/// verification holds (`BUG-2662`).
+pub fn declared_window(prefix: &[u8]) -> Option<u64> {
+    match *prefix.first()? {
+        PLAIN => Some(0),
+        ZSTD => header_window(&prefix[1..]),
         _ => None,
     }
 }
@@ -198,6 +220,36 @@ pub fn decode<'a>(id: &ObjectId, enc: &'a [u8], limit: u64) -> Result<Cow<'a, [u
         return Err(bad("object does not match its id"));
     }
     Ok(raw)
+}
+
+/// Check that `enc` is a valid encoding of `id` within `limit` bytes (same
+/// checks as [`decode`]), streaming zstd frames directly into BLAKE3 without
+/// allocating a second full-object output buffer (`BUG-2662`).
+pub fn verify(id: &ObjectId, enc: &[u8], limit: u64) -> Result<()> {
+    let bad = |m: &str| VeilError::Corrupt(id.hex(), m.to_string());
+    match enc.first() {
+        Some(&PLAIN) => {
+            if enc.len() as u64 > limit {
+                return Err(bad("object larger than the limit"));
+            }
+            if ObjectId::hash(enc) != *id {
+                return Err(bad("object does not match its id"));
+            }
+            Ok(())
+        }
+        Some(&ZSTD) => {
+            let frame = &enc[1..];
+            let size = crate::pack::frame_content_size(frame).ok_or_else(|| bad("not one zstd frame that declares its size"))?;
+            if size > limit {
+                return Err(bad("compressed object expands past the limit"));
+            }
+            if frame_window(frame).is_none_or(|w| w > MAX_WINDOW) {
+                return Err(bad("compressed object declares a window past 2^27 bytes"));
+            }
+            crate::pack::verify_zstd(frame, size, None, id).map_err(|e| bad(&e))
+        }
+        _ => Err(bad("unknown object encoding")),
+    }
 }
 
 /// [`decode`] for an encoding already checked against `id` (such as an entry
@@ -450,10 +502,21 @@ mod tests {
     #[test]
     fn a_prefix_declares_what_an_encoding_decodes_to() {
         let raw = [&b"veil:blob\n"[..], &b"abc ".repeat(4096)].concat();
+        let id = ObjectId::hash(&raw);
+        let other = ObjectId::hash(b"veil:blob\nother");
         let enc = encode(&raw);
         assert!(is_compressed(&enc));
         assert_eq!(declared_len(&enc[..HEADER.min(enc.len())], enc.len() as u64), Some(raw.len() as u64));
         assert_eq!(declared_len(&raw[..HEADER], raw.len() as u64), Some(raw.len() as u64));
         assert_eq!(declared_len(b"\x01xyz", 4), None);
+        assert_eq!(declared_window(&enc[..HEADER.min(enc.len())]), Some(raw.len() as u64));
+        assert_eq!(declared_window(&raw[..HEADER]), Some(0));
+        assert_eq!(declared_window(b"\x01xyz"), None);
+        assert!(verify(&id, &enc, raw.len() as u64).is_ok());
+        assert!(verify(&id, &raw, raw.len() as u64).is_ok());
+        assert!(verify(&other, &enc, 1 << 20).is_err());
+        assert!(verify(&other, &raw, 1 << 20).is_err());
+        assert!(verify(&id, &enc, raw.len() as u64 - 1).is_err());
+        assert!(verify(&id, &raw, raw.len() as u64 - 1).is_err());
     }
 }

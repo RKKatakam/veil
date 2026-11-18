@@ -930,35 +930,29 @@ async fn commit(
 /// be held again as a pack) stores them one by one, as before.
 const PACKED_BYTES: usize = 8 << 20;
 
-/// Store `objects` (what an API commit made, canonical encodings) as one
-/// pack of `project` (several past `pack::MAX_OBJECTS`), staged for
-/// `person` until the commit's transaction lists it; a write that fails
-/// leaves none of them.
+/// Keep `objects` (what an API commit made, canonical encodings) through
+/// [`crate::store::Objects::keep`]: in `packs`, as one staged pack of
+/// `project` (several past `pack::MAX_OBJECTS`) for `person` until the
+/// commit's transaction lists it; in `objects`, under their own keys,
+/// returning an empty `Vec`.
 async fn store_packed(hub: &Arc<Hub>, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<Vec<(Arc<str>, crate::pack::Held)>> {
-    // Compressed on a blocking thread (the server's own encoding).
-    let mut encoded = tokio::task::spawn_blocking(move || objects.into_iter().map(|(id, raw)| (id, crate::store::encode(raw))).collect::<Vec<_>>())
-        .await
-        .map_err(|e| Error::Other(e.into()))?;
-    let mut packs: Vec<(Arc<str>, crate::pack::Held)> = Vec::new();
-    while !encoded.is_empty() {
-        let rest = if encoded.len() > crate::pack::MAX_OBJECTS { encoded.split_off(crate::pack::MAX_OBJECTS) } else { Vec::new() };
-        // The commit's own storage write (counted as a push's own is).
-        match crate::store::own(hub.objects.put_pack(project, person, encoded)).await {
-            Ok((name, mut held)) => {
-                held.unproject();
-                packs.push((name, held));
-            }
-            Err(e) => {
-                let names: Vec<Arc<str>> = packs.iter().map(|(n, _)| n.clone()).collect();
-                if let Err(d) = hub.objects.discard(project, &names).await {
+    let mut written = Vec::new();
+    let opts = crate::store::KeepOpts { person, encode_threads: 1, already_held: true };
+    match crate::store::own(hub.objects.keep(project, &[], &HashSet::new(), objects, opts, &mut written)).await
+    {
+        Ok(kept) => Ok(kept.into_iter().filter_map(|p| Some((p.name, p.held?))).collect()),
+        Err(crate::store::KeepError::Discarded) => {
+            Err(Error::conflict("an upload this commit names was discarded; try again"))
+        }
+        Err(crate::store::KeepError::Store(e)) => {
+            if !written.is_empty() {
+                if let Err(d) = hub.objects.discard(project, &written).await {
                     eprintln!("veil-server: discarding what an API commit did not list: {d:#}");
                 }
-                return Err(Error::Other(e));
             }
+            Err(Error::Other(e))
         }
-        encoded = rest;
     }
-    Ok(packs)
 }
 
 /// The API commits moving each branch on this server now, by project and
@@ -1376,7 +1370,8 @@ pub(crate) async fn create_with(
         // `PACKED_BYTES`, and one that races other commits for its branch
         // (`Moving`: each try that lost would record a pack, write it and
         // discard it).
-        let packed = built.store.iter().map(|(_, b)| b.len()).sum::<usize>() <= PACKED_BYTES && moving.as_ref().is_none_or(Moving::alone);
+        let packed = hub.objects.layout() == crate::store::ObjectLayout::Objects
+            || (built.store.iter().map(|(_, b)| b.len()).sum::<usize>() <= PACKED_BYTES && moving.as_ref().is_none_or(Moving::alone));
         let held = packed.then(|| sync::Staged::holding(built.store.iter().cloned()));
         if held.is_none() {
             sync::put_all(hub, project.id, built.store.clone()).await?;

@@ -172,7 +172,7 @@ fn iso_utc(ms: i64) -> String {
 /// servers (`TestHub::beside`) and a crash mid-merge (resumed or rolled back).
 #[test]
 fn guarantee_1_merging_never_loses_or_changes_an_object_across_servers_and_crashes() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let other = TestHub::beside(&hub);
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
@@ -786,7 +786,7 @@ fn guarantee_2_gc_deletes_only_unreferenced_objects_respects_retention_window_an
 /// windows, and the embargoed line releases cleanly onto `main` afterwards.
 #[test]
 fn guarantee_3_embargoed_objects_never_deleted_before_release() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -886,7 +886,7 @@ fn guarantee_3_embargoed_objects_never_deleted_before_release() {
 /// `limits::DERIVE_PAUSE`).
 #[test]
 fn guarantee_4_merge_and_gc_are_bounded_and_yield_to_landings_and_pushes() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -998,7 +998,12 @@ fn guarantee_5_cost_of_merging_10000_small_pushes() {
     // database numbers its projects from 1 again, and the run's bucket holds
     // other such tests' `p/1/` keys, which the counts below would include.
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let hub = TestHub::start_with_s3(&crate::grants::fresh_database(&rt), Duration::from_secs(3600), None);
+    let hub = TestHub::start_with_s3_and_layout(
+        &crate::grants::fresh_database(&rt),
+        Duration::from_secs(3600),
+        None,
+        veil_server::ObjectLayout::Packs,
+    );
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();
@@ -1172,7 +1177,7 @@ pub(crate) fn gc_pass(hub: &TestHub, pid: i64, opts: &Options) -> pack_gc::Repor
 /// shared blobs/ancestors alive until its own window expires).
 #[test]
 fn bug_1780_cross_server_repush_and_retained_snapshot_closure() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let hub2 = TestHub::beside(&hub);
@@ -1780,6 +1785,21 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
         .rt
         .block_on(sqlx::query_scalar("SELECT created_by FROM projects WHERE id = $1").bind(pid).fetch_one(&h.db))
         .unwrap();
+    let now = veil_core::now_millis();
+    // BUG-2660: hold `main`'s landing lease so another test's `landing::resume`
+    // on the shared database does not start a landing service on `(pid, 'main')`
+    // that cleans or lands the synthetic rows written below.
+    hub.rt
+        .block_on(
+            sqlx::query(
+                "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at, lock_epoch) \
+                 VALUES ($1, 'main', 'test-2602', 1, $2, NULL)",
+            )
+            .bind(pid)
+            .bind(now + 3_600_000)
+            .execute(&h.db),
+        )
+        .unwrap();
     let exists = |id: &ObjectId| {
         let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
         hub.rt.block_on(fresh.exists(pid, id)).unwrap()
@@ -1806,7 +1826,7 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
             Box::new(move |s| {
                 format!(
                     "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, person_epoch, project_epoch, state, created_at) \
-                     VALUES ({pid}, 'main', 't-2602-stack', {admin_pid}, 'admin', 'k', '[[\"{s}\", \"{m}\"]]', 0, 0, 0, 'queued', 1000)"
+                     VALUES ({pid}, 'main', 't-2602-stack-{pid}', {admin_pid}, 'admin', 'k', '[[\"{s}\", \"{m}\"]]', 0, 0, 0, 'queued', 1000)"
                 )
             })
         }),
@@ -1814,13 +1834,13 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
             Box::new(move |s| {
                 format!(
                     "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, result, lineage, person_epoch, project_epoch, state, created_at) \
-                     VALUES ({pid}, 'main', 't-2602-result', {admin_pid}, 'admin', 'k', '[]', '{{\"landed\": \"{s}\"}}', 0, 0, 0, 'landed', 1000)"
+                     VALUES ({pid}, 'main', 't-2602-result-{pid}', {admin_pid}, 'admin', 'k', '[]', '{{\"landed\": \"{s}\"}}', 0, 0, 0, 'landed', 1000)"
                 )
             })
         }),
         ("landings", {
             let m = m.clone();
-            Box::new(move |s| format!("INSERT INTO landings (project_id, branch, lineage, submitted, landed, at) VALUES ({pid}, 'main', 0, '{m}', '{s}', 1000)"))
+            Box::new(move |s| format!("INSERT INTO landings (project_id, branch, lineage, submitted, landed, at) VALUES ({pid}, 'main', 0, '{m}', '{s}', {now})"))
         }),
         ("embargo_snapshots", Box::new(move |s| format!("INSERT INTO embargo_snapshots (project_id, snapshot, embargo_id) VALUES ({pid}, '{s}', 'e2602snap')"))),
         (
@@ -1988,6 +2008,15 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
         at += 400_000;
     }
 
+    // BUG-2660: a peer server running `landing::resume` on the shared database
+    // (as `rv_core2::bug_1883_…` does) leaves `(pid, 'main')`'s synthetic
+    // `'queued'` and `landings` rows untouched.
+    let peer = TestHub::beside(&hub);
+    peer.rt.block_on(async {
+        veil_server::landing::resume(peer.hub()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
     // Later passes, far past every window: the roots written keep what they name.
     for off in [at + 1_000_000, at + 2_000_000] {
         let rep = gc_pass(
@@ -2007,13 +2036,19 @@ fn bug_2602_a_root_written_as_gc_switches_keeps_its_objects_and_the_pass_collect
                  UNION ALL SELECT snapshot FROM tested WHERE project_id = $1 AND branch = 'racing-tested-2602' \
                  UNION ALL SELECT head FROM pr_revisions WHERE project_id = $1 AND pr = 'pr-2602' \
                  UNION ALL SELECT snapshot FROM embargo_snapshots WHERE project_id = $1 AND embargo_id = 'e2602snap' \
-                 UNION ALL SELECT landed FROM landings WHERE project_id = $1 AND landed <> submitted AND at = 1000",
+                 UNION ALL SELECT landed FROM landings WHERE project_id = $1 AND landed <> submitted AND at = $2",
             )
             .bind(pid)
+            .bind(now)
             .fetch_all(&h.db),
         )
         .unwrap();
     assert_eq!(named.len(), 7, "the roots written are still there: {named:?}");
+    let queued_state: String = hub
+        .rt
+        .block_on(sqlx::query_scalar("SELECT state FROM landing_queue WHERE project_id = $1 AND ticket = $2").bind(pid).bind(format!("t-2602-stack-{pid}")).fetch_one(&h.db))
+        .unwrap();
+    assert_eq!(queued_state, "queued", "t-2602-stack stays queued across peer landing::resume");
     for s in named {
         assert_closure_stored(&hub, pid, ObjectId::from_hex(&s).unwrap(), "after later passes");
     }
@@ -3258,7 +3293,7 @@ fn bug_1898_every_read_that_finds_its_pack_merged_and_swept_reads_the_listing_ag
         ("exists", 0, |o, rt, p, id, _, _| assert!(rt.block_on(o.exists(p, id)).expect("exists must not fail"), "exists must never see a missing object")),
     ];
 
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let h = hub.hub();

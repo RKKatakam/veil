@@ -72,7 +72,7 @@ fn read_all(hub: &TestHub, project: i64, ids: &[ObjectId], when: &str) {
 /// missed an object.
 #[test]
 fn bug_2230_background_merging_keeps_packs_bounded_and_readers_never_miss() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let other = TestHub::beside(&hub);
     let p = setup_project(&hub);
     let pid = project_id_of(&hub, &p.name);
@@ -264,7 +264,7 @@ fn stored(hub: &TestHub, project: i64, name: &str) -> bool {
 /// a fresh one.
 #[test]
 fn bug_2280_packs_a_background_merge_replaced_are_deleted_after_the_grace_period() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id_of(&hub, &p.name);
     let api = hub.api();
@@ -320,7 +320,7 @@ fn bug_2280_packs_a_background_merge_replaced_are_deleted_after_the_grace_period
 /// listed are untouched (every object read on both servers).
 #[test]
 fn bug_2280_a_crashed_merges_staged_pack_is_swept_without_a_push() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id_of(&hub, &p.name);
     let h = hub.hub();

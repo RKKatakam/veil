@@ -1300,7 +1300,7 @@ pub(crate) fn whole_tree_beside(hub: &TestHub, pid: i64, tip: veil_core::ObjectI
 /// landed tip whole.
 #[test]
 fn bug_1955_a_batchs_objects_are_one_pack_its_transaction_lists() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id_of(&hub, &p.name);
     let api = hub.api();
@@ -1347,7 +1347,7 @@ fn bug_1955_a_batchs_objects_are_one_pack_its_transaction_lists() {
 /// again lands with a pack of its own, and the tip reads whole.
 #[test]
 fn bug_1955_a_batch_that_does_not_commit_discards_its_pack() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_packs();
     let p = setup_project(&hub);
     let pid = project_id_of(&hub, &p.name);
     let api = hub.api();

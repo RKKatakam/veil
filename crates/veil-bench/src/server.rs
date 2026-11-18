@@ -32,6 +32,9 @@ pub struct ServerArgs {
     pub s3_endpoint: Option<String>,
     #[arg(long)]
     pub s3_bucket: Option<String>,
+    /// The server's object layout (`packs` or `objects`).
+    #[arg(long)]
+    pub object_layout: Option<String>,
 }
 
 impl ServerArgs {
@@ -82,6 +85,11 @@ impl Server {
         let (Some(bin), Some(url)) = (&a.server, a.db_url()) else {
             bail!("starting a server needs --server and --database-url (or VEIL_DATABASE_URL)");
         };
+        if let Some(l) = &a.object_layout {
+            if !matches!(l.as_str(), "packs" | "objects") {
+                bail!("--object-layout {l}: packs or objects");
+            }
+        }
         std::fs::create_dir_all(data)?;
         let st = Command::new(bin).arg("migrate").env("VEIL_DATABASE_URL", &url).stdout(Stdio::null()).status().context("veil-server migrate")?;
         if !st.success() {
@@ -108,6 +116,13 @@ impl Server {
         if help.contains("--device-rate") {
             let unlimited = "1000000000/1000000000";
             cmd.args(["--device-rate", unlimited, "--anonymous-rate", unlimited, "--max-connections", "262144"]);
+        }
+        if let Some(l) = &a.object_layout {
+            if help.contains("--object-layout") {
+                cmd.args(["--object-layout", l]);
+            } else if l != "packs" {
+                bail!("this veil-server binary has no --object-layout flag (cannot start in {l} mode)");
+            }
         }
         let log = data.with_extension("log");
         let mut child = cmd
@@ -238,6 +253,25 @@ pub fn io_bytes(pid: u32) -> Option<(u64, u64)> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
     let field = |f: &str| s.lines().find_map(|l| l.strip_prefix(f))?.trim().parse().ok();
     Some((field("rchar:")?, field("wchar:")?))
+}
+
+/// `object_layout` from the server's `data/stats.json`, if it wrote one.
+pub fn stats_layout(data: &Path) -> Option<String> {
+    let path = data.join("stats.json");
+    for _ in 0..20 {
+        if let Some(l) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["object_layout"].as_str().map(str::to_owned))
+        {
+            return Some(l);
+        }
+        if path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
 }
 
 /// A `/proc/PID/status` field in KiB.
