@@ -186,6 +186,14 @@ const MIGRATION_DEADLINE: Duration = Duration::from_secs(600);
 
 /// Whether every migration is applied. Reads only: no DDL.
 pub async fn schema_current(pool: &PgPool) -> anyhow::Result<bool> {
+    schema_current_in(pool).await.map_err(|e| match e {
+        Error::Db(e) => e.into(),
+        Error::Other(e) => e,
+        e => anyhow::anyhow!("{e:?}"),
+    })
+}
+
+async fn schema_current_in(pool: &PgPool) -> Result<bool> {
     let table: Option<String> = sqlx::query_scalar("SELECT to_regclass('schema_migrations')::text").fetch_one(pool).await?;
     if table.is_none() {
         return Ok(false);
@@ -218,20 +226,54 @@ pub type AfterBuild = dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>>
 /// left incomplete, as YugabyteDB's did (BUG-2571), made at will.
 #[doc(hidden)]
 pub async fn migrate_with(pool: &PgPool, after_build: Option<&AfterBuild>) -> anyhow::Result<()> {
-    if schema_current(pool).await? {
-        return Ok(());
+    let deadline = tokio::time::Instant::now() + MIGRATION_DEADLINE;
+    let mut check_attempt: u32 = 0;
+    loop {
+        match schema_current_in(pool).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => break,
+            Err(e) if e.is_retryable() && tokio::time::Instant::now() < deadline => {
+                check_attempt += 1;
+                eprintln!("veil-server: checking schema_migrations, retrying: {e:?}");
+                tokio::time::sleep(Duration::from_millis(100 * u64::from(check_attempt.min(20)))).await;
+            }
+            Err(Error::Db(e)) => return Err(e.into()),
+            Err(Error::Other(e)) => return Err(e),
+            Err(e) => anyhow::bail!("{e:?}"),
+        }
     }
     let mut c = pool.acquire().await?;
-    let deadline = tokio::time::Instant::now() + MIGRATION_DEADLINE;
     // Polled, not a blocking `pg_advisory_lock`: every statement has a
-    // timeout, and the wait must have a deadline.
+    // timeout, and the wait must have a deadline. Retry retryable errors
+    // (short statement timeouts, YugabyteDB catalog/RPC races) within the
+    // deadline, as `migrate_locked` does (BUG-2625).
+    let mut lock_attempt: u32 = 0;
     loop {
-        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(MIGRATION_LOCK).fetch_one(&mut *c).await?;
-        if got {
-            break;
+        match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)").bind(MIGRATION_LOCK).fetch_one(&mut *c).await {
+            Ok(true) => break,
+            Ok(false) => {
+                lock_attempt = 0;
+                anyhow::ensure!(tokio::time::Instant::now() < deadline, "another server's migrations did not finish within {MIGRATION_DEADLINE:?}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => {
+                let err = Error::Db(e);
+                if err.is_retryable() && tokio::time::Instant::now() < deadline {
+                    lock_attempt += 1;
+                    eprintln!("veil-server: waiting for migrations lock, retrying: {err:?}");
+                    // Close the connection in case the lock was acquired before
+                    // the statement timed out, then acquire a fresh one.
+                    let _ = sqlx::Connection::close(c.detach()).await;
+                    tokio::time::sleep(Duration::from_millis(200 * u64::from(lock_attempt.min(10)))).await;
+                    c = pool.acquire().await?;
+                } else {
+                    return Err(match err {
+                        Error::Db(e) => e.into(),
+                        _ => unreachable!(),
+                    });
+                }
+            }
         }
-        anyhow::ensure!(tokio::time::Instant::now() < deadline, "another server's migrations did not finish within {MIGRATION_DEADLINE:?}");
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let r = migrate_locked(&mut c, deadline, after_build).await;
     // The lock is the session's: release it, and reset the online index
@@ -252,9 +294,13 @@ pub async fn migrate_with(pool: &PgPool, after_build: Option<&AfterBuild>) -> an
 /// deadline, on a retryable error.
 async fn migrate_locked(c: &mut PgConnection, deadline: tokio::time::Instant, after_build: Option<&AfterBuild>) -> anyhow::Result<()> {
     let mut attempt: u32 = 0;
+    // Per-index completed build counts persist across retryable restarts of
+    // `migrate_once` so no index is built more than `BUILD_ATTEMPTS` times
+    // in one start (BUG-2625).
+    let mut builds: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     loop {
         attempt += 1;
-        match migrate_once(&mut *c, deadline, after_build).await {
+        match migrate_once(&mut *c, deadline, after_build, &mut builds).await {
             Ok(()) => return Ok(()),
             Err(e) if e.is_retryable() && tokio::time::Instant::now() < deadline => {
                 eprintln!("veil-server: migrating, retrying: {e:?}");
@@ -267,7 +313,12 @@ async fn migrate_locked(c: &mut PgConnection, deadline: tokio::time::Instant, af
     }
 }
 
-async fn migrate_once(c: &mut PgConnection, deadline: tokio::time::Instant, after_build: Option<&AfterBuild>) -> Result<()> {
+async fn migrate_once(
+    c: &mut PgConnection,
+    deadline: tokio::time::Instant,
+    after_build: Option<&AfterBuild>,
+    builds: &mut std::collections::HashMap<String, u32>,
+) -> Result<()> {
     let table: Option<String> = sqlx::query_scalar("SELECT to_regclass('schema_migrations')::text").fetch_one(&mut *c).await?;
     if table.is_none() {
         sqlx::raw_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)")
@@ -324,7 +375,7 @@ async fn migrate_once(c: &mut PgConnection, deadline: tokio::time::Instant, afte
                 *yugabyte.insert(yb)
             }
         };
-        online_index_steps(&mut *c, yb, &parts.online, deadline, after_build).await?;
+        online_index_steps(&mut *c, yb, &parts.online, deadline, after_build, builds).await?;
         sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
     }
     Ok(())
@@ -503,13 +554,12 @@ async fn online_index_steps(
     steps: &[IndexStep],
     deadline: tokio::time::Instant,
     after_build: Option<&AfterBuild>,
+    builds: &mut std::collections::HashMap<String, u32>,
 ) -> Result<()> {
     let mut pending: Vec<&IndexStep> = steps.iter().collect();
-    let mut builds = 0;
     loop {
-        builds += 1;
         for step in &pending {
-            online_index_step(&mut *c, yugabyte, step, deadline, after_build).await?;
+            online_index_step(&mut *c, yugabyte, step, deadline, after_build, builds).await?;
         }
         pending.retain(|step| matches!(step, IndexStep::Create { .. }));
         if !yugabyte || pending.is_empty() {
@@ -521,15 +571,35 @@ async fn online_index_steps(
         let r = checked_on_yugabyte(&mut *c, &pending).await;
         let reset = sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout").execute(&mut *c).await;
         let whole = r?;
-        reset?;
         pending = pending.into_iter().zip(whole).filter(|(_, whole)| !whole).map(|(step, _)| step).collect();
+        if pending.is_empty() {
+            reset?;
+            return Ok(());
+        }
+        let exhausted = pending.iter().find_map(|step| match step {
+            IndexStep::Create { name, .. } => {
+                let tried = builds.get(name.as_str()).copied().unwrap_or(0);
+                (tried >= BUILD_ATTEMPTS).then_some((name, tried))
+            }
+            IndexStep::Drop { .. } => None,
+        });
+        if let Some((name, tried)) = exhausted {
+            return Err(not_built_whole(name, tried));
+        }
         let Some(IndexStep::Create { name, .. }) = pending.first() else {
+            reset?;
             return Ok(());
         };
-        if builds >= BUILD_ATTEMPTS || tokio::time::Instant::now() >= deadline {
-            return Err(not_built_whole(name, builds));
+        let tried = builds.get(name.as_str()).copied().unwrap_or(0);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(not_built_whole(name, tried.max(1)));
         }
-        eprintln!("veil-server: index {name} is not built whole after build {builds} returned: building it again");
+        reset?;
+        if tried == 0 {
+            eprintln!("veil-server: index {name} found built is not whole: building it again");
+        } else {
+            eprintln!("veil-server: index {name} is not built whole after build {tried} returned: building it again");
+        }
     }
 }
 
@@ -654,39 +724,62 @@ async fn online_index_step(
     step: &IndexStep,
     deadline: tokio::time::Instant,
     after_build: Option<&AfterBuild>,
+    builds: &mut std::collections::HashMap<String, u32>,
 ) -> Result<()> {
-    let mut attempt = 0;
     loop {
-        attempt += 1;
         let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(STATEMENT_TIMEOUT);
         let ms = left.as_millis();
         sqlx::raw_sql(&format!("SET statement_timeout = {ms}; SET lock_timeout = {ms}")).execute(&mut *c).await?;
-        let r = online_index_step_now(&mut *c, yugabyte, step, after_build).await;
+        let r = online_index_step_now(&mut *c, yugabyte, step, after_build, builds).await;
         let reset = sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout").execute(&mut *c).await;
         let built = r?;
-        reset?;
         let name = match (built, step) {
-            (true, _) | (_, IndexStep::Drop { .. }) => return Ok(()),
+            (true, _) | (_, IndexStep::Drop { .. }) => {
+                reset?;
+                return Ok(());
+            }
             (false, IndexStep::Create { name, .. }) => name,
         };
-        if attempt >= BUILD_ATTEMPTS || tokio::time::Instant::now() >= deadline {
-            return Err(not_built_whole(name, attempt));
+        let tried = builds.get(name.as_str()).copied().unwrap_or(0);
+        if tried >= BUILD_ATTEMPTS || tokio::time::Instant::now() >= deadline {
+            return Err(not_built_whole(name, tried.max(1)));
         }
+        reset?;
         // Dropped by the next build, before it begins.
-        eprintln!("veil-server: index {name} is not built (live, ready and valid) {VALID_WAIT:?} after build {attempt} returned: building it again");
+        eprintln!("veil-server: index {name} is not built (live, ready and valid) {VALID_WAIT:?} after build {tried} returned: building it again");
     }
 }
 
 /// One try at a step: `false` when a build returned and its index did not
 /// read built within `VALID_WAIT`.
-async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &IndexStep, after_build: Option<&AfterBuild>) -> Result<bool> {
+async fn online_index_step_now(
+    c: &mut PgConnection,
+    yugabyte: bool,
+    step: &IndexStep,
+    after_build: Option<&AfterBuild>,
+    builds: &mut std::collections::HashMap<String, u32>,
+) -> Result<bool> {
     let (name, sql) = match step {
         IndexStep::Drop { name } => return drop_index(&mut *c, yugabyte, name).await.map(|()| true),
         IndexStep::Create { name, sql } => (name, sql),
     };
-    if index_built(&mut *c, name).await? == Some(Some(false)) {
-        eprintln!("veil-server: index {name} was left incomplete by a build that did not finish: dropping it to build it again");
-        drop_index(&mut *c, yugabyte, name).await?;
+    match index_built(&mut *c, name).await? {
+        Some(Some(true)) => return Ok(true),
+        Some(Some(false)) => {
+            let tried = builds.get(name.as_str()).copied().unwrap_or(0);
+            if tried >= BUILD_ATTEMPTS {
+                return Err(not_built_whole(name, tried));
+            }
+            eprintln!("veil-server: index {name} was left incomplete by a build that did not finish: dropping it to build it again");
+            drop_index(&mut *c, yugabyte, name).await?;
+        }
+        Some(None) => return Err(Error::Other(anyhow::anyhow!("{name} is not an index, so the index of that name was not built"))),
+        None => {
+            let tried = builds.get(name.as_str()).copied().unwrap_or(0);
+            if tried >= BUILD_ATTEMPTS {
+                return Err(not_built_whole(name, tried));
+            }
+        }
     }
     if let Err(e) = sqlx::raw_sql(sql).execute(&mut *c).await {
         // A failed build leaves its index invalid: not used, but written
@@ -714,6 +807,7 @@ async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &Inde
         }
         return Err(e.into());
     }
+    *builds.entry(name.clone()).or_default() += 1;
     if let Some(after_build) = after_build {
         after_build(name.clone()).await;
     }
@@ -725,16 +819,20 @@ async fn online_index_step_now(c: &mut PgConnection, yugabyte: bool, step: &Inde
     let mut looks = 0u32;
     loop {
         looks += 1;
-        match index_built(&mut *c, name).await? {
-            Some(Some(true)) => {
+        match index_built(&mut *c, name).await {
+            Ok(Some(Some(true))) => {
                 if looks > 1 {
                     eprintln!("veil-server: index {name} read built {:?} after its build returned", began.elapsed());
                 }
                 return Ok(true);
             }
-            Some(Some(false)) | None if tokio::time::Instant::now() < until => tokio::time::sleep(Duration::from_millis(200)).await,
-            Some(Some(false)) | None => return Ok(false),
-            Some(None) => return Err(Error::Other(anyhow::anyhow!("{name} is not an index, so the index of that name was not built"))),
+            Ok(Some(Some(false)) | None) if tokio::time::Instant::now() < until => tokio::time::sleep(Duration::from_millis(200)).await,
+            Ok(Some(Some(false)) | None) => return Ok(false),
+            Ok(Some(None)) => return Err(Error::Other(anyhow::anyhow!("{name} is not an index, so the index of that name was not built"))),
+            Err(e) if e.is_retryable() && tokio::time::Instant::now() < until => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(e),
         }
     }
 }

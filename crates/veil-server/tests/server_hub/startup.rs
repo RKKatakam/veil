@@ -21,7 +21,21 @@ fn fresh_database(rt: &tokio::runtime::Runtime) -> (String, String) {
     let name = format!("{}{}", crate::support::test_db_prefix(), unique("veil_fresh_"));
     rt.block_on(async {
         let db = veil_server::db::connect(&admin, 1).await.unwrap();
-        sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&db).await.unwrap();
+        let mut c = db.acquire().await.unwrap();
+        sqlx::raw_sql("SET statement_timeout = 0").execute(&mut *c).await.unwrap();
+        let mut tries = 0;
+        loop {
+            match sqlx::raw_sql(&format!("CREATE DATABASE {name}")).execute(&mut *c).await {
+                Ok(_) => break,
+                Err(e) if tries > 0 && e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42P04") => break,
+                Err(e) if retryable(&e) && tries < 50 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("CREATE DATABASE {name}: {e}"),
+            }
+        }
+        drop(c);
         db.close().await;
     });
     let (base, _) = admin.rsplit_once('/').unwrap();
@@ -35,7 +49,7 @@ fn runtime() -> tokio::runtime::Runtime {
 #[test]
 fn servers_starting_together_migrate_once() {
     let rt = runtime();
-    let (url, _) = fresh_database(&rt);
+    let (url, name) = fresh_database(&rt);
     let hubs: Vec<TestHub> = std::thread::scope(|s| {
         let started: Vec<_> = (0..4).map(|_| s.spawn(|| TestHub::start_on(&url, Duration::from_secs(3600)))).collect();
         started.into_iter().map(|h| h.join().expect("every server starts")).collect()
@@ -53,6 +67,8 @@ fn servers_starting_together_migrate_once() {
     for h in &hubs {
         h.api().login(&Identity::generate("x"), Some(&unique("starter"))).expect("signs up");
     }
+    drop(hubs);
+    drop_database(&rt, &name);
 }
 
 /// A server whose database role may only read and write rows (no DDL at
@@ -297,11 +313,9 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM view_graph").fetch_one(&db).await.unwrap();
         assert_eq!(n, 0, "the viewer graph (a cache) is cleared");
         db.close().await;
-        // The test's own database goes (the shared server keeps no leftovers).
-        let admin = veil_server::db::connect(&std::env::var("VEIL_TEST_DATABASE_URL").unwrap(), 1).await.unwrap();
-        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).execute(&admin).await.unwrap();
-        admin.close().await;
     });
+    // The test's own database goes (the shared server keeps no leftovers).
+    drop_database(&rt, &name);
 }
 
 /// A PostgreSQL that requires TLS, as every managed one does: a listener in
@@ -442,7 +456,20 @@ fn select_one(rt: &tokio::runtime::Runtime, url: &str) -> Result<i64, String> {
 fn drop_database(rt: &tokio::runtime::Runtime, name: &str) {
     rt.block_on(async {
         let admin = veil_server::db::connect(&std::env::var("VEIL_TEST_DATABASE_URL").unwrap(), 1).await.unwrap();
-        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).execute(&admin).await.unwrap();
+        let mut c = admin.acquire().await.unwrap();
+        sqlx::raw_sql("SET statement_timeout = 0").execute(&mut *c).await.unwrap();
+        let mut tries = 0;
+        loop {
+            match sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).execute(&mut *c).await {
+                Ok(_) => break,
+                Err(e) if retryable(&e) && tries < 50 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("DROP DATABASE IF EXISTS {name} WITH (FORCE): {e}"),
+            }
+        }
+        drop(c);
         admin.close().await;
     });
 }
