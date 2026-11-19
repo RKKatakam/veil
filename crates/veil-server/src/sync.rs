@@ -114,15 +114,29 @@ pub struct Source {
 /// and the slots of the objects the receipts name.
 type StagedPack = (Arc<str>, StagedSlots);
 
-/// On-demand lookup context for `PushRequest::packs` pushes (`BUG-1150`,
-/// `BUG-2852`, `BUG-2870`): searches `Packs::staged` on a cache hit (dropping
-/// `Arc<Held>` at once) and bisects via `Packs::stored_slots` under one
-/// `FIRST_READ` share (dropped at once) on a miss.
+/// Chunk size for batched staged-index resolution (`BUG-2870`): each sorted
+/// chunk takes and drops one `FIRST_READ` share per named pack without holding
+/// any other share across waits.
+const STAGED_BATCH_IDS: usize = 65_536;
+
+/// A staged pack name and an object's slot within it.
+type PackSlot = (Arc<str>, Slot);
+
+/// On-demand lookup context for `PushRequest::packs` (`BUG-1150`, `BUG-2852`,
+/// `BUG-2870`): holds only the validated pack names and the slots of object
+/// ids this push itself has resolved (bounded by the push's own objects,
+/// never a whole-index copy, and never retaining `Arc<pack::Held>` across
+/// `Bound::take_for` waits).
 struct PackLookup {
     hub: Arc<Hub>,
     project: i64,
     rt: Handle,
     names: Vec<Arc<str>>,
+    /// Per-push cache of resolved ids (`Some((pack, slot))` if found in a
+    /// named pack, `None` if verified absent from every live named pack).
+    /// Shared across `Staged::child()` so checks and `keep_uploads` reuse
+    /// batched lookups without re-bisecting.
+    resolved: Mutex<HashMap<ObjectId, Option<PackSlot>>>,
 }
 
 /// What a push's receipts or named staged packs hold, and the objects the
@@ -209,6 +223,73 @@ impl Staged {
         std::mem::take(&mut *self.touched.lock().unwrap())
     }
 
+    /// Whether `id` was already resolved to a slot in one of `PushRequest::packs`.
+    fn is_named_found(&self, id: &ObjectId) -> bool {
+        let Some(named) = &self.named else {
+            return false;
+        };
+        named.resolved.lock().unwrap().get(id).is_some_and(Option::is_some)
+    }
+
+    /// Batch-resolve `ids` across `PushRequest::packs` (`BUG-2870`): resolves
+    /// each sorted chunk against each named pack in one `staged_slots_optional`
+    /// call (cache hit or one `FIRST_READ` share taken and dropped per pack and
+    /// chunk, never holding any other share across waits). Results are bounded
+    /// strictly by the ids this push names (never a whole-index copy, `BUG-2852`).
+    fn resolve_batch(&self, ids: &[ObjectId]) -> veil_core::Result<()> {
+        let Some(named) = &self.named else {
+            return Ok(());
+        };
+        if ids.is_empty() || named.names.is_empty() {
+            return Ok(());
+        }
+        let mut todo: Vec<ObjectId> = {
+            let resolved = named.resolved.lock().unwrap();
+            ids.iter().copied().filter(|id| !resolved.contains_key(id)).collect()
+        };
+        if todo.is_empty() {
+            return Ok(());
+        }
+        todo.sort_unstable();
+        todo.dedup();
+        for chunk in todo.chunks(STAGED_BATCH_IDS) {
+            let mut remaining: Vec<ObjectId> = chunk.to_vec();
+            let mut found: Vec<(ObjectId, Arc<str>, Slot)> = Vec::new();
+            let mut any_gone = false;
+            for name in &named.names {
+                if remaining.is_empty() {
+                    break;
+                }
+                let Some(ss) = named
+                    .rt
+                    .block_on(named.hub.objects.staged_slots_optional(named.project, name, &remaining))
+                    .map_err(store_err)?
+                else {
+                    any_gone = true;
+                    continue;
+                };
+                if !ss.slots.is_empty() {
+                    let mut hit_ids: HashSet<ObjectId> = HashSet::with_capacity(ss.slots.len());
+                    for (id, slot) in ss.slots {
+                        hit_ids.insert(id);
+                        found.push((id, name.clone(), slot));
+                    }
+                    remaining.retain(|id| !hit_ids.contains(id));
+                }
+            }
+            let mut resolved = named.resolved.lock().unwrap();
+            for (id, name, slot) in found {
+                resolved.entry(id).or_insert_with(|| Some((name, slot)));
+            }
+            if !any_gone {
+                for id in remaining {
+                    resolved.entry(id).or_insert(None);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The staged pack and slot holding `id`, if uploaded in this push
     /// (called from blocking worker threads via `Source` / `Graft`).
     fn slot_of(&self, id: &ObjectId) -> veil_core::Result<Option<(Arc<str>, Slot)>> {
@@ -218,6 +299,9 @@ impl Staged {
         let Some(named) = &self.named else {
             return Ok(None);
         };
+        if let Some(hit) = named.resolved.lock().unwrap().get(id) {
+            return Ok(hit.clone());
+        }
         let lookup = match named.hub.objects.find_staged_slot_cached(named.project, &named.names, id) {
             crate::pack::CachedStagedLookup::Done(r) => r,
             crate::pack::CachedStagedLookup::Miss { uncached, gone } => named
@@ -226,8 +310,14 @@ impl Staged {
                 .map_err(store_err)?,
         };
         match lookup {
-            crate::pack::StagedLookup::Found(n, s) => Ok(Some((n, s))),
-            crate::pack::StagedLookup::NotFound => Ok(None),
+            crate::pack::StagedLookup::Found(n, s) => {
+                named.resolved.lock().unwrap().insert(*id, Some((n.clone(), s)));
+                Ok(Some((n, s)))
+            }
+            crate::pack::StagedLookup::NotFound => {
+                named.resolved.lock().unwrap().insert(*id, None);
+                Ok(None)
+            }
             crate::pack::StagedLookup::PackGone => Err(staged_gone()),
         }
     }
@@ -240,6 +330,9 @@ impl Staged {
         let Some(named) = &self.named else {
             return Ok(None);
         };
+        if let Some(hit) = named.resolved.lock().unwrap().get(id) {
+            return Ok(hit.clone());
+        }
         match named
             .hub
             .objects
@@ -247,8 +340,14 @@ impl Staged {
             .await
             .map_err(store_err)?
         {
-            crate::pack::StagedLookup::Found(n, s) => Ok(Some((n, s))),
-            crate::pack::StagedLookup::NotFound => Ok(None),
+            crate::pack::StagedLookup::Found(n, s) => {
+                named.resolved.lock().unwrap().insert(*id, Some((n.clone(), s)));
+                Ok(Some((n, s)))
+            }
+            crate::pack::StagedLookup::NotFound => {
+                named.resolved.lock().unwrap().insert(*id, None);
+                Ok(None)
+            }
             crate::pack::StagedLookup::PackGone => Err(staged_gone()),
         }
     }
@@ -481,6 +580,19 @@ impl Source {
             Object::Tree(t) => {
                 let t = Arc::new(t);
                 self.hub.trees.insert(ck, (t.clone(), enc), tree_weight(&t));
+                if let Some(st) = &self.staged {
+                    if st.is_named_found(id) {
+                        let dirs: Vec<ObjectId> = t
+                            .entries
+                            .iter()
+                            .filter(|e| e.kind == EntryKind::Dir)
+                            .map(|e| e.id)
+                            .collect();
+                        if dirs.len() >= 2 {
+                            st.resolve_batch(&dirs)?;
+                        }
+                    }
+                }
                 Ok(Node::Tree(t, enc))
             }
             _ => Ok(Node::Leaf),
@@ -3172,6 +3284,15 @@ pub(crate) fn complete(
     // terms) was uploaded by the pusher, or is named by the
     // entry at that path in a parent: anything else gets the answer
     // a missing object gets, stored or not (BUG-824, BUG-834).
+    // For `PushRequest::packs` pushes on a cold peer server, batch-resolve
+    // every changed entry's id against each named pack in sorted chunks so
+    // neither this proof loop nor `check_changes` bisects per object (`BUG-2870`).
+    if let Some(st) = &src.staged {
+        if st.named.is_some() {
+            let change_ids: Vec<ObjectId> = g.changes.iter().filter_map(|c| c.new.as_ref().map(|e| e.id)).collect();
+            st.resolve_batch(&change_ids)?;
+        }
+    }
     for c in &g.changes {
         let Some(e) = &c.new else { continue };
         let mut before = HashSet::new();
@@ -4654,25 +4775,44 @@ async fn keep_uploads(
         None => &st.packs,
         Some(named) => {
             debug_assert!(st.packs.is_empty(), "a push uses either `packs` or `receipts`, never both");
-            let mut remaining: HashSet<ObjectId> = touched.clone();
+            let mut by_pack: HashMap<Arc<str>, Vec<(ObjectId, Slot)>> = HashMap::new();
+            let mut remaining: HashSet<ObjectId> = HashSet::new();
+            {
+                let resolved = named.resolved.lock().unwrap();
+                for &id in touched {
+                    match resolved.get(&id) {
+                        Some(Some((pack, slot))) => {
+                            by_pack.entry(pack.clone()).or_default().push((id, *slot));
+                        }
+                        _ => {
+                            remaining.insert(id);
+                        }
+                    }
+                }
+            }
             let mut out = Vec::with_capacity(named.names.len());
             for name in &named.names {
-                if remaining.is_empty() {
-                    break;
+                let mut slots = by_pack.remove(name).unwrap_or_default();
+                if remaining.is_empty() && slots.is_empty() {
+                    continue;
                 }
-                let ids: Vec<ObjectId> = remaining.iter().copied().collect();
-                let Some(ss) = hub
+                let query: Vec<ObjectId> = remaining.iter().copied().collect();
+                let Some(mut ss) = hub
                     .objects
-                    .staged_slots_optional(project, name, &ids)
+                    .staged_slots_optional(project, name, &query)
                     .await
                     .map_err(Error::Other)?
                 else {
                     return Err(Error::conflict(DISCARDED_UPLOAD));
                 };
+                for &(id, _) in &ss.slots {
+                    remaining.remove(&id);
+                }
+                if !slots.is_empty() {
+                    slots.extend(ss.slots);
+                    ss.slots = slots;
+                }
                 if !ss.slots.is_empty() {
-                    for &(id, _) in &ss.slots {
-                        remaining.remove(&id);
-                    }
                     out.push((name.clone(), ss));
                 }
             }
@@ -4933,6 +5073,7 @@ async fn staging_packs(
             project,
             rt: Handle::current(),
             names: owned.clone(),
+            resolved: Mutex::new(HashMap::new()),
         })
     });
     Ok((

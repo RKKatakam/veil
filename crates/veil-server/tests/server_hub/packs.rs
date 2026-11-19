@@ -2201,3 +2201,221 @@ fn hostile_bug_2870_push_packs_never_self_deadlocks_on_uncached_multi_pack_push(
     );
     assert_eq!(r.json()["results"][0]["ok"], json!(false), "{}", String::from_utf8_lossy(&r.body));
 }
+
+/// Large push (~100,000 small objects) uploaded through server A (`hub1`) and
+/// pushed through cold peer server B (`hub2 = TestHub::beside_with_store`):
+/// verifies staged index lookups are batched rather than bisecting per object.
+/// Hostile size: run alone.
+#[test]
+fn hostile_bug_2870_cold_peer_large_push_batches_staged_lookups() {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+    use veil_core::object::{EntryKind, Snapshot, Text, Tree, TreeEntry, Visibility};
+    use veil_server::store::BlobStore;
+
+    struct CountingStore {
+        inner: Arc<dyn BlobStore>,
+        gets: AtomicU64,
+        get_ranges: AtomicU64,
+        puts: AtomicU64,
+        deletes: AtomicU64,
+    }
+
+    impl CountingStore {
+        fn wrap(inner: Arc<dyn BlobStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                gets: AtomicU64::new(0),
+                get_ranges: AtomicU64::new(0),
+                puts: AtomicU64::new(0),
+                deletes: AtomicU64::new(0),
+            })
+        }
+
+        fn reset(&self) {
+            self.gets.store(0, Ordering::Relaxed);
+            self.get_ranges.store(0, Ordering::Relaxed);
+            self.puts.store(0, Ordering::Relaxed);
+            self.deletes.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for CountingStore {
+        async fn get(&self, key: &str) -> anyhow::Result<Option<bytes::Bytes>> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(key).await
+        }
+        async fn put(&self, key: &str, data: bytes::Bytes) -> anyhow::Result<()> {
+            self.puts.fetch_add(1, Ordering::Relaxed);
+            self.inner.put(key, data).await
+        }
+        async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+            self.inner.exists(key).await
+        }
+        async fn len(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.inner.len(key).await
+        }
+        async fn get_range(&self, key: &str, start: u64, end: u64) -> anyhow::Result<Option<(bytes::Bytes, u64)>> {
+            self.get_ranges.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_range(key, start, end).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.deletes.fetch_add(1, Ordering::Relaxed);
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+    }
+
+    let hub1 = TestHub::start();
+    let counting = CountingStore::wrap(hub1.blob_store());
+    let hub2 = TestHub::beside_with_store(&hub1, counting.clone());
+    let p = setup_project(&hub1);
+    let pid = project_id(&hub1, &p.name);
+    let api1 = hub1.api();
+    let api2 = hub2.api();
+    let token = p.admin.token();
+
+    let tip = api1.tips(Some(&token), &p.name).unwrap().branches["main"];
+    let base_snap = match O::decode(&hub1.rt.block_on(hub1.hub().objects.get(pid, &tip)).unwrap().unwrap()).unwrap() {
+        O::Snapshot(s) => s,
+        _ => panic!("expected snapshot"),
+    };
+    let base_root = match O::decode(&hub1.rt.block_on(hub1.hub().objects.get(pid, &base_snap.tree)).unwrap().unwrap()).unwrap() {
+        O::Tree(t) => t,
+        _ => panic!("expected root tree"),
+    };
+    let base_src_id = base_root.entries.iter().find(|e| e.name == "src").expect("src dir").id;
+    let base_src = match O::decode(&hub1.rt.block_on(hub1.hub().objects.get(pid, &base_src_id)).unwrap().unwrap()).unwrap() {
+        O::Tree(t) => t,
+        _ => panic!("expected src tree"),
+    };
+
+    // 100 dirs * 1,000 tiny 7-byte blobs = 100,000 blobs + 103 trees + 1 snapshot = 100,104 objects.
+    const DIRS: usize = 100;
+    const FILES_PER_DIR: usize = 1_000;
+    let mut upload_body = Vec::with_capacity(100_200 * 64);
+    let mut put = |obj: O| -> ObjectId {
+        let raw = obj.encode();
+        let id = ObjectId::hash(&raw);
+        put_frame(&mut upload_body, &id, &raw);
+        id
+    };
+
+    let mut bulk_entries = Vec::with_capacity(DIRS);
+    for d in 0..DIRS {
+        let mut entries = Vec::with_capacity(FILES_PER_DIR);
+        for f in 0..FILES_PER_DIR {
+            let content = format!("{d:03}/{f:03}");
+            let id = put(O::Blob(content.as_bytes().to_vec()));
+            entries.push(TreeEntry {
+                name: format!("f{f:03}"),
+                kind: EntryKind::File,
+                id,
+                size: content.len() as u64,
+                visibility: Visibility::Public,
+                executable: false,
+            });
+        }
+        let dir_tree_id = put(O::Tree(Tree { entries }));
+        bulk_entries.push(TreeEntry::dir(&format!("d{d:03}"), dir_tree_id));
+    }
+    let bulk_tree_id = put(O::Tree(Tree { entries: bulk_entries }));
+
+    let mut src_entries = base_src.entries.clone();
+    src_entries.push(TreeEntry::dir("bulk", bulk_tree_id));
+    src_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let new_src_id = put(O::Tree(Tree { entries: src_entries }));
+
+    let mut root_entries = base_root.entries.clone();
+    for e in &mut root_entries {
+        if e.name == "src" {
+            e.id = new_src_id;
+        }
+    }
+    root_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let new_root_id = put(O::Tree(Tree { entries: root_entries }));
+
+    let mut snap = Snapshot {
+        parents: vec![tip],
+        change_id: veil_core::ChangeId::random(),
+        tree: new_root_id,
+        description: Text::Plain("BUG-2870 cold-peer 100k push".into()),
+        author: p.admin.name.clone(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+        agent: None,
+        attempts: vec![],
+        abandoned: None,
+    };
+    snap.sign(&p.admin.identity());
+    let snap_id = put(O::Snapshot(snap));
+
+    // Upload all 100,104 objects to server A (`hub1`), leaving server B (`hub2`) completely cold.
+    let up = api1.upload_encoded_body(&token, &p.name, &upload_body);
+    assert_eq!(up.status, 200, "upload: {}", String::from_utf8_lossy(&up.body[..up.body.len().min(400)]));
+    let text = std::str::from_utf8(&up.body).unwrap();
+    let marker = "\"packs\":[\"";
+    let at = text.find(marker).expect("packs in upload reply") + marker.len();
+    let pack = text[at..at + text[at..].find('"').unwrap()].to_string();
+    assert_eq!(pack.len(), 32, "valid 32-hex pack name");
+
+    // Reset cold server B counters right before pushing.
+    counting.reset();
+    let obj_reads_before = hub2.hub().objects.reads.load(Ordering::Relaxed);
+    let obj_writes_before = hub2.hub().objects.writes.load(Ordering::Relaxed);
+
+    let push_body = json!({
+        "updates": [{"branch": "main", "expected": tip.hex(), "new": snap_id.hex()}],
+        "packs": [pack],
+    });
+    // Time bound: 300 s (~3x the ~101 s debug MinIO run and ~2.4x the ~125 s
+    // full-index baseline, while well below unbatched per-object bisection
+    // which times out past 540 s). Deterministic read bound: 100,104 staged
+    // object reads plus <4,896 index range reads (batched scan uses ~266;
+    // unbatched per-object bisection exceeds 1,000,000).
+    let max_elapsed = std::time::Duration::from_secs(300);
+    let started = std::time::Instant::now();
+    let r = api2.post_json_within(&token, &format!("/v1/projects/{}/push", p.name), &push_body, max_elapsed);
+    let elapsed = started.elapsed();
+
+    let obj_reads = hub2.hub().objects.reads.load(Ordering::Relaxed) - obj_reads_before;
+    let obj_writes = hub2.hub().objects.writes.load(Ordering::Relaxed) - obj_writes_before;
+    let store_gets = counting.gets.load(Ordering::Relaxed);
+    let store_get_ranges = counting.get_ranges.load(Ordering::Relaxed);
+    let store_puts = counting.puts.load(Ordering::Relaxed);
+    let store_deletes = counting.deletes.load(Ordering::Relaxed);
+    eprintln!(
+        "COLD_PEER_100K_PUSH elapsed={:.2}s status={} objects_reads={} objects_writes={} store_gets={} store_get_ranges={} store_puts={} store_deletes={}",
+        elapsed.as_secs_f64(),
+        r.status,
+        obj_reads,
+        obj_writes,
+        store_gets,
+        store_get_ranges,
+        store_puts,
+        store_deletes,
+    );
+
+    assert_eq!(r.status, 200, "cold-peer 100k push failed: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r.body));
+    assert!(
+        elapsed < max_elapsed,
+        "cold-peer 100k push took {:.2}s (limit {}s); staged index lookups must be batched",
+        elapsed.as_secs_f64(),
+        max_elapsed.as_secs()
+    );
+    assert!(
+        store_get_ranges <= 105_000,
+        "cold-peer 100k push made {store_get_ranges} store get_range reads (expected ~100,400 with batched index lookups, <= 105,000)"
+    );
+    let tips = api2.tips(Some(&token), &p.name).unwrap();
+    assert_eq!(tips.branches["main"], snap_id, "main must advance to pushed snapshot");
+}
