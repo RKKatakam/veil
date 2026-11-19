@@ -1993,6 +1993,39 @@ fn bug_2925_migration_46_keeps_sweep_and_retention_indexes_usable_on_yugabytedb(
         let db = veil_server::db::connect(&url, 2).await.unwrap();
         veil_server::db::migrate(&db).await.unwrap();
 
+        // Populate a small realistic dataset and ANALYZE: under YugabyteDB 2025.2's
+        // default `yb_enable_base_scans_cost_model = on`, empty/unanalyzed tables
+        // always favor `*_pkey` (startup cost 21.00 < secondary index 24.00) even
+        // on pre-0046 schemas. With stats present, composite-hash indexes are still
+        // ignored while covering `(project_id HASH, ...) INCLUDE (...)` indexes get
+        // chosen for `Index Only Scan`.
+        exec_retrying(
+            &db,
+            "INSERT INTO landing_queue ( \
+                project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, \
+                person_epoch, project_epoch, state, created_at, done_at \
+             ) SELECT 1, 'b' || g, 't' || g, 1, 'a', 'd', '[]', 1, 0, 0, \
+                      CASE WHEN g <= 10 THEN 'landed' ELSE 'queued' END, 50, \
+                      CASE WHEN g <= 10 THEN 50 ELSE NULL END \
+               FROM generate_series(1, 500) g",
+        )
+        .await;
+        exec_retrying(
+            &db,
+            "INSERT INTO landings (project_id, branch, lineage, submitted, landed, at) \
+             SELECT 1, 'b' || g, 1, 's' || g, 'l' || g, CASE WHEN g <= 10 THEN 50 ELSE 5000 END \
+             FROM generate_series(1, 500) g",
+        )
+        .await;
+        exec_retrying(
+            &db,
+            "INSERT INTO packs (project_id, name, state, person_id, size, objects, created_at, discarded_at) \
+             SELECT 1, 'p' || g, CASE WHEN g <= 5 THEN 0 ELSE 1 END, 1, 100, 1, 50, NULL \
+             FROM generate_series(1, 500) g",
+        )
+        .await;
+        exec_retrying(&db, "ANALYZE landing_queue, landings, packs").await;
+
         let explain = |sql: &str| {
             let db = db.clone();
             let q = format!("EXPLAIN {sql}");
