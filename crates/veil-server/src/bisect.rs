@@ -1741,7 +1741,7 @@ async fn revert_confirmed_culprit(
                      ) VALUES ( \
                         $1, $2, $3, $4, $5, $6, $7, $8, \
                         $9, $10, 1, 'queued', (extract(epoch FROM clock_timestamp()) * 1000000)::BIGINT \
-                     ) ON CONFLICT (ticket) DO NOTHING",
+                     ) ON CONFLICT (project_id, ticket) DO NOTHING",
                 )
                 .bind(pid)
                 .bind(&branch_name)

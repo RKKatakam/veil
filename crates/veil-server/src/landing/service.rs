@@ -191,11 +191,16 @@ async fn renew(hub: &Hub, project: i64, branch: &str, epoch: i64) -> Result<bool
 
 /// Is anything queued or merging for `branch`?
 pub(super) async fn has_ready(hub: &Hub, project: i64, branch: &str) -> Result<bool> {
-    let n: Option<i64> = sqlx::query_scalar("SELECT seq FROM landing_queue WHERE project_id = $1 AND branch = $2 AND state IN ('queued', 'merging') LIMIT 1")
-        .bind(project)
-        .bind(branch)
-        .fetch_optional(&hub.db)
-        .await?;
+    let n: Option<i32> = sqlx::query_scalar(
+        "(SELECT 1 FROM landing_queue WHERE (CASE WHEN state = 'queued' THEN project_id END) = $1 AND state = 'queued' AND branch = $2 LIMIT 1) \
+         UNION ALL \
+         (SELECT 1 FROM landing_queue WHERE state = 'merging' AND project_id = $1 AND branch = $2 LIMIT 1) \
+         LIMIT 1",
+    )
+    .bind(project)
+    .bind(branch)
+    .fetch_optional(&hub.db)
+    .await?;
     Ok(n.is_some())
 }
 
