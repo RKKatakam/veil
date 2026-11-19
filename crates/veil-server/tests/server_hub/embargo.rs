@@ -2086,3 +2086,174 @@ fn bug_2634_an_embargo_collapsed_under_the_same_view_key_never_refuses_main_or_l
     let dev_clone = p.dev.dir("clone");
     p.dev.ok(p.dev.home.path(), &["clone", &cold.url(&p.name), dev_clone.to_str().unwrap()]);
 }
+
+/// BUG-2850 (review b1a; incomplete BUG-2634 fix): `sync::resolve_for_mode`
+/// queries `projections WHERE project_id = $1 AND view_key = $2 AND
+/// projected_id = $3` without excluding embargoed or collapsed rows, then picks
+/// the sole leaf snapshot (`[one] => Some(*one)`) before checking `withheld(r)`
+/// (`sync.rs:1325-1432`). When `fin` pushes a valid single-parent embargoed
+/// `billing/` snapshot `E` (`parents = [M1]`, `embargo = Some(eid)`) and
+/// `partner` (sharing `dev`'s `view_key`) pulls `E`, `projections` holds only
+/// `(vk, M1, m1_proj, false)` and `(vk, E, m1_proj, true)`. For any call where
+/// `M1` is not a tip in `branches` (`POST /changes` with no `onto` or a new
+/// branch, `POST /push` creating a feature branch off `M1`, or after `main`
+/// advances to `M2`), `resolve_for_mode` eliminates `M1` because it is `E`'s
+/// first parent, picks `leaves = [E]`, skips `own_projection`, sees
+/// `withheld(E) == true`, and returns `Ok(None)` — refusing `POST /changes`
+/// with `404` and `POST /push` with `400` to every outsider sharing `view_key`
+/// and creating an embargo existence oracle on `M1`.
+#[test]
+#[ignore = "BUG-2850: sync::resolve_for_mode picks a collapsed embargoed projection under the same view_key and refuses public commits with 404/400"]
+fn bug_2850_resolve_for_mode_ignores_collapsed_embargoed_projections_under_same_view_key() {
+    const FIX_MARK: &str = "EMBARGO-BILLING-COLLAPSED-2850";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let partner = hub.person("partner");
+    p.admin.ok(&p.dir, &["group", "create", "distro"]);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &partner.name, "--confirm", &partner.fingerprint()]);
+    p.admin.ok(&p.dir, &["group", "add", "distro", &partner.name]);
+    p.admin.ok(&p.dir, &["group", "add", "distro", &p.fin.name]);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
+    partner.trust_project(&hub, &p.name, &p.fp);
+
+    let api = hub.api();
+    let (dev, part_tok) = (p.dev.token(), partner.token());
+    let m1_proj = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+
+    // 1. Baseline BEFORE the embargo: `dev` can create an API change based on
+    //    `M1` and push a new feature branch off `M1`.
+    let pre_change = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": m1_proj.hex(),
+            "description": "before embargo",
+            "edits": [{"path": "src/dev_pre_2850.rs", "put": {"text": "pre\n"}}],
+        }),
+    );
+    assert_eq!(pre_change.status, 200, "pre-embargo change on M1: {}", String::from_utf8_lossy(&pre_change.body));
+
+    // 2. `fin` pushes a valid single-parent embargoed `billing/` snapshot `E`
+    //    parented on `M1` for `finance` + `distro`; `partner` (same `view_key`
+    //    as `dev`) pulls `E`, storing `(dev's vk, E -> m1_proj, collapsed = true)`.
+    let eid = "a1b2c3d4e5".to_string();
+    let now = veil_core::now_millis();
+    let mut fin_craft = Craft::new(&api, &p.fin, &p.name, "main");
+    let fin_m1 = fin_craft.tip;
+    fin_craft.file(&format!("{BILL_DIR}/acme/invoice.txt"), &format!("{BILL_MARK}\n{FIX_MARK}\n"));
+    let mut emb_snap = veil_core::object::Snapshot {
+        parents: vec![fin_m1],
+        change_id: veil_core::ChangeId::random(),
+        tree: fin_craft.root,
+        description: veil_core::object::Text::Plain("single-parent embargoed billing fix on M1".into()),
+        author: "fin".into(),
+        timestamp: now,
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: Some(eid.clone()),
+        signature: None,
+        agent: None,
+        attempts: vec![],
+        abandoned: None,
+    };
+    emb_snap.sign(&fin_craft.identity);
+    let embargoed = fin_craft.put(veil_core::object::Object::Snapshot(emb_snap));
+    let up = api.upload(&fin_craft.token, &p.name, &fin_craft.objects);
+    assert_eq!(up.status, 200, "upload embargoed snapshot: {}", String::from_utf8_lossy(&up.body));
+    let packs: Vec<String> = serde_json::from_value(up.json()["packs"].clone()).unwrap();
+    let rec = veil_core::keychain::EmbargoRecord {
+        format: veil_core::keychain::EMBARGO_FORMAT,
+        id: eid.clone(),
+        scope: "finance,distro".into(),
+        until: Some(now + 3_600_000),
+        released_at: None,
+        created: now,
+        state: None,
+        reason: None,
+    };
+    let push_emb = api.post_json(
+        Some(&fin_craft.token),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "main", "expected": fin_m1.hex(), "new": embargoed.hex()}],
+            "packs": packs,
+            "embargoes": [rec],
+        }),
+    );
+    assert_eq!(push_emb.status, 200, "push single-parent embargo: {}", String::from_utf8_lossy(&push_emb.body));
+    assert_eq!(push_emb.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&push_emb.body));
+
+    let part_tips = api.tips(Some(&part_tok), &p.name).unwrap();
+    assert_eq!(
+        part_tips.branches.get(&format!("embargo/{eid}")).copied(),
+        Some(m1_proj),
+        "embargoed billing commit collapsed into M1 for partner's view"
+    );
+
+    // Advance `main` to `M2` so `M1` is now a historical public commit (not
+    // `main`'s current tip) and `resolve_for_mode` resolves `m1_proj` through
+    // `projections` (`sync.rs:1325-1432`).
+    write_files(&p.dir, &[("src/after_m1_2850.rs", "pub const AFTER: u32 = 2;\n")]);
+    p.admin.ok(&p.dir, &["commit", "-m", "advance main past M1"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let m2_proj = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    assert_ne!(m2_proj, m1_proj, "main advanced past M1");
+
+    // 3. AFTER the embargo: `dev` (outside the embargo, same `view_key`) must
+    //    still be able to base API changes and feature branches on `M1` without
+    //    404/400 refusal or an embargo existence oracle.
+    let post_change = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": m1_proj.hex(),
+            "description": "after embargo",
+            "edits": [{"path": "src/dev_post_2850.rs", "put": {"text": "post\n"}}],
+        }),
+    );
+    assert_eq!(
+        post_change.status,
+        200,
+        "post-embargo POST /changes based on public commit M1 must succeed (not 404): {}",
+        String::from_utf8_lossy(&post_change.body)
+    );
+
+    let mut dev_craft = Craft::new(&api, &p.dev, &p.name, "main");
+    dev_craft.file("src/dev_branch_2850.rs", "pub const B: u32 = 1;\n");
+    let mut dev_snap = veil_core::object::Snapshot {
+        parents: vec![m1_proj],
+        change_id: veil_core::ChangeId::random(),
+        tree: dev_craft.root,
+        description: veil_core::object::Text::Plain("dev branch off M1".into()),
+        author: "dev".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+        agent: None,
+        attempts: vec![],
+        abandoned: None,
+    };
+    dev_snap.sign(&dev_craft.identity);
+    let dev_new = dev_craft.put(veil_core::object::Object::Snapshot(dev_snap));
+    let up_dev = api.upload(&dev_craft.token, &p.name, &dev_craft.objects);
+    assert_eq!(up_dev.status, 200, "{}", String::from_utf8_lossy(&up_dev.body));
+    let dev_packs: Vec<String> = serde_json::from_value(up_dev.json()["packs"].clone()).unwrap();
+    let post_push = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "dev-feat-2850", "expected": null, "new": dev_new.hex()}],
+            "packs": dev_packs,
+        }),
+    );
+    assert_eq!(
+        post_push.status,
+        200,
+        "post-embargo POST /push branching off public commit M1 must succeed (not 400): {}",
+        String::from_utf8_lossy(&post_push.body)
+    );
+    assert_eq!(post_push.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&post_push.body));
+}
+
