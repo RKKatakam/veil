@@ -1594,25 +1594,6 @@ impl Objects {
         self.packs.usable_for_packs(project, person, names, self.receipt_key.as_ref()).await
     }
 
-    /// Whether every name in `names` is cryptographically authenticated as a
-    /// staged upload issued by this cluster for `(project, person)` (`BUG-2851`).
-    pub fn all_staged_names_verified(&self, project: i64, person: i64, names: &[Arc<str>]) -> bool {
-        self.receipt_key
-            .as_ref()
-            .is_some_and(|k| names.iter().all(|n| crate::pack::verify_staged_name(k, project, person, n)))
-    }
-
-    /// Whether any name in `names` is already tombstoned as discarded in this
-    /// server's staged-index cache.
-    pub fn any_discarded_here(&self, project: i64, names: &[Arc<str>]) -> bool {
-        names.iter().any(|n| self.packs.is_discarded_here(project, n))
-    }
-
-    /// Tombstone `names` in this server's staged-index cache.
-    pub fn mark_discarded_here(&self, project: i64, names: &[Arc<str>]) {
-        self.packs.mark_discarded_here(project, names);
-    }
-
     /// Claim `names` out of `person`'s `recent` upload list while a request
     /// using them is in flight (`BUG-2661`).
     pub fn claim_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {

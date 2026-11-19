@@ -1314,14 +1314,6 @@ impl Packs {
         matches!(self.staged.get(&name_key(project, name)), Some(None))
     }
 
-    /// Tombstone `names` in this server's staged-index cache after the
-    /// database shows they are no longer usable (`STAGED`/`LISTED`).
-    pub fn mark_discarded_here(&self, project: i64, names: &[Arc<str>]) {
-        for n in names {
-            self.staged.insert(name_key(project, n), None, 64);
-        }
-    }
-
     /// Remove `names` from `person`'s `recent` upload list so no concurrent
     /// upload is handed an in-flight container (`BUG-2661`).
     pub fn claim_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {

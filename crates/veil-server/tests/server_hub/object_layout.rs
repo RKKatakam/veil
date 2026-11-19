@@ -1856,9 +1856,8 @@ fn p5b_batched_consumed_pack_purge_and_cross_hub_recheck() {
 
     // 2. Cross-hub refused pack: upload P1 and P2 on Hub A (cached in Hub A's
     //    `self.staged`), refuse P1 on Hub B (`state = DISCARDED, objects >= 0`),
-    //    then push `[P1, P2]` back on Hub A. Hub A's `UPDATE packs` fails and
-    //    `recheck_push_packs` must return 400 BAD_PACK_UPLOAD, discard P2, and
-    //    not create the branch.
+    //    then push `[P1, P2]` back on Hub A. Pre-tx `usable_for_packs` must
+    //    return 400 BAD_PACK_UPLOAD, discard P2, and not create the branch.
     let mut c1 = Craft::new(&api, &p.dev, &p.name, "main");
     c1.file("src/p5b_refused_1.rs", "// p1\n");
     let tip = c1.tip;
@@ -1962,7 +1961,6 @@ fn p5b_batched_consumed_pack_purge_and_cross_hub_recheck() {
 ///      consumed pack `P3` is paired with a pre-tx check refusal instead of
 ///      answering `409 DISCARDED_UPLOAD` and keeping `P4`.
 #[test]
-#[ignore = "BUG-2923: P5-B skip_precheck writes already-refused pack objects permanently to S3, leaks non-uniform status, and destroys live siblings of consumed packs"]
 fn bug_2923_cross_hub_refused_or_consumed_pack_never_persists_objects_or_destroys_siblings() {
     let hub = TestHub::start_objects();
     let other = TestHub::beside(&hub);
