@@ -2955,27 +2955,31 @@ Nothing changes for `vl` or on the wire.
   **An upload of objects that a pack the same person staged on this server
   holds all of** (a push that lost a race, uploaded again by `vl`'s next
   try) gets that pack's receipts and name, with no new pack and no commit.
-* **What counts as uploaded** (BUG-1155, BUG-1150): for a push naming
-  `packs` (revision 9, mutually exclusive with `receipts`), every object in
-  every named staged pack, where each pack name is syntactically valid (32
-  lowercase hex digits), named at most once, and belongs to the pusher in
-  `project` with state `STAGED` or `LISTED` (`Packs::usable_for_packs`); a
-  pack belonging to another person or project, a forged name, or a pack
-  discarded by an earlier check refusal (`objects >= 0`) all receive the
-  same `400 bad_request` answer (no oracle), and only the pusher's own
-  verified packs are ever discarded. For `receipts` (API commits and pushes
-  from clients before revision 9), only an object its receipt's pack holds,
-  where that pack is the pusher's and staged or listed (one statement: the
-  rows). A discarded upload is worth nothing in either form, and a staged
-  object is read from its pack only, never looked for in the project's store
-  instead, so naming a guess of hidden content gets the answer a wrong guess
-  gets.
-* **A push** reads the staged packs it names (`packs`, reading each pack's
-  index under `Packs::bound` and releasing the share immediately into
-  `StagedSlots`) or that its `receipts` name (from memory on the server that
-  took the upload, or by bisecting the sorted index in storage with 64 KiB
-  ranged reads), checks every new snapshot as before, and then, when
-  something lands:
+* **What counts as uploaded** (BUG-1155, BUG-1150, BUG-2851): for a push
+  naming `packs` (revision 9, mutually exclusive with `receipts`), every
+  object in every named staged pack, where each pack name is syntactically
+  valid (32 lowercase hex digits: an 8-byte random nonce plus an 8-byte
+  keyed BLAKE3 tag bound to `(project, person)` under `receipt_key`), named
+  at most once, and belongs to the pusher in `project` with state `STAGED`
+  or `LISTED` (`Packs::usable_for_packs`); a pack belonging to another person
+  or project, a forged name, or a pack discarded by an earlier check refusal
+  (`objects >= 0`) all receive the same `400 bad_request` answer (no oracle),
+  and only the pusher's own verified packs are ever discarded, whereas a
+  caller-authenticated pack already consumed or swept answers retryable
+  `409 conflict` (`DISCARDED_UPLOAD`) and preserves live sibling uploads.
+  For `receipts` (API commits and pushes from clients before revision 9),
+  only an object its receipt's pack holds, where that pack is the pusher's
+  and staged or listed (one statement: the rows). A discarded upload is
+  worth nothing in either form, and a staged object is read from its pack
+  only, never looked for in the project's store instead, so naming a guess
+  of hidden content gets the answer a wrong guess gets.
+* **A push** reads the staged packs it names (`packs`, keeping each pack's
+  `Held` index share alive inside `Staged` under `Packs::bound` /
+  `pack::INDEXES_HELD` for the duration of the push and binary-searching
+  `Held::index` in place with no extra index copies: BUG-2852) or that its
+  `receipts` name (from memory on the server that took the upload, or by
+  bisecting the sorted index in storage with 64 KiB ranged reads), checks
+  every new snapshot as before, and then, when something lands:
   * lists a staged pack **as it is** if its checks read every object in it
     (what a `vl` push uploads is exactly what the checks read: §13.5);
   * puts the objects the checks read from any other staged pack, and the

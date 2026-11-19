@@ -2003,7 +2003,6 @@ fn bug_1150_push_packs_proof_of_upload_in_objects_layout() {
 /// (`sync.rs:4663`), and returns non-retryable `400 bad_request` instead of
 /// retryable `409 conflict` (`DISCARDED_UPLOAD`), destroying `P2`.
 #[test]
-#[ignore = "BUG-2851: push naming a consumed pack in objects layout answers 400 and discards live sibling uploads instead of 409"]
 fn bug_2851_push_packs_consumed_in_objects_layout_answers_409_and_keeps_sibling_uploads() {
     let hub = TestHub::start_objects();
     let p = setup_project(&hub);
@@ -2088,7 +2087,6 @@ fn bug_2851_push_packs_consumed_in_objects_layout_answers_409_and_keeps_sibling_
 /// Concurrent losing pushes naming two large staged packs therefore bypass
 /// `INDEXES_HELD` and grow server RSS by hundreds of MiB. Hostile size: run alone.
 #[test]
-#[ignore = "BUG-2852: staging_packs drops Held and copies full staged pack indexes into unbudgeted Vec/HashMap/HashSet, bypassing INDEXES_HELD"]
 fn hostile_bug_2852_push_packs_holds_staged_indexes_within_indexes_held_bound() {
     let hub = TestHub::start();
     let p = setup_project(&hub);

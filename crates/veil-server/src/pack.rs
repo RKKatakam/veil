@@ -104,6 +104,48 @@ pub fn new_name() -> String {
     hex::encode(veil_core::crypto::random_bytes::<16>())
 }
 
+/// A fresh authenticated staged upload pack name for `(project, person)`
+/// (`BUG-2851`): 64 random nonce bits followed by a 64-bit keyed BLAKE3 tag
+/// bound to `(project, person, nonce)` under `key`, encoded as 32 lowercase
+/// hex characters (the same wire shape as [`new_name`]).
+pub fn new_staged_name(key: &[u8; 32], project: i64, person: i64) -> String {
+    let nonce = veil_core::crypto::random_bytes::<8>();
+    let tag = staged_name_tag(key, project, person, &nonce);
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&nonce);
+    out[8..].copy_from_slice(&tag);
+    hex::encode(out)
+}
+
+fn staged_name_tag(key: &[u8; 32], project: i64, person: i64, nonce: &[u8; 8]) -> [u8; 8] {
+    let mut h = blake3::Hasher::new_keyed(key);
+    h.update(&project.to_le_bytes());
+    h.update(&person.to_le_bytes());
+    h.update(b"staged pack");
+    h.update(nonce);
+    let mut tag = [0u8; 8];
+    tag.copy_from_slice(&h.finalize().as_bytes()[..8]);
+    tag
+}
+
+/// Is `name` an authenticated staged pack name issued by this cluster for
+/// `(project, person)`? Compared in constant time.
+pub fn verify_staged_name(key: &[u8; 32], project: i64, person: i64, name: &str) -> bool {
+    if !valid_name(name) {
+        return false;
+    }
+    let Ok(raw) = hex::decode(name) else {
+        return false;
+    };
+    if raw.len() != 16 {
+        return false;
+    }
+    let mut nonce = [0u8; 8];
+    nonce.copy_from_slice(&raw[..8]);
+    let expected = staged_name_tag(key, project, person, &nonce);
+    raw[8..].iter().zip(&expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
 /// Is `s` a pack name ([`new_name`]'s form)?
 pub fn valid_name(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -1392,14 +1434,22 @@ impl Packs {
     }
 
     /// Classify pack names supplied directly by `PushRequest::packs`
-    /// (`BUG-1150`). Only packs whose `packs` row belongs to `person` in
-    /// `project` and is `STAGED` or `LISTED` are `usable`. A row owned by
-    /// `person` with `state = DISCARDED` and `objects < 0` (consumed by a
-    /// committing request in `objects` mode, `BUG-2661`) goes into `consumed`.
+    /// (`BUG-1150`, `BUG-2851`). Only packs whose `packs` row belongs to
+    /// `person` in `project` and is `STAGED` or `LISTED` are `usable`. A row
+    /// owned by `person` with `state = DISCARDED` and `objects < 0` (consumed
+    /// by a committing request, `BUG-2661`), or a missing row whose name is
+    /// authenticated for `(project, person)` under `receipt_key` (consumed and
+    /// purged in `objects` layout or swept, `BUG-2851`), goes into `consumed`.
     /// Every other name (another person's pack, another project's pack, a
     /// forged name, or a pack discarded by an earlier check refusal with
     /// `objects >= 0`) goes into `invalid`.
-    pub async fn usable_for_packs(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<PackCheck> {
+    pub async fn usable_for_packs(
+        &self,
+        project: i64,
+        person: i64,
+        names: &[Arc<str>],
+        receipt_key: Option<&[u8; 32]>,
+    ) -> Result<PackCheck> {
         let Some(db) = &self.db else {
             return Ok(PackCheck {
                 usable: names.iter().cloned().collect(),
@@ -1435,6 +1485,12 @@ impl Packs {
                 Some(&(s, objs)) if s == DISCARDED && objs < 0 => {
                     consumed.insert(n.clone());
                 }
+                Some(&(s, objs)) if s == DISCARDED && objs >= 0 => {
+                    invalid.insert(n.clone());
+                }
+                None if receipt_key.is_some_and(|k| verify_staged_name(k, project, person, n)) => {
+                    consumed.insert(n.clone());
+                }
                 _ => {
                     invalid.insert(n.clone());
                 }
@@ -1444,13 +1500,21 @@ impl Packs {
     }
 
     /// The index and length of staged pack `name`, with its share of the
-    /// bound: from the staged-index cache, or read under a share of its own;
-    /// `None` if it is not in the store (discarded).
+    /// bound: from the staged-index cache, or read under a share of its own
+    /// (detached from the per-project active-reader quota once parsed while
+    /// retaining its [`INDEXES_HELD`] share so a push holding multiple
+    /// uncached packs stays within `INDEXES_HELD` without self-deadlocking
+    /// against one project's quarter share, `BUG-2852`); `None` if it is not
+    /// in the store (discarded).
     pub async fn staged_index(&self, store: &dyn BlobStore, project: i64, name: &str) -> Result<Option<Arc<Held>>> {
         if let Some(i) = self.staged.get(&name_key(project, name)) {
             return Ok(i);
         }
-        Ok(read_index(store, &key(project, name), &self.bound).await?.map(Arc::new))
+        let Some(mut held) = read_index(store, &key(project, name), &self.bound).await? else {
+            return Ok(None);
+        };
+        held.unproject();
+        Ok(Some(Arc::new(held)))
     }
 
     /// What a push or API commit keeps of staged pack `name` (BUG-1496,
