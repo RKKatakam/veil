@@ -196,12 +196,12 @@ pub struct Change {
 
 /// Membership test for objects uploaded in a push ([`Graft::proving`]).
 pub trait UploadedSet {
-    fn contains_uploaded(&self, id: &ObjectId) -> bool;
+    fn contains_uploaded(&self, id: &ObjectId) -> Result<bool>;
 }
 
 impl UploadedSet for HashSet<ObjectId> {
-    fn contains_uploaded(&self, id: &ObjectId) -> bool {
-        self.contains(id)
+    fn contains_uploaded(&self, id: &ObjectId) -> Result<bool> {
+        Ok(self.contains(id))
     }
 }
 
@@ -245,7 +245,7 @@ impl<'a> Graft<'a> {
     /// See [`Graft::proving`]: may the pushed tree `id` at `dir` be read?
     fn check_pushed(&mut self, dir: &str, id: &ObjectId, depth: usize) -> Result<()> {
         let Some((uploaded, parents)) = &self.proof else { return Ok(()) };
-        if *id == empty_tree_id() || uploaded.contains_uploaded(id) || self.proj.created.contains_key(id) {
+        if *id == empty_tree_id() || uploaded.contains_uploaded(id)? || self.proj.created.contains_key(id) {
             return Ok(());
         }
         for root in parents.clone() {

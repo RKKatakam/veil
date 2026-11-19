@@ -2973,13 +2973,14 @@ Nothing changes for `vl` or on the wire.
   worth nothing in either form, and a staged object is read from its pack
   only, never looked for in the project's store instead, so naming a guess
   of hidden content gets the answer a wrong guess gets.
-* **A push** reads the staged packs it names (`packs`, keeping each pack's
-  `Held` index share alive inside `Staged` under `Packs::bound` /
-  `pack::INDEXES_HELD` for the duration of the push and binary-searching
-  `Held::index` in place with no extra index copies: BUG-2852) or that its
-  `receipts` name (from memory on the server that took the upload, or by
-  bisecting the sorted index in storage with 64 KiB ranged reads), checks
-  every new snapshot as before, and then, when something lands:
+* **A push** reads the staged packs it names (`packs`, resolving lookups on
+  demand from the server's `staged` LRU on a cache hit—dropping its `Held`
+  share at once—or bisecting the sorted index in storage under one 64 KiB
+  `FIRST_READ` share on a miss, never holding `Held` shares across further
+  `Bound::take_for` waits or materializing whole-index copies: BUG-2852,
+  BUG-2870) or that its `receipts` name (from memory on the server that took
+  the upload, or by bisecting the sorted index in storage with 64 KiB ranged
+  reads), checks every new snapshot as before, and then, when something lands:
   * lists a staged pack **as it is** if its checks read every object in it
     (what a `vl` push uploads is exactly what the checks read: §13.5);
   * puts the objects the checks read from any other staged pack, and the

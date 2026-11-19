@@ -2148,7 +2148,6 @@ fn hostile_bug_2852_push_packs_holds_staged_indexes_within_indexes_held_bound() 
 /// 7th pack's `27 MiB` `read_weight`, failing with `503 Service Unavailable`.
 /// Hostile size: run alone.
 #[test]
-#[ignore = "BUG-2870: sync::staging_packs holds Bound permits in held_packs while awaiting more staged_index reads, self-deadlocking a 7-pack push with 503 IndexesFull"]
 fn hostile_bug_2870_push_packs_never_self_deadlocks_on_uncached_multi_pack_push() {
     let hub1 = TestHub::start();
     let hub2 = TestHub::beside(&hub1);

@@ -822,22 +822,51 @@ pub struct ReceiptPacks {
     pub vanished: HashSet<Arc<str>>,
 }
 
-/// Classification of pack names supplied in `PushRequest::packs` (BUG-1150).
-/// Unlike [`ReceiptPacks`], pack names carry no per-object MAC, so a missing
-/// row (forged name, another person's pack, another project's pack) goes into
-/// `invalid` together with packs discarded by an earlier check refusal so all
-/// of them receive the exact same `400 bad_request` answer (zero oracle).
+/// Classification of pack names supplied in `PushRequest::packs` (BUG-1150,
+/// BUG-2851). Staged pack names carry a keyed BLAKE3 tag bound to
+/// `(project, person)` ([`new_staged_name`]): a missing `packs` row whose
+/// signed name verifies for `(project, person)` under `receipt_key` was
+/// already consumed and purged in `objects` layout (or swept) and goes into
+/// `consumed` (`409 Conflict`, keeping sibling uploads); every other missing
+/// name (forged name, another person's pack, another project's pack) goes into
+/// `invalid` together with packs discarded by an earlier check refusal
+/// (`state = DISCARDED`, `objects >= 0`) so all of them receive the exact same
+/// `400 bad_request` answer (zero oracle).
 pub struct PackCheck {
     /// Packs `person` staged in `project` that are still `STAGED` or `LISTED`.
     pub usable: HashSet<Arc<str>>,
-    /// Packs `person` staged in `project` that a committing request in
-    /// `objects` mode already consumed (`state = DISCARDED`, `objects < 0`,
-    /// `BUG-2661`): answer `409 Conflict` without discarding sibling packs.
+    /// Packs `person` staged in `project` that a committing request already
+    /// consumed (`state = DISCARDED`, `objects < 0`, `BUG-2661`, or a missing
+    /// row whose signed name verifies for `(project, person)`, `BUG-2851`):
+    /// answer `409 Conflict` without discarding sibling packs.
     pub consumed: HashSet<Arc<str>>,
     /// Packs not owned by `person` in `project`, never staged, or discarded
     /// by an earlier check refusal (`state = DISCARDED`, `objects >= 0`,
     /// `BUG-930`, `BUG-1155`): answer `400 bad_request` and never touch them.
     pub invalid: HashSet<Arc<str>>,
+}
+
+/// Result of looking up one object across a push's named staged packs
+/// (`PushRequest::packs`, `BUG-2870`).
+pub enum StagedLookup {
+    /// Found in staged pack `name` at `slot`.
+    Found(Arc<str>, Slot),
+    /// Not in any of the named packs (all named packs still exist).
+    NotFound,
+    /// Not found in any live pack, and at least one named pack is gone
+    /// (tombstoned in `self.staged` or missing from `store`).
+    PackGone,
+}
+
+/// Result of checking only this server's `Packs::staged` cache for one object
+/// across `PushRequest::packs` (`BUG-2870`).
+pub enum CachedStagedLookup<'a> {
+    /// Resolved purely from `self.staged` without touching `store` or `bound`.
+    Done(StagedLookup),
+    /// Not found in cached packs; `uncached` packs must be bisected via
+    /// [`Packs::find_staged_slot_uncached`]. `gone` records whether any cached
+    /// pack was already tombstoned.
+    Miss { uncached: Vec<&'a Arc<str>>, gone: bool },
 }
 
 impl Packs {
@@ -1500,21 +1529,14 @@ impl Packs {
     }
 
     /// The index and length of staged pack `name`, with its share of the
-    /// bound: from the staged-index cache, or read under a share of its own
-    /// (detached from the per-project active-reader quota once parsed while
-    /// retaining its [`INDEXES_HELD`] share so a push holding multiple
-    /// uncached packs stays within `INDEXES_HELD` without self-deadlocking
-    /// against one project's quarter share, `BUG-2852`); `None` if it is not
-    /// in the store (discarded).
+    /// bound: from the staged-index cache, or read under a project-attributed
+    /// share of its own (`BUG-2870`: never unprojected outside the bounded
+    /// `self.staged` cache); `None` if it is not in the store (discarded).
     pub async fn staged_index(&self, store: &dyn BlobStore, project: i64, name: &str) -> Result<Option<Arc<Held>>> {
         if let Some(i) = self.staged.get(&name_key(project, name)) {
             return Ok(i);
         }
-        let Some(mut held) = read_index(store, &key(project, name), &self.bound).await? else {
-            return Ok(None);
-        };
-        held.unproject();
-        Ok(Some(Arc::new(held)))
+        Ok(read_index(store, &key(project, name), &self.bound).await?.map(Arc::new))
     }
 
     /// What a push or API commit keeps of staged pack `name` (BUG-1496,
@@ -1531,6 +1553,103 @@ impl Packs {
             return Ok(Some(StagedSlots { objects: held.index.len(), size: held.size, slots }));
         }
         self.stored_slots(store, project, &key(project, name), ids, true).await
+    }
+
+    /// Like [`Packs::staged_slots`], without requiring every id in `ids` to
+    /// exist in `name` (`PushRequest::packs`, `BUG-1150`, `BUG-2852`,
+    /// `BUG-2870`). A hit in `self.staged` searches the cached index and drops
+    /// its `Arc<Held>` at once; a miss bisects the stored index under one
+    /// [`FIRST_READ`] share (dropped at once), preserving `Bound::take_for`'s
+    /// deadlock-freedom and per-project fairness.
+    pub async fn staged_slots_optional(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        name: &str,
+        ids: &[ObjectId],
+    ) -> Result<Option<StagedSlots>> {
+        if let Some(cached) = self.staged.get(&name_key(project, name)) {
+            let Some(held) = cached else { return Ok(None) };
+            let slots = ids.iter().filter_map(|id| Some((*id, held.index.get(id)?))).collect();
+            return Ok(Some(StagedSlots { objects: held.index.len(), size: held.size, slots }));
+        }
+        self.stored_slots(store, project, &key(project, name), ids, false).await
+    }
+
+    /// Synchronous fast path for [`Packs::find_staged_slot`]: search every pack
+    /// in `names` that is currently in `self.staged`, dropping each `Arc<Held>`
+    /// immediately before moving on. Never touches `store` or `bound`.
+    pub fn find_staged_slot_cached<'a>(&self, project: i64, names: &'a [Arc<str>], id: &ObjectId) -> CachedStagedLookup<'a> {
+        if names.is_empty() {
+            return CachedStagedLookup::Done(StagedLookup::NotFound);
+        }
+        let mut uncached: Vec<&'a Arc<str>> = Vec::new();
+        let mut gone = false;
+        for n in names {
+            match self.staged.get(&name_key(project, n)) {
+                Some(Some(held)) => {
+                    if let Some(slot) = held.index.get(id) {
+                        return CachedStagedLookup::Done(StagedLookup::Found(n.clone(), slot));
+                    }
+                }
+                Some(None) => {
+                    gone = true;
+                }
+                None => {
+                    uncached.push(n);
+                }
+            }
+        }
+        if uncached.is_empty() {
+            CachedStagedLookup::Done(if gone { StagedLookup::PackGone } else { StagedLookup::NotFound })
+        } else {
+            CachedStagedLookup::Miss { uncached, gone }
+        }
+    }
+
+    /// Async slow path for [`Packs::find_staged_slot`]: bisect each uncached
+    /// staged pack via `Packs::stored_slots` (`every = false`) under one
+    /// [`FIRST_READ`] share at a time (dropped at once).
+    pub async fn find_staged_slot_uncached(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        uncached: &[&Arc<str>],
+        mut gone: bool,
+        id: &ObjectId,
+    ) -> Result<StagedLookup> {
+        for n in uncached {
+            match self.stored_slots(store, project, &key(project, n), std::slice::from_ref(id), false).await? {
+                Some(ss) => {
+                    if let Some(&(_, slot)) = ss.slots.first() {
+                        return Ok(StagedLookup::Found((*n).clone(), slot));
+                    }
+                }
+                None => {
+                    gone = true;
+                }
+            }
+        }
+        Ok(if gone { StagedLookup::PackGone } else { StagedLookup::NotFound })
+    }
+
+    /// Look up `id` across `names` for `PushRequest::packs` (`BUG-2870`):
+    /// checks `self.staged` hits first (dropping each `Arc<Held>` at once),
+    /// then bisects misses via `Packs::stored_slots` under one [`FIRST_READ`]
+    /// share at a time.
+    pub async fn find_staged_slot(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        names: &[Arc<str>],
+        id: &ObjectId,
+    ) -> Result<StagedLookup> {
+        match self.find_staged_slot_cached(project, names, id) {
+            CachedStagedLookup::Done(r) => Ok(r),
+            CachedStagedLookup::Miss { uncached, gone } => {
+                self.find_staged_slot_uncached(store, project, &uncached, gone, id).await
+            }
+        }
     }
 
     /// The slots of `ids` in the index of the pack stored at `k` (a pack of
@@ -3130,7 +3249,6 @@ mod tests {
     /// `72 MiB`+ of `INDEXES_HELD` (96 MiB), and starve unrelated projects into
     /// `503 IndexesFull`.
     #[tokio::test]
-    #[ignore = "BUG-2870: Packs::staged_index calls unproject() on uncached request-held shares, bypassing per-project quota and starving other projects into 503 IndexesFull"]
     async fn bug_2870_staged_index_never_bypasses_per_project_quota_to_starve_other_projects() {
         struct SharedPackStore(Bytes);
 

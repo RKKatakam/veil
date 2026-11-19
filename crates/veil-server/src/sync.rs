@@ -113,7 +113,17 @@ pub struct Source {
 /// keeps of its index (BUG-1496): how many objects it holds, its length
 /// and the slots of the objects the receipts name.
 type StagedPack = (Arc<str>, StagedSlots);
-type HeldPack = (Arc<str>, Arc<crate::pack::Held>);
+
+/// On-demand lookup context for `PushRequest::packs` pushes (`BUG-1150`,
+/// `BUG-2852`, `BUG-2870`): searches `Packs::staged` on a cache hit (dropping
+/// `Arc<Held>` at once) and bisects via `Packs::stored_slots` under one
+/// `FIRST_READ` share (dropped at once) on a miss.
+struct PackLookup {
+    hub: Arc<Hub>,
+    project: i64,
+    rt: Handle,
+    names: Vec<Arc<str>>,
+}
 
 /// What a push's receipts or named staged packs hold, and the objects the
 /// server made for it (S28). None of it is the project's until the push's
@@ -122,16 +132,15 @@ type HeldPack = (Arc<str>, Arc<crate::pack::Held>);
 /// project's, and it is discarded with its pack (BUG-930).
 pub struct Staged {
     /// Each receipted object in a staged pack: the pack and its slot.
-    /// Empty for `PushRequest::packs` pushes, which look up directly in
-    /// `held` (`BUG-2852`).
+    /// Empty for `PushRequest::packs` pushes, which resolve on demand through
+    /// `named` (`BUG-2852`, `BUG-2870`).
     at: Arc<HashMap<ObjectId, (Arc<str>, Slot)>>,
     /// Receipted staged packs: what the push keeps of each index.
     packs: Arc<Vec<StagedPack>>,
-    /// Staged pack indexes held under `Packs::bound` (`pack::INDEXES_HELD`)
-    /// for `PushRequest::packs` pushes (`BUG-1150`, `BUG-2852`): kept alive
-    /// for the duration of the push and binary-searched in place without
-    /// duplicating index entries.
-    held: Arc<Vec<HeldPack>>,
+    /// Named staged packs for `PushRequest::packs` pushes (`BUG-1150`,
+    /// `BUG-2852`, `BUG-2870`): never retains `Arc<pack::Held>` across waits
+    /// or duplicates whole pack indexes.
+    named: Option<Arc<PackLookup>>,
     /// Objects the server made for the push (canonical encodings).
     made: Arc<Mutex<HashMap<ObjectId, Bytes>>>,
     /// Receipted objects whose container was consumed or swept (`BUG-2661`),
@@ -142,8 +151,11 @@ pub struct Staged {
 }
 
 impl UploadedSet for Staged {
-    fn contains_uploaded(&self, id: &ObjectId) -> bool {
-        self.has_staged(id) || self.vanished.contains(id)
+    fn contains_uploaded(&self, id: &ObjectId) -> veil_core::Result<bool> {
+        if self.vanished.contains(id) {
+            return Ok(true);
+        }
+        Ok(self.slot_of(id)?.is_some())
     }
 }
 
@@ -157,7 +169,7 @@ impl Staged {
         Arc::new(Staged {
             at: Arc::new(HashMap::new()),
             packs: Arc::new(Vec::new()),
-            held: Arc::new(Vec::new()),
+            named: None,
             made: Arc::new(Mutex::new(HashMap::new())),
             vanished: Arc::new(HashSet::new()),
             touched: Mutex::new(HashSet::new()),
@@ -186,7 +198,7 @@ impl Staged {
         Arc::new(Staged {
             at: self.at.clone(),
             packs: self.packs.clone(),
-            held: self.held.clone(),
+            named: self.named.clone(),
             made: self.made.clone(),
             vanished: self.vanished.clone(),
             touched: Mutex::new(HashSet::new()),
@@ -197,42 +209,77 @@ impl Staged {
         std::mem::take(&mut *self.touched.lock().unwrap())
     }
 
-    /// The staged pack and slot holding `id`, if uploaded in this push.
-    fn slot_of(&self, id: &ObjectId) -> Option<(&Arc<str>, Slot)> {
+    /// The staged pack and slot holding `id`, if uploaded in this push
+    /// (called from blocking worker threads via `Source` / `Graft`).
+    fn slot_of(&self, id: &ObjectId) -> veil_core::Result<Option<(Arc<str>, Slot)>> {
         if let Some((n, s)) = self.at.get(id) {
-            return Some((n, *s));
+            return Ok(Some((n.clone(), *s)));
         }
-        for (n, h) in self.held.iter() {
-            if let Some(s) = h.index.get(id) {
-                return Some((n, s));
-            }
+        let Some(named) = &self.named else {
+            return Ok(None);
+        };
+        let lookup = match named.hub.objects.find_staged_slot_cached(named.project, &named.names, id) {
+            crate::pack::CachedStagedLookup::Done(r) => r,
+            crate::pack::CachedStagedLookup::Miss { uncached, gone } => named
+                .rt
+                .block_on(named.hub.objects.find_staged_slot_uncached(named.project, &uncached, gone, id))
+                .map_err(store_err)?,
+        };
+        match lookup {
+            crate::pack::StagedLookup::Found(n, s) => Ok(Some((n, s))),
+            crate::pack::StagedLookup::NotFound => Ok(None),
+            crate::pack::StagedLookup::PackGone => Err(staged_gone()),
         }
-        None
     }
 
-    fn has_staged(&self, id: &ObjectId) -> bool {
-        self.slot_of(id).is_some()
+    /// Async counterpart to [`Staged::slot_of`] for async request paths.
+    async fn slot_of_async(&self, id: &ObjectId) -> veil_core::Result<Option<(Arc<str>, Slot)>> {
+        if let Some((n, s)) = self.at.get(id) {
+            return Ok(Some((n.clone(), *s)));
+        }
+        let Some(named) = &self.named else {
+            return Ok(None);
+        };
+        match named
+            .hub
+            .objects
+            .find_staged_slot(named.project, &named.names, id)
+            .await
+            .map_err(store_err)?
+        {
+            crate::pack::StagedLookup::Found(n, s) => Ok(Some((n, s))),
+            crate::pack::StagedLookup::NotFound => Ok(None),
+            crate::pack::StagedLookup::PackGone => Err(staged_gone()),
+        }
+    }
+
+    async fn contains_uploaded_async(&self, id: &ObjectId) -> veil_core::Result<bool> {
+        if self.vanished.contains(id) {
+            return Ok(true);
+        }
+        Ok(self.slot_of_async(id).await?.is_some())
     }
 
     /// The staged packs' names.
     fn names(&self) -> Vec<Arc<str>> {
-        self.packs
-            .iter()
-            .map(|p| p.0.clone())
-            .chain(self.held.iter().map(|(n, _)| n.clone()))
-            .collect()
+        let mut out: Vec<Arc<str>> = self.packs.iter().map(|p| p.0.clone()).collect();
+        if let Some(named) = &self.named {
+            out.extend(named.names.iter().cloned());
+        }
+        out
     }
 
     /// A staged or made object's key in [`Hub::trees`]: never the
-    /// project's.
-    fn tree_key(&self, project: i64, id: &ObjectId) -> Option<ObjectId> {
+    /// project's. The boolean is `true` when the object lives in a staged
+    /// pack (so a cache hit still marks it `touched`).
+    fn tree_key(&self, project: i64, id: &ObjectId) -> veil_core::Result<Option<(ObjectId, bool)>> {
         if self.made.lock().unwrap().contains_key(id) {
-            return Some(crate::store::Objects::staged_key(project, "made", id, true));
+            return Ok(Some((crate::store::Objects::staged_key(project, "made", id, true), false)));
         }
         if self.vanished.contains(id) {
-            return Some(crate::store::Objects::staged_key(project, "vanished", id, true));
+            return Ok(Some((crate::store::Objects::staged_key(project, "vanished", id, true), false)));
         }
-        self.slot_of(id).map(|(n, _)| crate::store::Objects::staged_key(project, n, id, true))
+        Ok(self.slot_of(id)?.map(|(n, _)| (crate::store::Objects::staged_key(project, &n, id, true), true)))
     }
 }
 
@@ -253,8 +300,14 @@ impl Source {
     /// (`VeilError::Io` -> logged `500 internal`) when missing or corrupt,
     /// whereas client uploads keep `VeilError::Missing` / `VeilError::Corrupt`
     /// for `Error::client_object` (`400 bad_request`: BUG-2681).
-    pub(crate) fn is_client_upload(&self, id: &ObjectId) -> bool {
-        self.pending.contains_key(id) || self.staged.as_ref().is_some_and(|st| st.contains_uploaded(id))
+    pub(crate) fn is_client_upload(&self, id: &ObjectId) -> veil_core::Result<bool> {
+        if self.pending.contains_key(id) {
+            return Ok(true);
+        }
+        match &self.staged {
+            Some(st) => st.contains_uploaded(id),
+            None => Ok(false),
+        }
     }
 
     fn stored_missing(id: &ObjectId) -> VeilError {
@@ -281,11 +334,11 @@ impl Source {
             if st.vanished.contains(id) {
                 return Err(staged_gone());
             }
-            if let Some((name, slot)) = st.slot_of(id) {
+            if let Some((name, slot)) = st.slot_of(id)? {
                 // From its staged pack only, never from the project's store
                 // (BUG-1155: that would answer for what the pusher did not
                 // upload).
-                let got = self.rt.block_on(self.hub.objects.get_staged(self.project, name, slot, id));
+                let got = self.rt.block_on(self.hub.objects.get_staged(self.project, &name, slot, id));
                 let Some((_, raw)) = got.map_err(store_err)? else {
                     return Err(staged_gone());
                 };
@@ -299,7 +352,7 @@ impl Source {
     pub fn raw(&self, id: &ObjectId) -> veil_core::Result<Bytes> {
         match self.present_raw(id)? {
             Some(raw) => Ok(raw),
-            None if self.is_client_upload(id) => Err(VeilError::Missing(*id)),
+            None if self.is_client_upload(id)? => Err(VeilError::Missing(*id)),
             None => Err(Self::stored_missing(id)),
         }
     }
@@ -313,10 +366,21 @@ impl Source {
         }
         // A staged or made object from where `raw` reads it; anything else
         // from the store, uncached, as without them.
-        if self.staged.as_ref().is_some_and(|st| {
-            st.contains_uploaded(id) || st.made.lock().unwrap().contains_key(id)
-        }) {
-            return self.raw(id);
+        if let Some(st) = &self.staged {
+            if let Some(raw) = st.made.lock().unwrap().get(id) {
+                return Ok(raw.clone());
+            }
+            if st.vanished.contains(id) {
+                return Err(staged_gone());
+            }
+            if let Some((name, slot)) = st.slot_of(id)? {
+                let got = self.rt.block_on(self.hub.objects.get_staged(self.project, &name, slot, id));
+                let Some((_, raw)) = got.map_err(store_err)? else {
+                    return Err(staged_gone());
+                };
+                st.touched.lock().unwrap().insert(*id);
+                return Ok(raw);
+            }
         }
         self.hub
             .objects
@@ -337,12 +401,17 @@ impl Source {
     }
 
     pub(crate) fn decode_bytes(&self, id: &ObjectId, raw: &[u8]) -> veil_core::Result<Object> {
-        let client = self.is_client_upload(id);
-        Object::decode(raw).map_err(|e| match e {
-            VeilError::Corrupt(_, m) if client => VeilError::Corrupt(id.hex(), m),
-            other if client => other,
-            other => Self::stored_corrupt(id, other),
-        })
+        match Object::decode(raw) {
+            Ok(o) => Ok(o),
+            Err(e) => {
+                let client = self.is_client_upload(id)?;
+                Err(match e {
+                    VeilError::Corrupt(_, m) if client => VeilError::Corrupt(id.hex(), m),
+                    other if client => other,
+                    other => Self::stored_corrupt(id, other),
+                })
+            }
+        }
     }
 
     pub(crate) fn decode(&self, id: &ObjectId) -> veil_core::Result<Object> {
@@ -357,12 +426,17 @@ impl Source {
                 o => Err(VeilError::Corrupt(id.hex(), format!("expected a snapshot, found a {}", o.kind_name()))),
             };
         }
-        let client = self.is_client_upload(id);
-        Object::decode_snapshot_trusted(raw).map(Arc::new).map_err(|e| match e {
-            VeilError::Corrupt(_, m) if client => VeilError::Corrupt(id.hex(), m),
-            other if client => other,
-            other => Self::stored_corrupt(id, other),
-        })
+        match Object::decode_snapshot_trusted(raw) {
+            Ok(s) => Ok(Arc::new(s)),
+            Err(e) => {
+                let client = self.is_client_upload(id)?;
+                Err(match e {
+                    VeilError::Corrupt(_, m) if client => VeilError::Corrupt(id.hex(), m),
+                    other if client => other,
+                    other => Self::stored_corrupt(id, other),
+                })
+            }
+        }
     }
 
     pub fn snapshot(&self, id: &ObjectId) -> veil_core::Result<Arc<Snapshot>> {
@@ -379,23 +453,24 @@ impl Source {
         self.decode_snapshot_bytes(id, &raw).map(Some)
     }
 
-    fn cached_node(&self, id: &ObjectId) -> (ObjectId, Option<Node>) {
+    fn cached_node(&self, id: &ObjectId) -> veil_core::Result<(ObjectId, Option<Node>)> {
         // A push's uploads and made trees are cached under keys of their
         // own, never as the project's.
-        let staged = self.staged.as_ref().and_then(|st| st.tree_key(self.project, id).map(|k| (st, k)));
+        let staged = match &self.staged {
+            Some(st) => st.tree_key(self.project, id)?.map(|(k, from_pack)| (st, k, from_pack)),
+            None => None,
+        };
         let ck = match &staged {
-            Some((_, k)) => *k,
+            Some((_, k, _)) => *k,
             None => self.hub.objects.tree_key(self.project, id),
         };
         if let Some(t) = self.hub.trees.get(&ck) {
-            if let Some((st, _)) = &staged {
-                if st.has_staged(id) {
-                    st.touched.lock().unwrap().insert(*id);
-                }
+            if let Some((st, _, true)) = &staged {
+                st.touched.lock().unwrap().insert(*id);
             }
-            return (ck, Some(Node::Tree(t.0, t.1)));
+            return Ok((ck, Some(Node::Tree(t.0, t.1))));
         }
-        (ck, None)
+        Ok((ck, None))
     }
 
     fn decode_node(&self, id: &ObjectId, ck: ObjectId, raw: &[u8]) -> veil_core::Result<Node> {
@@ -415,7 +490,7 @@ impl Source {
     /// Tree `id` when absence in the store is a valid `None` (`ChainSource`,
     /// `narrowing_gate`).
     pub(crate) fn present_tree(&self, id: &ObjectId) -> veil_core::Result<Option<Arc<Tree>>> {
-        let (ck, cached) = self.cached_node(id);
+        let (ck, cached) = self.cached_node(id)?;
         if let Some(Node::Tree(t, _)) = cached {
             return Ok(Some(t));
         }
@@ -492,7 +567,7 @@ fn store_err(e: anyhow::Error) -> VeilError {
 
 impl TreeSource for Source {
     fn node(&self, id: &ObjectId) -> veil_core::Result<Node> {
-        let (ck, cached) = self.cached_node(id);
+        let (ck, cached) = self.cached_node(id)?;
         if let Some(node) = cached {
             return Ok(node);
         }
@@ -3105,12 +3180,16 @@ pub(crate) fn complete(
                 before.extend(named_ids(src, &pe)?);
             }
         }
-        let known = |id: &ObjectId| uploaded.contains_uploaded(id) || before.contains(id);
-        if !known(&e.id) {
+        let known = |id: &ObjectId| -> Result<bool> {
+            Ok(before.contains(id) || uploaded.contains_uploaded(id)?)
+        };
+        if !known(&e.id)? {
             return Err(Error::client_object(VeilError::Missing(e.id)));
         }
-        if let Some(id) = named_ids(src, e)?.into_iter().find(|id| !known(id)) {
-            return Err(Error::client_object(VeilError::Missing(id)));
+        for id in named_ids(src, e)? {
+            if !known(&id)? {
+                return Err(Error::client_object(VeilError::Missing(id)));
+            }
         }
     }
     check_changes(src, rows, &view, &g.changes, &real_tree, rp, &Policy::parse(&p.policy_text), admin)?;
@@ -3397,7 +3476,7 @@ async fn push_staged(
             known.insert(id, vec![r]);
             continue;
         }
-        if !st.contains_uploaded(&id) {
+        if !st.contains_uploaded_async(&id).await? {
             return Err(Error::bad_request(format!("snapshot {} was not uploaded", id.short())));
         }
         let s = blocking_staged(hub, project.id, Some(st.clone()), move |src| match src.snapshot(&id) {
@@ -4570,32 +4649,39 @@ async fn keep_uploads(
         let m = st.made.lock().unwrap();
         made.iter().filter_map(|id| Some((*id, m.get(id)?.clone()))).collect()
     };
-    let held_containers: Vec<StagedPack>;
-    let containers: &[StagedPack] = if st.held.is_empty() {
-        &st.packs
-    } else {
-        debug_assert!(st.packs.is_empty(), "a push uses either `packs` or `receipts`, never both");
-        let mut out = Vec::with_capacity(st.held.len());
-        for (name, held) in st.held.iter() {
-            let mut slots = Vec::new();
-            for id in touched {
-                if let Some(slot) = held.index.get(id) {
-                    slots.push((*id, slot));
+    let named_containers: Vec<StagedPack>;
+    let containers: &[StagedPack] = match &st.named {
+        None => &st.packs,
+        Some(named) => {
+            debug_assert!(st.packs.is_empty(), "a push uses either `packs` or `receipts`, never both");
+            let mut remaining: HashSet<ObjectId> = touched.clone();
+            let mut out = Vec::with_capacity(named.names.len());
+            for name in &named.names {
+                if remaining.is_empty() {
+                    break;
+                }
+                let ids: Vec<ObjectId> = remaining.iter().copied().collect();
+                let Some(ss) = hub
+                    .objects
+                    .staged_slots_optional(project, name, &ids)
+                    .await
+                    .map_err(Error::Other)?
+                else {
+                    return Err(Error::conflict(DISCARDED_UPLOAD));
+                };
+                if !ss.slots.is_empty() {
+                    for &(id, _) in &ss.slots {
+                        remaining.remove(&id);
+                    }
+                    out.push((name.clone(), ss));
                 }
             }
-            if !slots.is_empty() {
-                out.push((
-                    name.clone(),
-                    StagedSlots {
-                        objects: held.index.len(),
-                        size: held.size,
-                        slots,
-                    },
-                ));
+            if !remaining.is_empty() {
+                return Err(Error::conflict(DISCARDED_UPLOAD));
             }
+            named_containers = out;
+            &named_containers
         }
-        held_containers = out;
-        &held_containers
     };
     let opts = crate::store::KeepOpts { encode_threads: 1, already_held: false };
     hub.objects
@@ -4732,7 +4818,7 @@ async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<Obj
     Ok(Staged {
         at: Arc::new(at),
         packs: Arc::new(packs),
-        held: Arc::new(Vec::new()),
+        named: None,
         made: Default::default(),
         vanished: Arc::new(vanished_ids),
         touched: Mutex::new(HashSet::new()),
@@ -4745,15 +4831,16 @@ async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<Obj
 /// none of those cases can be told apart (BUG-1150, BUG-1155).
 const BAD_PACK_UPLOAD: &str = "an upload this push names is missing or was discarded";
 
-/// Validate and load the staged packs named in `PushRequest::packs`
-/// (`BUG-1150`, `BUG-2851`, `BUG-2852`). Every name must be syntactically
-/// valid, unique in the request, owned by `person` in `project`, and still
-/// `STAGED` or `LISTED` in `packs`. Only caller-owned packs from `usable` are
-/// ever passed to discard or `release_recent`, so naming someone else's pack
-/// can never read or discard it. Each pack's [`crate::pack::Held`] index
-/// stays alive inside [`Staged::held`] under `Packs::bound`
-/// (`pack::INDEXES_HELD`) for the duration of the push and is binary-searched
-/// directly without duplicating entries (`BUG-2852`).
+/// Validate the staged packs named in `PushRequest::packs` (`BUG-1150`,
+/// `BUG-2851`, `BUG-2852`, `BUG-2870`). Every name must be syntactically
+/// valid, unique in the request, owned by `person` in `project`, still
+/// `STAGED` or `LISTED` in `packs`, and present in storage. Only caller-owned
+/// packs from `usable` are ever passed to discard or `release_recent`, so
+/// naming someone else's pack can never read or discard it. No `Arc<Held>` is
+/// retained across waits or across the push, and no whole-index copy is
+/// materialized: each pack is verified via `staged_slots_optional(..., &[])`
+/// (cache hit or one `FIRST_READ` share, dropped immediately), and lookups
+/// during the push resolve on demand through [`Staged::named`].
 async fn staging_packs(
     hub: &Arc<Hub>,
     project: i64,
@@ -4785,7 +4872,6 @@ async fn staging_packs(
         hub.objects.release_recent(project, person, &owned);
         return Err(Error::conflict(DISCARDED_UPLOAD));
     }
-    let mut held_packs: Vec<HeldPack> = Vec::with_capacity(owned.len());
     let mut set = tokio::task::JoinSet::new();
     let mut it = owned.iter().cloned();
     let mut missing_pack: Option<Arc<str>> = None;
@@ -4795,12 +4881,12 @@ async fn staging_packs(
             let Some(n) = it.next() else { break };
             let h = hub.clone();
             set.spawn(async move {
-                let r = h.objects.staged_index(project, &n).await;
+                let r = h.objects.staged_slots_optional(project, &n, &[]).await;
                 (n, r)
             });
         }
         match set.join_next().await {
-            Some(Ok((n, Ok(Some(held))))) => held_packs.push((n, held)),
+            Some(Ok((_, Ok(Some(_))))) => {}
             Some(Ok((n, Ok(None)))) => {
                 missing_pack = Some(n);
                 break;
@@ -4841,11 +4927,19 @@ async fn staging_packs(
         }
         return Err(Error::bad_request(BAD_PACK_UPLOAD));
     }
+    let named = (!owned.is_empty()).then(|| {
+        Arc::new(PackLookup {
+            hub: hub.clone(),
+            project,
+            rt: Handle::current(),
+            names: owned.clone(),
+        })
+    });
     Ok((
         Staged {
             at: Arc::new(HashMap::new()),
             packs: Arc::new(Vec::new()),
-            held: Arc::new(held_packs),
+            named,
             made: Default::default(),
             vanished: Arc::new(HashSet::new()),
             touched: Mutex::new(HashSet::new()),

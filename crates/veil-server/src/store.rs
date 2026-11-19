@@ -1651,6 +1651,35 @@ impl Objects {
         self.packs.staged_slots(&*self.store, project, name, ids).await
     }
 
+    /// Like [`Objects::staged_slots`], without requiring every id in `ids` to
+    /// exist in `name` (`PushRequest::packs`, `BUG-2870`).
+    pub async fn staged_slots_optional(&self, project: i64, name: &str, ids: &[ObjectId]) -> Result<Option<StagedSlots>> {
+        self.packs.staged_slots_optional(&*self.store, project, name, ids).await
+    }
+
+    /// Synchronous cache-only check for one object across `PushRequest::packs`
+    /// (`BUG-2870`).
+    pub fn find_staged_slot_cached<'a>(&self, project: i64, names: &'a [Arc<str>], id: &ObjectId) -> crate::pack::CachedStagedLookup<'a> {
+        self.packs.find_staged_slot_cached(project, names, id)
+    }
+
+    /// Async bisected slow path for [`Objects::find_staged_slot_cached`]
+    /// (`BUG-2870`).
+    pub async fn find_staged_slot_uncached(
+        &self,
+        project: i64,
+        uncached: &[&Arc<str>],
+        gone: bool,
+        id: &ObjectId,
+    ) -> Result<crate::pack::StagedLookup> {
+        self.packs.find_staged_slot_uncached(&*self.store, project, uncached, gone, id).await
+    }
+
+    /// On-demand lookup of `id` across `PushRequest::packs` (`BUG-2870`).
+    pub async fn find_staged_slot(&self, project: i64, names: &[Arc<str>], id: &ObjectId) -> Result<crate::pack::StagedLookup> {
+        self.packs.find_staged_slot(&*self.store, project, names, id).await
+    }
+
     /// Object `id` at slot `s` of staged pack `name` of `project`: its
     /// encoding and the object, checked against its id; `None` if the pack
     /// is gone (discarded).
