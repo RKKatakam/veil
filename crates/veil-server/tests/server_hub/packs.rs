@@ -2077,3 +2077,63 @@ fn bug_2851_push_packs_consumed_in_objects_layout_answers_409_and_keeps_sibling_
     assert_eq!(r3.status, 200, "retry with surviving sibling p2: {}", String::from_utf8_lossy(&r3.body));
     assert_eq!(r3.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r3.body));
 }
+
+/// BUG-2852 (review b1a; regression of BUG-1496 in `t3/bug-1150-push-packs`):
+/// `sync::staging_packs` (`sync.rs:4679-4750`) loads each named staged pack's
+/// full index under `Packs::bound` (`pack::INDEXES_HELD`, 96 MiB), immediately
+/// copies every `(ObjectId, Slot)` into an unbudgeted `Vec` (`StagedSlots`),
+/// drops the `Held` permit (`sync.rs:4686`), duplicates every entry into
+/// `at: HashMap<ObjectId, (Arc<str>, Slot)>` (`sync.rs:4737-4740`), and copies
+/// every key a third time into `uploaded: HashSet<ObjectId>` (`sync.rs:3124`).
+/// Concurrent losing pushes naming two large staged packs therefore bypass
+/// `INDEXES_HELD` and grow server RSS by hundreds of MiB. Hostile size: run alone.
+#[test]
+#[ignore = "BUG-2852: staging_packs drops Held and copies full staged pack indexes into unbudgeted Vec/HashMap/HashSet, bypassing INDEXES_HELD"]
+fn hostile_bug_2852_push_packs_holds_staged_indexes_within_indexes_held_bound() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let tip = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    let mut packs = Vec::new();
+    for k in 0..2 {
+        let mut body = Vec::with_capacity(16 << 20);
+        for i in 0..250_000u32 {
+            let raw = O::Blob(format!("{k}.{i}").into_bytes()).encode();
+            let id = ObjectId::hash(&raw);
+            put_frame(&mut body, &id, &raw);
+        }
+        let up = api.upload_encoded_body(&token, &p.name, &body);
+        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body[..up.body.len().min(400)]));
+        let text = std::str::from_utf8(&up.body).unwrap();
+        let marker = "\"packs\":[\"";
+        let at = text.find(marker).expect("packs in upload reply") + marker.len();
+        let pack = text[at..at + text[at..].find('"').unwrap()].to_string();
+        assert_eq!(pack.len(), 32, "valid 32-hex pack name");
+        packs.push(pack);
+    }
+    let wrong = ObjectId::hash(b"not the tip 2852");
+    let body = json!({"updates": [{"branch": "main", "expected": wrong.hex(), "new": tip.hex()}], "packs": packs});
+    let path = format!("/v1/projects/{}/push", p.name);
+    let vm = |field: &str| -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let l = s.lines().find(|l| l.starts_with(field)).unwrap();
+        l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() << 10
+    };
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let before = vm("VmRSS:");
+    let replies: Vec<Reply> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8).map(|_| s.spawn(|| api.post_json(Some(&token), &path, &body))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for r in &replies {
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["results"][0]["ok"], json!(false), "the push lost its race: {}", String::from_utf8_lossy(&r.body));
+    }
+    let grew = vm("VmHWM:").saturating_sub(before);
+    assert!(
+        grew < 256 << 20,
+        "eight pushes naming two 250k-object staged packs took the server {} MiB past where it was (INDEXES_HELD is 96 MiB)",
+        grew >> 20
+    );
+}
