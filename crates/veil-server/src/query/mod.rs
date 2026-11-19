@@ -227,22 +227,46 @@ pub async fn resolve_real(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instan
             } else {
                 // Only an id this viewer was given: a projection memoised
                 // under their view key, preferring the snapshot it stands for
-                // over a hidden change collapsed into it.
-                sqlx::query_scalar(
-                    "SELECT real_id FROM ( \
-                       (SELECT real_id, 0 AS ord FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed LIMIT 1) \
-                       UNION ALL \
-                       (SELECT real_id, 1 AS ord FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 \
-                        AND NOT EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed) LIMIT 1) \
-                     ) q ORDER BY ord LIMIT 1",
-                )
-                // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
-                .persistent(false)
-                .bind(project)
-                .bind(&vk)
-                .bind(id.hex())
-                .fetch_optional(&hub.db)
-                .await?
+                // over a hidden change collapsed into it, and excluding
+                // unreleased embargo snapshots (BUG-2850).
+                let active_embargoes = crate::embargo::active_embargo_ids(hub, project).await?;
+                if active_embargoes.is_empty() {
+                    sqlx::query_scalar(
+                        "SELECT real_id FROM ( \
+                           (SELECT real_id, 0 AS ord FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed LIMIT 1) \
+                           UNION ALL \
+                           (SELECT real_id, 1 AS ord FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 \
+                            AND NOT EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed) LIMIT 1) \
+                         ) q ORDER BY ord LIMIT 1",
+                    )
+                    // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
+                    .persistent(false)
+                    .bind(project)
+                    .bind(&vk)
+                    .bind(id.hex())
+                    .fetch_optional(&hub.db)
+                    .await?
+                } else {
+                    sqlx::query_scalar(
+                        "SELECT real_id FROM ( \
+                           (SELECT p.real_id, 0 AS ord FROM projections p WHERE p.project_id = $1 AND p.view_key = $2 AND p.projected_id = $3 AND NOT p.collapsed \
+                            AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es WHERE es.project_id = $1 AND es.snapshot = p.real_id AND es.embargo_id = ANY($4)) LIMIT 1) \
+                           UNION ALL \
+                           (SELECT p.real_id, 1 AS ord FROM projections p WHERE p.project_id = $1 AND p.view_key = $2 AND p.projected_id = $3 \
+                            AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es WHERE es.project_id = $1 AND es.snapshot = p.real_id AND es.embargo_id = ANY($4)) \
+                            AND NOT EXISTS (SELECT 1 FROM projections p2 WHERE p2.project_id = $1 AND p2.view_key = $2 AND p2.projected_id = $3 AND NOT p2.collapsed \
+                              AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es2 WHERE es2.project_id = $1 AND es2.snapshot = p2.real_id AND es2.embargo_id = ANY($4))) LIMIT 1) \
+                         ) q ORDER BY ord LIMIT 1",
+                    )
+                    // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
+                    .persistent(false)
+                    .bind(project)
+                    .bind(&vk)
+                    .bind(id.hex())
+                    .bind(&active_embargoes)
+                    .fetch_optional(&hub.db)
+                    .await?
+                }
             };
             let r = real.and_then(|r| ObjectId::from_hex(&r).ok()).ok_or_else(no_revision)?;
             if crate::embargo::is_withheld_for_query(hub, project, &r).await? {
@@ -742,11 +766,16 @@ pub async fn resolve_prefix(hub: &Arc<Hub>, ask: &Ask, prefix: &str, from: &[Obj
         return Err(Error::bad_request(format!("at most {} snapshots to resolve from", veil_core::hub::wire::MAX_RESOLVE_FROM)));
     }
     let mut reals = Vec::new();
+    let active_embargoes = if from.is_empty() {
+        Vec::new()
+    } else {
+        crate::embargo::active_embargo_ids(hub, project).await?
+    };
     for f in from {
         if crate::embargo::is_withheld_for_query(hub, project, f).await? {
             continue;
         }
-        if let Some(r) = crate::sync::resolve_first(hub, project, &vk, f).await? {
+        if let Some(r) = crate::sync::resolve_first_excluding(hub, project, &vk, f, &active_embargoes).await? {
             if !crate::embargo::is_withheld_for_query(hub, project, &r).await? {
                 reals.push(r);
             }
@@ -930,11 +959,16 @@ pub async fn generations(hub: &Arc<Hub>, ask: &Ask, snapshots: Vec<ObjectId>, li
         .await?
     };
     let mut reals = Vec::new();
+    let active_embargoes = if unfilled.is_empty() {
+        Vec::new()
+    } else {
+        crate::embargo::active_embargo_ids(hub, project).await?
+    };
     for id in &unfilled {
         if crate::embargo::is_withheld_for_query(hub, project, id).await? {
             continue;
         }
-        if let Some(r) = crate::sync::resolve_first(hub, project, &vk, id).await? {
+        if let Some(r) = crate::sync::resolve_first_excluding(hub, project, &vk, id, &active_embargoes).await? {
             if !crate::embargo::is_withheld_for_query(hub, project, &r).await? {
                 reals.push(r);
             }

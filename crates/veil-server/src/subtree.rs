@@ -73,7 +73,12 @@ pub async fn wants(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, epochs: &
     if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &snapshot).await? {
         return Err(gone());
     }
-    let Some(real) = sync::resolve_first(hub, project.id, &project.view(viewer).key(), &snapshot).await? else {
+    let withheld_eids = if epochs.embargo_free(project.id) {
+        Vec::new()
+    } else {
+        crate::embargo::withheld_embargo_ids(hub, project, viewer).await?
+    };
+    let Some(real) = sync::resolve_first_excluding(hub, project.id, &project.view(viewer).key(), &snapshot, &withheld_eids).await? else {
         return Err(gone());
     };
     if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {

@@ -2103,7 +2103,6 @@ fn bug_2634_an_embargo_collapsed_under_the_same_view_key_never_refuses_main_or_l
 /// with `404` and `POST /push` with `400` to every outsider sharing `view_key`
 /// and creating an embargo existence oracle on `M1`.
 #[test]
-#[ignore = "BUG-2850: sync::resolve_for_mode picks a collapsed embargoed projection under the same view_key and refuses public commits with 404/400"]
 fn bug_2850_resolve_for_mode_ignores_collapsed_embargoed_projections_under_same_view_key() {
     const FIX_MARK: &str = "EMBARGO-BILLING-COLLAPSED-2850";
     let hub = TestHub::start();
@@ -2190,6 +2189,11 @@ fn bug_2850_resolve_for_mode_ignores_collapsed_embargoed_projections_under_same_
         "embargoed billing commit collapsed into M1 for partner's view"
     );
 
+    // Snapshot `dev`'s view of `M1`'s tree before `main` advances to `M2` so
+    // the post-embargo `POST /push` builds a valid commit parented on `M1`.
+    let mut dev_craft = Craft::new(&api, &p.dev, &p.name, "main");
+    assert_eq!(dev_craft.tip, m1_proj, "dev_craft starts from M1");
+
     // Advance `main` to `M2` so `M1` is now a historical public commit (not
     // `main`'s current tip) and `resolve_for_mode` resolves `m1_proj` through
     // `projections` (`sync.rs:1325-1432`).
@@ -2218,7 +2222,6 @@ fn bug_2850_resolve_for_mode_ignores_collapsed_embargoed_projections_under_same_
         String::from_utf8_lossy(&post_change.body)
     );
 
-    let mut dev_craft = Craft::new(&api, &p.dev, &p.name, "main");
     dev_craft.file("src/dev_branch_2850.rs", "pub const B: u32 = 1;\n");
     let mut dev_snap = veil_core::object::Snapshot {
         parents: vec![m1_proj],
@@ -2255,5 +2258,30 @@ fn bug_2850_resolve_for_mode_ignores_collapsed_embargoed_projections_under_same_
         String::from_utf8_lossy(&post_push.body)
     );
     assert_eq!(post_push.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&post_push.body));
+
+    // Meanwhile probing the embargoed snapshot id itself through `resolve_for_mode`
+    // (`POST /changes`) is still refused identically to an unknown id.
+    let unknown = ObjectId::hash(b"never-existed-2850");
+    let probe_emb = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": embargoed.hex(),
+            "description": "probe embargo",
+            "edits": [{"path": "src/probe_2850.rs", "put": {"text": "x\n"}}],
+        }),
+    );
+    let probe_unk = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": unknown.hex(),
+            "description": "probe unknown",
+            "edits": [{"path": "src/probe_2850.rs", "put": {"text": "x\n"}}],
+        }),
+    );
+    assert_eq!((probe_emb.status, probe_unk.status), (404, 404));
+    assert_eq!(probe_emb.json()["code"], probe_unk.json()["code"]);
+    assert_eq!(probe_emb.json()["message"], format!("no snapshot {} that you can see", embargoed.short()));
 }
 
