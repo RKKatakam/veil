@@ -853,31 +853,87 @@ pub(crate) fn project_one(
 /// Callers project what they get for the asker's current view, so the
 /// answer grants nothing.
 pub async fn resolve(hub: &Hub, project: i64, view_key: &str, id: &ObjectId) -> Result<Vec<ObjectId>> {
-    resolve_at_most(hub, project, view_key, id, None).await
+    resolve_at_most_excluding(hub, project, view_key, id, None, &[]).await
+}
+
+/// [`resolve`], excluding any real snapshot belonging to an embargo in
+/// `exclude_embargoes` before picking candidates (BUG-2850).
+pub async fn resolve_excluding(
+    hub: &Hub,
+    project: i64,
+    view_key: &str,
+    id: &ObjectId,
+    exclude_embargoes: &[String],
+) -> Result<Vec<ObjectId>> {
+    resolve_at_most_excluding(hub, project, view_key, id, None, exclude_embargoes).await
 }
 
 /// The first of [`resolve`]'s answer, reading no more of the database's
 /// list than it (BUG-2510: a run hidden from a view is one projected id
 /// for every real snapshot of it).
 pub async fn resolve_first(hub: &Hub, project: i64, view_key: &str, id: &ObjectId) -> Result<Option<ObjectId>> {
-    Ok(resolve_at_most(hub, project, view_key, id, Some(1)).await?.into_iter().next())
+    resolve_first_excluding(hub, project, view_key, id, &[]).await
 }
 
-/// [`resolve`]'s answer, its first `limit` only when given.
-async fn resolve_at_most(hub: &Hub, project: i64, view_key: &str, id: &ObjectId, limit: Option<i64>) -> Result<Vec<ObjectId>> {
+/// The first of [`resolve_excluding`]'s answer, excluding any real snapshot
+/// belonging to an embargo in `exclude_embargoes` before applying `LIMIT` or
+/// reading the reverse cache (BUG-2850).
+pub async fn resolve_first_excluding(
+    hub: &Hub,
+    project: i64,
+    view_key: &str,
+    id: &ObjectId,
+    exclude_embargoes: &[String],
+) -> Result<Option<ObjectId>> {
+    Ok(resolve_at_most_excluding(hub, project, view_key, id, Some(1), exclude_embargoes)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// [`resolve`]'s answer, its first `limit` only when given, excluding any
+/// snapshot in `exclude_embargoes`.
+async fn resolve_at_most_excluding(
+    hub: &Hub,
+    project: i64,
+    view_key: &str,
+    id: &ObjectId,
+    limit: Option<i64>,
+    exclude_embargoes: &[String],
+) -> Result<Vec<ObjectId>> {
     if *id == root_snapshot_id() || hub.caches.committed(project, id) {
         return Ok(vec![*id]);
     }
     if let Some(real) = hub.caches.resolved(project, view_key, id) {
-        return Ok(vec![real]);
+        if exclude_embargoes.is_empty() {
+            return Ok(vec![real]);
+        }
+        let excluded: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM embargo_snapshots WHERE project_id = $1 AND snapshot = $2 AND embargo_id = ANY($3))",
+        )
+        .bind(project)
+        .bind(real.hex())
+        .bind(exclude_embargoes)
+        .fetch_one(&hub.db)
+        .await?;
+        if !excluded {
+            return Ok(vec![real]);
+        }
     }
-    resolve_stored(hub, project, view_key, id, limit).await
+    resolve_stored_excluding(hub, project, view_key, id, limit, exclude_embargoes).await
 }
 
 /// [`resolve`] as the database answers it now, for `view_key` alone (BUG-915,
-/// BUG-2634), in one statement: the first `limit` of it when given (all when
-/// `None`).
-async fn resolve_stored(hub: &Hub, project: i64, view_key: &str, id: &ObjectId, limit: Option<i64>) -> Result<Vec<ObjectId>> {
+/// BUG-2634, BUG-2850), in one statement: the first `limit` of it when given
+/// (all when `None`), excluding snapshots in `exclude_embargoes`.
+async fn resolve_stored_excluding(
+    hub: &Hub,
+    project: i64,
+    view_key: &str,
+    id: &ObjectId,
+    limit: Option<i64>,
+    exclude_embargoes: &[String],
+) -> Result<Vec<ObjectId>> {
     if *id == root_snapshot_id() || hub.caches.committed(project, id) {
         return Ok(vec![*id]);
     }
@@ -890,28 +946,57 @@ async fn resolve_stored(hub: &Hub, project: i64, view_key: &str, id: &ObjectId, 
     // for `view_key` alone, preferring the snapshot `id` stands for
     // (`projections_own`, `NOT collapsed`) over any hidden changes collapsed
     // into it (`projections_by_view`, read only when there is no uncollapsed
-    // row, stopped after `limit`).
-    let rows: Vec<(String, i32, i64)> = sqlx::query_as(
-        "SELECT id, 0, 0::BIGINT FROM snapshots WHERE project_id = $1 AND id = $2 \
-         UNION ALL (SELECT real_id, 1, created_at FROM projections \
-         WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 AND NOT collapsed \
-           AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
-         ORDER BY created_at DESC LIMIT $4) \
-         UNION ALL (SELECT real_id, 2, 0::BIGINT FROM projections \
-         WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 \
-           AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
-           AND NOT EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 AND NOT collapsed) \
-         LIMIT $4) \
-         ORDER BY 2, 3 DESC",
-    )
-    // Planned for its own id (`resolve_for_mode`, BUG-2467).
-    .persistent(false)
-    .bind(project)
-    .bind(id.hex())
-    .bind(view_key)
-    .bind(limit)
-    .fetch_all(&hub.db)
-    .await?;
+    // row, stopped after `limit`), and excluding snapshots in
+    // `exclude_embargoes` so withheld embargoes never mask a public commit.
+    let rows: Vec<(String, i32, i64)> = if exclude_embargoes.is_empty() {
+        sqlx::query_as(
+            "SELECT id, 0, 0::BIGINT FROM snapshots WHERE project_id = $1 AND id = $2 \
+             UNION ALL (SELECT real_id, 1, created_at FROM projections \
+             WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 AND NOT collapsed \
+               AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
+             ORDER BY created_at DESC LIMIT $4) \
+             UNION ALL (SELECT real_id, 2, 0::BIGINT FROM projections \
+             WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 \
+               AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
+               AND NOT EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 AND NOT collapsed) \
+             LIMIT $4) \
+             ORDER BY 2, 3 DESC",
+        )
+        // Planned for its own id (`resolve_for_mode`, BUG-2467).
+        .persistent(false)
+        .bind(project)
+        .bind(id.hex())
+        .bind(view_key)
+        .bind(limit)
+        .fetch_all(&hub.db)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, 0, 0::BIGINT FROM snapshots WHERE project_id = $1 AND id = $2 \
+             UNION ALL (SELECT p.real_id, 1, p.created_at FROM projections p \
+             WHERE p.project_id = $1 AND p.view_key = $3 AND p.projected_id = $2 AND NOT p.collapsed \
+               AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
+               AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es WHERE es.project_id = $1 AND es.snapshot = p.real_id AND es.embargo_id = ANY($5)) \
+             ORDER BY p.created_at DESC LIMIT $4) \
+             UNION ALL (SELECT p.real_id, 2, 0::BIGINT FROM projections p \
+             WHERE p.project_id = $1 AND p.view_key = $3 AND p.projected_id = $2 \
+               AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
+               AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es WHERE es.project_id = $1 AND es.snapshot = p.real_id AND es.embargo_id = ANY($5)) \
+               AND NOT EXISTS (SELECT 1 FROM projections p2 WHERE p2.project_id = $1 AND p2.view_key = $3 AND p2.projected_id = $2 AND NOT p2.collapsed \
+                 AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es2 WHERE es2.project_id = $1 AND es2.snapshot = p2.real_id AND es2.embargo_id = ANY($5))) \
+             LIMIT $4) \
+             ORDER BY 2, 3 DESC",
+        )
+        // Planned for its own id (`resolve_for_mode`, BUG-2467).
+        .persistent(false)
+        .bind(project)
+        .bind(id.hex())
+        .bind(view_key)
+        .bind(limit)
+        .bind(exclude_embargoes)
+        .fetch_all(&hub.db)
+        .await?
+    };
     if rows.first().is_some_and(|r| r.1 == 0) {
         hub.caches.put_committed_at(project, gce, id);
         return Ok(vec![*id]);
@@ -1011,6 +1096,18 @@ pub(crate) async fn own_projection(
     viewer: &Viewer,
     key: &str,
     projected_id: &ObjectId,
+) -> Result<Option<ObjectId>> {
+    let withheld_eids = crate::embargo::withheld_embargo_ids(hub, project, viewer).await?;
+    own_projection_excluding(hub, project, viewer, key, projected_id, &withheld_eids).await
+}
+
+async fn own_projection_excluding(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    key: &str,
+    projected_id: &ObjectId,
+    withheld_eids: &[String],
 ) -> Result<Option<ObjectId>> {
     const REPAIR_BATCH: usize = 256;
     const MAX_REPAIR_BATCHES: usize = 16;
@@ -1150,20 +1247,39 @@ pub(crate) async fn own_projection(
         Ok(keep)
     };
 
-    let initial: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT p.real_id, g.parents \
-         FROM (SELECT real_id FROM projections \
-               WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed \
-               ORDER BY real_id LIMIT 2) p \
-         LEFT JOIN graph g ON g.project_id = $1 AND g.snapshot = p.real_id \
-         ORDER BY p.real_id",
-    )
-    .persistent(false)
-    .bind(project.id)
-    .bind(key)
-    .bind(projected_id.hex())
-    .fetch_all(&hub.db)
-    .await?;
+    let initial: Vec<(String, Option<String>)> = if withheld_eids.is_empty() {
+        sqlx::query_as(
+            "SELECT p.real_id, g.parents \
+             FROM (SELECT real_id FROM projections \
+                   WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed \
+                   ORDER BY real_id LIMIT 2) p \
+             LEFT JOIN graph g ON g.project_id = $1 AND g.snapshot = p.real_id \
+             ORDER BY p.real_id",
+        )
+        .persistent(false)
+        .bind(project.id)
+        .bind(key)
+        .bind(projected_id.hex())
+        .fetch_all(&hub.db)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT p.real_id, g.parents \
+             FROM (SELECT pr.real_id FROM projections pr \
+                   WHERE pr.project_id = $1 AND pr.view_key = $2 AND pr.projected_id = $3 AND NOT pr.collapsed \
+                     AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es WHERE es.project_id = $1 AND es.snapshot = pr.real_id AND es.embargo_id = ANY($4)) \
+                   ORDER BY pr.real_id LIMIT 2) p \
+             LEFT JOIN graph g ON g.project_id = $1 AND g.snapshot = p.real_id \
+             ORDER BY p.real_id",
+        )
+        .persistent(false)
+        .bind(project.id)
+        .bind(key)
+        .bind(projected_id.hex())
+        .bind(withheld_eids)
+        .fetch_all(&hub.db)
+        .await?
+    };
     if initial.is_empty() {
         return Ok(None);
     }
@@ -1177,22 +1293,43 @@ pub(crate) async fn own_projection(
         });
     }
     for _ in 0..MAX_REPAIR_BATCHES {
-        let batch: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT p.real_id, g.parents \
-             FROM (SELECT real_id FROM projections \
-                   WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed AND real_id > $4 \
-                   ORDER BY real_id LIMIT $5) p \
-             LEFT JOIN graph g ON g.project_id = $1 AND g.snapshot = p.real_id \
-             ORDER BY p.real_id",
-        )
-        .persistent(false)
-        .bind(project.id)
-        .bind(key)
-        .bind(projected_id.hex())
-        .bind(&after)
-        .bind(REPAIR_BATCH as i64)
-        .fetch_all(&hub.db)
-        .await?;
+        let batch: Vec<(String, Option<String>)> = if withheld_eids.is_empty() {
+            sqlx::query_as(
+                "SELECT p.real_id, g.parents \
+                 FROM (SELECT real_id FROM projections \
+                       WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed AND real_id > $4 \
+                       ORDER BY real_id LIMIT $5) p \
+                 LEFT JOIN graph g ON g.project_id = $1 AND g.snapshot = p.real_id \
+                 ORDER BY p.real_id",
+            )
+            .persistent(false)
+            .bind(project.id)
+            .bind(key)
+            .bind(projected_id.hex())
+            .bind(&after)
+            .bind(REPAIR_BATCH as i64)
+            .fetch_all(&hub.db)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT p.real_id, g.parents \
+                 FROM (SELECT pr.real_id FROM projections pr \
+                       WHERE pr.project_id = $1 AND pr.view_key = $2 AND pr.projected_id = $3 AND NOT pr.collapsed AND pr.real_id > $4 \
+                         AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es WHERE es.project_id = $1 AND es.snapshot = pr.real_id AND es.embargo_id = ANY($6)) \
+                       ORDER BY pr.real_id LIMIT $5) p \
+                 LEFT JOIN graph g ON g.project_id = $1 AND g.snapshot = p.real_id \
+                 ORDER BY p.real_id",
+            )
+            .persistent(false)
+            .bind(project.id)
+            .bind(key)
+            .bind(projected_id.hex())
+            .bind(&after)
+            .bind(REPAIR_BATCH as i64)
+            .bind(withheld_eids)
+            .fetch_all(&hub.db)
+            .await?
+        };
         if batch.is_empty() {
             return Ok(match keep.as_slice() {
                 [o] => Some(*o),
@@ -1303,19 +1440,42 @@ async fn resolve_for_mode(
         return Ok(None);
     }
     let key = project.view(viewer).key();
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT p.real_id, g.parents FROM projections p LEFT JOIN graph g ON g.project_id = p.project_id AND g.snapshot = p.real_id \
-         WHERE p.project_id = $1 AND p.view_key = $2 AND p.projected_id = $3 LIMIT $4",
-    )
-    // Planned for its own id (above, BUG-2467).
-    .persistent(false)
-    .bind(project.id)
-    .bind(&key)
-    .bind(id.hex())
-    .bind(NEWEST_BOUND as i64 + 1)
-    .fetch_all(&hub.db)
-    .await?;
-    let own = || own_projection(hub, project, viewer, &key, id);
+    let withheld_eids = crate::embargo::withheld_embargo_ids(hub, project, viewer).await?;
+    let rows: Vec<(String, Option<String>)> = if withheld_eids.is_empty() {
+        sqlx::query_as(
+            "SELECT p.real_id, g.parents FROM projections p LEFT JOIN graph g ON g.project_id = p.project_id AND g.snapshot = p.real_id \
+             WHERE p.project_id = $1 AND p.view_key = $2 AND p.projected_id = $3 LIMIT $4",
+        )
+        // Planned for its own id (above, BUG-2467).
+        .persistent(false)
+        .bind(project.id)
+        .bind(&key)
+        .bind(id.hex())
+        .bind(NEWEST_BOUND as i64 + 1)
+        .fetch_all(&hub.db)
+        .await?
+    } else {
+        // Exclude snapshots belonging to unreleased embargoes withheld from
+        // `viewer` before applying `LIMIT` or computing `firsts`/`leaves`
+        // (BUG-2850): a collapsed embargoed commit under the same `view_key`
+        // must never mask its public parent or split a visible line.
+        sqlx::query_as(
+            "SELECT p.real_id, g.parents FROM projections p LEFT JOIN graph g ON g.project_id = p.project_id AND g.snapshot = p.real_id \
+             WHERE p.project_id = $1 AND p.view_key = $2 AND p.projected_id = $3 \
+               AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es WHERE es.project_id = $1 AND es.snapshot = p.real_id AND es.embargo_id = ANY($5)) \
+             LIMIT $4",
+        )
+        // Planned for its own id (above, BUG-2467).
+        .persistent(false)
+        .bind(project.id)
+        .bind(&key)
+        .bind(id.hex())
+        .bind(NEWEST_BOUND as i64 + 1)
+        .bind(&withheld_eids)
+        .fetch_all(&hub.db)
+        .await?
+    };
+    let own = || own_projection_excluding(hub, project, viewer, &key, id, &withheld_eids);
     let pick = if rows.is_empty() {
         None
     } else if rows.len() > NEWEST_BOUND {
@@ -1516,11 +1676,17 @@ pub async fn history(
     let mut starts = Vec::new();
     let mut reals = Vec::new();
     let mut resolved = Vec::with_capacity(tips.len());
+    let vk = project.view(viewer).key();
+    let withheld_eids = if epochs.embargo_free(project.id) {
+        Vec::new()
+    } else {
+        crate::embargo::withheld_embargo_ids(hub, project, viewer).await?
+    };
     for t in tips {
         if crate::embargo::is_withheld_in(hub, project, viewer, epochs, t).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         }
-        let Some(real) = resolve_first(hub, project.id, &project.view(viewer).key(), t).await? else {
+        let Some(real) = resolve_first_excluding(hub, project.id, &vk, t, &withheld_eids).await? else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", t.short())));
         };
         if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {
@@ -1685,6 +1851,12 @@ pub async fn fetch(
     // Each want is checked in its own snapshot (revision 1), as the viewer
     // sees it.
     let mut reals: HashMap<ObjectId, ObjectId> = HashMap::new();
+    let vk = project.view(viewer).key();
+    let withheld_eids = if epochs.embargo_free(project.id) {
+        Vec::new()
+    } else {
+        crate::embargo::withheld_embargo_ids(hub, project, viewer).await?
+    };
     for snap in std::iter::once(snapshot).chain(wants.iter().filter_map(|w| w.snapshot)) {
         if reals.contains_key(&snap) {
             continue;
@@ -1692,7 +1864,7 @@ pub async fn fetch(
         if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &snap).await? {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         }
-        let Some(real) = resolve_first(hub, project.id, &project.view(viewer).key(), &snap).await? else {
+        let Some(real) = resolve_first_excluding(hub, project.id, &vk, &snap, &withheld_eids).await? else {
             return Err(Error::not_found(format!("no snapshot {} that you can see", snap.short())));
         };
         if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {

@@ -335,6 +335,42 @@ pub async fn is_withheld_from_viewer(hub: &Hub, project: &Project, viewer: &View
     Ok(!can_see_groups(hub, project, viewer, &groups).await?)
 }
 
+/// Every unreleased `embargo_id` in `project_id`. Used by query routes, which
+/// withhold all unreleased embargoes from every viewer (including admins), to
+/// exclude embargoed rows when resolving a projected snapshot id.
+pub async fn active_embargo_ids(hub: &Hub, project_id: i64) -> Result<Vec<String>> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT embargo_id FROM embargo_lines WHERE project_id = $1 AND released_at IS NULL",
+    )
+    .bind(project_id)
+    .fetch_all(&hub.db)
+    .await?;
+    Ok(ids)
+}
+
+/// Every unreleased `embargo_id` in `project` that `viewer` cannot see. Empty
+/// for project admins and when no unreleased embargo hides anything from
+/// `viewer`. Used by `projections` resolvers to exclude withheld rows before
+/// choosing among candidates under a shared `view_key` (BUG-2850).
+pub async fn withheld_embargo_ids(hub: &Hub, project: &Project, viewer: &Viewer) -> Result<Vec<String>> {
+    if viewer.admin {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
+        "SELECT embargo_id, group_names FROM embargo_lines WHERE project_id = $1 AND released_at IS NULL",
+    )
+    .bind(project.id)
+    .fetch_all(&hub.db)
+    .await?;
+    let mut out = Vec::new();
+    for (eid, groups) in rows {
+        if !can_see_groups(hub, project, viewer, &groups).await? {
+            out.push(eid);
+        }
+    }
+    Ok(out)
+}
+
 /// Return every unreleased `embargo_id` in `project_id` carried by any real
 /// snapshot in `starts` or its ancestors (decided from the content's ancestry,
 /// regardless of which route created the snapshot).
