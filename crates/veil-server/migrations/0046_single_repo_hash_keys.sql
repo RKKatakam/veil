@@ -43,7 +43,9 @@
 -- Each table rebuild uses 3 separate `-- veil: step` blocks so DDL and DML
 -- never share a YugabyteDB transaction (where DDL commits immediately while
 -- DML aborts/rolls back on catalog conflict), and is gated offline on any
--- non-empty YugabyteDB database (`veil-server migrate --offline`, BUG-2920):
+-- existing hash-sharded YugabyteDB database (any database that already had
+-- migrations recorded before this migrate run took the lock; fresh databases
+-- created from scratch run it automatically; BUG-2920, BUG-2931):
 --   1. If `<t>` exists and lacks the new PK, `DROP TABLE IF EXISTS <t>_q4`
 --      (wiping any stale staging table left by an interrupted prior attempt)
 --      and create a fresh empty `<t>_q4` with its indexes.

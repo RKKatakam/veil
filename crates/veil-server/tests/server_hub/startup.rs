@@ -221,10 +221,11 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
     let rt = runtime();
     let (url, name) = fresh_database(&rt);
     let rows: i64 = std::env::var("VEIL_TEST_GRAPH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
-    let timeout = rt.block_on(async {
+    let (timeout, yb) = rt.block_on(async {
         let db = veil_server::db::connect(&url, 1).await.unwrap();
         let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
-        let timeout = if veil_server::db::is_yugabyte(&version) { YB_MIGRATION_TIMEOUT } else { Duration::from_millis(250) };
+        let yb = veil_server::db::is_yugabyte(&version);
+        let timeout = if yb { YB_MIGRATION_TIMEOUT } else { Duration::from_millis(250) };
         // The schema before migration 21, applied and recorded as `migrate` does.
         sqlx::raw_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)")
             .execute(&db)
@@ -288,7 +289,7 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM view_graph").fetch_one(&db).await.unwrap();
         assert_eq!(n, rows);
         db.close().await;
-        timeout
+        (timeout, yb)
     });
     let started = std::time::Instant::now();
     let migrated = rt.block_on(async {
@@ -296,7 +297,14 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
         let ms = timeout.as_millis().to_string();
         let opts = opts.options([("statement_timeout", ms.as_str()), ("lock_timeout", ms.as_str())]);
         let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
-        let r = tokio::time::timeout(Duration::from_secs(60), veil_server::db::migrate(&pool)).await;
+        let r = if yb {
+            // On an existing hash-sharded YugabyteDB database, migration 46 is
+            // offline-only (BUG-2931); exercise online migrations 21..45 under
+            // the bounded timeout, then assert 46 refuses without `--offline`.
+            tokio::time::timeout(Duration::from_secs(60), veil_server::db::migrate_through(&pool, 45)).await
+        } else {
+            tokio::time::timeout(Duration::from_secs(60), veil_server::db::migrate(&pool)).await
+        };
         pool.close().await;
         r
     });
@@ -309,9 +317,15 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
     eprintln!("migrated {rows} viewer graph rows under a {timeout:?} statement timeout in {took:?}");
     rt.block_on(async {
         let db = veil_server::db::connect(&url, 1).await.unwrap();
-        assert!(veil_server::db::schema_current(&db).await.unwrap());
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM view_graph").fetch_one(&db).await.unwrap();
         assert_eq!(n, 0, "the viewer graph (a cache) is cleared");
+        if yb {
+            let err = veil_server::db::migrate(&db).await.expect_err("existing YB DB must refuse migration 46 without --offline");
+            assert!(err.to_string().contains("veil-server migrate --offline"), "expected --offline refusal, got: {err:?}");
+            assert!(!veil_server::db::schema_current(&db).await.unwrap());
+            veil_server::db::migrate_offline(&db).await.expect("offline migration 46 completes");
+        }
+        assert!(veil_server::db::schema_current(&db).await.unwrap());
         db.close().await;
     });
     // The test's own database goes (the shared server keeps no leftovers).
@@ -686,10 +700,20 @@ async fn exec_retrying(db: &sqlx::PgPool, q: &str) {
 /// one project of `rows` packs (two thirds listed). Returns the database's
 /// URL and name, the project and whether it is YugabyteDB.
 fn before_migration_41(rt: &tokio::runtime::Runtime, rows: i64) -> (String, String, i64, bool) {
+    before_migration_41_at(rt, rows, None)
+}
+
+/// [`before_migration_41`], migrating only through `max_version` when `Some`
+/// (used on YugabyteDB when testing online migrations 1..=45 under live
+/// writers before verifying that migration 46 requires `--offline`, BUG-2931).
+fn before_migration_41_at(rt: &tokio::runtime::Runtime, rows: i64, max_version: Option<i64>) -> (String, String, i64, bool) {
     let (url, name) = fresh_database(rt);
     let (project, yb) = rt.block_on(async {
         let db = veil_server::db::connect(&url, 2).await.unwrap();
-        veil_server::db::migrate(&db).await.expect("migrates");
+        match max_version {
+            Some(max) => veil_server::db::migrate_through(&db, max).await.expect("migrates"),
+            None => veil_server::db::migrate(&db).await.expect("migrates"),
+        }
         let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
         exec_retrying(&db, "DROP INDEX packs_listed").await;
         exec_retrying(&db, "DELETE FROM schema_migrations WHERE version = 41").await;
@@ -763,7 +787,11 @@ async fn listed_with_and_without_the_index(url: &str, project: i64) -> (Vec<Stri
 /// build (begun once the index existed, done while it was not yet valid)
 /// and are in it,
 /// it holds every listed row (read through it, the plan checked), and the
-/// connection's own timeouts are back afterwards.
+/// connection's own timeouts are back afterwards. On YugabyteDB, online
+/// migration stops at version 45 under the live writers, asserts that
+/// migration 46 refuses without `--offline` while writers are active
+/// (BUG-2931), then stops the writers, runs `migrate_offline`, and checks
+/// every row and rebuilt index again.
 #[test]
 fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_row() {
     let rt = runtime();
@@ -774,10 +802,10 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
         veil_server::db::is_yugabyte(&v)
     });
     let rows = std::env::var("VEIL_TEST_PACK_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(if yb { 300_000 } else { 4_000_000 });
-    let (url, name, project, _) = before_migration_41(&rt, rows);
+    let (url, name, project, _) = before_migration_41_at(&rt, rows, yb.then_some(45));
     let stop = AtomicBool::new(false);
     let during = std::sync::Mutex::new(Vec::<String>::new());
-    let (results, written) = std::thread::scope(|s| {
+    let (results, online_46_refusal, written) = std::thread::scope(|s| {
         let writers: Vec<_> = (0..4)
             .map(|w| {
                 let (url, stop, during, rt) = (&url, &stop, &during, &rt);
@@ -837,7 +865,11 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
                         let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
                         let opts = opts.options([("statement_timeout", "250"), ("lock_timeout", "250")]);
                         let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
-                        let r = tokio::time::timeout(Duration::from_secs(180), veil_server::db::migrate(&pool)).await;
+                        let r = if yb {
+                            tokio::time::timeout(Duration::from_secs(180), veil_server::db::migrate_through(&pool, 45)).await
+                        } else {
+                            tokio::time::timeout(Duration::from_secs(180), veil_server::db::migrate(&pool)).await
+                        };
                         // The connection `migrate` used keeps its own timeouts.
                         let after: Option<String> = match r {
                             Ok(Ok(())) => Some(sqlx::query_scalar("SHOW statement_timeout").fetch_one(&pool).await.unwrap()),
@@ -850,17 +882,56 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
             })
             .collect();
         let results: Vec<_> = starts.into_iter().map(|h| h.join().unwrap()).collect();
+        // On YugabyteDB, while writers are still live, assert that online
+        // `db::migrate` refuses migration 46 with the `--offline` message.
+        let online_46_refusal = if yb {
+            Some(rt.block_on(async {
+                let db = veil_server::db::connect(&url, 1).await.unwrap();
+                let err = veil_server::db::migrate(&db).await.expect_err("online migrate must refuse migration 46 on live YB DB");
+                let current = veil_server::db::schema_current(&db).await.unwrap();
+                db.close().await;
+                (err.to_string(), current)
+            }))
+        } else {
+            None
+        };
         std::thread::sleep(Duration::from_millis(300));
         stop.store(true, Ordering::Relaxed);
         let written: Vec<String> = writers.into_iter().flat_map(|h| h.join().unwrap()).collect();
-        (results, written)
+        (results, online_46_refusal, written)
     });
     for (r, after) in &results {
         assert!(matches!(r, Ok(Ok(()))), "a start migrating beside writes under a 250 ms statement timeout: {r:?}");
         assert_eq!(after.as_deref(), Some("250ms"), "the migrating connection's statement timeout is its own again");
     }
+    if let Some((msg, current)) = &online_46_refusal {
+        assert!(msg.contains("veil-server migrate --offline"), "expected --offline refusal on live YB DB, got: {msg}");
+        assert!(!current, "migration 46 must not be recorded before offline run");
+    }
     let during = during.into_inner().unwrap();
     assert!(!during.is_empty(), "rows were written while the index was built (begun after it existed, done before it was valid)");
+    if yb {
+        // Verify online migration 41 held every row before offline migration 46 runs.
+        let (with_pre, without_pre) = rt.block_on(listed_with_and_without_the_index(&url, project));
+        let missing_pre: Vec<&String> = written.iter().filter(|n| with_pre.binary_search(n).is_err()).collect();
+        assert!(
+            missing_pre.is_empty(),
+            "{} of {} rows written beside the build are missing from packs_listed before 46: {:?}",
+            missing_pre.len(),
+            written.len(),
+            &missing_pre[..missing_pre.len().min(10)]
+        );
+        assert!(during.iter().all(|n| with_pre.binary_search(n).is_ok()), "every row written during the build is in packs_listed");
+        assert_eq!(with_pre.len(), without_pre.len(), "packs_listed holds every listed row before 46");
+        assert!(with_pre == without_pre, "packs_listed holds exactly the listed rows before 46");
+
+        // Now that writers are stopped, apply migration 46 offline.
+        rt.block_on(async {
+            let db = veil_server::db::connect(&url, 1).await.unwrap();
+            veil_server::db::migrate_offline(&db).await.expect("offline migration 46 completes after writers stop");
+            db.close().await;
+        });
+    }
     rt.block_on(async {
         let db = veil_server::db::connect(&url, 1).await.unwrap();
         let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
@@ -2308,13 +2379,12 @@ fn bug_2930_migration_45_yugabytedb_loses_concurrent_revocation_in_person_epochs
     assert!(failures.is_empty(), "BUG-2930 YugabyteDB 0045 failures:\n{}", failures.join("\n"));
 }
 
-/// BUG-2931 (YugabyteDB): `ensure_q4_offline_safe` only inspects the 10
-/// `Q4_REBUILT_TABLES` and ignores `people`, `projects`, `sessions`, and
-/// `schema_migrations`, so an existing live pre-0046 deployment whose projects
-/// have not yet received a push is misclassified as "fresh empty" and rebuilt
-/// online without `--offline`.
+/// BUG-2931 (YugabyteDB): migration 0046 must never run automatically without
+/// `--offline` on an existing database (even when all rebuilt tables are empty
+/// because no project has received a push yet). Only a migrate run that created
+/// the schema from scratch (`schema_migrations` absent or empty when it took
+/// the migrations lock) may apply 0046 without `--offline`.
 #[test]
-#[ignore = "BUG-2931: ensure_q4_offline_safe allows online 0046 rebuild on an existing live org DB with people/projects/sessions"]
 fn bug_2931_migration_46_online_guard_misses_existing_live_org_without_pushes() {
     let rt = runtime();
     if !on_yugabyte(&rt) {
@@ -2327,7 +2397,7 @@ fn bug_2931_migration_46_online_guard_misses_existing_live_org_without_pushes() 
         apply_migrations_through(&db, 45).await;
 
         // Existing live deployment: users, project, and active session exist,
-        // pre-0046 servers are serving, but no push has populated the 10 rebuilt
+        // pre-0046 servers are serving, but no push has populated the rebuilt
         // tables yet.
         exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2931admin', 1)").await;
         exec_retrying(
@@ -2338,9 +2408,59 @@ fn bug_2931_migration_46_online_guard_misses_existing_live_org_without_pushes() 
         .await;
 
         let res = veil_server::db::migrate(&db).await;
-        db.close().await;
         let err = res.expect_err("online db::migrate() must refuse migration 46 on an existing non-empty org database");
-        assert!(err.to_string().contains("--offline"), "expected --offline refusal, got: {err:?}");
+        assert!(err.to_string().contains("veil-server migrate --offline"), "expected --offline refusal, got: {err:?}");
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "migration 46 must not be recorded");
+
+        veil_server::db::migrate_offline(&db).await.expect("offline migration 46 succeeds");
+        assert!(veil_server::db::schema_current(&db).await.unwrap());
+        db.close().await;
+    });
+}
+
+/// BUG-2931 (YugabyteDB): no emptiness gate — even a database already migrated
+/// through version 45 where every rebuilt table (and `people`/`projects`) is
+/// completely empty must refuse migration 46 without `--offline`, and then
+/// apply it cleanly with `migrate_offline`.
+#[test]
+fn bug_2931_migration_46_refuses_existing_db_with_empty_tables_without_offline() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate_through(&db, 45).await.expect("migrate through 45");
+
+        // Confirm every table rebuilt by 0046 is empty.
+        for tbl in [
+            "branches",
+            "snapshots",
+            "origins",
+            "projections",
+            "landed_changes",
+            "landing_queue",
+            "landings",
+            "landing_leases",
+            "packs",
+            "change_refs",
+            "access_epochs",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {tbl}")).fetch_one(&db).await.unwrap();
+            assert_eq!(count, 0, "{tbl} must be empty");
+        }
+
+        let err = veil_server::db::migrate(&db)
+            .await
+            .expect_err("existing DB at 45 with all rebuilt tables empty must still refuse 46 without --offline");
+        assert!(err.to_string().contains("veil-server migrate --offline"), "expected --offline refusal, got: {err:?}");
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "migration 46 must not be recorded");
+
+        veil_server::db::migrate_offline(&db).await.expect("offline migration 46 applies cleanly");
+        assert!(veil_server::db::schema_current(&db).await.unwrap());
+        db.close().await;
     });
 }
 

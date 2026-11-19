@@ -102,8 +102,8 @@ enum Command {
         #[arg(long)]
         database_url: Option<String>,
         /// Permit offline maintenance migrations that rebuild existing
-        /// non-empty tables (such as migration 0046 on hash-sharded
-        /// YugabyteDB). All veil-server instances must be stopped first.
+        /// tables (such as migration 0046 on an existing hash-sharded
+        /// YugabyteDB database). All veil-server instances must be stopped first.
         #[arg(long)]
         offline: bool,
     },
