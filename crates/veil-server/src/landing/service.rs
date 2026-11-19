@@ -938,8 +938,9 @@ impl Service {
             p
         };
         let epochs: Vec<(i64, i64, i64)> = sqlx::query_as(
-            "SELECT project_id, person_id, epoch FROM access_epochs WHERE (project_id = 0 AND person_id = ANY($1)) \
-             OR (project_id = $2 AND person_id = 0)",
+            "SELECT 0::bigint AS project_id, person_id, epoch FROM person_epochs WHERE person_id = ANY($1) \
+             UNION ALL \
+             SELECT project_id, person_id, epoch FROM access_epochs WHERE project_id = $2 AND person_id = 0",
         )
         .bind(&people)
         .bind(self.project)
@@ -973,6 +974,7 @@ impl Service {
                             person: person_epoch(row.person.id),
                             project: Some((self.project, project_epoch)),
                             embargoes: None,
+                            any_embargo: None,
                         },
                     };
                     match crate::perm::open(hub, &self.name, &caller).await {
@@ -1439,7 +1441,7 @@ impl Service {
                         return Err(Error::conflict(MOVED));
                     }
                     let cur: (i64, i64) = sqlx::query_as(
-                        "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1), 0), \
+                        "SELECT COALESCE((SELECT epoch FROM person_epochs WHERE person_id = $1), 0), \
                          COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = 0), 0)",
                     )
                     .bind(person_id)

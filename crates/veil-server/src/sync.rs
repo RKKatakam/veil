@@ -1844,22 +1844,20 @@ async fn resolve_for_mode(
 /// as a line; past it, the change they stand on.
 pub const NEWEST_BOUND: usize = 4_096;
 
-/// Branch tips as `viewer` sees them: every branch, or (`only`) those of
-/// them named (`tips?branches=`, `docs/HUB.md` §13.41), each projected as
-/// in the full answer. The branch rows come from this server's memory for
-/// at most `caches::TIPS_TTL`, dropped at every push's notice; each
-/// viewer's projection is of their current view.
-pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, only: Option<&std::collections::BTreeSet<String>>) -> Result<Vec<(String, ObjectId)>> {
-    use crate::caches::TipsLookup;
+/// Read a project's raw branch + current-lineage `@tested` rows from
+/// `caches.tips` (serving cached rows within `caches::TIPS_TTL`, coalescing
+/// concurrent misses, and dropping on `tips_moved` notices).
+pub(crate) async fn cached_branch_rows(hub: &Arc<Hub>, project_id: i64) -> Result<crate::caches::BranchRows> {
+    use crate::caches::{BranchRow, TipsLookup};
     let asked = std::time::Instant::now();
-    let rows = loop {
-        match hub.caches.tips(project.id) {
-            TipsLookup::Hit(rows) => break rows,
+    loop {
+        match hub.caches.tips(project_id) {
+            TipsLookup::Hit(rows) => return Ok(rows),
             TipsLookup::Wait(done) => {
                 let woken = done.woken().notified();
                 tokio::pin!(woken);
                 woken.as_mut().enable();
-                if hub.caches.tips_reading(project.id, &done) {
+                if hub.caches.tips_reading(project_id, &done) {
                     // A read whose request was dropped never wakes anyone:
                     // after TIPS_TTL the next asker reads.
                     let _ = tokio::time::timeout(crate::caches::TIPS_TTL, woken).await;
@@ -1867,41 +1865,92 @@ pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, only: Opti
                 // A read that started after this request answers it, kept
                 // or not (BUG-2460).
                 if let Some(rows) = done.rows_for(asked) {
-                    break rows;
+                    return Ok(rows);
                 }
             }
             TipsLookup::Read(read) => {
                 let at = std::time::Instant::now();
-                let r: std::result::Result<Vec<(String, String)>, sqlx::Error> =
-                    sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 ORDER BY name")
-                        .bind(project.id)
-                        .fetch_all(&hub.db)
-                        .await;
+                type RawBranchRow = (String, String, Option<String>, Option<String>);
+                let r: std::result::Result<Vec<RawBranchRow>, sqlx::Error> = sqlx::query_as(
+                    "SELECT b.name, b.target, \
+                     CASE WHEN t.lineage = b.lineage THEN t.snapshot ELSE NULL END, \
+                     b.hidden_for_embargo \
+                     FROM branches b \
+                     LEFT JOIN tested t ON t.project_id = b.project_id AND t.branch = b.name \
+                     WHERE b.project_id = $1 ORDER BY b.name",
+                )
+                .bind(project_id)
+                .fetch_all(&hub.db)
+                .await;
                 match r {
-                    Ok(rows) => break hub.caches.put_tips(project.id, read, at, rows),
+                    Ok(rows) => {
+                        let rows = rows
+                            .into_iter()
+                            .map(|(name, target, tested, hidden_for_embargo)| BranchRow {
+                                name,
+                                target,
+                                tested,
+                                hidden_for_embargo,
+                            })
+                            .collect();
+                        return Ok(hub.caches.put_tips(project_id, read, at, rows));
+                    }
                     Err(e) => {
-                        hub.caches.tips_failed(project.id, read);
+                        hub.caches.tips_failed(project_id, read);
                         return Err(e.into());
                     }
                 }
             }
         }
-    };
-    let named: Vec<(String, String)>;
-    let rows: &[(String, String)] = match only {
-        Some(only) => {
-            named = rows.iter().filter(|(name, _)| only.contains(name)).cloned().collect();
-            &named
-        }
-        None => rows.as_slice(),
-    };
-    let rows = crate::embargo::filter_branches(hub, project, viewer, rows).await?;
-    let mut out = Vec::new();
-    for (name, target) in rows.iter() {
-        let real = ObjectId::from_hex(target).map_err(|e| Error::Other(e.into()))?;
-        out.push((name.clone(), projected(hub, project, viewer, real).await?));
+    }
+}
+
+/// Branch tips as `viewer` sees them: every branch, or (`only`) those of
+/// them named (`tips?branches=`, `docs/HUB.md` §13.41), each projected as
+/// in the full answer. The branch rows come from this server's memory for
+/// at most `caches::TIPS_TTL`, dropped at every push's notice; each
+/// viewer's projection is of their current view.
+pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, only: Option<&std::collections::BTreeSet<String>>) -> Result<Vec<(String, ObjectId)>> {
+    let rows = cached_branch_rows(hub, project.id).await?;
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .filter(|r| only.is_none_or(|o| o.contains(&r.name)))
+        .map(|r| (r.name.clone(), r.target.clone()))
+        .collect();
+    let pairs = crate::embargo::filter_branches(hub, project, viewer, &pairs).await?;
+    let mut out = Vec::with_capacity(pairs.len());
+    for (name, target) in pairs {
+        let real = ObjectId::from_hex(&target).map_err(|e| Error::Other(e.into()))?;
+        out.push((name, projected(hub, project, viewer, real).await?));
     }
     Ok(out)
+}
+
+/// Branch tips and `<branch>@tested` pointers from the same cached
+/// `BranchRows` snapshot (`caches.tips`), with every embargo visibility check
+/// evaluated live (`embargo::filter_branches`, `embargo::can_see`,
+/// `embargo::is_withheld_in`).
+pub async fn tips_and_tested(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    epochs: &crate::caches::Epochs,
+    only: Option<&std::collections::BTreeSet<String>>,
+) -> Result<(Vec<(String, ObjectId)>, std::collections::BTreeMap<String, ObjectId>)> {
+    let rows = cached_branch_rows(hub, project.id).await?;
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .filter(|r| only.is_none_or(|o| o.contains(&r.name)))
+        .map(|r| (r.name.clone(), r.target.clone()))
+        .collect();
+    let pairs = crate::embargo::filter_branches(hub, project, viewer, &pairs).await?;
+    let mut branches = Vec::with_capacity(pairs.len());
+    for (name, target) in pairs {
+        let real = ObjectId::from_hex(&target).map_err(|e| Error::Other(e.into()))?;
+        branches.push((name, projected(hub, project, viewer, real).await?));
+    }
+    let tested = crate::ci::tested_from_rows(hub, project, viewer, epochs, &rows, only).await?;
+    Ok((branches, tested))
 }
 
 /// The snapshots reachable from `tips` in `viewer`'s projected history,

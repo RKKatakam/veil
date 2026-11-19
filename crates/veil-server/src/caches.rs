@@ -103,6 +103,12 @@ pub struct Epochs {
     /// The project, and whether it had an unreleased embargo line, when
     /// that was read with the epochs ([`read_epochs`]).
     pub embargoes: Option<(i64, bool)>,
+    /// The project, and whether it had any embargo line at all (unreleased
+    /// or released), when that was read with the epochs ([`read_epochs`]).
+    /// Never cached across requests: checked live on every request so
+    /// `GET /tips` can skip the `embargo_lines` detail query when a project
+    /// has no embargo rows.
+    pub any_embargo: Option<(i64, bool)>,
 }
 
 impl Epochs {
@@ -112,6 +118,13 @@ impl Epochs {
     /// request that did not read it for `project` knows nothing: `false`.
     pub fn embargo_free(&self, project: i64) -> bool {
         self.embargoes == Some((project, false))
+    }
+
+    /// Did this request read, with its epochs, that `project` has no
+    /// `embargo_lines` rows at all (neither active nor released)? A request
+    /// that did not read it for `project` knows nothing: `false`.
+    pub fn no_embargoes(&self, project: i64) -> bool {
+        self.any_embargo == Some((project, false))
     }
 }
 
@@ -135,8 +148,21 @@ pub struct ViewerEntry {
     pub person_epoch: i64,
 }
 
-/// A project's branch rows: `(name, target)` as stored.
-pub type BranchRows = Arc<Vec<(String, String)>>;
+/// One cached branch row (`branches LEFT JOIN tested`) for a project's tips
+/// cache: raw branch tip, optional `<branch>@tested` snapshot hex (when
+/// `tested.lineage = branches.lineage`), and optional embargo id (checked
+/// live against `embargo::can_see` for every viewer).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchRow {
+    pub name: String,
+    pub target: String,
+    pub tested: Option<String>,
+    pub hidden_for_embargo: Option<String>,
+}
+
+/// A project's branch rows as stored, with their current-lineage `@tested`
+/// snapshots.
+pub type BranchRows = Arc<Vec<BranchRow>>;
 
 #[derive(Default)]
 struct TipsSlot {
@@ -296,8 +322,17 @@ fn session_bytes(e: &SessionEntry) -> usize {
 }
 
 /// What a project's branch rows hold.
-fn rows_bytes(rows: &[(String, String)]) -> usize {
-    64 + rows.iter().map(|(n, t)| string_bytes(n) + string_bytes(t)).sum::<usize>()
+fn rows_bytes(rows: &[BranchRow]) -> usize {
+    64 + rows
+        .iter()
+        .map(|r| {
+            string_bytes(&r.name)
+                + string_bytes(&r.target)
+                + r.tested.as_ref().map_or(0, |s| string_bytes(s))
+                + r.hidden_for_embargo.as_ref().map_or(0, |s| string_bytes(s))
+                + 48
+        })
+        .sum::<usize>()
 }
 
 pub struct Caches {
@@ -530,7 +565,7 @@ impl Caches {
     /// Keep rows read from the database (the read started at `read_at`)
     /// unless a notice for the project came since the read was handed out;
     /// hand them to whoever waits for it, and back.
-    pub fn put_tips(&self, project: i64, read: TipsRead, read_at: Instant, rows: Vec<(String, String)>) -> BranchRows {
+    pub fn put_tips(&self, project: i64, read: TipsRead, read_at: Instant, rows: Vec<BranchRow>) -> BranchRows {
         let rows = Arc::new(rows);
         let mut t = self.tips.lock().unwrap();
         let fits = t.generation == read.generation.0 && t.slots.len() <= MAX_TIP_PROJECTS;
@@ -608,24 +643,45 @@ fn viewer_key(project: i64, person: &Person) -> ObjectId {
     key("viewer", &[&project.to_le_bytes(), &person.id.to_le_bytes(), person.device_key.as_bytes()])
 }
 
-/// The access epochs of `person` (0: anyone on Earth) and of `project`,
-/// and whether `project` has an unreleased embargo line (its lines by their
-/// primary key's prefix: a project has few), in one statement. Rows that do
-/// not exist yet read as 0.
+/// The access epochs of `person` (0: anyone on Earth, read from sharded
+/// `person_epochs`) and of `project` (`access_epochs`), and live embargo
+/// presence for `project` (whether it has an unreleased embargo line, and
+/// whether it has any `embargo_lines` row at all — by its primary key's
+/// prefix: a project has few), in one statement. Rows that do not exist yet
+/// read as 0.
 pub async fn read_epochs(db: &sqlx::PgPool, person: i64, project: Option<i64>) -> Result<Epochs> {
-    let (pe, je, embargoed): (i64, i64, bool) = sqlx::query_as(
-        "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1), 0), \
+    let Some(pid) = project else {
+        if person <= 0 {
+            return Ok(Epochs::default());
+        }
+        let pe: i64 = sqlx::query_scalar("SELECT COALESCE((SELECT epoch FROM person_epochs WHERE person_id = $1), 0)")
+            .bind(person)
+            .fetch_one(db)
+            .await?;
+        return Ok(Epochs {
+            person: pe,
+            project: None,
+            embargoes: None,
+            any_embargo: None,
+        });
+    };
+    let (pe, je, embargoed, any_embargo): (i64, i64, bool, bool) = sqlx::query_as(
+        "SELECT COALESCE(CASE WHEN $1 > 0 THEN (SELECT epoch FROM person_epochs WHERE person_id = $1) END, 0), \
          COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = 0), 0), \
-         EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $2 AND released_at IS NULL)",
+         COALESCE(e.unreleased, FALSE), \
+         e.any_line \
+         FROM (SELECT bool_or(released_at IS NULL) AS unreleased, COUNT(*) > 0 AS any_line \
+               FROM embargo_lines WHERE project_id = $2) e",
     )
     .bind(person)
-    .bind(project.unwrap_or(-1))
+    .bind(pid)
     .fetch_one(db)
     .await?;
     Ok(Epochs {
         person: pe,
-        project: project.map(|p| (p, je)),
-        embargoes: project.map(|p| (p, embargoed)),
+        project: Some((pid, je)),
+        embargoes: Some((pid, embargoed)),
+        any_embargo: Some((pid, any_embargo)),
     })
 }
 
@@ -805,17 +861,26 @@ mod tests {
         }
     }
 
+    fn branch_row(name: &str, target: &str) -> BranchRow {
+        BranchRow {
+            name: name.into(),
+            target: target.into(),
+            tested: None,
+            hidden_for_embargo: None,
+        }
+    }
+
     #[test]
     fn a_notice_beats_a_read_that_started_before_it() {
         let c = Caches::default();
         let r = read(&c, 7);
         let at = Instant::now();
         c.tips_changed(7);
-        c.put_tips(7, r, at, vec![("main".into(), "old".into())]);
+        c.put_tips(7, r, at, vec![branch_row("main", "old")]);
         assert!(rows(&c, 7).is_none(), "rows read before the notice are not kept");
         let r = read(&c, 7);
-        c.put_tips(7, r, Instant::now(), vec![("main".into(), "new".into())]);
-        assert_eq!(rows(&c, 7).unwrap()[0].1, "new");
+        c.put_tips(7, r, Instant::now(), vec![branch_row("main", "new")]);
+        assert_eq!(rows(&c, 7).unwrap()[0].target, "new");
         // A lost listener connection drops everything, and reads in flight.
         let r = read(&c, 8);
         c.drop_all_tips();
@@ -849,10 +914,10 @@ mod tests {
         let after = Instant::now();
         let TipsLookup::Wait(done) = c.tips(1) else { panic!("a second asker waits") };
         c.tips_changed(1);
-        let got = c.put_tips(1, r, Instant::now(), vec![("main".into(), "new".into())]);
-        assert_eq!(got[0].1, "new", "the reader gets its rows");
+        let got = c.put_tips(1, r, Instant::now(), vec![branch_row("main", "new")]);
+        assert_eq!(got[0].target, "new", "the reader gets its rows");
         assert!(rows(&c, 1).is_none(), "rows read across a notice are not kept");
-        assert_eq!(done.rows_for(before).expect("a request that asked before the read started takes its rows")[0].1, "new");
+        assert_eq!(done.rows_for(before).expect("a request that asked before the read started takes its rows")[0].target, "new");
         assert!(done.rows_for(after).is_none(), "a request that asked after the read started reads again: a push before it may be missing");
         // A failed read hands nothing to anyone.
         let r = read(&c, 2);

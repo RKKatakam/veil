@@ -493,7 +493,7 @@ pub(crate) async fn authenticate_parts(parts: &mut Parts, hub: &HubState, enforc
         type Row = (i64, String, String, i64, i64, i64, Option<String>, Option<i64>, Option<String>, bool);
         let row: Option<Row> = sqlx::query_as(
             "SELECT p.id, p.name, d.signing_key, s.expires_at, \
-             COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = p.id), 0), \
+             COALESCE((SELECT epoch FROM person_epochs WHERE person_id = p.id), 0), \
              COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $3 AND person_id = 0), 0), \
              s.agent, s.agent_project, s.agent_only, s.agent_runner \
              FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
@@ -526,8 +526,9 @@ pub(crate) async fn authenticate_parts(parts: &mut Parts, hub: &HubState, enforc
                     epochs: Epochs {
                         person: person_epoch,
                         project: project.map(|p| (p, project_epoch)),
-                        // Not read here: the routes ask (`embargo::is_withheld_in`).
+                        // Not read here: the routes ask (`embargo::is_withheld_in`, `embargoes_for_at`).
                         embargoes: None,
+                        any_embargo: None,
                     },
                 }
             }

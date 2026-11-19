@@ -219,6 +219,22 @@ pub async fn embargoes_for(hub: &Hub, project: &Project, viewer: &Viewer) -> Res
     Ok(out)
 }
 
+/// [`embargoes_for`], using the live `embargo_lines` check already performed
+/// by `caches::read_epochs` on this request (`Epochs::no_embargoes`). Nothing
+/// about embargoes is cached across requests: when `epochs` did not check this
+/// project or saw any row (active or released), [`embargoes_for`] runs live.
+pub async fn embargoes_for_at(
+    hub: &Hub,
+    project: &Project,
+    viewer: &Viewer,
+    epochs: &crate::caches::Epochs,
+) -> Result<Vec<EmbargoRecord>> {
+    if epochs.no_embargoes(project.id) {
+        return Ok(Vec::new());
+    }
+    embargoes_for(hub, project, viewer).await
+}
+
 /// Is `snapshot` (real or projected) on an active embargo line in `project`?
 /// Used by the query API to withhold unreleased embargo snapshots from every
 /// viewer (including admins) until release.

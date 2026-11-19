@@ -104,7 +104,7 @@ impl Grants {
         let row: Option<(i64, i64, Option<i64>)> = sqlx::query_as(
             "SELECT p.id, \
              COALESCE((SELECT epoch FROM access_epochs WHERE project_id = p.id AND person_id = 0), 0), \
-             (SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = d.person_id), 0) \
+             (SELECT COALESCE((SELECT epoch FROM person_epochs WHERE person_id = d.person_id), 0) \
               FROM devices d WHERE d.signing_key = $2 AND d.removed_at IS NULL AND NOT d.pending) \
              FROM projects p WHERE p.name = $1",
         )

@@ -294,6 +294,7 @@ pub async fn open_at(hub: &Hub, name: &str, caller: &Caller) -> Result<(Project,
         project: Some((project.id, entry.epoch)),
         // Only what this request read with its own epochs, for this project.
         embargoes: caller.epochs.embargoes.filter(|(p, _)| *p == project.id),
+        any_embargo: caller.epochs.any_embargo.filter(|(p, _)| *p == project.id),
     };
     Ok((project, viewer, epochs))
 }

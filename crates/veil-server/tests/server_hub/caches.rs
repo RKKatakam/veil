@@ -462,3 +462,94 @@ fn an_api_commit_is_one_commit_and_moves_every_servers_tips() {
         assert_eq!(distinct.len(), 1, "commit {i}: rows written by more than one transaction: {rows:?}");
     }
 }
+
+/// P6: `person_epochs` is sharded by `person_id` and dual-written by
+/// `veil_bump_epoch` (keeping `access_epochs (0, person_id)` in sync for
+/// rolling upgrades); `GET /tips` caches `tested` alongside `branches` and
+/// invalidates it when `tested` moves; and `embargo_lines` is NEVER cached
+/// (a newly committed embargo row is observed immediately on the very next
+/// `GET /tips`, even within `TIPS_TTL`).
+#[test]
+fn p6_person_epochs_sharded_tested_cached_embargo_live() {
+    let a = TestHub::start();
+    let b = TestHub::beside(&a);
+    let p = setup_project(&a);
+    let ha = a.hub();
+    let hb = b.hub();
+    let admin = p.admin.token();
+    let dev = p.dev.token();
+    let pid: i64 = a.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&ha.db)).unwrap();
+    let fin_id: i64 = a.rt.block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.fin.name).fetch_one(&ha.db)).unwrap();
+
+    // 1. Person epoch bumps write both `person_epochs` and `access_epochs(0, person_id)`.
+    member(&a.api(), &admin, &p.name, "finance", &p.fin.name, false);
+    let pe_row: i64 = a.rt.block_on(sqlx::query_scalar("SELECT epoch FROM person_epochs WHERE person_id = $1").bind(fin_id).fetch_one(&ha.db)).unwrap();
+    let ae_row: i64 = a
+        .rt
+        .block_on(sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1").bind(fin_id).fetch_one(&ha.db))
+        .unwrap();
+    assert_eq!(pe_row, ae_row, "veil_bump_epoch dual-writes person_epochs and access_epochs");
+    let read = a.rt.block_on(veil_server::caches::read_epochs(&ha.db, fin_id, Some(pid))).unwrap();
+    assert_eq!(read.person, pe_row, "read_epochs reads person_epochs");
+    assert!(read.embargo_free(pid) && read.no_embargoes(pid), "embargo-free project reports no_embargoes=true");
+
+    // 2. Warm GET /tips caches branches + tested together (tips_hits increments on repeat).
+    let t1 = b.api().tips(Some(&dev), &p.name).unwrap();
+    let hits_before = hb.caches.stats.tips_hits.load(std::sync::atomic::Ordering::Relaxed);
+    let t2 = b.api().tips(Some(&dev), &p.name).unwrap();
+    let hits_after = hb.caches.stats.tips_hits.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(t1.branches, t2.branches);
+    assert_eq!(t1.tested, t2.tested);
+    assert!(hits_after > hits_before, "warm GET /tips hits caches.tips");
+    assert!(t2.embargoes.is_empty());
+
+    // 3. Embargoes are NEVER cached: inserting an embargo_lines row is visible
+    //    on the VERY NEXT GET /tips on hub B (even while caches.tips is hot within TIPS_TTL).
+    let now = veil_core::now_millis();
+    let rec = veil_core::keychain::EmbargoRecord {
+        format: veil_core::keychain::EMBARGO_FORMAT,
+        id: "emb-p6-live".into(),
+        scope: "eng".into(),
+        until: None,
+        released_at: None,
+        created: now,
+        state: None,
+        reason: None,
+    };
+    let rec_json = serde_json::to_string(&rec).unwrap();
+    a.rt.block_on(
+        sqlx::query(
+            "INSERT INTO embargo_lines (project_id, embargo_id, group_names, target_branch, embargo_branch, until_ms, released_at, record_json, created_by, created_at) \
+             VALUES ($1, 'emb-p6-live', ARRAY['eng'], 'main', 'embargo/emb-p6-live', NULL, NULL, $2, $3, $4)",
+        )
+        .bind(pid)
+        .bind(&rec_json)
+        .bind(&p.admin.name)
+        .bind(now)
+        .execute(&ha.db),
+    )
+    .unwrap();
+    // Immediately ask hub B (no tips_moved notice sent, caches.tips still warm!):
+    let t3 = b.api().tips(Some(&admin), &p.name).unwrap();
+    assert_eq!(t3.embargoes.len(), 1, "new embargo must be visible immediately without waiting for TIPS_TTL");
+    assert_eq!(t3.embargoes[0].id, "emb-p6-live");
+    // And an outsider (fin, removed from finance and not in eng) still sees none:
+    let t3_out = b.api().tips(Some(&p.fin.token()), &p.name);
+    if let Some(t) = t3_out {
+        assert!(t.embargoes.is_empty());
+    }
+    // Releasing the embargo sets released_at (embargo_free becomes true, no_embargoes stays false so released record is still returned for pull keychain sync):
+    a.rt.block_on(
+        sqlx::query("UPDATE embargo_lines SET released_at = $2 WHERE project_id = $1 AND embargo_id = 'emb-p6-live'")
+            .bind(pid)
+            .bind(veil_core::now_millis())
+            .execute(&ha.db),
+    )
+    .unwrap();
+    let read_rel = a.rt.block_on(veil_server::caches::read_epochs(&ha.db, fin_id, Some(pid))).unwrap();
+    assert!(read_rel.embargo_free(pid), "released embargo is embargo_free for snapshot withholding");
+    assert!(!read_rel.no_embargoes(pid), "released embargo still triggers live embargoes_for so clients sync release");
+    let t4 = b.api().tips(Some(&admin), &p.name).unwrap();
+    assert_eq!(t4.embargoes.len(), 1, "released embargo record still returned on GET /tips");
+    assert!(t4.embargoes[0].id == "emb-p6-live");
+}
