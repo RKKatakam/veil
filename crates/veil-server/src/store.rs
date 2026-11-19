@@ -1708,6 +1708,12 @@ impl Objects {
         self.packs.usable_for_receipts(project, person, names).await
     }
 
+    /// Classify pack names supplied directly by `PushRequest::packs` for
+    /// `person` (`BUG-1150`).
+    pub async fn usable_for_packs(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<crate::pack::PackCheck> {
+        self.packs.usable_for_packs(project, person, names).await
+    }
+
     /// Claim `names` out of `person`'s `recent` upload list in `objects` mode
     /// while a request using them is in flight (`BUG-2661`).
     pub fn claim_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {

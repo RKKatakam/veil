@@ -3044,40 +3044,57 @@ async fn push_to_its_end(
     land_all: bool,
     wait: bool,
 ) -> Result<(PushResult, Vec<veil_core::hub::land::LandResult>)> {
+    if !project.participant(viewer) {
+        return Err(Error::forbidden("you are not in this project"));
+    }
     let person = who.person.id;
+    let req_packs = std::mem::take(&mut req.packs);
     // The receipts (a long history's are tens of megabytes) are not held
     // through the checks once read.
     let receipts = std::mem::take(&mut req.receipts);
-    let staged = receipted(hub, project.id, person, &receipts);
-    drop(receipts);
-    if hub.objects.layout() == crate::store::ObjectLayout::Objects {
+    if !req_packs.is_empty() && !receipts.is_empty() {
+        return Err(Error::bad_request("a push names either `packs` or `receipts`, not both"));
+    }
+    let in_objects = hub.objects.layout() == crate::store::ObjectLayout::Objects;
+    let (st, owned_names) = if !req_packs.is_empty() {
+        drop(receipts);
+        let (st, owned) = staging_packs(hub, project.id, person, req_packs).await?;
+        (Arc::new(st), owned)
+    } else {
+        let staged = receipted(hub, project.id, person, &receipts);
+        drop(receipts);
         let mut receipt_names: Vec<Arc<str>> = staged.values().cloned().collect();
         receipt_names.sort();
         receipt_names.dedup();
         let st = match staging(hub, project.id, person, &staged).await {
             Ok(st) => Arc::new(st),
             Err(e) => {
-                hub.objects.release_recent(project.id, person, &receipt_names);
+                if in_objects {
+                    hub.objects.release_recent(project.id, person, &receipt_names);
+                }
                 return Err(e);
             }
         };
         drop(staged);
+        (st, receipt_names)
+    };
+    if in_objects {
         let uploaded: HashSet<ObjectId> = st.at.keys().chain(st.vanished.iter()).copied().collect();
         let progress = Mutex::new(Progress::default());
         let r = push_staged(hub, project, viewer, who, req, land_all, wait, uploaded, st, &progress).await;
         let p = progress.into_inner().unwrap();
         match &r {
             Ok((_, _, Some(kept))) => {
-                let unkept: Vec<Arc<str>> = receipt_names.into_iter().filter(|n| !kept.contains(n)).collect();
+                let unkept: Vec<Arc<str>> = owned_names.into_iter().filter(|n| !kept.contains(n)).collect();
                 if let Err(e) = hub.objects.discard_consumed(project.id, &unkept).await {
                     eprintln!("veil-server: discarding what a push did not list: {e:#}");
                 }
             }
             Ok((_, _, None)) => {
-                hub.objects.release_recent(project.id, person, &receipt_names);
+                hub.objects.release_recent(project.id, person, &owned_names);
             }
             Err(Error::Api { status, .. }) if !p.transaction && is_check_refusal(*status) => {
-                if let Err(e) = hub.objects.discard_refused(project.id, &receipt_names).await {
+                if let Err(e) = hub.objects.discard_refused(project.id, &owned_names).await {
                     eprintln!("veil-server: discarding what a refused push uploaded: {e:#}");
                 }
                 if let Err(e) = hub.objects.discard(project.id, &p.written).await {
@@ -3085,7 +3102,7 @@ async fn push_to_its_end(
                 }
             }
             Err(_) => {
-                hub.objects.release_recent(project.id, person, &receipt_names);
+                hub.objects.release_recent(project.id, person, &owned_names);
                 if let Err(e) = hub.objects.discard(project.id, &p.written).await {
                     eprintln!("veil-server: discarding what a push did not list: {e:#}");
                 }
@@ -3093,8 +3110,6 @@ async fn push_to_its_end(
         }
         return r.map(|(res, landings, _)| (res, landings));
     }
-    let st = Arc::new(staging(hub, project.id, person, &staged).await?);
-    drop(staged);
     let uploaded: HashSet<ObjectId> = st.at.keys().copied().collect();
     let progress = Mutex::new(Progress::default());
     let r = push_staged(hub, project, viewer, who, req, land_all, wait, uploaded, st.clone(), &progress).await;
@@ -4585,6 +4600,145 @@ async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<Obj
     })
 }
 
+/// Uniform `400 bad_request` message for every invalid pack name in
+/// `PushRequest::packs` (another person's pack, another project's pack, a
+/// forged/malformed name, or a pack discarded by an earlier refused push) so
+/// none of those cases can be told apart (BUG-1150, BUG-1155).
+const BAD_PACK_UPLOAD: &str = "an upload this push names is missing or was discarded";
+
+/// Validate and load the staged packs named in `PushRequest::packs`
+/// (BUG-1150). Every name must be syntactically valid, unique in the request,
+/// owned by `person` in `project`, and still `STAGED` or `LISTED` in `packs`.
+/// Only caller-owned packs from `usable` are ever passed to discard or
+/// `release_recent`, so naming someone else's pack can never read or discard
+/// it. Each pack's index is loaded under the server's bound on indexes and
+/// converted immediately into [`crate::pack::StagedSlots`] so the bound share
+/// is released right away.
+async fn staging_packs(
+    hub: &Arc<Hub>,
+    project: i64,
+    person: i64,
+    req_packs: Vec<String>,
+) -> Result<(Staged, Vec<Arc<str>>)> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(req_packs.len());
+    let mut names: Vec<Arc<str>> = Vec::with_capacity(req_packs.len());
+    for p in &req_packs {
+        if !crate::pack::valid_name(p) {
+            return Err(Error::bad_request(BAD_PACK_UPLOAD));
+        }
+        if !seen.insert(p.as_str()) {
+            return Err(Error::bad_request("a push must not name the same staged pack twice"));
+        }
+        names.push(Arc::from(p.as_str()));
+    }
+    let in_objects = hub.objects.layout() == crate::store::ObjectLayout::Objects;
+    if in_objects {
+        hub.objects.claim_recent(project, person, &names);
+    }
+    let check = hub.objects.usable_for_packs(project, person, &names).await.map_err(Error::Other)?;
+    let mut owned: Vec<Arc<str>> = check.usable.into_iter().collect();
+    owned.sort();
+    if !check.invalid.is_empty() {
+        let discard_res = if in_objects {
+            hub.objects.discard_refused(project, &owned).await
+        } else {
+            hub.objects.discard(project, &owned).await
+        };
+        if let Err(e) = discard_res {
+            eprintln!("veil-server: discarding what a refused push uploaded: {e:#}");
+        }
+        return Err(Error::bad_request(BAD_PACK_UPLOAD));
+    }
+    if !check.consumed.is_empty() {
+        if in_objects {
+            hub.objects.release_recent(project, person, &owned);
+        }
+        return Err(Error::conflict(DISCARDED_UPLOAD));
+    }
+    let mut packs: Vec<StagedPack> = Vec::with_capacity(owned.len());
+    let mut set = tokio::task::JoinSet::new();
+    let mut it = owned.iter().cloned();
+    let mut missing_pack: Option<Arc<str>> = None;
+    let mut load_err: Option<Error> = None;
+    loop {
+        while set.len() < 16 {
+            let Some(n) = it.next() else { break };
+            let h = hub.clone();
+            set.spawn(async move {
+                let r = h.objects.staged_index(project, &n).await.map(|opt| {
+                    opt.map(|held| {
+                        let slots = crate::pack::StagedSlots {
+                            objects: held.index.len(),
+                            size: held.size,
+                            slots: held.index.iter().copied().collect(),
+                        };
+                        drop(held);
+                        slots
+                    })
+                });
+                (n, r)
+            });
+        }
+        match set.join_next().await {
+            Some(Ok((n, Ok(Some(slots))))) => packs.push((n, slots)),
+            Some(Ok((n, Ok(None)))) => {
+                missing_pack = Some(n);
+                break;
+            }
+            Some(Ok((_, Err(e)))) => {
+                load_err = Some(Error::Other(e));
+                break;
+            }
+            Some(Err(e)) => {
+                load_err = Some(Error::Other(e.into()));
+                break;
+            }
+            None => break,
+        }
+    }
+    if let Some(e) = load_err {
+        set.abort_all();
+        if in_objects {
+            hub.objects.release_recent(project, person, &owned);
+        }
+        return Err(e);
+    }
+    if let Some(n) = missing_pack {
+        set.abort_all();
+        if in_objects {
+            let recheck = hub
+                .objects
+                .usable_for_packs(project, person, std::slice::from_ref(&n))
+                .await
+                .map_err(Error::Other)?;
+            if recheck.consumed.contains(&n) || recheck.usable.contains(&n) {
+                hub.objects.release_recent(project, person, &owned);
+                return Err(Error::conflict(DISCARDED_UPLOAD));
+            }
+            if let Err(e) = hub.objects.discard_refused(project, &owned).await {
+                eprintln!("veil-server: discarding what a refused push uploaded: {e:#}");
+            }
+        } else if let Err(e) = hub.objects.discard(project, &owned).await {
+            eprintln!("veil-server: discarding what a refused push uploaded: {e:#}");
+        }
+        return Err(Error::bad_request(BAD_PACK_UPLOAD));
+    }
+    let at = packs
+        .iter()
+        .flat_map(|(n, sp)| sp.slots.iter().map(move |(id, s)| (*id, (n.clone(), *s))))
+        .collect();
+    Ok((
+        Staged {
+            at: Arc::new(at),
+            packs: Arc::new(packs),
+            made: Default::default(),
+            vanished: Arc::new(HashSet::new()),
+            touched: Mutex::new(HashSet::new()),
+        },
+        owned,
+    ))
+}
+
 /// Most bytes of uploaded objects one API commit may name. They are held
 /// decoded for its checks under [`DECODING_IN_FLIGHT`] for every request
 /// together (BUG-1156): a commit naming more than that takes all of it, so
@@ -4716,11 +4870,11 @@ pub(crate) async fn settle_uploads<T>(
 /// client chooses the stored bytes of an object others share (BUG-1008).
 /// The request's objects are written as **one staged pack** (one storage
 /// write), which nobody reads but a push or API commit of the same person
-/// that shows its receipts; a push that lands lists it, a refused one
-/// deletes it (BUG-930). Returns a receipt per object, in order (made
-/// whether or not the project held it already, so the answer is the same
-/// either way).
-pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64) -> Result<Vec<String>> {
+/// that names it or shows its receipts; a push that lands lists it, a refused
+/// one deletes it (BUG-930). Returns `Uploaded` with one receipt per object
+/// in order (made whether or not the project held it already, so the answer is
+/// the same either way) and the unique staged pack names written (BUG-1150).
+pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limit: u64) -> Result<veil_core::hub::wire::Uploaded> {
     // The checks, decoding and compressing on a blocking thread.
     let rt = Handle::current();
     let mut frames: Vec<(ObjectId, Bytes)> = tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Bytes)>> {
@@ -4771,9 +4925,11 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
     .await
     .map_err(|e| Error::Other(e.into()))??;
     if frames.is_empty() {
-        return Ok(Vec::new());
+        return Ok(veil_core::hub::wire::Uploaded::default());
     }
     let mut receipts = Vec::with_capacity(frames.len());
+    let mut packs = Vec::new();
+    let mut seen_packs: HashSet<Arc<str>> = HashSet::new();
     while !frames.is_empty() {
         let rest = if frames.len() > crate::pack::MAX_OBJECTS {
             frames.split_off(crate::pack::MAX_OBJECTS)
@@ -4783,10 +4939,17 @@ pub async fn upload(hub: &Arc<Hub>, project: i64, person: i64, body: Bytes, limi
         let ids: Vec<ObjectId> = frames.iter().map(|(id, _)| *id).collect();
         // Encodings, checked above: staged as they are, never encoded again.
         let pack = crate::store::own(hub.objects.stage(project, person, frames)).await.map_err(Error::Other)?;
+        if seen_packs.insert(pack.clone()) {
+            packs.push(pack.to_string());
+        }
         receipts.extend(ids.iter().map(|id| receipt(hub, project, person, id, &pack)));
         frames = rest;
     }
-    Ok(receipts)
+    Ok(veil_core::hub::wire::Uploaded {
+        stored: receipts.len(),
+        receipts,
+        packs,
+    })
 }
 
 /// Store `objects` (canonical encodings; compressed by the store) in

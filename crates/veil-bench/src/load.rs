@@ -770,6 +770,7 @@ impl Agent<'_> {
                 }],
                 force: false,
                 receipts,
+                packs: Vec::new(),
                 embargoes: Vec::new(),
             };
             let r = self.api.post_json(Some(self.token), &self.path("/push"), &req)?;

@@ -983,10 +983,10 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections); the branch rows may be up to 100 ms old (§13.14) |
 | `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`); to a caller that accepts encoded frames, each object as stored, compressed or not (§13.15) |
 | `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there (as stored, to a caller that accepts encoded frames: §13.15). No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
-| `POST …/objects` | upload object frames, plain or encoded (§13.15): decoded (bounded), re-hashed, canonically decoded, format-checked, compressed when that is smaller, and **staged** as one pack (S28, §13.20): nobody's until a push of the same person lists it, deleted if the push refuses it. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id ‖ pack, then the pack's name) |
-| `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
+| `POST …/objects` | upload object frames, plain or encoded (§13.15): decoded (bounded), re-hashed, canonically decoded, format-checked, compressed when that is smaller, and **staged** as one pack (S28, §13.20): nobody's until a push of the same person lists it, deleted if the push refuses it. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id ‖ pack, then the pack's name) and, from revision 9 (BUG-1150), the staged `packs` written |
+| `POST …/push {updates: [{branch, expected, new}], force, packs \| receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries. From revision 9 (BUG-1150), `vl` sends `packs` (the staged pack names from `POST …/objects`) instead of per-object `receipts`; `packs` and `receipts` are mutually exclusive |
 | `POST …/changes {base, edits, onto?, change_id?, receipts}` | a commit through the API, without a checkout (S10, §13.13) |
-| `POST …/land {onto, snapshot \| base+edits, receipts, wait}`, `GET …/land/{ticket}` | submit a landing to the landing service, and its outcome (S17, §13.19) |
+| `POST …/land {onto, snapshot \| base+edits, packs \| receipts, wait}`, `GET …/land/{ticket}` | submit a landing to the landing service, and its outcome (S17, §13.19; `packs` with `snapshot` only, revision 9, BUG-1150) |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
 | `…/groups`, `GET|POST …/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's devices (active, the newest pending, removed), the vouches and invite joins the server stores, which devices check before sharing a key (§13.11, §13.12) |
 | `POST /v1/devices/vouch {device, signature}` | the signed-in device vouches for another device of its person; a pending one becomes active |
@@ -2554,9 +2554,9 @@ edit sets, the fast path, the landing check; `rules.rs`: `.veilrules`),
 ```text
 POST /v1/projects/{p}/land
 { "onto": "main",
-  "snapshot": "<id, as a push names it>"            // uploaded first, with receipts
+  "snapshot": "<id, as a push names it>"            // uploaded first, with packs (rev 9+) or receipts
   | "base": "<id as the caller sees it>", "edits": [...], "description", "change_id"?,
-  "receipts": {...}, "wait": true }
+  "packs": [...], "receipts": {...}, "wait": true } // packs (snapshot only) and receipts are mutually exclusive
 → { "ticket", "state": "queued" | "landed" | "conflict" | "rejected",
     "change_id"?, "landed": ["<each change's snapshot, as the caller sees it>"],
     "message"?, "paths": ["<the change's own paths that moved>"], "warnings": [...] }
@@ -2945,24 +2945,37 @@ Nothing changes for `vl` or on the wire.
   one database commit per pack, so one per `vl` upload request, apart from
   the push's one), then the pack: one storage write per pack (one per `vl`
   upload request).
-  Each receipt is `MAC(project ‖ person ‖ id ‖ pack) ‖ "." ‖ pack`. A staged
-  pack is nobody's: its objects are read only by a push or API commit of
-  that person that shows its receipts, through `Objects::get_staged`, and
-  cached under keys of their own (`Objects::staged_key`, in the object and
-  tree caches), so no read of the project ever answers a staged object.
+  Each receipt is `MAC(project ‖ person ‖ id ‖ pack) ‖ "." ‖ pack`, and from
+  revision 9 (BUG-1150) the answer also lists the unique staged `packs`
+  written. A staged pack is nobody's: its objects are read only by a push or
+  API commit of that person that names it (`packs`) or shows its `receipts`,
+  through `Objects::get_staged`, and cached under keys of their own
+  (`Objects::staged_key`, in the object and tree caches), so no read of the
+  project ever answers a staged object.
   **An upload of objects that a pack the same person staged on this server
   holds all of** (a push that lost a race, uploaded again by `vl`'s next
-  try) gets that pack's receipts, with no new pack and no commit.
-* **What counts as uploaded** (BUG-1155): only an object its receipt's
-  pack holds, where that pack is the pusher's and staged or listed (one
-  statement: the rows). A receipt of a discarded upload is worth nothing,
-  and a staged object is read from its pack only, never looked for in the
-  project's store instead, so naming a guess of hidden content with an old
-  receipt gets the answer a wrong guess gets.
-* **A push** reads the staged packs its receipts name (their indexes, from
-  memory on the server that took the upload, or by bisecting the sorted
-  index in storage with 64 KiB ranged reads), checks every new snapshot as
-  before, and then, when something lands:
+  try) gets that pack's receipts and name, with no new pack and no commit.
+* **What counts as uploaded** (BUG-1155, BUG-1150): for a push naming
+  `packs` (revision 9, mutually exclusive with `receipts`), every object in
+  every named staged pack, where each pack name is syntactically valid (32
+  lowercase hex digits), named at most once, and belongs to the pusher in
+  `project` with state `STAGED` or `LISTED` (`Packs::usable_for_packs`); a
+  pack belonging to another person or project, a forged name, or a pack
+  discarded by an earlier check refusal (`objects >= 0`) all receive the
+  same `400 bad_request` answer (no oracle), and only the pusher's own
+  verified packs are ever discarded. For `receipts` (API commits and pushes
+  from clients before revision 9), only an object its receipt's pack holds,
+  where that pack is the pusher's and staged or listed (one statement: the
+  rows). A discarded upload is worth nothing in either form, and a staged
+  object is read from its pack only, never looked for in the project's store
+  instead, so naming a guess of hidden content gets the answer a wrong guess
+  gets.
+* **A push** reads the staged packs it names (`packs`, reading each pack's
+  index under `Packs::bound` and releasing the share immediately into
+  `StagedSlots`) or that its `receipts` name (from memory on the server that
+  took the upload, or by bisecting the sorted index in storage with 64 KiB
+  ranged reads), checks every new snapshot as before, and then, when
+  something lands:
   * lists a staged pack **as it is** if its checks read every object in it
     (what a `vl` push uploads is exactly what the checks read: §13.5);
   * puts the objects the checks read from any other staged pack, and the
@@ -3128,8 +3141,8 @@ trusted (with code; never with secrets' plaintext).
 | 1 | A pack hands a reader objects of folders they cannot see | no route sends a pack; every object is read one at a time after its path or chain check | `grants::object_routes_serve_only_what_a_grant_reaches`, `leaks::…`, `sync::…` (all on packed objects now) |
 | 2 | Pack membership confirms a hidden object (one in the same pack as a visible one) | lookups answer only what the route's check reached; a hidden object of the same pack gets the answer a random id gets | `grants::object_routes_serve_only_what_a_grant_reaches` |
 | 3 | A refused plain-text secret stays stored (BUG-930) | uploads are staged; the refusing push discards them; a landing push discards what it did not list | `packs::a_refused_push_deletes_its_staged_upload`, `packs::an_unread_plain_text_secret_beside_a_landing_push_is_not_kept`, `changes::bug_930_…` |
-| 4 | Another person's staged upload read or claimed, or a discarded upload's receipt used to confirm a guess of hidden content (BUG-824's class, BUG-1155) | receipts bind person and pack; an object counts as uploaded only if its receipt's pack, the pusher's and not discarded, holds it; staged objects are read only from their pack and never cached as the project's | `packs::receipts_hold_only_for_their_person_and_pack`, `packs::bug_1155_…` (a push and an API commit) |
-| 5 | A receipt moved to another pack, or a crafted pack name (`../`) | the MAC covers the pack; names are 32 lowercase hex digits | same |
+| 4 | Another person's staged upload read or claimed, or a discarded upload's receipt or pack name used to confirm a guess of hidden content (BUG-824's class, BUG-1155, BUG-1150) | `packs` names are checked against `packs` rows for `(project, person)` in state `STAGED`/`LISTED` (other people's packs, forged names, and refused discards all get the same `400 bad_request`, and only caller-owned packs are discarded); receipts bind person and pack; staged objects are read only from their pack and never cached as the project's | `packs::receipts_hold_only_for_their_person_and_pack`, `packs::bug_1155_…`, `packs::bug_1150_push_packs_proof_of_upload_in_{packs,objects}_layout` |
+| 5 | A receipt moved to another pack, a duplicate pack name, or a crafted pack name (`../`) | the MAC covers the pack; `packs` rejects duplicates; names are 32 lowercase hex digits | same |
 | 6 | A race lists a pack another push of the same person discards, or deletes a listed one | the primary key decides; discard deletes only after its row won; a push deletes its own pack directly only if its transaction never began | `pack::…`, `packs::a_refused_push_deletes_its_staged_upload` |
 | 7 | An object a push's checks never read kept in the store (an upload a push names but never checks) | only what the checks read is listed or copied | `packs::a_push_is_one_storage_write_and_reads_come_from_its_pack` (crafted pushes upload superseded trees) |
 | 8 | A damaged or hostile index (counts, offsets past the end, unsorted, overflow, a slot naming another object's entry) | parsed with every bound checked; every read, ranged ones too, checks the id its entry starts with; whole reads are checked against the id | `pack::tests::…`, `store::tests::bug_1154_a_wrong_slot_never_serves_another_objects_range` |
