@@ -2073,3 +2073,237 @@ fn bug_2925_migration_46_keeps_sweep_and_retention_indexes_usable_on_yugabytedb(
     });
 }
 
+/// BUG-2930 (YugabyteDB): migration 0045 (`BUG-2922` fix) still loses concurrent
+/// revocations on YugabyteDB during a normal rolling upgrade (no crash) AND on
+/// an interrupted retry between step 1 and step 2.
+///
+/// 1. Normal rolling upgrade: `db::migrate_once` executes `-- veil: step`
+///    migrations without waiting for active backends to adopt step 1's catalog
+///    version (`wait_for_every_session`). On YugabyteDB `CREATE TRIGGER` neither
+///    acquires a table lock blocking `access_epochs` DML nor drains in-flight
+///    transactions that already wrote `access_epochs` under the pre-step-1
+///    catalog. Step 2's MVCC snapshot reads the pre-revocation epoch and records
+///    version 45; when the in-flight `READ COMMITTED` revocation (`remove_members`,
+///    `bar_device`, …) commits, `access_epochs (0, person)` holds the revoked
+///    epoch while `person_epochs (person)` stays permanently at the old epoch.
+/// 2. Interrupted retry: re-running step 1 executes `DROP TRIGGER IF EXISTS`
+///    before `CREATE TRIGGER`. Because YugabyteDB commits DDL immediately
+///    outside the transaction block, a revocation between those two DDL
+///    statements updates `access_epochs` without firing the mirror trigger, and
+///    step 2's `ON CONFLICT (person_id) DO NOTHING` leaves `person_epochs` stuck
+///    at the stale pre-retry epoch permanently.
+#[test]
+#[ignore = "BUG-2930: migration 0045 loses concurrent revocations on YugabyteDB (no session barrier between steps; DROP TRIGGER commits before CREATE TRIGGER on retry)"]
+fn bug_2930_migration_45_yugabytedb_loses_concurrent_revocation_in_person_epochs() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // Part A: normal rolling upgrade (no crash).
+    {
+        let (url, name) = fresh_database(&rt);
+        let _drop = DropFreshDb(&rt, name);
+        rt.block_on(async {
+            let db = veil_server::db::connect(&url, 6).await.unwrap();
+            apply_migrations_through(&db, 44).await;
+
+            exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2930alice', 1)").await;
+            exec_retrying(
+                &db,
+                "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+                 SELECT 'b2930proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2930alice'",
+            )
+            .await;
+            let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2930proj'").fetch_one(&db).await.unwrap();
+            let alice: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2930alice'").fetch_one(&db).await.unwrap();
+            // Seed one branch row so `db::migrate(&db)` applies migration 45 and
+            // stops cleanly at migration 46's offline guard (isolating 0045).
+            exec_retrying(&db, &format!("INSERT INTO branches (project_id, name, target) VALUES ({pid}, 'main', 'snap0')")).await;
+            exec_retrying(&db, &format!("INSERT INTO groups (project_id, name) VALUES ({pid}, 'eng')")).await;
+            let gid: i64 = sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'eng'")
+                .bind(pid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            exec_retrying(&db, &format!("INSERT INTO group_members (group_id, person_id) VALUES ({gid}, {alice})")).await;
+
+            let e_before: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(alice)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_ne!(e_before, 0, "group insert bumped access_epochs");
+
+            // Pre-0045 server begins a READ COMMITTED revocation transaction
+            // (`api::change_group` / `Op::RemoveMember`) and deletes Alice from
+            // `group_members`, bumping `access_epochs (0, alice)` before step 1.
+            let mut rev_tx = db.begin().await.unwrap();
+            let deleted = sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND person_id = $2")
+                .bind(gid)
+                .bind(alice)
+                .execute(&mut *rev_tx)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(deleted, 1, "alice removed from group_members in open tx");
+
+            // Concurrently, a new server runs `db::migrate(&db)` (applies 0045
+            // step 1 + step 2 and records version 45, then refuses 0046 online).
+            let mig_err = veil_server::db::migrate(&db)
+                .await
+                .expect_err("0046 refuses online because branches has a row");
+            assert!(
+                mig_err.to_string().contains("--offline"),
+                "expected 0046 --offline refusal after 0045, got: {mig_err:?}"
+            );
+            let applied_45: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 45)")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert!(applied_45, "migration 45 must be recorded in schema_migrations");
+
+            // The pre-0045 revocation finishes its trailing `group_info` read
+            // and commits cleanly.
+            let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM group_members WHERE group_id = $1")
+                .bind(gid)
+                .fetch_one(&mut *rev_tx)
+                .await
+                .unwrap();
+            assert_eq!(remaining, 0);
+            rev_tx.commit().await.expect("pre-0045 revocation tx commits");
+
+            let e_revoked: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(alice)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_ne!(e_revoked, e_before, "committed revocation updated access_epochs");
+
+            let read = veil_server::caches::read_epochs(&db, alice, Some(pid)).await.unwrap();
+            db.close().await;
+            if read.person != e_revoked {
+                failures.push(format!(
+                    "Part A (normal rolling upgrade) lost revocation: person_epochs={} (pre-revocation {}), access_epochs={}",
+                    read.person, e_before, e_revoked
+                ));
+            }
+        });
+    }
+
+    // Part B: interrupted retry between step 1 and step 2 on YugabyteDB.
+    {
+        let (url, name) = fresh_database(&rt);
+        let _drop = DropFreshDb(&rt, name);
+        rt.block_on(async {
+            let db = veil_server::db::connect(&url, 6).await.unwrap();
+            apply_migrations_through(&db, 44).await;
+
+            exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2930bob', 1)").await;
+            exec_retrying(
+                &db,
+                "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+                 SELECT 'b2930proj2', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2930bob'",
+            )
+            .await;
+            let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2930proj2'").fetch_one(&db).await.unwrap();
+            let bob: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2930bob'").fetch_one(&db).await.unwrap();
+            exec_retrying(&db, &format!("INSERT INTO groups (project_id, name) VALUES ({pid}, 'eng')")).await;
+            let gid: i64 = sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'eng'")
+                .bind(pid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+
+            let sql45 = veil_server::db::MIGRATIONS
+                .iter()
+                .find(|(v, _, _)| *v == 45)
+                .expect("migration 45")
+                .2;
+            let steps = veil_server::db::migration_steps(sql45);
+            assert_eq!(steps.len(), 2);
+
+            // Attempt 1 applies step 1 then fails before step 2.
+            exec_retrying(&db, &steps[0]).await;
+
+            // While step 1 is in place, Bob is added to `eng`, mirroring `e1`
+            // into both `access_epochs` and `person_epochs`.
+            exec_retrying(&db, &format!("INSERT INTO group_members (group_id, person_id) VALUES ({gid}, {bob})")).await;
+            let e1_ae: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(bob)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            let e1_pe: i64 = sqlx::query_scalar("SELECT epoch FROM person_epochs WHERE person_id = $1")
+                .bind(bob)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_eq!(e1_pe, e1_ae, "mirror trigger populated person_epochs with e1");
+
+            // Attempt 2 re-runs step 1 inside a transaction block. On YugabyteDB,
+            // step 1's `DROP TRIGGER IF EXISTS` commits immediately before
+            // `CREATE TRIGGER` executes.
+            assert!(
+                steps[0].contains("DROP TRIGGER IF EXISTS veil_access_epochs_mirror_person ON access_epochs"),
+                "0045 step 1 drops the mirror trigger before recreating it"
+            );
+            let mut retry_tx = db.begin().await.unwrap();
+            sqlx::raw_sql("DROP TRIGGER IF EXISTS veil_access_epochs_mirror_person ON access_epochs")
+                .execute(&mut *retry_tx)
+                .await
+                .unwrap();
+
+            // A concurrent revocation commits in the window before CREATE TRIGGER.
+            let deleted = sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND person_id = $2")
+                .bind(gid)
+                .bind(bob)
+                .execute(&db)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(deleted, 1);
+
+            // Retry finishes step 1 and then runs step 2 (`ON CONFLICT DO NOTHING`).
+            sqlx::raw_sql(
+                "CREATE TRIGGER veil_access_epochs_mirror_person \
+                 AFTER INSERT OR UPDATE ON access_epochs \
+                 FOR EACH ROW \
+                 WHEN (NEW.project_id = 0 AND NEW.person_id > 0) \
+                 EXECUTE FUNCTION veil_mirror_person_epoch()",
+            )
+            .execute(&mut *retry_tx)
+            .await
+            .unwrap();
+            retry_tx.commit().await.unwrap();
+
+            let mut tx2 = db.begin().await.unwrap();
+            sqlx::raw_sql(&steps[1]).execute(&mut *tx2).await.unwrap();
+            sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (45, 'person_epochs', 0)")
+                .execute(&mut *tx2)
+                .await
+                .unwrap();
+            tx2.commit().await.unwrap();
+
+            let e2_ae: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(bob)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_ne!(e2_ae, e1_ae, "revocation bumped access_epochs to e2");
+
+            let read = veil_server::caches::read_epochs(&db, bob, Some(pid)).await.unwrap();
+            db.close().await;
+            if read.person != e2_ae {
+                failures.push(format!(
+                    "Part B (interrupted retry DROP TRIGGER window) lost revocation: person_epochs={} (stale e1={}), access_epochs={}",
+                    read.person, e1_ae, e2_ae
+                ));
+            }
+        });
+    }
+
+    assert!(failures.is_empty(), "BUG-2930 YugabyteDB 0045 failures:\n{}", failures.join("\n"));
+}
