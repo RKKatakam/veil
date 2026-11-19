@@ -465,13 +465,7 @@ pub(crate) async fn authenticate_parts(parts: &mut Parts, hub: &HubState, enforc
         (tok, true)
     } else {
         let epochs = match project {
-            Some(p) => {
-                let e = crate::caches::read_epochs(&hub.db, 0, Some(p)).await?;
-                if let Some((pid, ge)) = e.gc {
-                    hub.observe_gc_epoch(pid, ge);
-                }
-                e
-            }
+            Some(p) => crate::caches::read_epochs(&hub.db, 0, Some(p)).await?,
             None => Epochs::default(),
         };
         return Ok(Caller { person: None, epochs });
@@ -485,9 +479,6 @@ pub(crate) async fn authenticate_parts(parts: &mut Parts, hub: &HubState, enforc
     let caller = 'lookup: {
         if let Some(e) = hub.caches.session(&hash).filter(|e| e.expires_at > now) {
             let epochs = crate::caches::read_epochs(&hub.db, e.person.id, project).await?;
-            if let Some((pid, ge)) = epochs.gc {
-                hub.observe_gc_epoch(pid, ge);
-            }
             if epochs.person == e.epoch {
                 stats.session_hits.fetch_add(1, Ordering::Relaxed);
                 break 'lookup Caller {
@@ -499,12 +490,11 @@ pub(crate) async fn authenticate_parts(parts: &mut Parts, hub: &HubState, enforc
         stats.session_misses.fetch_add(1, Ordering::Relaxed);
         // The session and the person's epoch in one statement: the entry is
         // never tagged with an epoch newer than what it was read with.
-        type Row = (i64, String, String, i64, i64, i64, i64, Option<String>, Option<i64>, Option<String>, bool);
+        type Row = (i64, String, String, i64, i64, i64, Option<String>, Option<i64>, Option<String>, bool);
         let row: Option<Row> = sqlx::query_as(
             "SELECT p.id, p.name, d.signing_key, s.expires_at, \
              COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = p.id), 0), \
              COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $3 AND person_id = 0), 0), \
-             COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $3 AND person_id = -1), 0), \
              s.agent, s.agent_project, s.agent_only, s.agent_runner \
              FROM sessions s JOIN devices d ON d.id = s.device_id JOIN people p ON p.id = s.person_id \
              LEFT JOIN sessions par ON par.token_hash = s.parent_hash \
@@ -520,10 +510,7 @@ pub(crate) async fn authenticate_parts(parts: &mut Parts, hub: &HubState, enforc
         .fetch_optional(&hub.db)
         .await?;
         match row {
-            Some((id, name, device_key, expires_at, person_epoch, project_epoch, gc_epoch, agent, agent_project, agent_only, agent_runner)) => {
-                if let Some(pid) = project {
-                    hub.observe_gc_epoch(pid, gc_epoch);
-                }
+            Some((id, name, device_key, expires_at, person_epoch, project_epoch, agent, agent_project, agent_only, agent_runner)) => {
                 let agent = agent_grant(hash.clone(), agent, agent_project, agent_only, agent_runner)?;
                 let person = Person { id, name, device_key, agent };
                 hub.caches.put_session(
@@ -539,7 +526,6 @@ pub(crate) async fn authenticate_parts(parts: &mut Parts, hub: &HubState, enforc
                     epochs: Epochs {
                         person: person_epoch,
                         project: project.map(|p| (p, project_epoch)),
-                        gc: project.map(|p| (p, gc_epoch)),
                         // Not read here: the routes ask (`embargo::is_withheld_in`).
                         embargoes: None,
                     },

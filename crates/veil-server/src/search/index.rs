@@ -219,7 +219,6 @@ pub(crate) struct PreparedWrite {
     pub removed: Vec<String>,
     /// The branches' walks this write takes to their tips: `(branch, tip)`.
     pub walks: Vec<(String, String)>,
-    pub gc_epoch: i64,
 }
 
 impl PreparedWrite {
@@ -234,7 +233,6 @@ impl PreparedWrite {
         shards: &BTreeMap<String, Shard>,
         removed: Vec<String>,
         walks: Vec<(String, String)>,
-        gc_epoch: i64,
     ) -> Self {
         let rows = shards
             .iter()
@@ -250,41 +248,8 @@ impl PreparedWrite {
             rows,
             removed,
             walks,
-            gc_epoch,
         }
     }
-}
-
-fn read_gc_epoch_cx(cx: &Cx, pool: &PgPool) -> Result<i64> {
-    let project = cx.project();
-    let epoch: i64 = cx.db(|| async {
-        let cur: Option<i64> = sqlx::query_scalar(
-            "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1",
-        )
-        .bind(project)
-        .fetch_optional(pool)
-        .await?;
-        match cur {
-            Some(e) => Ok(e),
-            None => {
-                sqlx::query(
-                    "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) \
-                     VALUES ($1, -1, 0, 0) ON CONFLICT (project_id, person_id) DO NOTHING",
-                )
-                .bind(project)
-                .execute(pool)
-                .await?;
-                sqlx::query_scalar(
-                    "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1",
-                )
-                .bind(project)
-                .fetch_one(pool)
-                .await
-            }
-        }
-    })?;
-    cx.hub().observe_gc_epoch(project, epoch);
-    Ok(epoch)
 }
 
 pub(crate) async fn apply_write(
@@ -292,14 +257,6 @@ pub(crate) async fn apply_write(
     project: i64,
     w: &PreparedWrite,
 ) -> std::result::Result<bool, sqlx::Error> {
-    let cur_gc_epoch: Option<i64> = sqlx::query_scalar(crate::pack_gc::GUARD_SQL)
-        .bind(project)
-        .bind(crate::pack_gc::gate_key(project))
-        .fetch_optional(&mut **tx)
-        .await?;
-    if cur_gc_epoch != Some(w.gc_epoch) {
-        return Ok(false);
-    }
     let moved = match w.expect {
         Some(v) => sqlx::query(
             "UPDATE search_heads SET snapshot = $4, lines = $5, version = version + 1 \
@@ -909,10 +866,10 @@ fn textlike(e: &TreeEntry) -> (i64, i64) {
     }
 }
 
-/// In-memory `(snapshot, lines_ident, gc_epoch, shards)` of the default branch
+/// In-memory `(snapshot, lines_ident, shards)` of the default branch
 /// during [`all_at_once`], so new branches/tags prepared in the same batch diff
 /// against `default` instead of re-indexing from [`empty_tree_id`] (BUG-2663).
-type DefaultCodeState = (ObjectId, String, i64, BTreeMap<String, Shard>);
+type DefaultCodeState = (ObjectId, String, BTreeMap<String, Shard>);
 
 /// Move the code index of each of `wanted` (`(branch, tip)`) and the names
 /// index to their tips in one transaction: `false` (nothing written) if a
@@ -988,11 +945,10 @@ fn prepare_code(
     }
     let ident = identity(lines);
     let all: BTreeSet<String> = lines.all().into_iter().collect();
-    let gc_epoch = read_gc_epoch_cx(cx, pool)?;
     let (head, old) = read_state(cx, pool, CODE, branch, None)?;
     if head.as_ref().is_some_and(|h| h.snapshot == tip.hex() && h.lines == ident) {
         if branch == default {
-            *default_code = Some((tip, ident, gc_epoch, old));
+            *default_code = Some((tip, ident, old));
         }
         return Ok(None);
     }
@@ -1010,8 +966,8 @@ fn prepare_code(
         }
         None => {
             let from_default = if branch != default {
-                match default_code.as_ref().filter(|(_, l, e, _)| *l == ident && *e == gc_epoch) {
-                    Some((dtip, _, _, ds)) => Some((*dtip, ds.clone())),
+                match default_code.as_ref().filter(|(_, l, _)| *l == ident) {
+                    Some((dtip, _, ds)) => Some((*dtip, ds.clone())),
                     None => {
                         let (dh, ds) = read_state(cx, pool, CODE, default, None)?;
                         match dh.filter(|h| h.lines == ident) {
@@ -1101,7 +1057,7 @@ fn prepare_code(
         .collect();
     if branch == default {
         let committed = shards.into_iter().filter(|(_, s)| !s.segments.is_empty()).collect();
-        *default_code = Some((tip, ident.clone(), gc_epoch, committed));
+        *default_code = Some((tip, ident.clone(), committed));
     }
     Ok(Some(PreparedWrite::new(
         CODE,
@@ -1113,7 +1069,6 @@ fn prepare_code(
         &write,
         removed,
         Vec::new(),
-        gc_epoch,
     )))
 }
 
@@ -1225,7 +1180,6 @@ fn prepare_names_of(cx: &Cx, g: &Graph, lines: &Lines, tips: &[(String, ObjectId
     let pool = &cx.hub().derive.db;
     let ident = identity(lines);
     let all: BTreeSet<String> = lines.all().into_iter().collect();
-    let gc_epoch = read_gc_epoch_cx(cx, pool)?;
     let (head, old) = read_state(cx, pool, NAMES, "", None)?;
     // The branches whose walk is behind their tip (a withheld tip waits).
     let mut todo = Vec::new();
@@ -1358,7 +1312,6 @@ fn prepare_names_of(cx: &Cx, g: &Graph, lines: &Lines, tips: &[(String, ObjectId
         &write,
         removed,
         walks,
-        gc_epoch,
     )))
 }
 

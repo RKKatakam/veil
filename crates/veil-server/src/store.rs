@@ -613,8 +613,6 @@ pub struct Objects {
     /// Optional cluster receipt key used to authenticate staged upload pack
     /// names (`BUG-2851`).
     receipt_key: Option<[u8; 32]>,
-    /// Per-project GC epoch observed from `access_epochs (project_id, -1)`.
-    gc_epochs: std::sync::RwLock<std::collections::HashMap<i64, i64>>,
     /// Requests to the store, for the benchmarks' cost gates
     /// (`storage-and-cost.md` §9): writes, bytes written, reads, deletes,
     /// listings; of the writes, a push's and an upload's own (`own_writes`:
@@ -710,7 +708,6 @@ type KeepWriteSet = tokio::task::JoinSet<Result<(ObjectId, Bytes, Option<Bytes>,
 #[derive(Clone, Copy)]
 struct KeepWriteCtx {
     project: i64,
-    gce: i64,
     at_once: usize,
     already_held: bool,
 }
@@ -830,7 +827,6 @@ impl Objects {
             raw_cache,
             packs: crate::pack::Packs::new(db),
             receipt_key: None,
-            gc_epochs: Default::default(),
             writes: Default::default(),
             written_bytes: Default::default(),
             reads: Default::default(),
@@ -857,23 +853,6 @@ impl Objects {
         self.layout
     }
 
-    pub fn gc_epoch(&self, project: i64) -> i64 {
-        self.gc_epochs.read().unwrap().get(&project).copied().unwrap_or(0)
-    }
-
-    pub fn set_gc_epoch(&self, project: i64, epoch: i64) {
-        if self.gc_epoch(project) == epoch {
-            return;
-        }
-        let changed = {
-            let mut g = self.gc_epochs.write().unwrap();
-            g.insert(project, epoch) != Some(epoch)
-        };
-        if changed {
-            self.packs.invalidate_project(project);
-        }
-    }
-
     /// The server's bound on pack indexes held outside the lookup maps.
     pub fn index_bound(&self) -> &crate::pack::Bound {
         self.packs.bound()
@@ -889,21 +868,15 @@ impl Objects {
         let mut h = blake3::Hasher::new();
         h.update(b"tree");
         h.update(&project.to_le_bytes());
-        h.update(&self.gc_epoch(project).to_le_bytes());
-        h.update(&id.0);
-        ObjectId(*h.finalize().as_bytes())
-    }
-
-    fn cache_key_at(project: i64, gc_epoch: i64, id: &ObjectId) -> ObjectId {
-        let mut h = blake3::Hasher::new();
-        h.update(&project.to_le_bytes());
-        h.update(&gc_epoch.to_le_bytes());
         h.update(&id.0);
         ObjectId(*h.finalize().as_bytes())
     }
 
     fn cache_key(&self, project: i64, id: &ObjectId) -> ObjectId {
-        Self::cache_key_at(project, self.gc_epoch(project), id)
+        let mut h = blake3::Hasher::new();
+        h.update(&project.to_le_bytes());
+        h.update(&id.0);
+        ObjectId(*h.finalize().as_bytes())
     }
 
     /// Key of object `id` of staged pack `name` of `project`, in the object
@@ -1331,7 +1304,6 @@ impl Objects {
 
         let cx = KeepWriteCtx {
             project,
-            gce: self.gc_epoch(project),
             at_once: self.store.writes_at_once().max(1),
             already_held: opts.already_held,
         };
@@ -1367,7 +1339,7 @@ impl Objects {
             let read_whole = sp.size <= WHOLE_CONTAINER_MAX
                 && (uncached.len() == sp.objects || (uncached.len() > 1 && uncached_bytes.saturating_mul(2) >= sp.size));
             if read_whole {
-                self.drain_keep_writes(project, cx.gce, &mut set).await?;
+                self.drain_keep_writes(project, &mut set).await?;
                 let run_held = if !opts.already_held {
                     Some(ReadAhead::wait(sp.size).await)
                 } else {
@@ -1445,7 +1417,7 @@ impl Objects {
             }
         }
 
-        self.drain_keep_writes(project, cx.gce, &mut set).await
+        self.drain_keep_writes(project, &mut set).await
     }
 
     async fn keep_uncached_entries(
@@ -1465,7 +1437,7 @@ impl Objects {
         for (idx, &(id, s)) in entries.iter().enumerate() {
             if loaded.is_none() {
                 let span = end - s.offset + 1;
-                self.drain_keep_writes(cx.project, cx.gce, set).await?;
+                self.drain_keep_writes(cx.project, set).await?;
                 run_held = if !cx.already_held {
                     Some(ReadAhead::wait(span).await)
                 } else {
@@ -1515,7 +1487,7 @@ impl Objects {
                 // hold zero permits before `ReadAhead::wait` so requests never
                 // deadlock.
                 loaded = None;
-                self.drain_keep_writes(cx.project, cx.gce, set).await?;
+                self.drain_keep_writes(cx.project, set).await?;
                 run_held = None;
                 let enc_cost = enc.len() as u64;
                 Some(ReadAhead::wait(enc_cost.saturating_add(need)).await)
@@ -1535,7 +1507,7 @@ impl Objects {
             self.enqueue_keep_write(cx, run_held.is_some(), set, id, enc, raw_small).await?;
         }
         drop(loaded);
-        self.drain_keep_writes(cx.project, cx.gce, set).await
+        self.drain_keep_writes(cx.project, set).await
     }
 
     async fn enqueue_keep_write(
@@ -1548,7 +1520,7 @@ impl Objects {
         raw_small: Option<Bytes>,
     ) -> std::result::Result<(), KeepError> {
         while set.len() >= cx.at_once {
-            self.join_one_keep_write(cx.project, cx.gce, set).await?;
+            self.join_one_keep_write(cx.project, set).await?;
         }
         let cost = enc.len() as u64;
         let permit = if covered_by_run {
@@ -1561,7 +1533,7 @@ impl Objects {
                     break Some(p);
                 }
                 if !set.is_empty() {
-                    self.join_one_keep_write(cx.project, cx.gce, set).await?;
+                    self.join_one_keep_write(cx.project, set).await?;
                 } else {
                     break None;
                 }
@@ -1582,12 +1554,11 @@ impl Objects {
     async fn join_one_keep_write(
         &self,
         project: i64,
-        gce: i64,
         set: &mut KeepWriteSet,
     ) -> std::result::Result<(), KeepError> {
         let Some(done) = set.join_next().await else { return Ok(()) };
         let (id, enc, raw_small, _permit) = done.map_err(|e| KeepError::Store(e.into()))?.map_err(KeepError::Store)?;
-        let ck = Self::cache_key_at(project, gce, &id);
+        let ck = self.cache_key(project, &id);
         self.cache.insert(ck, enc.clone(), enc.len());
         if let Some(raw) = raw_small {
             self.raw_cache.insert(ck, raw.clone(), raw.len());
@@ -1598,11 +1569,10 @@ impl Objects {
     async fn drain_keep_writes(
         &self,
         project: i64,
-        gce: i64,
         set: &mut KeepWriteSet,
     ) -> std::result::Result<(), KeepError> {
         while !set.is_empty() {
-            self.join_one_keep_write(project, gce, set).await?;
+            self.join_one_keep_write(project, set).await?;
         }
         Ok(())
     }
@@ -1716,11 +1686,10 @@ impl Objects {
     /// [`DECODED_IN_FLIGHT`] (shares taken without waiting: without one,
     /// nothing is read ahead).
     pub async fn prefetch(&self, project: i64, ids: &[ObjectId]) {
-        let gce = self.gc_epoch(project);
         let mut by_pack: std::collections::HashMap<Arc<str>, Run> = Default::default();
         let mut seen = std::collections::HashSet::new();
         for id in ids {
-            if !seen.insert(*id) || self.cache.get(&Self::cache_key_at(project, gce, id)).is_some() {
+            if !seen.insert(*id) || self.cache.get(&self.cache_key(project, id)).is_some() {
                 continue;
             }
             if let Found::At(n, s) = self.packs.find(project, id) {
@@ -1786,7 +1755,7 @@ impl Objects {
                 let Some(_decoding) = ReadAhead::try_take(declared) else { continue };
                 let enc = Bytes::copy_from_slice(enc);
                 if decoded(&id, &enc).is_ok() {
-                    self.cache.insert(Self::cache_key_at(project, gce, &id), enc.clone(), enc.len());
+                    self.cache.insert(self.cache_key(project, &id), enc.clone(), enc.len());
                 }
             }
         }
@@ -1845,7 +1814,6 @@ impl Objects {
     /// staged-index cache's if that holds it, else read when a lookup needs
     /// it.
     pub fn listed(&self, project: i64, packs: Vec<(Arc<str>, Option<Arc<Index>>)>) {
-        let gce = self.gc_epoch(project);
         let packs: Vec<(Arc<str>, Option<Arc<Index>>)> = packs
             .into_iter()
             .map(|(name, index)| {
@@ -1856,7 +1824,7 @@ impl Objects {
         for (name, index) in &packs {
             for (id, _) in index.iter().flat_map(|i| i.iter()) {
                 if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
-                    self.cache.insert(Self::cache_key_at(project, gce, id), enc.clone(), enc.len());
+                    self.cache.insert(self.cache_key(project, id), enc.clone(), enc.len());
                 }
             }
         }

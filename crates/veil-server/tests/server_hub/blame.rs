@@ -3549,8 +3549,6 @@ enum BlameFault {
     Internal,
     Missing,
     StoreBusy,
-    GcEpochOnce,
-    GcEpochAlways,
 }
 
 struct FaultBlobStore {
@@ -3573,14 +3571,7 @@ impl FaultBlobStore {
             self.entered.notify_one();
             self.release.notified().await;
         }
-        let m = {
-            let mut g = self.mode.lock().unwrap();
-            let cur = *g;
-            if matches!(cur, BlameFault::GcEpochOnce) {
-                *g = BlameFault::Pass;
-            }
-            cur
-        };
+        let m = *self.mode.lock().unwrap();
         match m {
             BlameFault::Pass => Ok(false),
             BlameFault::Missing => {
@@ -3594,10 +3585,6 @@ impl FaultBlobStore {
             BlameFault::StoreBusy => {
                 self.faulted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(veil_server::store::StoreUnavailable::new("S3 GET answered HTTP 503 12 times (CANARY-STORE-2680)").into())
-            }
-            BlameFault::GcEpochOnce | BlameFault::GcEpochAlways => {
-                self.faulted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err(anyhow::Error::new(veil_server::pack_gc::GcEpochChanged))
             }
         }
     }
@@ -3799,12 +3786,10 @@ fn bug_2680_a_blame_jobs_internal_error_answers_internal_error_without_detail() 
     assert!(!body.contains(&tip2.short()), "missing stored snapshot in fill leaked short id: {body}");
 }
 
-/// BUG-2680: a busy object store (`StoreUnavailable`) or a GC epoch change
-/// (`GcEpochChanged`) during a blame job (or viewer-graph fill) answers
-/// `503 busy` (retryable where `error.rs` marks `Retryable`), never `500`.
+/// BUG-2680: a busy object store (`StoreUnavailable`) during a blame job
+/// (or viewer-graph fill) answers `503 busy`, never `500`.
 #[test]
-fn bug_2680_a_busy_store_or_gc_epoch_change_in_a_blame_job_answers_busy_retryable() {
-    use axum::response::IntoResponse;
+fn bug_2680_a_busy_store_in_a_blame_job_answers_busy_retryable() {
     use std::sync::{atomic::Ordering::SeqCst, Arc};
     use tower::ServiceExt;
 
@@ -3852,51 +3837,7 @@ fn bug_2680_a_busy_store_or_gc_epoch_change_in_a_blame_job_answers_busy_retryabl
     assert!(!body.contains("CANARY-STORE-2680") && !body.contains("S3 GET"), "store detail leaked: {body}");
     assert_eq!(hub.query.jobs.started.load(SeqCst), 1, "one blame job ran for StoreUnavailable");
 
-    // 2. GC epoch change (`GcEpochChanged`) during the blame job:
-    //    (a) single-attempt response is `503 busy` with the `Retryable` extension set;
-    *store.mode.lock().unwrap() = BlameFault::GcEpochAlways;
-    let a = ask(&th, &h, &Viewer::default());
-    let (status, is_retryable, has_retry_after, body) = th.rt.block_on(async {
-        let err = query::blame(
-            &hub,
-            &a,
-            BlameParams { rev: Some("main".into()), path: "pub/a.txt".into(), ..Default::default() },
-            Limits::default(),
-        )
-        .await
-        .expect_err("GcEpochChanged must fail the attempt");
-        assert!(veil_server::pack_gc::is_gc_epoch_changed(&err), "GcEpochChanged from blame job must keep its kind: {err:?}");
-        let resp = err.into_response();
-        let status = resp.status();
-        let is_retryable = resp.extensions().get::<veil_server::db::Retryable>().is_some();
-        let has_retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).is_some();
-        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
-        (status, is_retryable, has_retry_after, body)
-    });
-    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "GcEpochChanged in blame job: {body}");
-    assert!(is_retryable, "GcEpochChanged in blame job must mark response Retryable: {body}");
-    assert!(has_retry_after, "GcEpochChanged must include Retry-After header: {body}");
-    let json: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["code"], "busy", "{body}");
-    assert!(json["retry_after_ms"].as_u64().is_some_and(|ms| ms >= 500), "{body}");
-    assert_eq!(hub.query.jobs.started.load(SeqCst), 2, "second blame job ran for GcEpochAlways");
-
-    //    (b) through `api::router` (`db::retry_requests`), a transient `GcEpochChanged`
-    //        in the first blame job is automatically retried and succeeds with 200.
-    *store.mode.lock().unwrap() = BlameFault::GcEpochOnce;
-    let (status, body) = th.rt.block_on(async {
-        let req = axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        let status = resp.status();
-        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 16 << 10).await.unwrap().to_vec()).unwrap();
-        (status, body)
-    });
-    assert_eq!(status, axum::http::StatusCode::OK, "transient GcEpochChanged retried by router: {body}");
-    let json: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["line_count"], 2, "{body}");
-    assert_eq!(hub.query.jobs.started.load(SeqCst), 4, "router ran the failed job and the successful retry");
-
-    // 3. Shared viewer-graph fill (`query::graph::ensure_files`) preserves error kind too:
+    // 2. Shared viewer-graph fill (`query::graph::ensure_files`) preserves error kind too:
     //    a new un-warmed commit whose snapshot read hits `StoreUnavailable` answers `503 busy`, not `500`.
     let content2 = b"line one\nline two\nline three\n".to_vec();
     let tip2 = h.commit(&th, &[tip], Files::from([("pub/a.txt".to_string(), content2)]), [9; 16], 1_700_000_001_000, None);

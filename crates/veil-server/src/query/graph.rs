@@ -167,11 +167,10 @@ pub fn too_slow() -> Error {
     )
 }
 
-fn cache_key(project: i64, gc_epoch: i64, vk: &str, id: &ObjectId) -> ObjectId {
+fn cache_key(project: i64, vk: &str, id: &ObjectId) -> ObjectId {
     let mut h = blake3::Hasher::new();
     h.update(b"view-graph");
     h.update(&project.to_le_bytes());
-    h.update(&gc_epoch.to_le_bytes());
     h.update(&(vk.len() as u64).to_le_bytes());
     h.update(vk.as_bytes());
     h.update(&id.0);
@@ -183,7 +182,7 @@ pub fn cached_row(hub: &crate::Hub, project: i64, vk: &str, id: &ObjectId) -> Op
     if *id == root() {
         return Some(Arc::new(VRow::root()));
     }
-    hub.query.rows.get(&cache_key(project, hub.caches.gc_epoch(project), vk, id))
+    hub.query.rows.get(&cache_key(project, vk, id))
 }
 
 /// Reads of one viewer's graph, on a blocking thread.
@@ -230,7 +229,7 @@ impl<'a> G<'a> {
             return Ok(Some(r.clone()));
         }
         let hub = self.cx.hub();
-        let k = cache_key(self.cx.project(), hub.caches.gc_epoch(self.cx.project()), self.vk, id);
+        let k = cache_key(self.cx.project(), self.vk, id);
         if let Some(r) = hub.query.rows.get(&k) {
             self.local.borrow_mut().insert(*id, r.clone());
             return Ok(Some(r));
@@ -271,7 +270,7 @@ impl<'a> G<'a> {
             return Some(r.generation);
         }
         let hub = self.cx.hub();
-        let k = cache_key(self.cx.project(), hub.caches.gc_epoch(self.cx.project()), self.vk, id);
+        let k = cache_key(self.cx.project(), self.vk, id);
         if let Some(r) = hub.query.rows.get(&k) {
             let g = r.generation;
             self.local.borrow_mut().insert(*id, r);
@@ -304,8 +303,8 @@ impl<'a> G<'a> {
     /// their file history.
     fn present(&self, ids: &[ObjectId], files: bool) -> Result<HashSet<ObjectId>> {
         let hub = self.cx.hub();
-        let (project, gce) = (self.cx.project(), hub.caches.gc_epoch(self.cx.project()));
-        let held = |i: &ObjectId| *i == root() || (!files && hub.query.rows.get(&cache_key(project, gce, self.vk, i)).is_some());
+        let project = self.cx.project();
+        let held = |i: &ObjectId| *i == root() || (!files && hub.query.rows.get(&cache_key(project, self.vk, i)).is_some());
         let mut out: HashSet<ObjectId> = ids.iter().copied().filter(held).collect();
         let ask: Vec<String> = ids.iter().filter(|i| !out.contains(i)).map(|i| i.hex()).collect();
         if ask.is_empty() {
@@ -1442,7 +1441,6 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             self.fill.clear_stored();
         }
         self.fill.forget_if_large();
-        let gce = hub.caches.gc_epoch(project);
         // File history first: a graph row's `files` mark means its file
         // history is there.
         let marked = self.files;
@@ -1457,7 +1455,7 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             Ok(())
         })?;
         for (i, r, _) in &graph {
-            hub.query.rows.insert(cache_key(project, gce, vk, i), r.clone(), 320);
+            hub.query.rows.insert(cache_key(project, vk, i), r.clone(), 320);
         }
         if let Some(p) = &self.progress {
             p.wrote(graph.len() as u64);
@@ -1690,7 +1688,7 @@ pub(crate) fn cache_prepared_memo(hub: &Hub, project_id: i64, memo: &PreparedMem
         for (id, row, _) in &k.graph {
             hub.query
                 .rows
-                .insert(cache_key(project_id, hub.caches.gc_epoch(project_id), &k.vk, id), row.clone(), 320);
+                .insert(cache_key(project_id, &k.vk, id), row.clone(), 320);
         }
     }
 }
@@ -1976,7 +1974,7 @@ async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[Objec
         };
         // A row this server holds is there; whether its file history is
         // too, only the row's mark says.
-        let cached = p == root() || (!files && hub.query.rows.get(&cache_key(project, hub.caches.gc_epoch(project), vk, &p)).is_some());
+        let cached = p == root() || (!files && hub.query.rows.get(&cache_key(project, vk, &p)).is_some());
         if !cached {
             let found: Option<String> = sqlx::query_scalar(
                 "SELECT snapshot FROM view_graph WHERE project_id = $1 AND view_key = $2 AND snapshot = $3 AND (files IS TRUE OR NOT $4)",

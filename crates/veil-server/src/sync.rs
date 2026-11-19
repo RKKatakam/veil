@@ -784,19 +784,18 @@ pub(crate) struct Deferred {
     made: Vec<ObjectId>,
 }
 
-/// Is `id` committed history of `project` (`snapshots`, keyed by GC epoch)?
+/// Is `id` committed history of `project` (`snapshots`)?
 async fn committed(hub: &Hub, project: i64, id: &ObjectId) -> Result<bool> {
     if hub.caches.committed(project, id) {
         return Ok(true);
     }
-    let gce = hub.caches.gc_epoch(project);
     let stored: Option<String> = sqlx::query_scalar("SELECT id FROM snapshots WHERE project_id = $1 AND id = $2")
         .bind(project)
         .bind(id.hex())
         .fetch_optional(&hub.db)
         .await?;
     if stored.is_some() {
-        hub.caches.put_committed_at(project, gce, id);
+        hub.caches.put_committed(project, id);
     }
     Ok(stored.is_some())
 }
@@ -868,7 +867,6 @@ pub(crate) async fn projected_inner(
                 None => match hub.caches.memo(project.id, &view_key, &x) {
                     Some(p) => Some(p),
                     None => {
-                        let gce = hub.caches.gc_epoch(project.id);
                         let m: Option<(String, bool)> =
                             sqlx::query_as("SELECT projected_id, collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
                                 .bind(project.id)
@@ -880,7 +878,7 @@ pub(crate) async fn projected_inner(
                             .map(|(p, c)| ObjectId::from_hex(&p).map(|p| (p, c)).map_err(|e| Error::Other(e.into())))
                             .transpose()?;
                         if let Some((p, c)) = &m {
-                            hub.caches.put_memo_row_at(project.id, gce, &view_key, &x, p, *c);
+                            hub.caches.put_memo_row(project.id, &view_key, &x, p, *c);
                         }
                         m.map(|(p, _)| p)
                     }
@@ -1173,7 +1171,6 @@ async fn resolve_stored_excluding(
     if *id == root_snapshot_id() || hub.caches.committed(project, id) {
         return Ok(vec![*id]);
     }
-    let gce = hub.caches.gc_epoch(project);
     // Read no more than the answer (BUG-2510): a run hidden from a view is
     // projected to one id, so reading every row with that id to sort them
     // read the whole run. The projections are read only for an id that is
@@ -1249,7 +1246,7 @@ async fn resolve_stored_excluding(
         .await?
     };
     if rows.first().is_some_and(|r| r.1 == 0) {
-        hub.caches.put_committed_at(project, gce, id);
+        hub.caches.put_committed(project, id);
         return Ok(vec![*id]);
     }
     Ok(rows.iter().filter_map(|r| ObjectId::from_hex(&r.0).ok()).collect())
@@ -1429,7 +1426,6 @@ async fn own_projection_excluding(
             }
         }
         if !need_db.is_empty() {
-            let gce = hub.caches.gc_epoch(project.id);
             let need_hex: Vec<String> = need_db.iter().map(ObjectId::hex).collect();
             let stored: Vec<(String, String, bool)> = sqlx::query_as(
                 "SELECT real_id, projected_id, collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3)",
@@ -1441,7 +1437,7 @@ async fn own_projection_excluding(
             .await?;
             for (r_hex, pp_hex, collapsed) in stored {
                 if let (Ok(p0), Ok(pp)) = (ObjectId::from_hex(&r_hex), ObjectId::from_hex(&pp_hex)) {
-                    hub.caches.put_memo_row_at(project.id, gce, key, &p0, &pp, collapsed);
+                    hub.caches.put_memo_row(project.id, key, &p0, &pp, collapsed);
                     p0_proj.insert(p0, pp);
                 }
             }
@@ -1664,7 +1660,6 @@ async fn resolve_for_mode(
     let projected_somewhere = if hub.caches.committed(project.id, id) {
         return Ok(seen(*id).await?.then_some(*id));
     } else {
-        let gce = hub.caches.gc_epoch(project.id);
         let (stored, projected): (bool, bool) = sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2), \
              EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND projected_id = $2)",
@@ -1682,7 +1677,7 @@ async fn resolve_for_mode(
         .fetch_one(&hub.db)
         .await?;
         if stored {
-            hub.caches.put_committed_at(project.id, gce, id);
+            hub.caches.put_committed(project.id, id);
             return Ok(seen(*id).await?.then_some(*id));
         }
         projected
@@ -3567,7 +3562,6 @@ async fn push_staged(
     if req.force && viewer.agent {
         return Err(agent_refusal("an agent session never forces a branch move"));
     }
-    let gc_epoch = crate::pack_gc::push_gc_epoch(hub, project.id, who.epochs.gc).await?;
     if req.updates.len() > MAX_PUSH_UPDATES {
         return Err(Error::bad_request(format!("at most {MAX_PUSH_UPDATES} branch updates per push")));
     }
@@ -4348,7 +4342,6 @@ async fn push_staged(
         let embargo_snaps = embargo_snaps2.clone();
         let tx_packs = tx_packs.clone();
         Box::pin(async move {
-            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             for q in &queued {
                 crate::landing::insert(&mut *c, pid, &who, q).await?;
             }

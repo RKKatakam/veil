@@ -600,7 +600,6 @@ impl Service {
     async fn run(&self, wake: Arc<Notify>) -> Result<()> {
         let mut state = self.load().await?;
         let mut known = Known::default();
-        let mut last_gc_epoch: Option<i64> = None;
         let mut inflight: Option<InFlight> = None;
         let mut idle = Instant::now();
         let mut renewed = Instant::now();
@@ -652,10 +651,6 @@ impl Service {
                 continue;
             }
             idle = Instant::now();
-            let gc_epoch = crate::pack_gc::read_gc_epoch(&self.hub, self.project).await?;
-            if last_gc_epoch.replace(gc_epoch) != Some(gc_epoch) {
-                known = Known::default();
-            }
             // The batch being committed holds its objects; a committed one's
             // are stored (BUG-1107).
             let on = inflight.as_ref().map(|f| f.after.clone()).unwrap_or_else(|| State { made_bytes: 0, ..state.clone() });
@@ -711,7 +706,7 @@ impl Service {
             let seqs = built.rows.iter().map(|r| r.seq).collect();
             let (alone, after) = (built.alone, built.after.clone());
             let s = Arc::new(self.clone_handle());
-            let task = tokio::spawn(async move { s.commit(built, gc_epoch, stored).await });
+            let task = tokio::spawn(async move { s.commit(built, stored).await });
             inflight = Some(InFlight { task, seqs, alone, after });
         }
     }
@@ -775,9 +770,7 @@ impl Service {
             Err(e) => {
                 // Nothing of it committed (the transaction rolled back): the
                 // entries are still queued, built again from the database.
-                if !crate::pack_gc::is_gc_epoch_changed(&e) {
-                    eprintln!("veil-server: a landing batch of project {} failed: {e:?}", self.project);
-                }
+                eprintln!("veil-server: a landing batch of project {} failed: {e:?}", self.project);
                 *state = self.load().await?;
                 // A store that fails is tried again less often: each try
                 // records a pack before it writes it (a row an hour's sweep
@@ -941,15 +934,13 @@ impl Service {
         };
         let epochs: Vec<(i64, i64, i64)> = sqlx::query_as(
             "SELECT project_id, person_id, epoch FROM access_epochs WHERE (project_id = 0 AND person_id = ANY($1)) \
-             OR (project_id = $2 AND person_id IN (0, -1))",
+             OR (project_id = $2 AND person_id = 0)",
         )
         .bind(&people)
         .bind(self.project)
         .fetch_all(&hub.db)
         .await?;
         let project_epoch = epochs.iter().find(|e| e.0 == self.project && e.1 == 0).map_or(0, |e| e.2);
-        let gc_epoch = epochs.iter().find(|e| e.0 == self.project && e.1 == -1).map_or(0, |e| e.2);
-        hub.observe_gc_epoch(self.project, gc_epoch);
         let person_epoch = |p: i64| epochs.iter().find(|e| e.0 == 0 && e.1 == p).map_or(0, |e| e.2);
         if known.epoch != Some(project_epoch) {
             self.enumerate(known).await?;
@@ -976,7 +967,6 @@ impl Service {
                         epochs: Epochs {
                             person: person_epoch(row.person.id),
                             project: Some((self.project, project_epoch)),
-                            gc: Some((self.project, gc_epoch)),
                             embargoes: None,
                         },
                     };
@@ -1230,7 +1220,7 @@ impl Service {
 
     /// Commit the batch (its objects stored already) in one transaction;
     /// then tell the waiters here, spawn merge workers, and emit events.
-    async fn commit(&self, b: Built, gc_epoch: i64, stored: Arc<tokio::sync::Mutex<Storing>>) -> Result<Committed> {
+    async fn commit(&self, b: Built, stored: Arc<tokio::sync::Mutex<Storing>>) -> Result<Committed> {
         let t = Instant::now();
         let hub = &self.hub;
         let moved = b.after.tip != b.old_tip;
@@ -1417,7 +1407,6 @@ impl Service {
             let writers_seen = tx_writers.clone();
             Box::pin(async move {
                 run_asks.store(0, Ordering::Relaxed);
-                crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 // Fencing: only the lease's current holder moves the branch.
                 // (And the entries it has served: what a submit reads the
                 // service's rate from, `limits::pressure`.)
@@ -1845,7 +1834,6 @@ async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> 
     if !missing {
         return Ok(out);
     }
-    let gce = hub.caches.gc_epoch(project);
     let hex: Vec<String> = reals.iter().map(ObjectId::hex).collect();
     let rows: Vec<(String, String, String, bool)> = sqlx::query_as(
         "SELECT view_key, real_id, projected_id, collapsed FROM projections WHERE project_id = $1 AND view_key = ANY($2) AND real_id = ANY($3)",
@@ -1857,7 +1845,7 @@ async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> 
     .await?;
     for (k, r, p, collapsed) in rows {
         if let (Ok(r), Ok(p)) = (ObjectId::from_hex(&r), ObjectId::from_hex(&p)) {
-            hub.caches.put_memo_row_at(project, gce, &k, &r, &p, collapsed);
+            hub.caches.put_memo_row(project, &k, &r, &p, collapsed);
             out.insert((k, r), p);
         }
     }

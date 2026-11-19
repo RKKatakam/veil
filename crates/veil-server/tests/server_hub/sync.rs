@@ -1364,21 +1364,10 @@ fn bug_2671_preexisting_false_collapsed_merge_row_is_repaired() {
     };
 
     // (a) Without `graph` rows (object-store parent fallback) and with the
-    // in-memory memo cache invalidated (`gc_epoch` bumped), non-landing
+    // in-memory memo cache invalidated, non-landing
     // `POST /changes` succeeds and heals the stored rows.
     corrupt_merges(true);
-    let next_ep: i64 = hub
-        .rt
-        .block_on(
-            sqlx::query_scalar(
-                "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 1, 0) \
-                 ON CONFLICT (project_id, person_id) DO UPDATE SET epoch = access_epochs.epoch + 1 RETURNING epoch",
-            )
-            .bind(f.pid)
-            .fetch_one(&h.db),
-        )
-        .unwrap();
-    h.caches.set_gc_epoch(f.pid, next_ep);
+    h.caches.clear_snapshots();
     assert_eq!(false_merge_count(), 3);
     let r_chg = api.post_json(
         Some(&dev_tok),
@@ -1845,15 +1834,7 @@ fn bug_2671_gc_swept_merge_with_missing_first_parent_is_dropped_without_error_or
             .await
             .unwrap();
         }
-        let next_ep: i64 = sqlx::query_scalar(
-            "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 1, 0) \
-             ON CONFLICT (project_id, person_id) DO UPDATE SET epoch = access_epochs.epoch + 1 RETURNING epoch",
-        )
-        .bind(f.pid)
-        .fetch_one(&h.db)
-        .await
-        .unwrap();
-        h.caches.set_gc_epoch(f.pid, next_ep);
+        h.caches.clear_snapshots();
     });
 
     let swept_uncollapsed_count = || -> i64 {

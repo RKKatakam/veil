@@ -159,8 +159,8 @@ fn abandoned_staged_upload_is_swept_without_a_push() {
 /// BUG-2310: an upload a sweep discarded past its staged grace period
 /// (`DEFAULT_STAGED_GRACE_MS`), and whose row it then deleted past the
 /// pack grace period, is never committed by a push that named it before
-/// the sweep: the push is held at its commit transaction (the project's
-/// inert GC epoch row locked) while the sweeps run, as a sweeper does on
+/// the sweep: the push is held at its commit transaction (the branch row
+/// locked) while the sweeps run, as a sweeper does on
 /// a server other than the one with the upload's index in hand. It is
 /// refused with "push again", the branch does not move and no row remains
 /// for the deleted upload.
@@ -172,7 +172,6 @@ fn bug_2310_a_push_never_lists_an_upload_swept_while_it_ran() {
     let api = hub.api();
     push_file(&api, &p, "slow", "src/first.txt");
     let h = hub.hub();
-    hub.rt.block_on(pack_gc::read_gc_epoch(&h, pid)).expect("the epoch row is there");
     let uploads = |hub: &TestHub| -> Vec<(String, i16)> {
         hub.rt
             .block_on(
@@ -184,18 +183,18 @@ fn bug_2310_a_push_never_lists_an_upload_swept_while_it_ran() {
     };
     assert!(uploads(&hub).is_empty(), "no upload is left staged");
     let tip = tip_of(&api, &p.admin.token(), &p.name, "slow");
-    // The project's GC epoch row held: the push waits at its commit
-    // transaction's first statement (`GUARD_SQL`).
+    // The branch row held: the push waits at its commit transaction's
+    // branch UPDATE.
     let mut held = hub.rt.block_on(h.db.begin()).expect("a transaction");
-    let locked: i64 = hub
+    let locked: String = hub
         .rt
         .block_on(
-            sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE")
+            sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'slow' FOR UPDATE")
                 .bind(pid)
                 .fetch_one(&mut *held),
         )
-        .expect("the epoch row is locked");
-    assert!(locked >= 0);
+        .expect("the branch row is locked");
+    assert_eq!(locked, tip.expect("tip").hex());
     std::thread::scope(|s| {
         let pushing = s.spawn(|| {
             let mut c = Craft::new(&api, &p.admin, &p.name, "slow");

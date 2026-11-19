@@ -882,10 +882,10 @@ fn guarantee_9_landing_batch_keeps_loose_and_failed_batch_leaves_only_collectibl
     assert!(hub.rt.block_on(store.exists(&veil_server::store::object_key(pid, &tip1))).unwrap(), "landed tip stored loose under its key");
     assert!(whole_tree_beside(&hub, pid, tip1) >= 6);
 
-    // 2. A landing batch that does not commit: hold the GC epoch row while the batch writes its
-    //    objects, cancel `tickets2[0]` and bump the epoch so attempt 1 rolls back and attempt 2
-    //    lands only `tickets2[1..3]`. Attempt 1's `[0+1, 0+1+2]` trees/snapshots/projections are
-    //    left unreferenced in storage, kept inside the retention window, and collected after it.
+    // 2. A landing batch that does not commit: hold the branch row while the batch writes its
+    //    objects, then cancel `tickets2[0]` so attempt 1 rolls back (`landing_queue` state check)
+    //    and attempt 2 lands only `tickets2[1..3]`. Attempt 1's `[0+1, 0+1+2]` trees/snapshots/projections
+    //    are left unreferenced in storage.
     settle(&hub);
     let base2 = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
     hold_branch(&hub, pid, "main");
@@ -899,10 +899,10 @@ fn guarantee_9_landing_batch_keeps_loose_and_failed_batch_leaves_only_collectibl
     let kept_before = h.objects.objects_kept.load(Relaxed);
 
     let mut switch = hub.rt.block_on(h.db.begin()).unwrap();
-    let epoch: i64 = hub
+    let _locked: String = hub
         .rt
         .block_on(
-            sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE")
+            sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main' FOR UPDATE")
                 .bind(pid)
                 .fetch_one(&mut *switch),
         )
@@ -921,18 +921,13 @@ fn guarantee_9_landing_batch_keeps_loose_and_failed_batch_leaves_only_collectibl
     assert!(!attempt1_written.is_empty(), "failed batch attempt wrote loose objects before committing");
     assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], base2, "nothing landed while tx waited");
 
-    // Cancel `tickets2[0]` and bump GC epoch so attempt 1 aborts and attempt 2 builds a batch without `tickets2[0]`.
+    // Cancel `tickets2[0]` so attempt 1 aborts at its `landing_queue` CAS and attempt 2 builds a batch without `tickets2[0]`.
     hub.rt
         .block_on(async {
             sqlx::query("UPDATE landing_queue SET state = 'cancelled', done_at = $3 WHERE project_id = $1 AND ticket = $2")
                 .bind(pid)
                 .bind(&tickets2[0])
                 .bind(veil_core::now_millis())
-                .execute(&mut *switch)
-                .await?;
-            sqlx::query("UPDATE access_epochs SET epoch = $2 WHERE project_id = $1 AND person_id = -1")
-                .bind(pid)
-                .bind(epoch + 1)
                 .execute(&mut *switch)
                 .await?;
             switch.commit().await
