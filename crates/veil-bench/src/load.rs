@@ -138,6 +138,9 @@ pub enum Mode {
 
 /// The cost gates (`storage-and-cost.md` §9).
 pub const GATE_COMMITS_PER_PUSH: f64 = 1.0;
+/// The share of an offered rate a run must land for its branch to have
+/// held that rate ([`not_graded_gates`], BUG-2370).
+pub const HELD_SHARE: f64 = 0.95;
 /// Database commits per landing through the landing service (phase 4 §7):
 /// the submit's, and its share of its batch's.
 pub const GATE_COMMITS_PER_LANDING: f64 = 1.5;
@@ -1271,7 +1274,10 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
         // maintenance (autovacuum, analyze) takes a few transactions.
         let ops = r["ops"].as_f64().unwrap_or(0.0);
         let over = |c: f64| c * ops > GATE_COMMITS_PER_PUSH * ops * 1.02 + 20.0;
-        if let Some(c) = r["db_push_commits_per_op"].as_f64().filter(|c| over(*c)) {
+        // Read only at a rate the branch holds, as the landing gate above is
+        // read at its rates (BUG-2370): past it the point is printed, not
+        // graded ([`not_graded_gates`]).
+        if let Some(c) = r["db_push_commits_per_op"].as_f64().filter(|c| over(*c) && past_capacity(r).is_none()) {
             out.push(format!("{mode}: {c:.2} database commits per push, the background work's aside (gate: {GATE_COMMITS_PER_PUSH})"));
         }
         let merges = r["branch_merges"].as_f64().unwrap_or(0.0);
@@ -1327,6 +1333,50 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
         }
     }
     out
+}
+
+/// Why run `r` is past what its branch holds, if it is (BUG-2370; the
+/// owner's decision of 2026-11-18). Only where agents share a branch
+/// (`land`, `api`: `main`; in `branches` each agent has a branch of its
+/// own, which holds whatever it is given). A branch lands one change at a
+/// time, so:
+/// - at an offered rate (open loop), it held the rate when the run landed
+///   at least [`HELD_SHARE`] of it;
+/// - at `max` (closed loop: every agent lands again as soon as it is
+///   answered), one agent on a branch is that branch at its limit, and any
+///   more offer it more than it lands.
+///
+/// Past capacity a landing loses the race for its branch many times before
+/// it lands, and each of its pushes that got as far as its transaction
+/// committed one: the retries' cost, which the landing service is there to
+/// spare, not a commit a landing could do without.
+fn past_capacity(r: &serde_json::Value) -> Option<String> {
+    if !matches!(r["mode"].as_str(), Some("land" | "api")) {
+        return None;
+    }
+    if let Some(rate) = r["rate"].as_f64() {
+        let landed = r["ops_per_s"].as_f64()?;
+        return (landed < rate * HELD_SHARE).then(|| format!("{landed:.1} of the {rate} landings a second offered"));
+    }
+    if r["rate"].as_str() == Some("max") {
+        let (clients, projects) = (r["clients"].as_f64()?, r["projects"].as_f64()?);
+        return (clients > projects).then(|| format!("{clients} agents on {projects} branch(es), each landing as fast as it is answered"));
+    }
+    None
+}
+
+/// The gates of run `r` that are printed but not graded: the commits a
+/// landing costs, at a rate its branch does not hold ([`past_capacity`]).
+/// Neither met nor missed.
+pub fn not_graded_gates(r: &serde_json::Value) -> Vec<String> {
+    let mode = r["mode"].as_str().unwrap_or("");
+    match (past_capacity(r), r["db_push_commits_per_op"].as_f64()) {
+        (Some(why), Some(c)) => vec![format!(
+            "{mode}: {c:.2} database commits per push, not graded past capacity ({why}; {} collisions a landing; gate at a held rate: {GATE_COMMITS_PER_PUSH})",
+            r["collisions_per_op"].as_f64().map_or("–".into(), |x| format!("{x:.1}"))
+        )],
+        _ => Vec::new(),
+    }
 }
 
 /// The gates of run `r` that could not be judged: those of a running
@@ -2567,6 +2617,11 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
                     eprintln!("      GATE NOT MEASURED: {m}");
                 }
                 r["gates_unmeasured"] = json!(unmeasured);
+                let not_graded = if a.flood > 0 { Vec::new() } else { not_graded_gates(&r) };
+                for m in &not_graded {
+                    eprintln!("      GATE NOT GRADED: {m}");
+                }
+                r["gates_not_graded"] = json!(not_graded);
                 runs.push(r);
             }
         }
@@ -2669,8 +2724,8 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         }
     }
     out.push_str(
-        "\n| Mode | Layout | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | Storage deletes per op | Storage listings per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed | Gates not measured |\n\
-         |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n",
+        "\n| Mode | Layout | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | Storage deletes per op | Storage listings per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates not graded (past capacity) | Gates missed | Gates not measured |\n\
+         |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|\n",
     );
     let pct = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.0} %", v * 100.0)).unwrap_or_else(|| "–".into());
     let kib = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.1}", v / 1024.0)).unwrap_or_else(|| "–".into());
@@ -2679,8 +2734,11 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         // Gates this run could not judge (a running cache's, BUG-1591): a
         // column of their own, so "none missed" is never read as "all met".
         let unmeasured = r["gates_unmeasured"].as_array().map(|m| m.len()).unwrap_or(0);
+        // Gates read only at a rate the branch holds (BUG-2370): the point
+        // is in the row, its commits are not judged.
+        let not_graded = r["gates_not_graded"].as_array().map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} | {} | {} |\n",
             r["mode"].as_str().unwrap_or(""),
             layout_of(r),
             r["projects"],
@@ -2701,6 +2759,7 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             pct(&r["session_hit_share"]),
             pct(&r["permission_hit_share"]),
             pct(&r["tips_hit_share"]),
+            if not_graded == 0 { "none".to_string() } else { format!("**{not_graded}**") },
             if missed == 0 { "none".to_string() } else { format!("**{missed}**") },
             if unmeasured == 0 { "none".to_string() } else { format!("**{unmeasured}**") },
         ));
@@ -2777,6 +2836,74 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-2370 (the owner's decision, 2026-11-18): the commits a landing
+    /// costs are judged only at a rate its branch holds, as the landing gate
+    /// is read at its rates. Past capacity, where a landing loses the race
+    /// for `main` some 40 times and each push that reached its transaction
+    /// committed, the point is reported "not graded", neither met nor
+    /// missed; at a held rate the gate judges as before. The numbers are the
+    /// row's: `scripts/bench-server.sh load`'s `hot` curve (50 agents
+    /// landing on one `main`) and its `api-hot` curve.
+    #[test]
+    fn bug_2370_the_commits_gate_is_read_at_rates_the_branch_holds() {
+        let point = |mode: &str, rate: serde_json::Value, clients: u64, projects: u64, landed: f64, commits: f64, collisions: f64| {
+            json!({"mode": mode, "projects": projects, "clients": clients, "rate": rate, "ops": landed * 15.0, "ops_per_s": landed,
+                   "collisions_per_op": collisions, "db_push_commits_per_op": commits})
+        };
+        // Past capacity: 80 landings a second offered, 47.6 landed, 10.21 commits each.
+        let past = point("land", json!(80.0), 50, 1, 47.6, 10.21, 47.0);
+        assert_eq!(missed_gates(&past, 0.0), Vec::<String>::new());
+        assert_eq!(
+            not_graded_gates(&past),
+            ["land: 10.21 database commits per push, not graded past capacity (47.6 of the 80 landings a second offered; 47.0 collisions a landing; gate at a held rate: 1)"]
+        );
+        // Held: 40 offered, 39.8 landed. One commit a landing passes, three miss.
+        let held = point("land", json!(40.0), 50, 1, 39.8, 1.04, 0.6);
+        assert_eq!(missed_gates(&held, 0.0), Vec::<String>::new());
+        assert_eq!(not_graded_gates(&held), Vec::<String>::new());
+        let held_over = point("land", json!(40.0), 50, 1, 39.8, 3.0, 0.6);
+        assert_eq!(missed_gates(&held_over, 0.0), ["land: 3.00 database commits per push, the background work's aside (gate: 1)"]);
+        assert_eq!(not_graded_gates(&held_over), Vec::<String>::new());
+        // The edge: 95 % of the offer landed is held, less is not.
+        assert_eq!(missed_gates(&point("land", json!(40.0), 50, 1, 38.0, 3.0, 5.0), 0.0).len(), 1);
+        assert_eq!(missed_gates(&point("land", json!(40.0), 50, 1, 37.9, 3.0, 5.0), 0.0), Vec::<String>::new());
+        assert_eq!(not_graded_gates(&point("land", json!(40.0), 50, 1, 37.9, 3.0, 5.0)).len(), 1);
+
+        // As fast as answered (`max`): 50 agents on one `main` are past what it
+        // lands (the API's curve: 19.5 a second, 7.11 commits each).
+        let api_max = point("api", json!("max"), 50, 1, 19.5, 7.11, 40.0);
+        assert_eq!(missed_gates(&api_max, 0.0), Vec::<String>::new());
+        assert_eq!(
+            not_graded_gates(&api_max),
+            ["api: 7.11 database commits per push, not graded past capacity (50 agents on 1 branch(es), each landing as fast as it is answered; 40.0 collisions a landing; gate at a held rate: 1)"]
+        );
+        // One agent on each `main` is each branch at its limit: held, and judged.
+        let alone = |commits: f64| point("land", json!("max"), 100, 100, 280.0, commits, 0.0);
+        assert_eq!(missed_gates(&alone(1.0), 0.0), Vec::<String>::new());
+        assert_eq!(missed_gates(&alone(6.0), 0.0).len(), 1);
+        assert_eq!(not_graded_gates(&alone(6.0)), Vec::<String>::new());
+        // `branches`: each agent has a branch of its own, so it is always
+        // judged, whatever the server keeps up with.
+        let own_branch = point("branches", json!(5000.0), 1000, 1, 250.0, 2.5, 0.0);
+        assert_eq!(missed_gates(&own_branch, 0.0).len(), 1);
+        assert_eq!(not_graded_gates(&own_branch), Vec::<String>::new());
+        // The storage gate beside it is per push at any rate, as it was:
+        // 2 writes a push over 48 pushes passes, 3 a push misses.
+        let mut writes = past.clone();
+        writes["storage_push_writes_per_op"] = json!(96.0);
+        assert_eq!(missed_gates(&writes, 0.0), Vec::<String>::new());
+        writes["storage_push_writes_per_op"] = json!(144.0);
+        assert_eq!(missed_gates(&writes, 0.0).len(), 1);
+
+        // The table: the point's row is there, its commits shown, counted as not graded.
+        let mut row = past.clone();
+        row["gates_missed"] = json!(missed_gates(&row, 0.0));
+        row["gates_not_graded"] = json!(not_graded_gates(&row));
+        let md = markdown(&json!({"runs": [row]})).expect("table");
+        let line = md.lines().find(|l| l.starts_with("| land |") && l.contains("(10.21)")).expect("the point's row, with its commits");
+        assert!(line.ends_with("| **1** | none | none |"), "{line}");
+    }
 
     /// S28's gate: a landing's own storage writes (the deriver's aside), for
     /// pushes and, since it stores what it made as one pack (BUG-1948), for

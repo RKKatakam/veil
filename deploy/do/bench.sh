@@ -2,7 +2,8 @@
 # Run one gate against the deployment and fetch its results (docs/DEPLOY.md
 # §6; the gates themselves are in deploy/gates.sh, shared with the
 # rehearsal). Results land in deploy/results/NAME/<stamp>-<gate>/:
-#   run.txt        the commit, the image tag, the gate's settings, the address
+#   run.txt        the commit, the image tag, the gate's settings, the address, and the
+#                  object layout the servers ran (object_layout=, as each of them reported it)
 #   topology.env   deploy/do/.env's topology, without a single secret
 #   images.txt     the image ids on every machine, the pinned third-party digests
 #   commands.txt   every veil-bench command line, and on which machine
@@ -44,7 +45,6 @@ STEP_LIMIT=${STEP_LIMIT:-3600}
 STAMP=${BENCH_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}
 [[ "$STAMP" =~ ^[0-9A-Za-z-]+$ ]] || { echo "bench: invalid BENCH_STAMP '$STAMP'" >&2; exit 2; }
 OUT=$DO_ROOT/deploy/results/$NAME/$STAMP-$GATE
-[ $APPROVED = 1 ] && mkdir -p "$OUT"
 DRY=$((1 - APPROVED))
 R=/work/results/$STAMP-$GATE
 URL=https://$(front_host private):8443
@@ -119,7 +119,26 @@ db_sql() { # SQL on stdin -> rows, | between columns
 # What runs where, and the record of it.
 HUB_IPS=(); for i in $(seq "$HUBS"); do HUB_IPS+=("$(addr "$(hub_name "$i")")"); done
 DRIVER_IPS=(); for i in $(seq "$DRIVERS"); do DRIVER_IPS+=("$(addr "$NAME-driver$i")"); done
-{ gate_meta "$COMMIT" "$TAG"; echo "args=$*"; } | record run.txt
+# The object layout the gate runs on (docs/HUB.md §13.42), for its record:
+# what every server says it runs (its stats.json), not what the kit asked
+# for. A gate is refused, with nothing written, when a server gives none,
+# the servers differ, or they are not in the layout the kit set
+# (OBJECT_LAYOUT; empty: the server's default, whichever it is).
+if [ $APPROVED = 1 ]; then
+    LAYOUT=
+    for i in $(seq "$HUBS"); do
+        l=$(hub_stats "$i" | layout_of)
+        [ -n "$l" ] || { echo "bench: server $i reports no object layout (its stats.json; is it running? deploy/$KIT/logs.sh): no gate is run without knowing the layout" >&2; exit 2; }
+        [ "$l" = "${LAYOUT:-$l}" ] || { echo "bench: server $i reports object layout '$l', server 1 '$LAYOUT': no gate is run on servers in two layouts (deploy/$KIT/configure.sh --approve starts them all in one)" >&2; exit 2; }
+        LAYOUT=$l
+    done
+    [ -z "$OBJECT_LAYOUT" ] || [ "$LAYOUT" = "$OBJECT_LAYOUT" ] || { echo "bench: the servers report object layout '$LAYOUT', ${ENV_PREFIX}OBJECT_LAYOUT is '$OBJECT_LAYOUT' (deploy/$KIT/configure.sh --approve starts them in it)" >&2; exit 2; }
+    mkdir -p "$OUT"
+else
+    LAYOUT=${OBJECT_LAYOUT:-SERVERS_OBJECT_LAYOUT}   # a placeholder in a dry run
+    echo "would ask every server its object layout (its stats.json) and record it in run.txt" >&2
+fi
+{ gate_meta "$COMMIT" "$TAG"; echo "object_layout=$LAYOUT"; echo "args=$*"; } | record run.txt
 topology | record topology.env
 {
     echo "# built here (deploy/docker/build.sh), shipped by configure.sh: the ids are the images' config digests,"
@@ -158,7 +177,9 @@ minio_restarts() { remote "$(addr "$NAME-minio")" "docker inspect -f '{{.Restart
 
 echo "== $GATE against $URL ($HUBS server(s), $DRIVERS driver(s)), limit ${STEP_LIMIT}s per command"
 rc=0
-run_gate "$GATE" "$@" || rc=$?
+# The tool is told the layout: its json and tables name it, and a server
+# it starts itself (objects, openscion, scale) runs in the deployment's.
+run_gate "$GATE" --object-layout "$LAYOUT" "$@" || rc=$?
 if [ $WATCH_MINIO = 1 ]; then
     R1=$(minio_restarts)
     [ $APPROVED = 1 ] && echo "before=$R0 after=$R1" > "$OUT/minio-restarts.txt"

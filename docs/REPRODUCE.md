@@ -236,12 +236,12 @@ rehearsal: `deploy/compose/results/<stamp>/<gate>/`):
 
 | File | What |
 |---|---|
-| `run.txt` | the gate, the date, `commit=`, `image_tag=`, the address the agents used, the number of servers, every size setting |
+| `run.txt` | the gate, the date, `commit=`, `image_tag=`, the address the agents used, the number of servers, every size setting, and `object_layout=` (the object layout the servers ran, as they reported it) |
 | `topology.env` | the topology from `deploy/do/.env`: names, region, sizes, counts, image references; never a secret (a fixed list of names) |
 | `images.txt` | the image ids built here and the ones each machine runs; the pinned third-party digests |
 | `commands.txt` | every `veil-bench` command line, and the machine it ran on |
 | `<label>.json` | the tool's raw results: one object per curve point under `runs`, with `ops_per_s`, `p50_ms`, `p99_ms`, `errors`, `db_commits_per_op`, `gates_missed`, … |
-| `<label>.md` | the same as a table; `<label>.log` the tool's output (`GATE MISSED:` lines name each missed target) |
+| `<label>.md` | the same as a table; `<label>.log` the tool's output (`GATE MISSED:` lines name each missed target; `GATE NOT GRADED:` a point past the rate its branch holds, whose commits are printed, not judged) |
 | `hub<N>-stats.json`, `hub<N>-docker-stats.log` | each server's request-path counters at the end (the landing service's batches, landings and timings among them: the tool fills its own `landing_*` fields only for a server it starts; `s3_slow_down` and `s3_gave_up`, the object store's `503`/`429` answers and the requests given up after 10 s of retries), and its CPU and memory every 5 s |
 | `minio-docker-stats.log` | the MinIO storage droplet's CPU, memory, network and disk every 5 s: a run bound by the store shows here |
 | `spaces-verdict.md`, `spaces.json` | the `spaces` gate's verdict (`deploy/checks/spaces-verdict.py`): pushes, merges, errors, requests given up, `503` answers, pushes and storage requests a second |

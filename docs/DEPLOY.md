@@ -643,7 +643,7 @@ made them; `docs/REPRODUCE.md` §6 says how to read each file:
 
 | File | What |
 |---|---|
-| `run.txt` | gate, date, `commit=` (the checkout's full id), `image_tag=`, the agents' address, the number of servers, every size setting of `deploy/gates.sh`, extra flags |
+| `run.txt` | gate, date, `commit=` (the checkout's full id), `image_tag=`, the agents' address, the number of servers, every size setting of `deploy/gates.sh`, `object_layout=` (the object layout the servers ran, as each of them reported it before the gate: §12.4), extra flags |
 | `topology.env` | the topology from `deploy/do/.env` without a secret (`lib.sh` `topology`: a fixed list of names, so a new secret can never leak into it) and the pinned image references |
 | `images.txt` | the ids of the images built here, of the ones each server and driver has, the containers running, and the pinned third-party digests |
 | `commands.txt` | every `veil-bench` command line and the machine it ran on |
@@ -1288,6 +1288,20 @@ deploy/gcp/destroy.sh --approve
 deploy/gcp/destroy.sh --check --approve      # repeat until it says "nothing left"
 ```
 
+**The object layout a run used** (`docs/HUB.md` §13.42). The kit gives
+the servers no layout: each runs the server's own default. Every gate's
+`run.txt` states the layout that ran, `object_layout=packs` or
+`object_layout=objects`, and it is the servers' word, not the kit's:
+before a gate `bench.sh` asks each server (the `object_layout` of its
+`stats.json`), and refuses the gate, recording nothing, when a server
+gives none or two servers differ. The same value goes to every
+`veil-bench` command as `--object-layout`, so the tool's json and tables
+name it, and a server the tool starts itself (`objects`, `openscion`,
+`scale`) runs in the deployment's layout. `VEIL_GCP_OBJECT_LAYOUT=packs`
+(or `objects`) in `deploy/gcp/.env` passes that layout to every server
+`configure.sh` starts; a gate is then also refused while the servers
+report another.
+
 ### 12.5 Spot reclaims
 
 `deploy/gcp/bench.sh` watches the Spot VMs around each gate:
@@ -1344,7 +1358,7 @@ all are gone. Glance at Billing > Reports in the console the next day.
 
 ### 12.7 Testing the kit
 
-`bash deploy/gcp/test/test.sh` (85 checks) runs every script against a
+`bash deploy/gcp/test/test.sh` (97 checks) runs every script against a
 fake gcloud (`deploy/gcp/test/fake-gcloud`), a made-up project that
 remembers what was created, stopped and deleted, with fake ssh, scp,
 docker and curl. It checks that the dry runs of the full topology exit 0,
@@ -1361,7 +1375,11 @@ in the certificate, no `spaces.env`; each database machine's data disk;
 Veil's database colocated by default, the hash layout with its tablets,
 PostgreSQL's settings sized on the machine with durability on); the
 `onerepo` gate (one project, 1,000 and 5,000 agents, the database machines
-sampled) and its table on made-up results; the Spot watch (a clean gate valid; a
+sampled) and its table on made-up results; the object layout (no layout
+given to a server unless `VEIL_GCP_OBJECT_LAYOUT` names one; every gate
+recording the layout the servers report and telling the tool; a gate
+refused when a server reports none, the servers differ, or they are not
+in the one set); the Spot watch (a clean gate valid; a
 reclaim during a gate marks it invalid, starts the VM and reruns once; a
 second reclaim fails without a third run; a VM down before a gate is
 started first; a reclaimed storage machine with `all` reconfigures);

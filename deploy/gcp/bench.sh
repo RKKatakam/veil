@@ -113,7 +113,9 @@ rc=0; attempt=1; prev=""; S=$(stamp)
 while :; do
     rc=0; run_once "$S" "$@" || rc=$?
     OUT=$RESULTS/$S-$GATE
-    [ $APPROVED = 0 ] || [ -d "$OUT" ] || { echo "bench: the gate left no results directory ($OUT)" >&2; exit 1; }
+    # No directory: the shared steps refused before the gate and said why
+    # (e.g. the servers' object layout unknown or not the one set).
+    [ $APPROVED = 0 ] || [ -d "$OUT" ] || { echo "bench: $GATE did not run: no results directory ($OUT)" >&2; [ $rc != 0 ] || rc=1; exit $rc; }
     for l in "${NOTES[@]+"${NOTES[@]}"}"; do note "$OUT" "$l"; done; NOTES=()
     [ -z "$prev" ] || note "$OUT" "rerun_of=$prev"
     # Reclaimed during the gate: a preemption operation not seen before it, or a Spot VM down now.

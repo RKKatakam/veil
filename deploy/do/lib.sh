@@ -123,6 +123,9 @@ fi
 run_do() { # doctl arguments...
     if [ $APPROVED = 1 ]; then doctl "$@"; else echo "would run: doctl $*" >&2; fi
 }
+# The servers' object layout: this kit has no setting for it (deploy/gcp
+# has, VEIL_GCP_OBJECT_LAYOUT); its servers run the server's default.
+OBJECT_LAYOUT=
 # ssh, scp, the state file, addresses, the database URL: shared with deploy/gcp.
 . "$DO_ROOT/deploy/kit.sh"
 # The droplets of this topology: role, name, size. The first server keeps

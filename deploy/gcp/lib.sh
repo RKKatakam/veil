@@ -66,6 +66,11 @@ YB_TABLETS=${VEIL_GCP_YB_TABLETS:-1}
 DB_DISK_TYPE=${VEIL_GCP_DB_DISK_TYPE:-pd-ssd}
 DB_DISK_GB=${VEIL_GCP_DB_DISK_GB:-500}
 HOURS=${VEIL_GCP_HOURS:-8}
+# The servers' object layout (docs/HUB.md §13.42). Empty, the default:
+# the server's own default. packs or objects: passed to every server
+# configure.sh starts, as --object-layout. Either way bench.sh records the
+# layout the servers themselves report with every gate (run.txt).
+OBJECT_LAYOUT=${VEIL_GCP_OBJECT_LAYOUT:-}
 # Boot disks (pd-balanced, GB): the servers' and drivers' hold the images,
 # the benchmarks' working trees and the same-machine gates' data.
 DISK_HUB=${VEIL_GCP_DISK_HUB:-200}
@@ -91,6 +96,7 @@ bad() { echo "gcp: $*" >&2; exit 2; }
 [[ "$REGION" =~ ^[a-z]+-[a-z]+[0-9]+$ ]] || bad "invalid VEIL_GCP_REGION '$REGION'"
 [[ "$ZONE" =~ ^${REGION}-[a-z]$ ]] || bad "invalid VEIL_GCP_ZONE '$ZONE' (a zone of $REGION: all machines in one zone)"
 [[ "$SPOT" =~ ^(all|hybrid|none)$ ]] || bad "invalid VEIL_GCP_SPOT '$SPOT' (all, hybrid or none)"
+[[ "$OBJECT_LAYOUT" =~ ^(|packs|objects)$ ]] || bad "invalid VEIL_GCP_OBJECT_LAYOUT '$OBJECT_LAYOUT' (packs or objects; empty: the server's default)"
 for v in SIZE_HUB SIZE_LB SIZE_DRIVER SIZE_DB SIZE_OBJECTS SIZE_CACHE; do
     [[ "${!v}" =~ ^[a-z][a-z0-9]*-[a-z]+-[0-9]+$ ]] || bad "invalid VEIL_GCP_$v '${!v}' (a predefined machine type, as c2d-standard-16)"
 done
