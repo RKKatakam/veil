@@ -1598,7 +1598,7 @@ fn walk_lists_every_operation_after_its_descendants() {
 /// lists `y` (and `a`) before `x` and `z`, which descend from it: `vl undo`
 /// in `x`'s workspace, with `w` another workspace's, would undo `y`.
 #[test]
-#[ignore = "BUG-1432 (a documented residual): on a log written before operation times were clamped, the walk can list an operation before an older descendant reached by a later path"]
+#[ignore = "BUG-1432 (closed, won't fix, owner 2026-11-19: only pre-release logs can hold it): on a log written before operation times were clamped, the walk can list an operation before an older descendant reached by a later path"]
 fn bug_1432_walk_lists_an_operation_after_an_older_descendant_on_another_branch() {
     use veil_core::oplog::{OpStore, Operation};
     let op = |parents: Vec<ObjectId>, timestamp: i64, description: &str| Operation {
