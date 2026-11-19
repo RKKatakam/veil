@@ -441,6 +441,7 @@ fn bug_1157_a_push_that_lost_a_race_leaves_no_copy_of_its_upload() {
     assert_eq!(state, Some(0), "the upload is recorded, staged");
     // Every pack in storage has a row (whatever the storage: S3 or a
     // directory).
+    assert!(!packs_in_store(&hub, pid).is_empty(), "the project has packs in storage");
     assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "packs in storage with no row");
     // The same objects, landed on the tip: one more try, which lands.
     let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
@@ -668,8 +669,10 @@ fn packs_in_store(hub: &TestHub, project: i64) -> Vec<String> {
 fn packs_without_rows(hub: &TestHub, project: i64) -> Vec<String> {
     let rows: Vec<String> =
         hub.rt.block_on(sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1").bind(project).fetch_all(&hub.hub().db)).unwrap();
+    // No packs at all is a correct answer in the objects layout (a landed
+    // push's upload container is unpacked and deleted): callers that need
+    // packs to exist assert it with `packs_in_store` where they must.
     let in_store = packs_in_store(hub, project);
-    assert!(!in_store.is_empty(), "the project has packs in storage");
     in_store.into_iter().filter(|n| !rows.contains(n)).collect()
 }
 
@@ -776,6 +779,10 @@ fn every_pack_in_storage_has_a_row_after_refusals_races_and_api_commits() {
     bad.file("src/refused.rs", "MARKER-REFUSED-PUSH-2c8d");
     let unknown = { let t = bad.tip; snap(&mut bad, vec![t], "unknown key", Some(&stranger)) };
     let (map, _) = upload_all(&api, &bad);
+    // The listing sees the staged upload (the checks below are not of an
+    // empty listing).
+    assert!(!packs_in_store(&hub, pid).is_empty(), "the upload is staged in storage before the push");
+    assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "a staged upload has its row");
     let r = push_body(&api, &bad.token, &p.name, bad.tip, unknown, &map);
     assert_eq!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "after a refused push");
@@ -1577,6 +1584,7 @@ fn bug_2370_racing_pushes_leave_no_pack_of_their_own_behind() {
     for (n, _) in rows.iter().filter(|(_, st)| *st == 2) {
         assert!(!hub.rt.block_on(h.objects.blob_store().exists(&veil_server::pack::key(pid, n))).unwrap(), "discarded pack {n} is still stored");
     }
+    assert!(!packs_in_store(&hub, pid).is_empty(), "the project has packs in storage");
     assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "packs in storage with no row");
     let token = p.dev.token();
     for round in 0..ROUNDS {
@@ -2376,12 +2384,13 @@ fn hostile_bug_2870_cold_peer_large_push_batches_staged_lookups() {
         "updates": [{"branch": "main", "expected": tip.hex(), "new": snap_id.hex()}],
         "packs": [pack],
     });
-    // Time bound: 300 s (~3x the ~101 s debug MinIO run and ~2.4x the ~125 s
-    // full-index baseline, while well below unbatched per-object bisection
-    // which times out past 540 s). Deterministic read bound: 100,104 staged
-    // object reads plus <4,896 index range reads (batched scan uses ~266;
-    // unbatched per-object bisection exceeds 1,000,000).
-    let max_elapsed = std::time::Duration::from_secs(300);
+    // The regression check is the deterministic read bound below: 100,104
+    // staged object reads plus <4,896 index range reads (the batched scan
+    // uses ~266; unbatched per-object bisection exceeds 1,000,000). The time
+    // bound only catches a hang: this push took 101-276 s on the 4090 in a
+    // debug build (the unbatched form passed 540 s) and an ARM test machine is
+    // about twice as slow, so a tight time bound would fail on load alone.
+    let max_elapsed = std::time::Duration::from_secs(1200);
     let started = std::time::Instant::now();
     let r = api2.post_json_within(&token, &format!("/v1/projects/{}/push", p.name), &push_body, max_elapsed);
     let elapsed = started.elapsed();
