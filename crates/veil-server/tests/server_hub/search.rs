@@ -1495,7 +1495,12 @@ fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
         .rt
         .block_on(sqlx::query_scalar("SELECT count(*) FROM packs WHERE project_id = $1 AND state = 1").bind(pid).fetch_one(&writer.hub().db))
         .unwrap();
-    assert!(listed_packs >= 1, "expected history in packs layout, got {listed_packs} listed packs");
+    // Objects is the only written layout (owner, 2026-11-18): the history is
+    // kept as one object per key, never listed as packs. (Written when packs
+    // was the default; what this test checks, the index and cache bounds
+    // after a full clone has warmed the caches, holds either way.)
+    let kept = writer.hub().objects.objects_kept.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(listed_packs == 0 && kept > 0, "expected the history kept as objects: {listed_packs} listed packs, {kept} objects kept");
 
     let main_tip = writer.api().tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"];
     writer.rt.block_on(veil_server::derive::ensure(&writer.hub(), pid, main_tip)).unwrap();
