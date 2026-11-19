@@ -769,7 +769,7 @@ fn bug_2650_mount_guard_limit_fails_closed_without_weakening_protection() {
     // 3. If an already-mounted workspace (`live`) moves onto the 17 MiB sealed snapshot
     // while holding an unrecorded edit, `follow` / `record` refuses before switching
     // the mount's lower layer or recording without the guard, and `vl ws unmount` keeps
-    // it mounted until the oversized file is uncloaked.
+    // it mounted until the oversized file is removed.
     std::fs::write(live_mnt.join("README.md"), "live edit\n").unwrap();
     env.ok("alice", &alice, &["--no-snapshot", "rebase", "-r", "live@", "-d", "main"]);
     assert!(!live_mnt.join("internal/.env.plan").exists(), "mount switched lower to oversize secret");
@@ -779,9 +779,10 @@ fn bug_2650_mount_guard_limit_fails_closed_without_weakening_protection() {
     assert!(unm_err.contains("could not record the mount, so it stays mounted"), "{unm_err}");
     assert!(unm_err.contains("16 MiB limit"), "{unm_err}");
 
-    // Uncloaking the oversized data file on the workspace lets the mount follow, record, and unmount.
-    env.ok("alice", &alice, &["uncloak", "internal/.env.plan"]);
-    env.ok("alice", &alice, &["commit", "-m", "uncloak dump"]);
+    // Removing the oversized sealed file lets the mount follow, record, and unmount. (A
+    // sealed file stays sealed: there is no `vl uncloak`, so the file goes instead.)
+    std::fs::remove_file(alice.join("internal/.env.plan")).unwrap();
+    env.ok("alice", &alice, &["commit", "-m", "drop dump"]);
     env.ok("alice", &alice, &["--no-snapshot", "rebase", "-r", "live@", "-d", "@-"]);
     env.ok("alice", &alice, &["--no-snapshot", "ws", "unmount", "live"]);
     assert_eq!(env.stdout("alice", &alice, &["ws", "cat", "live", "README.md"]), "live edit\n");
