@@ -959,9 +959,22 @@ async fn resolve_at_most_excluding(
     resolve_stored_excluding(hub, project, view_key, id, limit, exclude_embargoes).await
 }
 
-/// [`resolve`] as the database answers it now, for `view_key` alone (BUG-915,
-/// BUG-2634, BUG-2850), in one statement: the first `limit` of it when given
-/// (all when `None`), excluding snapshots in `exclude_embargoes`.
+/// [`resolve`] as the database answers it now, in one statement: the first
+/// `limit` of it when given (all when `None`), excluding snapshots in
+/// `exclude_embargoes` (BUG-915, BUG-2634, BUG-2850, BUG-2880).
+///
+/// Priority:
+/// 0. `id` itself if it is a committed snapshot.
+/// 1. Uncollapsed projections under `view_key` (`projections_own`), newest first.
+/// 2. Collapsed projections under `view_key` (`projections_by_view`), only if
+///    (0) and (1) found nothing.
+/// 3. Projections under any other `view_key` (`projections_by_projected_at`),
+///    newest first, only if (0), (1), and (2) found nothing — so an id from a
+///    caller's prior view after an access change (e.g. `vl pull` / `history`)
+///    or from another view (e.g. `subtree`) still resolves to a real snapshot
+///    that the caller's route then projects through their current view, while
+///    never shadowing `view_key`'s own projection or returning an embargoed
+///    snapshot in `exclude_embargoes`.
 async fn resolve_stored_excluding(
     hub: &Hub,
     project: i64,
@@ -978,12 +991,15 @@ async fn resolve_stored_excluding(
     // projected to one id, so reading every row with that id to sort them
     // read the whole run. The projections are read only for an id that is
     // no committed snapshot (the `NOT EXISTS`, uncorrelated: decided once,
-    // before any of them is read; a committed id stands for itself alone),
-    // for `view_key` alone, preferring the snapshot `id` stands for
+    // before any of them is read; a committed id stands for itself alone):
+    // first for `view_key`, preferring the snapshot `id` stands for
     // (`projections_own`, `NOT collapsed`) over any hidden changes collapsed
     // into it (`projections_by_view`, read only when there is no uncollapsed
-    // row, stopped after `limit`), and excluding snapshots in
-    // `exclude_embargoes` so withheld embargoes never mask a public commit.
+    // row, stopped after `limit`); only when `view_key` has no non-excluded
+    // row at all, falling back across other views (`projections_by_projected_at`,
+    // newest first, stopped after `limit`: BUG-2880). Every branch excludes
+    // snapshots in `exclude_embargoes` so withheld embargoes never mask a
+    // public commit or leak via another view's projection.
     let rows: Vec<(String, i32, i64)> = if exclude_embargoes.is_empty() {
         sqlx::query_as(
             "SELECT id, 0, 0::BIGINT FROM snapshots WHERE project_id = $1 AND id = $2 \
@@ -996,6 +1012,11 @@ async fn resolve_stored_excluding(
                AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
                AND NOT EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 AND NOT collapsed) \
              LIMIT $4) \
+             UNION ALL (SELECT real_id, 3, created_at FROM projections \
+             WHERE project_id = $1 AND projected_id = $2 \
+               AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
+               AND NOT EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND view_key = $3 AND projected_id = $2) \
+             ORDER BY created_at DESC LIMIT $4) \
              ORDER BY 2, 3 DESC",
         )
         // Planned for its own id (`resolve_for_mode`, BUG-2467).
@@ -1021,6 +1042,13 @@ async fn resolve_stored_excluding(
                AND NOT EXISTS (SELECT 1 FROM projections p2 WHERE p2.project_id = $1 AND p2.view_key = $3 AND p2.projected_id = $2 AND NOT p2.collapsed \
                  AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es2 WHERE es2.project_id = $1 AND es2.snapshot = p2.real_id AND es2.embargo_id = ANY($5))) \
              LIMIT $4) \
+             UNION ALL (SELECT p.real_id, 3, p.created_at FROM projections p \
+             WHERE p.project_id = $1 AND p.projected_id = $2 \
+               AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
+               AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es WHERE es.project_id = $1 AND es.snapshot = p.real_id AND es.embargo_id = ANY($5)) \
+               AND NOT EXISTS (SELECT 1 FROM projections p3 WHERE p3.project_id = $1 AND p3.view_key = $3 AND p3.projected_id = $2 \
+                 AND NOT EXISTS (SELECT 1 FROM embargo_snapshots es3 WHERE es3.project_id = $1 AND es3.snapshot = p3.real_id AND es3.embargo_id = ANY($5))) \
+             ORDER BY p.created_at DESC LIMIT $4) \
              ORDER BY 2, 3 DESC",
         )
         // Planned for its own id (`resolve_for_mode`, BUG-2467).
