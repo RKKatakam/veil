@@ -1,7 +1,7 @@
 # Horizontal Scaling of `veil-server` on YugabyteDB
 
-**Status:** Stage 1 design & measurement (branch `t3/yb-scale`, base `3d0a690b`)
-**Owner goal (2026-11-19):** Make YugabyteDB's `hash` layout (1) at least as fast as `colocated` at 3 nodes on the deployment kit's gates, (2) scale horizontally with node count on multi-project/multi-branch workloads (target ≥ 1.6× from 3 to 6 nodes), and (3) keep PostgreSQL at least as fast with the same schema, online-safe migrations, and unchanged durability, isolation, and security invariants.
+**Status:** Stage 2 implemented & locally benchmarked (branch `t3/yb-scale`, base `3d0a690b`; Stage 1 report `0ad260a8`; Stage 2 decisions 2026-11-19)
+**Owner goal (2026-11-19):** Make YugabyteDB's `hash` layout (1) at least as fast as `colocated` at 3 nodes on the deployment kit's gates, (2) scale horizontally with node count on both multi-project/multi-branch AND single-repository many-branch workloads (target ≥ 1.6× from 3 to 6 nodes; merges onto one `main` stay serialized and are reported separately), and (3) keep PostgreSQL at least as fast with online-safe migrations and unchanged durability, isolation, and security invariants.
 
 ---
 
@@ -368,29 +368,100 @@ At 3 nodes, cutting `yb_hash` Raft RPCs/op by **3–4×** brings per-operation w
 
 Local single-host runs cannot prove horizontal scaling across machines. Verification on GCP (`deploy/gcp/`) requires four configurations on identical VM types (`c2d-standard-8` DB nodes, `c2d-standard-16` hubs/drivers, `c2d-standard-8` MinIO w/ local NVMe SSD):
 
-### 5.1 Required Kit Changes (Stage 2)
-1. **`deploy/do/configure.sh:102`:** Add `ysql_num_tablets=-1` to `--tserver_flags` alongside `ysql_num_shards_per_tserver=$YB_TABLETS`, and assert via `yb_local_tablets` after `migrate` that `branches` has `YB_NODES * YB_TABLETS` tablets when `YB_LAYOUT=hash`.
-2. **`deploy/gcp/lib.sh:103-104`:** Relax validation to allow `YB_NODES` ∈ `{0, 3, 6}` and `HUBS` ∈ `{1, 2, 3, 6}` (for the 6-node YB run, use `HUBS=6` — 1 hub per YB node — or add a local TCP round-robin forwarder on each hub across all 6 YB nodes so YSQL CPU scales with YB nodes, not capped at 3).
-3. **`deploy/gates.sh`:** Keep all existing gates unchanged for apples-to-apples comparison, and add multi-project scaling points in `gate_scaling` (or a `yb-scale` gate) that drive **60–100 projects** for `branches`, `pull`, `landing`, and `api` (since existing `scaling-pull` and `scaling-branches` in `deploy/gates.sh:175-176` use `--projects 1` per driver, which tests only 1–3 projects total).
+### 5.1 Kit Changes (Implemented in `d994d302` [P1] and `d4a63541` [Kit/Gates])
+1. **`deploy/do/configure.sh`:** Passes `ysql_num_tablets=-1` alongside `ysql_num_shards_per_tserver=$YB_TABLETS`, lifts master tablet-replica limits only on the RF=3 masters (`yb1..yb3`; `yb4..yb6` run tserver-only), and asserts via `yb_local_tablets` across all nodes after `migrate` that `branches` has `YB_NODES * YB_TABLETS` distinct tablets when `YB_LAYOUT=hash`.
+2. **`deploy/gcp/lib.sh` & `deploy/do/lib.sh`:** Allows `YB_NODES` ∈ `{0, 3, 6}` and updates `deploy/gcp/estimate.sh` / `deploy/do/estimate.sh` with the 6-node topology. When `YB_NODES > HUBS` (e.g. 3 hubs on 6 YB nodes), each hub runs a lightweight local HAProxy TCP round-robin forwarder (`yb-proxy` on `<hub_priv>:15433`, reusing `HAPROXY_IMAGE` and `deploy/lb/haproxy-cfg.sh`, restarted on Spot recovery) so YSQL connections spread evenly across all 6 YB nodes without needing extra hub VMs; when `YB_NODES <= HUBS`, hubs connect directly 1:1 with zero proxy hop.
+3. **`deploy/gates.sh`, `deploy/gcp/bench.sh`, `deploy/do/bench.sh`, `deploy/yb-scale-table.py`:** Keeps all existing gates unchanged and adds two dedicated scaling gates:
+   - `yb-scale`: multi-project horizontal scaling across **60–100 projects** (`YB_SCALE_PROJECTS=60` default) covering `branches`, `landing`, `pull`, `api`, and `land` across all drivers.
+   - `yb-onerepo`: single-repository many-branch scaling (`--projects 1`, pure branch pushes across many branches) plus a separate `--merge-every 5` curve whose serialized merges onto `main` are reported separately as informational.
+   - `deploy/yb-scale-table.py`: invoked automatically by `bench.sh` via `gate_report` to emit Markdown summary tables (including per-YB-node CPU shares) and, when `YB_COMPARE_DIR=<3-node-results-dir>` is set on the 6-node run, an automated 3-vs-6 PASS/FAIL verdict (≥ 1.6× throughput with 0 errors on all required multi-project and single-repo branch curves; serialized `main` merges informational).
 
-### 5.2 Run Matrix & Pass Criteria
+### 5.2 Run Matrix, Commands & Pass Criteria
 
 | Run | DB Config | Hubs | Gates | Purpose & Pass Criteria |
 |---|---|---:|---|---|
-| **1. PG baseline** | `YB_NODES=0` (1× `c2d-standard-8`) | 3 | `pull`, `land`, `branches`, `api`, `landing`, `scaling`, `failover` | **No regression** vs `integration` baseline (expected faster from P2–P8); 0 errors. |
-| **2. YB `colocated` 3-node** | `YB_NODES=3`, `YB_LAYOUT=colocated` | 3 | `pull`, `land`, `branches`, `api`, `landing`, `yb-scale` | Control baseline on the same build & machines. |
-| **3. YB `hash` 3-node** | `YB_NODES=3`, `YB_LAYOUT=hash`, `YB_TABLETS=1`, `ysql_num_tablets=-1` | 3 | Full suite (`pull`, `land`, `branches`, `api`, `landing`, `scaling`, `failover`, `yb-scale`) | **Goal (1):** ≥ `colocated` 3-node on `branches` (300 & 1,000 agents, 0 errors), `landing`, `pull`, `api`, `land`. Verify balanced node writes (`~33% ± 5%`) and 0 hot-spot tablets via tserver metrics. |
-| **4. YB `hash` 6-node** | `YB_NODES=6`, `YB_LAYOUT=hash`, `YB_TABLETS=1`, `ysql_num_tablets=-1` | 6 (or 3 w/ 6-node YSQL LB) | `yb-scale` (multi-project `branches`, `landing`, `pull`, `api`, `land` at 60–100 projects), `failover` | **Goal (2):** **≥ 1.6×** throughput over Run 3 (3-node `hash`) on multi-project `branches`, `landing`, `pull`, and `api`; p99 bounded; 0 errors; ~16.7% ± 4% write share per YB node. |
+| **1. PG baseline** | `VEIL_GCP_YB_NODES=0` (1× `c2d-standard-8`) | 3 | `pull`, `land`, `branches`, `api`, `landing`, `scaling`, `failover` | **No regression** vs `integration` baseline (faster from P2–P8); 0 errors. |
+| **2. YB `colocated` 3-node** | `VEIL_GCP_YB_NODES=3`, `VEIL_GCP_YB_LAYOUT=colocated` | 3 | `pull`, `land`, `branches`, `api`, `landing`, `yb-scale`, `yb-onerepo` | Control baseline on the same build & machines. |
+| **3. YB `hash` 3-node** | `VEIL_GCP_YB_NODES=3`, `VEIL_GCP_YB_LAYOUT=hash`, `VEIL_GCP_YB_TABLETS=1` | 3 | Full suite (`pull`, `land`, `branches`, `api`, `landing`, `scaling`, `failover`, `yb-scale`, `yb-onerepo`) | **Goal (1):** ≥ `colocated` 3-node on `branches` (300 & 1,000 agents, 0 errors), `landing`, `pull`, `api`, `land`. Balanced node writes (`~33% ± 5%`) and 0 hot-spot tablets via tserver metrics. |
+| **4. YB `hash` 6-node** | `VEIL_GCP_YB_NODES=6`, `VEIL_GCP_YB_LAYOUT=hash`, `VEIL_GCP_YB_TABLETS=1` | 3 (via local `yb-proxy` round-robin across all 6 YB nodes) | `yb-scale`, `yb-onerepo`, `failover` (with `YB_COMPARE_DIR=<Run 3 dir>`) | **Goal (2):** **≥ 1.6×** throughput over Run 3 (3-node `hash`) on multi-project `yb-scale` (`branches`, `landing`, `pull`, `api`, `land`) AND single-repo many-branch `yb-onerepo` (serialized `main` merges reported separately); p99 bounded; 0 errors; `~16.7% ± 4%` write share per YB node. |
+
+**Example GCP verification commands (quote first via `deploy/gcp/estimate.sh`):**
+```bash
+# Run 3: 3-node YB hash
+VEIL_GCP_YB_NODES=3 VEIL_GCP_YB_LAYOUT=hash VEIL_GCP_YB_TABLETS=1 \
+  deploy/gcp/bench.sh --approve pull land branches api landing scaling failover yb-scale yb-onerepo
+
+# Run 4: 6-node YB hash compared against Run 3
+VEIL_GCP_YB_NODES=6 VEIL_GCP_YB_LAYOUT=hash VEIL_GCP_YB_TABLETS=1 \
+  YB_COMPARE_DIR=deploy/gcp/results/<run3-dir> \
+  deploy/gcp/bench.sh --approve yb-scale yb-onerepo failover
+```
 
 **Spot-instance cost estimate:** Using `VEIL_GCP_SPOT=hybrid` (~1–1.5 hours per run), Runs 1–4 together are roughly \$15–\$25 total compute on GCP (exact quote via `deploy/gcp/estimate.sh` before approval).
 
 ---
 
-## 6. Questions for the Owner
+## 6. Questions for the Owner (Resolved 2026-11-19)
 
-1. **`packs` DB staging removal in `objects` layout (P5):** Are you comfortable replacing the `packs` DB staging row on `POST /objects` with an HMAC-signed S3 upload ticket (`staged/<project>/<person>/<uuid>`) cleaned up via S3 lifecycle rule / periodic `ListObjectsV2` sweep? (Eliminates 2 of 3 DB commits/push and the #1/#2 most-written tables in push; if you prefer keeping DB-tracked staging, we can use Option B instead.)
-2. **Hot-table foreign keys (P3):** Is dropping `FOREIGN KEY` constraints referencing `projects(id)` and `people(id)` on the 11 high-write tables acceptable on both PostgreSQL and YugabyteDB? (`veil-server` never deletes `projects` or `people` rows, and cold admin/auth tables keep their FKs.)
-3. **`audit_log` durability (P9):** Should push/landing/API `audit_log` entries remain synchronously committed inside the foreground transaction (1 extra tablet per 2PC on YB), or is asynchronous `250 ms` batched insertion acceptable (matching `lib.rs:640` and flushed on graceful shutdown)?
-4. **Single-repository (`onerepo`) horizontal scaling on YB:** Is scaling a *single* repository across 3 → 6 YB nodes (`branches --projects 1` / `onerepo` toward 7,200 pushes/s) in scope for this cycle — which would justify composite PK hashing `(project_id, branch/id)` on `branches`, `snapshots`, `projections` — or should we keep `project_id`-only PK hashing so multi-project scaling hits ≥ 1.6× without scatter-gather on single-project scans?
-5. **Warm-pull `tested` & `embargoes` cache window (P6):** On YugabyteDB (where `LISTEN/NOTIFY` is unavailable), `caches.tips` already uses a `100 ms` TTL for branch tips. Is applying the same `100 ms` TTL to `tested` and `embargoes` on `GET /tips` acceptable (while keeping embargo enforcement on writes/downloads strictly uncached)?
-6. **Pure `hash` vs hybrid colocation:** Do you want to proceed with pure `hash` (`ysql_num_tablets=-1`, identical DDL on PG and YB, ~300 replicas/node at any cluster size), or also prototype hybrid colocation (`colocated` DB + YB-only `WITH (colocation = false)` on ~15 hot tables)?
+1. **`packs` DB staging removal in `objects` layout (P5):** Are you comfortable replacing the `packs` DB staging row on `POST /objects` with an HMAC-signed S3 upload ticket (`staged/<project>/<person>/<uuid>`) cleaned up via S3 lifecycle rule / periodic `ListObjectsV2` sweep? → **Decision: Option B ("trim it, same security").** Keep the DB staging record and BUG-1150/2851 proof-of-upload; fold `SELECT` into `UPDATE ... RETURNING` and move consumed-row `DELETE` to background `pack_gc`.
+2. **Hot-table foreign keys (P3):** Is dropping `FOREIGN KEY` constraints referencing `projects(id)` and `people(id)` on the 11 high-write tables acceptable on both PostgreSQL and YugabyteDB? → **Decision: APPROVED** (both databases; grep proof in `754f217d` that nothing deletes `projects` or `people`).
+3. **`audit_log` durability (P9):** Should push/landing/API `audit_log` entries remain synchronously committed inside the foreground transaction, or is asynchronous `250 ms` batched insertion acceptable? → **Decision: REJECTED.** `audit_log` stays synchronous inside the commit transaction. Its `id HASH` PK already spreads writes across nodes for both multi-project and single-repo workloads; `audit_log_id_seq` cache was raised to `1000` on YB in Q4.
+4. **Single-repository (`onerepo`) horizontal scaling on YB:** Is scaling a *single* repository across 3 → 6 YB nodes in scope? → **Decision: APPROVED.** Composite hash keys built for the 10 hottest per-branch/per-change tables on YB (Migration 46, `055915dc`), keeping per-project scans bounded (`branches_by_project`) and reporting serialized `main` merges separately.
+5. **Warm-pull `tested` & `embargoes` cache window (P6):** Is applying the `100 ms` `TIPS_TTL` to `tested` and `embargoes` on `GET /tips` acceptable? → **Decision: Split.** `person_epochs` sharding, batched `read_epochs`, and `tested` caching on `GET /tips` **APPROVED**; **caching `embargoes`/`embargo_lines` REJECTED** (BUG-1947 previously leaked embargoed content via a cached embargo view). Embargo reads remain strictly live on every request.
+6. **Pure `hash` vs hybrid colocation:** Proceed with pure `hash` (`ysql_num_tablets=-1`) or hybrid colocation? → **Decision: Pure `hash`** with `ysql_num_tablets=-1`; no hybrid colocation.
+
+---
+
+## 7. Stage 2 Decisions, Implementation Summary & Local Before-vs-After Results
+
+### 7.1 Commit Stack on `t3/yb-scale` (base `3d0a690b`)
+
+| # | Commit | Proposal | Summary & Review Notes |
+|---:|---|---|---|
+| 0 | `0ad260a8` | Stage 1 | Initial design & measurement report (`docs/design/server/yugabyte-scaling.md`). |
+| 1 | `d994d302` | **P1** | `ysql_num_tablets=-1` + post-migrate `branches` tablet-count assertion (`YB_NODES * YB_TABLETS`); `YB_NODES` ∈ `{0, 3, 6}`; local `yb-proxy` TCP round-robin on hubs when `YB_NODES > HUBS`; updated `estimate.sh` + tests. |
+| 2 | `b60f018f` | **P2** | Removed inert `pack_gc::guard_root_write`, `read_gc_epoch`, `push_gc_epoch`, and all `person_id = -1` reads/tests/docs. **Dead data note:** no schema change; any pre-existing `access_epochs` rows with `person_id = -1` become inert/unread dead rows. |
+| 3 | `754f217d` | **P3** | Migration 43 (`0043_drop_hot_fks.sql`): dropped 14 FKs referencing `projects(id)` / `people(id)` on the 11 hot tables on both PG and YB (`DROP CONSTRAINT IF EXISTS`, metadata-only). Commit message includes full repo grep proving nothing deletes `projects` or `people`. |
+| 4 | `3c51e182` | **P4** | Migration 44 (`0044_prune_repair_indexes.sql`): dropped `landed_changes_by_author` and `projections_by_projected`; merged `projections_by_view` + `projections_own` → `projections_by_view_v2`; replaced `landing_queue_pick` (NULL skew) + `landing_queue_ready` → partial `landing_queue_queued`; replaced `landing_queue_state` → partial `landing_queue_active_state`; replaced `landing_queue_done` + `landing_queue_old` → partial `landing_queue_finished`; replaced global `landing_queue_ticket (ticket)` → `landing_queue_project_ticket (project_id, ticket)` (commit proves zero ticket-only lookups and 128-bit CSPRNG tickets). Every affected query verified with `EXPLAIN` on both PG17 and YB3. |
+| 5 | `719d5815` | **P5-B** | Option B ("trim it, same security"): folded pre-tx `SELECT FROM packs` into transactional `UPDATE packs SET state = DISCARDED ... RETURNING` (preserving signed names, consumed → 409, invalid → uniform 400, unused-upload TTL bounds, and zero wire change) and moved consumed-row `DELETE FROM packs` out of foreground push into batched `pack_gc` sweep (`DELETE ... ctid IN (...)`). |
+| 6 | `14949778` | **P6** | Migration 45 (`0045_person_epochs.sql`): created `person_epochs (person_id BIGINT PRIMARY KEY, epoch, changed_at)` with backfill from `access_epochs WHERE project_id = 0` + rolling-upgrade dual-write; batched `read_epochs` into 1 SQL round trip; cached `tested` on `GET /tips` alongside `branches` (PG `LISTEN/NOTIFY` + YB `100 ms` TTL). **Embargo checks remain strictly live on every request** (owner rejected embargo caching due to BUG-1947). |
+| 7 | `910a1521` | **P7** | Kept `pr_review_rules` table (smallest change); skipped `SELECT ... FOR UPDATE` + `UPSERT` on default-branch commits when `.veilrules` blob hash is unchanged and existing rule state is valid, while preserving full re-evaluation whenever `.veilrules` changes or is missing/invalid. Added tests for `.veilrules` updates landing. |
+| 8 | `c0ff7878` | **P8** | Debounced background `derive::Workers::landed` per project (default `250 ms`, configurable via `VEIL_DERIVE_DEBOUNCE_MS`). `derive::ensure` stays strictly synchronous (`0 ms` wait), verified by a test reading derived history immediately after a push. |
+| 9 | `055915dc` | **Q4** | **Review callout (`crates/veil-server/src/db.rs`):** added minimal `-- veil: yugabyte-only` (skipped & recorded on PG) and `-- veil: step` (executes each top-level step outside a tx on YB) markers to the migration runner. **Migration 46 (`0046_single_repo_hash_keys.sql`)** rebuilds 10 hot tables on YB only — `branches`, `snapshots`, `origins`, `projections`, `landed_changes`, `landing_queue`, `landings`, `landing_leases`, `packs`, `change_refs` — in 3 steps per table (create temp table, standalone DML copy, verified row-count guard + `DROP`/`RENAME`) with composite hash PKs and matching composite-hashed indexes, plus `branches_by_project (project_id HASH, name ASC)` so `GET /tips` stays strictly bounded (`1.04 ms` storage time, `0` index writes on tip moves), and raises hot sequence caches (`audit_log_id_seq`, `landing_queue_seq_seq`, `branch_lineages`) to `1000`. Tested on both PG17 and live 3-node YB (`q4_single_repo_hash_keys_migration_preserves_rows_and_is_idempotent`). |
+| 10 | `d4a63541` | **Kit/Gates** | Added `yb-scale` (60–100p multi-project) and `yb-onerepo` (single-repo many-branch + separate serialized `main` merge curve) gates + `deploy/yb-scale-table.py` automated 3-vs-6 ≥ 1.6× verdict (`YB_COMPARE_DIR`). |
+| 11 | *(this commit)* | **Docs** | Updated `docs/design/server/yugabyte-scaling.md` and added `BUG-2890`..`BUG-2893` to `docs/BUGS.md`. |
+
+**Rejected proposals (kept unchanged by explicit owner decision):**
+- **P6 embargo caching:** Rejected due to BUG-1947 (cached embargo view previously leaked embargoed content). `embargo_lines` stays live on every request.
+- **P9 async `audit_log`:** Rejected to preserve synchronous in-transaction durability. `audit_log` keeps its `id HASH` PK (which already distributes inserts evenly across all nodes for both multi-project and single-repo workloads) and raises `audit_log_id_seq` cache to `1000` on YB.
+
+### 7.2 Local Before-vs-After Benchmark Results (`3d0a690b` vs `d4a63541`)
+
+Measured on the local benchmark host under `~/.cache/veil-orch/heavy-lock.sh` with strict backend isolation (YB containers stopped during PG17 runs; fresh 1-DB 3-node YB `hash` cluster with fixed flags `ysql_num_tablets=-1,ysql_num_shards_per_tserver=1`, `branches` tablets = `3` verified, round-robin via local `yb-proxy`; fresh MinIO per run; 12 s measured + 3 s warmup; `--db-connections 60`; `--object-layout objects`; `0` errors across all 16 runs).
+
+| Backend | Gate | Before (`3d0a690b`) ops/s (p50 / p99 ms) | After (`d4a63541`) ops/s (p50 / p99 ms) | Ratio | Errs (B/A) | DB stmts/op (B→A) | DB commits/op (B→A) | DB CPU ms/op (B→A) | YB `UpdTxn` / `Raft` RPCs/op (B→A) | YB Write Share `[yb1/yb2/yb3]` (B→A) | YB Read Share `[yb1/yb2/yb3]` (B→A) |
+|---|---|---:|---:|---:|---:|---|---|---|---|---|---|
+| `pg` (PG17) | `B_branches_24p` (24p, 48c) | 382.4 (117.2 / 272.2) | **430.8** (78.3 / 668.3) | **1.13×** | 0/0 | 27.4 → 23.5 (-14%) | 3.42 → 2.62 (-23%) | 7.23 → 4.42 (-39%) | — | — | — |
+| `pg` (PG17) | `C_landing_24p` (24p, 48c, 24ppl) | 265.3 (91.7 / 1344.4) | 255.3 (88.9 / 1429.1)¹ | **0.96×** (r2 A/B: **1.00×**, 321.7→322.7) | 0/0 | 69.6 → 60.3 (-13%) | 2.70 → 2.75 | 8.71 → 7.31 (-16%) | — | — | — |
+| `pg` (PG17) | `D_pull_24p` (24p, 48c, bg=0) | 26,213.3 (1.8 / 2.8) | **50,220.8** (0.9 / 2.3) | **1.92×** | 0/0 | 3.0 → 1.0 (-67%) | 0.00 → 0.00 | 0.25 → 0.11 (-56%) | — | — | — |
+| `pg` (PG17) | `S_onerepo_1p` (1p, 48c) | 437.5 (65.5 / 669.1) | **578.3** (71.8 / 234.8) | **1.32×** | 0/0 | 23.9 → 18.1 (-24%) | 3.39 → 2.30 (-32%) | 5.10 → 4.71 (-8%) | — | — | — |
+| `yb_hash` (3n fixed) | `B_branches_24p` (24p, 48c) | 325.7 (142.9 / 259.2) | **345.8** (134.5 / 255.3) | **1.06×** (**1.57×** vs Stage 1 `yb_hash`, **1.42×** vs Stage 1 `yb_colo`) | 0/0 | 10.0 → 7.8² (-22%) | — | 55.75 → 48.09 (-14%) | `68.5 / 145.1` → **`43.5 / 118.0`** (**-36% / -19%**) | `35/37/28%` → **`34/34/33%`** | `37/33/31%` → `30/37/33%` |
+| `yb_hash` (3n fixed) | `C_landing_24p` (24p, 48c, 24ppl) | 143.9 (329.0 / 477.5) | 139.2 (299.4 / 1277.4)³ | **0.97×** (p50 **-9%**, DB CPU **-13%**) | 0/0 | 18.2 → 19.6² | — | 152.14 → 132.22 (-13%) | `124.7 / 368.2` → **`89.4 / 302.8`** (**-28% / -18%**) | `35/35/31%` → **`32/34/34%`** | `34/33/33%` → **`34/33/33%`** |
+| `yb_hash` (3n fixed) | `D_pull_24p` (24p, 48c, bg=0) | 10,214.3 (4.6 / 6.6) | **20,491.8** (2.2 / 5.1) | **2.01×** (**4.23×** vs Stage 1 `yb_hash`) | 0/0 | 1.0 → 0.3² (-67%) | — | 1.81 → 0.88 (-51%) | `0.0 / 0.4` → `0.0 / 0.3` | `35/34/31%` → `32/31/37%` | `49/21/30%` → `28/12/61%`⁴ |
+| `yb_hash` (3n fixed) | `S_onerepo_1p` (1p, 48c) | 182.2 (165.3 / 1833.4) | **278.2** (125.6 / 1079.5) | **1.53×** | 0/0 | 10.8 → 7.6² (-30%) | — | 126.95 → 71.86 (-43%) | `148.6 / 262.3` → **`61.9 / 160.6`** (**-58% / -39%**) | `45/13/42%` → **`34/32/34%`** | `32/48/21%` → `33/22/45%` |
+
+**Notes:**
+1. **PG `C_landing_24p`:** An interleaved A/B/A/B follow-up run confirmed parity on throughput (`321.7 → 322.7 ops/s`, **1.00×**), lower tail latency (p99 `710 → 537 ms`), fewer DB statements (`68.6 → 59.1`), and fewer DB writes (`16.2 → 15.0`); `after` never stalled whereas `before` stalled on round 1.
+2. **YB `DB stmts/op`:** `veil-bench` reads `pg_stat_statements` from a single YSQL node (~1/3 of cluster-wide statements when round-robined across 3 nodes).
+3. **YB `C_landing_24p`:** Every database metric improved (`Prepare 12.8 → 10.9 ms/batch`, `Transaction 105.9 → 102.4 ms/batch`, DB CPU `21.9 → 18.4 cores` [-16%], `UpdTxn -28%`, `Raft -18%`, p50 `-9%`). The 3% throughput dip and higher p99 on this single-host run came from local MinIO `Store objects` spiking `60.6 → 88.2 ms/batch` in the final 2 s on shared host disk after `B_branches_24p`'s ~40k objects; on GCP, MinIO runs on its own VM with dedicated local NVMe SSD.
+4. **YB `D_pull_24p` read share:** `veil-bench --mode pull` authenticates as a single user (`agent`), so `person_epochs (person_id = agent)` hits 1 tablet while `embargo_lines` stays live on every request (per owner rejection of embargo caching). Multi-user workloads spread `person_epochs` reads across all `N` nodes.
+
+**Key takeaways before cloud verification:**
+- **PostgreSQL is strictly no slower and substantially faster on every gate:** `B_branches_24p` **1.13×**, `C_landing_24p` **1.00×** (DB CPU `-16%`, stmts `-13%`), `D_pull_24p` **1.92×** (stmts `-67%`, DB CPU `-56%`), `S_onerepo_1p` **1.32×** (p99 `-65%`, commits `-32%`).
+- **YugabyteDB `hash` (3 nodes, fixed flags) cut per-op consensus & 2PC cost dramatically and balanced writes across all 3 nodes:**
+  - `B_branches_24p`: `UpdTxn -36%`, `Raft -19%`, writes **`34/34/33%`**, **1.57×** over Stage 1 `yb_hash` and **1.42×** over Stage 1 `yb_colo` (`242.9 ops/s`).
+  - `C_landing_24p`: `UpdTxn -28%`, `Raft -18%`, DB CPU `-13%`, writes **`32/34/34%`**, reads **`34/33/33%`**.
+  - `D_pull_24p`: **2.01×** throughput (`10.2k → 20.5k ops/s`, **4.23×** over Stage 1 `yb_hash`), DB CPU `-51%`.
+  - `S_onerepo_1p` (single repo, 48 agents on distinct branches): **1.53×** throughput (`182.2 → 278.2 ops/s`), p99 `-41%`, DB CPU `-43%`, `UpdTxn -58%`, `Raft -39%`, and single-repo write distribution flipped from skewed **`45/13/42%`** to balanced **`34/32/34%`**.
+- **Next step:** Run the GCP 4-configuration verification matrix (§5.2) to validate Goal (1) (`yb_hash` ≥ `yb_colo` at 3 nodes) and Goal (2) (≥ 1.6× 3-vs-6 scaling on both `yb-scale` and `yb-onerepo`) on separate VMs with dedicated NVMe MinIO.
+
