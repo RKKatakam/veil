@@ -26,14 +26,14 @@
 --                     + landing_queue_person_slot UNIQUE ((project_id, person_id) HASH, person_slot ASC)
 --                     + landing_queue_session_slot UNIQUE ((project_id, person_id, session) HASH, session_slot ASC)
 --                     + landing_queue_active_state ((project_id, branch) HASH, state ASC)
---                     + landing_queue_finished ((project_id, branch) HASH, done_at ASC)
+--                     + landing_queue_finished (project_id HASH, done_at ASC, branch ASC) WHERE done_at IS NOT NULL
 --   7. landings       PRIMARY KEY ((project_id, branch) HASH, lineage ASC, submitted ASC)
---                     + landings_at ((project_id, branch) HASH, at ASC)
+--                     + landings_at (project_id HASH, at ASC)
 --                     + landings_landed ((project_id, branch) HASH, lineage ASC, landed ASC)
 --   8. landing_leases PRIMARY KEY ((project_id, branch) HASH)
 --   9. packs          PRIMARY KEY ((project_id, name) HASH)
 --                     + packs_listed (project_id HASH, created_at ASC, name ASC) INCLUDE (size, objects)
---                     + packs_unlisted ((project_id, name) HASH) WHERE state <> 1
+--                     + packs_unlisted (project_id HASH) WHERE state <> 1
 --  10. change_refs    PRIMARY KEY ((project_id, change_id) HASH)
 --
 -- audit_log keeps PRIMARY KEY (id) (id HASH on YB, synchronous in-tx per P9)
@@ -410,7 +410,7 @@ BEGIN
       ON landing_queue_q4 ((project_id, branch) HASH, state ASC)
       WHERE state IN ('queued', 'merging');
     CREATE INDEX IF NOT EXISTS landing_queue_q4_finished
-      ON landing_queue_q4 ((project_id, branch) HASH, done_at ASC)
+      ON landing_queue_q4 (project_id HASH, done_at ASC, branch ASC)
       WHERE done_at IS NOT NULL;
   END IF;
 END
@@ -487,7 +487,7 @@ BEGIN
       PRIMARY KEY ((project_id, branch) HASH, lineage ASC, submitted ASC)
     );
     CREATE INDEX IF NOT EXISTS landings_q4_at
-      ON landings_q4 ((project_id, branch) HASH, at ASC);
+      ON landings_q4 (project_id HASH, at ASC);
     CREATE INDEX IF NOT EXISTS landings_q4_landed
       ON landings_q4 ((project_id, branch) HASH, lineage ASC, landed ASC);
   END IF;
@@ -620,7 +620,7 @@ BEGIN
     CREATE INDEX IF NOT EXISTS packs_q4_listed
       ON packs_q4 (project_id HASH, created_at ASC, name ASC) INCLUDE (size, objects) WHERE state = 1;
     CREATE INDEX IF NOT EXISTS packs_q4_unlisted
-      ON packs_q4 ((project_id, name) HASH) WHERE state <> 1;
+      ON packs_q4 (project_id HASH) WHERE state <> 1;
   END IF;
 END
 $q4$;

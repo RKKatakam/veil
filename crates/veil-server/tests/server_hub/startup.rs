@@ -1977,7 +1977,6 @@ fn bug_2924_migration_44_preserves_pre_44_bisect_on_conflict_ticket_during_rolli
 /// `at < $2`) or `pack_gc::sweep_*` (`WHERE project_id = $1 AND state ...`), so
 /// YugabyteDB ignores all three indexes and scans the primary keys across tablets.
 #[test]
-#[ignore = "BUG-2925: migration 0046 composite-hash secondary indexes landing_queue_finished, landings_at, and packs_unlisted are ignored by YugabyteDB for landing retention and pack_gc sweeps"]
 fn bug_2925_migration_46_keeps_sweep_and_retention_indexes_usable_on_yugabytedb() {
     let rt = runtime();
     if !on_yugabyte(&rt) {
