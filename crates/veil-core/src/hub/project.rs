@@ -194,6 +194,17 @@ pub struct Change {
     pub new: Option<TreeEntry>,
 }
 
+/// Membership test for objects uploaded in a push ([`Graft::proving`]).
+pub trait UploadedSet {
+    fn contains_uploaded(&self, id: &ObjectId) -> bool;
+}
+
+impl UploadedSet for HashSet<ObjectId> {
+    fn contains_uploaded(&self, id: &ObjectId) -> bool {
+        self.contains(id)
+    }
+}
+
 /// Rebuilds full trees from trees a viewer pushed.
 pub struct Graft<'a> {
     pub proj: Projector<'a>,
@@ -203,7 +214,7 @@ pub struct Graft<'a> {
     pub changes: Vec<Change>,
     /// Set by [`Graft::proving`]: the objects the pusher uploaded, and the
     /// real root trees of the snapshot's parents.
-    proof: Option<(&'a HashSet<ObjectId>, Vec<ObjectId>)>,
+    proof: Option<(&'a dyn UploadedSet, Vec<ObjectId>)>,
 }
 
 fn refused(path: &str) -> VeilError {
@@ -226,7 +237,7 @@ impl<'a> Graft<'a> {
     /// their real root trees). Any other tree the push names gets
     /// [`VeilError::Missing`], whether the project stores it or not: a push
     /// never confirms a guess of a hidden folder (BUG-824).
-    pub fn proving(mut self, uploaded: &'a HashSet<ObjectId>, parents: Vec<ObjectId>) -> Graft<'a> {
+    pub fn proving(mut self, uploaded: &'a dyn UploadedSet, parents: Vec<ObjectId>) -> Graft<'a> {
         self.proof = Some((uploaded, parents));
         self
     }
@@ -234,7 +245,7 @@ impl<'a> Graft<'a> {
     /// See [`Graft::proving`]: may the pushed tree `id` at `dir` be read?
     fn check_pushed(&mut self, dir: &str, id: &ObjectId, depth: usize) -> Result<()> {
         let Some((uploaded, parents)) = &self.proof else { return Ok(()) };
-        if *id == empty_tree_id() || uploaded.contains(id) || self.proj.created.contains_key(id) {
+        if *id == empty_tree_id() || uploaded.contains_uploaded(id) || self.proj.created.contains_key(id) {
             return Ok(());
         }
         for root in parents.clone() {

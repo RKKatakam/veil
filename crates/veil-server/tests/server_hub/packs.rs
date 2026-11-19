@@ -1991,3 +1991,147 @@ fn bug_1150_push_packs_proof_of_upload(hub: TestHub) {
 fn bug_1150_push_packs_proof_of_upload_in_objects_layout() {
     bug_1150_push_packs_proof_of_upload(TestHub::start_objects());
 }
+
+/// BUG-2851 (review b1a; `t3/bug-1150-push-packs` × `t3/object-layout`):
+/// In `objects` layout, a committing push marks its consumed staged pack `P1`
+/// `DISCARDED (objects = -1)` and synchronously runs `purge_discarded`
+/// (`pack.rs:1691-1725`), deleting `P1`'s blob and `packs` row before returning
+/// `200`. A concurrent or retrying push naming `[P1, P2]` (where `P2` is an
+/// unrelated live sibling upload by the same person) finds no row for `P1` in
+/// `usable_for_packs` (`pack.rs:1476-1518`), classifies `P1` as `invalid`
+/// instead of `consumed`, calls `discard_refused` on live sibling `P2`
+/// (`sync.rs:4663`), and returns non-retryable `400 bad_request` instead of
+/// retryable `409 conflict` (`DISCARDED_UPLOAD`), destroying `P2`.
+#[test]
+fn bug_2851_push_packs_consumed_in_objects_layout_answers_409_and_keeps_sibling_uploads() {
+    let hub = TestHub::start_objects();
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let h = hub.hub();
+    let dev_tok = p.dev.token();
+
+    let mut c1 = Craft::new(&api, &p.dev, &p.name, "main");
+    c1.file("src/first_2851.rs", "MARKER-FIRST-2851\n");
+    let tip1 = c1.tip;
+    let snap1 = snap(&mut c1, vec![tip1], "first commit", None);
+    let up1 = api.upload(&dev_tok, &p.name, &c1.objects);
+    assert_eq!(up1.status, 200, "{}", String::from_utf8_lossy(&up1.body));
+    let p1 = up1.json()["packs"][0].as_str().unwrap().to_string();
+
+    let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
+    c2.file("src/sibling_2851.rs", "MARKER-SIBLING-2851\n");
+    let snap2 = snap(&mut c2, vec![tip1], "sibling commit", None);
+    let up2 = api.upload(&dev_tok, &p.name, &c2.objects);
+    assert_eq!(up2.status, 200, "{}", String::from_utf8_lossy(&up2.body));
+    let p2 = up2.json()["packs"][0].as_str().unwrap().to_string();
+
+    assert!(hub.rt.block_on(h.objects.staged_index(pid, &p1)).unwrap().is_some(), "p1 staged");
+    assert!(hub.rt.block_on(h.objects.staged_index(pid, &p2)).unwrap().is_some(), "p2 staged");
+
+    // Push 1 consumes `p1` (marking `objects = -1` and purging its `packs` row in `objects` layout).
+    let r1 = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "main", "expected": tip1.hex(), "new": snap1.hex()}],
+            "packs": [&p1],
+        }),
+    );
+    assert_eq!(r1.status, 200, "push 1 committing p1: {}", String::from_utf8_lossy(&r1.body));
+    assert_eq!(r1.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r1.body));
+    assert!(hub.rt.block_on(h.objects.staged_index(pid, &p2)).unwrap().is_some(), "sibling p2 still staged after push 1");
+
+    // Push 2 names already-consumed `p1` alongside live sibling `p2`: must
+    // answer retryable `409 conflict` (`DISCARDED_UPLOAD`) and keep `p2` live.
+    let r2 = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "side-2851", "expected": null, "new": snap2.hex()}],
+            "packs": [&p1, &p2],
+        }),
+    );
+    assert_eq!(
+        r2.status,
+        409,
+        "push naming consumed pack in objects layout must answer 409 conflict (not 400): {}",
+        String::from_utf8_lossy(&r2.body)
+    );
+    assert_eq!(r2.json()["code"], "conflict", "{}", String::from_utf8_lossy(&r2.body));
+    assert!(
+        hub.rt.block_on(h.objects.staged_index(pid, &p2)).unwrap().is_some(),
+        "live sibling staged upload p2 must not be discarded when p1 was already consumed"
+    );
+
+    // Retry naming only live sibling `p2` succeeds.
+    let r3 = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "side-2851", "expected": null, "new": snap2.hex()}],
+            "packs": [&p2],
+        }),
+    );
+    assert_eq!(r3.status, 200, "retry with surviving sibling p2: {}", String::from_utf8_lossy(&r3.body));
+    assert_eq!(r3.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r3.body));
+}
+
+/// BUG-2852 (review b1a; regression of BUG-1496 in `t3/bug-1150-push-packs`):
+/// `sync::staging_packs` (`sync.rs:4679-4750`) loads each named staged pack's
+/// full index under `Packs::bound` (`pack::INDEXES_HELD`, 96 MiB), immediately
+/// copies every `(ObjectId, Slot)` into an unbudgeted `Vec` (`StagedSlots`),
+/// drops the `Held` permit (`sync.rs:4686`), duplicates every entry into
+/// `at: HashMap<ObjectId, (Arc<str>, Slot)>` (`sync.rs:4737-4740`), and copies
+/// every key a third time into `uploaded: HashSet<ObjectId>` (`sync.rs:3124`).
+/// Concurrent losing pushes naming two large staged packs therefore bypass
+/// `INDEXES_HELD` and grow server RSS by hundreds of MiB. Hostile size: run alone.
+#[test]
+fn hostile_bug_2852_push_packs_holds_staged_indexes_within_indexes_held_bound() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let token = p.dev.token();
+    let tip = api.tips(Some(&token), &p.name).unwrap().branches["main"];
+    let mut packs = Vec::new();
+    for k in 0..2 {
+        let mut body = Vec::with_capacity(16 << 20);
+        for i in 0..250_000u32 {
+            let raw = O::Blob(format!("{k}.{i}").into_bytes()).encode();
+            let id = ObjectId::hash(&raw);
+            put_frame(&mut body, &id, &raw);
+        }
+        let up = api.upload_encoded_body(&token, &p.name, &body);
+        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body[..up.body.len().min(400)]));
+        let text = std::str::from_utf8(&up.body).unwrap();
+        let marker = "\"packs\":[\"";
+        let at = text.find(marker).expect("packs in upload reply") + marker.len();
+        let pack = text[at..at + text[at..].find('"').unwrap()].to_string();
+        assert_eq!(pack.len(), 32, "valid 32-hex pack name");
+        packs.push(pack);
+    }
+    let wrong = ObjectId::hash(b"not the tip 2852");
+    let body = json!({"updates": [{"branch": "main", "expected": wrong.hex(), "new": tip.hex()}], "packs": packs});
+    let path = format!("/v1/projects/{}/push", p.name);
+    let vm = |field: &str| -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let l = s.lines().find(|l| l.starts_with(field)).unwrap();
+        l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() << 10
+    };
+    std::fs::write("/proc/self/clear_refs", "5").unwrap();
+    let before = vm("VmRSS:");
+    let replies: Vec<Reply> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8).map(|_| s.spawn(|| api.post_json(Some(&token), &path, &body))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for r in &replies {
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["results"][0]["ok"], json!(false), "the push lost its race: {}", String::from_utf8_lossy(&r.body));
+    }
+    let grew = vm("VmHWM:").saturating_sub(before);
+    assert!(
+        grew < 256 << 20,
+        "eight pushes naming two 250k-object staged packs took the server {} MiB past where it was (INDEXES_HELD is 96 MiB)",
+        grew >> 20
+    );
+}

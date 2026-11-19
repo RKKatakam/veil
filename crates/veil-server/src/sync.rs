@@ -37,7 +37,7 @@ use tokio::runtime::Handle;
 use veil_core::{
     hub::{
         access::{AccessPolicy, View},
-        project::{Change, Graft, Node, Projector, TreeSource},
+        project::{Change, Graft, Node, Projector, TreeSource, UploadedSet},
         encoding,
         wire::{put_frame, BranchResult, PushRequest, PushResult, Want, MAX_FRAME_OBJECT},
     },
@@ -113,17 +113,25 @@ pub struct Source {
 /// keeps of its index (BUG-1496): how many objects it holds, its length
 /// and the slots of the objects the receipts name.
 type StagedPack = (Arc<str>, StagedSlots);
+type HeldPack = (Arc<str>, Arc<crate::pack::Held>);
 
-/// What a push's receipts name in staged packs, and the objects the server
-/// made for it (S28). None of it is the project's until the push's
+/// What a push's receipts or named staged packs hold, and the objects the
+/// server made for it (S28). None of it is the project's until the push's
 /// transaction commits: staged objects are read only through this (under
 /// cache keys of their own), so a refused upload is never answered as the
 /// project's, and it is discarded with its pack (BUG-930).
 pub struct Staged {
     /// Each receipted object in a staged pack: the pack and its slot.
+    /// Empty for `PushRequest::packs` pushes, which look up directly in
+    /// `held` (`BUG-2852`).
     at: Arc<HashMap<ObjectId, (Arc<str>, Slot)>>,
-    /// The staged packs: what the push keeps of each index.
+    /// Receipted staged packs: what the push keeps of each index.
     packs: Arc<Vec<StagedPack>>,
+    /// Staged pack indexes held under `Packs::bound` (`pack::INDEXES_HELD`)
+    /// for `PushRequest::packs` pushes (`BUG-1150`, `BUG-2852`): kept alive
+    /// for the duration of the push and binary-searched in place without
+    /// duplicating index entries.
+    held: Arc<Vec<HeldPack>>,
     /// Objects the server made for the push (canonical encodings).
     made: Arc<Mutex<HashMap<ObjectId, Bytes>>>,
     /// Receipted objects whose container was consumed or swept (`BUG-2661`),
@@ -131,6 +139,12 @@ pub struct Staged {
     vanished: Arc<HashSet<ObjectId>>,
     /// The staged objects read through this one: what the checks read.
     touched: Mutex<HashSet<ObjectId>>,
+}
+
+impl UploadedSet for Staged {
+    fn contains_uploaded(&self, id: &ObjectId) -> bool {
+        self.has_staged(id) || self.vanished.contains(id)
+    }
 }
 
 impl Staged {
@@ -143,6 +157,7 @@ impl Staged {
         Arc::new(Staged {
             at: Arc::new(HashMap::new()),
             packs: Arc::new(Vec::new()),
+            held: Arc::new(Vec::new()),
             made: Arc::new(Mutex::new(HashMap::new())),
             vanished: Arc::new(HashSet::new()),
             touched: Mutex::new(HashSet::new()),
@@ -171,6 +186,7 @@ impl Staged {
         Arc::new(Staged {
             at: self.at.clone(),
             packs: self.packs.clone(),
+            held: self.held.clone(),
             made: self.made.clone(),
             vanished: self.vanished.clone(),
             touched: Mutex::new(HashSet::new()),
@@ -181,9 +197,30 @@ impl Staged {
         std::mem::take(&mut *self.touched.lock().unwrap())
     }
 
+    /// The staged pack and slot holding `id`, if uploaded in this push.
+    fn slot_of(&self, id: &ObjectId) -> Option<(&Arc<str>, Slot)> {
+        if let Some((n, s)) = self.at.get(id) {
+            return Some((n, *s));
+        }
+        for (n, h) in self.held.iter() {
+            if let Some(s) = h.index.get(id) {
+                return Some((n, s));
+            }
+        }
+        None
+    }
+
+    fn has_staged(&self, id: &ObjectId) -> bool {
+        self.slot_of(id).is_some()
+    }
+
     /// The staged packs' names.
     fn names(&self) -> Vec<Arc<str>> {
-        self.packs.iter().map(|p| p.0.clone()).collect()
+        self.packs
+            .iter()
+            .map(|p| p.0.clone())
+            .chain(self.held.iter().map(|(n, _)| n.clone()))
+            .collect()
     }
 
     /// A staged or made object's key in [`Hub::trees`]: never the
@@ -195,7 +232,7 @@ impl Staged {
         if self.vanished.contains(id) {
             return Some(crate::store::Objects::staged_key(project, "vanished", id, true));
         }
-        self.at.get(id).map(|(n, _)| crate::store::Objects::staged_key(project, n, id, true))
+        self.slot_of(id).map(|(n, _)| crate::store::Objects::staged_key(project, n, id, true))
     }
 }
 
@@ -217,8 +254,7 @@ impl Source {
     /// whereas client uploads keep `VeilError::Missing` / `VeilError::Corrupt`
     /// for `Error::client_object` (`400 bad_request`: BUG-2681).
     pub(crate) fn is_client_upload(&self, id: &ObjectId) -> bool {
-        self.pending.contains_key(id)
-            || self.staged.as_ref().is_some_and(|st| st.at.contains_key(id) || st.vanished.contains(id))
+        self.pending.contains_key(id) || self.staged.as_ref().is_some_and(|st| st.contains_uploaded(id))
     }
 
     fn stored_missing(id: &ObjectId) -> VeilError {
@@ -245,11 +281,11 @@ impl Source {
             if st.vanished.contains(id) {
                 return Err(staged_gone());
             }
-            if let Some((name, slot)) = st.at.get(id) {
+            if let Some((name, slot)) = st.slot_of(id) {
                 // From its staged pack only, never from the project's store
                 // (BUG-1155: that would answer for what the pusher did not
                 // upload).
-                let got = self.rt.block_on(self.hub.objects.get_staged(self.project, name, *slot, id));
+                let got = self.rt.block_on(self.hub.objects.get_staged(self.project, name, slot, id));
                 let Some((_, raw)) = got.map_err(store_err)? else {
                     return Err(staged_gone());
                 };
@@ -278,7 +314,7 @@ impl Source {
         // A staged or made object from where `raw` reads it; anything else
         // from the store, uncached, as without them.
         if self.staged.as_ref().is_some_and(|st| {
-            st.at.contains_key(id) || st.vanished.contains(id) || st.made.lock().unwrap().contains_key(id)
+            st.contains_uploaded(id) || st.made.lock().unwrap().contains_key(id)
         }) {
             return self.raw(id);
         }
@@ -353,7 +389,7 @@ impl Source {
         };
         if let Some(t) = self.hub.trees.get(&ck) {
             if let Some((st, _)) = &staged {
-                if st.at.contains_key(id) {
+                if st.has_staged(id) {
                     st.touched.lock().unwrap().insert(*id);
                 }
             }
@@ -3001,7 +3037,7 @@ pub(crate) fn complete(
     src: &Source,
     p: &Project,
     viewer: &Viewer,
-    uploaded: &HashSet<ObjectId>,
+    uploaded: &dyn UploadedSet,
     n: &Snapshot,
     rp: &[ObjectId],
     ra: &[ObjectId],
@@ -3069,7 +3105,7 @@ pub(crate) fn complete(
                 before.extend(named_ids(src, &pe)?);
             }
         }
-        let known = |id: &ObjectId| uploaded.contains(id) || before.contains(id);
+        let known = |id: &ObjectId| uploaded.contains_uploaded(id) || before.contains(id);
         if !known(&e.id) {
             return Err(Error::client_object(VeilError::Missing(e.id)));
         }
@@ -3239,9 +3275,8 @@ async fn push_to_its_end(
         drop(staged);
         (st, receipt_names)
     };
-    let uploaded: HashSet<ObjectId> = st.at.keys().chain(st.vanished.iter()).copied().collect();
     let progress = Mutex::new(Progress::default());
-    let r = push_staged(hub, project, viewer, who, req, land_all, wait, uploaded, st, &progress).await;
+    let r = push_staged(hub, project, viewer, who, req, land_all, wait, st, &progress).await;
     let p = progress.into_inner().unwrap();
     match &r {
         Ok((_, _, Some(kept))) => {
@@ -3291,7 +3326,6 @@ async fn push_staged(
     mut req: PushRequest,
     land_all: bool,
     wait: bool,
-    uploaded: HashSet<ObjectId>,
     st: Arc<Staged>,
     progress: &Mutex<Progress>,
 ) -> Result<(PushResult, Vec<veil_core::hub::land::LandResult>, Option<HashSet<Arc<str>>>)> {
@@ -3363,7 +3397,7 @@ async fn push_staged(
             known.insert(id, vec![r]);
             continue;
         }
-        if !uploaded.contains(&id) {
+        if !st.contains_uploaded(&id) {
             return Err(Error::bad_request(format!("snapshot {} was not uploaded", id.short())));
         }
         let s = blocking_staged(hub, project.id, Some(st.clone()), move |src| match src.snapshot(&id) {
@@ -3450,9 +3484,6 @@ async fn push_staged(
     let current = current;
     // How many branches the project has, asked only when the push creates one.
     let mut branch_count: Option<usize> = None;
-    // What this pusher uploaded (BUG-824): a push names nothing else that
-    // is not already where it was in a parent.
-    let uploaded = Arc::new(uploaded);
     // What the walk read of the uploads (the new snapshots).
     let mut touched = st.touched();
     // 2. Complete and check each new snapshot, parents first. BUG-865:
@@ -3494,7 +3525,6 @@ async fn push_staged(
                         hub.clone(),
                         project.clone(),
                         viewer.clone(),
-                        uploaded.clone(),
                         st.child(),
                         n,
                         rp.clone(),
@@ -3542,7 +3572,6 @@ async fn push_staged(
                         hub.clone(),
                         project.clone(),
                         viewer.clone(),
-                        uploaded.clone(),
                         st.child(),
                         n,
                         real_parents.clone(),
@@ -4217,12 +4246,11 @@ async fn push_staged(
                 }
             }
             crate::embargo::record_in_tx(&mut *c, pid, &embargo_upserts, &embargo_snaps).await?;
-            // The packs that hold what this push stored (S28): in `packs`,
-            // turned `LISTED`; in `objects`, upload containers turned
-            // `DISCARDED` (keeping any already `LISTED` pack from an earlier
-            // `packs` server). A row missing or already `DISCARDED` is
-            // excluded by `state <> $14`, returning fewer rows and aborting
-            // with 409 Conflict.
+            // The upload containers that hold what this push stored (S28):
+            // `STAGED` containers turned `DISCARDED` (keeping any already
+            // `LISTED` pack from an earlier `packs` server). A row missing or
+            // not `STAGED`/`LISTED` is excluded by `state IN ($15, $16)`
+            // (`BUG-2860`), returning fewer rows and aborting with 409 Conflict.
             let mut authors: Vec<(String, i64)> = Vec::with_capacity(new_reals.len());
             let mut author_at: HashMap<&str, usize> = HashMap::with_capacity(new_reals.len());
             for (r, author) in &new_reals {
@@ -4246,7 +4274,7 @@ async fn push_staged(
                    SET state = CASE WHEN state = $15 THEN $13 ELSE state END, \
                        discarded_at = CASE WHEN state = $15 THEN $6 ELSE discarded_at END, \
                        objects = CASE WHEN state = $15 THEN -1 ELSE objects END \
-                   WHERE project_id = $1 AND name = ANY($14) AND state <> $13 \
+                   WHERE project_id = $1 AND name = ANY($14) AND state IN ($15, $16) \
                    RETURNING CASE WHEN state = $13 THEN name ELSE '' END AS discarded_name), \
                  s AS (INSERT INTO snapshots (project_id, id, author) SELECT $1, i, a FROM UNNEST($2::text[], $3::bigint[]) AS t(i, a) \
                    ON CONFLICT (project_id, id) DO UPDATE SET author = EXCLUDED.author WHERE snapshots.author = 0), \
@@ -4275,6 +4303,7 @@ async fn push_staged(
             .bind(crate::pack::DISCARDED)
             .bind(&tx_packs)
             .bind(crate::pack::STAGED)
+            .bind(crate::pack::LISTED)
             .fetch_one(&mut *c)
             .await?;
             if updated_packs != tx_packs.len() as i64 {
@@ -4330,6 +4359,7 @@ async fn push_staged(
     } else {
         None
     };
+    drop(st);
     if !embargo_upserts.is_empty() {
         hub.embargo.wake();
     }
@@ -4508,7 +4538,6 @@ async fn complete_one(
     hub: Arc<Hub>,
     project: Project,
     viewer: Viewer,
-    uploaded: Arc<HashSet<ObjectId>>,
     staged: Arc<Staged>,
     n: Arc<Snapshot>,
     rp: Vec<ObjectId>,
@@ -4516,9 +4545,10 @@ async fn complete_one(
     mut rows: PushRows,
 ) -> Result<Checked> {
     let st = staged.clone();
+    let st_check = staged.clone();
     let hub2 = hub.clone();
     let (c, rows) = blocking_staged(&hub, project.id, Some(staged), move |src| {
-        let c = complete(src, &project, &viewer, &uploaded, &n, &rp, &ra, &hub2.identity, &mut rows)?;
+        let c = complete(src, &project, &viewer, &*st_check, &n, &rp, &ra, &hub2.identity, &mut rows)?;
         Ok((c, rows))
     })
     .await?;
@@ -4540,9 +4570,36 @@ async fn keep_uploads(
         let m = st.made.lock().unwrap();
         made.iter().filter_map(|id| Some((*id, m.get(id)?.clone()))).collect()
     };
+    let held_containers: Vec<StagedPack>;
+    let containers: &[StagedPack] = if st.held.is_empty() {
+        &st.packs
+    } else {
+        debug_assert!(st.packs.is_empty(), "a push uses either `packs` or `receipts`, never both");
+        let mut out = Vec::with_capacity(st.held.len());
+        for (name, held) in st.held.iter() {
+            let mut slots = Vec::new();
+            for id in touched {
+                if let Some(slot) = held.index.get(id) {
+                    slots.push((*id, slot));
+                }
+            }
+            if !slots.is_empty() {
+                out.push((
+                    name.clone(),
+                    StagedSlots {
+                        objects: held.index.len(),
+                        size: held.size,
+                        slots,
+                    },
+                ));
+            }
+        }
+        held_containers = out;
+        &held_containers
+    };
     let opts = crate::store::KeepOpts { encode_threads: 1, already_held: false };
     hub.objects
-        .keep(project, &st.packs, touched, made_objects, opts)
+        .keep(project, containers, touched, made_objects, opts)
         .await
         .map_err(|e| match e {
             crate::store::KeepError::Discarded => {
@@ -4675,6 +4732,7 @@ async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<Obj
     Ok(Staged {
         at: Arc::new(at),
         packs: Arc::new(packs),
+        held: Arc::new(Vec::new()),
         made: Default::default(),
         vanished: Arc::new(vanished_ids),
         touched: Mutex::new(HashSet::new()),
@@ -4688,13 +4746,14 @@ async fn staging(hub: &Arc<Hub>, project: i64, person: i64, staged: &HashMap<Obj
 const BAD_PACK_UPLOAD: &str = "an upload this push names is missing or was discarded";
 
 /// Validate and load the staged packs named in `PushRequest::packs`
-/// (BUG-1150). Every name must be syntactically valid, unique in the request,
-/// owned by `person` in `project`, and still `STAGED` or `LISTED` in `packs`.
-/// Only caller-owned packs from `usable` are ever passed to discard or
-/// `release_recent`, so naming someone else's pack can never read or discard
-/// it. Each pack's index is loaded under the server's bound on indexes and
-/// converted immediately into [`crate::pack::StagedSlots`] so the bound share
-/// is released right away.
+/// (`BUG-1150`, `BUG-2851`, `BUG-2852`). Every name must be syntactically
+/// valid, unique in the request, owned by `person` in `project`, and still
+/// `STAGED` or `LISTED` in `packs`. Only caller-owned packs from `usable` are
+/// ever passed to discard or `release_recent`, so naming someone else's pack
+/// can never read or discard it. Each pack's [`crate::pack::Held`] index
+/// stays alive inside [`Staged::held`] under `Packs::bound`
+/// (`pack::INDEXES_HELD`) for the duration of the push and is binary-searched
+/// directly without duplicating entries (`BUG-2852`).
 async fn staging_packs(
     hub: &Arc<Hub>,
     project: i64,
@@ -4726,7 +4785,7 @@ async fn staging_packs(
         hub.objects.release_recent(project, person, &owned);
         return Err(Error::conflict(DISCARDED_UPLOAD));
     }
-    let mut packs: Vec<StagedPack> = Vec::with_capacity(owned.len());
+    let mut held_packs: Vec<HeldPack> = Vec::with_capacity(owned.len());
     let mut set = tokio::task::JoinSet::new();
     let mut it = owned.iter().cloned();
     let mut missing_pack: Option<Arc<str>> = None;
@@ -4736,22 +4795,12 @@ async fn staging_packs(
             let Some(n) = it.next() else { break };
             let h = hub.clone();
             set.spawn(async move {
-                let r = h.objects.staged_index(project, &n).await.map(|opt| {
-                    opt.map(|held| {
-                        let slots = crate::pack::StagedSlots {
-                            objects: held.index.len(),
-                            size: held.size,
-                            slots: held.index.iter().copied().collect(),
-                        };
-                        drop(held);
-                        slots
-                    })
-                });
+                let r = h.objects.staged_index(project, &n).await;
                 (n, r)
             });
         }
         match set.join_next().await {
-            Some(Ok((n, Ok(Some(slots))))) => packs.push((n, slots)),
+            Some(Ok((n, Ok(Some(held))))) => held_packs.push((n, held)),
             Some(Ok((n, Ok(None)))) => {
                 missing_pack = Some(n);
                 break;
@@ -4774,12 +4823,16 @@ async fn staging_packs(
     }
     if let Some(n) = missing_pack {
         set.abort_all();
-        let recheck = hub
+        // `n` was already verified owned by `person` in `project` above:
+        // only a check-refusal discard (`state = DISCARDED, objects >= 0`)
+        // answers `400`; consumption/purge or sweep answers `409` and keeps
+        // live sibling uploads (`BUG-2851`).
+        let rp = hub
             .objects
-            .usable_for_packs(project, person, std::slice::from_ref(&n))
+            .usable_for_receipts(project, person, std::slice::from_ref(&n))
             .await
             .map_err(Error::Other)?;
-        if recheck.consumed.contains(&n) || recheck.usable.contains(&n) {
+        if rp.vanished.contains(&n) || rp.usable.contains(&n) {
             hub.objects.release_recent(project, person, &owned);
             return Err(Error::conflict(DISCARDED_UPLOAD));
         }
@@ -4788,14 +4841,11 @@ async fn staging_packs(
         }
         return Err(Error::bad_request(BAD_PACK_UPLOAD));
     }
-    let at = packs
-        .iter()
-        .flat_map(|(n, sp)| sp.slots.iter().map(move |(id, s)| (*id, (n.clone(), *s))))
-        .collect();
     Ok((
         Staged {
-            at: Arc::new(at),
-            packs: Arc::new(packs),
+            at: Arc::new(HashMap::new()),
+            packs: Arc::new(Vec::new()),
+            held: Arc::new(held_packs),
             made: Default::default(),
             vanished: Arc::new(HashSet::new()),
             touched: Mutex::new(HashSet::new()),

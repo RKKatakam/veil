@@ -610,6 +610,9 @@ pub struct Objects {
     raw_cache: LruCache<Bytes>,
     /// The listed packs of every project, as this server knows them.
     packs: crate::pack::Packs,
+    /// Optional cluster receipt key used to authenticate staged upload pack
+    /// names (`BUG-2851`).
+    receipt_key: Option<[u8; 32]>,
     /// Per-project GC epoch observed from `access_epochs (project_id, -1)`.
     gc_epochs: std::sync::RwLock<std::collections::HashMap<i64, i64>>,
     /// Requests to the store, for the benchmarks' cost gates
@@ -826,6 +829,7 @@ impl Objects {
             cache,
             raw_cache,
             packs: crate::pack::Packs::new(db),
+            receipt_key: None,
             gc_epochs: Default::default(),
             writes: Default::default(),
             written_bytes: Default::default(),
@@ -839,6 +843,13 @@ impl Objects {
             own_writes: Default::default(),
             pack_rows: Default::default(),
         }
+    }
+
+    /// Attach the cluster upload-receipt key so staged upload pack names are
+    /// authenticated to `(project, person)` (`BUG-2851`).
+    pub fn with_receipt_key(mut self, key: [u8; 32]) -> Objects {
+        self.receipt_key = Some(key);
+        self
     }
 
     /// How this server keeps new objects.
@@ -1250,7 +1261,10 @@ impl Objects {
     /// staged before it is written.
     async fn write_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>, record: bool, staged_by: Option<i64>) -> Result<(Arc<str>, Held)> {
         let share = self.packs.bound().take_for(Some(project), Index::write_weight_of(objects.len()) as u64).await?;
-        let name: Arc<str> = crate::pack::new_name().into();
+        let name: Arc<str> = match (staged_by, &self.receipt_key) {
+            (Some(person), Some(key)) => crate::pack::new_staged_name(key, project, person).into(),
+            _ => crate::pack::new_name().into(),
+        };
         if staged_by.is_some() {
             for (id, enc) in &objects {
                 self.cache.insert(Self::staged_key(project, &name, id, false), enc.clone(), enc.len());
@@ -1605,9 +1619,9 @@ impl Objects {
     }
 
     /// Classify pack names supplied directly by `PushRequest::packs` for
-    /// `person` (`BUG-1150`).
+    /// `person` (`BUG-1150`, `BUG-2851`).
     pub async fn usable_for_packs(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<crate::pack::PackCheck> {
-        self.packs.usable_for_packs(project, person, names).await
+        self.packs.usable_for_packs(project, person, names, self.receipt_key.as_ref()).await
     }
 
     /// Claim `names` out of `person`'s `recent` upload list while a request

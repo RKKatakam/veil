@@ -281,7 +281,10 @@ pub async fn start_with_store(config: Config, store_override: Option<Arc<dyn sto
     let cache_budget = veil_core::cache::CacheBudget::new(HUB_CACHE_BYTES);
     let hub = Arc::new(Hub {
         db: db.clone(),
-        objects: Arc::new(store::Objects::with_layout_and_budget(blob, 256 << 20, Some(db.clone()), config.object_layout, Some(&cache_budget))),
+        objects: Arc::new(
+            store::Objects::with_layout_and_budget(blob, 256 << 20, Some(db.clone()), config.object_layout, Some(&cache_budget))
+                .with_receipt_key(receipt_key),
+        ),
         trees: LruCache::with_budget(256 << 20, &cache_budget),
         segments: LruCache::with_budget(SEGMENT_CACHE_BYTES, &cache_budget),
         identity,
