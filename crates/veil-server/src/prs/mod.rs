@@ -1852,25 +1852,21 @@ pub async fn rules_unchanged_in_tx(
     };
     let live_rules = match tip {
         None => Review::default(),
-        Some(t) => match &ctx.default_file {
-            state::RulesFile::Valid(text) => Review::parse(Some(text.as_bytes())),
-            state::RulesFile::Absent => Review::default(),
-            state::RulesFile::Broken(_) => {
-                let row: Option<(String, String)> = sqlx::query_as(
-                    "SELECT checked, state FROM pr_review_rules WHERE project_id = $1",
-                )
-                .bind(project_id)
-                .fetch_optional(&mut *c)
-                .await?;
-                let st = match row {
-                    Some((checked, state_str)) if checked == t.hex() => {
-                        serde_json::from_str(&state_str).unwrap_or(state::RulesState::Strict)
-                    }
-                    _ => state::next_state(&ctx.default_file, None),
-                };
-                state::review_of(&ctx.default_file, &st)
-            }
-        },
+        Some(t) => {
+            let row: Option<(String, String)> = sqlx::query_as(
+                "SELECT checked, state FROM pr_review_rules WHERE project_id = $1",
+            )
+            .bind(project_id)
+            .fetch_optional(&mut *c)
+            .await?;
+            let st = match row {
+                Some((checked, state_str)) if checked == t.hex() => {
+                    serde_json::from_str(&state_str).unwrap_or(state::RulesState::Strict)
+                }
+                _ => state::next_state(&ctx.default_file, None),
+            };
+            state::review_of(&ctx.default_file, &st)
+        }
     };
     Ok(live_rules == ctx.rules)
 }

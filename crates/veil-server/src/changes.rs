@@ -586,7 +586,6 @@ struct Move {
     /// the move brings onto the branch with the change (BUG-1922).
     below: ObjectId,
     keep_on_loss: bool,
-    old_rules_file: Option<crate::prs::state::RulesFile>,
 }
 
 /// The one database commit of a change: its snapshot row, the caller's
@@ -623,13 +622,7 @@ async fn commit(
     let expected_prev = plan.predecessors.first().map(ObjectId::hex);
     // A change onto the tip is a fast-forward from it.
     let rules_landing = match (&built.rules_file, &mv) {
-        (Some(file), Some(m)) => Some(crate::prs::state::Landing {
-            old: Some(m.cur),
-            new: built.real,
-            file: file.clone(),
-            old_file: m.old_rules_file.clone(),
-            fast_forward: true,
-        }),
+        (Some(file), Some(m)) => Some(crate::prs::state::Landing { old: Some(m.cur), new: built.real, file: file.clone(), fast_forward: true }),
         _ => None,
     };
     // The held snapshots the move reaches first: the change's parent, when
@@ -1311,27 +1304,17 @@ pub(crate) async fn create_with(
             }
         }
         // The branch rules: a move of the default branch changes them only
-        // for an admin, judged against its tip (BUG-1102). Also read the old
-        // tip's `.veilrules` so unchanged non-broken commits skip writing
-        // `pr_review_rules` (P7).
-        let (rules_moved, old_rules_file) = match cur {
-            Some(c) if plan.default_branch && rejected.is_none() => {
-                let (tip_entry, old_file) = sync::blocking(hub, project.id, move |src| {
-                    let tree = src.snapshot(&c)?.tree;
-                    let entry = sync::entry_at(src, &tree, crate::landing::rules::RULES_FILE)?;
-                    let file = crate::prs::state::file_at(src, tree)?;
-                    Ok((entry, file))
-                })
-                .await?;
-                let moved = !who.viewer.admin
-                    && match (&built.rules, &tip_entry) {
-                        (None, None) => false,
-                        (Some(a), Some(b)) => !a.same_content(b),
-                        _ => true,
-                    };
-                (moved, Some(old_file))
+        // for an admin, judged against its tip (BUG-1102).
+        let rules_moved = match cur {
+            Some(c) if plan.default_branch && !who.viewer.admin && rejected.is_none() => {
+                let tip = sync::blocking(hub, project.id, move |src| sync::entry_at(src, &src.snapshot(&c)?.tree, crate::landing::rules::RULES_FILE)).await?;
+                match (&built.rules, &tip) {
+                    (None, None) => false,
+                    (Some(a), Some(b)) => !a.same_content(b),
+                    _ => true,
+                }
             }
-            _ => (false, None),
+            _ => false,
         };
         if let (None, Some(o), Some(c), None) = (&land, &onto, cur, &rejected) {
             if crate::bisect::branch_has_reverted_twice(hub, project.id, &o.branch).await? {
@@ -1386,7 +1369,6 @@ pub(crate) async fn create_with(
                     below: parent,
                     // A tip that moves away and back must not keep it trying.
                     keep_on_loss: !rebase || rebased >= MAX_REBASES || attempts > MAX_REBASES,
-                    old_rules_file,
                 }),
             },
             _ => None,

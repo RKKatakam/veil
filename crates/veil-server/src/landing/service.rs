@@ -385,8 +385,6 @@ struct Built {
     accept: Option<String>,
     /// The default branch's `.veilrules` at the new tip (S21).
     rules_file: Option<crate::prs::state::RulesFile>,
-    /// The default branch's `.veilrules` at `old_tip` before this batch (P7).
-    old_rules_file: Option<crate::prs::state::RulesFile>,
     review_guard: Option<BatchReviewGuard>,
     /// The entries answered `conflict`, by their place in `outcomes`: each
     /// one's report is built once the batch is ([`build`]).
@@ -1328,7 +1326,6 @@ impl Service {
                 old: b.old_tip,
                 new,
                 file,
-                old_file: b.old_rules_file.clone(),
                 fast_forward: true,
             }),
             _ => None,
@@ -2041,7 +2038,6 @@ fn build(
         merge_read: 0,
         accept: None,
         rules_file: None,
-        old_rules_file: None,
         review_guard,
         conflicts: Vec::new(),
     };
@@ -2514,11 +2510,6 @@ fn entry(
         // branch's tip, never against a parent's (BUG-1102).
         if !who.viewer.admin && sync::entry_at(src, &chain_tree, RULES_FILE)? != sync::entry_at(src, &tip_tree, RULES_FILE)? {
             return Ok(Some(Outcome::Rejected("only admins may change the branch rules (.veilrules)".into())));
-        }
-        if b.old_rules_file.is_none() {
-            if let Some(old) = b.old_tip {
-                b.old_rules_file = Some(crate::prs::state::file_at(src, src.snapshot(&old)?.tree)?);
-            }
         }
         b.rules_file = Some(crate::prs::state::file_at(src, chain_tree)?);
     }

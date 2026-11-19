@@ -4163,20 +4163,12 @@ async fn push_staged(
         let (mut accept, mut policy_text_update) = (None, None);
         if u.branch == project.default_branch {
             if let Some(n) = new_real {
-                let (file, old_file) = blocking_staged(hub, project.id, Some(st.clone()), move |src| {
-                    let file = crate::prs::state::file_at(src, src.snapshot(&n)?.tree)?;
-                    let old_file = match cur {
-                        Some(c) => Some(crate::prs::state::file_at(src, src.snapshot(&c)?.tree)?),
-                        None => None,
-                    };
-                    Ok((file, old_file))
-                })
-                .await?;
+                let file = blocking_staged(hub, project.id, Some(st.clone()), move |src| crate::prs::state::file_at(src, src.snapshot(&n)?.tree)).await?;
                 let fast_forward = match cur {
                     Some(c) => !req.force || is_ancestor_in(hub, project.id, Some(st.clone()), c, n).await?,
                     None => false,
                 };
-                rules_landing = Some(crate::prs::state::Landing { old: cur, new: n, file, old_file, fast_forward });
+                rules_landing = Some(crate::prs::state::Landing { old: cur, new: n, file, fast_forward });
                 let text = blocking_staged(hub, project.id, Some(st.clone()), move |src| policy_text(src, &src.snapshot(&n)?.tree)).await?;
                 let incoming = AccessPolicy::parse(&text);
                 if !incoming.same_rules(&project.policy) {
