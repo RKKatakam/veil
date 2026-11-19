@@ -1592,3 +1592,409 @@ fn q4_single_repo_hash_keys_migration_preserves_rows_and_is_idempotent() {
     });
     drop_database(&rt, &name);
 }
+
+struct DropFreshDb<'a>(&'a tokio::runtime::Runtime, String);
+
+impl Drop for DropFreshDb<'_> {
+    fn drop(&mut self) {
+        drop_database(self.0, &self.1);
+    }
+}
+
+fn fresh_colocated_database(rt: &tokio::runtime::Runtime) -> (String, String) {
+    let admin = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    let name = format!("{}{}", crate::support::test_db_prefix(), unique("veil_coloc_"));
+    rt.block_on(async {
+        let db = veil_server::db::connect(&admin, 1).await.unwrap();
+        let mut c = db.acquire().await.unwrap();
+        sqlx::raw_sql("SET statement_timeout = 0").execute(&mut *c).await.unwrap();
+        let mut tries = 0;
+        loop {
+            match sqlx::raw_sql(&format!("CREATE DATABASE {name} WITH COLOCATION = true")).execute(&mut *c).await {
+                Ok(_) => break,
+                Err(e) if tries > 0 && e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42P04") => break,
+                Err(e) if retryable(&e) && tries < 50 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("CREATE DATABASE {name} WITH COLOCATION = true: {e}"),
+            }
+        }
+        drop(c);
+        db.close().await;
+    });
+    let (base, _) = admin.rsplit_once('/').unwrap();
+    (format!("{base}/{name}"), name)
+}
+
+async fn apply_migrations_through(db: &sqlx::PgPool, max_version: i64) {
+    use veil_server::db::{migration_parts, IndexStep, MIGRATIONS};
+    exec_retrying(
+        db,
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+    )
+    .await;
+    for &(ver, mname, sql) in MIGRATIONS {
+        if ver > max_version {
+            break;
+        }
+        let parts = migration_parts(sql).unwrap();
+        let mut stmts = Vec::new();
+        if parts.transactional.lines().any(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with("--")
+        }) {
+            stmts.push(parts.transactional.to_string());
+        }
+        for s in parts.online {
+            match s {
+                IndexStep::Create { sql, .. } => stmts.push(sql),
+                IndexStep::Drop { name } => stmts.push(format!("DROP INDEX IF EXISTS {name}")),
+            }
+        }
+        for s in stmts {
+            exec_retrying(db, &s).await;
+        }
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, 0)")
+            .bind(ver)
+            .bind(mname)
+            .execute(db)
+            .await
+            .unwrap();
+    }
+}
+
+/// BUG-2920 (YugabyteDB): migration 0046 rebuilds each table in three
+/// non-transactional steps (`CREATE TABLE <t>_q4`, `INSERT ... ON CONFLICT DO
+/// NOTHING`, `count(*)` check + `DROP TABLE <t>` + `RENAME`). Any `UPDATE`
+/// committed between step 2 and step 3 (live server write during rolling
+/// upgrade) or between an interrupted attempt 1 and a clean offline retry 2
+/// keeps `count(*)` unchanged and is silently reverted when `<t>` is dropped.
+#[test]
+#[ignore = "BUG-2920: migration 0046 silently reverts committed UPDATEs on branches/packs during live writes or after interrupted retry on YugabyteDB"]
+fn bug_2920_migration_46_never_reverts_updates_committed_during_or_before_retry() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        apply_migrations_through(&db, 45).await;
+
+        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2920alice', 1)").await;
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'b2920proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2920alice'",
+        )
+        .await;
+        let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2920proj'").fetch_one(&db).await.unwrap();
+        let uid: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2920alice'").fetch_one(&db).await.unwrap();
+
+        exec_retrying(
+            &db,
+            &format!("INSERT INTO branches (project_id, name, target) VALUES ({pid}, 'main', 'snap-old')"),
+        )
+        .await;
+        exec_retrying(
+            &db,
+            &format!(
+                "INSERT INTO packs (project_id, name, state, person_id, size, objects, created_at) \
+                 VALUES ({pid}, 'pack-refused', 0, {uid}, 64, 1, 100)"
+            ),
+        )
+        .await;
+
+        // Simulate attempt 1 completing steps 1 and 2 for `branches` and `packs`
+        // before aborting (e.g. a concurrent insert caused c_new < c_old or a
+        // transient catalog error interrupted step 3).
+        let sql46 = veil_server::db::MIGRATIONS
+            .iter()
+            .find(|(v, _, _)| *v == 46)
+            .expect("migration 46")
+            .2;
+        let mut steps: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for line in sql46.lines() {
+            if line.trim() == "-- veil: step" {
+                if !cur.trim().is_empty() {
+                    steps.push(std::mem::take(&mut cur));
+                }
+            } else {
+                cur.push_str(line);
+                cur.push('\n');
+            }
+        }
+        if !cur.trim().is_empty() {
+            steps.push(cur);
+        }
+        let find_step = |needle: &str| {
+            steps
+                .iter()
+                .find(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("missing 0046 step containing {needle}"))
+                .as_str()
+        };
+        // Steps 1 & 2 for `branches` and `packs` (create `_q4` + copy existing rows).
+        exec_retrying(&db, find_step("CREATE TABLE IF NOT EXISTS branches_q4")).await;
+        exec_retrying(&db, find_step("INSERT INTO branches_q4")).await;
+        exec_retrying(&db, find_step("CREATE TABLE IF NOT EXISTS packs_q4")).await;
+        exec_retrying(&db, find_step("INSERT INTO packs_q4")).await;
+
+        // A live server commits a push advancing `main` and refuses `pack-refused`
+        // (`state = 2` DISCARDED) before the migration retries or enters step 3.
+        exec_retrying(
+            &db,
+            &format!("UPDATE branches SET target = 'snap-committed' WHERE project_id = {pid} AND name = 'main'"),
+        )
+        .await;
+        exec_retrying(
+            &db,
+            &format!("UPDATE packs SET state = 2, discarded_at = 200 WHERE project_id = {pid} AND name = 'pack-refused'"),
+        )
+        .await;
+
+        // Now run the real migration runner cleanly (even with zero concurrent writers).
+        veil_server::db::migrate(&db).await.expect("migration 46 completes");
+        assert!(veil_server::db::schema_current(&db).await.unwrap());
+
+        let target: String = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'")
+            .bind(pid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let pack_state: i16 = sqlx::query_scalar("SELECT state FROM packs WHERE project_id = $1 AND name = 'pack-refused'")
+            .bind(pid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        db.close().await;
+
+        assert!(
+            target == "snap-committed" && pack_state == 2,
+            "migration 0046 silently reverted committed updates: branches.target={target:?} (expected \"snap-committed\"), packs.state={pack_state} (expected 2 DISCARDED)"
+        );
+    });
+}
+
+/// BUG-2921 (YugabyteDB): the deployment kit defaults to `YB_LAYOUT=colocated`
+/// (`CREATE DATABASE veil WITH COLOCATION = true`), but `db::migrate_once`
+/// checks only `is_yugabyte(version)` and executes migration 0046's
+/// `PRIMARY KEY ((...) HASH)` / `CREATE INDEX (... HASH)` DDL on colocated
+/// databases, which YugabyteDB rejects with `cannot colocate hash partitioned table`.
+#[test]
+#[ignore = "BUG-2921: migration 0046 fails unconditionally on colocated YugabyteDB databases (the deployment kit's default YB_LAYOUT=colocated)"]
+fn bug_2921_migration_46_succeeds_on_colocated_yugabytedb_database() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_colocated_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        let colocated: bool = sqlx::query_scalar("SELECT yb_is_database_colocated()").fetch_one(&db).await.unwrap();
+        assert!(colocated, "test database must be colocated");
+        let res = veil_server::db::migrate(&db).await;
+        db.close().await;
+        res.expect("veil-server migrate must succeed on a colocated YugabyteDB database");
+    });
+}
+
+/// BUG-2922 (PostgreSQL): migration 0045 runs `CREATE TABLE person_epochs`,
+/// `CREATE OR REPLACE FUNCTION veil_bump_epoch`, and the backfill
+/// `INSERT INTO person_epochs SELECT ... FROM access_epochs` inside one
+/// transaction. A pre-0045 server revoking a person while that transaction is
+/// open executes the old `veil_bump_epoch`, updating `access_epochs (0, person)`
+/// without touching `person_epochs`. When 0045 commits, `person_epochs` keeps
+/// the pre-revocation epoch so new servers keep honoring revoked grants/landings.
+#[test]
+#[ignore = "BUG-2922: concurrent access revocation during migration 0045 leaves person_epochs stale at the pre-revocation epoch"]
+fn bug_2922_migration_45_never_loses_concurrent_revocation_from_person_epochs() {
+    let rt = runtime();
+    if on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 4).await.unwrap();
+        apply_migrations_through(&db, 44).await;
+
+        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2922alice', 1)").await;
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'b2922proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2922alice'",
+        )
+        .await;
+        let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2922proj'").fetch_one(&db).await.unwrap();
+        let uid: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2922alice'").fetch_one(&db).await.unwrap();
+        exec_retrying(&db, &format!("INSERT INTO groups (project_id, name) VALUES ({pid}, 'eng')")).await;
+        let gid: i64 = sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'eng'")
+            .bind(pid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        exec_retrying(&db, &format!("INSERT INTO group_members (group_id, person_id) VALUES ({gid}, {uid})")).await;
+
+        let e_before: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+            .bind(uid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_ne!(e_before, 0, "group membership insert bumped access_epochs");
+
+        let sql45 = veil_server::db::MIGRATIONS
+            .iter()
+            .find(|(v, _, _)| *v == 45)
+            .expect("migration 45")
+            .2;
+
+        // Run migration 0045 in a transaction exactly as `db::migrate_once` does
+        // on PostgreSQL, pausing just before COMMIT while a pre-0045 server
+        // revokes Alice's group membership on another connection.
+        let mut mig_tx = db.begin().await.unwrap();
+        sqlx::raw_sql(sql45).execute(&mut *mig_tx).await.unwrap();
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (45, 'person_epochs', 0)")
+            .execute(&mut *mig_tx)
+            .await
+            .unwrap();
+
+        // Concurrent pre-0045 server revokes Alice: DELETE FROM group_members
+        // fires veil_epoch_person_row -> old veil_bump_epoch(0, uid).
+        sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND person_id = $2")
+            .bind(gid)
+            .bind(uid)
+            .execute(&db)
+            .await
+            .unwrap();
+        let e_revoked: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+            .bind(uid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_ne!(e_revoked, e_before, "revocation bumped access_epochs");
+
+        mig_tx.commit().await.unwrap();
+
+        let read = veil_server::caches::read_epochs(&db, uid, Some(pid)).await.unwrap();
+        db.close().await;
+
+        assert_eq!(
+            read.person, e_revoked,
+            "new server reading person_epochs must see revoked epoch {e_revoked}, not pre-revocation epoch {e_before}"
+        );
+    });
+}
+
+/// BUG-2924: migration 0044 drops `landing_queue_ticket (ticket)` in the same
+/// migration that creates `(project_id, ticket)`. Any pre-0044 server still
+/// running during a rolling upgrade executes `bisect::revert_confirmed_culprit`
+/// with `ON CONFLICT (ticket) DO NOTHING`, which fails with PostgreSQL `42P10`.
+#[test]
+#[ignore = "BUG-2924: migration 0044 drops landing_queue_ticket in the same migration, breaking pre-0044 servers' ON CONFLICT (ticket) during rolling upgrades"]
+fn bug_2924_migration_44_preserves_pre_44_bisect_on_conflict_ticket_during_rolling_upgrade() {
+    let rt = runtime();
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        apply_migrations_through(&db, 44).await;
+
+        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2924admin', 1)").await;
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'b2924proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2924admin'",
+        )
+        .await;
+        let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2924proj'").fetch_one(&db).await.unwrap();
+        let uid: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2924admin'").fetch_one(&db).await.unwrap();
+
+        // Exact SQL issued by pre-0044 servers (`3d0a690b:crates/veil-server/src/bisect.rs:1813-1820`).
+        let res = sqlx::query(
+            "INSERT INTO landing_queue ( \
+                project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, \
+                person_epoch, project_epoch, priority, state, created_at \
+             ) VALUES ($1, 'main', 'revert-1-main-1-0000', $2, 'b2924admin', 'dev1', '[]', 1, 0, 0, 1, 'queued', 100) \
+             ON CONFLICT (ticket) DO NOTHING",
+        )
+        .bind(pid)
+        .bind(uid)
+        .execute(&db)
+        .await;
+        db.close().await;
+
+        res.expect("pre-0044 bisect ON CONFLICT (ticket) DO NOTHING must keep working during rolling upgrade");
+    });
+}
+
+/// BUG-2925 (YugabyteDB): migration 0046 changes `landing_queue_finished`,
+/// `landings_at`, and `packs_unlisted` to composite hash keys
+/// `((project_id, branch) HASH, ...)` / `((project_id, name) HASH)`, which do
+/// not match `landing::service::clean` (`WHERE project_id = $1 AND done_at < $2` /
+/// `at < $2`) or `pack_gc::sweep_*` (`WHERE project_id = $1 AND state ...`), so
+/// YugabyteDB ignores all three indexes and scans the primary keys across tablets.
+#[test]
+#[ignore = "BUG-2925: migration 0046 composite-hash secondary indexes landing_queue_finished, landings_at, and packs_unlisted are ignored by YugabyteDB for landing retention and pack_gc sweeps"]
+fn bug_2925_migration_46_keeps_sweep_and_retention_indexes_usable_on_yugabytedb() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate(&db).await.unwrap();
+
+        let explain = |sql: &str| {
+            let db = db.clone();
+            let q = format!("EXPLAIN {sql}");
+            async move {
+                let rows: Vec<String> = sqlx::query_scalar(&q).fetch_all(&db).await.unwrap();
+                rows.join("\n")
+            }
+        };
+
+        let p_finished = explain(
+            "SELECT project_id, branch, seq FROM landing_queue \
+             WHERE project_id = 1 AND done_at < 100 AND state NOT IN ('queued', 'merging') LIMIT 500",
+        )
+        .await;
+        let p_landings = explain(
+            "SELECT project_id, branch, lineage, submitted FROM landings \
+             WHERE project_id = 1 AND at < 100 LIMIT 500",
+        )
+        .await;
+        let p_packs_due = explain(
+            "SELECT min(discarded_at) FILTER (WHERE state = 2), count(*) FILTER (WHERE state = 0 AND person_id IS NULL), \
+             min(created_at) FILTER (WHERE state = 0 AND person_id IS NOT NULL) FROM packs WHERE project_id = 1 AND state <> 1",
+        )
+        .await;
+        let p_packs_staged = explain(
+            "SELECT name FROM packs WHERE project_id = 1 AND state = 0 AND (person_id IS NULL OR created_at <= 100)",
+        )
+        .await;
+        db.close().await;
+
+        let mut failures: Vec<String> = Vec::new();
+        if !p_finished.contains("landing_queue_finished") {
+            failures.push(format!("landing::clean ignored landing_queue_finished:\n{p_finished}"));
+        }
+        if !p_landings.contains("landings_at") {
+            failures.push(format!("landing::clean ignored landings_at:\n{p_landings}"));
+        }
+        if !p_packs_due.contains("packs_unlisted") {
+            failures.push(format!("pack_gc::sweep_due ignored packs_unlisted:\n{p_packs_due}"));
+        }
+        if !p_packs_staged.contains("packs_unlisted") {
+            failures.push(format!("pack_gc::sweep_staged ignored packs_unlisted:\n{p_packs_staged}"));
+        }
+        assert!(failures.is_empty(), "BUG-2925 unusable indexes:\n{}", failures.join("\n---\n"));
+    });
+}
+

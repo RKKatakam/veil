@@ -2633,6 +2633,92 @@ mod s21_cycle3 {
         assert_eq!(normal(), 1);
     }
 
+    /// BUG-2926 (P7): during a rolling upgrade, a new server skips updating
+    /// `pr_review_rules.checked` on unchanged non-broken commits (`t1 -> t2`),
+    /// leaving `checked = t1`. If an older pre-P7 server (which lacks the
+    /// `old_file` fallback) then lands a fast-forward commit `t2 -> t3` with a
+    /// broken `.veilrules`, `checked != t2` causes it to write `Strict` (1
+    /// approval), downgrading a stricter `.veilrules` (e.g. `approvals = 2`)
+    /// across all servers.
+    #[test]
+    #[ignore = "BUG-2926: P7 skipping pr_review_rules writes downgrades stricter review rules to Strict (1 approval) if a pre-P7 server lands a broken .veilrules during a rolling upgrade"]
+    fn bug_2926_rolling_upgrade_broken_veilrules_preserves_strict_rules_after_p7_skip() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let hub = th.hub();
+        let pid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.db)).unwrap();
+        let admin = p.admin.token();
+        let dev = p.dev.token();
+        let tip = |token: &str| th.api().tips(Some(token), &p.name).unwrap().branches["main"];
+        let land = |token: &str, edits: Value| -> ObjectId {
+            let base = tip(token);
+            let r = th.api().post_json(
+                Some(token),
+                &format!("/v1/projects/{}/changes", p.name),
+                &json!({"base": base.hex(), "edits": edits, "onto": {"branch": "main", "expected": "rebase"}}),
+            );
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let v = r.json();
+            assert_eq!(v["branch"]["status"], "ok", "{v}");
+            ObjectId::from_hex(v["branch"]["tip"].as_str().unwrap()).unwrap()
+        };
+        let normal = || th.rt.block_on(prs::rules_of_project(&hub, pid, "main")).unwrap().need(Risk::Normal).approvals;
+
+        // 1. Admin sets `.veilrules` requiring 2 approvals at t1.
+        let t1 = land(&admin, json!([{"path": ".veilrules", "put": {"text": "[review]\nnormal = { approvals = 2 }\n"}}]));
+        assert_eq!(normal(), 2);
+
+        // 2. New (P7) server lands an unchanged commit t1 -> t2 (skips updating `pr_review_rules.checked`).
+        let t2 = land(&dev, json!([{"path": "src/b2926.rs", "put": {"text": "fn b() {}\n"}}]));
+        assert_ne!(t2, t1);
+        let (checked_after_t2, state_after_t2): (String, String) = th
+            .rt
+            .block_on(
+                sqlx::query_as("SELECT checked, state FROM pr_review_rules WHERE project_id = $1")
+                    .bind(pid)
+                    .fetch_one(&hub.db),
+            )
+            .unwrap();
+        assert_eq!(checked_after_t2, t1.hex(), "P7 left pr_review_rules.checked at t1");
+
+        // 3. Pre-P7 server lands fast-forward t2 -> t3_broken with broken `.veilrules`:
+        //    pre-P7 servers call `record_landing` without `old_file` (`old_file: None`).
+        let t3_broken = land(&admin, json!([{"path": ".veilrules", "put": {"text": BROKEN}}]));
+        th.rt.block_on(async {
+            let mut tx = hub.db.begin().await.unwrap();
+            // Restore `pr_review_rules` to the exact row step 2 left (`checked = t1`, `approvals = 2`),
+            // as it stood right before the pre-P7 server committed `t2 -> t3_broken`.
+            sqlx::query("UPDATE pr_review_rules SET checked = $2, state = $3 WHERE project_id = $1")
+                .bind(pid)
+                .bind(&checked_after_t2)
+                .bind(&state_after_t2)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            prs::state::record_landing(
+                &mut tx,
+                pid,
+                &prs::state::Landing {
+                    old: Some(t2),
+                    new: t3_broken,
+                    file: prs::state::RulesFile::Broken(prs::rules::Review::strict("bad toml".into())),
+                    old_file: None,
+                    fast_forward: true,
+                },
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        });
+
+        assert_eq!(
+            normal(),
+            2,
+            "broken .veilrules landed by a pre-P7 server after a P7-skipped commit must preserve 2 approvals, not downgrade to Strict (1)"
+        );
+    }
+
+
     /// Bounded reviews in answers (cycle 3): 300 reviewers' verdicts with
     /// 64 KiB texts: a PR answer lists the 100 latest, with texts within
     /// 256 KiB, and says how many there are.
