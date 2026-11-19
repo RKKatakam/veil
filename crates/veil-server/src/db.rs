@@ -638,7 +638,14 @@ async fn checked_on_yugabyte(c: &mut PgConnection, built: &[&IndexStep]) -> Resu
     let mut whole = Vec::with_capacity(built.len());
     for step in built {
         whole.push(match step {
-            IndexStep::Create { name, .. } => index_holds_every_row(&mut *c, name).await?,
+            IndexStep::Create { name, .. } => match index_built(&mut *c, name).await? {
+                Some(Some(true)) => index_holds_every_row(&mut *c, name).await?,
+                Some(Some(false)) | None => {
+                    eprintln!("veil-server: index {name} does not read built after waiting for every session: building it again");
+                    false
+                }
+                Some(None) => return Err(Error::Other(anyhow::anyhow!("{name} is not an index, so the index of that name was not built"))),
+            },
             IndexStep::Drop { .. } => true,
         });
     }
@@ -853,13 +860,26 @@ async fn index_holds_every_row(c: &mut PgConnection, name: &str) -> Result<bool>
         Ok(_) => return Ok(true),
         Err(e) => e,
     };
-    let code = e.as_database_error().and_then(|d| d.code()).map(|code| code.into_owned());
+    let db_err = e.as_database_error();
+    let code = db_err.and_then(|d| d.code()).map(|code| code.into_owned());
     match code.as_deref() {
         // `index_corrupted`: a row missing from the index, or one in it
         // that its table does not hold.
         Some("XX002") => {
             eprintln!("veil-server: index {name} reads built and does not hold its table's rows ({e}): dropping it to build it again");
             drop_index(&mut *c, true, name).await?;
+            Ok(false)
+        }
+        // `internal_error` when `yb_index_check` sees `indisvalid = false`
+        // (BUG-2625: e.g. a stale `pg_index` read saw it valid before the
+        // catalog refreshed). Drop only if `index_built` still reads it valid,
+        // so the next pass cannot skip rebuilding while leaving an invalid
+        // index in place if `BUILD_ATTEMPTS` is exhausted.
+        Some("XX000") if db_err.is_some_and(|d| d.message().contains("is marked invalid")) => {
+            eprintln!("veil-server: index {name} is marked invalid ({e}): building it again");
+            if index_built(&mut *c, name).await? == Some(Some(true)) {
+                drop_index(&mut *c, true, name).await?;
+            }
             Ok(false)
         }
         // Under what was left of the migrations' deadline, as the build.
