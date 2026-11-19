@@ -123,6 +123,38 @@ impl<'g, 'a> Trees<'g, 'a> {
         Ok(self.pr.borrow_mut().root(tree)?)
     }
 
+    /// Whether projecting a root tree for this viewer walks any policy-rule
+    /// directory.
+    pub(crate) fn has_rules(&self) -> bool {
+        self.view.rule_below("")
+    }
+
+    /// This viewer's access view.
+    pub(crate) fn view(&self) -> &View<'g> {
+        self.view
+    }
+
+    /// Whether `id` is a projected tree created in memory by this projector.
+    pub(crate) fn is_created(&self, id: &ObjectId) -> bool {
+        self.pr.borrow().created.contains_key(id)
+    }
+
+    /// Decoded tree `id` if already in memory (empty tree, projector-created,
+    /// or `Hub::trees`), without hitting storage.
+    pub(crate) fn cached_tree(&self, id: &ObjectId) -> Option<std::sync::Arc<Tree>> {
+        static EMPTY: std::sync::OnceLock<(ObjectId, std::sync::Arc<Tree>)> = std::sync::OnceLock::new();
+        let (empty_id, empty_tree) = EMPTY.get_or_init(|| (empty_tree_id(), std::sync::Arc::new(Tree::default())));
+        if *id == *empty_id {
+            return Some(empty_tree.clone());
+        }
+        if let Some((t, _)) = self.pr.borrow().created.get(id) {
+            return Some(t.clone());
+        }
+        let hub = self.g.cx.hub();
+        let ck = hub.objects.tree_key(self.g.cx.project(), id);
+        hub.trees.get(&ck).map(|(t, _)| t)
+    }
+
     /// The projected root trees of the snapshot `row` stands for and of
     /// its first parent (the empty tree for the root).
     pub fn roots_of(&self, row: &VRow) -> Result<(ObjectId, ObjectId)> {

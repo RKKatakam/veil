@@ -780,6 +780,24 @@ pub struct ReceiptPacks {
     pub vanished: HashSet<Arc<str>>,
 }
 
+/// Classification of pack names supplied in `PushRequest::packs` (BUG-1150).
+/// Unlike [`ReceiptPacks`], pack names carry no per-object MAC, so a missing
+/// row (forged name, another person's pack, another project's pack) goes into
+/// `invalid` together with packs discarded by an earlier check refusal so all
+/// of them receive the exact same `400 bad_request` answer (zero oracle).
+pub struct PackCheck {
+    /// Packs `person` staged in `project` that are still `STAGED` or `LISTED`.
+    pub usable: HashSet<Arc<str>>,
+    /// Packs `person` staged in `project` that a committing request in
+    /// `objects` mode already consumed (`state = DISCARDED`, `objects < 0`,
+    /// `BUG-2661`): answer `409 Conflict` without discarding sibling packs.
+    pub consumed: HashSet<Arc<str>>,
+    /// Packs not owned by `person` in `project`, never staged, or discarded
+    /// by an earlier check refusal (`state = DISCARDED`, `objects >= 0`,
+    /// `BUG-930`, `BUG-1155`): answer `400 bad_request` and never touch them.
+    pub invalid: HashSet<Arc<str>>,
+}
+
 impl Packs {
     pub fn new(db: Option<sqlx::PgPool>) -> Packs {
         Packs {
@@ -1371,6 +1389,58 @@ impl Packs {
             }
         }
         Ok(ReceiptPacks { usable, vanished })
+    }
+
+    /// Classify pack names supplied directly by `PushRequest::packs`
+    /// (`BUG-1150`). Only packs whose `packs` row belongs to `person` in
+    /// `project` and is `STAGED` or `LISTED` are `usable`. A row owned by
+    /// `person` with `state = DISCARDED` and `objects < 0` (consumed by a
+    /// committing request in `objects` mode, `BUG-2661`) goes into `consumed`.
+    /// Every other name (another person's pack, another project's pack, a
+    /// forged name, or a pack discarded by an earlier check refusal with
+    /// `objects >= 0`) goes into `invalid`.
+    pub async fn usable_for_packs(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<PackCheck> {
+        let Some(db) = &self.db else {
+            return Ok(PackCheck {
+                usable: names.iter().cloned().collect(),
+                consumed: HashSet::new(),
+                invalid: HashSet::new(),
+            });
+        };
+        if names.is_empty() {
+            return Ok(PackCheck {
+                usable: HashSet::new(),
+                consumed: HashSet::new(),
+                invalid: HashSet::new(),
+            });
+        }
+        let asked: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let rows: Vec<(String, i16, i64)> = sqlx::query_as(
+            "SELECT name, state, objects FROM packs WHERE project_id = $1 AND name = ANY($2) AND person_id = $3",
+        )
+        .bind(project)
+        .bind(&asked)
+        .bind(person)
+        .fetch_all(db)
+        .await?;
+        let by_name: HashMap<String, (i16, i64)> = rows.into_iter().map(|(n, s, o)| (n, (s, o))).collect();
+        let mut usable = HashSet::with_capacity(names.len());
+        let mut consumed = HashSet::new();
+        let mut invalid = HashSet::new();
+        for n in names {
+            match by_name.get(&**n) {
+                Some(&(s, _)) if s == STAGED || s == LISTED => {
+                    usable.insert(n.clone());
+                }
+                Some(&(s, objs)) if s == DISCARDED && objs < 0 => {
+                    consumed.insert(n.clone());
+                }
+                _ => {
+                    invalid.insert(n.clone());
+                }
+            }
+        }
+        Ok(PackCheck { usable, consumed, invalid })
     }
 
     /// The index and length of staged pack `name`, with its share of the

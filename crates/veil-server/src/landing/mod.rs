@@ -986,6 +986,9 @@ pub async fn submit(
             return Err(Error::bad_request("`delete_branch` names the branch landed from, not the one landed on"));
         }
     }
+    if !req.packs.is_empty() && !req.receipts.is_empty() {
+        return Err(Error::bad_request("a landing names either `packs` or `receipts`, not both"));
+    }
     // Past what the branch's service lands in time, the submitter is told
     // to come back, before anything is done for the submit (BUG-1955).
     if let Some(refused) = crate::limits::pressure::admit(hub, project.id, &req.onto, &who).await? {
@@ -1002,6 +1005,7 @@ pub async fn submit(
                 }],
                 force: false,
                 receipts: req.receipts,
+                packs: req.packs,
                 ..Default::default()
             };
             let (pushed, mut landings) = match crate::sync::push_with(hub, project, viewer, &who, push, true, req.wait).await {
@@ -1039,6 +1043,9 @@ pub async fn submit(
             }
         }
         (None, base) if base.is_some() || !req.edits.is_empty() => {
+            if !req.packs.is_empty() {
+                return Err(Error::bad_request("`packs` goes with an uploaded `snapshot`, not `edits`"));
+            }
             let base = base.unwrap_or(ObjectId([0; 32]));
             let q = Queued {
                 ticket: ticket(),

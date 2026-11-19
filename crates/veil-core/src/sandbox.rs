@@ -55,7 +55,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    builder::{BuildReport, InjectedSecrets, INJECTED_RULE},
+    builder::{guard_bytes_limit_error, BuildReport, InjectedSecrets, INJECTED_RULE, MAX_GUARD_BYTES},
     crypto::Envelope,
     error::VeilError,
     keychain::LOCAL_SCOPE,
@@ -777,7 +777,7 @@ pub fn inject(fs: &SandboxFs, files: &[(String, Vec<u8>)]) -> Result<Injection> 
 /// before [`write_injection`].
 pub fn plan_injection(fs: &SandboxFs, files: &[(String, Vec<u8>)]) -> Result<Injection> {
     let mut inj = Injection {
-        secrets: InjectedSecrets::from_files(files.iter().map(|(p, d)| (p.as_str(), d.as_slice()))),
+        secrets: InjectedSecrets::try_from_files(files.iter().map(|(p, d)| (p.as_str(), d.as_slice())))?,
         ..Default::default()
     };
     for (p, _) in files {
@@ -1034,34 +1034,183 @@ pub struct Guard {
     pub injection: Option<SavedInjection>,
 }
 
+fn hex_eq(hex_bytes: &[u8], raw: &[u8]) -> bool {
+    if hex_bytes.len() != raw.len().saturating_mul(2) {
+        return false;
+    }
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    raw.iter().enumerate().all(|(i, &b)| {
+        hex_bytes[2 * i].to_ascii_lowercase() == LUT[(b >> 4) as usize]
+            && hex_bytes[2 * i + 1].to_ascii_lowercase() == LUT[(b & 0xf) as usize]
+    })
+}
+
+fn readable_oversize_blob(store: &ObjectStore, e: &TreeEntry) -> bool {
+    match store.kind_by_head(&e.id) {
+        Some(crate::HeadKind::Sealed(readable)) => readable,
+        Some(crate::HeadKind::Plain) => true,
+        None => store.entry_readable(e),
+    }
+}
+
+fn read_bounded_fallback(fs: Option<&dyn StorageBackend>, p: &VPath) -> Result<Option<Vec<u8>>> {
+    let Some(fs) = fs else { return Ok(None) };
+    if behind_special(fs, p).unwrap_or(true) {
+        return Ok(None);
+    }
+    let Ok(Some(m)) = fs.metadata(p) else { return Ok(None) };
+    if m.len > MAX_GUARD_BYTES as u64 {
+        return Err(guard_bytes_limit_error(Some(p.as_str()), m.len));
+    }
+    Ok(fs.read(p).ok())
+}
+
 impl Guard {
-    /// Add `files` (path, content) to the guard.
-    pub fn add(&mut self, files: &[(String, Vec<u8>)]) {
-        for (p, d) in files {
-            let e = (p.clone(), hex::encode(d));
-            if !self.files.contains(&e) {
-                self.files.push(e);
-            }
-        }
+    /// Total plaintext bytes currently held across [`Self::files`].
+    pub fn total_bytes(&self) -> usize {
+        self.files.iter().map(|(_, h)| h.len() / 2).sum()
     }
 
-    /// Merge another guard's entries into this one.
-    pub fn merge(&mut self, other: &Guard) {
+    /// Add one `(path, content)` pair if not already present, failing closed
+    /// when [`Self::total_bytes`] would exceed [`MAX_GUARD_BYTES`] (BUG-2650).
+    pub fn try_add_one(&mut self, path: &str, data: &[u8]) -> Result<bool> {
+        if self.files.iter().any(|(p, h)| p == path && hex_eq(h.as_bytes(), data)) {
+            return Ok(false);
+        }
+        let next = self.total_bytes().saturating_add(data.len());
+        if next > MAX_GUARD_BYTES {
+            return Err(guard_bytes_limit_error(Some(path), next as u64));
+        }
+        self.files.push((path.to_string(), hex::encode(data)));
+        Ok(true)
+    }
+
+    /// Add `files` (path, content) to the guard, failing closed at [`MAX_GUARD_BYTES`].
+    pub fn try_add(&mut self, files: &[(String, Vec<u8>)]) -> Result<bool> {
+        let mut changed = false;
+        for (p, d) in files {
+            changed |= self.try_add_one(p, d)?;
+        }
+        Ok(changed)
+    }
+
+    /// Merge another guard's entries into this one, failing closed at [`MAX_GUARD_BYTES`].
+    pub fn try_merge(&mut self, other: &Guard) -> Result<bool> {
+        let mut changed = false;
         for e in &other.files {
             if !self.files.contains(e) {
+                let next = self.total_bytes().saturating_add(e.1.len() / 2);
+                if next > MAX_GUARD_BYTES {
+                    return Err(guard_bytes_limit_error(Some(&e.0), next as u64));
+                }
                 self.files.push(e.clone());
+                changed = true;
             }
         }
+        Ok(changed)
     }
 
-    /// The guard as the builder applies it.
-    pub fn secrets(&self) -> InjectedSecrets {
-        let files: Vec<(&str, Vec<u8>)> = self
-            .files
-            .iter()
-            .filter_map(|(p, d)| Some((p.as_str(), hex::decode(d).ok()?)))
-            .collect();
-        InjectedSecrets::from_files(files.iter().map(|(p, d)| (*p, d.as_slice())))
+    /// Absorb every sealed (`Cloaked`) file or conflict in `root` that
+    /// `store` holds locally and can decrypt (falling back to `fallback_fs`
+    /// when given, for an unchanged file already checked out into a sandbox
+    /// whose thin-clone cache evicted the blob; never fetches from the
+    /// server). A conflict with a sealed version (BUG-1932) gives what the
+    /// sandbox holds there, the rendering, and each readable version whole
+    /// under the conflict's path. Oversized readable entries (`>`
+    /// [`MAX_GUARD_BYTES`]) fail closed by header inspection before reading
+    /// or decrypting the blob (BUG-2650).
+    pub fn absorb_tree(
+        &mut self,
+        store: &ObjectStore,
+        root: &ObjectId,
+        fallback_fs: Option<&dyn StorageBackend>,
+    ) -> Result<bool> {
+        store.without_fetching(|| {
+            let mut changed = false;
+            let Ok(top) = store.tree(root) else { return Ok(false) };
+            let mut stack: Vec<(VPath, std::sync::Arc<crate::object::Tree>, usize)> = vec![(VPath::root(), top, 0)];
+            while let Some((dir, tree, i)) = stack.last_mut() {
+                let Some(e) = tree.entries.get(*i).cloned() else {
+                    stack.pop();
+                    continue;
+                };
+                *i += 1;
+                let p = dir.join(&e.name);
+                match e.kind {
+                    EntryKind::Dir => {
+                        if let Ok(child) = store.tree(&e.id) {
+                            stack.push((p, child, 0));
+                        }
+                    }
+                    EntryKind::File if sealed_leaf(store, &e) != Some(false) => {
+                        if e.size > MAX_GUARD_BYTES as u64 {
+                            if readable_oversize_blob(store, &e) {
+                                return Err(guard_bytes_limit_error(Some(p.as_str()), e.size));
+                            }
+                            if let Some(d) = read_bounded_fallback(fallback_fs, &p)? {
+                                changed |= self.try_add_one(p.as_str(), &d)?;
+                            }
+                            continue;
+                        }
+                        let data = match crate::conflict::read_file_like(store, &e) {
+                            Ok(d) => Some(d),
+                            Err(_) => read_bounded_fallback(fallback_fs, &p)?,
+                        };
+                        if let Some(d) = data {
+                            changed |= self.try_add_one(p.as_str(), &d)?;
+                        }
+                    }
+                    EntryKind::Conflict if sealed_leaf(store, &e) != Some(false) => {
+                        if let Ok(c) = store.conflict(&e.id) {
+                            for t in c.adds.iter().chain(&c.removes).flatten() {
+                                let te = t.entry(&e.name);
+                                if te.size > MAX_GUARD_BYTES as u64 && readable_oversize_blob(store, &te) {
+                                    return Err(guard_bytes_limit_error(Some(p.as_str()), te.size));
+                                }
+                            }
+                        }
+                        let data = match crate::conflict::read_file_like(store, &e) {
+                            Ok(d) => Some(d),
+                            Err(_) => read_bounded_fallback(fallback_fs, &p)?,
+                        };
+                        if let Some(d) = data {
+                            changed |= self.try_add_one(p.as_str(), &d)?;
+                        }
+                        if let Ok(c) = store.conflict(&e.id) {
+                            for t in c.adds.iter().chain(&c.removes).flatten() {
+                                if let Ok(d) = store.read_entry(&t.entry(&e.name)) {
+                                    changed |= self.try_add_one(p.as_str(), &d)?;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(changed)
+        })
+    }
+
+    /// The guard as the builder applies it, decoding one entry at a time so
+    /// peak memory is bounded and failing closed if [`MAX_GUARD_BYTES`] or
+    /// [`crate::builder::MAX_WINDOWS`] is exceeded (BUG-2650).
+    pub fn try_secrets(&self) -> Result<InjectedSecrets> {
+        if self.total_bytes() > MAX_GUARD_BYTES {
+            return Err(guard_bytes_limit_error(None, self.total_bytes() as u64));
+        }
+        let mut builder = crate::builder::InjectedSecretsBuilder::default();
+        let mut buf = Vec::new();
+        for (p, d) in &self.files {
+            if d.len() % 2 != 0 {
+                return Err(VeilError::Corrupt(p.clone(), "corrupt hex in sandbox guard".into()));
+            }
+            buf.resize(d.len() / 2, 0);
+            hex::decode_to_slice(d, &mut buf)
+                .map_err(|e| VeilError::Corrupt(p.clone(), format!("corrupt hex in sandbox guard: {e}")))?;
+            builder.try_add_file(p.as_str(), &buf)?;
+        }
+        drop(buf);
+        Ok(builder.finish())
     }
 }
 
@@ -1078,66 +1227,6 @@ pub fn sealed_leaf(store: &ObjectStore, e: &TreeEntry) -> Option<bool> {
         }
         _ => Some(!e.visibility.is_public()),
     }
-}
-
-/// Every sealed (`Cloaked`) file in `root` that `store` holds locally and can
-/// decrypt (falling back to `fallback_fs` when given, for an unchanged file
-/// already checked out into a sandbox whose thin-clone cache evicted the
-/// blob). Never fetches from the server: in a thin clone over a mount, an
-/// unfetched subtree or blob was never read by the command.
-///
-/// A conflict with a sealed version (BUG-1932) gives what the sandbox holds
-/// there, the rendering with every shown version between markers, and each
-/// readable version whole (the plain ones too: the file they are versions
-/// of is a secret), all under the conflict's path, so the path's own
-/// resolution may keep them and no other file may. A conflict the store
-/// does not hold cannot be judged: the sandbox's copy is taken.
-pub fn sealed_files_in_tree(
-    store: &ObjectStore,
-    root: &ObjectId,
-    fallback_fs: Option<&dyn StorageBackend>,
-) -> Vec<(String, Vec<u8>)> {
-    store.without_fetching(|| {
-        let mut out = Vec::new();
-        let Ok(top) = store.tree(root) else { return out };
-        let mut stack: Vec<(VPath, std::sync::Arc<crate::object::Tree>, usize)> = vec![(VPath::root(), top, 0)];
-        while let Some((dir, tree, i)) = stack.last_mut() {
-            let Some(e) = tree.entries.get(*i).cloned() else {
-                stack.pop();
-                continue;
-            };
-            *i += 1;
-            let p = dir.join(&e.name);
-            match e.kind {
-                EntryKind::Dir => {
-                    if let Ok(child) = store.tree(&e.id) {
-                        stack.push((p, child, 0));
-                    }
-                }
-                EntryKind::File | EntryKind::Conflict if sealed_leaf(store, &e) != Some(false) => {
-                    let data = crate::conflict::read_file_like(store, &e).ok().or_else(|| {
-                        let fs = fallback_fs?;
-                        if behind_special(fs, &p).unwrap_or(true) {
-                            return None;
-                        }
-                        fs.read(&p).ok()
-                    });
-                    if let Some(d) = data {
-                        out.push((p.as_str().to_string(), d));
-                    }
-                    if let (EntryKind::Conflict, Ok(c)) = (e.kind, store.conflict(&e.id)) {
-                        for t in c.adds.iter().chain(&c.removes).flatten() {
-                            if let Ok(d) = store.read_entry(&t.entry(&e.name)) {
-                                out.push((p.as_str().to_string(), d));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        out
-    })
 }
 
 /// Every sealed (`Cloaked`) leaf path in `root` held locally by `store`.
@@ -1194,8 +1283,12 @@ impl SandboxPaths {
     /// Write the guard, sealed, atomically and durably.
     pub fn save_guard(&self, repo: &Repo, g: &Guard) -> Result<()> {
         let key = repo.keys().require(LOCAL_SCOPE)?;
-        let env = Envelope::seal(&key, LOCAL_SCOPE, &serde_json::to_vec(g)?, false)?;
-        self.meta().write(&Self::guard_path(), &env.to_bytes())
+        let plain = serde_json::to_vec(g)?;
+        let env = Envelope::seal(&key, LOCAL_SCOPE, &plain, false)?;
+        drop(plain);
+        let bytes = env.to_bytes();
+        drop(env);
+        self.meta().write(&Self::guard_path(), &bytes)
     }
 }
 

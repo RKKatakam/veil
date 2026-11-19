@@ -482,7 +482,7 @@ fn rebuild(th: &TestHub, h: &Hist) {
             again(|| sqlx::query(&q).bind(h.id).execute(&h.hub.db)).await;
         }
     });
-    segment::clear_cache();
+    segment::clear_cache(&h.hub);
     index(th, h);
 }
 
@@ -936,7 +936,13 @@ fn search_speed() {
                 last = v;
             }
             let hits = last["results"].as_array().or(last["files"].as_array()).map(|a| a.len()).unwrap_or(0);
-            println!("search_speed: {who}: {name}: p50 {:?}, p99 {:?}, work {}, {hits} hits shown", pct(times.clone(), 50), pct(times, 99), last["work"]);
+            println!(
+                "search_speed: {who}: {name}: p50 {:?}, p95 {:?}, p99 {:?}, work {}, {hits} hits shown",
+                pct(times.clone(), 50),
+                pct(times.clone(), 95),
+                pct(times, 99),
+                last["work"]
+            );
         }
     }
 }
@@ -1442,4 +1448,304 @@ fn bug_1990_a_stopping_server_waits_for_its_search_index_updates_to_end() {
         .block_on(sqlx::query_scalar("SELECT snapshot FROM search_heads WHERE project_id = $1 AND branch = 'main' AND kind IN ('code', 'walk')").bind(project).fetch_all(&hub.db))
         .unwrap();
     assert!(heads.len() == 2 && heads.iter().all(|s| *s == tip.hex()), "the next update did not bring main's index up to its tip: {heads:?}");
+}
+
+/// BUG-2663: when search indexing and segment loads run after a full packed
+/// clone has warmed `Hub::objects` (256 MiB) and `Hub::trees` (256 MiB),
+/// (1) `all_at_once` prepared every new branch/tag before `main` was visible
+/// in `search_heads`, re-indexing all 19 `rel-*` tags from `empty_tree_id()`
+/// instead of sharing `main`'s shards, and (2) `search::segment` held a
+/// separate uncoordinated 256 MiB cache (also populated during compaction)
+/// on top of the 512 MiB object and tree caches.
+#[test]
+fn bug_2663_packed_clone_then_multi_branch_search_index_stays_bounded() {
+    let writer = TestHub::start();
+    let p = setup_project(&writer);
+    let pid: i64 = writer
+        .rt
+        .block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&writer.hub().db))
+        .unwrap();
+
+    // Build a packed multi-tag history (`main` + `rel-01`..`rel-19`).
+    let mut base_files = Vec::new();
+    for i in 0..80usize {
+        let mut body = String::with_capacity(16 << 10);
+        for line in 0..260usize {
+            body.push_str(&format!("module_{i:03} symbol_{i:03}_{line:03} packed_main_anchor_{i:03}\n"));
+        }
+        base_files.push((format!("src/mod_{i:03}.rs"), body));
+    }
+    let refs: Vec<(&str, &str)> = base_files.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    write_files(&p.dir, &refs);
+    p.admin.commit_main(&p.dir, "base tree on main");
+    for r in 1..=19usize {
+        let tag = format!("rel-{r:02}");
+        let note = format!("release_marker_{r:02} shipped\n");
+        write_files(&p.dir, &[("src/release.txt", &note)]);
+        p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", &format!("release {r:02}")]);
+        p.admin.ok(&p.dir, &["tag", "set", "main", "-r", "@-", "--force"]);
+        p.admin.ok(&p.dir, &["tag", "set", &tag, "-r", "@-", "--force"]);
+    }
+    write_files(&p.dir, &[("src/release.txt", "release_marker_main_head shipped\n")]);
+    p.admin.ok(&p.dir, &["commit", "--no-advance", "-m", "main head after releases"]);
+    p.admin.ok(&p.dir, &["tag", "set", "main", "-r", "@-", "--force"]);
+    p.admin.ok(&p.dir, &["push"]);
+
+    let listed_packs: i64 = writer
+        .rt
+        .block_on(sqlx::query_scalar("SELECT count(*) FROM packs WHERE project_id = $1 AND state = 1").bind(pid).fetch_one(&writer.hub().db))
+        .unwrap();
+    assert!(listed_packs >= 1, "expected history in packs layout, got {listed_packs} listed packs");
+
+    let main_tip = writer.api().tips(Some(&p.admin.token()), &p.name).unwrap().branches["main"];
+    writer.rt.block_on(veil_server::derive::ensure(&writer.hub(), pid, main_tip)).unwrap();
+
+    // Restart the server (stops any background index update cleanly, starts
+    // a fresh Hub on the same port and packed store with cold caches), and
+    // clear search rows so indexing runs deterministically *after* the full
+    // clone and cache warm-up.
+    let admin_token = p.admin.token();
+    let dev_token = p.dev.token();
+    let srv = writer.restart(|_| {});
+
+    let hub = srv.hub();
+    srv.rt.block_on(async {
+        for t in ["search_heads", "search_shards"] {
+            let q = format!("DELETE FROM {t} WHERE project_id = $1");
+            again(|| sqlx::query(&q).bind(pid).execute(&hub.db)).await;
+        }
+    });
+    segment::clear_cache(&srv.hub());
+
+    // 1. Full clone against `srv` (warms pack index, objects and trees).
+    let cloned = p.admin.dir("full-clone-2663");
+    p.admin.clone_trusting(&srv.url(&p.name), &cloned, &p.fp);
+    assert_eq!(
+        std::fs::read_to_string(cloned.join("src/release.txt")).unwrap(),
+        "release_marker_main_head shipped\n"
+    );
+
+    // Prepare 32 distinct ~6 MiB search segments in storage before warming
+    // the caches so we can also exercise loading ~195 MiB of distinct
+    // segments on top of full object + tree caches.
+    let seg_project = pid + 1_000_000;
+    let mut base_gs = Vec::with_capacity(5_500);
+    for k in 0..5_500u32 {
+        base_gs.push((k.wrapping_mul(251)) & 0x00ff_ffff);
+    }
+    base_gs.sort_unstable();
+    base_gs.dedup();
+    let mut b = segment::Builder::default();
+    for d in 0..960usize {
+        let path = format!("src/seg/file_{d:04}_{}.rs", "x".repeat(180));
+        b.add(
+            segment::Doc {
+                path,
+                id: ObjectId([1; 32]),
+                flags: segment::TEXT,
+                size: 24_000,
+            },
+            &base_gs,
+        );
+    }
+    let seg_template = b.encode();
+    let mut seg_ids = Vec::with_capacity(32);
+    let mlen = segment::MAGIC.len();
+    for s_idx in 0..32u8 {
+        let mut raw_seg = seg_template.clone();
+        let path_len = u32::from_le_bytes(raw_seg[mlen + 4..mlen + 8].try_into().unwrap()) as usize;
+        raw_seg[mlen + 8 + path_len] = s_idx.wrapping_add(1);
+        let seg_id = ObjectId::hash(&raw_seg);
+        srv.rt
+            .block_on(srv.hub().objects.put_ephemeral(seg_project, &seg_id, raw_seg.into()))
+            .unwrap();
+        seg_ids.push(seg_id);
+    }
+    segment::clear_cache(&srv.hub());
+
+    // 2. Fill `Hub::objects` (192 MiB encoded + 64 MiB raw = 256 MiB) and
+    // `Hub::trees` (256 MiB) to capacity (512 MiB total), matching the
+    // post-`clone, full` cache state of `bench-server.sh 1g`.
+    let warm_project = pid + 2_000_000;
+    let mut tmpl_2m = vec![0u8; (2 << 20) - 64];
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    for chunk in tmpl_2m.as_chunks_mut::<8>().0 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *chunk = x.to_le_bytes();
+    }
+    let tmpl_64k = tmpl_2m[..(64 << 10) - 64].to_vec();
+    srv.rt.block_on(async {
+        let hub = srv.hub();
+        for i in 0..1_040u32 {
+            let mut buf = tmpl_64k.clone();
+            buf[..4].copy_from_slice(&i.to_le_bytes());
+            let raw = Object::Blob(buf).encode();
+            assert!(raw.len() <= 64 << 10, "raw_cache only caches <= 64 KiB objects");
+            let id = ObjectId::hash(&raw);
+            hub.objects.put(warm_project, &id, raw.into()).await.unwrap();
+        }
+        for i in 0..98u32 {
+            let mut buf = tmpl_2m.clone();
+            buf[..4].copy_from_slice(&i.to_le_bytes());
+            let raw = Object::Blob(buf).encode();
+            let id = ObjectId::hash(&raw);
+            // Already incompressible: store raw directly as its encoding.
+            hub.objects.put_encoded(warm_project, &id, raw.into()).await.unwrap();
+        }
+    });
+    let base_entries: Vec<TreeEntry> = (0..1_500u32)
+        .map(|j| TreeEntry {
+            name: format!("entry_{j:04}_{}", "n".repeat(76)),
+            kind: EntryKind::File,
+            id: ObjectId([7; 32]),
+            size: 1024,
+            executable: false,
+            visibility: Visibility::Public,
+        })
+        .collect();
+    let sample_raw = Object::Tree(Tree { entries: base_entries.clone() }).encode();
+    let enc = Object::tree_encoding(&sample_raw).unwrap();
+    for i in 0..1_024u32 {
+        let mut entries = base_entries.clone();
+        entries[0].id.0[..4].copy_from_slice(&i.to_le_bytes());
+        let tree = Tree { entries };
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&i.to_le_bytes());
+        key[4] = 0x77;
+        // ~260 KiB per tree -> fills 256 MiB `Hub::trees`.
+        srv.hub().trees.insert(ObjectId(key), (std::sync::Arc::new(tree), enc), 262_144);
+    }
+    let total_cached = || {
+        let h = srv.hub();
+        h.objects.cached_bytes() + h.trees.stats().weight + h.segments.stats().weight
+    };
+    assert!(
+        srv.hub().objects.cached_bytes() >= 250 << 20 && srv.hub().trees.stats().weight >= 250 << 20,
+        "expected both objects ({} MiB) and trees ({} MiB) warm near 256 MiB",
+        srv.hub().objects.cached_bytes() >> 20,
+        srv.hub().trees.stats().weight >> 20,
+    );
+    assert!(
+        total_cached() <= veil_server::HUB_CACHE_BYTES,
+        "warm caches exceeded HUB_CACHE_BYTES: {} > {}",
+        total_cached(),
+        veil_server::HUB_CACHE_BYTES,
+    );
+
+    // 3. Index `main` + all 19 `rel-*` tags in one `index::update`, then
+    // query every branch/tag over HTTP and verify exact search results and
+    // permissions.
+    let stats = srv.rt.block_on(index::update(&srv.hub(), pid, None)).unwrap();
+    assert_eq!(stats.branches.len(), 20, "expected main + 19 rel-* branches: {:?}", stats.branches);
+    assert!(
+        stats.docs < 200,
+        "BUG-2663: all_at_once indexed {} docs across 20 branches (expected < 200 when rel-* diff from main)",
+        stats.docs,
+    );
+    assert_eq!(
+        srv.hub().segments.stats().weight,
+        0,
+        "background indexing/compaction must not populate Hub::segments (got {} bytes)",
+        srv.hub().segments.stats().weight,
+    );
+    assert!(
+        total_cached() <= veil_server::HUB_CACHE_BYTES,
+        "post-indexing caches exceeded HUB_CACHE_BYTES: {} > {}",
+        total_cached(),
+        veil_server::HUB_CACHE_BYTES,
+    );
+
+    let api = srv.api();
+    let r_main = api.get(Some(&admin_token), &format!("/v1/projects/{}/q/search?q=release_marker_main_head&rev=main", p.name));
+    assert_eq!(r_main.status, 200, "{}", String::from_utf8_lossy(&r_main.body));
+    assert_eq!(r_main.json()["results"].as_array().unwrap().len(), 1);
+
+    for r in 1..=19usize {
+        let tag = format!("rel-{r:02}");
+        let needle = format!("release_marker_{r:02}");
+        let rep = api.get(Some(&admin_token), &format!("/v1/projects/{}/q/search?q={needle}&rev={tag}", p.name));
+        assert_eq!(rep.status, 200, "{tag}: {}", String::from_utf8_lossy(&rep.body));
+        let hits = rep.json()["results"].as_array().unwrap().clone();
+        assert_eq!(hits.len(), 1, "{tag} must find its own release marker");
+        assert_eq!(hits[0]["path"].as_str(), Some("src/release.txt"));
+
+        let base_rep = api.get(Some(&admin_token), &format!("/v1/projects/{}/q/search?q=packed_main_anchor_042&rev={tag}", p.name));
+        assert_eq!(base_rep.status, 200, "{tag}: {}", String::from_utf8_lossy(&base_rep.body));
+        assert_eq!(base_rep.json()["results"].as_array().unwrap().len(), 1, "{tag} must find inherited main files");
+
+        let leak_rep = api.get(Some(&dev_token), &format!("/v1/projects/{}/q/search?q={BILL_MARK}&rev={tag}", p.name));
+        assert_eq!(leak_rep.status, 200, "{tag} dev: {}", String::from_utf8_lossy(&leak_rep.body));
+        assert!(leak_rep.json()["results"].as_array().unwrap().is_empty(), "dev must never see restricted billing hits on {tag}");
+    }
+    assert!(
+        total_cached() <= veil_server::HUB_CACHE_BYTES,
+        "post-query caches exceeded HUB_CACHE_BYTES: {} > {}",
+        total_cached(),
+        veil_server::HUB_CACHE_BYTES,
+    );
+
+    // 4. Load all 32 distinct ~5.6 MiB segments (~180 MiB) through
+    // `segment::load` while `objects` + `trees` are already at 512 MiB:
+    // global LRU eviction must keep `objects + trees + segments <= 512 MiB`
+    // instead of adding an uncoordinated 256 MiB segment cache on top.
+    let loaded_weight: usize = srv
+        .rt
+        .block_on(veil_server::sync::blocking(&srv.hub(), seg_project, move |src| {
+            let mut total = 0usize;
+            for id in &seg_ids {
+                let seg = segment::load(src, id)?;
+                assert_eq!(seg.docs.len(), 960);
+                total += seg.weight;
+            }
+            Ok(total)
+        }))
+        .unwrap();
+    assert!(loaded_weight >= 140 << 20, "expected >= 140 MiB of decoded segments, got {} MiB", loaded_weight >> 20);
+    assert!(
+        srv.hub().segments.stats().weight >= 140 << 20
+            && srv.hub().segments.stats().weight <= veil_server::SEGMENT_CACHE_BYTES,
+        "expected segments cached in Hub::segments within 140..=160 MiB, got {} MiB",
+        srv.hub().segments.stats().weight >> 20,
+    );
+    assert!(
+        srv.hub().objects.cached_bytes() + srv.hub().trees.stats().weight
+            >= veil_server::HUB_CACHE_BYTES - veil_server::SEGMENT_CACHE_BYTES - (8 << 20),
+        "expected objects ({} MiB) + trees ({} MiB) to retain ~352 MiB under 160 MiB segment cap",
+        srv.hub().objects.cached_bytes() >> 20,
+        srv.hub().trees.stats().weight >> 20,
+    );
+    assert!(
+        total_cached() <= veil_server::HUB_CACHE_BYTES,
+        "BUG-2663: loading {} MiB of segments on warm caches pushed objects ({} MiB) + trees ({} MiB) + segments ({} MiB) = {} MiB past {} MiB",
+        loaded_weight >> 20,
+        srv.hub().objects.cached_bytes() >> 20,
+        srv.hub().trees.stats().weight >> 20,
+        srv.hub().segments.stats().weight >> 20,
+        total_cached() >> 20,
+        veil_server::HUB_CACHE_BYTES >> 20,
+    );
+    let src_shards: Vec<(String, String)> = srv
+        .rt
+        .block_on(
+            sqlx::query_as("SELECT branch, segments FROM search_shards WHERE project_id = $1 AND kind = 'code' AND docs >= 80 ORDER BY branch")
+                .bind(pid)
+                .fetch_all(&srv.hub().db),
+        )
+        .unwrap();
+    assert_eq!(src_shards.len(), 20, "expected 20 branches with the src/ shard");
+    let main_segs: Vec<index::SegRef> = src_shards
+        .iter()
+        .find(|(b, _)| b == "main")
+        .map(|(_, s)| serde_json::from_str(s).unwrap())
+        .unwrap();
+    for (branch, raw_segs) in &src_shards {
+        let segs: Vec<index::SegRef> = serde_json::from_str(raw_segs).unwrap();
+        assert_eq!(
+            segs[0].id, main_segs[0].id,
+            "branch {branch} did not share main's base segment ({} vs {})",
+            segs[0].id, main_segs[0].id
+        );
+    }
 }

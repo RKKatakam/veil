@@ -1,7 +1,8 @@
 # The helpers both deployment kits share (deploy/do, deploy/gcp; docs/DEPLOY.md).
 # Sourced by each kit's lib.sh after it has set NAME, STATE, STATE_FILE,
 # APPROVED, KIT (do or gcp), ENV_PREFIX, HUBS, YB_NODES, YB_LAYOUT, YB_TABLETS,
-# DB_CONNECTIONS, DB_DISK_GB, OBJECTS, DB_PASSWORD and
+# DB_CONNECTIONS, DB_DISK_GB, OBJECTS, OBJECT_LAYOUT (empty: the server's
+# default object layout; docs/HUB.md §13.42), DB_PASSWORD and
 # `droplets` (the run's machines: role, name, size). The steps that run on
 # the machines (deploy/do/configure.sh, bench.sh, logs.sh) are shared the
 # same way: deploy/gcp runs them with VEIL_KIT=gcp, and they source its lib.
@@ -9,6 +10,13 @@
 [[ "$YB_LAYOUT" =~ ^(colocated|hash)$ ]] || { echo "$KIT: invalid ${ENV_PREFIX}YB_LAYOUT '$YB_LAYOUT' (colocated or hash)" >&2; exit 2; }
 [[ "$YB_TABLETS" =~ ^[1-9][0-9]?$ ]] || { echo "$KIT: invalid ${ENV_PREFIX}YB_TABLETS '$YB_TABLETS' (1 to 99 tablets per table on each node)" >&2; exit 2; }
 [ "$YB_LAYOUT" = hash ] || [ "$YB_TABLETS" = 1 ] || { echo "$KIT: ${ENV_PREFIX}YB_TABLETS is for ${ENV_PREFIX}YB_LAYOUT=hash (a colocated database is one tablet)" >&2; exit 2; }
+# The object layout a server says it runs: `object_layout` of the counters
+# it writes at start and on SIGUSR1 (stats.json), read here from stdin;
+# empty when there is none. The server is the authority on it: bench.sh
+# records what the servers say, not what the kit asked for.
+layout_of() { python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("object_layout") or "")
+except Exception: print("")'; }
 # Veil's database: `veil` on PostgreSQL and on YugabyteDB (made by
 # configure.sh in the chosen layout; never the default `yugabyte` one).
 DB_NAME=veil

@@ -281,6 +281,11 @@ const S3_SIGN_FOR: Duration = Duration::from_secs(300);
 /// MinIO that resets connections under load stays unreachable for seconds
 /// at a time (BUG-861).
 const S3_RETRY_FOR: Duration = Duration::from_secs(10);
+/// How long [`S3Store::ensure_bucket`] waits at start before giving up on the
+/// server's start (BUG-2630: after a 100-project burst, MinIO/docker-proxy
+/// reset connections for 21 s, past [`S3_RETRY_FOR`], while holding no
+/// request transaction).
+const S3_START_RETRY_FOR: Duration = Duration::from_secs(60);
 const S3_FIRST_WAIT: Duration = Duration::from_millis(25);
 const S3_MOST_WAIT: Duration = Duration::from_secs(1);
 
@@ -331,15 +336,19 @@ impl std::error::Error for StoreUnavailable {
 /// of a key that names its content or a pack's fresh random name). When the
 /// bound runs out, the error is a [`StoreUnavailable`].
 async fn s3_send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, Bytes)> {
-    s3_send_inner(make, false).await.map(|(status, _, body)| (status, body))
+    s3_send_inner(make, false, S3_RETRY_FOR).await.map(|(status, _, body)| (status, body))
 }
 
 /// [`s3_send`], with the answer's headers.
 async fn s3_send_with_headers(make: impl Fn() -> reqwest::RequestBuilder) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
-    s3_send_inner(make, true).await
+    s3_send_inner(make, true, S3_RETRY_FOR).await
 }
 
-async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers: bool) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
+async fn s3_send_inner(
+    make: impl Fn() -> reqwest::RequestBuilder,
+    need_headers: bool,
+    retry_for: Duration,
+) -> Result<(u16, reqwest::header::HeaderMap, Bytes)> {
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut wait = S3_FIRST_WAIT;
     for tries in 1.. {
@@ -358,7 +367,7 @@ async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers:
             if matches!(status.as_u16(), 503 | 429) {
                 S3_SLOW_DOWN.fetch_add(1, Ordering::Relaxed);
             }
-            let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
+            let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + retry_for);
             let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
             if tokio::time::Instant::now() + wait + jitter >= dl {
                 S3_GAVE_UP.fetch_add(1, Ordering::Relaxed);
@@ -369,7 +378,7 @@ async fn s3_send_inner(make: impl Fn() -> reqwest::RequestBuilder, need_headers:
             continue;
         }
         let e = answer.unwrap_err();
-        let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + S3_RETRY_FOR);
+        let dl = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + retry_for);
         let jitter = Duration::from_millis(u64::from(u16::from_le_bytes(veil_core::crypto::random_bytes::<2>())) % (wait.as_millis() as u64 + 1));
         if e.is_builder() {
             return Err(anyhow::Error::new(e).context("S3 request"));
@@ -422,7 +431,7 @@ impl S3Store {
     pub async fn ensure_bucket(&self) -> Result<()> {
         use rusty_s3::S3Action;
         let url = self.bucket.create_bucket(&self.credentials).sign(S3_SIGN_FOR);
-        let (status, _) = s3_send(|| self.http.put(url.clone())).await?;
+        let (status, _, _) = s3_send_inner(|| self.http.put(url.clone()), false, S3_START_RETRY_FOR).await?;
         if (200..300).contains(&status) || status == 409 {
             return Ok(());
         }
@@ -793,13 +802,29 @@ impl Objects {
 
     /// Objects in `store`, keeping new objects in `layout`.
     pub fn with_layout(store: Arc<dyn BlobStore>, cache_bytes: usize, db: Option<sqlx::PgPool>, layout: ObjectLayout) -> Objects {
+        Objects::with_layout_and_budget(store, cache_bytes, db, layout, None)
+    }
+
+    /// Objects in `store`, keeping new objects in `layout`, with an optional
+    /// shared [`veil_core::cache::CacheBudget`] over both caches.
+    pub fn with_layout_and_budget(
+        store: Arc<dyn BlobStore>,
+        cache_bytes: usize,
+        db: Option<sqlx::PgPool>,
+        layout: ObjectLayout,
+        budget: Option<&Arc<veil_core::cache::CacheBudget>>,
+    ) -> Objects {
         let raw_bytes = (cache_bytes / 4).max(1);
         let enc_bytes = cache_bytes.saturating_sub(raw_bytes).max(1);
+        let (cache, raw_cache) = match budget {
+            Some(b) => (LruCache::with_budget(enc_bytes, b), LruCache::with_budget(raw_bytes, b)),
+            None => (LruCache::new(enc_bytes), LruCache::new(raw_bytes)),
+        };
         Objects {
             store,
             layout,
-            cache: LruCache::new(enc_bytes),
-            raw_cache: LruCache::new(raw_bytes),
+            cache,
+            raw_cache,
             packs: crate::pack::Packs::new(db),
             gc_epochs: Default::default(),
             writes: Default::default(),
@@ -841,6 +866,11 @@ impl Objects {
     /// The server's bound on pack indexes held outside the lookup maps.
     pub fn index_bound(&self) -> &crate::pack::Bound {
         self.packs.bound()
+    }
+
+    /// Combined weight of the encoded and decoded object caches.
+    pub fn cached_bytes(&self) -> usize {
+        self.cache.stats().weight + self.raw_cache.stats().weight
     }
 
     /// Key of decoded tree `id` of `project` in [`crate::Hub::trees`].
@@ -1195,6 +1225,15 @@ impl Objects {
         self.store.put(&object_key(project, id), enc.clone()).await?;
         self.cache.insert(self.cache_key(project, id), enc.clone(), enc.len());
         Ok(())
+    }
+
+    /// Store object `id` loose without inserting into the object caches (for
+    /// derived search segments, which live decoded in [`crate::Hub::segments`]
+    /// only when a query reads them).
+    pub async fn put_ephemeral(&self, project: i64, id: &ObjectId, raw: Bytes) -> Result<()> {
+        let enc = encode(raw);
+        count_write(self, enc.len());
+        self.store.put(&object_key(project, id), enc).await
     }
 
     /// Write `objects` (encodings the caller has checked or made) as one
@@ -1563,6 +1602,12 @@ impl Objects {
     /// Classify receipted containers `names` for `person` (`BUG-2661`).
     pub async fn usable_for_receipts(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<crate::pack::ReceiptPacks> {
         self.packs.usable_for_receipts(project, person, names).await
+    }
+
+    /// Classify pack names supplied directly by `PushRequest::packs` for
+    /// `person` (`BUG-1150`).
+    pub async fn usable_for_packs(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<crate::pack::PackCheck> {
+        self.packs.usable_for_packs(project, person, names).await
     }
 
     /// Claim `names` out of `person`'s `recent` upload list while a request
@@ -2764,6 +2809,7 @@ mod tests {
             db: db.clone(),
             objects: objects.clone(),
             trees: LruCache::new(1 << 20),
+            segments: LruCache::new(1 << 20),
             identity: veil_core::Identity::generate("hub"),
             receipt_key: [0; 32],
             grants: crate::grant::Grants::load(data.path()).unwrap(),
@@ -2813,6 +2859,56 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// BUG-2630: after a 100-project push curve, MinIO/docker-proxy reset
+    /// every connection (`Connection reset by peer`) for 21 s, past
+    /// `S3_RETRY_FOR` (10 s). A request-path call still gives up at
+    /// `S3_RETRY_FOR` so a request's transaction stays bounded; `ensure_bucket`
+    /// at server start holds no transaction and waits out the resets up to
+    /// `S3_START_RETRY_FOR` (60 s).
+    #[tokio::test(start_paused = true)]
+    async fn bug_2630_ensure_bucket_waits_out_connection_resets_past_a_requests_retry_bound() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn serve_resets_then_ok(reset_for: Duration) -> (String, tokio::task::JoinHandle<usize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let until = tokio::time::Instant::now() + reset_for;
+            let h = tokio::spawn(async move {
+                let mut resets = 0usize;
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else { break };
+                    if tokio::time::Instant::now() < until {
+                        drop(s);
+                        resets += 1;
+                        continue;
+                    }
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    break;
+                }
+                resets
+            });
+            (endpoint, h)
+        }
+
+        // 1. Live request path: still gives up at `S3_RETRY_FOR` (10 s).
+        let (ep1, h1) = serve_resets_then_ok(Duration::from_secs(25)).await;
+        let store1 = S3Store::new(&ep1, "veil-bench", "us-east-1", "k", "s").unwrap();
+        let t0 = tokio::time::Instant::now();
+        let err = BlobStore::get(&store1, "probe").await.expect_err("live GET gives up at S3_RETRY_FOR");
+        assert!(err.downcast_ref::<StoreUnavailable>().is_some(), "expected StoreUnavailable: {err:#}");
+        assert!(t0.elapsed() < Duration::from_secs(15), "live GET stayed bounded by S3_RETRY_FOR: {:?}", t0.elapsed());
+        h1.abort();
+
+        // 2. Server start (`ensure_bucket`): waits out 25 s of resets and succeeds.
+        let (ep2, h2) = serve_resets_then_ok(Duration::from_secs(25)).await;
+        let store2 = S3Store::new(&ep2, "veil-bench", "us-east-1", "k", "s").unwrap();
+        let t1 = tokio::time::Instant::now();
+        store2.ensure_bucket().await.expect("ensure_bucket waits out 25 s of connection resets");
+        let resets = h2.await.unwrap();
+        assert!(resets >= 12 && t1.elapsed() >= Duration::from_secs(25), "waited {resets} resets over {:?}", t1.elapsed());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

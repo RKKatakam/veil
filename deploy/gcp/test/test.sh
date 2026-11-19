@@ -30,6 +30,11 @@
 #      down before the gate is started first; with VEIL_GCP_SPOT=all a
 #      reclaimed storage machine means configure.sh again; ssh knows a
 #      restarted VM by its name, not its new address (BUG-2458);
+#   6b. the object layout: the servers run their default unless
+#      VEIL_GCP_OBJECT_LAYOUT names one (passed to each as --object-layout);
+#      every gate records the layout the servers themselves report and
+#      tells the tool; a gate is refused, nothing recorded, when a server
+#      reports none, the servers differ, or they are not in the one set;
 #   7. destroy.sh: --check finds running and stopped VMs and their disks,
 #      a leftover disk, firewall rule, network or address, and fails when
 #      gcloud fails; destroy --approve deletes them all, then --check passes;
@@ -79,9 +84,16 @@ if [[ "$*" == *"timeout --kill-after"* ]] && [ -s "$D/preempt" ]; then
 fi
 # $D/break-lists: gcloud's listings fail from the gate on (fake-gcloud).
 if [[ "$*" == *"timeout --kill-after"* ]] && [ -f "$D/break-lists" ]; then touch "$D/lists-broken"; fi
+# A server remembers the object layout it was started in, by machine (its
+# HostKeyAlias: a restarted VM's address changes), and its stats.json says
+# it: the one --object-layout names, else this fake server's default, objects.
+alias=$(sed -n 's/.*-o HostKeyAlias=\([^ ]*\) .*/\1/p' <<<"$*")
+if [[ "$*" == *"docker run -d --name veil-server "* ]]; then
+    l=$(sed -n 's/.* --object-layout \([a-z]*\).*/\1/p' <<<"$*"); echo "${l:-objects}" > "$D/layout-$alias"
+fi
 case "$*" in
     *"cat /var/lib/veil/hub-"*) echo "fake-server-key-material" ;;
-    *"cat /var/lib/veil/stats.json"*) echo '{"landing_batches": 0}' ;;
+    *"cat /var/lib/veil/stats.json"*) l=$(cat "$D/layout-$alias" 2>/dev/null); echo "{\"landing_batches\": 0${l:+, \"object_layout\": \"$l\"}}" ;;
     *"{{.RestartCount}}' minio"*) echo 0 ;;
 esac
 exit 0
@@ -136,8 +148,9 @@ check "flag typos and stray arguments are refused" '
     ! "$K/configure.sh" --aprove >/dev/null 2>&1 && ! "$K/estimate.sh" --lve >/dev/null 2>&1 &&
     ! "$K/logs.sh" --aprove >/dev/null 2>&1 && ! "$K/bench.sh" --aprove pull >/dev/null 2>&1 &&
     ! "$K/preflight.sh" --aprove >/dev/null 2>&1 && ! "$K/bench.sh" nosuchgate >/dev/null 2>&1'
-check "invalid settings are refused: a name, a zone of another region, a Spot model, a size" '
+check "invalid settings are refused: a name, a zone of another region, a Spot model, a size, an object layout" '
     ! VEIL_GCP_NAME=Veil_Big "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_ZONE=europe-west1-b "$K/estimate.sh" >/dev/null 2>&1 &&
+    ! VEIL_GCP_OBJECT_LAYOUT=loose "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_OBJECT_LAYOUT=packs "$K/estimate.sh" >/dev/null 2>&1 && VEIL_GCP_OBJECT_LAYOUT=objects "$K/estimate.sh" >/dev/null 2>&1 &&
     ! VEIL_GCP_SPOT=some "$K/estimate.sh" >/dev/null 2>&1 && ! VEIL_GCP_SIZE_HUB="c2d standard" "$K/estimate.sh" >/dev/null 2>&1'
 out=$("$K/bench.sh" spaces 2>&1 || true)
 check "the spaces gate (DigitalOcean Spaces) is refused" '[[ "$out" == *"the gcp kit has none"* ]]'
@@ -226,6 +239,9 @@ check "MinIO is started directly (the server binary, never the image's setup scr
 check "the certificate names the storage machine, and localhost (BUG-2432)" 'openssl x509 -in "$S/tls/server.pem" -noout -text | grep -q "DNS:veil-kit-minio" && openssl x509 -in "$S/tls/server.pem" -noout -text | grep -q "DNS:localhost" && openssl x509 -in "$S/tls/server.pem" -noout -text | grep -q "IP Address:10.42.0.10"'
 check "three YugabyteDB nodes, three servers, the balancer; no spaces.env (no Spaces here)" '[ "$(grep -c "bin/yugabyted start" "$FAKE_SSH_LOG")" = 3 ] && [ "$(grep -c "docker run -d --name veil-server" "$FAKE_SSH_LOG")" = 3 ] && grep -q "docker run -d --name veil-lb" "$FAKE_SSH_LOG" && ! grep -q spaces.env "$FAKE_SSH_LOG" && [ ! -e "$S/spaces.env" ]'
 check "configure.sh called no gcloud" '[ "$(wc -l < "$FAKE_GCLOUD_LOG")" = "$g_before" ]'
+check "without VEIL_GCP_OBJECT_LAYOUT no server is given an object layout: each runs the server's default" '[ "$(grep -c "docker run -d --name veil-server" "$FAKE_SSH_LOG")" = 3 ] && ! grep -q -- "--object-layout" "$FAKE_SSH_LOG"'
+out=$(VEIL_GCP_OBJECT_LAYOUT=objects "$K/configure.sh" gcpkit-test 2>&1 </dev/null); rc=$?
+check "VEIL_GCP_OBJECT_LAYOUT=objects (dry run): every server would be started with --object-layout objects" '[ $rc = 0 ] && [ "$(grep -c "docker run -d --name veil-server .* --object-layout objects$" <<<"$out")" = 3 ]'
 check "each YugabyteDB node keeps its data on its own data disk (a file system made only when it has none)" '[ "$(grep -c "dev=/dev/disk/by-id/google-veil-db-data;.*blkid \$dev >/dev/null 2>&1 || mkfs.ext4 .*mount -o discard,defaults,noatime \$dev /mnt/db-data" "$FAKE_SSH_LOG")" = 3 ] && [ "$(grep -c "docker run -d --name yb .*-v /mnt/db-data/yb:/root/var .*ysql_num_shards_per_tserver=1 " "$FAKE_SSH_LOG")" = 3 ]'
 check "Veil's database veil, colocated by default: made once, its layout checked; the servers' URLs name it" '[ "$(grep -c "CREATE DATABASE veil WITH COLOCATION = true" "$FAKE_SSH_LOG")" = 1 ] && grep -q "select yb_is_database_colocated()" "$FAKE_SSH_LOG" && grep -q "^VEIL_DATABASE_URL=postgres://yugabyte@10.42.0.5:5433/veil$" "$S/hub1.env" && grep -q "^VEIL_DATABASE_URL=postgres://yugabyte@10.42.0.7:5433/veil$" "$S/hub3.env"'
 : > "$FAKE_SSH_LOG"
@@ -242,6 +258,7 @@ res() { ls -d "$T"/results/veil-kit/*-"$1" 2>/dev/null | sort; }
 rc=0; out=$("$K/bench.sh" --approve pull 2>&1 </dev/null) || rc=$?
 r1=$(res pull)
 check "a clean gate: one results directory, run.txt says no Spot VM was reclaimed and the result is valid" '[ $rc = 0 ] && [ "$(grep -c . <<<"$r1")" = 1 ] && grep -qx "spot_reclaimed_during=none" "$r1/run.txt" && grep -qx "result_valid=yes" "$r1/run.txt" && [ -s "$r1/topology.env" ] && grep -qx "SPOT=hybrid" "$r1/topology.env"'
+check "its run.txt records the object layout the servers report (objects, this fake server's default), and every benchmark command is told it" 'grep -qx "object_layout=objects" "$r1/run.txt" && [ -s "$r1/commands.txt" ] && [ "$(grep -vc -- " --object-layout objects" "$r1/commands.txt")" = 0 ]'
 check "it looked for preemptions in the zone and at the Spot VMs, before and after" '[ "$(grep -c "^gcloud compute operations list --zones=us-central1-a --filter=operationType=compute.instances.preempted" "$FAKE_GCLOUD_LOG")" = 2 ]'
 rm -rf "$T/results"; : > "$FAKE_GCLOUD_LOG"
 echo veil-kit-driver1 > "$FAKE_GCLOUD_DIR/preempt"
@@ -293,6 +310,35 @@ for i in 1 2 3; do printf '2026-11-06T21:19:50Z veil-server cpu=1600.00%% mem=1G
 printf '2026-11-06T21:20:30Z pg cpu=600.00%% mem=8GiB / 32GiB;\n2026-11-06T21:23:00Z pg cpu=100.00%% mem=8GiB / 32GiB;\n' > "$mk/db1-docker-stats.log"
 tab=$(python3 "$ROOT/deploy/onerepo-table.py" --target 7200 --servers 3 --server-vcpus 16 "$mk")
 check "onerepo's table: 50.0 % of the target, 27 server cores (7.50 ms a push), 6 database cores (1.67 ms), and what 7,200 a second needs" '[[ "$tab" == *"| 5,000 | 3,600.0 | 50.0 % | 900 / 2,100 | 3 | 7 | 40.1 | 11.0 | 1.02 | 27.0 | 7.50 | 6.0 | 1.67 | 5.5 |"* && "$tab" == *"54 server cores (5 servers of 16 vCPUs at 70% busy)"* && "$tab" == *"12 database cores (at 70% busy: 18)"* && "$tab" == *"288,720 statements a second"* ]]'
+
+echo "== 6b. the object layout: the setting passed through, the servers' own word recorded"
+rm -rf "$T/results"; : > "$FAKE_SSH_LOG"
+rc=0; out=$(VEIL_GCP_OBJECT_LAYOUT=objects "$K/configure.sh" --approve gcpkit-test 2>&1 </dev/null) || rc=$?
+check "VEIL_GCP_OBJECT_LAYOUT=objects: configure.sh starts each of the three servers with --object-layout objects" '[ $rc = 0 ] && [ "$(grep -c "docker run -d --name veil-server .* --object-layout objects$" "$FAKE_SSH_LOG")" = 3 ]'
+: > "$FAKE_SSH_LOG"
+rc=0; out=$(VEIL_GCP_OBJECT_LAYOUT=objects "$K/bench.sh" --approve land 2>&1 </dev/null) || rc=$?
+r1=$(res land)
+check "a gate on them is valid, its run.txt says objects and every benchmark command is told objects" '[ $rc = 0 ] && [ "$(grep -c . <<<"$r1")" = 1 ] && grep -qx "object_layout=objects" "$r1/run.txt" && grep -qx "result_valid=yes" "$r1/run.txt" && [ -s "$r1/commands.txt" ] && [ "$(grep -vc -- " --object-layout objects" "$r1/commands.txt")" = 0 ]'
+check "all three servers were asked their layout before the gate's first benchmark command" '[ "$(awk "/timeout --kill-after/ {exit} /cat \/var\/lib\/veil\/stats.json/ {n++} END {print n + 0}" "$FAKE_SSH_LOG")" = 3 ]'
+rm -rf "$T/results"; : > "$FAKE_SSH_LOG"
+rc=0; out=$("$K/bench.sh" --approve objects 2>&1 </dev/null) || rc=$?
+r1=$(res objects)
+check "without the setting the record is still the servers' word (objects), and the objects gate's own server, started by the tool on the first server's machine, is told it" '[ $rc = 0 ] && grep -qx "object_layout=objects" "$r1/run.txt" && grep "HostKeyAlias=veil_kit_hub .*timeout --kill-after" "$FAKE_SSH_LOG" | grep -q -- "--server /usr/local/bin/veil-server --s3-endpoint https://10.42.0.10:9000 --s3-bucket $BUCKET-objects --mode objects .* --object-layout objects"'
+rm -rf "$T/results"; : > "$FAKE_SSH_LOG"
+for a in veil_kit_hub veil_kit_hub2 veil_kit_hub3; do echo packs > "$FAKE_GCLOUD_DIR/layout-$a"; done
+rc=0; out=$(VEIL_GCP_OBJECT_LAYOUT=objects "$K/bench.sh" --approve land 2>&1 </dev/null) || rc=$?
+check "servers in another layout than the one set: the gate is refused (exit 2) before any benchmark command, and nothing is recorded" '[ $rc = 2 ] && [[ "$out" == *"the servers report object layout '"'"'packs'"'"', VEIL_GCP_OBJECT_LAYOUT is '"'"'objects'"'"'"* ]] && ! grep -q "timeout --kill-after" "$FAKE_SSH_LOG" && [ -z "$(res land)" ]'
+echo objects > "$FAKE_GCLOUD_DIR/layout-veil_kit_hub2"
+rc=0; out=$("$K/bench.sh" --approve land 2>&1 </dev/null) || rc=$?
+check "servers in two layouts: refused the same way, naming the server" '[ $rc = 2 ] && [[ "$out" == *"server 2 reports object layout '"'"'objects'"'"', server 1 '"'"'packs'"'"'"* ]] && ! grep -q "timeout --kill-after" "$FAKE_SSH_LOG" && [ -z "$(res land)" ]'
+rm -f "$FAKE_GCLOUD_DIR/layout-veil_kit_hub2"
+rc=0; out=$("$K/bench.sh" --approve land 2>&1 </dev/null) || rc=$?
+check "a server that reports no layout: refused the same way" '[ $rc = 2 ] && [[ "$out" == *"server 2 reports no object layout"* ]] && ! grep -q "timeout --kill-after" "$FAKE_SSH_LOG" && [ -z "$(res land)" ]'
+rc=0; out=$("$K/configure.sh" --approve gcpkit-test 2>&1 </dev/null) || rc=$?
+rc2=0; "$K/bench.sh" --approve land >/dev/null 2>&1 </dev/null || rc2=$?
+r1=$(res land)
+check "configure.sh again without the setting: the servers are back on their default, and the next gate is valid and records it" '[ $rc = 0 ] && [ $rc2 = 0 ] && [ "$(grep -c . <<<"$r1")" = 1 ] && grep -qx "object_layout=objects" "$r1/run.txt" && grep -qx "result_valid=yes" "$r1/run.txt"'
+rm -rf "$T/results"
 
 echo "== 7. destroy.sh and its check"
 awk '$1 == "veil-kit-driver2" {$3 = "TERMINATED"} {print}' "$FAKE_GCLOUD_DIR/instances" > "$T/i"; mv "$T/i" "$FAKE_GCLOUD_DIR/instances"

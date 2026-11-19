@@ -734,3 +734,167 @@ fn bug_1954_a_file_history_filled_in_part_answers_whole_or_warming() {
     }
     assert_eq!(rows_with_files(&th, &h, &adm_viewer), 2 * n as i64, "every row of the admins' graph is marked");
 }
+
+/// BUG-1954: filling file history for a multi-level packed push prefetches
+/// tree objects across batches in coalesced reads rather than reading each
+/// tree sequentially one at a time, and produces exact history and blame
+/// answers for both admin and restricted viewers (including incremental
+/// pushes on top of an already-filled history).
+#[test]
+fn bug_1954_file_history_fill_prefetches_packed_trees_and_matches_exact_results() {
+    use bytes::Bytes;
+    use veil_core::{object::{Object, Snapshot, Text}, ChangeId};
+
+    let th = TestHub::start();
+    let carol = 772_002;
+    let (policy_text, bindings) = policy(carol);
+    let mut h = Hist::new(&th, &policy_text, &bindings);
+    let project = h.project(&th);
+
+    // Build a 4-level packed history (no loose copies) of `n1` snapshots, then
+    // an incremental `n2` snapshots on top.
+    let mut files = Files::new();
+    let mut packed_order = Vec::<ObjectId>::new();
+    let push_packed = |h: &mut Hist, from: ObjectId, start: usize, count: usize, files: &mut Files| -> ObjectId {
+        let mut tip = from;
+        let mut objs: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+        let mut snaps: Vec<ObjectId> = Vec::new();
+        for i in start..start + count {
+            files.insert("pub/a/b/c/hot.txt".into(), format!("line1\nver {i}\n").into_bytes());
+            if i % 2 == 0 {
+                files.insert("fin/x/y/z/ledger.txt".into(), format!("entry {i}\n").into_bytes());
+            }
+            let tree = crate::derived::build_tree(files, &mut objs);
+            let mut change = [0u8; 16];
+            change[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            change[15] = 0x54;
+            let s = Snapshot {
+                parents: vec![tip],
+                change_id: ChangeId(change),
+                tree,
+                description: Text::Plain(format!("packed {i}")),
+                author: "gen".into(),
+                timestamp: 1_700_000_000_000 + i as i64 * 1000,
+                predecessors: vec![],
+                conflicts: vec![],
+                embargo: None,
+                agent: None,
+                abandoned: None,
+                attempts: vec![],
+                signature: None,
+            };
+            let raw = Object::Snapshot(s).encode();
+            let id = ObjectId::hash(&raw);
+            objs.push((id, raw));
+            snaps.push(id);
+            tip = id;
+        }
+        objs.retain(|(id, _)| h.stored.insert(*id));
+        let packed: Vec<(ObjectId, Bytes)> = objs.into_iter().map(|(id, b)| (id, veil_server::store::encode(Bytes::from(b)))).collect();
+        let (hub, pid) = (h.hub.clone(), h.id);
+        th.rt.block_on(async move {
+            let (name, held) = hub.objects.put_pack(pid, 1, packed).await.expect("put_pack");
+            sqlx::query("UPDATE packs SET state = $3 WHERE project_id = $1 AND name = $2")
+                .bind(pid)
+                .bind(&*name)
+                .bind(veil_server::pack::LISTED)
+                .execute(&hub.db)
+                .await
+                .expect("list pack");
+            hub.objects.listed_here(pid, vec![(name, held.index.clone())]);
+            for id in &snaps {
+                again(|| {
+                    sqlx::query("INSERT INTO snapshots (project_id, id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                        .bind(pid)
+                        .bind(id.hex())
+                        .execute(&hub.db)
+                })
+                .await;
+            }
+        });
+        tip
+    };
+
+    let n1 = 350usize;
+    let tip1 = push_packed(&mut h, root_snapshot_id(), 0, n1, &mut files);
+    h.set_branch(&th, "main", tip1);
+    // Recover snapshot order along first parents for exact assertions.
+    {
+        let mut cur = tip1;
+        while cur != root_snapshot_id() {
+            packed_order.push(cur);
+            let raw = th.rt.block_on(h.hub.objects.get(h.id, &cur)).unwrap().unwrap();
+            let Object::Snapshot(s) = Object::decode(&raw).unwrap() else { unreachable!() };
+            cur = s.parents[0];
+        }
+        packed_order.reverse();
+    }
+    assert_eq!(packed_order.len(), n1);
+
+    // Cold server sharing DB + object store: empty caches, every tree comes from the pack.
+    let cold = TestHub::beside(&th);
+    let cold_hub = cold.hub();
+    let adm_viewer = admin();
+    let anyone_viewer = Viewer::default();
+
+    // Rows first (as BUG-1943 does on push), leaving file history and trees cold.
+    cold.rt.block_on(query::graph::extend_rows(&cold_hub, &project, &adm_viewer, &[tip1])).unwrap();
+    let reads_before = cold_hub.objects.reads.load(Ordering::Relaxed);
+    let t0 = Instant::now();
+    cold.rt.block_on(query::graph::ensure_files(&cold_hub, &project, &adm_viewer, &[tip1], None)).unwrap();
+    let took = t0.elapsed();
+    let tree_reads = cold_hub.objects.reads.load(Ordering::Relaxed) - reads_before;
+    println!("BUG-1954: {n1} packed 4-level snapshots file-history fill: {tree_reads} store reads in {took:?}");
+    // 350 snapshots * 5+ changed trees = ~2,000+ distinct trees. Sequential reading
+    // does 1,700+ store reads; batch BFS prefetch coalesces them into a small number
+    // of ranged reads.
+    assert!(
+        tree_reads < 250,
+        "file-history fill of {n1} packed 4-level snapshots made {tree_reads} store reads (expected coalesced batch prefetch < 250)"
+    );
+
+    // Restricted viewer (`anyone`, sees only `pub/`, not `fin/`) on the same cold server.
+    cold.rt.block_on(query::graph::ensure_files(&cold_hub, &project, &anyone_viewer, &[tip1], None)).unwrap();
+    let h_cold = Hist { hub: cold_hub.clone(), id: h.id, name: h.name.clone(), stored: Default::default(), files: Default::default(), parents: Default::default(), order: packed_order.clone(), branches: Default::default() };
+    let adm_ask = ask(&cold, &h_cold, &adm_viewer);
+    let anyone_ask = ask(&cold, &h_cold, &anyone_viewer);
+    let expected_hot: Vec<String> = packed_order.iter().rev().map(|id| id.hex()).collect();
+    let expected_fin: Vec<String> = packed_order.iter().enumerate().rev().filter(|(i, _)| i % 2 == 0).map(|(_, id)| id.hex()).collect();
+    assert_eq!(whole_history(&cold, &h_cold, &adm_ask, &tip1.hex(), "pub/a/b/c/hot.txt", Limits::default()), Ok(expected_hot.clone()));
+    assert_eq!(whole_history(&cold, &h_cold, &adm_ask, &tip1.hex(), "fin/x/y/z/ledger.txt", Limits::default()), Ok(expected_fin));
+    let anyone_hot = whole_history(&cold, &h_cold, &anyone_ask, "main", "pub/a/b/c/hot.txt", Limits::default()).unwrap();
+    assert_eq!(anyone_hot.len(), n1, "anyone sees all {n1} edits to pub/a/b/c/hot.txt");
+    let blame = cold.rt.block_on(query::blame(&cold_hub, &adm_ask, BlameParams { rev: Some("main".into()), path: "pub/a/b/c/hot.txt".into(), ..Default::default() }, Limits::default())).unwrap();
+    let lines = blame["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["snapshot"], packed_order[0].hex());
+    assert_eq!(lines[1]["snapshot"], packed_order[n1 - 1].hex());
+
+    // Incremental push of `n2` packed snapshots on top of the filled history (exercises `low > 1` + stored prefetch).
+    let n2 = 150usize;
+    let tip2 = push_packed(&mut h, tip1, n1, n2, &mut files);
+    h.set_branch(&th, "main", tip2);
+    let mut order2 = Vec::new();
+    {
+        let mut cur = tip2;
+        while cur != tip1 {
+            order2.push(cur);
+            let raw = th.rt.block_on(h.hub.objects.get(h.id, &cur)).unwrap().unwrap();
+            let Object::Snapshot(s) = Object::decode(&raw).unwrap() else { unreachable!() };
+            cur = s.parents[0];
+        }
+        order2.reverse();
+    }
+    packed_order.extend(order2);
+    assert_eq!(packed_order.len(), n1 + n2);
+
+    cold.rt.block_on(query::graph::ensure_files(&cold_hub, &project, &adm_viewer, &[tip2], None)).unwrap();
+    cold.rt.block_on(query::graph::ensure_files(&cold_hub, &project, &anyone_viewer, &[tip2], None)).unwrap();
+    let expected_hot2: Vec<String> = packed_order.iter().rev().map(|id| id.hex()).collect();
+    let expected_fin2: Vec<String> = packed_order.iter().enumerate().rev().filter(|(i, _)| i % 2 == 0).map(|(_, id)| id.hex()).collect();
+    assert_eq!(whole_history(&cold, &h_cold, &adm_ask, &tip2.hex(), "pub/a/b/c/hot.txt", Limits::default()), Ok(expected_hot2));
+    assert_eq!(whole_history(&cold, &h_cold, &adm_ask, &tip2.hex(), "fin/x/y/z/ledger.txt", Limits::default()), Ok(expected_fin2));
+    let anyone_hot2 = whole_history(&cold, &h_cold, &anyone_ask, "main", "pub/a/b/c/hot.txt", Limits::default()).unwrap();
+    assert_eq!(anyone_hot2.len(), n1 + n2, "anyone sees all {} edits after incremental fill", n1 + n2);
+}
+

@@ -201,7 +201,9 @@ remote "$HUB1" "docker run --rm --env-file /etc/veil/hub.env veil-server:$TAG mi
 # them on a server it starts (crates/veil-bench/src/server.rs): a driver's
 # 10,000 agents are a few devices on one address, and would measure the
 # limits. A server for people keeps the defaults (docs/HUB.md §13.25).
-SERVER_RUN="docker run -d --name veil-server --restart unless-stopped -p 8443:8443 --env-file /etc/veil/hub.env -v veil-data:/var/lib/veil -v /etc/veil/tls:/tls:ro --ulimit nofile=1048576:1048576 veil-server:$TAG --listen 0.0.0.0:8443 --data /var/lib/veil --db-connections $DB_CONNECTIONS --s3-endpoint $(objects_endpoint) --s3-bucket $BUCKET --s3-region $S3_REGION --tls-cert /tls/server.pem --tls-key /tls/server-key.pem --device-rate 1000000000/1000000000 --anonymous-rate 1000000000/1000000000 --max-connections 262144"
+# The object layout is the server's default unless the kit sets one
+# (OBJECT_LAYOUT; docs/HUB.md §13.42).
+SERVER_RUN="docker run -d --name veil-server --restart unless-stopped -p 8443:8443 --env-file /etc/veil/hub.env -v veil-data:/var/lib/veil -v /etc/veil/tls:/tls:ro --ulimit nofile=1048576:1048576 veil-server:$TAG --listen 0.0.0.0:8443 --data /var/lib/veil --db-connections $DB_CONNECTIONS --s3-endpoint $(objects_endpoint) --s3-bucket $BUCKET --s3-region $S3_REGION --tls-cert /tls/server.pem --tls-key /tls/server-key.pem --device-rate 1000000000/1000000000 --anonymous-rate 1000000000/1000000000 --max-connections 262144${OBJECT_LAYOUT:+ --object-layout $OBJECT_LAYOUT}"
 HEALTHY='for i in $(seq 30); do [ "$(docker inspect -f "{{.State.Health.Status}}" veil-server 2>/dev/null)" = healthy ] && break; sleep 2; done; docker inspect -f "   veil-server: {{.State.Health.Status}}" veil-server; docker logs --tail 5 veil-server'
 remote "$HUB1" "docker rm -f veil-server >/dev/null 2>&1; $SERVER_RUN"
 remote "$HUB1" "$HEALTHY"

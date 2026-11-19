@@ -1666,6 +1666,9 @@ pub enum WsCmd {
     Exec {
         /// Workspace to run in (or use --ephemeral).
         name: Option<String>,
+        /// Workspace to run in when its name starts with `-`.
+        #[arg(long, value_name = "NAME", allow_hyphen_values = true, conflicts_with_all = ["name", "ephemeral"])]
+        workspace: Option<String>,
         /// Run in a one-shot workspace on REV and record the result as a new change on top of it.
         #[arg(long)]
         ephemeral: bool,

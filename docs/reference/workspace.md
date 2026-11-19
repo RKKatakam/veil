@@ -116,6 +116,7 @@ Options:
 
 | | |
 |---|---|
+| `--workspace <NAME>` | Workspace to run in when its name starts with `-` |
 | `--ephemeral` | Run in a one-shot workspace on REV and record the result as a new change on top of it |
 | `-r, --rev <REV>` | Base revision for --ephemeral (default: `@-`) |
 | `-m, --message <MESSAGE>` | Description to record (default: empty) |

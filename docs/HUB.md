@@ -983,10 +983,10 @@ For a viewer `v`, real snapshot `S` maps to `P(S)` (`sync::projected`):
 | `GET /v1/projects/{p}/tips` | branches → tips as the caller sees them (projections); the branch rows may be up to 100 ms old (§13.14) |
 | `POST …/history {tips, stop}` | the caller's projected snapshots from `tips` down to `stop`, as object frames (`id ‖ len u32be ‖ object`); to a caller that accepts encoded frames, each object as stored, compressed or not (§13.15) |
 | `POST …/fetch {snapshot, objects: [{path, id, snapshot?}]}` | objects by id, each with the path where the client met it under that snapshot (its own `snapshot`, or the request's); the server walks the viewer's projection of that snapshot to that path and serves the object only if it is there (as stored, to a caller that accepts encoded frames: §13.15). No list of what the client has; each request names an immutable object, so a per-viewer cache can serve it |
-| `POST …/objects` | upload object frames, plain or encoded (§13.15): decoded (bounded), re-hashed, canonically decoded, format-checked, compressed when that is smaller, and **staged** as one pack (S28, §13.20): nobody's until a push of the same person lists it, deleted if the push refuses it. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id ‖ pack, then the pack's name) |
-| `POST …/push {updates: [{branch, expected, new}], force, receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries |
+| `POST …/objects` | upload object frames, plain or encoded (§13.15): decoded (bounded), re-hashed, canonically decoded, format-checked, compressed when that is smaller, and **staged** as one pack (S28, §13.20): nobody's until a push of the same person lists it, deleted if the push refuses it. Answers a **receipt** per object (a server MAC over project ‖ person ‖ id ‖ pack, then the pack's name) and, from revision 9 (BUG-1150), the staged `packs` written |
+| `POST …/push {updates: [{branch, expected, new}], force, packs \| receipts}` | complete and check every new snapshot, then move the branches in **one serialisable transaction of compare-and-swaps** (`UPDATE branches SET target = new WHERE … AND target = expected`); one lost race rejects the whole push with 409 and `vl` retries. From revision 9 (BUG-1150), `vl` sends `packs` (the staged pack names from `POST …/objects`) instead of per-object `receipts`; `packs` and `receipts` are mutually exclusive |
 | `POST …/changes {base, edits, onto?, change_id?, receipts}` | a commit through the API, without a checkout (S10, §13.13) |
-| `POST …/land {onto, snapshot \| base+edits, receipts, wait}`, `GET …/land/{ticket}` | submit a landing to the landing service, and its outcome (S17, §13.19) |
+| `POST …/land {onto, snapshot \| base+edits, packs \| receipts, wait}`, `GET …/land/{ticket}` | submit a landing to the landing service, and its outcome (S17, §13.19; `packs` with `snapshot` only, revision 9, BUG-1150) |
 | `GET …/access?path=` | the deciding line and who it names; only for a path the caller may read |
 | `…/groups`, `GET|POST …/rings/{scope}`, `GET /v1/people/{name}/devices` | groups; key rings of secret scopes; a person's devices (active, the newest pending, removed), the vouches and invite joins the server stores, which devices check before sharing a key (§13.11, §13.12) |
 | `POST /v1/devices/vouch {device, signature}` | the signed-in device vouches for another device of its person; a pending one becomes active |
@@ -2554,9 +2554,9 @@ edit sets, the fast path, the landing check; `rules.rs`: `.veilrules`),
 ```text
 POST /v1/projects/{p}/land
 { "onto": "main",
-  "snapshot": "<id, as a push names it>"            // uploaded first, with receipts
+  "snapshot": "<id, as a push names it>"            // uploaded first, with packs (rev 9+) or receipts
   | "base": "<id as the caller sees it>", "edits": [...], "description", "change_id"?,
-  "receipts": {...}, "wait": true }
+  "packs": [...], "receipts": {...}, "wait": true } // packs (snapshot only) and receipts are mutually exclusive
 → { "ticket", "state": "queued" | "landed" | "conflict" | "rejected",
     "change_id"?, "landed": ["<each change's snapshot, as the caller sees it>"],
     "message"?, "paths": ["<the change's own paths that moved>"], "warnings": [...] }
@@ -2945,24 +2945,37 @@ Nothing changes for `vl` or on the wire.
   one database commit per pack, so one per `vl` upload request, apart from
   the push's one), then the pack: one storage write per pack (one per `vl`
   upload request).
-  Each receipt is `MAC(project ‖ person ‖ id ‖ pack) ‖ "." ‖ pack`. A staged
-  pack is nobody's: its objects are read only by a push or API commit of
-  that person that shows its receipts, through `Objects::get_staged`, and
-  cached under keys of their own (`Objects::staged_key`, in the object and
-  tree caches), so no read of the project ever answers a staged object.
+  Each receipt is `MAC(project ‖ person ‖ id ‖ pack) ‖ "." ‖ pack`, and from
+  revision 9 (BUG-1150) the answer also lists the unique staged `packs`
+  written. A staged pack is nobody's: its objects are read only by a push or
+  API commit of that person that names it (`packs`) or shows its `receipts`,
+  through `Objects::get_staged`, and cached under keys of their own
+  (`Objects::staged_key`, in the object and tree caches), so no read of the
+  project ever answers a staged object.
   **An upload of objects that a pack the same person staged on this server
   holds all of** (a push that lost a race, uploaded again by `vl`'s next
-  try) gets that pack's receipts, with no new pack and no commit.
-* **What counts as uploaded** (BUG-1155): only an object its receipt's
-  pack holds, where that pack is the pusher's and staged or listed (one
-  statement: the rows). A receipt of a discarded upload is worth nothing,
-  and a staged object is read from its pack only, never looked for in the
-  project's store instead, so naming a guess of hidden content with an old
-  receipt gets the answer a wrong guess gets.
-* **A push** reads the staged packs its receipts name (their indexes, from
-  memory on the server that took the upload, or by bisecting the sorted
-  index in storage with 64 KiB ranged reads), checks every new snapshot as
-  before, and then, when something lands:
+  try) gets that pack's receipts and name, with no new pack and no commit.
+* **What counts as uploaded** (BUG-1155, BUG-1150): for a push naming
+  `packs` (revision 9, mutually exclusive with `receipts`), every object in
+  every named staged pack, where each pack name is syntactically valid (32
+  lowercase hex digits), named at most once, and belongs to the pusher in
+  `project` with state `STAGED` or `LISTED` (`Packs::usable_for_packs`); a
+  pack belonging to another person or project, a forged name, or a pack
+  discarded by an earlier check refusal (`objects >= 0`) all receive the
+  same `400 bad_request` answer (no oracle), and only the pusher's own
+  verified packs are ever discarded. For `receipts` (API commits and pushes
+  from clients before revision 9), only an object its receipt's pack holds,
+  where that pack is the pusher's and staged or listed (one statement: the
+  rows). A discarded upload is worth nothing in either form, and a staged
+  object is read from its pack only, never looked for in the project's store
+  instead, so naming a guess of hidden content gets the answer a wrong guess
+  gets.
+* **A push** reads the staged packs it names (`packs`, reading each pack's
+  index under `Packs::bound` and releasing the share immediately into
+  `StagedSlots`) or that its `receipts` name (from memory on the server that
+  took the upload, or by bisecting the sorted index in storage with 64 KiB
+  ranged reads), checks every new snapshot as before, and then, when
+  something lands:
   * lists a staged pack **as it is** if its checks read every object in it
     (what a `vl` push uploads is exactly what the checks read: §13.5);
   * puts the objects the checks read from any other staged pack, and the
@@ -3128,8 +3141,8 @@ trusted (with code; never with secrets' plaintext).
 | 1 | A pack hands a reader objects of folders they cannot see | no route sends a pack; every object is read one at a time after its path or chain check | `grants::object_routes_serve_only_what_a_grant_reaches`, `leaks::…`, `sync::…` (all on packed objects now) |
 | 2 | Pack membership confirms a hidden object (one in the same pack as a visible one) | lookups answer only what the route's check reached; a hidden object of the same pack gets the answer a random id gets | `grants::object_routes_serve_only_what_a_grant_reaches` |
 | 3 | A refused plain-text secret stays stored (BUG-930) | uploads are staged; the refusing push discards them; a landing push discards what it did not list | `packs::a_refused_push_deletes_its_staged_upload`, `packs::an_unread_plain_text_secret_beside_a_landing_push_is_not_kept`, `changes::bug_930_…` |
-| 4 | Another person's staged upload read or claimed, or a discarded upload's receipt used to confirm a guess of hidden content (BUG-824's class, BUG-1155) | receipts bind person and pack; an object counts as uploaded only if its receipt's pack, the pusher's and not discarded, holds it; staged objects are read only from their pack and never cached as the project's | `packs::receipts_hold_only_for_their_person_and_pack`, `packs::bug_1155_…` (a push and an API commit) |
-| 5 | A receipt moved to another pack, or a crafted pack name (`../`) | the MAC covers the pack; names are 32 lowercase hex digits | same |
+| 4 | Another person's staged upload read or claimed, or a discarded upload's receipt or pack name used to confirm a guess of hidden content (BUG-824's class, BUG-1155, BUG-1150) | `packs` names are checked against `packs` rows for `(project, person)` in state `STAGED`/`LISTED` (other people's packs, forged names, and refused discards all get the same `400 bad_request`, and only caller-owned packs are discarded); receipts bind person and pack; staged objects are read only from their pack and never cached as the project's | `packs::receipts_hold_only_for_their_person_and_pack`, `packs::bug_1155_…`, `packs::bug_1150_push_packs_proof_of_upload_in_{packs,objects}_layout` |
+| 5 | A receipt moved to another pack, a duplicate pack name, or a crafted pack name (`../`) | the MAC covers the pack; `packs` rejects duplicates; names are 32 lowercase hex digits | same |
 | 6 | A race lists a pack another push of the same person discards, or deletes a listed one | the primary key decides; discard deletes only after its row won; a push deletes its own pack directly only if its transaction never began | `pack::…`, `packs::a_refused_push_deletes_its_staged_upload` |
 | 7 | An object a push's checks never read kept in the store (an upload a push names but never checks) | only what the checks read is listed or copied | `packs::a_push_is_one_storage_write_and_reads_come_from_its_pack` (crafted pushes upload superseded trees) |
 | 8 | A damaged or hostile index (counts, offsets past the end, unsorted, overflow, a slot naming another object's entry) | parsed with every bound checked; every read, ranged ones too, checks the id its entry starts with; whole reads are checked against the id | `pack::tests::…`, `store::tests::bug_1154_a_wrong_slot_never_serves_another_objects_range` |
@@ -4738,20 +4751,23 @@ vl daemon status | start [--cache-size SIZE] | stop
   request is still checked by its own grant and device signature, which is
   what keeps another Veil home's device, and later a narrower agent
   session (S11), to its own projection through the socket. **Sandboxed
-  commands (`vl ws exec`) see neither the socket nor the store**: the
+  commands (`vl ws exec`, Linux) see neither the socket nor the store**: the
   daemon's folders are Veil's own private folders, listed with the Veil
   home in one place (`ctx::veil_private_dirs`), which the confinement
-  never shows: an allowed folder or seed that holds one, as named or
-  resolved (`--allow ~/.cache`, `--allow ~`), is refused, naming narrower
-  folders to allow, and so is an allowed path inside one (BUG-1512:
-  `--allow ~/.cache` showed the store; BUG-1516: a mask covers a folder
-  as it is at the start, so one removed and made again during a run
-  showed through; refusing by name holds for the whole run). Veil's
-  sandboxes never write through a link into one. **Residual
-  (BUG-1519):** a second view of a folder that holds them (a bind mount, a
-  disk mounted twice, a FUSE mirror such as `bindfs`: made by the person or
-  by root, both inside the trust boundary; a confined command cannot make
-  one) is not known by name, and an allowed path through it shows them.
+  never shows: an allowed folder or seed that holds or lies inside one —
+  as named, resolved through symlinks, by Unix `(st_dev, st_ino)` file
+  identity, via Linux `/proc/self/mountinfo` aliases (bind mounts,
+  reverse/subtree/file bind mounts, submounts, double-mounted disks,
+  `overlay`, and `fuse.bindfs` with its backing path in `mountinfo`), or
+  via hard links to files in the Veil home or daemon runtime folder — is
+  refused before the command runs, naming narrower folders to allow
+  (BUG-1512, BUG-1516, BUG-1519). Veil's sandboxes never write through a
+  link into one. Residual: only a mount whose backing path is opaque to
+  `/proc/self/mountinfo` (an arbitrary custom FUSE mirror or loopback
+  network mount) or a mount created concurrently after `bwrap` starts
+  (by the person or root, inside the trust boundary; a confined command
+  cannot mount); on macOS `vl ws exec` confinement is not yet built and
+  warns that plain runs are unconfined (BUG-2455).
 
 #### The decision, per request
 
@@ -4912,7 +4928,7 @@ minutes by whoever saw it"; the daemon saw it), and returns no object.
 | 2 | Same | a real grant with a chain through another snapshot's or the admin's trees | chains start at the grant's root, each step from the hash-checked store | guarantee 1 |
 | 3 | A same-user process | hands the daemon its own grant key and a grant it signed | no such field: the daemon checks under the key it fetched from the server | by construction; guarantee 1 (a grant signed by another key) |
 | 4 | A person or device removed | keeps using a grant | refused within 5 s | guarantee 2 |
-| 5 | A sandboxed agent (`vl ws exec`) | connects to the socket, reads the store, also through an allowed folder that holds them (`--allow ~/.cache`), or after the folder is removed and made again during the run | an allowed folder or seed holding one of Veil's folders is refused, so none is ever shown (BUG-1512, BUG-1516); a second view made by the person or by root (both inside the trust boundary; a confined command cannot make one) is residual (BUG-1519); without the device key it could not sign a request anyway | `cli_workspaces` `confine_cli::the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them`, `s6r2_the_daemons_folders_stay_hidden_by_every_route`, `s6r2_a_daemon_folder_made_again_during_a_run_stays_hidden`, `s6r3_a_linked_home_and_unusual_xdg_values_never_show_or_misplace_the_daemon` (a `HOME` through a link; a relative `XDG_CACHE_HOME`; an `XDG_RUNTIME_DIR` not this user's 0700 folder) |
+| 5 | A sandboxed agent (`vl ws exec`, Linux) | connects to the socket, reads the store, also through an allowed folder that holds them (`--allow ~/.cache`), through a bind mount / double-mounted disk / `overlay` / `fuse.bindfs` / hard link / symlink / renamed parent, or after the folder is removed and made again during the run | an allowed folder or seed holding or lying inside one of Veil's folders (by name, symlink, Unix `(st_dev, st_ino)` identity, Linux `/proc/self/mountinfo` aliases, or hard links) is refused before the command runs, so none is ever shown (BUG-1512, BUG-1516, BUG-1519); only a mount opaque to `/proc/self/mountinfo` or made concurrently after `bwrap` starts remains (requiring the person or root, inside the trust boundary; a confined command cannot mount); without the device key it could not sign a request anyway | `cli_workspaces` `confine_cli::the_daemons_store_and_socket_stay_hidden_when_an_allowed_folder_holds_them`, `s6r2_the_daemons_folders_stay_hidden_by_every_route`, `s6r2_a_daemon_folder_made_again_during_a_run_stays_hidden`, `s6r2_a_bind_mount_alias_never_shows_veils_folders`, `bug_1519_hard_links_symlinks_and_renamed_parents_never_expose_veils_folders_or_credentials`, `s6r3_a_linked_home_and_unusual_xdg_values_never_show_or_misplace_the_daemon`; `vl` `confine::tests::bug_1519_*` |
 | 5b | Another OS user | listens first at the daemon's socket path (a shared `XDG_RUNTIME_DIR`) | a `vl` checks its peer's uid and sends nothing; a runtime folder not this user's 0700 one is not used (BUG-1515) | `s6r2_a_vl_never_asks_another_os_users_daemon` (needs root) |
 | 6 | Another OS user | connects to the socket, reads the store | the directories are 0700 and the peer's uid is checked | guarantee 6 (modes; a second uid needs root to test) |
 | 7 | A local process, a torn write | changes bytes in the store | the object fails its id check, is removed, comes from the server | guarantee 6, `store::tests` |

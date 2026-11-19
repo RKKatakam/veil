@@ -2588,7 +2588,11 @@ take no lock:
   workspaces, tags, remote tags: one side's change wins, two different
   changes go to the first side and the other target stays a visible head
   (through the rest of the fold too: a later step's dropped head never
-  hides a loser, BUG-1298), with a warning printed once by the process that writes the merge; a
+  hides a loser, BUG-1298; and a loser settled by an earlier merge whose
+  head `drop_ancestor_heads` removed because a covering head sat above it
+  is recovered if a concurrent undo or op restore drops that covering head,
+  provided the losing write was neither retracted nor superseded on that
+  ref, BUG-2642), with a warning printed once by the process that writes the merge; a
   removal loses to a change; a workspace's or tag's cloak merges separately
   and a cloaked side wins; a release tag's target and annotation are one
   unit and win over an ordinary tag). Each side's `rewritten` is applied to
@@ -2608,16 +2612,24 @@ take no lock:
   shows set (a tag on the old version, a workspace on it, an undo's
   revert) stays where it is, and every other ref follows the rewrite. A
   rewrite only merges recorded (the op log does not say which command it
-  is) is still judged by the views: not applied when a head that saw it
-  shows its old snapshot, or a side shows it where the fold step's shared
-  history does not (BUG-1295). Two rewrites of one snapshot that stand
-  and differ are a divergent change, whether their commands ran
-  concurrently or one saw the other (a command that saw a rewrite and
-  rewrote the old version again made a second version, BUG-1488; one
-  that was taken back is dropped by what the op log says took it back,
-  never because a later one "replaces" it). Nothing follows either
-  version, and a snapshot with two versions that commands made (each
-  recorded by a command the merge collects, neither taken back) stays
+  is) stands only when at least one merge that recorded it was not taken
+  back by an op restore still in force (BUG-2641), and is still judged by
+  the views: not applied when a head that saw it shows its old snapshot,
+  or a folded head shows it where its own shared history with the incoming
+  head does not (BUG-1295, BUG-2641 — each folded head is checked
+  individually rather than the un-rebased accumulated view); and when it
+  meets a standing command's rewrite of the same snapshot, `is_merge_rebase`
+  distinguishes a merge's own parent rebase (including one another settler
+  also made in the shared history) from a shared-history command copied
+  onto a merge, so a settler's rebase does not turn a command's rewrite
+  into a false divergence (BUG-2641). Two rewrites
+  of one snapshot that stand and differ are a divergent change, whether
+  their commands ran concurrently or one saw the other (a command that saw
+  a rewrite and rewrote the old version again made a second version,
+  BUG-1488; one that was taken back is dropped by what the op log says
+  took it back, never because a later one "replaces" it). Nothing follows
+  either version, and a snapshot with two versions that commands made
+  (each recorded by a command the merge collects, neither taken back) stays
   where it is, with what is on it: the merge's rebase does not move it
   through an ancestor's rewrite either (that made a third version). One
   whose differing rewrites only merges recorded is rebased like any
@@ -2636,13 +2648,17 @@ take no lock:
   it replaces), and what follows the rewrite lands on the result. A
   command's own rebase is unchanged: its replacements are where the
   command put them (the server's version of a change, a projection).
-  Open: an undo of an op restore (or of an undo) puts rewrites back in
-  force that nothing applies to what was put on their old snapshots
-  meanwhile (BUG-2640); in a fold of three or more heads the merged
-  view of the heads folded so far, not rebased yet, can be taken for a
-  side that brought an old snapshot back, and a settler's recorded
-  rebase that op restores went back past still counts as a version of
-  its snapshot (BUG-2641).
+  **Reinstated rewrites** (BUG-2640): when an undo, redo or op restore
+  takes an earlier undo or op restore back — whether as a single command
+  (`Repo::reinstated_for_command`) or on one side of a merge
+  (`Repo::extend_with_reinstated`) — the shared-history commands it puts
+  back in force (and what the shared history made of their replacements,
+  followed transitively) are applied to what the resulting view shows on
+  their old snapshots (never walking `start_view` on an undo/restore, so
+  dropped heads are not rebased back in), respecting pinned refs and
+  divergent changes, and are **not** re-recorded on the operation's
+  `rewritten` so a later undo or restore of the original command still
+  takes them back cleanly.
   The confinement check runs against **every side's view**: a rewrite that
   would move a change out of an unreleased embargo either side had it in
   is dropped and its replacement rewritten back, so the change stays
@@ -3624,7 +3640,7 @@ afterwards; textconv input on stdin, output never stored.
 
 * **the Veil server, with plain-text code,** branch tips, group and admin records, folder access and metadata. It enforces every permission. Someone who breaks into it reads the code; that is accepted (`docs/OVERVIEW.md`, non-goals);
 * **regional caches** (`veil-server cache`, `docs/HUB.md` §13.18; owner-delegated, 2026-11-07), run by the server's operator, inside the server's boundary. A cache holds the caches' token, hash-checked objects (secret files only as ciphertext), the server's public grant key and nothing else: no key that opens a secret, no session, no database and no permission authority. It serves an object only under a grant the server signed, a request signed by the grant's device, a chain checked from the grant's root, and access epochs the server confirmed within 5 s; past that it fails closed and passes requests to the server. **A compromised cache** can serve what it already holds to anyone, so it is as trusted as the object store; it can never sign a grant or read a secret;
-* **the Veil daemon** (`vl daemon`, `docs/HUB.md` §13.29), a process of the person's own OS account, one per OS user in the default layout (or one per `VEIL_HOME` when set). It holds hash-checked objects its Veil home's `vl` processes read (secret files only as ciphertext), the server's public grant key (fetched by itself) and no key, session or permission authority. It serves an object only under a grant the server signed, a request signed by the grant's device, a chain checked from the grant's root and access epochs the server confirmed within 5 s, else passes the request to the server; its socket and store are 0700 and it accepts only its own OS user. Other OS users share nothing with it: a `vl` connects only to a socket its own user listens on, and takes `XDG_RUNTIME_DIR` only when it is that user's 0700 folder (BUG-1515). A command confined by `vl ws exec` cannot see its socket or store: they are Veil's own private folders, listed with the Veil home in one place (`ctx::veil_private_dirs`); the sandbox never shows them, and an allowed folder or seed that holds one, as named or resolved, is refused (BUG-1512, BUG-1516). **Residual (BUG-1519):** the confinement knows paths and links, not mounts; a second view of a folder holding the Veil home or the daemon's store (a bind mount, a disk mounted twice, a FUSE mirror such as `bindfs`), allowed by its other path, shows them. Such a second view is made by the person or by root, both inside the trust boundary, and a confined command cannot make one (`--dev` gives it no `/dev/fuse`, and `no_new_privs` makes `fusermount3`'s setuid inert);
+* **the Veil daemon** (`vl daemon`, `docs/HUB.md` §13.29), a process of the person's own OS account, one per OS user in the default layout (or one per `VEIL_HOME` when set). It holds hash-checked objects its Veil home's `vl` processes read (secret files only as ciphertext), the server's public grant key (fetched by itself) and no key, session or permission authority. It serves an object only under a grant the server signed, a request signed by the grant's device, a chain checked from the grant's root and access epochs the server confirmed within 5 s, else passes the request to the server; its socket and store are 0700 and it accepts only its own OS user. Other OS users share nothing with it: a `vl` connects only to a socket its own user listens on, and takes `XDG_RUNTIME_DIR` only when it is that user's 0700 folder (BUG-1515). A command confined by `vl ws exec` (Linux) cannot see its socket or store: they are Veil's own private folders, listed with the Veil home in one place (`ctx::veil_private_dirs`); the sandbox never shows them, and an allowed folder or seed that holds or lies inside one — as named, resolved through symlinks, by Unix file identity `(st_dev, st_ino)`, via Linux `/proc/self/mountinfo` aliases (bind mounts, reverse bind mounts, subtree/file bind mounts, submounts across filesystems, double-mounted disks, `overlay`, and `fuse.bindfs` whose backing path appears in `mountinfo`), or via hard links to files in the Veil home or daemon runtime folder — is refused before the command runs, and masked credential files (`~/.cargo/credentials*`, etc.) and the real project root are likewise masked across mount aliases and hard links (BUG-1512, BUG-1516, BUG-1519). **Per-platform boundary:** on **Linux**, confinement enforces all of the above (failing closed if `/proc/self/mountinfo` is unreadable); the only remaining mount residual is a second view whose backing directory is opaque to `/proc/self/mountinfo` (such as an arbitrary userspace FUSE mirror that does not report its backing path or a loopback NFS/SMB mount) or a mount/rename/hard-link created concurrently *after* `bwrap` starts, both requiring the person or root (inside the trust boundary; a confined command cannot mount because `--dev` gives it no `/dev/fuse` and `no_new_privs` makes `fusermount3`'s setuid inert). On **macOS**, `vl ws exec` confinement is not yet built: flags asking for confinement or limits are refused, and plain runs execute unconfined with an explicit warning (BUG-2455); the Unix `(st_dev, st_ino)` identity and hard-link checks are portable across Unix for future macOS confinement;
 * each person's device and OS account, and the identity and key files on it. Anyone who can run commands as the person, read their process memory or replace the `vl` binary already holds their keys. Protecting key files at rest is a backlog item, not a bug;
 * each person's own deliberate commands, including `public!`, `--force`, `--no-verify` and their own edits to `.veilpolicy` (the server still checks who may change access). Veil warns but obeys;
 * the OS, the file system, and the toolchain and dependencies `vl` was built with.

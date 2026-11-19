@@ -405,7 +405,7 @@ so a database reached by an address its certificate does not carry is
 accepted when its CA is the one given. Proven against PostgreSQL 17 with `ssl = on` and
 only `hostssl` lines; not yet run against a managed service.
 
-**Object layout (`--object-layout`, `VEIL_OBJECT_LAYOUT`).** `--object-layout packs|objects` (or `VEIL_OBJECT_LAYOUT`, default `packs`; `docs/HUB.md` §13.42, `docs/design/server/object-layout.md`) chooses whether kept objects are stored in packs or one object per key (`p/<project>/<2 hex>/<62 hex>`). Every read checks both layouts, so switching the flag and restarting needs no migration and converts nothing; `stats.json` records `object_layout`, `storage_deletes`, `storage_lists`, `objects_kept` and `uploads`. In `objects`, a push makes roughly three times as many `PUT`/`DELETE` requests to the object store as in `packs`, so a project that suddenly turns busy meets S3's or Cloud Storage's per-prefix warm-up (~3,500 writes/s before automatic prefix splitting) about three times sooner—and DigitalOcean Spaces' 800 requests/s bucket limit (§2.3) proportionately sooner too. Watch `s3_slow_down` (`503 Slow Down` / `429` retries) and `s3_gave_up` in `stats.json`.
+**Object layout (`--object-layout`, `VEIL_OBJECT_LAYOUT`).** In v1, `objects` is the default and sole writable object layout (`--object-layout objects`, `VEIL_OBJECT_LAYOUT=objects`; `docs/HUB.md` §13.42, `docs/design/server/object-layout.md`): kept objects are stored one object per key (`p/<project>/<2 hex>/<62 hex>`), and passing `packs` is rejected at startup. Every read still checks existing listed packs from earlier `packs` deployments before the loose key, so nothing needs conversion; `stats.json` records `object_layout`, `storage_deletes`, `storage_lists`, `objects_kept` and `uploads`. In `objects`, a push writes each kept object individually (plus one staged upload container that is deleted on commit), so a project that suddenly turns busy meets S3's or Cloud Storage's per-prefix warm-up (~3,500 writes/s before automatic prefix splitting)—and DigitalOcean Spaces' 800 requests/s bucket limit (§2.3)—sooner than packed storage. Watch `s3_slow_down` (`503 Slow Down` / `429` retries) and `s3_gave_up` in `stats.json`.
 
 ## 4. Local rehearsal
 
@@ -643,7 +643,7 @@ made them; `docs/REPRODUCE.md` §6 says how to read each file:
 
 | File | What |
 |---|---|
-| `run.txt` | gate, date, `commit=` (the checkout's full id), `image_tag=`, the agents' address, the number of servers, every size setting of `deploy/gates.sh`, extra flags |
+| `run.txt` | gate, date, `commit=` (the checkout's full id), `image_tag=`, the agents' address, the number of servers, every size setting of `deploy/gates.sh`, `object_layout=` (the object layout the servers ran, as each of them reported it before the gate: §12.4), extra flags |
 | `topology.env` | the topology from `deploy/do/.env` without a secret (`lib.sh` `topology`: a fixed list of names, so a new secret can never leak into it) and the pinned image references |
 | `images.txt` | the ids of the images built here, of the ones each server and driver has, the containers running, and the pinned third-party digests |
 | `commands.txt` | every `veil-bench` command line and the machine it ran on |
@@ -1288,6 +1288,20 @@ deploy/gcp/destroy.sh --approve
 deploy/gcp/destroy.sh --check --approve      # repeat until it says "nothing left"
 ```
 
+**The object layout a run used** (`docs/HUB.md` §13.42). The kit gives
+the servers no layout: each runs the server's own default (`objects` in
+v1). Every gate's `run.txt` states the layout that ran
+(`object_layout=objects`), and it is the servers' word, not the kit's:
+before a gate `bench.sh` asks each server (the `object_layout` of its
+`stats.json`), and refuses the gate, recording nothing, when a server
+gives none or two servers differ. The same value goes to every
+`veil-bench` command as `--object-layout`, so the tool's json and tables
+name it, and a server the tool starts itself (`objects`, `openscion`,
+`scale`) runs in the deployment's layout. `VEIL_GCP_OBJECT_LAYOUT=objects`
+in `deploy/gcp/.env` passes that layout explicitly to every server
+`configure.sh` starts (setting `packs` is refused in v1); a gate is then
+also refused while the servers report another.
+
 ### 12.5 Spot reclaims
 
 `deploy/gcp/bench.sh` watches the Spot VMs around each gate:
@@ -1344,7 +1358,7 @@ all are gone. Glance at Billing > Reports in the console the next day.
 
 ### 12.7 Testing the kit
 
-`bash deploy/gcp/test/test.sh` (85 checks) runs every script against a
+`bash deploy/gcp/test/test.sh` (97 checks) runs every script against a
 fake gcloud (`deploy/gcp/test/fake-gcloud`), a made-up project that
 remembers what was created, stopped and deleted, with fake ssh, scp,
 docker and curl. It checks that the dry runs of the full topology exit 0,
@@ -1361,7 +1375,11 @@ in the certificate, no `spaces.env`; each database machine's data disk;
 Veil's database colocated by default, the hash layout with its tablets,
 PostgreSQL's settings sized on the machine with durability on); the
 `onerepo` gate (one project, 1,000 and 5,000 agents, the database machines
-sampled) and its table on made-up results; the Spot watch (a clean gate valid; a
+sampled) and its table on made-up results; the object layout (no layout
+given to a server unless `VEIL_GCP_OBJECT_LAYOUT` names one; every gate
+recording the layout the servers report and telling the tool; a gate
+refused when a server reports none, the servers differ, or they are not
+in the one set); the Spot watch (a clean gate valid; a
 reclaim during a gate marks it invalid, starts the VM and reruns once; a
 second reclaim fails without a third run; a VM down before a gate is
 started first; a reclaimed storage machine with `all` reconfigures);

@@ -846,11 +846,9 @@ async fn objects(
     if !project.participant(&viewer) {
         return Err(Error::forbidden("you are not in this project"));
     }
-    let receipts = sync::upload(&hub, project.id, me, body, crate::db::body_limit("/objects") as u64).await?;
-    Ok(Json(veil_core::hub::wire::Uploaded {
-        stored: receipts.len(),
-        receipts,
-    }))
+    Ok(Json(
+        sync::upload(&hub, project.id, me, body, crate::db::body_limit("/objects") as u64).await?,
+    ))
 }
 
 async fn push(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>, Json(req): Json<PushRequest>) -> Result<Json<PushResult>> {

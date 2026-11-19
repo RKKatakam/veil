@@ -867,10 +867,11 @@ impl Client {
     }
 
     /// Upload object frames (plain, or encoded for a server of revision 2);
-    /// the server's receipt for each, in order.
-    pub fn upload(&self, frames: Vec<u8>) -> Result<Vec<String>> {
+    /// the server's answer: stored count, per-object receipts, and from
+    /// revision 9 the staged pack names (BUG-1150).
+    pub fn upload(&self, frames: Vec<u8>) -> Result<veil_core::hub::wire::Uploaded> {
         let out = self.ok("POST", &self.url.project_path("/objects"), Some(("application/octet-stream", frames)))?;
-        Ok(serde_json::from_slice::<veil_core::hub::wire::Uploaded>(&out)?.receipts)
+        Ok(serde_json::from_slice(&out)?)
     }
 
     /// Push; `Ok(None)` when a branch moved during the push (retry).
@@ -1877,16 +1878,31 @@ impl<'a, F: FnMut(ObjectId, Vec<u8>) -> Result<()>> Introduced<'a, F> {
     }
 }
 
+/// What [`upload_new`] sends with the push or snapshot landing: staged pack
+/// names for a server of revision 9+, or per-object receipts for an older
+/// server (BUG-1150).
+#[derive(Default)]
+struct UploadedProof {
+    count: usize,
+    receipts: BTreeMap<ObjectId, String>,
+    packs: Vec<String>,
+}
+
 /// Object frames on their way to the server, about 8 MiB per request, and
-/// the server's receipt for each: the push shows them, so it names nothing
-/// it did not send (BUG-824). To a server of revision 2 each object goes
-/// compressed (S27), compressed as the walk finds it.
+/// what the server returned for them: staged pack names from revision 9
+/// (BUG-1150), or per-object receipts for older servers (BUG-824). To a
+/// server of revision 2 each object goes compressed (S27), compressed as the
+/// walk finds it.
 struct Uploads<'a> {
     client: &'a Client,
     compress: bool,
+    use_packs: bool,
     frames: Vec<u8>,
     ids: Vec<ObjectId>,
+    count: usize,
     receipts: BTreeMap<ObjectId, String>,
+    packs: Vec<String>,
+    seen_packs: HashSet<String>,
 }
 
 impl Uploads<'_> {
@@ -1907,12 +1923,28 @@ impl Uploads<'_> {
         if self.ids.is_empty() {
             return Ok(());
         }
-        let r = self.client.upload(std::mem::take(&mut self.frames))?;
+        let up = self.client.upload(std::mem::take(&mut self.frames))?;
         let ids = std::mem::take(&mut self.ids);
-        if r.len() != ids.len() {
-            bail!("the server sent {} upload receipts for {} objects", r.len(), ids.len());
+        if self.use_packs {
+            if up.stored != ids.len() {
+                bail!("the server stored {} objects for {} uploaded", up.stored, ids.len());
+            }
+            if up.packs.is_empty() {
+                bail!("the server returned no staged packs for {} uploaded objects", ids.len());
+            }
+            self.count += ids.len();
+            for p in up.packs {
+                if self.seen_packs.insert(p.clone()) {
+                    self.packs.push(p);
+                }
+            }
+        } else {
+            if up.receipts.len() != ids.len() {
+                bail!("the server sent {} upload receipts for {} objects", up.receipts.len(), ids.len());
+            }
+            self.count += ids.len();
+            self.receipts.extend(ids.into_iter().zip(up.receipts));
         }
-        self.receipts.extend(ids.into_iter().zip(r));
         Ok(())
     }
 }
@@ -2108,17 +2140,19 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
             });
         }
         let targets: Vec<ObjectId> = updates.iter().filter_map(|u| u.new).collect();
-        let (uploaded, receipts) = if targets.is_empty() {
-            (0, BTreeMap::new())
+        let proof = if targets.is_empty() {
+            UploadedProof::default()
         } else {
-            upload_new(repo, remote, client, &targets, revision >= 2)?
+            upload_new(repo, remote, client, &targets, revision)?
         };
+        let uploaded = proof.count;
         let pushed: HashMap<String, ObjectId> = updates.iter().filter_map(|u| Some((u.branch.clone(), u.new?))).collect();
         let req_embargoes: Vec<veil_core::keychain::EmbargoRecord> = embargoes.into_values().collect();
         let answer = match client.push(&PushRequest {
             updates,
             force,
-            receipts,
+            receipts: proof.receipts,
+            packs: proof.packs,
             embargoes: req_embargoes,
         }) {
             // A deletion the server refuses never holds back the rest.
@@ -2230,10 +2264,12 @@ pub fn push(repo: &mut Repo, remote: &str, client: &Client, only_tags: &[String]
 /// Upload what the snapshots `targets` reach that the server lacks (what
 /// the remote tags of `remote` do not reach), 8 MiB per request (BUG-858),
 /// then the key rings (secret scopes), so new members can open what lands
-/// (`team` first of them: it names the project the others belong to). The
-/// objects sent, and their receipts.
-/// `compress`: a server of revision 2 reads compressed objects.
-fn upload_new(repo: &Repo, remote: &str, client: &Client, targets: &[ObjectId], compress: bool) -> Result<(usize, BTreeMap<ObjectId, String>)> {
+/// (`team` first of them: it names the project the others belong to). Returns
+/// the count uploaded and the staged pack names (revision 9+, BUG-1150) or
+/// per-object receipts (older servers).
+fn upload_new(repo: &Repo, remote: &str, client: &Client, targets: &[ObjectId], revision: u32) -> Result<UploadedProof> {
+    let compress = revision >= 2;
+    let use_packs = revision >= veil_core::hub::wire::PUSH_PACKS_REVISION;
     let prefix = format!("{remote}/");
     let view = repo.view().clone();
     // What the server has: everything the remote tags reach, as held
@@ -2280,7 +2316,17 @@ fn upload_new(repo: &Repo, remote: &str, client: &Client, targets: &[ObjectId], 
         bail!("{why}");
     }
     // Upload what the push introduces as the walk finds it.
-    let mut up = Uploads { client, compress, frames: Vec::new(), ids: Vec::new(), receipts: BTreeMap::new() };
+    let mut up = Uploads {
+        client,
+        compress,
+        use_packs,
+        frames: Vec::new(),
+        ids: Vec::new(),
+        count: 0,
+        receipts: BTreeMap::new(),
+        packs: Vec::new(),
+        seen_packs: HashSet::new(),
+    };
     let mut walk = Introduced::new(&store, |id, raw| up.add(&id, &raw));
     for ((id, _), (tree, parents)) in new.iter().zip(tree_pairs) {
         walk.snapshot(*id, tree, parents)?;
@@ -2292,7 +2338,11 @@ fn upload_new(repo: &Repo, remote: &str, client: &Client, targets: &[ObjectId], 
             crate::render::warn(&format!("key ring '{}' not sent: {e:#}", ring.scope));
         }
     }
-    Ok((up.receipts.len(), up.receipts))
+    Ok(UploadedProof {
+        count: up.count,
+        receipts: up.receipts,
+        packs: up.packs,
+    })
 }
 
 /// After a landing: a local tag still where the landed change was (`from`,
@@ -2352,11 +2402,13 @@ pub fn land(repo: &mut Repo, remote: &str, client: &Client, rev: ObjectId, onto:
             bail!("'{b}' on the server is not at the change being landed: push {b} first, or land without --delete");
         }
     }
-    let (uploaded, receipts) = upload_new(repo, remote, client, &[rev], revision >= 2)?;
+    let proof = upload_new(repo, remote, client, &[rev], revision)?;
+    let uploaded = proof.count;
     let result = client.land(&veil_core::hub::land::LandRequest {
         onto: onto.to_string(),
         snapshot: Some(rev),
-        receipts,
+        receipts: proof.receipts,
+        packs: proof.packs,
         wait,
         delete_branch: delete.map(str::to_string),
         ..Default::default()

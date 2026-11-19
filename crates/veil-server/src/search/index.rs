@@ -398,17 +398,24 @@ pub fn flags_of(e: &TreeEntry) -> u8 {
     f
 }
 
-/// The content of a [`TEXT`] entry, if it is searchable: a blob with no
-/// NUL byte (the same test a grep's scan makes).
-pub fn text_of(src: &Source, id: &ObjectId) -> Result<Option<Vec<u8>>> {
-    let raw = src.raw(id)?;
-    if !Object::is_blob_raw(&raw) {
+fn decode_text(raw: &[u8]) -> Result<Option<Vec<u8>>> {
+    if !Object::is_blob_raw(raw) {
         return Ok(None);
     }
-    match Object::decode(&raw)? {
+    match Object::decode(raw)? {
         Object::Blob(b) if !b.contains(&0) && b.len() as u64 <= MAX_TEXT_BYTES => Ok(Some(b)),
         _ => Ok(None),
     }
+}
+
+/// The content of a [`TEXT`] entry, if it is searchable: a blob with no
+/// NUL byte (the same test a grep's scan makes).
+pub fn text_of(src: &Source, id: &ObjectId) -> Result<Option<Vec<u8>>> {
+    decode_text(&src.raw(id)?)
+}
+
+fn text_of_ephemeral(src: &Source, id: &ObjectId) -> Result<Option<Vec<u8>>> {
+    decode_text(&src.raw_ephemeral(id)?)
 }
 
 /// Writes segments for one shard, flushing at the caps.
@@ -456,7 +463,7 @@ fn put(src: &Source, raw: Vec<u8>, stats: &mut Stats) -> Result<SegRef> {
     stats.segments += 1;
     stats.segment_bytes += bytes;
     src.rt
-        .block_on(src.hub.objects.put(src.project, &id, Bytes::from(raw)))
+        .block_on(src.hub.objects.put_ephemeral(src.project, &id, Bytes::from(raw)))
         .map_err(|e| Error::Other(e.context("storing a search segment")))?;
     Ok(SegRef { id: id.hex(), bytes })
 }
@@ -474,7 +481,7 @@ fn code_segments(src: &Source, adds: &[(String, TreeEntry)], dead: Vec<String>, 
         let mut flags = flags_of(e);
         let mut g = Vec::new();
         if flags & TEXT != 0 {
-            match text_of(src, &e.id)? {
+            match text_of_ephemeral(src, &e.id)? {
                 Some(t) => {
                     w.stats.content_bytes += t.len() as u64;
                     w.b.bytes += t.len() as u64;
@@ -526,19 +533,35 @@ fn name_segments(src: &Source, names: &BTreeMap<String, u8>, stats: &mut Stats) 
 }
 
 fn load_all(src: &Source, segs: &[SegRef]) -> Result<Vec<Arc<Segment>>> {
-    segs.iter().map(|s| segment::load(src, &oid(&s.id)?)).collect()
+    segs.iter().map(|s| segment::load_uncached(src, &oid(&s.id)?)).collect()
+}
+
+fn merge_loaded(
+    src: &Source,
+    shard: &mut Shard,
+    a: usize,
+    b: usize,
+    inputs: Vec<Arc<Segment>>,
+    newer: &dyn Fn(&str) -> bool,
+    stats: &mut Stats,
+) -> Result<()> {
+    let (raw, dropped) = segment::merge(&inputs, newer, a == 0);
+    drop(inputs);
+    stats.merges += 1;
+    let replacement = if Segment::is_empty_encoded(&raw) {
+        Vec::new()
+    } else {
+        vec![put(src, raw, stats)?]
+    };
+    shard.segments.splice(a..b, replacement);
+    shard.dead = (shard.dead - dropped as i64).max(0);
+    Ok(())
 }
 
 /// Merge `shard.segments[a..b]` into one segment.
 fn merge_range(src: &Source, shard: &mut Shard, a: usize, b: usize, newer: &dyn Fn(&str) -> bool, stats: &mut Stats) -> Result<()> {
     let inputs = load_all(src, &shard.segments[a..b])?;
-    let (raw, dropped) = segment::merge(&inputs, newer, a == 0);
-    stats.merges += 1;
-    let empty = Segment::decode(&raw).map(|s| s.docs.is_empty() && s.dead.is_empty()).unwrap_or(false);
-    let replacement = if empty { Vec::new() } else { vec![put(src, raw, stats)?] };
-    shard.segments.splice(a..b, replacement);
-    shard.dead = (shard.dead - dropped as i64).max(0);
-    Ok(())
+    merge_loaded(src, shard, a, b, inputs, newer, stats)
 }
 
 /// Keep a shard's segments few and its dead documents bounded.
@@ -590,11 +613,12 @@ fn rewrite(src: &Source, shard: &mut Shard, stats: &mut Stats) -> Result<()> {
     // stay valid.
     let mut shadow: HashSet<String> = HashSet::new();
     for (a, b) in groups {
-        let paths: Vec<String> = load_all(src, &shard.segments[a..b])?
+        let inputs = load_all(src, &shard.segments[a..b])?;
+        let paths: Vec<String> = inputs
             .iter()
-            .flat_map(|s| s.docs.iter().map(|d| d.path.clone()).chain(s.dead.iter().cloned()).collect::<Vec<_>>())
+            .flat_map(|s| s.docs.iter().map(|d| d.path.clone()).chain(s.dead.iter().cloned()))
             .collect();
-        merge_range(src, shard, a, b, &|p| shadow.contains(p), stats)?;
+        merge_loaded(src, shard, a, b, inputs, &|p| shadow.contains(p), stats)?;
         shadow.extend(paths);
     }
     Ok(())
@@ -885,6 +909,11 @@ fn textlike(e: &TreeEntry) -> (i64, i64) {
     }
 }
 
+/// In-memory `(snapshot, lines_ident, gc_epoch, shards)` of the default branch
+/// during [`all_at_once`], so new branches/tags prepared in the same batch diff
+/// against `default` instead of re-indexing from [`empty_tree_id`] (BUG-2663).
+type DefaultCodeState = (ObjectId, String, i64, BTreeMap<String, Shard>);
+
 /// Move the code index of each of `wanted` (`(branch, tip)`) and the names
 /// index to their tips in one transaction: `false` (nothing written) if a
 /// head moved meanwhile.
@@ -892,9 +921,11 @@ fn all_at_once(cx: &Cx, lines: &Lines, wanted: &[(String, ObjectId)], default: &
     let pool = &cx.hub().derive.db;
     let g = Graph::new(cx);
     let mut writes = Vec::new();
+    let mut default_code: Option<DefaultCodeState> = None;
     for (branch, tip) in wanted {
-        writes.extend(prepare_code(cx, &g, lines, branch, *tip, default, stats)?);
+        writes.extend(prepare_code(cx, &g, lines, branch, *tip, default, &mut default_code, stats)?);
     }
+    drop(default_code);
     writes.extend(prepare_names_of(cx, &g, lines, wanted, default, stats)?);
     if writes.is_empty() {
         return Ok(true);
@@ -918,7 +949,8 @@ fn code(cx: &Cx, lines: &Lines, branch: &str, tip: ObjectId, default: &str, stat
     let pool = &cx.hub().derive.db;
     let g = Graph::new(cx);
     for _ in 0..8 {
-        let Some(w) = prepare_code(cx, &g, lines, branch, tip, default, stats)? else {
+        let mut default_code = None;
+        let Some(w) = prepare_code(cx, &g, lines, branch, tip, default, &mut default_code, stats)? else {
             return Ok(());
         };
         let ok = cx.db(|| async {
@@ -938,7 +970,17 @@ fn code(cx: &Cx, lines: &Lines, branch: &str, tip: ObjectId, default: &str, stat
     Err(Error::busy())
 }
 
-fn prepare_code(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId, default: &str, stats: &mut Stats) -> Result<Option<PreparedWrite>> {
+#[allow(clippy::too_many_arguments)]
+fn prepare_code(
+    cx: &Cx,
+    g: &Graph,
+    lines: &Lines,
+    branch: &str,
+    tip: ObjectId,
+    default: &str,
+    default_code: &mut Option<DefaultCodeState>,
+    stats: &mut Stats,
+) -> Result<Option<PreparedWrite>> {
     let src = &cx.src;
     let pool = &cx.hub().derive.db;
     if withheld(g, &tip)? {
@@ -949,11 +991,15 @@ fn prepare_code(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId, 
     let gc_epoch = read_gc_epoch_cx(cx, pool)?;
     let (head, old) = read_state(cx, pool, CODE, branch, None)?;
     if head.as_ref().is_some_and(|h| h.snapshot == tip.hex() && h.lines == ident) {
+        if branch == default {
+            *default_code = Some((tip, ident, gc_epoch, old));
+        }
         return Ok(None);
     }
     // Where to start: this branch's index under the same lines, else
-    // the default branch's, else nothing; under other lines, the
-    // shards whose keys are kept (the rest are built from the tip).
+    // the default branch's (committed or prepared earlier in this batch),
+    // else nothing; under other lines, the shards whose keys are kept (the
+    // rest are built from the tip).
     let (mut shards, base, fresh, removed): (BTreeMap<String, Shard>, Option<ObjectId>, BTreeSet<String>, Vec<String>) = match &head {
         Some(h) if h.lines == ident => (old, Some(oid(&h.snapshot)?), BTreeSet::new(), Vec::new()),
         Some(h) => {
@@ -964,13 +1010,21 @@ fn prepare_code(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId, 
         }
         None => {
             let from_default = if branch != default {
-                let (dh, ds) = read_state(cx, pool, CODE, default, None)?;
-                dh.filter(|h| h.lines == ident).map(|h| (h, ds))
+                match default_code.as_ref().filter(|(_, l, e, _)| *l == ident && *e == gc_epoch) {
+                    Some((dtip, _, _, ds)) => Some((*dtip, ds.clone())),
+                    None => {
+                        let (dh, ds) = read_state(cx, pool, CODE, default, None)?;
+                        match dh.filter(|h| h.lines == ident) {
+                            Some(h) => Some((oid(&h.snapshot)?, ds)),
+                            None => None,
+                        }
+                    }
+                }
             } else {
                 None
             };
             match from_default {
-                Some((dh, ds)) => (ds, Some(oid(&dh.snapshot)?), BTreeSet::new(), Vec::new()),
+                Some((dtip, ds)) => (ds, Some(dtip), BTreeSet::new(), Vec::new()),
                 None => (BTreeMap::new(), None, all.clone(), Vec::new()),
             }
         }
@@ -1045,6 +1099,10 @@ fn prepare_code(cx: &Cx, g: &Graph, lines: &Lines, branch: &str, tip: ObjectId, 
             }
         })
         .collect();
+    if branch == default {
+        let committed = shards.into_iter().filter(|(_, s)| !s.segments.is_empty()).collect();
+        *default_code = Some((tip, ident.clone(), gc_epoch, committed));
+    }
     Ok(Some(PreparedWrite::new(
         CODE,
         branch,
@@ -1210,7 +1268,7 @@ fn prepare_names_of(cx: &Cx, g: &Graph, lines: &Lines, tips: &[(String, ObjectId
         };
         for s in old.values() {
             for r in &s.segments {
-                let seg = segment::load(src, &oid(&r.id)?)?;
+                let seg = segment::load_uncached(src, &oid(&r.id)?)?;
                 for d in &seg.docs {
                     let k = lines.key_of(&d.path, &entry_of(d)).to_string();
                     if fresh.contains(&k) && moved.entry(k).or_default().insert(d.path.clone(), d.flags).is_none() {
@@ -1231,8 +1289,14 @@ fn prepare_names_of(cx: &Cx, g: &Graph, lines: &Lines, tips: &[(String, ObjectId
     };
     let mut new = Vec::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut covered_tips: Vec<ObjectId> = Vec::new();
+    let mut covered_set: HashSet<ObjectId> = HashSet::new();
     for (branch, tip, walked) in &todo {
-        let mut stops: Vec<ObjectId> = Vec::new();
+        let subset_stops = *branch == default || walked.is_none();
+        if subset_stops && covered_set.contains(tip) {
+            continue;
+        }
+        let mut stops: Vec<ObjectId> = covered_tips.clone();
         if head.is_some() {
             if let Some(w) = walked {
                 stops.push(oid(&w.snapshot)?);
@@ -1243,8 +1307,15 @@ fn prepare_names_of(cx: &Cx, g: &Graph, lines: &Lines, tips: &[(String, ObjectId
                 }
             }
         }
-        new.extend(rev_list(g, *tip, &stops)?.into_iter().filter(|s| seen.insert(*s)));
+        let walked_now = rev_list(g, *tip, &stops)?;
+        if subset_stops {
+            covered_set.extend(walked_now.iter().copied());
+            covered_tips.push(*tip);
+        }
+        new.extend(walked_now.into_iter().filter(|s| seen.insert(*s)));
     }
+    drop(covered_set);
+    drop(covered_tips);
     stats.walked += new.len();
     let mut gathered: BTreeMap<String, BTreeMap<String, u8>> = BTreeMap::new();
     let mut held = 0usize;
@@ -1332,7 +1403,8 @@ pub(crate) fn prepare_for_landing(
     }
     let mut stats = Stats::default();
     let mut out = Vec::with_capacity(2);
-    if let Some(w) = prepare_code(cx, g, lines, branch, *tip, &default, &mut stats)? {
+    let mut default_code = None;
+    if let Some(w) = prepare_code(cx, g, lines, branch, *tip, &default, &mut default_code, &mut stats)? {
         out.push(w);
     }
     if let Some(w) = prepare_names(cx, g, lines, branch, *tip, &default, &mut stats)? {

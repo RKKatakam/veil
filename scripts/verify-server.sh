@@ -64,7 +64,24 @@ BUCKETS="veil-pg veil-yb veil-hpg veil-hyb veil-load-pg veil-load-yb"
 remove_buckets() { # names in the shared MinIO's data directory
   [ $# -gt 0 ] && D exec "$S3" sh -c 'cd /bitnami/minio/data && for b; do case "$b" in ""|.*|*/*) continue;; esac; rm -rf -- "$b" ".minio.sys/buckets/$b"; done' sh "$@" >/dev/null 2>&1
 }
+kill_vt_orphans() { # detached children (`vl share-keys`, `vl daemon`) left under this run's TMPDIR=$VT
+  case "$VT" in "$HOME"/.vt/??????) ;; *) return 0 ;; esac
+  python3 - "$VT" "$$" <<'PY' 2>/dev/null
+import os, signal, sys
+vt, me = b'TMPDIR=' + sys.argv[1].encode(), int(sys.argv[2])
+for e in os.listdir('/proc'):
+    if not e.isdigit() or int(e) == me: continue
+    try:
+        env = open(f'/proc/{e}/environ', 'rb').read().split(b'\0')
+        if vt in env:
+            os.kill(int(e), signal.SIGTERM)
+    except Exception:
+        pass
+PY
+}
+
 cleanup() {
+  kill_vt_orphans
   case "$VT" in "$HOME"/.vt/??????) rm -rf -- "$VT" 2>/dev/null ;; esac
   if [ $SHARED = 1 ]; then
     remove_buckets $(for k in $BUCKETS; do echo "$k-$RUN"; done)
@@ -171,10 +188,97 @@ done
 status=0
 # Every step is bounded: a hang fails the run instead of blocking it.
 STEP_LIMIT=${STEP_LIMIT:-600}
+# BUG-2720: dump process tree, thread wait channels/syscalls, open sockets and
+# active database queries once a step passes WATCHDOG_AT (default 300 s) and
+# again right before `timeout` kills it, so a hung run never dies silent.
+WATCHDOG_AT=${VEIL_WATCHDOG_SECS:-300}
+dump_watchdog() { # out_file, root_pid, step_name, elapsed_s
+  local out=$1 root=$2 name=$3 elapsed=$4 pids p t tid
+  {
+    echo "=== watchdog: step=$name elapsed=${elapsed}s $(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cat /proc/loadavg 2>/dev/null) ==="
+    pids=$(python3 - "$root" "$VT" <<'PY' 2>/dev/null
+import os, sys
+root, vt = int(sys.argv[1]), sys.argv[2].encode()
+children, vt_pids = {}, set()
+for e in os.listdir('/proc'):
+    if not e.isdigit(): continue
+    pid = int(e)
+    try:
+        st = open(f'/proc/{pid}/stat', 'rb').read()
+        ppid = int(st[st.rfind(b')')+2:].split()[1])
+        children.setdefault(ppid, []).append(pid)
+    except Exception:
+        pass
+    try:
+        env = open(f'/proc/{pid}/environ', 'rb').read().split(b'\0')
+        if b'TMPDIR=' + vt in env:
+            vt_pids.add(pid)
+    except Exception:
+        pass
+seen, stack = set(), [root]
+while stack:
+    p = stack.pop()
+    if p in seen: continue
+    seen.add(p)
+    stack.extend(children.get(p, []))
+seen |= vt_pids
+seen.discard(os.getpid())
+print(' '.join(str(p) for p in sorted(seen) if os.path.exists(f'/proc/{p}')))
+PY
+    )
+    if [ -n "$pids" ]; then
+      ps -o pid,ppid,pgid,stat,etime,pcpu,rss,wchan:28,args -p "$(echo "$pids" | tr ' ' ',')" 2>&1 || true
+      for p in $pids; do
+        [ -d "/proc/$p/task" ] || continue
+        echo "--- threads of pid $p ($(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-160)) ---"
+        for t in /proc/$p/task/*; do
+          [ -d "$t" ] || continue
+          tid=${t##*/}
+          echo "  tid=$tid comm=$(cat "$t/comm" 2>/dev/null) wchan=$(cat "$t/wchan" 2>/dev/null) syscall=$(cat "$t/syscall" 2>/dev/null)"
+          sed 's/^/    /' "$t/stack" 2>/dev/null || true
+        done
+      done
+      command -v lsof >/dev/null 2>&1 && lsof -nP -a -i -U -p "$(echo "$pids" | tr ' ' ',')" 2>/dev/null | head -120
+    else
+      echo "(no step processes found)"
+    fi
+    echo "--- postgres active queries ---"
+    D exec "$PG" psql -U veil -d veil -c "SELECT pid, datname, state, wait_event_type, wait_event, now() - query_start AS age, left(query, 160) FROM pg_stat_activity WHERE state <> 'idle' AND pid <> pg_backend_pid()" 2>&1 || true
+    if [ "$WITH_YB" = 1 ]; then
+      echo "--- yugabyte active queries ---"
+      ysql "SELECT pid, datname, state, wait_event_type, wait_event, now() - query_start AS age, left(query, 160) FROM pg_stat_activity WHERE state <> 'idle' AND pid <> pg_backend_pid()" 2>&1 || true
+    fi
+  } >> "$out" 2>&1
+}
+
 step() { # name, command...
   local name=$1; shift
-  if timeout --kill-after=30 "$STEP_LIMIT" "$@" > "$LOGS/$name.log" 2>&1; then echo "   ok    $name"
-  else echo "   FAIL  $name (exit $?: 124 is the ${STEP_LIMIT}s limit)  ($LOGS/$name.log)"; status=1; fi
+  local t0 rc spid wpid dt extra="" wlog="$LOGS/$name.watchdog.log"
+  t0=$(date +%s)
+  rm -f "$wlog"
+  timeout --kill-after=30 "$STEP_LIMIT" "$@" > "$LOGS/$name.log" 2>&1 &
+  spid=$!
+  (
+    local next=$WATCHDOG_AT pre=$(( STEP_LIMIT > 25 ? STEP_LIMIT - 20 : STEP_LIMIT )) pre_done=0 el
+    while kill -0 "$spid" 2>/dev/null; do
+      el=$(( $(date +%s) - t0 ))
+      if (( el >= next )); then
+        dump_watchdog "$wlog" "$spid" "$name" "$el"
+        next=$(( el + 120 ))
+      elif (( !pre_done && el >= pre )); then
+        dump_watchdog "$wlog" "$spid" "$name" "$el"
+        pre_done=1
+      fi
+      sleep 2
+    done
+  ) &
+  wpid=$!
+  wait "$spid"; rc=$?
+  kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  dt=$(( $(date +%s) - t0 ))
+  [ -s "$wlog" ] && extra="  (watchdog: $wlog)"
+  if [ $rc = 0 ]; then echo "   ok    $name (${dt}s)$extra"
+  else echo "   FAIL  $name (${dt}s, exit $rc: 124 is the ${STEP_LIMIT}s limit)  ($LOGS/$name.log)$extra"; status=1; fi
   grep -E '^test result|tests run' "$LOGS/$name.log" | tail -1 | sed 's/^/         /'
 }
 
@@ -227,8 +331,10 @@ load() { # url, bucket, copies (each copy bounded like a step)
   return $rc
 }
 load_step() { # name, url, bucket, copies: the copies are bounded, not the function
-  local name=$1; shift
-  if load "$@" > "$LOGS/$name.log" 2>&1; then echo "   ok    $name"; else echo "   FAIL  $name  ($LOGS/$name.log)"; status=1; fi
+  local name=$1 t0 dt; shift
+  t0=$(date +%s)
+  if load "$@" > "$LOGS/$name.log" 2>&1; then dt=$(( $(date +%s) - t0 )); echo "   ok    $name (${dt}s)"
+  else dt=$(( $(date +%s) - t0 )); echo "   FAIL  $name (${dt}s)  ($LOGS/$name.log)"; status=1; fi
   cat "$LOGS/$name.log" | sed 's/^/         /'
 }
 load_step load-postgres "$PG_URL" veil-load-pg-$RUN 8
