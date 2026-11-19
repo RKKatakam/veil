@@ -2135,3 +2135,70 @@ fn hostile_bug_2852_push_packs_holds_staged_indexes_within_indexes_held_bound() 
         grew >> 20
     );
 }
+
+/// BUG-2870 (review b1b; regression introduced by BUG-2852 in `t3/fix-1150-review`):
+/// `sync::staging_packs` retains every loaded `Arc<pack::Held>` in `held_packs`
+/// (`Staged::held`) while awaiting `Packs::staged_index` (`Bound::take_for`) for
+/// remaining packs of the same push, violating `Bound::take_for`'s own invariant
+/// ("only by a holder of none, so holders never wait on one another in a cycle").
+/// A single push naming 7 uncached `MAX_OBJECTS` (262,144-object) staged packs
+/// (e.g. routed to a cold peer server, or evicted from the 32 MiB `staged` LRU)
+/// holds `6 × 12 MiB = 72 MiB` of `INDEXES_HELD` (96 MiB) in `held_packs` (leaving
+/// 24 MiB free) and then self-deadlocks for `INDEX_WAIT` (10 s) waiting for the
+/// 7th pack's `27 MiB` `read_weight`, failing with `503 Service Unavailable`.
+/// Hostile size: run alone.
+#[test]
+#[ignore = "BUG-2870: sync::staging_packs holds Bound permits in held_packs while awaiting more staged_index reads, self-deadlocking a 7-pack push with 503 IndexesFull"]
+fn hostile_bug_2870_push_packs_never_self_deadlocks_on_uncached_multi_pack_push() {
+    let hub1 = TestHub::start();
+    let hub2 = TestHub::beside(&hub1);
+    let p = setup_project(&hub1);
+    let api1 = hub1.api();
+    let api2 = hub2.api();
+    let token = p.dev.token();
+    let tip = api1.tips(Some(&token), &p.name).unwrap().branches["main"];
+
+    // Build `MAX_OBJECTS - 1` shared tiny blobs once, then upload 7 distinct
+    // `MAX_OBJECTS` (262,144-object) staged packs to `hub1` (each appending one
+    // unique blob so `stage` creates 7 distinct containers).
+    let shared_count = veil_server::pack::MAX_OBJECTS - 1;
+    let mut shared = Vec::with_capacity(shared_count * 56);
+    for i in 0..shared_count {
+        let mut raw = [0u8; 18];
+        raw[..10].copy_from_slice(b"veil:blob\n");
+        raw[10..18].copy_from_slice(&(i as u64).to_le_bytes());
+        let id = ObjectId::hash(&raw);
+        put_frame(&mut shared, &id, &raw);
+    }
+
+    let mut packs = Vec::with_capacity(7);
+    for k in 0..7u32 {
+        let mut body = Vec::with_capacity(shared.len() + 64);
+        body.extend_from_slice(&shared);
+        let raw = O::Blob(format!("bug-2870-unique-{k}").into_bytes()).encode();
+        let id = ObjectId::hash(&raw);
+        put_frame(&mut body, &id, &raw);
+        let up = api1.upload_encoded_body(&token, &p.name, &body);
+        assert_eq!(up.status, 200, "upload {k}: {}", String::from_utf8_lossy(&up.body[..up.body.len().min(400)]));
+        let text = std::str::from_utf8(&up.body).unwrap();
+        let marker = "\"packs\":[\"";
+        let at = text.find(marker).expect("packs in upload reply") + marker.len();
+        let pack = text[at..at + text[at..].find('"').unwrap()].to_string();
+        assert_eq!(pack.len(), 32, "valid 32-hex pack name");
+        packs.push(pack);
+    }
+
+    // Push naming all 7 packs on cold peer `hub2` (none in `hub2`'s `staged` LRU).
+    // Must complete (200 with ok=false on mismatched expected tip), never hang for
+    // 10 s and fail with 503 IndexesFull.
+    let wrong = ObjectId::hash(b"not the tip 2870");
+    let body = json!({"updates": [{"branch": "main", "expected": wrong.hex(), "new": tip.hex()}], "packs": packs});
+    let r = api2.post_json(Some(&token), &format!("/v1/projects/{}/push", p.name), &body);
+    assert_eq!(
+        r.status,
+        200,
+        "7-pack push on cold peer server must not self-deadlock with 503 IndexesFull: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["results"][0]["ok"], json!(false), "{}", String::from_utf8_lossy(&r.body));
+}

@@ -3120,4 +3120,93 @@ mod tests {
         assert_eq!(found_name, rep_name);
         assert!(packs2.gone.load(Ordering::SeqCst) > gone_before, "vanished pack must be forgotten");
     }
+
+    /// BUG-2870 (review b1b; regression of BUG-1620 introduced by BUG-2852 in
+    /// `t3/fix-1150-review`): `Packs::staged_index` calls `held.unproject()` on
+    /// uncached request-held indexes without placing them in the bounded 32 MiB
+    /// `self.staged` cache. That zeroes `BoundState::held[project]` while
+    /// keeping `12 MiB` of permits in `self.bound.sem` per `MAX_OBJECTS` pack,
+    /// letting one project bypass the 16 MiB per-project `quarter` cap, consume
+    /// `72 MiB`+ of `INDEXES_HELD` (96 MiB), and starve unrelated projects into
+    /// `503 IndexesFull`.
+    #[tokio::test]
+    #[ignore = "BUG-2870: Packs::staged_index calls unproject() on uncached request-held shares, bypassing per-project quota and starving other projects into 503 IndexesFull"]
+    async fn bug_2870_staged_index_never_bypasses_per_project_quota_to_starve_other_projects() {
+        struct SharedPackStore(Bytes);
+
+        #[async_trait::async_trait]
+        impl BlobStore for SharedPackStore {
+            async fn get(&self, _key: &str) -> Result<Option<Bytes>> {
+                Ok(Some(self.0.clone()))
+            }
+            async fn put(&self, _key: &str, _data: Bytes) -> Result<()> {
+                Ok(())
+            }
+            async fn exists(&self, _key: &str) -> Result<bool> {
+                Ok(true)
+            }
+            async fn len(&self, _key: &str) -> Result<Option<u64>> {
+                Ok(Some(self.0.len() as u64))
+            }
+            async fn get_range(&self, _key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+                let total = self.0.len() as u64;
+                if start >= total {
+                    return Ok(None);
+                }
+                let stop = (end.min(total - 1) + 1) as usize;
+                Ok(Some((self.0.slice(start as usize..stop), total)))
+            }
+            async fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+        }
+
+        // Build one valid `MAX_OBJECTS` (262,144-object) pack (`weight = 12 MiB`,
+        // `read_weight = 27 MiB`) served for any uncached staged pack name.
+        let mut items = Vec::with_capacity(MAX_OBJECTS);
+        for i in 0..MAX_OBJECTS {
+            let mut raw = [0u8; 18];
+            raw[..10].copy_from_slice(b"veil:blob\n");
+            raw[10..18].copy_from_slice(&(i as u64).to_le_bytes());
+            items.push((ObjectId::hash(&raw), Bytes::copy_from_slice(&raw)));
+        }
+        let (pack_bytes, _) = build(items).unwrap();
+        let store = SharedPackStore(pack_bytes);
+
+        let mut packs = Packs::new(None);
+        packs.bound.wait = Duration::from_millis(250);
+
+        // Project 1 holds as many uncached staged indexes as `staged_index` allows
+        // (up to 6 packs = 72 MiB if unproject() bypasses the 16 MiB quarter cap).
+        let mut p1_held = Vec::new();
+        for i in 0..6 {
+            match packs.staged_index(&store, 1, &format!("p1_{i}")).await {
+                Ok(Some(h)) => p1_held.push(h),
+                Ok(None) => panic!("synthetic staged pack must exist"),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !p1_held.is_empty(),
+            "project 1 must be able to load at least one uncached staged pack"
+        );
+
+        // Under BUG-1620, project 1 may hold at most its per-project share (leaving
+        // >= 48 MiB of `most = 64 MiB` free), so unrelated project 2 must always be
+        // able to load one `MAX_OBJECTS` staged pack (27 MiB read weight).
+        let avail_before_p2 = packs.bound().available();
+        let p2_res = packs.staged_index(&store, 2, "p2_0").await;
+        drop(p1_held);
+        let p2_held = p2_res.unwrap_or_else(|e| {
+            panic!(
+                "unrelated project 2 starved into IndexesFull while project 1 held uncached staged indexes (available before p2: {} MiB / {} MiB): {e:#}",
+                avail_before_p2 >> 20,
+                INDEXES_HELD >> 20
+            )
+        });
+        assert!(p2_held.is_some(), "project 2's staged pack must load");
+    }
 }
