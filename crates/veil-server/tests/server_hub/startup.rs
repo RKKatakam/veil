@@ -1895,7 +1895,6 @@ fn bug_2922_migration_45_never_loses_concurrent_revocation_from_person_epochs() 
 /// running during a rolling upgrade executes `bisect::revert_confirmed_culprit`
 /// with `ON CONFLICT (ticket) DO NOTHING`, which fails with PostgreSQL `42P10`.
 #[test]
-#[ignore = "BUG-2924: migration 0044 drops landing_queue_ticket in the same migration, breaking pre-0044 servers' ON CONFLICT (ticket) during rolling upgrades"]
 fn bug_2924_migration_44_preserves_pre_44_bisect_on_conflict_ticket_during_rolling_upgrade() {
     let rt = runtime();
     let (url, name) = fresh_database(&rt);

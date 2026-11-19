@@ -21,7 +21,7 @@
 --                     + projections_by_projected_at ((project_id, projected_id) HASH, created_at DESC)
 --   5. landed_changes PRIMARY KEY ((project_id, branch) HASH, lineage ASC, change_id ASC, author ASC)
 --   6. landing_queue  PRIMARY KEY ((project_id, branch) HASH, seq ASC)
---                     + landing_queue_project_ticket UNIQUE ((project_id, ticket) HASH)
+--                     + landing_queue_ticket UNIQUE (ticket HASH)
 --                     + landing_queue_queued (((CASE ...), branch) HASH, priority DESC, created_at ASC, seq ASC)
 --                     + landing_queue_person_slot UNIQUE ((project_id, person_id) HASH, person_slot ASC)
 --                     + landing_queue_session_slot UNIQUE ((project_id, person_id, session) HASH, session_slot ASC)
@@ -392,8 +392,8 @@ BEGIN
       session_slot  INTEGER,
       PRIMARY KEY ((project_id, branch) HASH, seq ASC)
     );
-    CREATE UNIQUE INDEX IF NOT EXISTS landing_queue_q4_project_ticket
-      ON landing_queue_q4 ((project_id, ticket) HASH);
+    CREATE UNIQUE INDEX IF NOT EXISTS landing_queue_q4_ticket
+      ON landing_queue_q4 (ticket HASH);
     CREATE INDEX IF NOT EXISTS landing_queue_q4_queued
       ON landing_queue_q4 (
         ((CASE WHEN state = 'queued' THEN project_id ELSE NULL END), branch) HASH,
@@ -458,7 +458,7 @@ BEGIN
   END IF;
   ALTER SEQUENCE landing_queue_seq_seq OWNED BY landing_queue.seq;
   ALTER INDEX IF EXISTS landing_queue_q4_pkey RENAME TO landing_queue_pkey;
-  ALTER INDEX IF EXISTS landing_queue_q4_project_ticket RENAME TO landing_queue_project_ticket;
+  ALTER INDEX IF EXISTS landing_queue_q4_ticket RENAME TO landing_queue_ticket;
   ALTER INDEX IF EXISTS landing_queue_q4_queued RENAME TO landing_queue_queued;
   ALTER INDEX IF EXISTS landing_queue_q4_person_slot RENAME TO landing_queue_person_slot;
   ALTER INDEX IF EXISTS landing_queue_q4_session_slot RENAME TO landing_queue_session_slot;

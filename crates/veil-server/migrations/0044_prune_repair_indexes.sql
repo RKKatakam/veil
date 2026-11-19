@@ -31,8 +31,10 @@ DROP INDEX CONCURRENTLY IF EXISTS projections_own;
 --      every finished 'landed' row onto one tablet on YB).
 --    - landing_queue_finished replaces both landing_queue_done and
 --      landing_queue_old; enqueue (done_at IS NULL) writes 0 entries to it.
---    - landing_queue_project_ticket replaces globally hashed landing_queue_ticket
---      so ticket lookups and inserts stay project-sharded.
+--    - landing_queue_ticket (ticket) is kept intact so rolling-upgrade pre-0044
+--      servers' `ON CONFLICT (ticket) DO NOTHING` (BUG-2924) continues working;
+--      every ticket lookup already filters `ticket = $1` (unique) and random
+--      tickets already hash-spread across YB nodes without a redundant index.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS landing_queue_queued
     ON landing_queue ((CASE WHEN state = 'queued' THEN project_id END), branch, priority DESC, created_at, seq)
     WHERE state = 'queued';
@@ -42,12 +44,9 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS landing_queue_active_state
 CREATE INDEX CONCURRENTLY IF NOT EXISTS landing_queue_finished
     ON landing_queue (project_id, done_at, branch)
     WHERE done_at IS NOT NULL;
-CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS landing_queue_project_ticket
-    ON landing_queue (project_id, ticket);
 
 DROP INDEX CONCURRENTLY IF EXISTS landing_queue_pick;
 DROP INDEX CONCURRENTLY IF EXISTS landing_queue_ready;
 DROP INDEX CONCURRENTLY IF EXISTS landing_queue_state;
 DROP INDEX CONCURRENTLY IF EXISTS landing_queue_done;
 DROP INDEX CONCURRENTLY IF EXISTS landing_queue_old;
-DROP INDEX CONCURRENTLY IF EXISTS landing_queue_ticket;
