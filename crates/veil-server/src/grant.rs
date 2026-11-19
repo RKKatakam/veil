@@ -85,17 +85,6 @@ impl Grants {
         })
     }
 
-    /// Ephemeral grant key for offline tools (`veil-server gc`) that never
-    /// issue or verify HTTP read grants.
-    pub(crate) fn ephemeral() -> Grants {
-        let key = SeedSigner::from_seed(&[0u8; 32]);
-        Grants {
-            key_hex: key.verifying_hex(),
-            key,
-            stored: LruCache::new(1 << 10),
-        }
-    }
-
     /// The grant key's public half (hex).
     pub fn key_hex(&self) -> &str {
         &self.key_hex

@@ -182,59 +182,26 @@ pub struct Running {
     pub hub: HubState,
     shutdown: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
-    serving_lock: pack_gc::ServingLock,
 }
 
 impl Running {
     /// A clean stop: the server stops taking connections, then its landing
     /// services end and give their leases up (`landing::stop`, BUG-1970),
-    /// its search index updates at work end (`search::index::stop`,
-    /// BUG-1990), and its serving lock is released so offline GC may run.
+    /// and its background derivers, viewer-graph fills, search index updates,
+    /// and upload-container sweepers end (`derive::stop`, `query::graph::stop`,
+    /// `search::index::stop`, `pack_gc::stop`, BUG-1990, BUG-2635).
     pub async fn stop(self) {
         let _ = self.shutdown.send(true);
         let _ = self.task.await;
         landing::stop(&self.hub).await;
-        search::index::stop(&self.hub).await;
-        self.serving_lock.release().await;
+        tokio::join!(
+            derive::stop(&self.hub),
+            query::graph::stop(&self.hub),
+            search::index::stop(&self.hub),
+            pack_gc::stop(&self.hub),
+        );
+        tokio::task::yield_now().await;
     }
-}
-
-/// Open an offline [`HubState`] connected to `database_url` and `storage`
-/// without binding a listener, taking [`pack_gc::ServingLock`], or spawning
-/// background workers (used by `veil-server gc` and offline GC tests).
-pub async fn open_offline(database_url: &str, storage: &Storage) -> Result<HubState> {
-    let db = db::connect(database_url, 4).await.context("connecting to the database")?;
-    let derive_db = db::connect_lazy(database_url, derive::DERIVE_CONNECTIONS)?;
-    let blob: Arc<dyn store::BlobStore> = match storage {
-        Storage::Dir(d) => Arc::new(store::FsStore::new(d)),
-        Storage::S3 {
-            endpoint,
-            bucket,
-            region,
-            key,
-            secret,
-        } => Arc::new(store::S3Store::new(endpoint, bucket, region, key, secret)?),
-    };
-    Ok(Arc::new(Hub {
-        db: db.clone(),
-        objects: Arc::new(store::Objects::with_db(blob, 64 << 20, Some(db))),
-        trees: LruCache::new(16 << 20),
-        identity: Identity::generate("hub-offline"),
-        receipt_key: [0u8; 32],
-        grants: grant::Grants::ephemeral(),
-        cache_token: blake3::hash(&[]),
-        session_ttl_ms: 0,
-        certificate: rustls::pki_types::CertificateDer::from(Vec::new()),
-        caches: caches::Caches::default(),
-        derive: derive::Workers::new(derive_db),
-        query: query::graph::State::default(),
-        landing: landing::Services::default(),
-        events: events::Events::default(),
-        embargo: embargo::State::default(),
-        pack_gc: pack_gc::State::default(),
-        limits: limits::Limits::new(limits::Settings::default(), 4),
-        commits: Default::default(),
-    }))
 }
 
 /// Load or create the server's signing identity in `data_dir`.
@@ -277,7 +244,6 @@ pub async fn start_with_store(config: Config, store_override: Option<Arc<dyn sto
     let db = db::connect(&config.database_url, config.db_connections).await.context("connecting to the database")?;
     db::read_committed_is_read_committed(&db).await.context("checking the database's isolation")?;
     db::migrate(&db).await.context("migrating the database")?;
-    let serving_lock = pack_gc::ServingLock::acquire(&db).await?;
     // The background deriver's own connections (BUG-911), opened when a
     // run first needs one.
     let derive_db = db::connect_lazy(&config.database_url, derive::DERIVE_CONNECTIONS)?;
@@ -318,7 +284,6 @@ pub async fn start_with_store(config: Config, store_override: Option<Arc<dyn sto
         limits: limits::Limits::new(config.limits, config.db_connections),
         commits: Default::default(),
     });
-    pack_gc::wire_leftover_merges(&hub);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::watch::channel(false);
@@ -339,14 +304,16 @@ pub async fn start_with_store(config: Config, store_override: Option<Arc<dyn sto
             async move {
                 derive::resume(hub.clone(), None).await;
                 // The search index follows (S15, BUG-1231).
-                crate::search::index::resume(hub, None).await;
+                if !hub.landing.stopping() {
+                    crate::search::index::resume(hub, None).await;
+                }
             }
         });
         // Landings queued when a server stopped are landed.
         tokio::spawn(landing::resume(hub.clone()));
         tokio::spawn(bisect::resume(hub.clone()));
-        // Packs a stopped server left to sweep, then a look every few
-        // minutes (BUG-2280).
+        // Staged/discarded upload containers left to sweep, then a look every
+        // few minutes.
         tokio::spawn(pack_gc::sweep_scan(hub.clone(), sweep_stop));
     }
     Ok(Running {
@@ -355,7 +322,6 @@ pub async fn start_with_store(config: Config, store_override: Option<Arc<dyn sto
         hub,
         shutdown: tx,
         task,
-        serving_lock,
     })
 }
 

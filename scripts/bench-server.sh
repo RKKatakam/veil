@@ -16,7 +16,7 @@
 #
 # Environment:
 #   OBJECTS=local   the server keeps objects in a local directory instead of MinIO
-#   OBJECT_LAYOUT   the server's --object-layout: packs (default) or objects
+#   OBJECT_LAYOUT   the server's --object-layout: objects (default)
 #   SERVER_BIN      the veil-server to measure (default: the release build here),
 #                   e.g. an older build kept for a before/after comparison
 #   STEP_LIMIT      seconds for the profile's run (default 3600); the build has 1800
@@ -113,7 +113,7 @@ else
 fi
 echo "   postgres :$PG_PORT ($DB_URL)  minio :$S3_PORT"
 
-OBJECT_LAYOUT=${OBJECT_LAYOUT:-packs}
+OBJECT_LAYOUT=${OBJECT_LAYOUT:-objects}
 SERVER_ARGS=(--server "${SERVER_BIN:-$ROOT/target/release/veil-server}" --database-url "$DB_URL" --object-layout "$OBJECT_LAYOUT")
 if [[ "${OBJECTS:-s3}" != "local" ]]; then
     export VEIL_S3_ACCESS_KEY=veilminio VEIL_S3_SECRET_KEY=veilminio-secret

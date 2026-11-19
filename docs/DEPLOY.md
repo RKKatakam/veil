@@ -1613,62 +1613,34 @@ Statements on YugabyteDB are counted on the node the driver's URL names
 (`pg_stat_statements` is per node): with three servers spread over three
 nodes, about a third of them.
 
-## 13. Offline garbage collection (v1)
+## 13. Storage and garbage collection (v1)
 
-In Veil v1, **unreachable-object garbage collection is offline-only** (owner,
-2026-11-18). Online servers still merge small packs in the background
-(`run_gc: false`) and sweep superseded packs and abandoned staged uploads, but
-they never delete unreachable objects from deleted branches, force-pushes, or
-expired snapshots. **Storage grows with unreferenced objects between offline
-maintenance windows** until an operator reclaims them with `veil-server gc`.
+In Veil v1, **storage is append-only and there is no garbage collection of
+history — not even offline** (owner, 2026-11-18).
 
-### How the fence works (PostgreSQL only in v1)
+* **Default layout (`objects`).** `--object-layout` (`VEIL_OBJECT_LAYOUT`,
+  `Config::object_layout`) defaults to `objects`, which is the sole writable
+  layout in v1. Every committed object is written under its own content-addressed
+  key (`p/<project>/<2 hex>/<62 hex>`).
+* **Existing packs stay readable.** Pre-existing `LISTED` packs (`veilpack3\n`)
+  written by earlier servers remain readable across every read path (`get`,
+  `get_many`, `get_encoded`, `get_range`, `prefetch`) with no migration. New
+  data is never written into packs, and online pack merging is removed.
+* **Append-only history.** Objects from deleted branches, force-pushes, or
+  expired snapshots are never collected in v1, and view keys' `view_graph`,
+  `view_changes`, and `view_file_history` rows are kept. Plan storage capacity
+  accordingly.
+* **What servers still delete.** Uploads (`POST …/objects`) still land in
+  temporary staged upload containers (`packs` rows with `state = STAGED`) so
+  refused pushes, unread plain-text secrets beside a landing push, or abandoned
+  uploads are never kept under project keys. Committed pushes and API commits
+  discard and purge their consumed staged containers; refused pushes discard
+  theirs immediately; and background sweepers (`pack_gc::schedule_sweep`,
+  `pack_gc::sweep_scan`) sweep only uncommitted `STAGED` upload containers past
+  `DEFAULT_STAGED_GRACE_MS` (1 hour) and `DISCARDED` upload containers past
+  `DEFAULT_PACK_GRACE_MS` (15 minutes). Neither ever touches `LISTED` packs or
+  committed project objects.
+* **Database support.** Veil v1 supports **PostgreSQL only**; YugabyteDB is
+  experimental and not supported in v1.
 
-Every serving `veil-server` holds a PostgreSQL database-level shared session
-advisory lock (`pack_gc::SERVING_LOCK_KEY`) for the entire time it serves,
-released on clean stop (or automatically by PostgreSQL if the process crashes).
-`veil-server gc` acquires the matching exclusive session advisory lock
-non-blockingly (`pg_try_advisory_lock`):
-
-- If **any** `veil-server` is serving the database, `veil-server gc` refuses
-  immediately with a clear error without touching the database or object store.
-- While `veil-server gc` holds the exclusive lock, **any starting
-  `veil-server`** refuses to start with a clear error until GC finishes.
-
-> **PostgreSQL only in v1:** the offline-GC advisory-lock fence is built and
-> verified on PostgreSQL. YugabyteDB is **experimental and not supported in
-> v1**; do not rely on the advisory-lock fence on YugabyteDB.
-
-As in §1, every server and `veil-server gc` must connect directly to PostgreSQL
-with no transaction-pooling proxy (`pgbouncer` in transaction mode) in between,
-because the fence is a session-level advisory lock.
-
-### Maintenance runbook
-
-1. Stop every `veil-server` connected to the database (e.g. `docker stop
-   veil-server` on each hub droplet; `SIGINT` lets each server finish in-flight
-   work and release its serving lock cleanly).
-2. Inspect what would be reclaimed without modifying anything:
-
-   ```sh
-   veil-server gc --database-url "$VEIL_DATABASE_URL" \
-     --s3-endpoint "$VEIL_S3_ENDPOINT" --s3-bucket "$VEIL_S3_BUCKET" \
-     --s3-region "$VEIL_S3_REGION" --dry-run
-   ```
-
-   Pass `--storage /path/to/objects` instead of the `--s3-*` flags for
-   local-directory storage, or `--project NAME` to limit the pass to one
-   project.
-3. Run collection and review the per-project and total deletion counts:
-
-   ```sh
-   veil-server gc --database-url "$VEIL_DATABASE_URL" \
-     --s3-endpoint "$VEIL_S3_ENDPOINT" --s3-bucket "$VEIL_S3_BUCKET" \
-     --s3-region "$VEIL_S3_REGION"
-   ```
-
-   `veil-server gc` uses zero retention and grace windows so a single offline
-   maintenance pass reclaims all currently unreachable objects, expired
-   snapshots, superseded packs, and stale staged uploads immediately.
-4. Start the `veil-server` instances again.
 

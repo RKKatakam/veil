@@ -760,16 +760,23 @@ async fn walk_tips(
     progress: &Progress,
     slots: Option<&Arc<tokio::sync::Semaphore>>,
 ) -> Result<Vec<ObjectId>> {
+    stopping(hub)?;
     let ps = project_tips(hub, project, viewer, tips, progress).await?;
     let _slot = match slots {
-        Some(s) => Some(s.clone().acquire_owned().await.map_err(|e| Error::Other(e.into()))?),
+        Some(s) => Some(tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            p = s.clone().acquire_owned() => p.map_err(|e| Error::Other(e.into()))?,
+        }),
         None => None,
     };
+    stopping(hub)?;
     let vk = project.view(viewer).key();
     let admin = viewer.admin;
     let pairs: Vec<(ObjectId, ObjectId)> = tips.iter().copied().zip(ps.iter().copied()).collect();
     let (project, viewer, progress) = (project.clone(), viewer.clone(), progress.clone());
     blocking(hub, project.id, move |cx| {
+        stopping(cx.hub())?;
         let g = G::new(cx, &vk, None);
         let view = project.view(&viewer);
         let t = Trees::new(&g, &view);
@@ -777,14 +784,17 @@ async fn walk_tips(
         w.progress = Some(progress);
         let r = (|| {
             for (t, p) in &pairs {
+                stopping(cx.hub())?;
                 w.pmap.insert(*t, *p);
                 w.walk(*t)?;
             }
             Ok(())
         })();
         // What was computed is kept, also when the walk failed: the next
-        // one goes on from there.
-        w.flush()?;
+        // one goes on from there, unless the server is stopping (BUG-2635).
+        if !cx.hub().landing.stopping() {
+            w.flush()?;
+        }
         r
     })
     .await?;
@@ -801,11 +811,14 @@ async fn walk_tips(
 /// projected again one memo at a time, each stored one taken as it is
 /// (`sync::projected`).
 async fn project_tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], progress: &Progress) -> Result<Vec<ObjectId>> {
+    stopping(hub)?;
     if let Ok(Some(ps)) = project_tips_together(hub, project, viewer, tips, progress).await {
         return Ok(ps);
     }
+    stopping(hub)?;
     let mut ps = Vec::with_capacity(tips.len());
     for t in tips {
+        stopping(hub)?;
         ps.push(FILLING.scope(progress.clone(), sync::projected(hub, project, viewer, *t)).await?);
     }
     Ok(ps)
@@ -817,6 +830,7 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
     let mut deferred = sync::Deferred::default();
     let mut ps = Vec::with_capacity(tips.len());
     for t in tips {
+        stopping(hub)?;
         // Each projection worked out is a step of the fill's progress
         // (`projected_one`), as when they are stored one at a time: a
         // viewer's first fill of a long history spends most of its time
@@ -824,6 +838,7 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
         // the server is not getting on (BUG-2627).
         ps.push(FILLING.scope(progress.clone(), crate::store::not_own(Box::pin(sync::projected_inner(hub, project, viewer, *t, Some(&mut deferred))))).await?);
     }
+    stopping(hub)?;
     let now = veil_core::now_millis();
     let mut tx = hub.db.begin().await?;
     let mut wrote = false;
@@ -1068,6 +1083,7 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
     fn walk(&mut self, tip: ObjectId) -> Result<()> {
         let mut stack = vec![(tip, false)];
         while let Some((x, expanded)) = stack.pop() {
+            stopping(self.g.cx.hub())?;
             let px = self.pmap[&x];
             if self.has(&px)? {
                 continue;
@@ -1130,6 +1146,7 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        stopping(self.g.cx.hub())?;
         let cx = self.g.cx;
         let hub = cx.hub();
         let project = cx.project();
@@ -1372,6 +1389,11 @@ pub struct State {
     /// Versions blamed (computed, not read kept) here: the tests count
     /// them, to show no version is blamed twice.
     pub blame_steps: std::sync::atomic::AtomicU64,
+    /// Background viewer-graph fill tasks currently running on this server
+    /// ([`stop`]).
+    at_work: std::sync::atomic::AtomicUsize,
+    /// Notified when `at_work` reaches zero.
+    idle: tokio::sync::Notify,
 }
 
 type Fill = watch::Receiver<Option<std::result::Result<(), crate::error::Answer>>>;
@@ -1387,6 +1409,56 @@ impl Default for State {
             fill_reads: std::sync::atomic::AtomicU64::new(0),
             jobs: super::files::Jobs::default(),
             blame_steps: std::sync::atomic::AtomicU64::new(0),
+            at_work: std::sync::atomic::AtomicUsize::new(0),
+            idle: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+struct AtWork(Arc<Hub>);
+
+impl AtWork {
+    fn new(hub: &Arc<Hub>) -> Self {
+        hub.query.at_work.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        AtWork(hub.clone())
+    }
+}
+
+impl Drop for AtWork {
+    fn drop(&mut self) {
+        if self.0.query.at_work.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            self.0.query.idle.notify_waiters();
+        }
+    }
+}
+
+/// A stopping server (`landing::stop` has said so) starts no new background
+/// viewer-graph fill and cuts in-flight fills at their next step (BUG-2635).
+fn stopping(hub: &Hub) -> Result<()> {
+    match hub.landing.stopping() {
+        true => Err(Error::Other(anyhow::anyhow!("the server is stopping: viewer graph fill resumes at next start"))),
+        false => Ok(()),
+    }
+}
+
+/// How long a clean stop waits for background viewer-graph fills to exit.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// Wait for every active background viewer-graph fill task on `hub` to exit
+/// after `landing::stop` has flagged shutdown (BUG-2635).
+pub async fn stop(hub: &Arc<Hub>) {
+    let until = tokio::time::Instant::now() + STOP_WAIT;
+    loop {
+        let notified = hub.query.idle.notified();
+        if hub.query.at_work.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        if tokio::time::timeout_at(until, notified).await.is_err() {
+            let left = hub.query.at_work.load(std::sync::atomic::Ordering::SeqCst);
+            if left > 0 {
+                eprintln!("veil-server: {left} viewer-graph fills still at work at the stop");
+            }
+            return;
         }
     }
 }
@@ -1519,6 +1591,9 @@ async fn filled(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[Obje
 /// any project, and waiting it holds no connection, lock or slot (the
 /// fill's own task waits for those).
 pub async fn prefill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<()> {
+    if hub.landing.stopping() {
+        return Ok(());
+    }
     let vk = project.view(viewer).key();
     if warm(hub, project.id, &vk, viewer.admin, tips, true).await?.is_none() {
         start_or_join(hub, project, viewer, &vk, tips, true);
@@ -1531,6 +1606,9 @@ pub async fn prefill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
 /// view key (`derive::rows_of_tips`, BUG-1943): its people read it within
 /// the second, and the history of its files some minutes later.
 pub async fn prefill_rows(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<()> {
+    if hub.landing.stopping() {
+        return Ok(());
+    }
     let vk = project.view(viewer).key();
     if warm(hub, project.id, &vk, viewer.admin, tips, false).await?.is_none() {
         start_or_join(hub, project, viewer, &vk, tips, false);
@@ -1589,6 +1667,10 @@ async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[Objec
 /// the rows' fill projects, then walks in a slot of its own kind, and
 /// queues the file history's fill when it is done.
 fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId], files: bool) -> (Fill, Progress, bool) {
+    if hub.landing.stopping() {
+        let (_, rx) = watch::channel(Some(Err(stopping(hub).unwrap_err().answer())));
+        return (rx, Progress::default(), false);
+    }
     let key = (project.id, vk.to_string(), files);
     let mut fills = hub.query.fills.lock().unwrap();
     if let Some((rx, progress)) = fills.get(&key) {
@@ -1607,7 +1689,9 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
     }
     drop(fills);
     let (hub, project, viewer, tips, at) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec(), progress.clone());
+    let at_work = AtWork::new(&hub);
     tokio::spawn(async move {
+        let _at_work = at_work;
         let r = match files {
             true => leased_fill(&hub, &project, &viewer, &key.1, &tips, &at).await,
             false => walk_tips(&hub, &project, &viewer, &tips, false, &at, Some(&hub.query.row_slots)).await.map(|_| ()),
@@ -1623,7 +1707,7 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
         let _ = tx.send(Some(out));
         // The rows are there: their file history next, in the background
         // (nobody waits for it but blame and the history of a path).
-        if rows_done {
+        if rows_done && !hub.landing.stopping() {
             match warm(&hub, project.id, &key.1, viewer.admin, &tips, true).await {
                 Ok(None) => drop(start_or_join(&hub, &project, &viewer, &key.1, &tips, true)),
                 Ok(Some(_)) => {}
@@ -1644,6 +1728,7 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
 /// [`FILL_LOCK_WAIT`]; a lease left by a server that stopped expires after
 /// [`LEASE`].
 async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId], progress: &Progress) -> Result<()> {
+    stopping(hub)?;
     let holder = hex::encode(veil_core::crypto::random_bytes::<16>());
     let take = || async {
         let now = veil_core::now_millis();
@@ -1667,14 +1752,23 @@ async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &st
     let wait = tokio::time::Instant::now() + FILL_LOCK_WAIT;
     let mut leased = take().await?;
     while !leased && tokio::time::Instant::now() < wait {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+        stopping(hub)?;
         leased = take().await?;
     }
     let renew = leased.then(|| {
         let (hub, id, vk, holder) = (hub.clone(), project.id, vk.to_string(), holder.clone());
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(LEASE_RENEW).await;
+                tokio::select! {
+                    biased;
+                    _ = hub.landing.wait_stop() => return,
+                    _ = tokio::time::sleep(LEASE_RENEW) => {}
+                }
                 let _ = sqlx::query("UPDATE view_fills SET expires_at = $1 WHERE project_id = $2 AND view_key = $3 AND holder = $4")
                     .bind(veil_core::now_millis() + LEASE.as_millis() as i64)
                     .bind(id)
@@ -1685,9 +1779,17 @@ async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &st
             }
         })
     });
-    let r = match hub.query.slots.clone().acquire_owned().await {
-        Ok(_slot) => walk_tips(hub, project, viewer, tips, true, progress, None).await.map(|_| ()),
-        Err(e) => Err(Error::Other(e.into())),
+    let r = if hub.landing.stopping() {
+        Err(stopping(hub).unwrap_err())
+    } else {
+        tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => Err(stopping(hub).unwrap_err()),
+            slot = hub.query.slots.clone().acquire_owned() => match slot {
+                Ok(_slot) => walk_tips(hub, project, viewer, tips, true, progress, None).await.map(|_| ()),
+                Err(e) => Err(Error::Other(e.into())),
+            }
+        }
     };
     if let Some(renew) = renew {
         renew.abort();

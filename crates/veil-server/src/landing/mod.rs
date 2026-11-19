@@ -444,6 +444,9 @@ pub struct Services {
     /// The server is stopping cleanly ([`stop`]): no service starts, and
     /// each running one ends after its batch being committed.
     stopping: AtomicBool,
+    /// Broadcasts `true` when [`stop`] begins so background workers parked on
+    /// sleeps, semaphores, or lock-retry loops wake immediately (BUG-2635).
+    stop_tx: tokio::sync::watch::Sender<bool>,
     /// The locks of the leases this server holds (`lease_lock`).
     locks: lease_lock::Session,
     /// Leases this server has taken, ever: a poller reads the outcomes
@@ -463,6 +466,7 @@ const RETRY_LEASE: Duration = Duration::from_millis(500);
 impl Default for Services {
     fn default() -> Self {
         let holder = format!("{}-{}", std::process::id(), hex::encode(veil_core::crypto::random_bytes::<8>()));
+        let (stop_tx, _) = tokio::sync::watch::channel(false);
         Services {
             locks: lease_lock::Session::new(&holder),
             holder,
@@ -475,6 +479,7 @@ impl Default for Services {
             pressure: Default::default(),
             stats: Stats::default(),
             stopping: AtomicBool::new(false),
+            stop_tx,
             taken: AtomicU64::new(0),
             classes: veil_core::cache::LruCache::new(CLASSES),
         }
@@ -608,6 +613,7 @@ const STOP_WAIT: Duration = Duration::from_secs(15);
 pub async fn stop(hub: &Arc<Hub>) {
     let s = &hub.landing;
     s.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = s.stop_tx.send(true);
     let until = Instant::now() + STOP_WAIT;
     loop {
         let wakes: Vec<Arc<Notify>> = s.running.lock().unwrap().values().map(|r| r.wake.clone()).collect();
@@ -629,6 +635,12 @@ impl Services {
     /// Is this server stopping ([`stop`])?
     pub(crate) fn stopping(&self) -> bool {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Completes as soon as this server is stopping ([`stop`]).
+    pub(crate) async fn wait_stop(&self) {
+        let mut rx = self.stop_tx.subscribe();
+        let _ = rx.wait_for(|&stopped| stopped).await;
     }
 }
 

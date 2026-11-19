@@ -82,25 +82,17 @@ pub struct TestHub {
     pub _dir: tempfile::TempDir,
 }
 
-/// Object layout for tests that do not pin one: `VEIL_TEST_OBJECT_LAYOUT`
-/// (`packs` or `objects`), defaulting to `packs`.
+/// Object layout for tests: `VEIL_TEST_OBJECT_LAYOUT`, defaulting to `objects`.
 pub fn env_object_layout() -> veil_server::ObjectLayout {
     match std::env::var("VEIL_TEST_OBJECT_LAYOUT") {
         Ok(v) if !v.is_empty() => v.parse().unwrap_or_else(|e| panic!("VEIL_TEST_OBJECT_LAYOUT={v:?}: {e}")),
-        _ => veil_server::ObjectLayout::Packs,
+        _ => veil_server::ObjectLayout::Objects,
     }
 }
 
 impl TestHub {
     pub fn start() -> TestHub {
         TestHub::start_with_ttl(Duration::from_secs(3600))
-    }
-
-    /// A server pinned to [`veil_server::ObjectLayout::Packs`], for tests
-    /// whose assertions are about packs (one storage write a push, listed
-    /// packs, background merges).
-    pub fn start_packs() -> TestHub {
-        TestHub::start_with_layout(veil_server::ObjectLayout::Packs)
     }
 
     /// A server pinned to [`veil_server::ObjectLayout::Objects`].
@@ -240,31 +232,22 @@ impl TestHub {
     /// same database, data directory (identity, certificate, receipt key)
     /// and object storage.
     pub fn beside(other: &TestHub) -> TestHub {
-        TestHub::beside_with_layout(other, other.config.object_layout)
-    }
-
-    /// [`TestHub::beside`] with `object_layout` (mixed deployments,
-    /// `object-layout.md` §5.1).
-    pub fn beside_with_layout(other: &TestHub, object_layout: veil_server::ObjectLayout) -> TestHub {
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
-            object_layout,
             ..other.config.clone()
         };
         TestHub::run(config, dir)
     }
 
-    /// [`TestHub::beside_with_layout`] over a custom `BlobStore` wrapper.
+    /// [`TestHub::beside`] over a custom `BlobStore` wrapper.
     pub fn beside_with_store(
         other: &TestHub,
-        object_layout: veil_server::ObjectLayout,
         store: Arc<dyn veil_server::store::BlobStore>,
     ) -> TestHub {
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
-            object_layout,
             ..other.config.clone()
         };
         TestHub::run_with_store(config, dir, Some(store))
@@ -273,20 +256,13 @@ impl TestHub {
     /// This server stopped and started again on the same port, data
     /// directory and storage, its memory empty (as after an upgrade);
     /// `between` runs while it is down (a migration).
-    pub fn restart(self, between: impl FnOnce(&str)) -> TestHub {
-        let layout = self.config.object_layout;
-        self.restart_with_layout(layout, between)
-    }
-
-    /// [`TestHub::restart`] switching `object_layout`.
-    pub fn restart_with_layout(mut self, object_layout: veil_server::ObjectLayout, between: impl FnOnce(&str)) -> TestHub {
+    pub fn restart(mut self, between: impl FnOnce(&str)) -> TestHub {
         if let Some(r) = self.running.take() {
             self.rt.block_on(r.stop());
         }
         between(&self.config.database_url);
         let config = Config {
             listen: format!("127.0.0.1:{}", self.port).parse().unwrap(),
-            object_layout,
             ..self.config.clone()
         };
         let dir = std::mem::replace(&mut self._dir, tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap());
@@ -395,105 +371,12 @@ impl TestHub {
         &self.config.database_url
     }
 
-    pub fn config(&self) -> &Config {
-        &self.config
-    }
-
-    /// Whether this test hub currently has a live serving instance.
-    pub fn is_serving(&self) -> bool {
-        self.running.is_some()
-    }
-
-    /// Stop the serving instance (releasing its [`veil_server::pack_gc::ServingLock`]),
-    /// keeping the database, data directory, and storage intact.
+    /// Stop the serving instance, keeping the database, data directory, and
+    /// storage intact.
     pub fn stop_serving(&mut self) {
         if let Some(r) = self.running.take() {
             self.rt.block_on(r.stop());
         }
-    }
-
-    /// Start serving again after [`TestHub::stop_serving`], binding the same
-    /// port (or an ephemeral port if the OS reused it) and re-acquiring
-    /// [`veil_server::pack_gc::ServingLock`].
-    pub fn start_serving(&mut self) {
-        assert!(self.running.is_none(), "TestHub is already serving");
-        let preferred = Config {
-            listen: format!("127.0.0.1:{}", self.port).parse().unwrap(),
-            ..self.config.clone()
-        };
-        let running = match self.rt.block_on(veil_server::start(preferred)) {
-            Ok(r) => r,
-            Err(_) => {
-                let any = Config {
-                    listen: "127.0.0.1:0".parse().unwrap(),
-                    ..self.config.clone()
-                };
-                self.rt.block_on(veil_server::start(any)).expect("server restarts")
-            }
-        };
-        self.port = running.addr.port();
-        self.running = Some(running);
-    }
-
-    /// Attempt to start another serving instance on this hub's database and
-    /// storage (used to assert start-up refusal while offline GC runs).
-    pub fn try_start_serving(&self) -> anyhow::Result<Running> {
-        let config = Config {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            ..self.config.clone()
-        };
-        self.rt.block_on(veil_server::start(config))
-    }
-
-    /// Open an offline [`veil_server::Hub`] on this test hub's database and
-    /// storage without acquiring [`veil_server::pack_gc::ServingLock`].
-    pub fn offline_hub(&self) -> Arc<veil_server::Hub> {
-        self.rt
-            .block_on(veil_server::open_offline(&self.config.database_url, &self.config.storage))
-            .expect("offline hub opens")
-    }
-
-    /// Stop this server if it is serving, run one offline `pack_gc::run_project`
-    /// pass, and start serving again if it was serving before.
-    pub fn offline_gc(
-        &mut self,
-        project: i64,
-        opts: &veil_server::pack_gc::Options,
-    ) -> veil_server::error::Result<veil_server::pack_gc::Report> {
-        let was_serving = self.running.is_some();
-        if was_serving {
-            self.stop_serving();
-        }
-        let offline = self.offline_hub();
-        let res = self.rt.block_on(veil_server::pack_gc::run_project(&offline, project, opts));
-        self.rt.block_on(offline.db.close());
-        if was_serving {
-            self.start_serving();
-        }
-        res
-    }
-
-    /// Build a `veil-server gc` CLI command pointed at this hub's database and
-    /// object store.
-    pub fn gc_command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_veil-server"));
-        cmd.arg("gc").arg("--database-url").arg(&self.config.database_url);
-        match &self.config.storage {
-            Storage::Dir(d) => {
-                cmd.arg("--storage").arg(d);
-            }
-            Storage::S3 { endpoint, bucket, region, key, secret } => {
-                cmd.arg("--s3-endpoint")
-                    .arg(endpoint)
-                    .arg("--s3-bucket")
-                    .arg(bucket)
-                    .arg("--s3-region")
-                    .arg(region)
-                    .env("VEIL_S3_ACCESS_KEY", key)
-                    .env("VEIL_S3_SECRET_KEY", secret);
-            }
-        }
-        cmd
     }
 
     /// The server's object storage, opened anew (what another server on it
