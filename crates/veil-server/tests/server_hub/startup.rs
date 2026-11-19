@@ -2307,3 +2307,40 @@ fn bug_2930_migration_45_yugabytedb_loses_concurrent_revocation_in_person_epochs
 
     assert!(failures.is_empty(), "BUG-2930 YugabyteDB 0045 failures:\n{}", failures.join("\n"));
 }
+
+/// BUG-2931 (YugabyteDB): `ensure_q4_offline_safe` only inspects the 10
+/// `Q4_REBUILT_TABLES` and ignores `people`, `projects`, `sessions`, and
+/// `schema_migrations`, so an existing live pre-0046 deployment whose projects
+/// have not yet received a push is misclassified as "fresh empty" and rebuilt
+/// online without `--offline`.
+#[test]
+#[ignore = "BUG-2931: ensure_q4_offline_safe allows online 0046 rebuild on an existing live org DB with people/projects/sessions"]
+fn bug_2931_migration_46_online_guard_misses_existing_live_org_without_pushes() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        apply_migrations_through(&db, 45).await;
+
+        // Existing live deployment: users, project, and active session exist,
+        // pre-0046 servers are serving, but no push has populated the 10 rebuilt
+        // tables yet.
+        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2931admin', 1)").await;
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'b2931proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2931admin'",
+        )
+        .await;
+
+        let res = veil_server::db::migrate(&db).await;
+        db.close().await;
+        let err = res.expect_err("online db::migrate() must refuse migration 46 on an existing non-empty org database");
+        assert!(err.to_string().contains("--offline"), "expected --offline refusal, got: {err:?}");
+    });
+}
+
