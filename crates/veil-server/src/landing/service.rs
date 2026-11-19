@@ -470,107 +470,45 @@ impl Built {
 /// A batch's objects being stored ([`store`]): its transaction runs
 /// meanwhile and waits for them only before it commits (BUG-1955: the
 /// store and then the transaction, one after the other, were the service's
-/// longest step). Waited once; a transaction run again finds the outcome:
-/// the packs that hold them, staged until the transaction lists them.
+/// longest step). Waited once; a transaction run again finds the outcome.
 enum Storing {
-    Running(tokio::task::JoinHandle<Result<Packs>>),
-    Stored(Packs),
+    Running(tokio::task::JoinHandle<Result<()>>),
+    Stored,
     Failed(String),
 }
 
-/// Packs written, each with its index.
-type Packs = Vec<(Arc<str>, crate::pack::Held)>;
-
 impl Storing {
-    /// Wait for the objects: the names of the packs that hold them.
-    async fn wait(this: &tokio::sync::Mutex<Storing>) -> Result<Vec<Arc<str>>> {
+    /// Wait for the batch's objects to be written to storage.
+    async fn wait(this: &tokio::sync::Mutex<Storing>) -> Result<()> {
         let mut s = this.lock().await;
         if let Storing::Running(task) = &mut *s {
             *s = match task.await {
-                Ok(Ok(packs)) => Storing::Stored(packs),
+                Ok(Ok(())) => Storing::Stored,
                 Ok(Err(e)) => Storing::Failed(format!("{e:?}")),
                 Err(e) => Storing::Failed(e.to_string()),
             };
         }
         match &*s {
             Storing::Failed(e) => Err(Error::Other(anyhow::anyhow!("{STORE_FAILED}: {e}"))),
-            Storing::Stored(packs) => Ok(packs.iter().map(|(n, _)| n.clone()).collect()),
+            Storing::Stored => Ok(()),
             Storing::Running(_) => unreachable!("waited for above"),
         }
     }
-
-    /// The batch's transaction committed, listing its packs: this server
-    /// reads them from now on (before anything is told of the new tip), as
-    /// after a push (`sync::push`).
-    async fn listed(this: &tokio::sync::Mutex<Storing>, hub: &Arc<Hub>, project: i64) {
-        let packs = match &mut *this.lock().await {
-            Storing::Stored(packs) => std::mem::take(packs),
-            _ => Vec::new(),
-        };
-        if packs.is_empty() {
-            return;
-        }
-        hub.objects.listed_here(project, packs.into_iter().map(|(n, h)| (n, h.index)).collect());
-        crate::pack_gc::maybe_schedule(hub, project);
-    }
-
-    /// The batch did not commit (it lost, failed, or was built on a tip
-    /// that did not come to be): its packs, which no transaction listed,
-    /// are discarded once they are written, as a refused push's are. A pack
-    /// its transaction did list is left as it is (`pack::Packs::discard`).
-    fn discard(this: Arc<tokio::sync::Mutex<Storing>>, hub: &Arc<Hub>, project: i64) {
-        let hub = hub.clone();
-        tokio::spawn(async move {
-            let Ok(names) = Storing::wait(&this).await else { return };
-            if let Err(e) = hub.objects.discard(project, &names).await {
-                eprintln!("veil-server: discarding a landing batch's packs of project {project}: {e:?}");
-            }
-        });
-    }
 }
 
-/// Store a batch's new objects as packs of `project` (one, but for a batch
-/// of more than `pack::MAX_OBJECTS`), each one storage write, staged until
-/// the batch's transaction lists it, as a push stores what the server made
-/// for it (`sync::packs_to_list`). Stored loose, a batch's some 600 objects
-/// were 600 writes: on a local disk each waited twice for the journal,
-/// which every submit's upload and the database's log wait for too
-/// (BUG-1955); in an object store each was a request. A staged pack has an
-/// uploader (`packs.person_id`: without one it is a merge pass's, deleted
-/// by the next pass): `person`, one of the batch's submitters, who is given
-/// no receipt for it and so can name it in no push.
-async fn store(hub: &Arc<Hub>, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<Packs> {
+/// Store a batch's new objects under their own object keys.
+async fn store(hub: &Arc<Hub>, project: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<()> {
     if objects.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    // Compressed on the batch's threads (the server's own encoding).
-    let mut encoded = tokio::task::spawn_blocking(move || on_threads(&objects, build_threads(), 64, |(id, raw)| (*id, crate::store::encode(raw.clone()))))
-        .await
-        .map_err(|e| Error::Other(e.into()))?;
-    let mut packs = Vec::new();
-    while !encoded.is_empty() {
-        let rest = if encoded.len() > crate::pack::MAX_OBJECTS { encoded.split_off(crate::pack::MAX_OBJECTS) } else { Vec::new() };
-        match hub.objects.put_pack(project, person, encoded).await {
-            Ok((name, mut held)) => {
-                held.unproject();
-                packs.push((name, held));
-            }
-            // A later pack's write failed: the earlier ones, which nothing
-            // will list or name, are discarded now and not left staged for
-            // the sweep (the error drops their names; a store that keeps
-            // failing is tried again every `STORE_RETRY`), as an API
-            // commit's are (`changes::store_packed`).
-            Err(e) => {
-                let names: Vec<Arc<str>> = packs.iter().map(|(n, _)| n.clone()).collect();
-                if let Err(d) = hub.objects.discard(project, &names).await {
-                    eprintln!("veil-server: discarding a landing batch's packs of project {project}: {d:?}");
-                }
-                return Err(Error::Other(e));
-            }
+    let opts = crate::store::KeepOpts { encode_threads: build_threads(), already_held: false };
+    match hub.objects.keep(project, &[], &HashSet::new(), objects, opts).await {
+        Ok(()) => Ok(()),
+        Err(crate::store::KeepError::Discarded) => {
+            Err(Error::conflict("a landing batch's upload was discarded"))
         }
-        encoded = rest;
+        Err(crate::store::KeepError::Store(e)) => Err(Error::Other(e)),
     }
-    Ok(packs)
 }
 
 /// `f` as [`crate::db::transaction`] takes it, so that it can be passed by
@@ -746,31 +684,23 @@ impl Service {
                 continue;
             }
             self.hub.landing.stats.build_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-            // Its objects are stored while the batch before it commits, as a
-            // pack nobody reads until this batch's transaction lists it (a
-            // batch that is then discarded discards it).
+            // Its objects are stored while the batch before it commits.
             let stored = {
                 let (hub, project, objects) = (self.hub.clone(), self.project, built.objects.clone());
-                let person = built.rows.first().map(|r| r.person_id);
                 Arc::new(tokio::sync::Mutex::new(Storing::Running(tokio::spawn(async move {
                     let t = Instant::now();
-                    let r = match person {
-                        Some(person) => store(&hub, project, person, objects).await,
-                        None => Ok(Vec::new()),
-                    };
+                    let r = store(&hub, project, objects).await;
                     hub.landing.stats.store_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                     r
                 }))))
             };
             if let Some(f) = inflight.take() {
                 if !self.finish(f, &mut state).await? {
-                    Storing::discard(stored, &self.hub, self.project);
                     return Ok(());
                 }
                 // Built on a tip that did not come to be (the batch before
-                // it lost): discarded, and built again from the database's.
+                // it lost): built again from the database's.
                 if state.tip != built.old_tip {
-                    Storing::discard(stored, &self.hub, self.project);
                     continue;
                 }
             }
@@ -781,13 +711,7 @@ impl Service {
             let seqs = built.rows.iter().map(|r| r.seq).collect();
             let (alone, after) = (built.alone, built.after.clone());
             let s = Arc::new(self.clone_handle());
-            let task = tokio::spawn(async move {
-                let r = s.commit(built, gc_epoch, stored.clone()).await;
-                if !matches!(r, Ok(Committed::Ok)) {
-                    Storing::discard(stored, &s.hub, s.project);
-                }
-                r
-            });
+            let task = tokio::spawn(async move { s.commit(built, gc_epoch, stored).await });
             inflight = Some(InFlight { task, seqs, alone, after });
         }
     }
@@ -1771,33 +1695,16 @@ impl Service {
                 // holds the lease's row (and the branch's other servers)
                 // for long; past that, outside the transaction, which then
                 // runs again (BUG-1982).
-                if tokio::time::timeout(STORE_IN_TRANSACTION, Storing::wait(&stored)).await.is_err() {
-                    return Err(Error::conflict(STORE_SLOW));
-                }
-                // Its packs turn listed with the branch's move: their objects
-                // are the project's from this commit on, and nobody's before.
-                // One that is no longer staged (swept as an upload nobody
-                // listed) lands nothing: the batch is built and stored again.
-                let packs: Vec<String> = Storing::wait(&stored).await?.iter().map(|n| n.to_string()).collect();
-                if !packs.is_empty() {
-                    let listed = sqlx::query("UPDATE packs SET state = $3 WHERE project_id = $1 AND name = ANY($2) AND state = $4")
-                        .bind(pid)
-                        .bind(&packs)
-                        .bind(crate::pack::LISTED)
-                        .bind(crate::pack::STAGED)
-                        .execute(&mut *c)
-                        .await?
-                        .rows_affected();
-                    if listed != packs.len() as u64 {
-                        return Err(Error::conflict(PACK_GONE));
-                    }
+                match tokio::time::timeout(STORE_IN_TRANSACTION, Storing::wait(&stored)).await {
+                    Ok(r) => r?,
+                    Err(_) => return Err(Error::conflict(STORE_SLOW)),
                 }
                 Ok((results, marked))
             })
         });
         let r = loop {
             match crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, &mut run).await {
-                Err(Error::Api { code: "conflict", message, .. }) if message == STORE_SLOW => drop(Storing::wait(&stored_outside).await?),
+                Err(Error::Api { code: "conflict", message, .. }) if message == STORE_SLOW => Storing::wait(&stored_outside).await?,
                 Err(Error::Api { code: "conflict", message, .. }) if message == REVIEW_WRITERS => {
                     let ids = std::mem::take(&mut writers_seen.lock().unwrap().0);
                     crate::prs::review_gate::wait_review_writers(&hub.db, pid, &ids).await?;
@@ -1811,14 +1718,13 @@ impl Service {
                 hub.commits.count(crate::db::Commit::LandBatch);
                 let read = b.review_guard.as_ref().map_or(0, |g| g.asks);
                 hub.landing.stats.review_asks.fetch_add(read + tx_asks.load(Ordering::Relaxed), Ordering::Relaxed);
-                Storing::listed(&stored_outside, hub, self.project).await;
                 r
             }
             Err(Error::Api { code: "conflict", message, .. }) if message == LEASE_LOST => {
                 hub.landing.stats.lease_lost.fetch_add(1, Ordering::Relaxed);
                 return Ok(Committed::LeaseLost);
             }
-            Err(Error::Api { code: "conflict", message, .. }) if message == MOVED || message == PACK_GONE => return Ok(Committed::Moved),
+            Err(Error::Api { code: "conflict", message, .. }) if message == MOVED => return Ok(Committed::Moved),
             Err(Error::Api { code: "conflict", message, .. }) if message == MEMO_RACE => {
                 hub.landing.stats.memo_races.fetch_add(1, Ordering::Relaxed);
                 // What is stored wins: the batch built again projects onto it.
@@ -1833,8 +1739,8 @@ impl Service {
         for s in &b.snapshots {
             hub.caches.put_committed(self.project, s);
         }
-        for (k, real, proj, _) in &b.memos {
-            hub.caches.put_memo(self.project, k, real, proj);
+        for (k, real, proj, collapsed) in &b.memos {
+            hub.caches.put_memo_row(self.project, k, real, proj, *collapsed);
         }
         // Every server's copy too, by a notice after the commit (BUG-2459).
         if moved {
@@ -1941,17 +1847,17 @@ async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> 
     }
     let gce = hub.caches.gc_epoch(project);
     let hex: Vec<String> = reals.iter().map(ObjectId::hex).collect();
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT view_key, real_id, projected_id FROM projections WHERE project_id = $1 AND view_key = ANY($2) AND real_id = ANY($3)",
+    let rows: Vec<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT view_key, real_id, projected_id, collapsed FROM projections WHERE project_id = $1 AND view_key = ANY($2) AND real_id = ANY($3)",
     )
     .bind(project)
     .bind(keys)
     .bind(&hex)
     .fetch_all(&hub.db)
     .await?;
-    for (k, r, p) in rows {
+    for (k, r, p, collapsed) in rows {
         if let (Ok(r), Ok(p)) = (ObjectId::from_hex(&r), ObjectId::from_hex(&p)) {
-            hub.caches.put_memo_at(project, gce, &k, &r, &p);
+            hub.caches.put_memo_row_at(project, gce, &k, &r, &p, collapsed);
             out.insert((k, r), p);
         }
     }
@@ -1976,9 +1882,6 @@ const RESET: &str = "the branch was reset since this change was submitted (a for
 /// how long the service waits before it builds the batch again.
 const STORE_FAILED: &str = "storing the batch's objects";
 const STORE_RETRY: Duration = Duration::from_millis(250);
-/// A pack of the batch's objects was no longer staged when its transaction
-/// came to list it.
-const PACK_GONE: &str = "a pack of the batch's objects was discarded before it was listed";
 const MEMO_RACE: &str = "a projection memo was stored meanwhile with another value";
 
 fn state_name(s: LandState) -> &'static str {

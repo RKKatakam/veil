@@ -1735,9 +1735,15 @@ fn bug_1947_an_embargo_made_after_a_request_read_its_epochs_withholds_what_the_r
     const FIX_MARK: &str = "EMBARGO-SECRET-RACE-1947";
     let hub = TestHub::start();
     let p = setup_project(&hub);
+    let partner = hub.person("partner");
+    p.admin.ok(&p.dir, &["group", "create", "distro"]);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &partner.name, "--confirm", &partner.fingerprint()]);
+    p.admin.ok(&p.dir, &["group", "add", "distro", &partner.name]);
+    p.admin.ok(&p.dir, &["group", "add", "distro", &p.sec.name]);
     p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    partner.trust_project(&hub, &p.name, &p.fp);
     let other = TestHub::beside(&hub);
-    let (dev, sec) = (p.dev.token(), p.sec.token());
+    let (dev, sec, part_tok) = (p.dev.token(), p.sec.token(), partner.token());
     let history = |h: &TestHub, tok: &str, id: ObjectId| h.api().post_json(Some(tok), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [id.hex()], "stop": []}));
 
     // What `dev` names: `main`'s tip as they see it. Not a committed id (the
@@ -1786,19 +1792,25 @@ fn bug_1947_an_embargo_made_after_a_request_read_its_epochs_withholds_what_the_r
         assert!(r.is_ok(), "{what} of main's tip, no embargo: {:?}", r.err());
     }
 
-    // 2. Two requests on the second server pass their session check: dev's
-    //    and one of someone in `security`. Both read "no unreleased embargo".
-    let (stale_dev, stale_sec) = (begin(&other, &p.dev), begin(&other, &p.sec));
+    // 2. Requests on the second server pass their session check: dev's and
+    //    those of members in the embargo (`partner` shares dev's exact view
+    //    key). All read "no unreleased embargo".
+    let (stale_dev, stale_sec, stale_partner) = (begin(&other, &p.dev), begin(&other, &p.sec), begin(&other, &partner));
+    assert_eq!(stale_dev.1.view(&stale_dev.2).key(), stale_partner.1.view(&stale_partner.2).key(), "partner and dev share a view key");
     assert!(stale_dev.0.epochs.embargo_free(stale_dev.1.id) && stale_sec.0.epochs.embargo_free(stale_sec.1.id));
 
     // 3. Meanwhile someone in `security` pushes an embargoed fix (through
-    //    the first server)...
+    //    the first server) for `security` and `distro`, and `partner` pulls
+    //    it: storing `(dev's view key, embargoed -> embargoed_proj, FALSE)`.
     let sec_dir = p.sec.dir("work");
     p.sec.ok(p.sec.home.path(), &["clone", &hub.url(&p.name), sec_dir.to_str().unwrap()]);
     write_files(&sec_dir, &[("src/embargo_race_1947.rs", &format!("pub const FIX: &str = \"{FIX_MARK}\";\n"))]);
     p.sec.ok(&sec_dir, &["commit", "--no-advance", "-m", "an embargoed fix"]);
     let until = iso_utc(veil_core::now_millis() + 3_600_000);
-    let merge_out = p.sec.ok(&sec_dir, &["merge", "@-", "--into", "main", "--embargo-for", "security", "--until", &until, "-m", "an embargoed merge"]);
+    let merge_out = p.sec.ok(
+        &sec_dir,
+        &["merge", "@-", "--into", "main", "--embargo-for", "security", "--embargo-for", "distro", "--until", &until, "-m", "an embargoed merge"],
+    );
     let eid = parse_embargo_id(&merge_out);
     let out = p.sec.ok(&sec_dir, &["log", "-r", "main", "-n", "1", "--json"]);
     let embargoed = ObjectId::from_hex(serde_json::from_str::<Value>(&out).unwrap()["entries"][0]["snapshot_id"].as_str().unwrap()).unwrap();
@@ -1806,59 +1818,78 @@ fn bug_1947_an_embargo_made_after_a_request_read_its_epochs_withholds_what_the_r
     let (r_dev, r_sec) = (history(&hub, &dev, embargoed), history(&hub, &sec, embargoed));
     assert_eq!(r_dev.status, 404, "the embargo is there: {}", String::from_utf8_lossy(&r_dev.body));
     assert_eq!(r_sec.status, 200, "and its member reads it: {}", String::from_utf8_lossy(&r_sec.body));
-    //    ...and an embargo member of another view pulls it, who sees it as
-    //    the id dev named (the fix is in a folder that view may not see):
-    //    the row their pull stores.
+    let embargoed_real = {
+        let hb = hub.hub();
+        let hex: String = hub
+            .rt
+            .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2").bind(stale_dev.1.id).bind(format!("embargo/{eid}")).fetch_one(&hb.db))
+            .unwrap();
+        ObjectId::from_hex(&hex).unwrap()
+    };
+    let r_part = history(&hub, &part_tok, embargoed_real);
+    assert_eq!(r_part.status, 200, "partner in distro reads it: {}", String::from_utf8_lossy(&r_part.body));
+    let embargoed_proj = {
+        let hb = hub.hub();
+        let vk = stale_dev.1.view(&stale_dev.2).key();
+        let hex: String = hub
+            .rt
+            .block_on(sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3 AND NOT collapsed").bind(stale_dev.1.id).bind(&vk).bind(embargoed_real.hex()).fetch_one(&hb.db))
+            .unwrap();
+        ObjectId::from_hex(&hex).unwrap()
+    };
+    assert_ne!(embargoed_proj, embargoed_real, "projected for dev's view");
+    assert_ne!(embargoed_proj, named, "visible change in src/ does not collapse");
+    //    Another view's collapsed row mapping `named` to `embargoed_real` is
+    //    also present (BUG-2634): it neither leaks `embargoed_real` nor refuses `named`.
     let ho = other.hub();
     let stored = other.rt.block_on(
         sqlx::query("INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, 'another-view', $2, $3, $4, TRUE)")
             .bind(stale_dev.1.id)
-            .bind(embargoed.hex())
+            .bind(embargoed_real.hex())
             .bind(named.hex())
             .bind(veil_core::now_millis() + 3_600_000)
             .execute(&ho.db),
     );
     assert_eq!(stored.unwrap().rows_affected(), 1, "the other view's row");
 
-    // 4. dev's request goes on: the id it named now stands for the embargoed
-    //    snapshot. Every route answers as for an id nobody ever had.
-    for (what, r) in finish(&other, &stale_dev, named) {
-        match r {
-            Err(Error::Api { status, code, message }) => {
-                assert_eq!((status.as_u16(), code), (404, "not_found"), "{what}: {message}");
-                assert_eq!(message, format!("no snapshot {} that you can see", named.short()), "{what}");
-                assert_no_str(&message, &[FIX_MARK, &eid], what);
+    // 4. `stale_dev` naming `embargoed_proj` (resolved via dev's own view key
+    //    on `other` after `stale_dev` read `embargo_free`), `embargoed_real`,
+    //    or `embargoed` is refused on every route as for an id nobody ever had
+    //    (`withheld_since`).
+    for target in [embargoed_proj, embargoed_real, embargoed] {
+        for (what, r) in finish(&other, &stale_dev, target) {
+            match r {
+                Err(Error::Api { status, code, message }) => {
+                    assert_eq!((status.as_u16(), code), (404, "not_found"), "{what}: {message}");
+                    assert_eq!(message, format!("no snapshot {} that you can see", target.short()), "{what}");
+                    assert_no_str(&message, &[FIX_MARK, &eid], what);
+                }
+                Ok(()) => panic!("{what}: a request that began before the embargo was served {}", target.short()),
+                Err(e) => panic!("{what}: {e:?}"),
             }
-            Ok(()) => panic!("{what}: a request that began before the embargo was served the embargoed snapshot"),
-            Err(e) => panic!("{what}: {e:?}"),
         }
     }
-    //    Someone in the embargo, whose request began as early, is served it.
-    for (what, r) in finish(&other, &stale_sec, embargoed) {
-        // (Their tree is not the one this fetch names: only the snapshot's
-        // check is under test.)
-        match (what, r) {
-            ("fetch", Err(Error::Api { status, message, .. })) => assert!(status.as_u16() == 404 && message.contains("no such object"), "{what}: {message}"),
-            (_, r) => assert!(r.is_ok(), "{what} by a member of the embargo: {:?}", r.err()),
+    //    Meanwhile `stale_dev` naming `named` (`main`'s pre-embargo tip) is
+    //    still served `main`'s tip, containing nothing of the embargo (BUG-2634).
+    for (what, r) in finish(&other, &stale_dev, named) {
+        assert!(r.is_ok(), "{what} of main's pre-embargo tip: {:?}", r.err());
+    }
+    //    And members in the embargo, whose requests began as early, are served it.
+    for (who, st, target) in [("sec", &stale_sec, embargoed), ("partner", &stale_partner, embargoed_proj)] {
+        for (what, r) in finish(&other, st, target) {
+            match (what, r) {
+                ("fetch", Err(Error::Api { status, message, .. })) => assert!(status.as_u16() == 404 && message.contains("no such object"), "{who} {what}: {message}"),
+                (_, r) => assert!(r.is_ok(), "{who} {what} by a member of the embargo: {:?}", r.err()),
+            }
         }
     }
 }
 
-/// BUG-2634 (open; found by the review of BUG-1947's fix; the same before
-/// it): while an embargo lasts, someone outside it is refused `main`'s tip.
-/// The routes of a pull ask about the id a request names before they
-/// resolve it, and `is_withheld_from_viewer` counts an id as embargoed when
-/// **any view's** `projections` row maps it to an embargoed snapshot. An
-/// embargo member whose view cannot see the fix's folder sees the embargoed
-/// snapshot as its parent's projection; if their view sees `main`'s tip as
-/// someone outside sees it, that is the id the outsider names for `main`,
-/// and their pull's row turns the outsider's pulls into 404s, on every
-/// server (the check comes before the server's own memory of the id). The
-/// row is written here as that pull stores it (as in the test above; the
-/// two views are not built). Expected: the outsider still pulls what is
-/// theirs, `main`'s tip as they see it, and nothing of the embargo.
+/// BUG-2634: while an embargo lasts, someone outside it is never refused
+/// `main`'s tip when another view's `projections` row maps the id they name
+/// to an embargoed snapshot, on a warm or a cold server, across `history`,
+/// `fetch`, `subtree` and `q/`.
 #[test]
-#[ignore = "BUG-2634: during an embargo, someone outside it is refused main's tip (404) when another view's projections row maps the id they name to the embargoed snapshot"]
 fn bug_2634_an_embargo_another_view_sees_as_mains_tip_does_not_refuse_main_to_those_outside_it() {
     const FIX_MARK: &str = "EMBARGO-SECRET-FIX-2634";
     let hub = TestHub::start();
@@ -1871,9 +1902,14 @@ fn bug_2634_an_embargo_another_view_sees_as_mains_tip_does_not_refuse_main_to_th
     // `main`'s tip as dev sees it, pulled through both servers: each has
     // resolved the id for dev's view.
     let named = hub.api().tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let mut tip_tree = ObjectId::from_hex("0000000000000000000000000000000000000000000000000000000000000000").unwrap();
     for (name, h) in [("the first server", &hub), ("the second server", &other)] {
         let r = history(h, &dev, named);
         assert_eq!(r.status, 200, "{name}, before the embargo: {}", String::from_utf8_lossy(&r.body));
+        let raw = r.frames().into_iter().find(|(id, _)| *id == named).expect("tip frame").1;
+        if let veil_core::object::Object::Snapshot(s) = veil_core::object::Object::decode(&raw).unwrap() {
+            tip_tree = s.tree;
+        }
     }
 
     // Someone in `security` pushes an embargoed fix.
@@ -1900,22 +1936,477 @@ fn bug_2634_an_embargo_another_view_sees_as_mains_tip_does_not_refuse_main_to_th
     let ho = hub.hub();
     let stored = hub.rt.block_on(async {
         let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&ho.db).await.unwrap();
-        sqlx::query("INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, 'another-view', $2, $3, $4, TRUE)")
+        let real_emb: String = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2")
             .bind(pid)
-            .bind(embargoed.hex())
-            .bind(named.hex())
-            .bind(veil_core::now_millis() + 3_600_000)
-            .execute(&ho.db)
+            .bind(format!("embargo/{eid}"))
+            .fetch_one(&ho.db)
             .await
+            .unwrap();
+        for (vk, rid) in [("another-view", embargoed.hex()), ("another-view-real", real_emb)] {
+            sqlx::query("INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) VALUES ($1, $2, $3, $4, $5, TRUE)")
+                .bind(pid)
+                .bind(vk)
+                .bind(rid)
+                .bind(named.hex())
+                .bind(veil_core::now_millis() + 3_600_000)
+                .execute(&ho.db)
+                .await
+                .unwrap();
+        }
+        1u64
     });
-    assert_eq!(stored.unwrap().rows_affected(), 1, "the other view's row");
+    assert_eq!(stored, 1, "the other view's row");
 
-    // dev still pulls `main`, through either server, and gets nothing of
-    // the embargo.
-    for (name, h) in [("the first server", &hub), ("the second server", &other)] {
+    // A third server started cold after the row is stored has no memory of `named`.
+    let cold = TestHub::beside(&hub);
+
+    // dev still pulls `main` across every route on warm and cold servers, and
+    // gets nothing of the embargo.
+    for (name, h) in [("the first server", &hub), ("the second server", &other), ("a cold server", &cold)] {
         let r = history(h, &dev, named);
         assert_eq!(r.status, 200, "{name}: someone outside the embargo is refused main's tip: {}", String::from_utf8_lossy(&r.body));
         assert!(r.frames().iter().any(|(id, _)| *id == named), "{name}: main's tip is in its history");
         assert_no_str(&String::from_utf8_lossy(&r.body), &[FIX_MARK, &eid], name);
+
+        let rf = h.api().post_json(
+            Some(&dev),
+            &format!("/v1/projects/{}/fetch", p.name),
+            &json!({"snapshot": named.hex(), "objects": [{"path": "", "id": tip_tree.hex()}]}),
+        );
+        assert_eq!(rf.status, 200, "{name} fetch: {}", String::from_utf8_lossy(&rf.body));
+        assert_no_str(&String::from_utf8_lossy(&rf.body), &[FIX_MARK, &eid], name);
+
+        let rs = h.api().get(Some(&dev), &format!("/v1/projects/{}/subtree?snapshot={}&path=", p.name, named.hex()));
+        assert_eq!(rs.status, 200, "{name} subtree: {}", String::from_utf8_lossy(&rs.body));
+        assert_no_str(&String::from_utf8_lossy(&rs.body), &[FIX_MARK, &eid], name);
+
+        let rq = h.api().get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path=src/lib.rs", p.name, named.hex()));
+        assert_eq!(rq.status, 200, "{name} q/file: {}", String::from_utf8_lossy(&rq.body));
+        assert_no_str(&String::from_utf8_lossy(&rq.body), &[FIX_MARK, &eid], name);
     }
+}
+
+/// BUG-2634 (end-to-end, same view key + embargo PR): an embargo partner who
+/// shares `dev`'s exact view key (`[devs, distro]`, where `distro` is an
+/// embargo group not named in `.veilpolicy`) pulls an embargoed change in
+/// `billing/` (hidden from `devs`, so it collapses into `main`'s tip `named`
+/// under `dev`'s own view key!) and views a multi-commit embargo PR whose
+/// first commit is in `billing/` (collapsed into `named`) and second is in
+/// `src/`. `dev` outside the embargo still pulls and queries `main`'s tip on
+/// warm and cold servers, and probing the embargoed snapshots answers
+/// identically to an unknown id.
+#[test]
+fn bug_2634_an_embargo_collapsed_under_the_same_view_key_never_refuses_main_or_leaks() {
+    const FIX_MARK: &str = "EMBARGO-BILLING-COLLAPSED-2634";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let partner = hub.person("partner");
+    p.admin.ok(&p.dir, &["group", "create", "distro"]);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &partner.name, "--confirm", &partner.fingerprint()]);
+    p.admin.ok(&p.dir, &["group", "add", "distro", &partner.name]);
+    p.admin.ok(&p.dir, &["group", "add", "distro", &p.fin.name]);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
+    partner.trust_project(&hub, &p.name, &p.fp);
+
+    let (dev, part_tok) = (p.dev.token(), partner.token());
+    let named = hub.api().tips(Some(&dev), &p.name).unwrap().branches["main"];
+
+    // 1. `fin` pushes a pure `billing/` embargoed fix for `finance` + `distro`;
+    //    `partner` (same view key as `dev`) pulls it, storing `(dev's vk, embargoed -> named, TRUE)`.
+    let fin_dir = p.fin.dir("work");
+    p.fin.ok(p.fin.home.path(), &["clone", &hub.url(&p.name), fin_dir.to_str().unwrap()]);
+    write_files(&fin_dir, &[(&format!("{BILL_DIR}/acme/invoice.txt"), &format!("{BILL_MARK}\n{FIX_MARK}\n"))]);
+    p.fin.ok(&fin_dir, &["commit", "--no-advance", "-m", "embargoed billing fix"]);
+    let until = iso_utc(veil_core::now_millis() + 3_600_000);
+    let merge_out = p.fin.ok(
+        &fin_dir,
+        &["merge", "@-", "--into", "main", "--embargo-for", "finance", "--embargo-for", "distro", "--until", &until, "-m", "embargoed billing merge"],
+    );
+    let eid = parse_embargo_id(&merge_out);
+    p.fin.ok(&fin_dir, &["push"]);
+    let embargoed = {
+        let hb = hub.hub();
+        let pid: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hb.db)).unwrap();
+        let hex: String = hub
+            .rt
+            .block_on(sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = $2").bind(pid).bind(format!("embargo/{eid}")).fetch_one(&hb.db))
+            .unwrap();
+        ObjectId::from_hex(&hex).unwrap()
+    };
+    let part_pull = hub.api().post_json(Some(&part_tok), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [embargoed.hex()], "stop": []}));
+    assert_eq!(part_pull.status, 200, "partner pulls embargoed snapshot: {}", String::from_utf8_lossy(&part_pull.body));
+    assert!(part_pull.frames().iter().any(|(id, _)| *id == named), "embargoed billing commit collapsed into named for partner's view");
+
+    // 2. `sec` pushes a `src/`-only embargoed fix onto `main` for `security` + `distro`
+    //    and opens an embargo PR; `partner` views it (`200`), exercising
+    //    `prs::embargo::projected` on `[r.base, r.head]` (BUG-2760: `r.base`
+    //    projects to `named` for `partner`, and must not tag `named` in
+    //    `embargo_snapshots`).
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
+    let sec_dir = p.sec.dir("work");
+    p.sec.ok(p.sec.home.path(), &["clone", &hub.url(&p.name), sec_dir.to_str().unwrap()]);
+    write_files(&sec_dir, &[("src/embargo_pr_2634.rs", &format!("pub const M: &str = \"{FIX_MARK}\";\n"))]);
+    p.sec.ok(&sec_dir, &["commit", "--no-advance", "-m", "embargoed src fix"]);
+    let merge_out2 = p.sec.ok(
+        &sec_dir,
+        &["merge", "@-", "--into", "main", "--embargo-for", "security", "--embargo-for", "distro", "--until", &until, "-m", "embargoed src merge"],
+    );
+    let eid2 = parse_embargo_id(&merge_out2);
+    p.sec.ok(&sec_dir, &["push"]);
+    let pr = hub.api().post_json(
+        Some(&p.sec.token()),
+        &format!("/v1/projects/{}/prs", p.name),
+        &json!({"title": "src fix", "head": format!("embargo/{eid2}"), "onto": "main"}),
+    );
+    assert_eq!(pr.status, 200, "create embargo PR: {}", String::from_utf8_lossy(&pr.body));
+    let pr_id = pr.json()["id"].as_str().unwrap().to_string();
+    let pr_view = hub.api().get(Some(&part_tok), &format!("/v1/projects/{}/prs/{pr_id}", p.name));
+    assert_eq!(pr_view.status, 200, "partner views embargo PR: {}", String::from_utf8_lossy(&pr_view.body));
+
+    let cold = TestHub::beside(&hub);
+    for (name, h) in [("warm server", &hub), ("cold server", &cold)] {
+        let r = h.api().post_json(Some(&dev), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [named.hex()], "stop": []}));
+        assert_eq!(r.status, 200, "{name} history: {}", String::from_utf8_lossy(&r.body));
+        assert!(r.frames().iter().any(|(id, _)| *id == named), "{name}: main's tip is served");
+        assert_no_str(&String::from_utf8_lossy(&r.body), &[FIX_MARK, &eid], name);
+
+        let rq = h.api().get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path=src/lib.rs", p.name, named.hex()));
+        assert_eq!(rq.status, 200, "{name} q/file: {}", String::from_utf8_lossy(&rq.body));
+
+        // `dev` probing `embargoed` gets the exact same refusal as for an unknown snapshot id.
+        let unknown = ObjectId::hash(b"never-existed-2634");
+        let r_emb = h.api().post_json(Some(&dev), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [embargoed.hex()], "stop": []}));
+        let r_unk = h.api().post_json(Some(&dev), &format!("/v1/projects/{}/history", p.name), &json!({"tips": [unknown.hex()], "stop": []}));
+        assert_eq!((r_emb.status, r_unk.status), (404, 404));
+        assert_eq!(r_emb.json()["code"], r_unk.json()["code"]);
+        assert_eq!(r_emb.json()["message"], format!("no snapshot {} that you can see", embargoed.short()));
+    }
+
+    // `dev` can also clone cleanly right now while the embargo is active.
+    let dev_clone = p.dev.dir("clone");
+    p.dev.ok(p.dev.home.path(), &["clone", &cold.url(&p.name), dev_clone.to_str().unwrap()]);
+}
+
+/// BUG-2850 (review b1a; incomplete BUG-2634 fix): `sync::resolve_for_mode`
+/// queries `projections WHERE project_id = $1 AND view_key = $2 AND
+/// projected_id = $3` without excluding embargoed or collapsed rows, then picks
+/// the sole leaf snapshot (`[one] => Some(*one)`) before checking `withheld(r)`
+/// (`sync.rs:1325-1432`). When `fin` pushes a valid single-parent embargoed
+/// `billing/` snapshot `E` (`parents = [M1]`, `embargo = Some(eid)`) and
+/// `partner` (sharing `dev`'s `view_key`) pulls `E`, `projections` holds only
+/// `(vk, M1, m1_proj, false)` and `(vk, E, m1_proj, true)`. For any call where
+/// `M1` is not a tip in `branches` (`POST /changes` with no `onto` or a new
+/// branch, `POST /push` creating a feature branch off `M1`, or after `main`
+/// advances to `M2`), `resolve_for_mode` eliminates `M1` because it is `E`'s
+/// first parent, picks `leaves = [E]`, skips `own_projection`, sees
+/// `withheld(E) == true`, and returns `Ok(None)` — refusing `POST /changes`
+/// with `404` and `POST /push` with `400` to every outsider sharing `view_key`
+/// and creating an embargo existence oracle on `M1`.
+#[test]
+fn bug_2850_resolve_for_mode_ignores_collapsed_embargoed_projections_under_same_view_key() {
+    const FIX_MARK: &str = "EMBARGO-BILLING-COLLAPSED-2850";
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let partner = hub.person("partner");
+    p.admin.ok(&p.dir, &["group", "create", "distro"]);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &partner.name, "--confirm", &partner.fingerprint()]);
+    p.admin.ok(&p.dir, &["group", "add", "distro", &partner.name]);
+    p.admin.ok(&p.dir, &["group", "add", "distro", &p.fin.name]);
+    p.admin.ok(&p.dir, &["group", "add", "devs", &p.fin.name]);
+    partner.trust_project(&hub, &p.name, &p.fp);
+
+    let api = hub.api();
+    let (dev, part_tok) = (p.dev.token(), partner.token());
+    let m1_proj = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+
+    // 1. Baseline BEFORE the embargo: `dev` can create an API change based on
+    //    `M1` and push a new feature branch off `M1`.
+    let pre_change = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": m1_proj.hex(),
+            "description": "before embargo",
+            "edits": [{"path": "src/dev_pre_2850.rs", "put": {"text": "pre\n"}}],
+        }),
+    );
+    assert_eq!(pre_change.status, 200, "pre-embargo change on M1: {}", String::from_utf8_lossy(&pre_change.body));
+
+    // 2. `fin` pushes a valid single-parent embargoed `billing/` snapshot `E`
+    //    parented on `M1` for `finance` + `distro`; `partner` (same `view_key`
+    //    as `dev`) pulls `E`, storing `(dev's vk, E -> m1_proj, collapsed = true)`.
+    let eid = "a1b2c3d4e5".to_string();
+    let now = veil_core::now_millis();
+    let mut fin_craft = Craft::new(&api, &p.fin, &p.name, "main");
+    let fin_m1 = fin_craft.tip;
+    fin_craft.file(&format!("{BILL_DIR}/acme/invoice.txt"), &format!("{BILL_MARK}\n{FIX_MARK}\n"));
+    let mut emb_snap = veil_core::object::Snapshot {
+        parents: vec![fin_m1],
+        change_id: veil_core::ChangeId::random(),
+        tree: fin_craft.root,
+        description: veil_core::object::Text::Plain("single-parent embargoed billing fix on M1".into()),
+        author: "fin".into(),
+        timestamp: now,
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: Some(eid.clone()),
+        signature: None,
+        agent: None,
+        attempts: vec![],
+        abandoned: None,
+    };
+    emb_snap.sign(&fin_craft.identity);
+    let embargoed = fin_craft.put(veil_core::object::Object::Snapshot(emb_snap));
+    let up = api.upload(&fin_craft.token, &p.name, &fin_craft.objects);
+    assert_eq!(up.status, 200, "upload embargoed snapshot: {}", String::from_utf8_lossy(&up.body));
+    let packs: Vec<String> = serde_json::from_value(up.json()["packs"].clone()).unwrap();
+    let rec = veil_core::keychain::EmbargoRecord {
+        format: veil_core::keychain::EMBARGO_FORMAT,
+        id: eid.clone(),
+        scope: "finance,distro".into(),
+        until: Some(now + 3_600_000),
+        released_at: None,
+        created: now,
+        state: None,
+        reason: None,
+    };
+    let push_emb = api.post_json(
+        Some(&fin_craft.token),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "main", "expected": fin_m1.hex(), "new": embargoed.hex()}],
+            "packs": packs,
+            "embargoes": [rec],
+        }),
+    );
+    assert_eq!(push_emb.status, 200, "push single-parent embargo: {}", String::from_utf8_lossy(&push_emb.body));
+    assert_eq!(push_emb.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&push_emb.body));
+
+    let part_tips = api.tips(Some(&part_tok), &p.name).unwrap();
+    assert_eq!(
+        part_tips.branches.get(&format!("embargo/{eid}")).copied(),
+        Some(m1_proj),
+        "embargoed billing commit collapsed into M1 for partner's view"
+    );
+
+    // Snapshot `dev`'s view of `M1`'s tree before `main` advances to `M2` so
+    // the post-embargo `POST /push` builds a valid commit parented on `M1`.
+    let mut dev_craft = Craft::new(&api, &p.dev, &p.name, "main");
+    assert_eq!(dev_craft.tip, m1_proj, "dev_craft starts from M1");
+
+    // Advance `main` to `M2` so `M1` is now a historical public commit (not
+    // `main`'s current tip) and `resolve_for_mode` resolves `m1_proj` through
+    // `projections` (`sync.rs:1325-1432`).
+    write_files(&p.dir, &[("src/after_m1_2850.rs", "pub const AFTER: u32 = 2;\n")]);
+    p.admin.ok(&p.dir, &["commit", "-m", "advance main past M1"]);
+    p.admin.ok(&p.dir, &["push"]);
+    let m2_proj = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    assert_ne!(m2_proj, m1_proj, "main advanced past M1");
+
+    // 3. AFTER the embargo: `dev` (outside the embargo, same `view_key`) must
+    //    still be able to base API changes and feature branches on `M1` without
+    //    404/400 refusal or an embargo existence oracle.
+    let post_change = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": m1_proj.hex(),
+            "description": "after embargo",
+            "edits": [{"path": "src/dev_post_2850.rs", "put": {"text": "post\n"}}],
+        }),
+    );
+    assert_eq!(
+        post_change.status,
+        200,
+        "post-embargo POST /changes based on public commit M1 must succeed (not 404): {}",
+        String::from_utf8_lossy(&post_change.body)
+    );
+
+    dev_craft.file("src/dev_branch_2850.rs", "pub const B: u32 = 1;\n");
+    let mut dev_snap = veil_core::object::Snapshot {
+        parents: vec![m1_proj],
+        change_id: veil_core::ChangeId::random(),
+        tree: dev_craft.root,
+        description: veil_core::object::Text::Plain("dev branch off M1".into()),
+        author: "dev".into(),
+        timestamp: veil_core::now_millis(),
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: None,
+        signature: None,
+        agent: None,
+        attempts: vec![],
+        abandoned: None,
+    };
+    dev_snap.sign(&dev_craft.identity);
+    let dev_new = dev_craft.put(veil_core::object::Object::Snapshot(dev_snap));
+    let up_dev = api.upload(&dev_craft.token, &p.name, &dev_craft.objects);
+    assert_eq!(up_dev.status, 200, "{}", String::from_utf8_lossy(&up_dev.body));
+    let dev_packs: Vec<String> = serde_json::from_value(up_dev.json()["packs"].clone()).unwrap();
+    let post_push = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "dev-feat-2850", "expected": null, "new": dev_new.hex()}],
+            "packs": dev_packs,
+        }),
+    );
+    assert_eq!(
+        post_push.status,
+        200,
+        "post-embargo POST /push branching off public commit M1 must succeed (not 400): {}",
+        String::from_utf8_lossy(&post_push.body)
+    );
+    assert_eq!(post_push.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&post_push.body));
+
+    // Meanwhile probing the embargoed snapshot id itself through `resolve_for_mode`
+    // (`POST /changes`) is still refused identically to an unknown id.
+    let unknown = ObjectId::hash(b"never-existed-2850");
+    let probe_emb = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": embargoed.hex(),
+            "description": "probe embargo",
+            "edits": [{"path": "src/probe_2850.rs", "put": {"text": "x\n"}}],
+        }),
+    );
+    let probe_unk = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/changes", p.name),
+        &json!({
+            "base": unknown.hex(),
+            "description": "probe unknown",
+            "edits": [{"path": "src/probe_2850.rs", "put": {"text": "x\n"}}],
+        }),
+    );
+    assert_eq!((probe_emb.status, probe_unk.status), (404, 404));
+    assert_eq!(probe_emb.json()["code"], probe_unk.json()["code"]);
+    assert_eq!(probe_emb.json()["message"], format!("no snapshot {} that you can see", embargoed.short()));
+}
+
+/// BUG-2880: restricting `resolve_stored_excluding` strictly to the caller's
+/// current `view_key` broke legitimate cross-view resolution (e.g. `vl pull`
+/// calling `POST /history` with tips from before an access change, or `GET
+/// /subtree` naming another view's projected id). With an active embargo
+/// present (exercising the `!exclude_embargoes.is_empty()` branch too), a
+/// cross-view public projected id must still resolve and project through the
+/// caller's current view, while another view's embargoed projected id remains
+/// refused as unknown.
+#[test]
+fn bug_2880_cross_view_resolution_still_resolves_public_ids_and_excludes_withheld_embargoes() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let (dev, fin) = (p.dev.token(), p.fin.token());
+
+    // Public commit touching both `src/` and `billing/` so `dev` and `fin`
+    // hold distinct projected ids for `main`'s tip.
+    write_files(
+        &p.dir,
+        &[
+            ("src/pub_2880.rs", "pub const V: u32 = 1;\n"),
+            (&format!("{BILL_DIR}/pub_2880.txt"), "billing public\n"),
+        ],
+    );
+    p.admin.ok(&p.dir, &["commit", "-m", "public commit 2880"]);
+    p.admin.ok(&p.dir, &["push"]);
+
+    let dev_pub_tip = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let fin_pub_tip = api.tips(Some(&fin), &p.name).unwrap().branches["main"];
+    assert_ne!(dev_pub_tip, fin_pub_tip, "dev and fin have distinct views of main");
+
+    // `fin` pushes an active embargo scoped to `finance` (so `dev` is outside
+    // it and `withheld_eids` is non-empty for `dev`).
+    let eid = "2880deadbe".to_string();
+    let now = veil_core::now_millis();
+    let mut fin_craft = Craft::new(&api, &p.fin, &p.name, "main");
+    let fin_base = fin_craft.tip;
+    fin_craft.file(&format!("{BILL_DIR}/embargo_2880.txt"), "secret embargo 2880\n");
+    let mut emb_snap = veil_core::object::Snapshot {
+        parents: vec![fin_base],
+        change_id: veil_core::ChangeId::random(),
+        tree: fin_craft.root,
+        description: veil_core::object::Text::Plain("embargo 2880".into()),
+        author: "fin".into(),
+        timestamp: now,
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: Some(eid.clone()),
+        signature: None,
+        agent: None,
+        attempts: vec![],
+        abandoned: None,
+    };
+    emb_snap.sign(&fin_craft.identity);
+    let emb_real = fin_craft.put(veil_core::object::Object::Snapshot(emb_snap));
+    let up = api.upload(&fin_craft.token, &p.name, &fin_craft.objects);
+    assert_eq!(up.status, 200, "upload embargo: {}", String::from_utf8_lossy(&up.body));
+    let packs: Vec<String> = serde_json::from_value(up.json()["packs"].clone()).unwrap();
+    let rec = veil_core::keychain::EmbargoRecord {
+        format: veil_core::keychain::EMBARGO_FORMAT,
+        id: eid.clone(),
+        scope: "finance".into(),
+        until: Some(now + 3_600_000),
+        released_at: None,
+        created: now,
+        state: None,
+        reason: None,
+    };
+    let push_emb = api.post_json(
+        Some(&fin_craft.token),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "main", "expected": fin_base.hex(), "new": emb_real.hex()}],
+            "packs": packs,
+            "embargoes": [rec],
+        }),
+    );
+    assert_eq!(push_emb.status, 200, "push embargo: {}", String::from_utf8_lossy(&push_emb.body));
+    assert_eq!(push_emb.json()["results"][0]["ok"], json!(true));
+
+    let fin_emb_proj = api.tips(Some(&fin), &p.name).unwrap().branches[&format!("embargo/{eid}")];
+    assert_ne!(fin_emb_proj, fin_pub_tip);
+
+    // 1. Cross-view public projected id (`fin_pub_tip`) resolves for `dev`
+    //    even while an active withheld embargo exists in the project.
+    let hist_pub = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/history", p.name),
+        &json!({ "tips": [fin_pub_tip.hex()], "stop": [] }),
+    );
+    assert_eq!(hist_pub.status, 200, "cross-view public history must succeed: {}", String::from_utf8_lossy(&hist_pub.body));
+
+    // And `GET /subtree` with `fin_pub_tip` resolves the snapshot and projects
+    // it through `dev`'s own view (refusing `BILL_DIR` as no such path, not as
+    // unknown snapshot, while serving `src`).
+    let sub_hidden = api.get(
+        Some(&dev),
+        &format!("/v1/projects/{}/subtree?snapshot={}&path={BILL_DIR}", p.name, fin_pub_tip.hex()),
+    );
+    assert_eq!(sub_hidden.status, 404);
+    assert_eq!(sub_hidden.json()["message"], "no such object at that path that you can see");
+
+    let sub_visible = api.get(
+        Some(&dev),
+        &format!("/v1/projects/{}/subtree?snapshot={}&path=src", p.name, fin_pub_tip.hex()),
+    );
+    assert_eq!(sub_visible.status, 200, "cross-view public subtree of visible path must succeed: {}", String::from_utf8_lossy(&sub_visible.body));
+
+    // 2. Cross-view embargoed projected id (`fin_emb_proj`) must remain
+    //    refused as unknown for `dev` across `history` and `subtree`.
+    let hist_emb = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/history", p.name),
+        &json!({ "tips": [fin_emb_proj.hex()], "stop": [] }),
+    );
+    assert_eq!(hist_emb.status, 404);
+    assert_eq!(hist_emb.json()["message"], format!("no snapshot {} that you can see", fin_emb_proj.short()));
+
+    let sub_emb = api.get(
+        Some(&dev),
+        &format!("/v1/projects/{}/subtree?snapshot={}&path=src", p.name, fin_emb_proj.hex()),
+    );
+    assert_eq!(sub_emb.status, 404);
+    assert_eq!(sub_emb.json()["message"], format!("no snapshot {} that you can see", fin_emb_proj.short()));
 }

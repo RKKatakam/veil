@@ -139,19 +139,48 @@ fn show_set(set: Option<&SparseSet>) -> String {
     }
 }
 
+/// Does `safe(s)` leave `s` unchanged (no control or bidirectional characters)?
+fn verbatim(s: &str) -> bool {
+    safe(s).as_ref() == s
+}
+
 /// `word` as a shell takes it for one argument: as it is when it holds
-/// nothing a shell reads, in single quotes otherwise.
+/// nothing a shell (including zsh's leading `=`) reads, in single quotes
+/// otherwise.
 fn shell_word(word: &str) -> String {
-    let plain = !word.is_empty() && word.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./-@%+=:,".contains(&b));
+    let plain = !word.is_empty() && word.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./-@%+:,".contains(&b));
     match plain {
         true => word.to_string(),
         false => format!("'{}'", safe(word).replace('\'', "'\\''")),
     }
 }
 
-/// A sparse set as `--only` takes it on a command line: `src tests/unit.rs`.
+/// Workspace `name` as an argument to `vl ws exec`: `--workspace=NAME` when
+/// `name` starts with `-` so clap never reads it as an option.
+fn ws_exec_arg(name: &str) -> String {
+    match name.starts_with('-') {
+        true => format!("--workspace={}", shell_word(name)),
+        false => shell_word(name),
+    }
+}
+
+/// A sparse set as `--only` takes it at the workspace root: `src tests/unit.rs`,
+/// with `./` before any path starting with `-`.
 fn set_args(set: Option<&SparseSet>) -> String {
-    set.map(|s| s.paths().iter().map(|p| shell_word(p.as_str())).collect::<Vec<_>>().join(" ")).unwrap_or_default()
+    set.map(|s| {
+        s.paths()
+            .iter()
+            .map(|p| {
+                let s = p.as_str();
+                match s.starts_with('-') {
+                    true => shell_word(&format!("./{s}")),
+                    false => shell_word(s),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+    .unwrap_or_default()
 }
 
 /// Say which files the command wrote outside the `--only` paths (they are
@@ -273,8 +302,9 @@ fn exec_mounted(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Confin
     if let Loaded::Found(m) = paths.load_manifest() {
         if m.pending.is_some() {
             bail!(
-                "the sandbox of workspace {n} holds the output of an earlier run that is not recorded; `vl ws exec {n} --record-only` records it first",
-                n = safe(name)
+                "the sandbox of workspace {n} holds the output of an earlier run that is not recorded; `vl ws exec {w} --record-only` records it first",
+                n = safe(name),
+                w = ws_exec_arg(name),
             );
         }
     }
@@ -391,7 +421,19 @@ impl Drop for PrivateUmask {
 
 fn vault_files(repo: &Repo) -> Result<Vec<(String, Vec<u8>)>> {
     let mut files = Vec::new();
+    let mut total = 0usize;
     for (p, hexdata) in repo.vault_load()?.files {
+        total = total.saturating_add(hexdata.len() / 2);
+        if total > veil_core::builder::MAX_GUARD_BYTES {
+            let max_mib = veil_core::builder::MAX_GUARD_BYTES >> 20;
+            let mib = total as f64 / (1u64 << 20) as f64;
+            bail!(
+                "the secret-value guard exceeds the {max_mib} MiB limit ({} brings it to {mib:.1} MiB): \
+                 sealed and injected secret files in a mounted or `vl ws exec` workspace may total at most {max_mib} MiB \
+                 so every recording can check for copied secrets in bounded memory",
+                safe(&p)
+            );
+        }
         files.push((p, hex::decode(hexdata)?));
     }
     Ok(files)
@@ -528,16 +570,55 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
     // could add its own where nothing tells it from the sandbox's.
     m.shut_by_command.retain(|d| VPath::new(&d.dir).is_ok_and(|p| !matches!(fs.metadata(&p), Ok(None))));
     if let Some(shut) = m.shut_by_command.iter().find(|d| d.refuses(set.as_ref())) {
-        let (d, was) = (&shut.dir, set_args(shut.only_set().as_ref()));
+        let only_set = shut.only_set();
+        let (d, was) = (&shut.dir, set_args(only_set.as_ref()));
+        let at_path = paths.files.join(d);
+        let repo_flag = ctx.needs_repo_flag();
+        let runnable = std::env::current_dir().is_ok()
+            && verbatim(name)
+            && verbatim(d)
+            && at_path.to_str().is_some_and(verbatim)
+            && repo_flag.as_ref().is_none_or(|r| r.to_str().is_some_and(verbatim))
+            && only_set.as_ref().is_some_and(|s| s.paths().iter().all(|p| verbatim(p.as_str())));
+        if runnable {
+            let at_raw = at_path.to_str().expect("checked");
+            let at = match at_raw.starts_with('-') {
+                true => shell_word(&format!("./{at_raw}")),
+                false => shell_word(at_raw),
+            };
+            let r_opt = match &repo_flag {
+                Some(r) => format!("-R={} ", shell_word(r.to_str().expect("checked"))),
+                None => String::new(),
+            };
+            let w = ws_exec_arg(name);
+            let cmd_only = only_set
+                .as_ref()
+                .expect("checked")
+                .paths()
+                .iter()
+                .map(|p| shell_word(&ctx.only_arg(p)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            bail!(
+                "the sandbox of workspace '{n}' holds {d}, which a command of an earlier `--only {was}` run made unlistable: what is \
+                 in it outside those paths was written outside `--only` and is not the workspace's. Until it is removed, only a \
+                 run with exactly those paths at or below {d} starts. Make the directory listable (`chmod u+rwx {at}`) and run \
+                 `vl ws exec {r_opt}{w} --only {cmd_only} -- true`, which removes what was written there; or delete the directory. Then run \
+                 again",
+                n = safe(name),
+                d = safe(d),
+            );
+        }
         bail!(
             "the sandbox of workspace '{n}' holds {d}, which a command of an earlier `--only {was}` run made unlistable: what is \
              in it outside those paths was written outside `--only` and is not the workspace's. Until it is removed, only a \
-             run with exactly those paths at or below {d} starts. Make the directory listable (`chmod u+rwx {at}`) and run \
-             `vl ws exec {n} --only {was} -- true`, which removes what was written there; or delete the directory. Then run \
-             again",
+             run with exactly those paths at or below {d} starts. Make the directory ({at}) listable (`u+rwx`) and run `vl ws exec` \
+             in workspace '{n}' with those `--only` paths, passing `true` after `--`, which removes what was written there (no \
+             command to paste is printed because a path holds control, bidirectional or non-UTF-8 characters, shown escaped here); \
+             or delete the directory. Then run again",
             n = safe(name),
             d = safe(d),
-            at = shell_word(&paths.files.join(d).display().to_string()),
+            at = safe(&at_path.display().to_string()),
         );
     }
     let run_id = hex::encode(veil_core::crypto::random_bytes::<8>());
@@ -554,26 +635,11 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
             Some(s) => restrict_tree(ctx.repo.store(), &synced, s)?,
             None => synced,
         };
-        let sealed = core::sealed_files_in_tree(ctx.repo.store(), &synced_slice, None);
-        if !sealed.is_empty() {
-            let mut guard = paths.load_guard(&ctx.repo)?.unwrap_or_default();
-            let prev = guard.files.len();
-            guard.add(&sealed);
-            if guard.files.len() != prev {
-                paths.save_guard(&ctx.repo, &guard)?;
-            }
-        }
+        let mut guard = paths.load_guard(&ctx.repo)?;
+        absorb_into_guard(&ctx.repo, &paths, &mut guard, ctx.repo.store(), &synced_slice, None)?;
         let co = core::sync_to(&ctx.repo, &fs, &mut m, &synced, set.as_ref(), &mut cache)?;
         core::vouch_written(ctx.repo.store(), &fs, &synced, &co, &mut cache, core::VouchWait::IfCheaper)?;
-        let sealed_fs = core::sealed_files_in_tree(ctx.repo.store(), &synced_slice, Some(&fs));
-        if !sealed_fs.is_empty() {
-            let mut guard = paths.load_guard(&ctx.repo)?.unwrap_or_default();
-            let prev = guard.files.len();
-            guard.add(&sealed_fs);
-            if guard.files.len() != prev {
-                paths.save_guard(&ctx.repo, &guard)?;
-            }
-        }
+        absorb_into_guard(&ctx.repo, &paths, &mut guard, ctx.repo.store(), &synced_slice, Some(&fs))?;
         if let SetAside::Reimport {
             from,
             paths: keep,
@@ -630,7 +696,8 @@ fn exec_persistent(ctx: &mut Ctx, name: &str, a: &Exec<'_>, confine: Option<&Con
                 // recording of this sandbox applies, and what the injection
                 // replaces (for a cleanup after `vl` dies).
                 let mut guard = paths.load_guard(&ctx.repo)?.unwrap_or_default();
-                guard.add(&files);
+                guard.try_add(&files)?;
+                guard.try_secrets()?;
                 guard.injection = Some(inj.to_saved(&run_id));
                 paths.save_guard(&ctx.repo, &guard)?;
                 run.reaper = spawn_reaper(&[PERSISTENT_ARG.as_ref(), paths.dir.as_os_str(), run_id.as_ref()]);
@@ -738,16 +805,8 @@ impl crate::ws_socket::Around for MidRun {
             Some(s) => restrict_tree(&store, &synced, s)?,
             None => synced,
         };
-        let sealed = core::sealed_files_in_tree(&store, &synced_slice, Some(&fs));
-        if !sealed.is_empty() {
-            let g = guard.get_or_insert_with(core::Guard::default);
-            let prev = g.files.len();
-            g.add(&sealed);
-            if g.files.len() != prev {
-                paths.save_guard(&ctx.repo, g)?;
-            }
-        }
-        let secrets = guard.as_ref().map(core::Guard::secrets);
+        absorb_into_guard(&ctx.repo, &paths, &mut guard, &store, &synced_slice, Some(&fs))?;
+        let secrets = guard.as_ref().map(core::Guard::try_secrets).transpose()?;
         let mut cache = paths.load_cache();
         let pin = core::PolicyPin::new(&fs, &store, &synced)?;
         let view = set.as_ref().map(|s| SparseView::new(&pin, store.clone(), synced, s));
@@ -780,15 +839,7 @@ impl crate::ws_socket::Around for MidRun {
             Some(s) => restrict_tree(&store, &tree, s)?,
             None => tree,
         };
-        let new_sealed = core::sealed_files_in_tree(&store, &recorded_slice, Some(&fs));
-        if !new_sealed.is_empty() {
-            let g = guard.get_or_insert_with(core::Guard::default);
-            let prev = g.files.len();
-            g.add(&new_sealed);
-            if g.files.len() != prev {
-                paths.save_guard(&ctx.repo, g)?;
-            }
-        }
+        let _ = absorb_into_guard(&ctx.repo, &paths, &mut guard, &store, &recorded_slice, Some(&fs));
         if let Some(pp) = &mut m.pending {
             pp.base = out.snapshot;
         }
@@ -885,6 +936,30 @@ fn finish(
     res
 }
 
+/// Absorb any sealed entries of `tree` into `guard` (creating one only if
+/// `tree` actually yields sealed files), persisting `guard.bin` when changed;
+/// returns whether `guard.files` gained a new secret file (BUG-2650).
+fn absorb_into_guard(
+    repo: &Repo,
+    paths: &SandboxPaths,
+    guard: &mut Option<core::Guard>,
+    store: &veil_core::store::ObjectStore,
+    tree: &ObjectId,
+    fallback_fs: Option<&dyn StorageBackend>,
+) -> veil_core::Result<bool> {
+    let mut g = guard.clone().unwrap_or_default();
+    let prev_files = g.files.len();
+    let changed = g.absorb_tree(store, tree, fallback_fs)?;
+    let grew = g.files.len() != prev_files;
+    if !g.files.is_empty() || g.injection.is_some() {
+        if changed {
+            paths.save_guard(repo, &g)?;
+        }
+        *guard = Some(g);
+    }
+    Ok(grew)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_recording(
     ctx: &mut Ctx,
@@ -905,16 +980,13 @@ fn finish_recording(
         Some(s) => restrict_tree(&store, &synced, s)?,
         None => synced,
     };
-    let sealed = core::sealed_files_in_tree(&store, &synced_slice, Some(fs));
-    if !sealed.is_empty() {
-        let g = guard.get_or_insert_with(core::Guard::default);
-        let prev = g.files.len();
-        g.add(&sealed);
-        if g.files.len() != prev {
-            paths.save_guard(&ctx.repo, g).map_err(|e| not_recorded(name, paths, e))?;
-        }
-    }
-    let mut secrets = guard.as_ref().map(core::Guard::secrets);
+    absorb_into_guard(&ctx.repo, paths, &mut guard, &store, &synced_slice, Some(fs))
+        .map_err(|e| not_recorded(name, paths, e))?;
+    let mut secrets = guard
+        .as_ref()
+        .map(core::Guard::try_secrets)
+        .transpose()
+        .map_err(|e| not_recorded(name, paths, e))?;
 
     let pin = core::PolicyPin::new(fs, &store, &synced)?;
     let (recorded, recorded_tree, report, outcome) = {
@@ -1007,14 +1079,9 @@ fn finish_recording(
         Some(s) => restrict_tree(&store, &recorded_tree, s)?,
         None => recorded_tree,
     };
-    let new_sealed = core::sealed_files_in_tree(&store, &recorded_slice, Some(fs));
-    if !new_sealed.is_empty() {
-        let g = guard.get_or_insert_with(core::Guard::default);
-        let prev = g.files.len();
-        g.add(&new_sealed);
-        if g.files.len() != prev {
-            paths.save_guard(&ctx.repo, g)?;
-            secrets = Some(g.secrets());
+    if let Ok(true) = absorb_into_guard(&ctx.repo, paths, &mut guard, &store, &recorded_slice, Some(fs)) {
+        if let Some(Ok(s)) = guard.as_ref().map(core::Guard::try_secrets) {
+            secrets = Some(s);
         }
     }
 
@@ -1482,25 +1549,31 @@ fn exec_ephemeral(ctx: &mut Ctx, a: &Exec<'_>, confine: Option<&Confine>) -> Res
             Some(s) => restrict_tree(ctx.repo.store(), &tree, s)?,
             None => tree,
         };
+        let mut guard = core::Guard::default();
+        guard.absorb_tree(ctx.repo.store(), &to, None)?;
+        let isolated = match a.with_isolated {
+            true => {
+                let files = vault_files(&ctx.repo)?;
+                guard.try_add(&files)?;
+                Some(files)
+            }
+            false => None,
+        };
+        let mut injected = (!guard.files.is_empty()).then(|| guard.try_secrets()).transpose()?;
         // What could not be materialised (a link the sandbox refuses, a
         // file it cannot hold) is recorded as such, so recording the run
         // carries it instead of deleting it.
         let mut record = veil_core::checkout::Materialised::default();
         let checked_out = ctx.repo.checkout_tree_recorded(&sandbox, None, &to, &mut record, None)?;
         crate::ctx::print_failed(&checked_out.failed);
-        let mut guard_files = core::sealed_files_in_tree(ctx.repo.store(), &to, Some(&sandbox));
-        if a.with_isolated {
-            let files = vault_files(&ctx.repo)?;
-            for (p, data) in &files {
+        if guard.absorb_tree(ctx.repo.store(), &to, Some(&sandbox))? {
+            injected = Some(guard.try_secrets()?);
+        }
+        if let Some(files) = &isolated {
+            for (p, data) in files {
                 sandbox.write_secret(&VPath::new(p)?, data, false)?;
             }
-            guard_files.extend(files);
         }
-        // Whatever the command does with these, they must not be recorded
-        // in another file.
-        let injected = (!guard_files.is_empty()).then(|| {
-            veil_core::builder::InjectedSecrets::from_files(guard_files.iter().map(|(p, d)| (p.as_str(), d.as_slice())))
-        });
         sb.make_private()?;
         print_running(a.command, &dir, confine);
         let code = run_command(&dir, &dir, a.command, confine, None, None)?;

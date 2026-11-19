@@ -138,6 +138,9 @@ pub enum Mode {
 
 /// The cost gates (`storage-and-cost.md` §9).
 pub const GATE_COMMITS_PER_PUSH: f64 = 1.0;
+/// The share of an offered rate a run must land for its branch to have
+/// held that rate ([`not_graded_gates`], BUG-2370).
+pub const HELD_SHARE: f64 = 0.95;
 /// Database commits per landing through the landing service (phase 4 §7):
 /// the submit's, and its share of its batch's.
 pub const GATE_COMMITS_PER_LANDING: f64 = 1.5;
@@ -767,6 +770,7 @@ impl Agent<'_> {
                 }],
                 force: false,
                 receipts,
+                packs: Vec::new(),
                 embargoes: Vec::new(),
             };
             let r = self.api.post_json(Some(self.token), &self.path("/push"), &req)?;
@@ -1271,22 +1275,42 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
         // maintenance (autovacuum, analyze) takes a few transactions.
         let ops = r["ops"].as_f64().unwrap_or(0.0);
         let over = |c: f64| c * ops > GATE_COMMITS_PER_PUSH * ops * 1.02 + 20.0;
-        if let Some(c) = r["db_push_commits_per_op"].as_f64().filter(|c| over(*c)) {
+        // Read only at a rate the branch holds, as the landing gate above is
+        // read at its rates (BUG-2370): past it the point is printed, not
+        // graded ([`not_graded_gates`]).
+        if let Some(c) = r["db_push_commits_per_op"].as_f64().filter(|c| over(*c) && past_capacity(r).is_none()) {
             out.push(format!("{mode}: {c:.2} database commits per push, the background work's aside (gate: {GATE_COMMITS_PER_PUSH})"));
         }
         let merges = r["branch_merges"].as_f64().unwrap_or(0.0);
         if let Some(c) = r["db_branch_landing_commits_per_landing"].as_f64().filter(|c| c * merges > GATE_COMMITS_PER_BRANCH_LANDING * merges * 1.02 + 20.0) {
             out.push(format!("{mode}: {c:.2} database commits per branch landing (gate: {GATE_COMMITS_PER_BRANCH_LANDING})"));
         }
-        // An API commit too: it stores what it made as one pack (BUG-1948;
-        // stored loose, as S10 did, its writes were only reported).
-        let tries = 1.0 + r["collisions_per_op"].as_f64().unwrap_or(0.0);
-        let over = |w: f64| w * ops > GATE_STORAGE_WRITES_PER_PUSH * tries * ops * 1.02 + 20.0;
-        if let Some(w) = r["storage_push_writes_per_op"].as_f64().filter(|w| over(*w)) {
-            out.push(format!(
-                "{mode}: {:.2} storage writes per push ({w:.2} per landing of {tries:.2} pushes), the deriver's aside (gate: {GATE_STORAGE_WRITES_PER_PUSH})",
-                w / tries
-            ));
+        // An API commit too: it stores what it made as one pack in `packs`
+        // (BUG-1948) and under its keys in `objects`. In `objects`, a push's
+        // own writes are at most its upload requests plus the objects it kept
+        // (`storage_own_writes <= uploads + objects_kept`, `object-layout.md` §8.2).
+        if r["object_layout"].as_str() == Some("objects") {
+            if let Some(w) = r["storage_push_writes_per_op"].as_f64() {
+                match r["uploads_per_op"].as_f64().zip(r["objects_kept_per_op"].as_f64()) {
+                    Some((u, k)) if w * ops <= (u + k) * ops * 1.02 + 20.0 => {}
+                    Some((u, k)) => out.push(format!(
+                        "{mode}: {w:.2} own storage writes per op, the deriver's aside (gate in `objects`: <= {:.2}, uploads {u:.2} + objects kept {k:.2})",
+                        u + k
+                    )),
+                    None => out.push(format!(
+                        "{mode}: {w:.2} own storage writes per op in `objects` without `uploads` and `objects_kept` counters"
+                    )),
+                }
+            }
+        } else {
+            let tries = 1.0 + r["collisions_per_op"].as_f64().unwrap_or(0.0);
+            let over = |w: f64| w * ops > GATE_STORAGE_WRITES_PER_PUSH * tries * ops * 1.02 + 20.0;
+            if let Some(w) = r["storage_push_writes_per_op"].as_f64().filter(|w| over(*w)) {
+                out.push(format!(
+                    "{mode}: {:.2} storage writes per push ({w:.2} per landing of {tries:.2} pushes), the deriver's aside (gate: {GATE_STORAGE_WRITES_PER_PUSH})",
+                    w / tries
+                ));
+            }
         }
     }
     if mode == "objects" && r["via"] == "cache" {
@@ -1310,6 +1334,50 @@ pub fn missed_gates(r: &serde_json::Value, background: f64) -> Vec<String> {
         }
     }
     out
+}
+
+/// Why run `r` is past what its branch holds, if it is (BUG-2370; the
+/// owner's decision of 2026-11-18). Only where agents share a branch
+/// (`land`, `api`: `main`; in `branches` each agent has a branch of its
+/// own, which holds whatever it is given). A branch lands one change at a
+/// time, so:
+/// - at an offered rate (open loop), it held the rate when the run landed
+///   at least [`HELD_SHARE`] of it;
+/// - at `max` (closed loop: every agent lands again as soon as it is
+///   answered), one agent on a branch is that branch at its limit, and any
+///   more offer it more than it lands.
+///
+/// Past capacity a landing loses the race for its branch many times before
+/// it lands, and each of its pushes that got as far as its transaction
+/// committed one: the retries' cost, which the landing service is there to
+/// spare, not a commit a landing could do without.
+fn past_capacity(r: &serde_json::Value) -> Option<String> {
+    if !matches!(r["mode"].as_str(), Some("land" | "api")) {
+        return None;
+    }
+    if let Some(rate) = r["rate"].as_f64() {
+        let landed = r["ops_per_s"].as_f64()?;
+        return (landed < rate * HELD_SHARE).then(|| format!("{landed:.1} of the {rate} landings a second offered"));
+    }
+    if r["rate"].as_str() == Some("max") {
+        let (clients, projects) = (r["clients"].as_f64()?, r["projects"].as_f64()?);
+        return (clients > projects).then(|| format!("{clients} agents on {projects} branch(es), each landing as fast as it is answered"));
+    }
+    None
+}
+
+/// The gates of run `r` that are printed but not graded: the commits a
+/// landing costs, at a rate its branch does not hold ([`past_capacity`]).
+/// Neither met nor missed.
+pub fn not_graded_gates(r: &serde_json::Value) -> Vec<String> {
+    let mode = r["mode"].as_str().unwrap_or("");
+    match (past_capacity(r), r["db_push_commits_per_op"].as_f64()) {
+        (Some(why), Some(c)) => vec![format!(
+            "{mode}: {c:.2} database commits per push, not graded past capacity ({why}; {} collisions a landing; gate at a held rate: {GATE_COMMITS_PER_PUSH})",
+            r["collisions_per_op"].as_f64().map_or("–".into(), |x| format!("{x:.1}"))
+        )],
+        _ => Vec::new(),
+    }
 }
 
 /// The gates of run `r` that could not be judged: those of a running
@@ -1869,6 +1937,11 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         let (sent, received) = (BYTES_SENT.load(Ordering::Relaxed) - sent0, BYTES_RECEIVED.load(Ordering::Relaxed) - received0);
         let server_stats = cx.server_stats.as_ref().and_then(|(pid, f)| server_stats(*pid, f)).zip(before_server_stats);
         let stat = |k: &str| server_stats.as_ref().and_then(|(b, a)| Some(b[k].as_f64()? - a[k].as_f64()?));
+        let object_layout = server_stats
+            .as_ref()
+            .and_then(|(b, _)| b["object_layout"].as_str().map(str::to_owned))
+            .or_else(|| cx.server_stats.as_ref().and_then(|(_, f)| f.parent().and_then(crate::server::stats_layout)))
+            .or_else(|| a.server.object_layout.clone());
         let dml_both = cx.stats.and_then(|(rt, url)| db_writes(rt, url)).zip(before_dml);
         let dml = dml_both.map(|((_, bw), (_, aw))| bw - aw);
         // Explicit `COMMIT`s, counted on YugabyteDB too (it has no
@@ -1903,7 +1976,6 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
         });
         result = json!({
             "mode": match a.mode { Mode::Pull => "pull", Mode::Land => "land", Mode::Branches => "branches", Mode::Api => "api", Mode::Landing => "landing", Mode::Objects => "objects", Mode::Agents => "agents" },
-
             "projects": projects,
             "clients": clients,
             "rate": match rate { Rate::Max => json!("max"), Rate::PerSecond(r) => json!(r) },
@@ -1946,6 +2018,11 @@ fn run_one(cx: &Ctx<'_>, a: &Args, projects: usize, clients: usize, rate: Rate, 
             "background_landings": bg.ops.load(Ordering::Relaxed),
             "background_errors": bg.errors.load(Ordering::Relaxed),
         });
+        result["object_layout"] = json!(object_layout);
+        result["storage_deletes_per_op"] = json!(stat("storage_deletes").map(per_op));
+        result["storage_lists_per_op"] = json!(stat("storage_lists").map(per_op));
+        result["objects_kept_per_op"] = json!(stat("objects_kept").map(per_op));
+        result["uploads_per_op"] = json!(stat("uploads").map(per_op));
         // The measured window's wall-clock edges, to line up samples taken
         // elsewhere (the servers' and the database's CPU: deploy/gates.sh `onerepo`).
         result["window_start_unix_ms"] = json!(window_start);
@@ -2541,18 +2618,29 @@ pub fn run_all(a: &Args) -> Result<serde_json::Value> {
                     eprintln!("      GATE NOT MEASURED: {m}");
                 }
                 r["gates_unmeasured"] = json!(unmeasured);
+                let not_graded = if a.flood > 0 { Vec::new() } else { not_graded_gates(&r) };
+                for m in &not_graded {
+                    eprintln!("      GATE NOT GRADED: {m}");
+                }
+                r["gates_not_graded"] = json!(not_graded);
                 runs.push(r);
             }
         }
     }
     }
-    Ok(json!({ "profile": "load", "server": base, "runs": runs }))
+    let object_layout = runs
+        .iter()
+        .find_map(|r| r["object_layout"].as_str().map(str::to_owned))
+        .or_else(|| _server.as_ref().and_then(|_| crate::server::stats_layout(&a.dir.join("server"))))
+        .or_else(|| a.server.object_layout.clone());
+    Ok(json!({ "profile": "load", "server": base, "object_layout": object_layout, "runs": runs }))
 }
 
 fn line(r: &serde_json::Value) -> String {
     let f = |k: &str| r[k].as_f64().map(|v| format!("{v:.2}")).unwrap_or_else(|| "–".into());
     format!(
-        "{} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, told to come back {} (busy {}, branch landings {}), server ms/op {}, db ms/op {}, db/op {}, commits/op {}, writes/op {}, derived {} s later ({} branches behind), storage reads/op {}, object cache hits {}",
+        "layout {}, {} ops/s ({} agents finishing), p50 {} ms, p99 {} ms, collisions/op {}, errors {}, told to come back {} (busy {}, branch landings {}), server ms/op {}, db ms/op {}, db/op {}, commits/op {}, writes/op {}, derived {} s later ({} branches behind), storage writes/op {} ({}), reads/op {}, deletes/op {}, lists/op {}, object cache hits {}",
+        r["object_layout"].as_str().unwrap_or("–"),
         f("ops_per_s"),
         r["agents_finishing"],
         f("p50_ms"),
@@ -2569,22 +2657,35 @@ fn line(r: &serde_json::Value) -> String {
         f("db_writes_per_op"),
         f("derive_lag_s"),
         r["derive_behind"],
+        f("storage_writes_per_op"),
+        f("storage_push_writes_per_op"),
         f("storage_reads_per_op"),
+        f("storage_deletes_per_op"),
+        f("storage_lists_per_op"),
         f("object_cache_hit_share")
     )
 }
 
 /// The runs as a Markdown table.
 pub fn markdown(v: &serde_json::Value) -> Result<String> {
-    let mut out = String::from(
-        "| Mode | Projects | Clients | Agents finishing | Target rate (/s) | Done (/s) | p50 (ms) | p99 (ms) | Collisions per landing | Requests per op | Server CPU (ms/op) | Server cores | DB CPU (ms/op) | DB cores | DB statements per op | DB commits per op | DB writes per op | Load tool cores | Errors |\n\
-         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+    let mut out = String::new();
+    let top_layout = v["object_layout"]
+        .as_str()
+        .or_else(|| v["runs"].as_array().and_then(|rs| rs.iter().find_map(|r| r["object_layout"].as_str())));
+    if let Some(l) = top_layout {
+        out.push_str(&format!("Object layout: `{l}`.\n\n"));
+    }
+    let layout_of = |r: &serde_json::Value| r["object_layout"].as_str().or(top_layout).unwrap_or("–").to_string();
+    out.push_str(
+        "| Mode | Layout | Projects | Clients | Agents finishing | Target rate (/s) | Done (/s) | p50 (ms) | p99 (ms) | Collisions per landing | Requests per op | Server CPU (ms/op) | Server cores | DB CPU (ms/op) | DB cores | DB statements per op | DB commits per op | DB writes per op | Load tool cores | Errors |\n\
+         |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     let f = |x: &serde_json::Value, d: usize| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{v:.d$}")).unwrap_or_else(|| "–".into());
     for r in v["runs"].as_array().ok_or_else(|| anyhow!("no runs"))? {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             r["mode"].as_str().unwrap_or(""),
+            layout_of(r),
             r["projects"],
             r["clients"],
             r["agents_finishing"],
@@ -2624,8 +2725,8 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         }
     }
     out.push_str(
-        "\n| Mode | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates missed | Gates not measured |\n\
-         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|\n",
+        "\n| Mode | Layout | Projects | Clients | Target rate (/s) | DB commits per op (the push's own: the deriver's and uploads' aside) | DB statements per op | DB statements per request | Storage writes per op (the deriver's aside) | Storage reads per op | Storage deletes per op | Storage listings per op | KiB stored per op | KiB sent per op | KiB received per op | Session / permission / tips cache hits | Gates not graded (past capacity) | Gates missed | Gates not measured |\n\
+         |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|\n",
     );
     let pct = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.0} %", v * 100.0)).unwrap_or_else(|| "–".into());
     let kib = |x: &serde_json::Value| x.as_f64().filter(|v| v.is_finite()).map(|v| format!("{:.1}", v / 1024.0)).unwrap_or_else(|| "–".into());
@@ -2634,9 +2735,13 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
         // Gates this run could not judge (a running cache's, BUG-1591): a
         // column of their own, so "none missed" is never read as "all met".
         let unmeasured = r["gates_unmeasured"].as_array().map(|m| m.len()).unwrap_or(0);
+        // Gates read only at a rate the branch holds (BUG-2370): the point
+        // is in the row, its commits are not judged.
+        let not_graded = r["gates_not_graded"].as_array().map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} / {} / {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} | {} | {} |\n",
             r["mode"].as_str().unwrap_or(""),
+            layout_of(r),
             r["projects"],
             r["clients"],
             r["rate"].as_str().map(str::to_string).unwrap_or_else(|| f(&r["rate"], 2)),
@@ -2647,12 +2752,15 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
             f(&r["storage_writes_per_op"], 1),
             f(&r["storage_push_writes_per_op"], 1),
             f(&r["storage_reads_per_op"], 1),
+            f(&r["storage_deletes_per_op"], 1),
+            f(&r["storage_lists_per_op"], 2),
             kib(&r["storage_written_bytes_per_op"]),
             kib(&r["bytes_sent_per_op"]),
             kib(&r["bytes_received_per_op"]),
             pct(&r["session_hit_share"]),
             pct(&r["permission_hit_share"]),
             pct(&r["tips_hit_share"]),
+            if not_graded == 0 { "none".to_string() } else { format!("**{not_graded}**") },
             if missed == 0 { "none".to_string() } else { format!("**{missed}**") },
             if unmeasured == 0 { "none".to_string() } else { format!("**{unmeasured}**") },
         ));
@@ -2660,13 +2768,14 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
     let landing: Vec<&serde_json::Value> = v["runs"].as_array().map(|r| r.iter().filter(|r| r["mode"] == "landing").collect()).unwrap_or_default();
     if !landing.is_empty() {
         out.push_str(
-            "\n| Landing service: clients | Target rate (/s) | Done (/s) | Batches | Landings per batch | Prepare (ms/batch) | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) |\n\
-             |---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+            "\n| Landing service: clients | Layout | Target rate (/s) | Done (/s) | Batches | Landings per batch | Prepare (ms/batch) | Build CPU (ms/landing) | Store objects (ms/batch) | Transaction (ms/batch) |\n\
+             |---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
         );
         for r in landing {
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 r["clients"],
+                layout_of(r),
                 r["rate"].as_str().map(str::to_string).unwrap_or_else(|| f(&r["rate"], 2)),
                 f(&r["ops_per_s"], 1),
                 f(&r["landing_batches"], 0),
@@ -2699,13 +2808,14 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
     let objects: Vec<&serde_json::Value> = v["runs"].as_array().into_iter().flatten().filter(|r| r["mode"] == "objects").collect();
     if !objects.is_empty() {
         out.push_str(
-            "\n| Via | Projects | Clients | Reads (/s) | Objects per read | p50 (ms) | p99 (ms) | Server CPU (ms/read) | Cache hits | Cache requests to the server per read | Cache CPU (ms/read) | Cache peak (MiB) | Errors |\n\
-             |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+            "\n| Via | Layout | Projects | Clients | Reads (/s) | Objects per read | p50 (ms) | p99 (ms) | Server CPU (ms/read) | Cache hits | Cache requests to the server per read | Cache CPU (ms/read) | Cache peak (MiB) | Errors |\n\
+             |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
         );
         for r in objects {
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 r["via"].as_str().unwrap_or(""),
+                layout_of(r),
                 r["projects"],
                 r["clients"],
                 f(&r["ops_per_s"], 1),
@@ -2728,9 +2838,78 @@ pub fn markdown(v: &serde_json::Value) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// BUG-2370 (the owner's decision, 2026-11-18): the commits a landing
+    /// costs are judged only at a rate its branch holds, as the landing gate
+    /// is read at its rates. Past capacity, where a landing loses the race
+    /// for `main` some 40 times and each push that reached its transaction
+    /// committed, the point is reported "not graded", neither met nor
+    /// missed; at a held rate the gate judges as before. The numbers are the
+    /// row's: `scripts/bench-server.sh load`'s `hot` curve (50 agents
+    /// landing on one `main`) and its `api-hot` curve.
+    #[test]
+    fn bug_2370_the_commits_gate_is_read_at_rates_the_branch_holds() {
+        let point = |mode: &str, rate: serde_json::Value, clients: u64, projects: u64, landed: f64, commits: f64, collisions: f64| {
+            json!({"mode": mode, "projects": projects, "clients": clients, "rate": rate, "ops": landed * 15.0, "ops_per_s": landed,
+                   "collisions_per_op": collisions, "db_push_commits_per_op": commits})
+        };
+        // Past capacity: 80 landings a second offered, 47.6 landed, 10.21 commits each.
+        let past = point("land", json!(80.0), 50, 1, 47.6, 10.21, 47.0);
+        assert_eq!(missed_gates(&past, 0.0), Vec::<String>::new());
+        assert_eq!(
+            not_graded_gates(&past),
+            ["land: 10.21 database commits per push, not graded past capacity (47.6 of the 80 landings a second offered; 47.0 collisions a landing; gate at a held rate: 1)"]
+        );
+        // Held: 40 offered, 39.8 landed. One commit a landing passes, three miss.
+        let held = point("land", json!(40.0), 50, 1, 39.8, 1.04, 0.6);
+        assert_eq!(missed_gates(&held, 0.0), Vec::<String>::new());
+        assert_eq!(not_graded_gates(&held), Vec::<String>::new());
+        let held_over = point("land", json!(40.0), 50, 1, 39.8, 3.0, 0.6);
+        assert_eq!(missed_gates(&held_over, 0.0), ["land: 3.00 database commits per push, the background work's aside (gate: 1)"]);
+        assert_eq!(not_graded_gates(&held_over), Vec::<String>::new());
+        // The edge: 95 % of the offer landed is held, less is not.
+        assert_eq!(missed_gates(&point("land", json!(40.0), 50, 1, 38.0, 3.0, 5.0), 0.0).len(), 1);
+        assert_eq!(missed_gates(&point("land", json!(40.0), 50, 1, 37.9, 3.0, 5.0), 0.0), Vec::<String>::new());
+        assert_eq!(not_graded_gates(&point("land", json!(40.0), 50, 1, 37.9, 3.0, 5.0)).len(), 1);
+
+        // As fast as answered (`max`): 50 agents on one `main` are past what it
+        // lands (the API's curve: 19.5 a second, 7.11 commits each).
+        let api_max = point("api", json!("max"), 50, 1, 19.5, 7.11, 40.0);
+        assert_eq!(missed_gates(&api_max, 0.0), Vec::<String>::new());
+        assert_eq!(
+            not_graded_gates(&api_max),
+            ["api: 7.11 database commits per push, not graded past capacity (50 agents on 1 branch(es), each landing as fast as it is answered; 40.0 collisions a landing; gate at a held rate: 1)"]
+        );
+        // One agent on each `main` is each branch at its limit: held, and judged.
+        let alone = |commits: f64| point("land", json!("max"), 100, 100, 280.0, commits, 0.0);
+        assert_eq!(missed_gates(&alone(1.0), 0.0), Vec::<String>::new());
+        assert_eq!(missed_gates(&alone(6.0), 0.0).len(), 1);
+        assert_eq!(not_graded_gates(&alone(6.0)), Vec::<String>::new());
+        // `branches`: each agent has a branch of its own, so it is always
+        // judged, whatever the server keeps up with.
+        let own_branch = point("branches", json!(5000.0), 1000, 1, 250.0, 2.5, 0.0);
+        assert_eq!(missed_gates(&own_branch, 0.0).len(), 1);
+        assert_eq!(not_graded_gates(&own_branch), Vec::<String>::new());
+        // The storage gate beside it is per push at any rate, as it was:
+        // 2 writes a push over 48 pushes passes, 3 a push misses.
+        let mut writes = past.clone();
+        writes["storage_push_writes_per_op"] = json!(96.0);
+        assert_eq!(missed_gates(&writes, 0.0), Vec::<String>::new());
+        writes["storage_push_writes_per_op"] = json!(144.0);
+        assert_eq!(missed_gates(&writes, 0.0).len(), 1);
+
+        // The table: the point's row is there, its commits shown, counted as not graded.
+        let mut row = past.clone();
+        row["gates_missed"] = json!(missed_gates(&row, 0.0));
+        row["gates_not_graded"] = json!(not_graded_gates(&row));
+        let md = markdown(&json!({"runs": [row]})).expect("table");
+        let line = md.lines().find(|l| l.starts_with("| land |") && l.contains("(10.21)")).expect("the point's row, with its commits");
+        assert!(line.ends_with("| **1** | none | none |"), "{line}");
+    }
+
     /// S28's gate: a landing's own storage writes (the deriver's aside), for
     /// pushes and, since it stores what it made as one pack (BUG-1948), for
-    /// an API commit.
+    /// an API commit; in `objects` mode, bounded by `uploads + objects_kept`
+    /// (`object-layout.md` §8.2).
     #[test]
     fn storage_writes_per_push_are_gated() {
         let run = |mode: &str, push_writes: f64| json!({"mode": mode, "ops": 1000.0, "storage_push_writes_per_op": push_writes});
@@ -2744,6 +2923,32 @@ mod tests {
         let raced = |w: f64| json!({"mode": "land", "ops": 1000.0, "collisions_per_op": 4.0, "storage_push_writes_per_op": w});
         assert!(missed_gates(&raced(9.0), 0.0).is_empty());
         assert_eq!(missed_gates(&raced(12.0), 0.0).len(), 1);
+
+        // `objects` layout: own writes <= uploads + objects_kept.
+        let obj_run = |mode: &str, own_writes: f64, uploads: f64, kept: f64| {
+            json!({
+                "mode": mode,
+                "object_layout": "objects",
+                "ops": 1000.0,
+                "storage_push_writes_per_op": own_writes,
+                "uploads_per_op": uploads,
+                "objects_kept_per_op": kept,
+                "storage_deletes_per_op": uploads,
+                "storage_lists_per_op": 0.0,
+            })
+        };
+        assert!(missed_gates(&obj_run("branches", 7.0, 1.0, 6.0), 0.0).is_empty());
+        assert!(missed_gates(&obj_run("land", 21.0, 3.0, 18.0), 0.0).is_empty());
+        assert!(missed_gates(&obj_run("api", 6.0, 0.0, 6.0), 0.0).is_empty());
+        assert_eq!(missed_gates(&obj_run("branches", 8.0, 1.0, 6.0), 0.0).len(), 1, "extra write per push misses gate");
+        assert_eq!(missed_gates(&obj_run("api", 7.0, 0.0, 6.0), 0.0).len(), 1, "extra write on API commit misses gate");
+        let missing_counters = json!({"mode": "branches", "object_layout": "objects", "ops": 1000.0, "storage_push_writes_per_op": 7.0});
+        assert_eq!(missed_gates(&missing_counters, 0.0).len(), 1);
+
+        let md = markdown(&json!({"object_layout": "objects", "runs": [obj_run("branches", 7.0, 1.0, 6.0)]})).expect("table");
+        assert!(md.starts_with("Object layout: `objects`.\n\n"), "{md}");
+        assert!(md.contains("| Storage deletes per op | Storage listings per op |"), "{md}");
+        assert!(md.contains("| branches | objects |"), "{md}");
     }
 
     /// BUG-2350: the commits the server counts by kind are charged where

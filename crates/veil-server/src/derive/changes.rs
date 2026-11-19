@@ -32,7 +32,7 @@
 //!   `p`'s version of it), found through the `file_history` rows
 //!   ([`super::Batch::last_changes`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use veil_core::{
@@ -187,14 +187,36 @@ fn walk(
     if depth > MAX_TREE_DEPTH {
         return Err(Error::Other(anyhow::anyhow!("tree nested deeper than {MAX_TREE_DEPTH} directories")));
     }
-    let mut names: BTreeMap<&str, (Option<&TreeEntry>, Option<&TreeEntry>)> = BTreeMap::new();
-    for e in old.map(|t| t.entries.as_slice()).unwrap_or_default() {
-        names.entry(&e.name).or_default().0 = Some(e);
-    }
-    for e in new.map(|t| t.entries.as_slice()).unwrap_or_default() {
-        names.entry(&e.name).or_default().1 = Some(e);
-    }
-    for (name, (o, n)) in names {
+    let oe = old.map(|t| t.entries.as_slice()).unwrap_or_default();
+    let ne = new.map(|t| t.entries.as_slice()).unwrap_or_default();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < oe.len() || j < ne.len() {
+        let (name, o, n) = match (oe.get(i), ne.get(j)) {
+            (Some(a), Some(b)) => match a.name.cmp(&b.name) {
+                std::cmp::Ordering::Less => {
+                    i += 1;
+                    (a.name.as_str(), Some(a), None)
+                }
+                std::cmp::Ordering::Greater => {
+                    j += 1;
+                    (b.name.as_str(), None, Some(b))
+                }
+                std::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                    (a.name.as_str(), Some(a), Some(b))
+                }
+            },
+            (Some(a), None) => {
+                i += 1;
+                (a.name.as_str(), Some(a), None)
+            }
+            (None, Some(b)) => {
+                j += 1;
+                (b.name.as_str(), None, Some(b))
+            }
+            (None, None) => break,
+        };
         if o == n {
             continue;
         }

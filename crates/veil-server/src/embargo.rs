@@ -223,12 +223,15 @@ pub async fn embargoes_for(hub: &Hub, project: &Project, viewer: &Viewer) -> Res
 /// Used by the query API to withhold unreleased embargo snapshots from every
 /// viewer (including admins) until release.
 pub async fn is_withheld_for_query(hub: &Hub, project: i64, snapshot: &ObjectId) -> Result<bool> {
+    if *snapshot == crate::sync::root_snapshot_id() {
+        return Ok(false);
+    }
     let hex = snapshot.hex();
     let eid: Option<String> = sqlx::query_scalar(
         "SELECT s.embargo_id FROM embargo_snapshots s \
          JOIN embargo_lines l ON l.project_id = s.project_id AND l.embargo_id = s.embargo_id \
          WHERE s.project_id = $1 \
-           AND (s.snapshot = $2 OR s.snapshot IN (SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2)) \
+           AND (s.snapshot = $2 OR s.snapshot IN (SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2 AND NOT collapsed)) \
            AND l.released_at IS NULL LIMIT 1",
     )
     // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
@@ -264,13 +267,14 @@ pub async fn is_withheld_in(hub: &Hub, project: &Project, viewer: &Viewer, epoch
 /// What [`is_withheld_in`]'s "no embargo" cannot answer for: the snapshots a
 /// request found **after** it read that. `resolved` is every snapshot the
 /// request named with the real snapshot the server then found behind it
-/// (`sync::resolve_first`: for a projected id, the newest snapshot any view
-/// projects to it), and this is called after the last of them was found,
-/// before anything of them is read or projected. An embargoed snapshot
-/// committed in between can be what a named id now stands for (an embargo
-/// member of another view sees it as the id the request named), and the
-/// flag read before it says nothing of it: the routes served it (BUG-1947's
-/// review). So a request that read "no unreleased line" reads it once more
+/// (`sync::resolve_first`: for a projected id, the snapshot the viewer's own
+/// view projects to it, falling back across other views if their own view has
+/// none), and this is called after the last of them was found, before
+/// anything of them is read or projected. An embargoed snapshot committed in
+/// between can be what a named id now stands for (an embargo member of the
+/// same or another view pulled it and stored the row), and the flag read
+/// before it says nothing of it: the routes served it (BUG-1947's review).
+/// So a request that read "no unreleased line" reads it once more
 /// here, one statement for the request: still none, and nothing it found is
 /// withheld (a line and its snapshots commit together, `record_in_tx`, so
 /// one committed before the snapshot was found is seen); with one, every
@@ -306,28 +310,66 @@ pub async fn withheld_since(
 /// (`history`, `fetch`, `resolve_for`) because it belongs to an unreleased
 /// embargo that `viewer` is not in?
 pub async fn is_withheld_from_viewer(hub: &Hub, project: &Project, viewer: &Viewer, snapshot: &ObjectId) -> Result<bool> {
-    if viewer.admin {
+    if viewer.admin || *snapshot == crate::sync::root_snapshot_id() {
         return Ok(false);
     }
     hub.caches.stats.embargo_asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let hex = snapshot.hex();
+    let vk = project.view(viewer).key();
     let groups: Option<Vec<String>> = sqlx::query_scalar(
         "SELECT l.group_names FROM embargo_snapshots s \
          JOIN embargo_lines l ON l.project_id = s.project_id AND l.embargo_id = s.embargo_id \
          WHERE s.project_id = $1 \
-           AND (s.snapshot = $2 OR s.snapshot IN (SELECT real_id FROM projections WHERE project_id = $1 AND projected_id = $2)) \
+           AND (s.snapshot = $2 OR s.snapshot IN (SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 AND NOT collapsed)) \
            AND l.released_at IS NULL LIMIT 1",
     )
     // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
     .persistent(false)
     .bind(project.id)
     .bind(&hex)
+    .bind(&vk)
     .fetch_optional(&hub.db)
     .await?;
     let Some(groups) = groups else {
         return Ok(false);
     };
     Ok(!can_see_groups(hub, project, viewer, &groups).await?)
+}
+
+/// Every unreleased `embargo_id` in `project_id`. Used by query routes, which
+/// withhold all unreleased embargoes from every viewer (including admins), to
+/// exclude embargoed rows when resolving a projected snapshot id.
+pub async fn active_embargo_ids(hub: &Hub, project_id: i64) -> Result<Vec<String>> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT embargo_id FROM embargo_lines WHERE project_id = $1 AND released_at IS NULL",
+    )
+    .bind(project_id)
+    .fetch_all(&hub.db)
+    .await?;
+    Ok(ids)
+}
+
+/// Every unreleased `embargo_id` in `project` that `viewer` cannot see. Empty
+/// for project admins and when no unreleased embargo hides anything from
+/// `viewer`. Used by `projections` resolvers to exclude withheld rows before
+/// choosing among candidates under a shared `view_key` (BUG-2850).
+pub async fn withheld_embargo_ids(hub: &Hub, project: &Project, viewer: &Viewer) -> Result<Vec<String>> {
+    if viewer.admin {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
+        "SELECT embargo_id, group_names FROM embargo_lines WHERE project_id = $1 AND released_at IS NULL",
+    )
+    .bind(project.id)
+    .fetch_all(&hub.db)
+    .await?;
+    let mut out = Vec::new();
+    for (eid, groups) in rows {
+        if !can_see_groups(hub, project, viewer, &groups).await? {
+            out.push(eid);
+        }
+    }
+    Ok(out)
 }
 
 /// Return every unreleased `embargo_id` in `project_id` carried by any real

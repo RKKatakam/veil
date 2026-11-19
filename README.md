@@ -514,7 +514,10 @@ docker run -d --name veil-pg -e POSTGRES_USER=veil -e POSTGRES_PASSWORD=veil -e 
 veil-server --database-url postgres://veil:veil@127.0.0.1:5432/veil --data ~/veil-hub --listen 127.0.0.1:8443
 ```
 
-It makes a self-signed certificate in `~/veil-hub` and keeps running. In
+It makes a self-signed certificate in `~/veil-hub` and keeps running. Its
+storage is append-only in v1: there is no garbage collection, and nothing a
+project's history named is deleted later
+([the server guide](docs/guide/the-server.md#running-a-server)). In
 another terminal, in `my-project`:
 
 ```sh

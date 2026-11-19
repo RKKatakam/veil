@@ -5,7 +5,13 @@
 //! entries, bytes, …). Once the total weight exceeds the capacity, the least
 //! recently used entries are evicted. Lookups and inserts are O(log n).
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, Weak,
+    },
+};
 
 use crate::id::ObjectId;
 
@@ -13,11 +19,81 @@ struct Slot<V> {
     id: ObjectId,
     value: V,
     weight: usize,
+    stamp: u64,
     prev: usize,
     next: usize,
 }
 
 const NONE: usize = usize::MAX;
+
+trait Budgeted: Send + Sync {
+    fn oldest_stamp(&self) -> Option<u64>;
+    fn evict_oldest(&self) -> bool;
+}
+
+/// Shared weight ceiling across several [`LruCache`] instances. Each cache
+/// still enforces its own capacity; whenever the combined weight exceeds
+/// `limit`, the least-recently-used entries across all registered caches are
+/// evicted until the sum is back within `limit`.
+pub struct CacheBudget {
+    limit: usize,
+    weight: AtomicUsize,
+    clock: AtomicU64,
+    members: Mutex<Vec<Weak<dyn Budgeted>>>,
+}
+
+impl CacheBudget {
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(CacheBudget {
+            limit,
+            weight: AtomicUsize::new(0),
+            clock: AtomicU64::new(1),
+            members: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn weight(&self) -> usize {
+        self.weight.load(Ordering::Acquire)
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    fn next_stamp(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn enforce(&self) {
+        if self.weight.load(Ordering::Acquire) <= self.limit {
+            return;
+        }
+        let live: Vec<Arc<dyn Budgeted>> = {
+            let mut m = self.members.lock().unwrap();
+            let mut out = Vec::with_capacity(m.len());
+            m.retain(|w| match w.upgrade() {
+                Some(a) => {
+                    out.push(a);
+                    true
+                }
+                None => false,
+            });
+            out
+        };
+        while self.weight.load(Ordering::Acquire) > self.limit {
+            let mut oldest: Option<(u64, usize)> = None;
+            for (i, c) in live.iter().enumerate() {
+                if let Some(st) = c.oldest_stamp() {
+                    if oldest.is_none_or(|(best, _)| st < best) {
+                        oldest = Some((st, i));
+                    }
+                }
+            }
+            let Some((_, idx)) = oldest else { break };
+            let _ = live[idx].evict_oldest();
+        }
+    }
+}
 
 struct Inner<V> {
     map: HashMap<ObjectId, usize>,
@@ -29,9 +105,38 @@ struct Inner<V> {
     tail: usize,
     weight: usize,
     capacity: usize,
+    budget: Option<Arc<CacheBudget>>,
+}
+
+impl<V> Drop for Inner<V> {
+    fn drop(&mut self) {
+        if self.weight > 0 {
+            if let Some(b) = &self.budget {
+                b.weight.fetch_sub(self.weight, Ordering::AcqRel);
+            }
+        }
+    }
 }
 
 impl<V> Inner<V> {
+    fn add_weight(&mut self, w: usize) {
+        self.weight += w;
+        if let Some(b) = &self.budget {
+            b.weight.fetch_add(w, Ordering::AcqRel);
+        }
+    }
+
+    fn sub_weight(&mut self, w: usize) {
+        self.weight -= w;
+        if let Some(b) = &self.budget {
+            b.weight.fetch_sub(w, Ordering::AcqRel);
+        }
+    }
+
+    fn next_stamp(&self) -> u64 {
+        self.budget.as_ref().map_or(0, |b| b.next_stamp())
+    }
+
     fn detach(&mut self, idx: usize) {
         let (prev, next) = {
             let s = self.slots[idx].as_ref().unwrap();
@@ -63,15 +168,38 @@ impl<V> Inner<V> {
         self.tail = idx;
     }
 
-    fn evict_to(&mut self, limit: usize) {
-        while self.weight > limit && self.head != NONE {
-            let idx = self.head;
-            self.detach(idx);
-            let slot = self.slots[idx].take().unwrap();
-            self.free.push(idx);
-            self.map.remove(&slot.id);
-            self.weight -= slot.weight;
+    fn pop_head(&mut self) -> Option<V> {
+        if self.head == NONE {
+            return None;
         }
+        let idx = self.head;
+        self.detach(idx);
+        let slot = self.slots[idx].take().unwrap();
+        self.free.push(idx);
+        self.map.remove(&slot.id);
+        self.sub_weight(slot.weight);
+        Some(slot.value)
+    }
+
+    fn evict_to(&mut self, limit: usize, evicted: &mut Vec<V>) {
+        while self.weight > limit {
+            let Some(v) = self.pop_head() else { break };
+            evicted.push(v);
+        }
+    }
+}
+
+impl<V: Send + Sync> Budgeted for Mutex<Inner<V>> {
+    fn oldest_stamp(&self) -> Option<u64> {
+        let g = self.lock().unwrap();
+        (g.head != NONE).then(|| g.slots[g.head].as_ref().unwrap().stamp)
+    }
+
+    fn evict_oldest(&self) -> bool {
+        let dropped = self.lock().unwrap().pop_head();
+        let had = dropped.is_some();
+        drop(dropped);
+        had
     }
 }
 
@@ -84,13 +212,35 @@ pub struct CacheStats {
 }
 
 pub struct LruCache<V> {
-    inner: Mutex<Inner<V>>,
+    inner: Arc<Mutex<Inner<V>>>,
+    budget: Option<Arc<CacheBudget>>,
+}
+
+impl<V: Clone + Send + Sync + 'static> LruCache<V> {
+    pub fn with_budget(capacity: usize, budget: &Arc<CacheBudget>) -> Self {
+        let inner = Arc::new(Mutex::new(Inner {
+            map: HashMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            head: NONE,
+            tail: NONE,
+            weight: 0,
+            capacity,
+            budget: Some(budget.clone()),
+        }));
+        let weak: Weak<dyn Budgeted> = Arc::downgrade(&inner) as Weak<dyn Budgeted>;
+        budget.members.lock().unwrap().push(weak);
+        LruCache {
+            inner,
+            budget: Some(budget.clone()),
+        }
+    }
 }
 
 impl<V: Clone> LruCache<V> {
     pub fn new(capacity: usize) -> Self {
         LruCache {
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 map: HashMap::new(),
                 slots: Vec::new(),
                 free: Vec::new(),
@@ -98,7 +248,9 @@ impl<V: Clone> LruCache<V> {
                 tail: NONE,
                 weight: 0,
                 capacity,
-            }),
+                budget: None,
+            })),
+            budget: None,
         }
     }
 
@@ -106,7 +258,10 @@ impl<V: Clone> LruCache<V> {
         let mut g = self.inner.lock().unwrap();
         let inner = &mut *g;
         let idx = *inner.map.get(id)?;
-        let val = inner.slots[idx].as_ref().unwrap().value.clone();
+        let stamp = inner.next_stamp();
+        let s = inner.slots[idx].as_mut().unwrap();
+        s.stamp = stamp;
+        let val = s.value.clone();
         if inner.tail != idx {
             inner.detach(idx);
             inner.push_tail(idx);
@@ -115,60 +270,114 @@ impl<V: Clone> LruCache<V> {
     }
 
     /// Insert (or replace) an entry. Entries heavier than the whole capacity
-    /// are not cached at all.
+    /// (or than the shared [`CacheBudget`]) are not cached at all, and drop any
+    /// existing entry under `id`.
     pub fn insert(&self, id: ObjectId, value: V, weight: usize) {
-        let mut g = self.inner.lock().unwrap();
-        let inner = &mut *g;
-        if weight > inner.capacity {
+        if self.budget.as_ref().is_some_and(|b| weight > b.limit) {
+            self.remove(&id);
             return;
         }
-        if let Some(&idx) = inner.map.get(&id) {
-            inner.detach(idx);
-            let old_w = inner.slots[idx].as_ref().unwrap().weight;
-            inner.weight -= old_w;
-            inner.evict_to(inner.capacity - weight);
-            let s = inner.slots[idx].as_mut().unwrap();
-            s.value = value;
-            s.weight = weight;
-            inner.push_tail(idx);
-            inner.weight += weight;
-            return;
+        let mut evicted = Vec::new();
+        let mut replaced = None;
+        {
+            let mut g = self.inner.lock().unwrap();
+            let inner = &mut *g;
+            if weight > inner.capacity {
+                if let Some(idx) = inner.map.remove(&id) {
+                    inner.detach(idx);
+                    let slot = inner.slots[idx].take().unwrap();
+                    inner.free.push(idx);
+                    inner.sub_weight(slot.weight);
+                    replaced = Some(slot.value);
+                }
+            } else {
+                let stamp = inner.next_stamp();
+                if let Some(&idx) = inner.map.get(&id) {
+                    inner.detach(idx);
+                    let old_w = inner.slots[idx].as_ref().unwrap().weight;
+                    inner.sub_weight(old_w);
+                    inner.evict_to(inner.capacity - weight, &mut evicted);
+                    let s = inner.slots[idx].as_mut().unwrap();
+                    replaced = Some(std::mem::replace(&mut s.value, value));
+                    s.weight = weight;
+                    s.stamp = stamp;
+                    inner.push_tail(idx);
+                    inner.add_weight(weight);
+                } else {
+                    inner.evict_to(inner.capacity - weight, &mut evicted);
+                    let slot = Slot {
+                        id,
+                        value,
+                        weight,
+                        stamp,
+                        prev: NONE,
+                        next: NONE,
+                    };
+                    let idx = if let Some(free_idx) = inner.free.pop() {
+                        inner.slots[free_idx] = Some(slot);
+                        free_idx
+                    } else {
+                        let i = inner.slots.len();
+                        inner.slots.push(Some(slot));
+                        i
+                    };
+                    inner.map.insert(id, idx);
+                    inner.push_tail(idx);
+                    inner.add_weight(weight);
+                }
+            }
         }
-        inner.evict_to(inner.capacity - weight);
-        let slot = Slot {
-            id,
-            value,
-            weight,
-            prev: NONE,
-            next: NONE,
+        drop(replaced);
+        drop(evicted);
+        if let Some(b) = &self.budget {
+            b.enforce();
+        }
+    }
+
+    pub fn remove(&self, id: &ObjectId) -> bool {
+        let dropped = {
+            let mut g = self.inner.lock().unwrap();
+            let inner = &mut *g;
+            match inner.map.remove(id) {
+                Some(idx) => {
+                    inner.detach(idx);
+                    let slot = inner.slots[idx].take().unwrap();
+                    inner.free.push(idx);
+                    inner.sub_weight(slot.weight);
+                    Some(slot.value)
+                }
+                None => None,
+            }
         };
-        let idx = if let Some(free_idx) = inner.free.pop() {
-            inner.slots[free_idx] = Some(slot);
-            free_idx
-        } else {
-            let i = inner.slots.len();
-            inner.slots.push(Some(slot));
-            i
-        };
-        inner.map.insert(id, idx);
-        inner.push_tail(idx);
-        inner.weight += weight;
+        let had = dropped.is_some();
+        drop(dropped);
+        had
     }
 
     pub fn set_capacity(&self, capacity: usize) {
-        let mut g = self.inner.lock().unwrap();
-        g.capacity = capacity;
-        g.evict_to(capacity);
+        let mut evicted = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.capacity = capacity;
+            g.evict_to(capacity, &mut evicted);
+        }
+        drop(evicted);
     }
 
     pub fn clear(&self) {
-        let mut g = self.inner.lock().unwrap();
-        g.map.clear();
-        g.slots.clear();
-        g.free.clear();
-        g.head = NONE;
-        g.tail = NONE;
-        g.weight = 0;
+        let old_slots = {
+            let mut g = self.inner.lock().unwrap();
+            g.map.clear();
+            g.free.clear();
+            g.head = NONE;
+            g.tail = NONE;
+            let w = g.weight;
+            if w > 0 {
+                g.sub_weight(w);
+            }
+            std::mem::take(&mut g.slots)
+        };
+        drop(old_slots);
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -214,5 +423,102 @@ mod tests {
         c.set_capacity(3);
         assert_eq!(c.stats().entries, 1);
         assert_eq!(c.get(&id(1)), Some(10));
+    }
+
+    #[test]
+    fn shared_budget_bounds_sum_and_preserves_subcache_caps() {
+        let budget = CacheBudget::new(10);
+        let objects = LruCache::with_budget(5, &budget);
+        let trees = LruCache::with_budget(5, &budget);
+        let segments = LruCache::with_budget(5, &budget);
+
+        // Filling `objects` past its own 5-byte cap evicts within `objects`
+        // only and never touches `trees`.
+        trees.insert(id(10), 10, 5);
+        objects.insert(id(1), 1, 3);
+        objects.insert(id(2), 2, 3);
+        assert_eq!(objects.get(&id(1)), None);
+        assert_eq!(objects.stats().weight, 3);
+        assert_eq!(trees.stats().weight, 5);
+        assert_eq!(budget.weight(), 8);
+
+        // Touch `trees` so `objects` holds the globally oldest entry, then
+        // fill `objects` to 5 (total 10, right at the shared limit).
+        assert_eq!(trees.get(&id(10)), Some(10));
+        objects.insert(id(3), 3, 2);
+        assert_eq!(budget.weight(), 10);
+
+        // Inserting 4 bytes into `segments` pushes total to 14 -> evicts
+        // oldest across all three caches (`id(2)` weight 3, then `id(10)`
+        // weight 5 -> total becomes 6 <= 10).
+        segments.insert(id(20), 20, 4);
+        assert!(budget.weight() <= 10, "budget weight {} > 10", budget.weight());
+        assert_eq!(
+            budget.weight(),
+            objects.stats().weight + trees.stats().weight + segments.stats().weight
+        );
+        assert_eq!(objects.get(&id(2)), None);
+        assert_eq!(trees.get(&id(10)), None);
+        assert_eq!(objects.get(&id(3)), Some(3));
+        assert_eq!(segments.get(&id(20)), Some(20));
+
+        assert!(segments.remove(&id(20)));
+        assert_eq!(segments.stats().weight, 0);
+        assert_eq!(budget.weight(), 2);
+
+        drop(objects);
+        assert_eq!(budget.weight(), 0);
+    }
+
+    #[test]
+    fn oversize_replace_removes_stale_entry() {
+        // Case 1: `weight > inner.capacity` (with `budget.limit` larger than `capacity`).
+        let budget = CacheBudget::new(20);
+        let c = LruCache::with_budget(10, &budget);
+        c.insert(id(1), 100, 4);
+        c.insert(id(2), 200, 3);
+        assert_eq!(c.stats().weight, 7);
+        assert_eq!(budget.weight(), 7);
+
+        c.insert(id(1), 999, 11);
+        assert_eq!(c.get(&id(1)), None);
+        assert_eq!(c.get(&id(2)), Some(200));
+        assert_eq!(
+            c.stats(),
+            CacheStats {
+                entries: 1,
+                weight: 3,
+                capacity: 10,
+            }
+        );
+        assert_eq!(budget.weight(), 3);
+
+        // Slot recycling and LRU links stay intact after oversize removal.
+        c.insert(id(3), 300, 5);
+        assert_eq!(c.get(&id(2)), Some(200));
+        assert_eq!(c.get(&id(3)), Some(300));
+        assert_eq!(c.stats().weight, 8);
+        assert_eq!(budget.weight(), 8);
+
+        // Case 2: `weight > budget.limit` (with `inner.capacity` larger than `budget.limit`).
+        let small_budget = CacheBudget::new(8);
+        let c2 = LruCache::with_budget(12, &small_budget);
+        c2.insert(id(1), 10, 5);
+        c2.insert(id(2), 20, 2);
+        assert_eq!(c2.stats().weight, 7);
+        assert_eq!(small_budget.weight(), 7);
+
+        c2.insert(id(1), 99, 9);
+        assert_eq!(c2.get(&id(1)), None);
+        assert_eq!(c2.get(&id(2)), Some(20));
+        assert_eq!(
+            c2.stats(),
+            CacheStats {
+                entries: 1,
+                weight: 2,
+                capacity: 12,
+            }
+        );
+        assert_eq!(small_budget.weight(), 2);
     }
 }

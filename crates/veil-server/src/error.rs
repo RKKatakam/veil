@@ -134,6 +134,12 @@ impl Error {
             Error::Other(e) if crate::pack_gc::gc_epoch_changed(&e) => {
                 Answer { status: StatusCode::SERVICE_UNAVAILABLE, code: "busy", message: BUSY_DB.into(), retry: Retry::GcEpoch }
             }
+            Error::Other(e) if crate::error::caused_by::<crate::sync::StagedUploadDiscarded>(&e) => Answer {
+                status: StatusCode::CONFLICT,
+                code: "conflict",
+                message: crate::sync::DISCARDED_UPLOAD.into(),
+                retry: Retry::None,
+            },
             // A lost race of the object store's statements (BUG-2340), as
             // any other: run again, or "busy" at the deadline.
             e @ Error::Other(_) if e.is_retryable() => {
@@ -311,6 +317,9 @@ impl From<sqlx::Error> for Error {
 
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Error {
+        if caused_by::<crate::sync::StagedUploadDiscarded>(&e) {
+            return Error::conflict(crate::sync::DISCARDED_UPLOAD);
+        }
         Error::Other(e)
     }
 }
@@ -321,6 +330,9 @@ impl From<veil_core::VeilError> for Error {
             veil_core::VeilError::Policy(m) => Error::forbidden(m),
             veil_core::VeilError::Io { source, .. } if source.get_ref().is_some_and(|i| i.is::<CarriedError>()) => {
                 source.into_inner().unwrap().downcast::<CarriedError>().unwrap().0
+            }
+            veil_core::VeilError::Io { source, .. } if crate::sync::staged_upload_discarded(&source) => {
+                Error::conflict(crate::sync::DISCARDED_UPLOAD)
             }
             // Server-side reads and decodes of stored objects go through `?`:
             // `Missing` and `Corrupt` here are server storage faults (logged,
@@ -485,5 +497,24 @@ mod tests {
         assert_eq!(client_corrupt.status, StatusCode::BAD_REQUEST);
         assert_eq!(client_corrupt.code, "bad_request");
         assert_eq!(client_corrupt.message, "invalid object: bad tree");
+    }
+
+    /// BUG-2661 + BUG-2681: a vanished staged upload (`staged_gone`) answers
+    /// `409 conflict` through `From<VeilError>`, `Error::client_object`, and
+    /// `anyhow` chains, never `500` or `400`.
+    #[test]
+    fn bug_2661_staged_upload_discarded_answers_409_under_both_from_and_client_object() {
+        for err in [
+            Error::from(crate::sync::staged_gone()),
+            Error::client_object(crate::sync::staged_gone()),
+            Error::from(anyhow::Error::from(crate::sync::staged_gone()).context("push")),
+            Error::Other(anyhow::Error::from(crate::sync::staged_gone())),
+        ] {
+            let ans = err.answer();
+            assert_eq!(ans.status, StatusCode::CONFLICT);
+            assert_eq!(ans.code, "conflict");
+            assert_eq!(ans.message, crate::sync::DISCARDED_UPLOAD);
+            assert_eq!(ans.retry, Retry::None);
+        }
     }
 }

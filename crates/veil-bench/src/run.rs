@@ -409,13 +409,22 @@ pub fn local(b: &mut Bench, label: &str, trace: bool) -> Result<()> {
     Ok(())
 }
 
+/// A name for this run's project or identity on the server that no earlier
+/// run in the same deployment used (BUG-2840): a process id alone repeats
+/// in a container, so a gate run again found the first run's project and
+/// its "initial push" uploaded nothing.
+fn run_name(prefix: &str) -> String {
+    let hex: String = veil_core::crypto::random_bytes::<6>().iter().map(|b| format!("{b:02x}")).collect();
+    format!("{prefix}-{}-{hex}", std::process::id())
+}
+
 /// Push, clone and pull through the Veil server (`server`: started by the
 /// caller; the repository's identity signs in as the project's admin, so
 /// it may push the history it signed). Every case records the client's
 /// and the server's peak RSS.
 pub fn server(b: &mut Bench, server: &crate::server::Server) -> Result<()> {
     let repo = b.repo.clone();
-    let project = format!("{}-{}", b.manifest["profile"].as_str().unwrap_or("bench"), std::process::id());
+    let project = run_name(b.manifest["profile"].as_str().unwrap_or("bench"));
     let url = server.url(&project);
     let g = "server";
     let clone_parent = b.dir.join("clone-server");
@@ -423,7 +432,7 @@ pub fn server(b: &mut Bench, server: &crate::server::Server) -> Result<()> {
     let store = b.manifest["store_disk_bytes_loose"].as_u64().unwrap_or(2_000_000_000);
     let tree = b.manifest["tree_disk_bytes"].as_u64().unwrap_or(1_000_000_000);
     b.preflight("push to the server", store)?;
-    let me = format!("bench-{}", std::process::id());
+    let me = run_name("bench");
     b.vl_ok(&repo, &["login", &format!("veil://{}", server.authority), "--name", &me, "--ca", &s(&server.cert)])?;
     let _ = b.env.run(&repo, &["remote", "rm", "hub"], false);
     b.vl_ok(&repo, &["remote", "add", "hub", &url])?;
@@ -613,6 +622,16 @@ pub fn read_snapshots(dir: &Path) -> Result<HashSet<String>> {
 
 #[cfg(test)]
 mod tests {
+    /// BUG-2840: two runs with the same process id (two containers in one
+    /// deployment) never share a project or a sign-in name.
+    #[test]
+    fn bug_2840_each_run_names_its_project_afresh() {
+        let (a, b) = (super::run_name("1g"), super::run_name("1g"));
+        assert!(a.starts_with(&format!("1g-{}-", std::process::id())), "{a}");
+        assert_eq!(a.len(), b.len(), "{a} {b}");
+        assert_ne!(a, b, "the same process id must not give the same name");
+    }
+
     use super::*;
 
     #[test]

@@ -192,12 +192,13 @@ async fn grant_root(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, snap: Ob
     // this root: the newest alone first, the rest read only if it has not
     // (BUG-2510: a run hidden from them is every one of them).
     let key = project.view(viewer).key();
-    let first: Vec<ObjectId> = sync::resolve_first(hub, project.id, &key, &snap).await?.into_iter().collect();
+    let withheld_eids = crate::embargo::withheld_embargo_ids(hub, project, viewer).await?;
+    let first: Vec<ObjectId> = sync::resolve_first_excluding(hub, project.id, &key, &snap, &withheld_eids).await?.into_iter().collect();
     let mut created = None;
     for reals in [Some(first), None] {
         let reals = match reals {
             Some(r) => r,
-            None => sync::resolve(hub, project.id, &key, &snap).await?,
+            None => sync::resolve_excluding(hub, project.id, &key, &snap, &withheld_eids).await?,
         };
         let (p, v) = (project.clone(), viewer.clone());
         created = sync::blocking(hub, project.id, move |src| {

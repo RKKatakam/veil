@@ -50,13 +50,19 @@ pub const PROTOCOL: u32 = 1;
 /// `subtree` answers the trees of a folder, every level, in one request;
 /// 8, `tips?branches=` answers for the branches named only
 /// ([`TIPS_BRANCHES`]), and a landing deletes the branch it merged when
-/// asked (`super::land::LandRequest::delete_branch`).
-pub const REVISION: u32 = 8;
+/// asked (`super::land::LandRequest::delete_branch`); 9, a push or snapshot
+/// landing names its staged packs ([`PushRequest::packs`],
+/// `super::land::LandRequest::packs`), returned by `POST …/objects`
+/// ([`Uploaded::packs`]; BUG-1150).
+pub const REVISION: u32 = 9;
 /// The revision that answers `subtree` (see [`REVISION`]).
 pub const SUBTREE_REVISION: u32 = 7;
 /// The revision that answers `tips?branches=` and takes a landing's
 /// `delete_branch` (see [`REVISION`]).
 pub const NAMED_TIPS_REVISION: u32 = 8;
+/// The revision that takes staged pack names on a push or snapshot landing
+/// ([`PushRequest::packs`], [`Uploaded::packs`]; see [`REVISION`]).
+pub const PUSH_PACKS_REVISION: u32 = 9;
 /// The query parameter of `GET …/tips` naming, separated by commas, the
 /// branches the caller needs (`docs/HUB.md` §13.41): the answer holds those
 /// and the default branch only, each exactly as the full answer has it.
@@ -236,10 +242,16 @@ pub struct FetchRequest {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Uploaded {
     pub stored: usize,
-    /// One receipt per object, in the order sent: what a push shows for
-    /// the objects it names (BUG-824).
+    /// One receipt per object, in the order sent: what an API commit (or a
+    /// push from a client before revision 9) shows for the objects it names
+    /// (BUG-824).
     #[serde(default)]
     pub receipts: Vec<String>,
+    /// The staged packs written by this upload (revision 9, BUG-1150): what a
+    /// push or snapshot landing names in [`PushRequest::packs`] or
+    /// `super::land::LandRequest::packs` instead of per-object receipts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -258,9 +270,16 @@ pub struct PushRequest {
     pub force: bool,
     /// The upload receipts of the objects this push names, by id. Every
     /// object the push introduces needs one, unless it is the entry at the
-    /// same path in one of the snapshot's parents (BUG-824).
-    #[serde(default)]
+    /// same path in one of the snapshot's parents (BUG-824). Mutually
+    /// exclusive with [`PushRequest::packs`] (revision 9, BUG-1150).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub receipts: BTreeMap<ObjectId, String>,
+    /// The staged packs (`POST …/objects`, [`Uploaded::packs`]) carrying the
+    /// objects this push introduces (revision 9, BUG-1150). Every object in
+    /// each pack the pusher staged counts as uploaded by them; mutually
+    /// exclusive with [`PushRequest::receipts`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<String>,
     /// Embargo records of embargoed merges this push introduces, or whose
     /// release it publishes (`docs/HUB.md` §13.31).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -2,6 +2,8 @@
 
 > **Status: design, ready to build** (2026-11-18, revised after review cycle 3; branch `t3/design-change-sized-cleanup` from `integration` @ `7b9b9a07`). Closes **BUG-2623**, **BUG-2628**, **BUG-2629**, **BUG-2635**, **BUG-2670** and **BUG-2721** (aligns with **BUG-2680**, and surfaces **BUG-2671** filed separately), and adds **scheduled collection** (`docs/HUB.md` §13.37) across both object storage layouts (`packs` and `objects`, `docs/design/server/object-layout.md` §3.2 and §9).
 >
+> **Not built in v1 (owner, 2026-11-18):** storage in v1 is append-only, with no garbage collection, online or offline (`docs/HUB.md` §13.37). This design is kept for after v1.
+>
 > **Sources of truth:** `docs/OVERVIEW.md`, `docs/VISIBILITY.md`, `docs/ARCHITECTURE.md` ("Threat model"), `docs/HUB.md` §13.20 (S28) and §13.37 (S29), `docs/design/server/object-layout.md`.
 >
 > **Numbers:** "measured" names where a number was measured in `docs/BUGS.md` or `docs/HUB.md`. "Estimate" is arithmetic from those measurements and query plans; nothing was measured for this document.

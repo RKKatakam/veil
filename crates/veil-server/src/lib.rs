@@ -23,6 +23,10 @@
 //! | [`pack`] | packs: a push's objects in one storage object, read by range (S28) |
 //! | [`tls`] | TLS configuration |
 
+// `stats_json`'s `serde_json::json!` has more fields than the default macro
+// recursion limit allows (BUG-2220's and BUG-2221's counters).
+#![recursion_limit = "256"]
+
 pub mod api;
 pub mod auth;
 pub mod bisect;
@@ -52,6 +56,8 @@ pub mod subtree;
 pub mod tls;
 pub mod web;
 
+pub use store::ObjectLayout;
+
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
@@ -75,12 +81,26 @@ pub fn spawn_scoped<'s, 'e, T: Send + 's>(s: &'s std::thread::Scope<'s, 'e>, f: 
     std::thread::Builder::new().stack_size(THREAD_STACK).spawn_scoped(s, f).expect("failed to spawn a thread")
 }
 
+/// Combined ceiling on [`Hub::objects`], [`Hub::trees`], and [`Hub::segments`]
+/// (BUG-2663): `objects` and `trees` each keep their 256 MiB cap, `segments`
+/// is capped at [`SEGMENT_CACHE_BYTES`] (160 MiB, so `objects` + `trees`
+/// always retain at least 352 MiB under competing search + pull load), and
+/// their sum stays at or below 512 MiB regardless of background indexing or
+/// query order.
+pub const HUB_CACHE_BYTES: usize = 512 << 20;
+/// Individual ceiling on [`Hub::segments`] within [`HUB_CACHE_BYTES`]
+/// (BUG-2663).
+pub const SEGMENT_CACHE_BYTES: usize = 160 << 20;
+
 /// Shared server state.
 pub struct Hub {
     pub db: sqlx::PgPool,
     pub objects: Arc<store::Objects>,
     /// Decoded trees, by [`store::Objects::tree_key`].
     pub trees: LruCache<(Arc<Tree>, TreeEncoding)>,
+    /// Decoded search segments, capped at [`SEGMENT_CACHE_BYTES`] and sharing
+    /// [`HUB_CACHE_BYTES`] with [`Hub::objects`] and [`Hub::trees`] (BUG-2663).
+    pub segments: LruCache<Arc<search::segment::Segment>>,
     /// The server's own signing identity: projected snapshots are signed
     /// with it.
     pub identity: Identity,
@@ -147,6 +167,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub database_url: String,
     pub storage: Storage,
+    /// How this server keeps new objects (`objects`; v1 is append-only).
+    pub object_layout: ObjectLayout,
     pub tls: tls::TlsSource,
     /// The server's identity and the self-signed certificate live here.
     pub data_dir: PathBuf,
@@ -179,13 +201,20 @@ pub struct Running {
 impl Running {
     /// A clean stop: the server stops taking connections, then its landing
     /// services end and give their leases up (`landing::stop`, BUG-1970),
-    /// and its search index updates at work end (`search::index::stop`,
-    /// BUG-1990).
+    /// and its background derivers, viewer-graph fills, search index updates,
+    /// and upload-container sweepers end (`derive::stop`, `query::graph::stop`,
+    /// `search::index::stop`, `pack_gc::stop`, BUG-1990, BUG-2635).
     pub async fn stop(self) {
         let _ = self.shutdown.send(true);
         let _ = self.task.await;
         landing::stop(&self.hub).await;
-        search::index::stop(&self.hub).await;
+        tokio::join!(
+            derive::stop(&self.hub),
+            query::graph::stop(&self.hub),
+            search::index::stop(&self.hub),
+            pack_gc::stop(&self.hub),
+        );
+        tokio::task::yield_now().await;
     }
 }
 
@@ -215,6 +244,11 @@ fn receipt_key(data_dir: &std::path::Path) -> Result<[u8; 32]> {
 
 /// Connect, migrate and start serving.
 pub async fn start(config: Config) -> Result<Running> {
+    start_with_store(config, None).await
+}
+
+/// [`start`], optionally overriding the blob store (for fault-injection tests).
+pub async fn start_with_store(config: Config, store_override: Option<Arc<dyn store::BlobStore>>) -> Result<Running> {
     std::fs::create_dir_all(&config.data_dir)?;
     let identity = server_identity(&config.data_dir)?;
     let receipt_key = receipt_key(&config.data_dir)?;
@@ -227,24 +261,32 @@ pub async fn start(config: Config) -> Result<Running> {
     // The background deriver's own connections (BUG-911), opened when a
     // run first needs one.
     let derive_db = db::connect_lazy(&config.database_url, derive::DERIVE_CONNECTIONS)?;
-    let blob: Arc<dyn store::BlobStore> = match &config.storage {
-        Storage::Dir(d) => Arc::new(store::FsStore::new(d)),
-        Storage::S3 {
-            endpoint,
-            bucket,
-            region,
-            key,
-            secret,
-        } => {
-            let s = store::S3Store::new(endpoint, bucket, region, key, secret)?;
-            s.ensure_bucket().await?;
-            Arc::new(s)
-        }
+    let blob: Arc<dyn store::BlobStore> = match store_override {
+        Some(s) => s,
+        None => match &config.storage {
+            Storage::Dir(d) => Arc::new(store::FsStore::new(d)),
+            Storage::S3 {
+                endpoint,
+                bucket,
+                region,
+                key,
+                secret,
+            } => {
+                let s = store::S3Store::new(endpoint, bucket, region, key, secret)?;
+                s.ensure_bucket().await?;
+                Arc::new(s)
+            }
+        },
     };
+    let cache_budget = veil_core::cache::CacheBudget::new(HUB_CACHE_BYTES);
     let hub = Arc::new(Hub {
         db: db.clone(),
-        objects: Arc::new(store::Objects::with_db(blob, 256 << 20, Some(db.clone()))),
-        trees: LruCache::new(256 << 20),
+        objects: Arc::new(
+            store::Objects::with_layout_and_budget(blob, 256 << 20, Some(db.clone()), config.object_layout, Some(&cache_budget))
+                .with_receipt_key(receipt_key),
+        ),
+        trees: LruCache::with_budget(256 << 20, &cache_budget),
+        segments: LruCache::with_budget(SEGMENT_CACHE_BYTES, &cache_budget),
         identity,
         receipt_key,
         grants,
@@ -281,14 +323,16 @@ pub async fn start(config: Config) -> Result<Running> {
             async move {
                 derive::resume(hub.clone(), None).await;
                 // The search index follows (S15, BUG-1231).
-                crate::search::index::resume(hub, None).await;
+                if !hub.landing.stopping() {
+                    crate::search::index::resume(hub, None).await;
+                }
             }
         });
         // Landings queued when a server stopped are landed.
         tokio::spawn(landing::resume(hub.clone()));
         tokio::spawn(bisect::resume(hub.clone()));
-        // Packs a stopped server left to sweep, then a look every few
-        // minutes (BUG-2280).
+        // Staged/discarded upload containers left to sweep, then a look every
+        // few minutes.
         tokio::spawn(pack_gc::sweep_scan(hub.clone(), sweep_stop));
     }
     Ok(Running {
@@ -601,4 +645,66 @@ pub async fn audit(db: &sqlx::PgPool, project: Option<i64>, actor: Option<i64>, 
         .bind(details)
         .execute(db)
         .await;
+}
+
+/// The counters `SIGUSR1` writes to `stats.json` (`n` counts the signals).
+pub fn stats_json(hub: &Hub, n: u64) -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &hub.caches.stats;
+    serde_json::json!({
+        "n": n,
+        "object_layout": hub.objects.layout().as_str(),
+        "storage_writes": hub.objects.writes.load(Relaxed),
+        "storage_written_bytes": hub.objects.written_bytes.load(Relaxed),
+        "storage_reads": hub.objects.reads.load(Relaxed),
+        "storage_deletes": hub.objects.deletes.load(Relaxed),
+        "storage_lists": hub.objects.lists.load(Relaxed),
+        "objects_kept": hub.objects.objects_kept.load(Relaxed),
+        "uploads": hub.objects.uploads.load(Relaxed),
+        "object_cache_hits": hub.objects.cache_hits.load(Relaxed),
+        "object_cache_misses": hub.objects.cache_misses.load(Relaxed),
+        "storage_own_writes": hub.objects.own_writes.load(Relaxed),
+        "pack_row_commits": hub.objects.pack_rows.load(Relaxed),
+        "commits": hub.commits.by_kind(),
+        "s3_slow_down": crate::store::S3_SLOW_DOWN.load(Relaxed),
+        "s3_gave_up": crate::store::S3_GAVE_UP.load(Relaxed),
+        "session_hits": c.session_hits.load(Relaxed),
+        "embargo_asks": c.embargo_asks.load(Relaxed),
+        "session_misses": c.session_misses.load(Relaxed),
+        "permission_hits": c.permission_hits.load(Relaxed),
+        "permission_misses": c.permission_misses.load(Relaxed),
+        "tips_hits": c.tips_hits.load(Relaxed),
+        "tips_misses": c.tips_misses.load(Relaxed),
+        "notices": hub.caches.notices.load(Relaxed),
+        "landing_batches": hub.landing.stats.batches.load(Relaxed),
+        "landing_landed": hub.landing.stats.landed.load(Relaxed),
+        "landing_conflicts": hub.landing.stats.conflicts.load(Relaxed),
+        "landing_rejected": hub.landing.stats.rejected.load(Relaxed),
+        "landing_build_us": hub.landing.stats.build_us.load(Relaxed),
+        "landing_prepare_us": hub.landing.stats.prepare_us.load(Relaxed),
+        "landing_projected": hub.landing.stats.projected.load(Relaxed),
+        "landing_attached": hub.landing.stats.attached.load(Relaxed),
+        "landing_prefilled": hub.landing.stats.prefilled.load(Relaxed),
+        "landing_dropped": hub.landing.stats.dropped.load(Relaxed),
+        "landing_memo_races": hub.landing.stats.memo_races.load(Relaxed),
+        "landing_kept": hub.landing.stats.kept.load(Relaxed),
+        "landing_rechecked": hub.landing.stats.rechecked.load(Relaxed),
+        "landing_classified": hub.landing.stats.classified.load(Relaxed),
+        "landing_store_us": hub.landing.stats.store_us.load(Relaxed),
+        "landing_commit_us": hub.landing.stats.commit_us.load(Relaxed),
+        "landing_pick_statements": hub.landing.stats.pick_statements.load(Relaxed),
+        "landing_pick_rows": hub.landing.stats.pick_rows.load(Relaxed),
+        "landing_review_asks": hub.landing.stats.review_asks.load(Relaxed),
+        "landing_queue_full": hub.landing.stats.queue_full.load(Relaxed),
+        "landing_merging": hub.landing.stats.merging.load(Relaxed),
+        "landing_read_us": hub.landing.stats.read_us.load(Relaxed),
+        "landing_write_rule_us": hub.landing.stats.write_rule_us.load(Relaxed),
+        "landing_merge_us": hub.landing.stats.merge_us.load(Relaxed),
+        "landing_conflict_us": hub.landing.stats.conflict_us.load(Relaxed),
+        "landing_apply_us": hub.landing.stats.apply_us.load(Relaxed),
+        "landing_recheck_us": hub.landing.stats.recheck_us.load(Relaxed),
+        "landing_project_us": hub.landing.stats.project_us.load(Relaxed),
+        "landing_walks": hub.landing.stats.walks.load(Relaxed),
+        "landing_graph_reads": hub.landing.stats.graph_reads.load(Relaxed),
+    })
 }

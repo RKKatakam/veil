@@ -344,6 +344,27 @@ given up, on no push or no merge into `main`, or on missing counters; the
 `503` answers, the rate held and the requests a second against the 800
 are recorded, not judged.
 
+### 2.4 Storage only grows (v1)
+
+**Storage is append-only in v1, and there is no garbage collection**
+(owner, 2026-11-18): none runs in the servers, and there is no command to
+run one. Nothing unreachable is deleted: the objects of a deleted branch,
+of a history that was rewritten, or of a superseded search segment stay in
+the bucket. Plan its size, and its cost, for everything ever pushed.
+
+The only deletion is of uploads that were never used. An upload request is
+staged apart from the project's objects until a push names it; what a push
+does not keep (the push was refused, or never came) is discarded: by that
+push, or by the server's sweep when the push never came or a server
+stopped first. So a plain-text secret a push was refused for is never kept
+(`docs/HUB.md` §13.20, BUG-930).
+
+**The object layout.** `objects` is the default (`--object-layout`): each
+object a push keeps is written under its own key, and nothing is packed or
+merged afterwards. `packs`, the earlier layout, stays readable for data
+already written: every server reads both, and a deployment that changes
+layout converts nothing. Nothing merges or deletes packs either.
+
 ## 3. The images
 
 ```sh
@@ -404,6 +425,8 @@ the name (BUG-1909, fixed: the workspace patches `sqlx-core` 0.8.6 for it),
 so a database reached by an address its certificate does not carry is
 accepted when its CA is the one given. Proven against PostgreSQL 17 with `ssl = on` and
 only `hostssl` lines; not yet run against a managed service.
+
+**Object layout (`--object-layout`, `VEIL_OBJECT_LAYOUT`).** In v1, `objects` is the default and sole writable object layout (`--object-layout objects`, `VEIL_OBJECT_LAYOUT=objects`; `docs/HUB.md` §13.42, `docs/design/server/object-layout.md`): kept objects are stored one object per key (`p/<project>/<2 hex>/<62 hex>`), and passing `packs` is rejected at startup. Every read still checks existing listed packs from earlier `packs` deployments before the loose key, so nothing needs conversion; `stats.json` records `object_layout`, `storage_deletes`, `storage_lists`, `objects_kept` and `uploads`. In `objects`, a push writes each kept object individually (plus one staged upload container that is deleted on commit), so a project that suddenly turns busy meets S3's or Cloud Storage's per-prefix warm-up (~3,500 writes/s before automatic prefix splitting)—and DigitalOcean Spaces' 800 requests/s bucket limit (§2.3)—sooner than packed storage. Watch `s3_slow_down` (`503 Slow Down` / `429` retries) and `s3_gave_up` in `stats.json`.
 
 ## 4. Local rehearsal
 
@@ -641,7 +664,7 @@ made them; `docs/REPRODUCE.md` §6 says how to read each file:
 
 | File | What |
 |---|---|
-| `run.txt` | gate, date, `commit=` (the checkout's full id), `image_tag=`, the agents' address, the number of servers, every size setting of `deploy/gates.sh`, extra flags |
+| `run.txt` | gate, date, `commit=` (the checkout's full id), `image_tag=`, the agents' address, the number of servers, every size setting of `deploy/gates.sh`, `object_layout=` (the object layout the servers ran, as each of them reported it before the gate: §12.4), extra flags |
 | `topology.env` | the topology from `deploy/do/.env` without a secret (`lib.sh` `topology`: a fixed list of names, so a new secret can never leak into it) and the pinned image references |
 | `images.txt` | the ids of the images built here, of the ones each server and driver has, the containers running, and the pinned third-party digests |
 | `commands.txt` | every `veil-bench` command line and the machine it ran on |
@@ -1286,6 +1309,20 @@ deploy/gcp/destroy.sh --approve
 deploy/gcp/destroy.sh --check --approve      # repeat until it says "nothing left"
 ```
 
+**The object layout a run used** (`docs/HUB.md` §13.42). The kit gives
+the servers no layout: each runs the server's own default (`objects` in
+v1). Every gate's `run.txt` states the layout that ran
+(`object_layout=objects`), and it is the servers' word, not the kit's:
+before a gate `bench.sh` asks each server (the `object_layout` of its
+`stats.json`), and refuses the gate, recording nothing, when a server
+gives none or two servers differ. The same value goes to every
+`veil-bench` command as `--object-layout`, so the tool's json and tables
+name it, and a server the tool starts itself (`objects`, `openscion`,
+`scale`) runs in the deployment's layout. `VEIL_GCP_OBJECT_LAYOUT=objects`
+in `deploy/gcp/.env` passes that layout explicitly to every server
+`configure.sh` starts (setting `packs` is refused in v1); a gate is then
+also refused while the servers report another.
+
 ### 12.5 Spot reclaims
 
 `deploy/gcp/bench.sh` watches the Spot VMs around each gate:
@@ -1342,7 +1379,7 @@ all are gone. Glance at Billing > Reports in the console the next day.
 
 ### 12.7 Testing the kit
 
-`bash deploy/gcp/test/test.sh` (85 checks) runs every script against a
+`bash deploy/gcp/test/test.sh` (97 checks) runs every script against a
 fake gcloud (`deploy/gcp/test/fake-gcloud`), a made-up project that
 remembers what was created, stopped and deleted, with fake ssh, scp,
 docker and curl. It checks that the dry runs of the full topology exit 0,
@@ -1359,7 +1396,11 @@ in the certificate, no `spaces.env`; each database machine's data disk;
 Veil's database colocated by default, the hash layout with its tablets,
 PostgreSQL's settings sized on the machine with durability on); the
 `onerepo` gate (one project, 1,000 and 5,000 agents, the database machines
-sampled) and its table on made-up results; the Spot watch (a clean gate valid; a
+sampled) and its table on made-up results; the object layout (no layout
+given to a server unless `VEIL_GCP_OBJECT_LAYOUT` names one; every gate
+recording the layout the servers report and telling the tool; a gate
+refused when a server reports none, the servers differ, or they are not
+in the one set); the Spot watch (a clean gate valid; a
 reclaim during a gate marks it invalid, starts the VM and reruns once; a
 second reclaim fails without a third run; a VM down before a gate is
 started first; a reclaimed storage machine with `all` reconfigures);
@@ -1610,3 +1651,35 @@ driver's own cores, and a driver near its vCPUs was the limit, not Veil.
 Statements on YugabyteDB are counted on the node the driver's URL names
 (`pg_stat_statements` is per node): with three servers spread over three
 nodes, about a third of them.
+
+## 13. Storage and garbage collection (v1)
+
+In Veil v1, **storage is append-only and there is no garbage collection of
+history — not even offline** (owner, 2026-11-18).
+
+* **Default layout (`objects`).** `--object-layout` (`VEIL_OBJECT_LAYOUT`,
+  `Config::object_layout`) defaults to `objects`, which is the sole writable
+  layout in v1. Every committed object is written under its own content-addressed
+  key (`p/<project>/<2 hex>/<62 hex>`).
+* **Existing packs stay readable.** Pre-existing `LISTED` packs (`veilpack3\n`)
+  written by earlier servers remain readable across every read path (`get`,
+  `get_many`, `get_encoded`, `get_range`, `prefetch`) with no migration. New
+  data is never written into packs, and online pack merging is removed.
+* **Append-only history.** Objects from deleted branches, force-pushes, or
+  expired snapshots are never collected in v1, and view keys' `view_graph`,
+  `view_changes`, and `view_file_history` rows are kept. Plan storage capacity
+  accordingly.
+* **What servers still delete.** Uploads (`POST …/objects`) still land in
+  temporary staged upload containers (`packs` rows with `state = STAGED`) so
+  refused pushes, unread plain-text secrets beside a landing push, or abandoned
+  uploads are never kept under project keys. Committed pushes and API commits
+  discard and purge their consumed staged containers; refused pushes discard
+  theirs immediately; and background sweepers (`pack_gc::schedule_sweep`,
+  `pack_gc::sweep_scan`) sweep only uncommitted `STAGED` upload containers past
+  `DEFAULT_STAGED_GRACE_MS` (1 hour) and `DISCARDED` upload containers past
+  `DEFAULT_PACK_GRACE_MS` (15 minutes). Neither ever touches `LISTED` packs or
+  committed project objects.
+* **Database support.** Veil v1 supports **PostgreSQL and YugabyteDB**; both
+  run in the required checks (`scripts/verify-server.sh`).
+
+

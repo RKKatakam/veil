@@ -79,12 +79,31 @@ pub struct TestHub {
     pub ca: PathBuf,
     pub cert_pem: String,
     config: Config,
+    watch_id: u64,
     pub _dir: tempfile::TempDir,
+}
+
+/// Object layout for tests: `VEIL_TEST_OBJECT_LAYOUT`, defaulting to `objects`.
+pub fn env_object_layout() -> veil_server::ObjectLayout {
+    match std::env::var("VEIL_TEST_OBJECT_LAYOUT") {
+        Ok(v) if !v.is_empty() => v.parse().unwrap_or_else(|e| panic!("VEIL_TEST_OBJECT_LAYOUT={v:?}: {e}")),
+        _ => veil_server::ObjectLayout::Objects,
+    }
 }
 
 impl TestHub {
     pub fn start() -> TestHub {
         TestHub::start_with_ttl(Duration::from_secs(3600))
+    }
+
+    /// A server pinned to [`veil_server::ObjectLayout::Objects`].
+    pub fn start_objects() -> TestHub {
+        TestHub::start_with_layout(veil_server::ObjectLayout::Objects)
+    }
+
+    pub fn start_with_layout(layout: veil_server::ObjectLayout) -> TestHub {
+        let url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
+        TestHub::start_with_s3_and_layout(&url, Duration::from_secs(3600), std::env::var("VEIL_TEST_S3_ENDPOINT").ok(), layout)
     }
 
     /// A server on a new database of its own, for a test that changes the
@@ -94,6 +113,17 @@ impl TestHub {
     pub fn start_own() -> TestHub {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         TestHub::start_on(&crate::grants::fresh_database(&rt), Duration::from_secs(3600))
+    }
+
+    /// [`TestHub::start_own`] pinned to [`veil_server::ObjectLayout::Objects`].
+    pub fn start_own_objects() -> TestHub {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        TestHub::start_with_s3_and_layout(
+            &crate::grants::fresh_database(&rt),
+            Duration::from_secs(3600),
+            std::env::var("VEIL_TEST_S3_ENDPOINT").ok(),
+            veil_server::ObjectLayout::Objects,
+        )
     }
 
     pub fn start_with_ttl(ttl: Duration) -> TestHub {
@@ -108,7 +138,17 @@ impl TestHub {
     /// A server whose objects are in the S3 store at `endpoint` (MinIO, or
     /// something in front of it), or in a temporary directory.
     pub fn start_with_s3(database_url: &str, ttl: Duration, endpoint: Option<String>) -> TestHub {
-        TestHub::start_with(database_url, ttl, endpoint, TestHub::limits(), "127.0.0.1:0".parse().unwrap())
+        TestHub::start_with_s3_and_layout(database_url, ttl, endpoint, env_object_layout())
+    }
+
+    /// [`TestHub::start_with_s3`] with an explicit [`veil_server::ObjectLayout`].
+    pub fn start_with_s3_and_layout(
+        database_url: &str,
+        ttl: Duration,
+        endpoint: Option<String>,
+        layout: veil_server::ObjectLayout,
+    ) -> TestHub {
+        TestHub::start_with(database_url, ttl, endpoint, TestHub::limits(), "127.0.0.1:0".parse().unwrap(), layout)
     }
 
     /// A server with `limits` (S24's tests).
@@ -120,10 +160,17 @@ impl TestHub {
     /// an IPv6 address).
     pub fn start_with_limits_on(listen: std::net::SocketAddr, limits: veil_server::limits::Settings) -> TestHub {
         let url = std::env::var("VEIL_TEST_DATABASE_URL").expect("VEIL_TEST_DATABASE_URL (run scripts/verify-server.sh)");
-        TestHub::start_with(&url, Duration::from_secs(3600), std::env::var("VEIL_TEST_S3_ENDPOINT").ok(), limits, listen)
+        TestHub::start_with(&url, Duration::from_secs(3600), std::env::var("VEIL_TEST_S3_ENDPOINT").ok(), limits, listen, env_object_layout())
     }
 
-    fn start_with(database_url: &str, ttl: Duration, endpoint: Option<String>, limits: veil_server::limits::Settings, listen: std::net::SocketAddr) -> TestHub {
+    fn start_with(
+        database_url: &str,
+        ttl: Duration,
+        endpoint: Option<String>,
+        limits: veil_server::limits::Settings,
+        listen: std::net::SocketAddr,
+        object_layout: veil_server::ObjectLayout,
+    ) -> TestHub {
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let storage = match endpoint {
             Some(endpoint) => Storage::S3 {
@@ -154,6 +201,7 @@ impl TestHub {
             listen,
             database_url,
             storage,
+            object_layout,
             tls: TlsSource::SelfSigned,
             data_dir: dir.path().join("data"),
             session_ttl: ttl,
@@ -193,6 +241,19 @@ impl TestHub {
         TestHub::run(config, dir)
     }
 
+    /// [`TestHub::beside`] over a custom `BlobStore` wrapper.
+    pub fn beside_with_store(
+        other: &TestHub,
+        store: Arc<dyn veil_server::store::BlobStore>,
+    ) -> TestHub {
+        let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..other.config.clone()
+        };
+        TestHub::run_with_store(config, dir, Some(store))
+    }
+
     /// This server stopped and started again on the same port, data
     /// directory and storage, its memory empty (as after an upgrade);
     /// `between` runs while it is down (a migration).
@@ -210,21 +271,32 @@ impl TestHub {
     }
 
     fn run(config: Config, dir: tempfile::TempDir) -> TestHub {
+        TestHub::run_with_store(config, dir, None)
+    }
+
+    fn run_with_store(
+        config: Config,
+        dir: tempfile::TempDir,
+        store: Option<Arc<dyn veil_server::store::BlobStore>>,
+    ) -> TestHub {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(8)
             .thread_stack_size(veil_server::THREAD_STACK)
             .build()
             .unwrap();
-        let running = rt.block_on(veil_server::start(config.clone())).expect("server starts");
+        let running = rt.block_on(veil_server::start_with_store(config.clone(), store)).expect("server starts");
+        let port = running.addr.port();
         let ca = config.data_dir.join("self-signed-cert.pem");
+        let watch_id = watchdog::enter(format!("hub 127.0.0.1:{port}"));
         TestHub {
-            port: running.addr.port(),
+            port,
             cert_pem: running.cert_pem.clone(),
             running: Some(running),
             rt,
             ca,
             config,
+            watch_id,
             _dir: dir,
         }
     }
@@ -238,6 +310,23 @@ impl TestHub {
         let rt = std::mem::replace(&mut self.rt, tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
         drop(running);
         rt.shutdown_timeout(Duration::from_secs(5));
+        watchdog::leave(self.watch_id);
+    }
+
+    /// [`TestHub::crash`] followed by a fresh start on the same data
+    /// directory, database and object storage (`between` runs while down).
+    pub fn crash_and_restart(mut self, between: impl FnOnce(&str)) -> TestHub {
+        let running = self.running.take();
+        let rt = std::mem::replace(&mut self.rt, tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
+        drop(running);
+        rt.shutdown_timeout(Duration::from_secs(5));
+        between(&self.config.database_url);
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..self.config.clone()
+        };
+        let dir = std::mem::replace(&mut self._dir, tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap());
+        TestHub::run(config, dir)
     }
 
     pub fn authority(&self) -> String {
@@ -283,6 +372,18 @@ impl TestHub {
         self.running.as_ref().unwrap().hub.clone()
     }
 
+    pub fn database_url(&self) -> &str {
+        &self.config.database_url
+    }
+
+    /// Stop the serving instance, keeping the database, data directory, and
+    /// storage intact.
+    pub fn stop_serving(&mut self) {
+        if let Some(r) = self.running.take() {
+            self.rt.block_on(r.stop());
+        }
+    }
+
     /// The server's object storage, opened anew (what another server on it
     /// reads).
     pub fn blob_store(&self) -> Arc<dyn veil_server::store::BlobStore> {
@@ -299,8 +400,143 @@ impl Drop for TestHub {
     fn drop(&mut self) {
         if let Some(r) = self.running.take() {
             self.rt.block_on(r.stop());
+            // Never let a wedged `spawn_blocking` worker hold `Runtime::drop`
+            // until `STEP_LIMIT` kills the binary and hides the test's output
+            // (BUG-2720).
+            let rt = std::mem::replace(&mut self.rt, tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
+            rt.shutdown_timeout(Duration::from_secs(15));
+        }
+        watchdog::leave(self.watch_id);
+    }
+}
+
+/// BUG-2720: records live `TestHub`s and `vl` commands and writes any running
+/// past `VEIL_TEST_WATCHDOG_SECS` (default 300 s) straight to fd 2 (libtest
+/// captures `eprintln!` until a test ends, so a step killed at `STEP_LIMIT`
+/// otherwise leaves nothing of what hung).
+mod watchdog {
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Mutex, OnceLock,
+        },
+        time::{Duration, Instant},
+    };
+
+    struct Entry {
+        thread: String,
+        what: String,
+        started: Instant,
+        next_report: Duration,
+    }
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    static ACTIVE: OnceLock<Mutex<BTreeMap<u64, Entry>>> = OnceLock::new();
+
+    fn threshold() -> Duration {
+        let secs = std::env::var("VEIL_TEST_WATCHDOG_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300u64).max(1);
+        Duration::from_secs(secs)
+    }
+
+    fn table() -> &'static Mutex<BTreeMap<u64, Entry>> {
+        ACTIVE.get_or_init(|| {
+            let m = Mutex::new(BTreeMap::new());
+            std::thread::Builder::new()
+                .name("server-hub-watchdog".into())
+                .spawn(|| loop {
+                    let limit = threshold();
+                    std::thread::sleep(limit.min(Duration::from_secs(5)).max(Duration::from_millis(200)));
+                    let mut lines = Vec::new();
+                    if let Some(t) = ACTIVE.get() {
+                        let mut map = t.lock().unwrap();
+                        for e in map.values_mut() {
+                            let elapsed = e.started.elapsed();
+                            if elapsed >= e.next_report {
+                                lines.push(format!(
+                                    "[server_hub watchdog] pid={} test={} elapsed={}s: {}\n",
+                                    std::process::id(),
+                                    e.thread,
+                                    elapsed.as_secs(),
+                                    e.what
+                                ));
+                                e.next_report = elapsed + limit.min(Duration::from_secs(60));
+                            }
+                        }
+                    }
+                    for line in lines {
+                        write_stderr(line.as_bytes());
+                    }
+                })
+                .ok();
+            m
+        })
+    }
+
+    #[cfg(unix)]
+    fn write_stderr(bytes: &[u8]) {
+        use std::{io::Write, os::fd::FromRawFd};
+        let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(2) });
+        let _ = f.write_all(bytes);
+    }
+
+    #[cfg(not(unix))]
+    fn write_stderr(bytes: &[u8]) {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(bytes);
+    }
+
+    pub fn enter(what: String) -> u64 {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let thread = std::thread::current().name().unwrap_or("<unnamed>").to_string();
+        table().lock().unwrap().insert(id, Entry { thread, what, started: Instant::now(), next_report: threshold() });
+        id
+    }
+
+    pub fn leave(id: u64) {
+        if let Some(t) = ACTIVE.get() {
+            t.lock().unwrap().remove(&id);
         }
     }
+
+    pub struct Guard(u64);
+    impl Guard {
+        pub fn new(what: String) -> Guard {
+            Guard(enter(what))
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            leave(self.0);
+        }
+    }
+
+    pub fn snapshot_overdue(after: Duration) -> Vec<String> {
+        let Some(t) = ACTIVE.get() else { return Vec::new() };
+        t.lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.started.elapsed() >= after)
+            .map(|e| format!("[server_hub watchdog] pid={} test={} elapsed={}s: {}", std::process::id(), e.thread, e.started.elapsed().as_secs(), e.what))
+            .collect()
+    }
+}
+
+#[test]
+fn bug_2720_watchdog_reports_overdue_operations_and_clears_finished_ones() {
+    let g = watchdog::Guard::new("admin vl [\"access\", \"infra/\", \"ops\"]".into());
+    std::thread::sleep(Duration::from_millis(60));
+    let overdue = watchdog::snapshot_overdue(Duration::from_millis(40));
+    assert!(
+        overdue.iter().any(|l| l.contains("bug_2720_watchdog_reports_overdue_operations") && l.contains("admin vl [\"access\", \"infra/\", \"ops\"]")),
+        "expected overdue entry in {overdue:?}"
+    );
+    drop(g);
+    let after = watchdog::snapshot_overdue(Duration::ZERO);
+    assert!(
+        !after.iter().any(|l| l.contains("admin vl [\"access\", \"infra/\", \"ops\"]")),
+        "finished guard stayed in {after:?}"
+    );
 }
 
 pub struct Person {
@@ -349,9 +585,12 @@ impl Person {
     }
 
     pub fn run(&self, dir: &Path, args: &[&str]) -> Output {
-        // `timeout` ends a `vl` that never returns: the test then fails.
+        // `timeout --kill-after=10` ends a `vl` that never returns even if it
+        // ignores SIGTERM: the test then fails instead of hanging the step.
+        let _watch = watchdog::Guard::new(format!("{} vl {args:?} in {}", self.name, dir.display()));
         let c = self.command(dir, args);
         Command::new("timeout")
+            .arg("--kill-after=10")
             .arg("300")
             .arg(c.get_program())
             .args(c.get_args())

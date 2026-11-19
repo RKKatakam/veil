@@ -128,6 +128,14 @@ Veil is server-centric ([OVERVIEW.md](OVERVIEW.md)). The order is:
 - ~~A hostile SFTP server can still force up to the 4 GiB read ceiling~~:
   gone with SFTP remotes (simplification pass, part 1).
 
+## Designs waiting for the owner
+
+- **Purge: removing named content from a server, offline**
+  ([design/server/purge.md](design/server/purge.md)). Storage is
+  append-only in v1; this is the one deliberate deletion (customer data, a
+  credential Veil did not recognise, a legal removal). Not built: a new
+  command, the owner's decision.
+
 ## Optional (owner: "nice to have, not needed")
 
 - **Admin governance:** a rogue or departed sole admin can remove everyone.

@@ -284,7 +284,7 @@ fn check_description(ctx: &Ctx, root: &Path, ws: &str, cli: &Cli) -> Result<()> 
     let paths = veil_core::sandbox::SandboxPaths::new(root, ws);
     let mut guard = paths.load_guard(&ctx.repo)?.unwrap_or_default();
     if let Some(mg) = crate::mount::Paths::new(root, ws).load_guard(&ctx.repo)? {
-        guard.merge(&mg);
+        guard.try_merge(&mg)?;
     }
     let wc = ctx.wc()?;
     let store = ctx.repo.store().clone();
@@ -296,14 +296,14 @@ fn check_description(ctx: &Ctx, root: &Path, ws: &str, cli: &Cli) -> Result<()> 
                         Some(set) => veil_core::vfs::restrict(&store, &s.tree, set)?,
                         None => s.tree,
                     };
-                    guard.add(&veil_core::sandbox::sealed_files_in_tree(&store, &slice, None));
+                    guard.absorb_tree(&store, &slice, None)?;
                 }
             }
         }
         Ok(())
     })?;
     if !guard.files.is_empty() {
-        if let Some(f) = guard.secrets().find(message.as_bytes()) {
+        if let Some(f) = guard.try_secrets()?.find(message.as_bytes()) {
             bail!(
                 "`vl {what}` refused: the change description holds {} ({}); change descriptions are recorded in plain text",
                 safe(&f.excerpt),

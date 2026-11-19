@@ -19,10 +19,10 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
-use veil_core::{cache::LruCache, ObjectId};
+use veil_core::ObjectId;
 
 use crate::error::{Error, Result};
 
@@ -125,9 +125,19 @@ impl Builder {
     pub fn encode(mut self) -> Vec<u8> {
         self.dead.sort_by(|a, b| tree_cmp(a, b));
         self.dead.dedup();
-        let mut grams: Vec<(u32, Vec<u32>)> = self.grams.into_iter().collect();
+        let out = encode_header(&self.docs, &self.dead);
+        drop(self.docs);
+        drop(self.dead);
+        let mut grams: Vec<(u32, Vec<u32>)> = self.grams.drain().collect();
+        drop(self.grams);
         grams.sort_unstable_by_key(|g| g.0);
-        encode(&self.docs, &self.dead, &grams)
+        let gram_count = grams.len() as u32;
+        let mut table = Vec::with_capacity(grams.len() * 16);
+        let mut postings = Vec::with_capacity(self.postings.saturating_mul(2));
+        for (g, list) in grams {
+            append_gram(&mut table, &mut postings, g, &list);
+        }
+        finish_encoded(out, gram_count, table, postings)
     }
 }
 
@@ -148,7 +158,7 @@ fn put_varint(out: &mut Vec<u8>, mut v: u32) {
     out.push(v as u8);
 }
 
-fn encode(docs: &[Doc], dead: &[String], grams: &[(u32, Vec<u32>)]) -> Vec<u8> {
+fn encode_header(docs: &[Doc], dead: &[String]) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     put_u32(&mut out, docs.len() as u32);
     for d in docs {
@@ -161,23 +171,28 @@ fn encode(docs: &[Doc], dead: &[String], grams: &[(u32, Vec<u32>)]) -> Vec<u8> {
     for p in dead {
         put_str(&mut out, p);
     }
-    let mut postings = Vec::new();
-    let mut table = Vec::with_capacity(grams.len() * 16);
-    for (g, list) in grams {
-        let start = postings.len() as u32;
-        let mut last = 0u32;
-        for (i, d) in list.iter().enumerate() {
-            put_varint(&mut postings, if i == 0 { *d } else { d - last });
-            last = *d;
-        }
-        put_u32(&mut table, *g);
-        put_u32(&mut table, start);
-        put_u32(&mut table, postings.len() as u32 - start);
-        put_u32(&mut table, list.len() as u32);
+    out
+}
+
+fn append_gram(table: &mut Vec<u8>, postings: &mut Vec<u8>, g: u32, list: &[u32]) {
+    let start = postings.len() as u32;
+    let mut last = 0u32;
+    for (i, &d) in list.iter().enumerate() {
+        put_varint(postings, if i == 0 { d } else { d - last });
+        last = d;
     }
-    put_u32(&mut out, grams.len() as u32);
-    out.extend(table);
-    out.extend(postings);
+    put_u32(table, g);
+    put_u32(table, start);
+    put_u32(table, postings.len() as u32 - start);
+    put_u32(table, list.len() as u32);
+}
+
+fn finish_encoded(mut out: Vec<u8>, gram_count: u32, table: Vec<u8>, postings: Vec<u8>) -> Vec<u8> {
+    out.reserve_exact(4 + table.len() + postings.len());
+    put_u32(&mut out, gram_count);
+    out.extend_from_slice(&table);
+    drop(table);
+    out.extend_from_slice(&postings);
     out
 }
 
@@ -218,6 +233,10 @@ impl<'a> Reader<'a> {
 }
 
 impl Segment {
+    pub fn is_empty_encoded(raw: &[u8]) -> bool {
+        raw.strip_prefix(MAGIC).is_some_and(|b| b.len() >= 8 && b[..8] == [0; 8])
+    }
+
     pub fn decode(raw: &[u8]) -> Result<Segment> {
         let mut r = Reader(raw.strip_prefix(MAGIC).ok_or_else(corrupt)?);
         let n = r.u32()? as usize;
@@ -567,34 +586,62 @@ pub fn merge(inputs: &[Arc<Segment>], newer: &dyn Fn(&str) -> bool, oldest: bool
         map[*i][*o as usize] = Some(n as u32);
         docs.push(inputs[*i].docs[*o as usize].clone());
     }
-    let mut grams: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (i, s) in inputs.iter().enumerate() {
-        for &(g, _, _, _) in &s.grams {
-            let list: Vec<u32> = s.postings(g).into_iter().filter_map(|o| map[i][o as usize]).collect();
-            if !list.is_empty() {
-                grams.entry(g).or_default().extend(list);
-            }
-        }
-    }
-    let mut grams: Vec<(u32, Vec<u32>)> = grams.into_iter().collect();
-    for (_, l) in &mut grams {
-        l.sort_unstable();
-    }
-    grams.sort_unstable_by_key(|g| g.0);
+    drop(kept);
     let mut dead: Vec<String> = if oldest {
         Vec::new()
     } else {
         inputs.iter().flat_map(|s| s.dead.iter()).filter(|p| !seen.contains(p.as_str())).cloned().collect()
     };
+    drop(seen);
     dead.sort_by(|a, b| tree_cmp(a, b));
     dead.dedup();
-    (encode(&docs, &dead, &grams), dropped)
-}
+    let out = encode_header(&docs, &dead);
+    drop(docs);
+    drop(dead);
 
-/// Decoded segments, by project and id, process-wide (they never change).
-fn cache() -> &'static LruCache<Arc<Segment>> {
-    static CACHE: OnceLock<LruCache<Arc<Segment>>> = OnceLock::new();
-    CACHE.get_or_init(|| LruCache::new(256 << 20))
+    // Each input's `grams` table is sorted by trigram: advance cursors across
+    // them in trigram order so merge streams postings into `postings` without
+    // holding all decoded posting vectors in a HashMap (BUG-2663).
+    let mut cursors = vec![0usize; inputs.len()];
+    let mut table = Vec::new();
+    let mut postings = Vec::new();
+    let mut list = Vec::new();
+    let mut gram_count = 0u32;
+    loop {
+        let mut next_g: Option<u32> = None;
+        for (i, s) in inputs.iter().enumerate() {
+            if let Some(&(g, ..)) = s.grams.get(cursors[i]) {
+                next_g = Some(next_g.map_or(g, |cur| cur.min(g)));
+            }
+        }
+        let Some(g) = next_g else { break };
+        list.clear();
+        for (i, s) in inputs.iter().enumerate() {
+            while let Some(&(cg, off, len, _)) = s.grams.get(cursors[i]) {
+                if cg != g {
+                    break;
+                }
+                cursors[i] += 1;
+                let p = Posts {
+                    bytes: &s.postings[off as usize..(off + len) as usize],
+                    pos: 0,
+                    last: 0,
+                    first: true,
+                };
+                for o in p {
+                    if let Some(mapped) = map[i].get(o as usize).copied().flatten() {
+                        list.push(mapped);
+                    }
+                }
+            }
+        }
+        if !list.is_empty() {
+            list.sort_unstable();
+            append_gram(&mut table, &mut postings, g, &list);
+            gram_count += 1;
+        }
+    }
+    (finish_encoded(out, gram_count, table, postings), dropped)
 }
 
 fn cache_key(project: i64, gc_epoch: i64, id: &ObjectId) -> ObjectId {
@@ -606,21 +653,33 @@ fn cache_key(project: i64, gc_epoch: i64, id: &ObjectId) -> ObjectId {
     ObjectId(*h.finalize().as_bytes())
 }
 
-/// Segment `id` of `project`, from the cache or the store.
+/// Segment `id` of `project`, from [`crate::Hub::segments`] or the store.
 pub fn load(src: &crate::sync::Source, id: &ObjectId) -> Result<Arc<Segment>> {
     let k = cache_key(src.project, src.hub.objects.gc_epoch(src.project), id);
-    if let Some(s) = cache().get(&k) {
+    if let Some(s) = src.hub.segments.get(&k) {
         return Ok(s);
     }
-    let raw = src.raw(id)?;
+    let raw = src.raw_ephemeral(id)?;
     let s = Arc::new(Segment::decode(&raw)?);
-    cache().insert(k, s.clone(), s.weight);
+    src.hub.segments.insert(k, s.clone(), s.weight);
     Ok(s)
 }
 
-/// Forget decoded segments (the tests' restart).
-pub fn clear_cache() {
-    cache().clear();
+/// Segment `id` of `project` for background compaction or migration: hits
+/// [`crate::Hub::segments`] when already resident, otherwise decodes without
+/// inserting transient inputs into the cache (BUG-2663).
+pub fn load_uncached(src: &crate::sync::Source, id: &ObjectId) -> Result<Arc<Segment>> {
+    let k = cache_key(src.project, src.hub.objects.gc_epoch(src.project), id);
+    if let Some(s) = src.hub.segments.get(&k) {
+        return Ok(s);
+    }
+    let raw = src.raw_ephemeral(id)?;
+    Ok(Arc::new(Segment::decode(&raw)?))
+}
+
+/// Forget decoded segments on `hub` (the tests' restart).
+pub fn clear_cache(hub: &crate::Hub) {
+    hub.segments.clear();
 }
 
 #[cfg(test)]
@@ -660,14 +719,93 @@ mod tests {
         let s2 = Arc::new(Segment::decode(&b.encode()).unwrap());
         let (raw, dropped) = merge(&[s1.clone(), s2.clone()], &|_| false, false);
         assert_eq!(dropped, 2);
+        assert!(!Segment::is_empty_encoded(&raw));
         let m = Segment::decode(&raw).unwrap();
         assert_eq!(m.docs.len(), 1);
         assert_eq!(m.holding(&grams(b"bye")).unwrap(), vec![0]);
         assert!(m.holding(&grams(b"hello")).unwrap().is_empty());
         assert!(m.dead.contains("gone") && m.dead.contains("a/y"));
         let (raw, _) = merge(&[s1, s2], &|p| p == "a/x", true);
+        assert!(Segment::is_empty_encoded(&raw));
         let m = Segment::decode(&raw).unwrap();
         assert!(m.docs.is_empty() && m.dead.is_empty());
+    }
+
+    #[test]
+    fn streaming_merge_matches_reference_encoding() {
+        let mut segs = Vec::new();
+        for seg_idx in 0..4usize {
+            let mut b = Builder::default();
+            let mut items: Vec<(String, String)> = (0..18usize)
+                .map(|j| {
+                    let slot = (j * 3 + seg_idx * 5) % 24;
+                    let path = format!("dir_{}/file_{slot:02}.rs", slot % 4);
+                    let body = format!("common_token seg_{seg_idx}_item_{j} slot_{slot:02} alpha_{}", (slot * 7) % 11);
+                    (path, body)
+                })
+                .collect();
+            items.sort_by(|a, b| tree_cmp(&a.0, &b.0));
+            items.dedup_by(|a, b| a.0 == b.0);
+            for (path, body) in items {
+                b.add(doc(&path), &grams(body.as_bytes()));
+            }
+            b.delete(format!("dir_{}/file_{:02}.rs", seg_idx % 4, (seg_idx * 7 + 1) % 24));
+            segs.push(Arc::new(Segment::decode(&b.encode()).unwrap()));
+        }
+        for oldest in [false, true] {
+            let newer = |p: &str| p.ends_with("03.rs");
+            let (got_raw, got_dropped) = merge(&segs, &newer, oldest);
+            let mut kept: Vec<(usize, u32)> = Vec::new();
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut ref_dropped = 0u64;
+            for (i, s) in segs.iter().enumerate().rev() {
+                for (o, d) in s.docs.iter().enumerate() {
+                    if newer(&d.path) || segs[i + 1..].iter().any(|n| n.shadows(&d.path)) || seen.contains(d.path.as_str()) {
+                        ref_dropped += 1;
+                    } else {
+                        seen.insert(&d.path);
+                        kept.push((i, o as u32));
+                    }
+                }
+            }
+            kept.sort_by(|a, b| tree_cmp(&segs[a.0].docs[a.1 as usize].path, &segs[b.0].docs[b.1 as usize].path));
+            let mut map: Vec<Vec<Option<u32>>> = segs.iter().map(|s| vec![None; s.docs.len()]).collect();
+            let mut docs = Vec::with_capacity(kept.len());
+            for (n, (i, o)) in kept.iter().enumerate() {
+                map[*i][*o as usize] = Some(n as u32);
+                docs.push(segs[*i].docs[*o as usize].clone());
+            }
+            let mut gram_map: HashMap<u32, Vec<u32>> = HashMap::new();
+            for (i, s) in segs.iter().enumerate() {
+                for &(g, _, _, _) in &s.grams {
+                    let list: Vec<u32> = s.postings(g).into_iter().filter_map(|o| map[i][o as usize]).collect();
+                    if !list.is_empty() {
+                        gram_map.entry(g).or_default().extend(list);
+                    }
+                }
+            }
+            let mut gram_vec: Vec<(u32, Vec<u32>)> = gram_map.into_iter().collect();
+            for (_, l) in &mut gram_vec {
+                l.sort_unstable();
+            }
+            gram_vec.sort_unstable_by_key(|g| g.0);
+            let mut dead: Vec<String> = if oldest {
+                Vec::new()
+            } else {
+                segs.iter().flat_map(|s| s.dead.iter()).filter(|p| !seen.contains(p.as_str())).cloned().collect()
+            };
+            dead.sort_by(|a, b| tree_cmp(a, b));
+            dead.dedup();
+            let header = encode_header(&docs, &dead);
+            let mut table = Vec::new();
+            let mut postings = Vec::new();
+            for (g, l) in &gram_vec {
+                append_gram(&mut table, &mut postings, *g, l);
+            }
+            let ref_raw = finish_encoded(header, gram_vec.len() as u32, table, postings);
+            assert_eq!(got_dropped, ref_dropped);
+            assert_eq!(got_raw, ref_raw, "oldest={oldest}: streaming merge must match reference encoding byte-for-byte");
+        }
     }
 
     #[test]

@@ -51,8 +51,12 @@ pub fn markdown(r: &Value) -> String {
     let mut o = String::new();
     let m = &r["machine"];
     let man = &r["manifest"];
+    let layout_note = r["object_layout"]
+        .as_str()
+        .map(|l| format!("object layout `{l}`, "))
+        .unwrap_or_default();
     o.push_str(&format!(
-        "Profile `{}` (seed {}), vl {} ({}), {} CPUs ({}), {} RAM, {} on `{}`, {} cache, {}.\n\n",
+        "Profile `{}` (seed {}), {layout_note}vl {} ({}), {} CPUs ({}), {} RAM, {} on `{}`, {} cache, {}.\n\n",
         man["profile"].as_str().unwrap_or("?"),
         man["seed"],
         m["commit"].as_str().unwrap_or("?"),
@@ -83,8 +87,8 @@ pub fn markdown(r: &Value) -> String {
         "Peak RSS is the child's `ru_maxrss`; it cannot read below the harness's own peak ({} MiB): values at that floor mean \"at most this\". ⛔ marks a case over the 512 MiB gate (the client's) or the 1 GB gate (the server's, `storage-and-cost.md` §9; not on the 5 GB profile; \"known: BUG-NNN\" marks a case a filed bug excuses, which does not fail the run). The server's RSS is its `VmRSS` before the case's first run and its `VmHWM` during the case's runs (reset before each run; it cannot restart below the RSS the server keeps).\n\n",
         f(&r["rss_floor_mib"], 0)
     ));
-    o.push_str("| case | group | median | spread | runs | peak RSS | server RSS before → peak | snapshots read | local lock held | remote lock held | ok |\n");
-    o.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    o.push_str("| case | group | median | spread | runs | peak RSS | layout | server RSS before → peak | snapshots read | local lock held | remote lock held | ok |\n");
+    o.push_str("|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|\n");
     for c in r["cases"].as_array().into_iter().flatten() {
         if c.is_null() {
             continue;
@@ -110,8 +114,13 @@ pub fn markdown(r: &Value) -> String {
                 }
             }
         };
+        let case_layout = if c["group"] == "server" || c["server_maxrss_mib"].is_number() {
+            r["object_layout"].as_str().unwrap_or("–")
+        } else {
+            ""
+        };
         o.push_str(&format!(
-            "| {} | {} | {} s | {}{} | {} | {} MiB{} | {}{} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} s | {}{} | {} | {} MiB{} | {} | {}{} | {} | {} | {} | {} |\n",
             c["name"].as_str().unwrap_or(""),
             c["group"].as_str().unwrap_or(""),
             f(&c["median_secs"], 3),
@@ -120,6 +129,7 @@ pub fn markdown(r: &Value) -> String {
             c["runs"].as_array().map(|a| a.len()).unwrap_or(0),
             f(&c["maxrss_mib"], 0),
             if c["maxrss_mib"].as_f64().is_some_and(|m| m > 512.0) { " ⛔" } else { "" },
+            case_layout,
             c["server_maxrss_mib"].as_f64().map(|m| format!("{} → {m:.0} MiB", f(&c["server_rss_before_mib"], 0))).unwrap_or_default(),
             match (server_over(r, c), known_over_gate(c["name"].as_str().unwrap_or(""))) {
                 (None, _) => String::new(),
@@ -191,6 +201,168 @@ pub fn markdown(r: &Value) -> String {
     o
 }
 
+/// Render any `veil-bench` result JSON as Markdown.
+pub fn any_markdown(r: &Value) -> anyhow::Result<String> {
+    match r["profile"].as_str() {
+        Some("load") => crate::load::markdown(r),
+        Some("openscion") => crate::openscion::markdown(r),
+        Some("daemon") => crate::daemon::markdown(r),
+        _ => Ok(markdown(r)),
+    }
+}
+
+/// The server `object_layout` of a result JSON (`Some("packs")` for older
+/// server results recorded before `--object-layout`, `None` for local-only
+/// runs). Errors if a single result file mixes layouts across its runs.
+pub fn effective_layout(v: &Value) -> anyhow::Result<Option<&str>> {
+    let mut seen: Option<&str> = v["object_layout"].as_str();
+    for r in v["runs"].as_array().into_iter().flatten() {
+        if let Some(l) = r["object_layout"].as_str() {
+            if let Some(prev) = seen {
+                if prev != l {
+                    anyhow::bail!("result mixes object layouts (`{prev}` and `{l}`)");
+                }
+            }
+            seen = Some(l);
+        }
+    }
+    if seen.is_some() {
+        return Ok(seen);
+    }
+    let has_server = matches!(v["profile"].as_str(), Some("load" | "openscion" | "daemon"))
+        || v["cases"]
+            .as_array()
+            .is_some_and(|cs| cs.iter().any(|c| c["group"] == "server" || c["server_maxrss_mib"].is_number()));
+    Ok(has_server.then_some("packs"))
+}
+
+/// Compare `after` against `before` for regressions (`object-layout.md` §8.2,
+/// §8.3), refusing when the two results come from different `object_layout`s.
+pub fn compare(before: &Value, after: &Value) -> anyhow::Result<(String, Vec<String>)> {
+    let (lb, la) = (effective_layout(before)?, effective_layout(after)?);
+    if lb != la {
+        anyhow::bail!(
+            "refusing to compare results of different object layouts (`{}` vs `{}`) as a regression",
+            lb.unwrap_or("none"),
+            la.unwrap_or("none")
+        );
+    }
+    if before["profile"] != after["profile"] {
+        anyhow::bail!("refusing to compare different benchmark profiles ({} vs {})", before["profile"], after["profile"]);
+    }
+    let mut out = String::new();
+    if let Some(l) = la {
+        out.push_str(&format!("Object layout: `{l}`.\n\n"));
+    }
+    let mut regressions = Vec::new();
+    if after["profile"].as_str() == Some("load") {
+        out.push_str(
+            "| Mode | Layout | Projects | Clients | Rate | Before (/s) | After (/s) | Before p99 (ms) | After p99 (ms) | Own writes/op (before → after) | Deletes/op (before → after) | Listings/op (before → after) | Gates missed (before → after) |\n\
+             |---|---|---:|---:|---|---:|---:|---:|---:|---|---|---|---|\n",
+        );
+        let b_runs = before["runs"].as_array().ok_or_else(|| anyhow::anyhow!("before: no runs"))?;
+        let a_runs = after["runs"].as_array().ok_or_else(|| anyhow::anyhow!("after: no runs"))?;
+        let key_of = |r: &Value| {
+            format!(
+                "{}:{}:{}:{}:{}",
+                r["mode"].as_str().unwrap_or(""),
+                r["via"].as_str().unwrap_or(""),
+                r["projects"],
+                r["clients"],
+                r["rate"]
+            )
+        };
+        for ar in a_runs {
+            let k = key_of(ar);
+            let Some(br) = b_runs.iter().find(|r| key_of(r) == k) else { continue };
+            let layout = la.unwrap_or("–");
+            let bm = br["gates_missed"].as_array().map_or(0, Vec::len);
+            let am = ar["gates_missed"].as_array().map_or(0, Vec::len);
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} → {} | {} → {} | {} → {} | {} → {} |\n",
+                ar["mode"].as_str().unwrap_or(""),
+                layout,
+                ar["projects"],
+                ar["clients"],
+                ar["rate"].as_str().map(str::to_string).unwrap_or_else(|| f(&ar["rate"], 2)),
+                f(&br["ops_per_s"], 1),
+                f(&ar["ops_per_s"], 1),
+                f(&br["p99_ms"], 1),
+                f(&ar["p99_ms"], 1),
+                f(&br["storage_push_writes_per_op"], 1),
+                f(&ar["storage_push_writes_per_op"], 1),
+                f(&br["storage_deletes_per_op"], 1),
+                f(&ar["storage_deletes_per_op"], 1),
+                f(&br["storage_lists_per_op"], 2),
+                f(&ar["storage_lists_per_op"], 2),
+                bm,
+                am,
+            ));
+            for m in ar["gates_missed"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                let had = br["gates_missed"].as_array().is_some_and(|xs| xs.iter().any(|x| x.as_str() == Some(m)));
+                if !had {
+                    regressions.push(format!("{k}: newly missed gate: {m}"));
+                }
+            }
+            let (be, ae) = (br["errors"].as_u64().unwrap_or(0), ar["errors"].as_u64().unwrap_or(0));
+            if ae > be {
+                regressions.push(format!("{k}: errors rose from {be} to {ae}"));
+            }
+            if let (Some(bo), Some(ao)) = (br["ops_per_s"].as_f64(), ar["ops_per_s"].as_f64()) {
+                if bo > 0.0 && ao < bo * 0.95 {
+                    regressions.push(format!("{k}: throughput dropped from {bo:.1}/s to {ao:.1}/s (> 5 %)"));
+                }
+            }
+            if let (Some(bp), Some(ap)) = (br["p99_ms"].as_f64(), ar["p99_ms"].as_f64()) {
+                if bp >= 1.0 && ap > bp * 1.10 {
+                    regressions.push(format!("{k}: p99 rose from {bp:.1} ms to {ap:.1} ms (> 10 %)"));
+                }
+            }
+        }
+    } else {
+        out.push_str("| Case | Layout | Before | After |\n|---|---|---:|---:|\n");
+        let b_cases = before["cases"].as_array().ok_or_else(|| anyhow::anyhow!("before: no cases"))?;
+        let a_cases = after["cases"].as_array().ok_or_else(|| anyhow::anyhow!("after: no cases"))?;
+        let name_of = |c: &Value| {
+            format!(
+                "{}:{}:{}",
+                c["name"].as_str().or_else(|| c["case"].as_str()).unwrap_or(""),
+                c["mode"].as_str().unwrap_or(""),
+                c["files"]
+            )
+        };
+        let metric = |c: &Value| {
+            c["median_secs"]
+                .as_f64()
+                .map(|s| (s * 1000.0, format!("{s:.3} s")))
+                .or_else(|| c["veil_ms"].as_f64().map(|m| (m, format!("{m:.1} ms"))))
+                .or_else(|| c["ms"].as_f64().map(|m| (m, format!("{m:.1} ms"))))
+        };
+        for ac in a_cases.iter().filter(|c| !c.is_null()) {
+            let k = name_of(ac);
+            let Some(bc) = b_cases.iter().filter(|c| !c.is_null()).find(|c| name_of(c) == k) else { continue };
+            let (bm, bt) = metric(bc).unwrap_or((f64::NAN, "–".into()));
+            let (am, at) = metric(ac).unwrap_or((f64::NAN, "–".into()));
+            let label = ac["name"].as_str().or_else(|| ac["case"].as_str()).unwrap_or("");
+            out.push_str(&format!("| {} | {} | {} | {} |\n", label, la.unwrap_or("–"), bt, at));
+            if bm >= 1.0 && am > bm * 1.10 {
+                regressions.push(format!("{label}: latency rose from {bt} to {at} (> 10 %)"));
+            }
+            if bc["ok"].as_bool() == Some(true) && ac["ok"].as_bool() == Some(false) {
+                regressions.push(format!("{label}: case failed in after"));
+            }
+        }
+        let (b_over, _) = server_over_gate(before);
+        let (a_over, _) = server_over_gate(after);
+        for g in a_over {
+            if !b_over.contains(&g) {
+                regressions.push(format!("server memory gate newly missed: {g}"));
+            }
+        }
+    }
+    Ok((out, regressions))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +391,56 @@ mod tests {
         assert!(md.contains("→ 1579 MiB ⛔ |"), "{md}");
         assert!(!md.contains("900 MiB ⛔"), "{md}");
         assert!(!markdown(&r("5g")).contains("MiB ⛔"));
+    }
+
+    #[test]
+    fn compare_refuses_different_object_layouts_and_judges_same_layout() {
+        let scale = json!({
+            "manifest": {"profile": "1g"},
+            "object_layout": "objects",
+            "cases": [{"name": "push, initial (all tags)", "group": "server", "server_maxrss_mib": 500.0, "ok": true}],
+        });
+        let scale_md = markdown(&scale);
+        assert!(scale_md.contains("object layout `objects`"), "{scale_md}");
+        assert!(scale_md.contains("| objects | – → 500 MiB |"), "{scale_md}");
+
+        let load_res = |layout: Option<&str>, ops: f64, p99: f64| {
+            let mut v = json!({
+                "profile": "load",
+                "runs": [{
+                    "mode": "branches",
+                    "projects": 1,
+                    "clients": 10,
+                    "rate": "max",
+                    "ops_per_s": ops,
+                    "p99_ms": p99,
+                    "storage_push_writes_per_op": 2.0,
+                    "storage_deletes_per_op": 0.0,
+                    "storage_lists_per_op": 0.0,
+                    "errors": 0,
+                    "gates_missed": [],
+                }]
+            });
+            if let Some(l) = layout {
+                v["object_layout"] = json!(l);
+                v["runs"][0]["object_layout"] = json!(l);
+            }
+            v
+        };
+        // Different layouts (`packs` vs `objects`) cannot be compared as a regression.
+        let err = compare(&load_res(Some("packs"), 200.0, 10.0), &load_res(Some("objects"), 50.0, 40.0)).unwrap_err();
+        assert!(err.to_string().contains("different object layouts (`packs` vs `objects`)"), "{err}");
+
+        // An older server result with no `object_layout` field is `packs`, so comparing against `objects` is refused too.
+        let err_legacy = compare(&load_res(None, 200.0, 10.0), &load_res(Some("objects"), 50.0, 40.0)).unwrap_err();
+        assert!(err_legacy.to_string().contains("different object layouts (`packs` vs `objects`)"), "{err_legacy}");
+
+        // Same layout (`objects` vs `objects`): rendered and judged cleanly.
+        let (md, reg) = compare(&load_res(Some("objects"), 100.0, 20.0), &load_res(Some("objects"), 98.0, 21.0)).unwrap();
+        assert!(md.starts_with("Object layout: `objects`.\n\n"), "{md}");
+        assert!(reg.is_empty(), "{reg:?}");
+
+        let (_, reg_slow) = compare(&load_res(Some("objects"), 100.0, 20.0), &load_res(Some("objects"), 80.0, 30.0)).unwrap();
+        assert_eq!(reg_slow.len(), 2, "{reg_slow:?}");
     }
 }

@@ -760,16 +760,23 @@ async fn walk_tips(
     progress: &Progress,
     slots: Option<&Arc<tokio::sync::Semaphore>>,
 ) -> Result<Vec<ObjectId>> {
+    stopping(hub)?;
     let ps = project_tips(hub, project, viewer, tips, progress).await?;
     let _slot = match slots {
-        Some(s) => Some(s.clone().acquire_owned().await.map_err(|e| Error::Other(e.into()))?),
+        Some(s) => Some(tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            p = s.clone().acquire_owned() => p.map_err(|e| Error::Other(e.into()))?,
+        }),
         None => None,
     };
+    stopping(hub)?;
     let vk = project.view(viewer).key();
     let admin = viewer.admin;
     let pairs: Vec<(ObjectId, ObjectId)> = tips.iter().copied().zip(ps.iter().copied()).collect();
     let (project, viewer, progress) = (project.clone(), viewer.clone(), progress.clone());
     blocking(hub, project.id, move |cx| {
+        stopping(cx.hub())?;
         let g = G::new(cx, &vk, None);
         let view = project.view(&viewer);
         let t = Trees::new(&g, &view);
@@ -777,14 +784,18 @@ async fn walk_tips(
         w.progress = Some(progress);
         let r = (|| {
             for (t, p) in &pairs {
+                stopping(cx.hub())?;
                 w.pmap.insert(*t, *p);
                 w.walk(*t)?;
             }
+            w.diff_pending()?;
             Ok(())
         })();
         // What was computed is kept, also when the walk failed: the next
-        // one goes on from there.
-        w.flush()?;
+        // one goes on from there, unless the server is stopping (BUG-2635).
+        if !cx.hub().landing.stopping() {
+            w.flush()?;
+        }
         r
     })
     .await?;
@@ -801,11 +812,14 @@ async fn walk_tips(
 /// projected again one memo at a time, each stored one taken as it is
 /// (`sync::projected`).
 async fn project_tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId], progress: &Progress) -> Result<Vec<ObjectId>> {
+    stopping(hub)?;
     if let Ok(Some(ps)) = project_tips_together(hub, project, viewer, tips, progress).await {
         return Ok(ps);
     }
+    stopping(hub)?;
     let mut ps = Vec::with_capacity(tips.len());
     for t in tips {
+        stopping(hub)?;
         ps.push(FILLING.scope(progress.clone(), sync::projected(hub, project, viewer, *t)).await?);
     }
     Ok(ps)
@@ -817,6 +831,7 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
     let mut deferred = sync::Deferred::default();
     let mut ps = Vec::with_capacity(tips.len());
     for t in tips {
+        stopping(hub)?;
         // Each projection worked out is a step of the fill's progress
         // (`projected_one`), as when they are stored one at a time: a
         // viewer's first fill of a long history spends most of its time
@@ -824,6 +839,7 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
         // the server is not getting on (BUG-2627).
         ps.push(FILLING.scope(progress.clone(), crate::store::not_own(Box::pin(sync::projected_inner(hub, project, viewer, *t, Some(&mut deferred))))).await?);
     }
+    stopping(hub)?;
     let now = veil_core::now_millis();
     let mut tx = hub.db.begin().await?;
     let mut wrote = false;
@@ -872,13 +888,26 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
         hub.commits.count(crate::db::Commit::Fill);
     }
     for (k, r, p) in &deferred.rows {
-        hub.caches.put_memo(project.id, k, r, p);
+        hub.caches.put_memo_row(project.id, k, r, p, deferred.collapsed.contains(r));
     }
     Ok(Some(ps))
 }
 
 /// Most snapshots one [`Walk::learn`] asks about at once.
 const AHEAD: usize = 512;
+/// Snapshots batched together for parallel tree prefetching before diffing
+/// (BUG-1954), aligned with [`ROWS_PER_STATEMENT`].
+const DIFF_BATCH: usize = 500;
+/// Tree object ids passed per `Objects::prefetch` + decode chunk.
+const PREFETCH_CHUNK: usize = 2048;
+/// Concurrent decode tasks per prefetch chunk.
+const PREFETCH_CONCURRENCY: usize = 16;
+/// Cap on tree pairs queued per BFS level during batch prefetching.
+const MAX_PREFETCH_FRONTIER: usize = 16_384;
+
+/// One snapshot waiting for batched tree prefetch and diff:
+/// `(projected id, row, change id, real root tree, real first parent)`.
+type DiffItem = (ObjectId, Arc<VRow>, ChangeId, ObjectId, Option<ObjectId>);
 
 /// One extension of a viewer's graph: its rows, and with `files` its file
 /// history (S14: `files::Fill`, the rows of each snapshot's changed paths,
@@ -900,6 +929,9 @@ struct Walk<'w, 'g, 'a> {
     rows: HashMap<ObjectId, Arc<VRow>>,
     /// Rows not written yet, parents first, with their change ids.
     pending: Vec<(ObjectId, Arc<VRow>, ChangeId)>,
+    /// Snapshots awaiting batched tree prefetch and diff (not in `pending`
+    /// until their file history is computed).
+    to_diff: Vec<DiffItem>,
     inline_cap: bool,
     /// How many snapshots the next [`Walk::learn`] asks about: one, then
     /// four times as many each time, up to [`AHEAD`]. A landing's one new
@@ -924,6 +956,7 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             absent: HashSet::new(),
             rows: HashMap::new(),
             pending: Vec::new(),
+            to_diff: Vec::new(),
             inline_cap: false,
             ahead: 1,
             read: HashMap::new(),
@@ -1068,6 +1101,7 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
     fn walk(&mut self, tip: ObjectId) -> Result<()> {
         let mut stack = vec![(tip, false)];
         while let Some((x, expanded)) = stack.pop() {
+            stopping(self.g.cx.hub())?;
             let px = self.pmap[&x];
             if self.has(&px)? {
                 continue;
@@ -1112,13 +1146,280 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             let row = Arc::new(VRow::compute(&ps, &parents, x));
             self.g.keep(px, row.clone());
             self.rows.insert(px, row.clone());
-            if self.files {
-                self.fill.add(self.g, self.t, px, &row)?;
+            if self.files && !self.inline_cap {
+                self.to_diff.push((px, row, ps.change_id, s.tree, s.parents.first().copied()));
+                if self.to_diff.len() >= DIFF_BATCH {
+                    self.diff_pending()?;
+                }
+            } else {
+                if self.files {
+                    self.fill.add(self.g, self.t, px, &row)?;
+                }
+                self.pending.push((px, row, ps.change_id));
+                if self.inline_cap && (self.pending.len() >= 16 || self.fill.pending.len() >= 64) {
+                    return Err(bad("inline fill exceeded cap"));
+                }
+                if self.pending.len() >= ROWS_PER_STATEMENT || self.fill.pending.len() >= 4 * ROWS_PER_STATEMENT {
+                    self.flush()?;
+                }
             }
-            self.pending.push((px, row, ps.change_id));
-            if self.inline_cap && (self.pending.len() >= 16 || self.fill.pending.len() >= 64) {
-                return Err(bad("inline fill exceeded cap"));
+        }
+        Ok(())
+    }
+
+    /// Prefetch all trees needed to diff [`Walk::to_diff`] in coalesced ranged
+    /// pack reads and parallel decode tasks (BUG-1954), then diff and queue
+    /// their file-history and graph rows in topological order.
+    fn diff_pending(&mut self) -> Result<()> {
+        use veil_core::{
+            hub::project::{empty_tree_id, Change},
+            object::EntryKind,
+            tree::MAX_TREE_DEPTH,
+        };
+
+        if self.to_diff.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(&mut self.to_diff);
+        let hub = self.g.cx.hub();
+        let project = self.g.cx.project();
+        let rt = &self.g.cx.src.rt;
+        let empty = empty_tree_id();
+
+        // 1. Collect real root trees of the batch and any external first parents.
+        let mut batch_trees: HashMap<ObjectId, ObjectId> = HashMap::with_capacity(batch.len());
+        for (_, row, _, now_real, _) in &batch {
+            if !row.withheld() {
+                batch_trees.insert(row.real, *now_real);
             }
+        }
+        let mut ext_parents: Vec<ObjectId> = Vec::new();
+        let mut seen_ext: HashSet<ObjectId> = HashSet::new();
+        for (_, row, _, _, first_parent) in &batch {
+            if row.withheld() {
+                continue;
+            }
+            if let Some(p) = first_parent {
+                if *p != root() && !batch_trees.contains_key(p) && seen_ext.insert(*p) {
+                    ext_parents.push(*p);
+                }
+            }
+        }
+        if ext_parents.len() > 1 {
+            rt.block_on(hub.objects.prefetch(project, &ext_parents));
+        }
+        for p in ext_parents {
+            batch_trees.insert(p, self.g.snapshot(&p)?.tree);
+        }
+
+        // 2. For restricted viewers with access rules, BFS-prefetch every
+        //    policy-rule directory that `Projector::root` will walk.
+        if !self.admin && self.t.has_rules() {
+            let view = self.t.view();
+            let mut seen_rule: HashSet<(String, ObjectId)> = HashSet::new();
+            let mut frontier: Vec<(String, ObjectId)> = Vec::new();
+            let mut push_root = |id: ObjectId| {
+                if id != empty && seen_rule.insert((String::new(), id)) {
+                    frontier.push((String::new(), id));
+                }
+            };
+            for (_, row, _, now_real, first_parent) in &batch {
+                if row.withheld() {
+                    continue;
+                }
+                push_root(*now_real);
+                if let Some(p) = first_parent {
+                    if *p != root() {
+                        push_root(batch_trees[p]);
+                    }
+                }
+            }
+            for _ in 0..=MAX_TREE_DEPTH {
+                if frontier.is_empty() {
+                    break;
+                }
+                let mut missing_set: HashSet<ObjectId> = HashSet::new();
+                let mut missing: Vec<ObjectId> = Vec::new();
+                for (_, id) in &frontier {
+                    if *id != empty && missing_set.insert(*id) && hub.trees.get(&hub.objects.tree_key(project, id)).is_none() {
+                        missing.push(*id);
+                    }
+                }
+                if !missing.is_empty() {
+                    rt.block_on(prefetch_trees_async(hub, project, missing));
+                }
+                if let Some(p) = &self.progress {
+                    p.step();
+                }
+                let mut next: Vec<(String, ObjectId)> = Vec::new();
+                'expand_rules: for (dir, id) in frontier {
+                    let Some(tree) = self.t.cached_tree(&id) else { continue };
+                    for e in &tree.entries {
+                        if e.kind == EntryKind::Dir {
+                            let child = if dir.is_empty() { e.name.clone() } else { format!("{dir}/{}", e.name) };
+                            if view.rule_below(&child) && seen_rule.insert((child.clone(), e.id)) {
+                                next.push((child, e.id));
+                                if next.len() >= MAX_PREFETCH_FRONTIER {
+                                    break 'expand_rules;
+                                }
+                            }
+                        }
+                    }
+                }
+                frontier = next;
+            }
+        }
+
+        // 3. Project roots for every non-withheld snapshot in the batch.
+        let mut projected_pairs: Vec<Option<(ObjectId, ObjectId)>> = Vec::with_capacity(batch.len());
+        for (_, row, _, now_real, first_parent) in &batch {
+            if row.withheld() {
+                projected_pairs.push(None);
+                continue;
+            }
+            let now_proj = self.t.root(*now_real)?;
+            let before_proj = match first_parent {
+                None => empty,
+                Some(p) if *p == root() => empty,
+                Some(p) => self.t.root(batch_trees[p])?,
+            };
+            projected_pairs.push(Some((before_proj, now_proj)));
+        }
+
+        // 4. Level-by-level BFS prefetch of all differing subtrees across the
+        //    batch so `changes::diff` hits `hub.trees` in memory.
+        let mut seen_pairs: HashSet<(ObjectId, ObjectId)> = HashSet::new();
+        let mut frontier: Vec<(ObjectId, ObjectId)> = Vec::new();
+        for pair in projected_pairs.iter().flatten() {
+            let (a, b) = *pair;
+            if a != b && seen_pairs.insert((a.min(b), a.max(b))) {
+                frontier.push((a, b));
+            }
+        }
+        for _ in 0..=MAX_TREE_DEPTH {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut missing_set: HashSet<ObjectId> = HashSet::new();
+            let mut missing: Vec<ObjectId> = Vec::new();
+            for &(a, b) in &frontier {
+                for id in [a, b] {
+                    if id != empty
+                        && !self.t.is_created(&id)
+                        && missing_set.insert(id)
+                        && hub.trees.get(&hub.objects.tree_key(project, &id)).is_none()
+                    {
+                        missing.push(id);
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                rt.block_on(prefetch_trees_async(hub, project, missing));
+            }
+            if let Some(p) = &self.progress {
+                p.step();
+            }
+            let mut next: Vec<(ObjectId, ObjectId)> = Vec::new();
+            'expand_diff: for (a, b) in frontier {
+                let ta = self.t.cached_tree(&a);
+                let tb = self.t.cached_tree(&b);
+                let oe = ta.as_deref().map(|t| t.entries.as_slice()).unwrap_or_default();
+                let ne = tb.as_deref().map(|t| t.entries.as_slice()).unwrap_or_default();
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < oe.len() || j < ne.len() {
+                    let (o, n) = match (oe.get(i), ne.get(j)) {
+                        (Some(x), Some(y)) => match x.name.cmp(&y.name) {
+                            std::cmp::Ordering::Less => {
+                                i += 1;
+                                (Some(x), None)
+                            }
+                            std::cmp::Ordering::Greater => {
+                                j += 1;
+                                (None, Some(y))
+                            }
+                            std::cmp::Ordering::Equal => {
+                                i += 1;
+                                j += 1;
+                                (Some(x), Some(y))
+                            }
+                        },
+                        (Some(x), None) => {
+                            i += 1;
+                            (Some(x), None)
+                        }
+                        (None, Some(y)) => {
+                            j += 1;
+                            (None, Some(y))
+                        }
+                        (None, None) => break,
+                    };
+                    if o == n {
+                        continue;
+                    }
+                    let od = o.filter(|e| e.kind == EntryKind::Dir).map(|e| e.id);
+                    let nd = n.filter(|e| e.kind == EntryKind::Dir).map(|e| e.id);
+                    let sub = match (od, nd) {
+                        (Some(x), Some(y)) if x != y => Some((x, y)),
+                        (Some(x), None) => Some((x, empty)),
+                        (None, Some(y)) => Some((empty, y)),
+                        _ => None,
+                    };
+                    if let Some((x, y)) = sub {
+                        if seen_pairs.insert((x.min(y), x.max(y))) {
+                            next.push((x, y));
+                            if next.len() >= MAX_PREFETCH_FRONTIER {
+                                break 'expand_diff;
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        // 5. Diff in topological order, batch-prefetching stored history when
+        //    any parent needs it, and flush completed rows in order.
+        let mut ready: Vec<(ObjectId, Arc<VRow>, ChangeId, Vec<Change>)> = Vec::with_capacity(batch.len());
+        let mut ready_changes = 0usize;
+        for ((px, row, cid, _, _), pair) in batch.into_iter().zip(projected_pairs) {
+            let ch = match pair {
+                Some((before_proj, now_proj)) => crate::derive::changes::diff(self.t, before_proj, now_proj)?.0,
+                None => Vec::new(),
+            };
+            ready_changes += ch.len();
+            ready.push((px, row, cid, ch));
+            if ready_changes >= 4 * ROWS_PER_STATEMENT {
+                self.drain_diffed(&mut ready)?;
+                ready_changes = 0;
+            }
+        }
+        if !ready.is_empty() {
+            self.drain_diffed(&mut ready)?;
+        }
+        self.t.forget();
+        Ok(())
+    }
+
+    fn drain_diffed(&mut self, ready: &mut Vec<(ObjectId, Arc<VRow>, ChangeId, Vec<veil_core::hub::project::Change>)>) -> Result<()> {
+        let mut keys: Vec<String> = Vec::new();
+        for (_, row, _, ch) in ready.iter() {
+            if row.withheld() || ch.is_empty() {
+                continue;
+            }
+            if row.parents.iter().any(|q| self.fill.needs_stored(q)) {
+                for c in ch {
+                    keys.push(crate::derive::changes::path_key(&c.path));
+                }
+            }
+        }
+        if !keys.is_empty() {
+            self.fill.prefetch_stored(self.g, &keys)?;
+        }
+        for (px, row, cid, ch) in ready.drain(..) {
+            if !row.withheld() {
+                self.fill.add_changes(self.g, px, &row, ch)?;
+            }
+            self.pending.push((px, row, cid));
             if self.pending.len() >= ROWS_PER_STATEMENT || self.fill.pending.len() >= 4 * ROWS_PER_STATEMENT {
                 self.flush()?;
             }
@@ -1130,12 +1431,16 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        stopping(self.g.cx.hub())?;
         let cx = self.g.cx;
         let hub = cx.hub();
         let project = cx.project();
         let vk = self.g.vk;
         let files = std::mem::take(&mut self.fill.pending);
         let graph = std::mem::take(&mut self.pending);
+        if !files.is_empty() {
+            self.fill.clear_stored();
+        }
         self.fill.forget_if_large();
         let gce = hub.caches.gc_epoch(project);
         // File history first: a graph row's `files` mark means its file
@@ -1158,6 +1463,56 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             p.wrote(graph.len() as u64);
         }
         Ok(())
+    }
+}
+
+/// About the memory decoded tree `t` holds in [`Hub::trees`].
+fn tree_weight(t: &veil_core::object::Tree) -> usize {
+    let heap: usize = t
+        .entries
+        .iter()
+        .map(|e| e.name.capacity() + if e.visibility.is_public() { 0 } else { 64 })
+        .sum();
+    128 + std::mem::size_of::<veil_core::object::Tree>()
+        + t.entries.capacity() * std::mem::size_of::<veil_core::TreeEntry>()
+        + heap
+}
+
+/// Prefetch and decode tree objects `ids` into [`Hub::trees`] using coalesced
+/// ranged pack reads (`Objects::prefetch`) and bounded parallel decoding.
+/// Best-effort: missing or corrupt objects are skipped so the diff pass
+/// reports them through its normal error path.
+async fn prefetch_trees_async(hub: &Arc<Hub>, project: i64, ids: Vec<ObjectId>) {
+    use veil_core::object::Object;
+    for chunk in ids.chunks(PREFETCH_CHUNK) {
+        hub.objects.prefetch(project, chunk).await;
+        let mut set = tokio::task::JoinSet::new();
+        let mut it = chunk.iter().copied();
+        loop {
+            while set.len() < PREFETCH_CONCURRENCY {
+                let Some(id) = it.next() else { break };
+                let hub = hub.clone();
+                set.spawn(async move {
+                    let ck = hub.objects.tree_key(project, &id);
+                    if hub.trees.get(&ck).is_some() {
+                        return;
+                    }
+                    let Ok(Some(raw)) = hub.objects.get(project, &id).await else {
+                        return;
+                    };
+                    let Some(enc) = Object::tree_encoding(&raw) else {
+                        return;
+                    };
+                    if let Ok(Object::Tree(t)) = Object::decode(&raw) {
+                        let w = tree_weight(&t);
+                        hub.trees.insert(ck, (Arc::new(t), enc), w);
+                    }
+                });
+            }
+            if set.join_next().await.is_none() {
+                break;
+            }
+        }
     }
 }
 
@@ -1329,8 +1684,8 @@ pub(crate) fn cache_prepared_memo(hub: &Hub, project_id: i64, memo: &PreparedMem
         if skip_vks.contains(&k.vk) {
             continue;
         }
-        for (r, p, _) in &k.projections {
-            hub.caches.put_memo(project_id, &k.vk, r, p);
+        for (r, p, collapsed) in &k.projections {
+            hub.caches.put_memo_row(project_id, &k.vk, r, p, *collapsed);
         }
         for (id, row, _) in &k.graph {
             hub.query
@@ -1372,6 +1727,11 @@ pub struct State {
     /// Versions blamed (computed, not read kept) here: the tests count
     /// them, to show no version is blamed twice.
     pub blame_steps: std::sync::atomic::AtomicU64,
+    /// Background viewer-graph fill tasks currently running on this server
+    /// ([`stop`]).
+    at_work: std::sync::atomic::AtomicUsize,
+    /// Notified when `at_work` reaches zero.
+    idle: tokio::sync::Notify,
 }
 
 type Fill = watch::Receiver<Option<std::result::Result<(), crate::error::Answer>>>;
@@ -1387,6 +1747,56 @@ impl Default for State {
             fill_reads: std::sync::atomic::AtomicU64::new(0),
             jobs: super::files::Jobs::default(),
             blame_steps: std::sync::atomic::AtomicU64::new(0),
+            at_work: std::sync::atomic::AtomicUsize::new(0),
+            idle: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+struct AtWork(Arc<Hub>);
+
+impl AtWork {
+    fn new(hub: &Arc<Hub>) -> Self {
+        hub.query.at_work.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        AtWork(hub.clone())
+    }
+}
+
+impl Drop for AtWork {
+    fn drop(&mut self) {
+        if self.0.query.at_work.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            self.0.query.idle.notify_waiters();
+        }
+    }
+}
+
+/// A stopping server (`landing::stop` has said so) starts no new background
+/// viewer-graph fill and cuts in-flight fills at their next step (BUG-2635).
+fn stopping(hub: &Hub) -> Result<()> {
+    match hub.landing.stopping() {
+        true => Err(Error::Other(anyhow::anyhow!("the server is stopping: viewer graph fill resumes at next start"))),
+        false => Ok(()),
+    }
+}
+
+/// How long a clean stop waits for background viewer-graph fills to exit.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// Wait for every active background viewer-graph fill task on `hub` to exit
+/// after `landing::stop` has flagged shutdown (BUG-2635).
+pub async fn stop(hub: &Arc<Hub>) {
+    let until = tokio::time::Instant::now() + STOP_WAIT;
+    loop {
+        let notified = hub.query.idle.notified();
+        if hub.query.at_work.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        if tokio::time::timeout_at(until, notified).await.is_err() {
+            let left = hub.query.at_work.load(std::sync::atomic::Ordering::SeqCst);
+            if left > 0 {
+                eprintln!("veil-server: {left} viewer-graph fills still at work at the stop");
+            }
+            return;
         }
     }
 }
@@ -1519,6 +1929,9 @@ async fn filled(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[Obje
 /// any project, and waiting it holds no connection, lock or slot (the
 /// fill's own task waits for those).
 pub async fn prefill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<()> {
+    if hub.landing.stopping() {
+        return Ok(());
+    }
     let vk = project.view(viewer).key();
     if warm(hub, project.id, &vk, viewer.admin, tips, true).await?.is_none() {
         start_or_join(hub, project, viewer, &vk, tips, true);
@@ -1531,6 +1944,9 @@ pub async fn prefill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &
 /// view key (`derive::rows_of_tips`, BUG-1943): its people read it within
 /// the second, and the history of its files some minutes later.
 pub async fn prefill_rows(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, tips: &[ObjectId]) -> Result<()> {
+    if hub.landing.stopping() {
+        return Ok(());
+    }
     let vk = project.view(viewer).key();
     if warm(hub, project.id, &vk, viewer.admin, tips, false).await?.is_none() {
         start_or_join(hub, project, viewer, &vk, tips, false);
@@ -1589,6 +2005,10 @@ async fn warm(hub: &Arc<Hub>, project: i64, vk: &str, admin: bool, tips: &[Objec
 /// the rows' fill projects, then walks in a slot of its own kind, and
 /// queues the file history's fill when it is done.
 fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId], files: bool) -> (Fill, Progress, bool) {
+    if hub.landing.stopping() {
+        let (_, rx) = watch::channel(Some(Err(stopping(hub).unwrap_err().answer())));
+        return (rx, Progress::default(), false);
+    }
     let key = (project.id, vk.to_string(), files);
     let mut fills = hub.query.fills.lock().unwrap();
     if let Some((rx, progress)) = fills.get(&key) {
@@ -1607,7 +2027,9 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
     }
     drop(fills);
     let (hub, project, viewer, tips, at) = (hub.clone(), project.clone(), viewer.clone(), tips.to_vec(), progress.clone());
+    let at_work = AtWork::new(&hub);
     tokio::spawn(async move {
+        let _at_work = at_work;
         let r = match files {
             true => leased_fill(&hub, &project, &viewer, &key.1, &tips, &at).await,
             false => walk_tips(&hub, &project, &viewer, &tips, false, &at, Some(&hub.query.row_slots)).await.map(|_| ()),
@@ -1623,7 +2045,7 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
         let _ = tx.send(Some(out));
         // The rows are there: their file history next, in the background
         // (nobody waits for it but blame and the history of a path).
-        if rows_done {
+        if rows_done && !hub.landing.stopping() {
             match warm(&hub, project.id, &key.1, viewer.admin, &tips, true).await {
                 Ok(None) => drop(start_or_join(&hub, &project, &viewer, &key.1, &tips, true)),
                 Ok(Some(_)) => {}
@@ -1644,6 +2066,7 @@ fn start_or_join(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, t
 /// [`FILL_LOCK_WAIT`]; a lease left by a server that stopped expires after
 /// [`LEASE`].
 async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &str, tips: &[ObjectId], progress: &Progress) -> Result<()> {
+    stopping(hub)?;
     let holder = hex::encode(veil_core::crypto::random_bytes::<16>());
     let take = || async {
         let now = veil_core::now_millis();
@@ -1667,14 +2090,23 @@ async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &st
     let wait = tokio::time::Instant::now() + FILL_LOCK_WAIT;
     let mut leased = take().await?;
     while !leased && tokio::time::Instant::now() < wait {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+        stopping(hub)?;
         leased = take().await?;
     }
     let renew = leased.then(|| {
         let (hub, id, vk, holder) = (hub.clone(), project.id, vk.to_string(), holder.clone());
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(LEASE_RENEW).await;
+                tokio::select! {
+                    biased;
+                    _ = hub.landing.wait_stop() => return,
+                    _ = tokio::time::sleep(LEASE_RENEW) => {}
+                }
                 let _ = sqlx::query("UPDATE view_fills SET expires_at = $1 WHERE project_id = $2 AND view_key = $3 AND holder = $4")
                     .bind(veil_core::now_millis() + LEASE.as_millis() as i64)
                     .bind(id)
@@ -1685,9 +2117,17 @@ async fn leased_fill(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, vk: &st
             }
         })
     });
-    let r = match hub.query.slots.clone().acquire_owned().await {
-        Ok(_slot) => walk_tips(hub, project, viewer, tips, true, progress, None).await.map(|_| ()),
-        Err(e) => Err(Error::Other(e.into())),
+    let r = if hub.landing.stopping() {
+        Err(stopping(hub).unwrap_err())
+    } else {
+        tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => Err(stopping(hub).unwrap_err()),
+            slot = hub.query.slots.clone().acquire_owned() => match slot {
+                Ok(_slot) => walk_tips(hub, project, viewer, tips, true, progress, None).await.map(|_| ()),
+                Err(e) => Err(Error::Other(e.into())),
+            }
+        }
     };
     if let Some(renew) = renew {
         renew.abort();

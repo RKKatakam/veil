@@ -16,6 +16,7 @@
 #
 # Environment:
 #   OBJECTS=local   the server keeps objects in a local directory instead of MinIO
+#   OBJECT_LAYOUT   the server's --object-layout: objects (default)
 #   SERVER_BIN      the veil-server to measure (default: the release build here),
 #                   e.g. an older build kept for a before/after comparison
 #   STEP_LIMIT      seconds for the profile's run (default 3600); the build has 1800
@@ -54,10 +55,16 @@ TAG=veil-bench-$$
 PG=$TAG-pg S3=$TAG-minio
 WORK=$ROOT/.scratch/bench-server-$$
 cleanup() {
-    # The server logs go with the results (they name what failed).
+    # The server and MinIO logs go with the results (they name what failed, BUG-2630).
     for l in "$WORK"/*/server.log "$WORK"/*/*/server.log; do
         [[ -f "$l" && -n "${OUT:-}" ]] && cp "$l" "${OUT%.json}-$(basename "$(dirname "$l")")-server.log"
     done
+    if [[ "${OBJECTS:-s3}" != "local" && -n "${OUT:-}" ]]; then
+        {
+            D inspect -f 'Status={{.State.Status}} RestartCount={{.RestartCount}} OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}' "$S3"
+            D logs "$S3"
+        } > "${OUT%.json}-minio.log" 2>&1 || true
+    fi
     D rm -f "$PG" "$S3" >/dev/null 2>&1
     # Only ever inside the worktree's .scratch/.
     [[ -n "$WORK" && "$WORK" == "$ROOT/.scratch/"* ]] && rm -rf "$WORK"
@@ -95,30 +102,41 @@ D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilmi
     bitnamilegacy/minio:latest >/dev/null || exit 1
 PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000)
 wait_for PostgreSQL 120 D exec "$PG" pg_isready -U veil
-wait_for MinIO 120 curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live"
+# Bitnami starts a temporary setup MinIO, stops it, and starts the real one (BUG-1953).
+minio_started() { D logs "$S3" 2>&1 | grep -q '\*\* Starting MinIO \*\*'; }
+wait_for MinIO 120 minio_started
 # pg_isready answers before the init scripts' restart; wait for a query.
 wait_for PostgreSQL 60 D exec "$PG" psql -U veil -d veil -c "select 1"
 D exec "$PG" psql -q -U veil -d veil -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements" >/dev/null || exit 1
 PG_ID=$(D inspect -f '{{.Id}}' "$PG")
-# Straight to the container's address where it answers, as a database on
-# its own host would be reached: through the published port every
-# statement went through docker-proxy, which took 3 of the machine's 32
-# threads during a landing run (BUG-1955).
+# Straight to the containers' addresses where they answer, as services on
+# their own hosts would be reached: through the published port every request
+# went through docker-proxy, which took 3 of the machine's 32 threads during
+# a landing run (BUG-1955) and reset S3 connections once its outbound
+# ephemeral ports filled after a 100-project push curve (BUG-2630).
 PG_ADDR=$(D inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$PG")
 if [[ -n "$PG_ADDR" ]] && timeout 2 bash -c "exec 3<>/dev/tcp/$PG_ADDR/5432" 2>/dev/null; then
     DB_URL=postgres://veil:veil@$PG_ADDR:5432/veil
 else
     DB_URL=postgres://veil:veil@127.0.0.1:$PG_PORT/veil
 fi
-echo "   postgres :$PG_PORT ($DB_URL)  minio :$S3_PORT"
+S3_ADDR=$(D inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$S3")
+if [[ -n "$S3_ADDR" ]] && timeout 2 bash -c "exec 3<>/dev/tcp/$S3_ADDR/9000" 2>/dev/null; then
+    S3_URL=http://$S3_ADDR:9000
+else
+    S3_URL=http://127.0.0.1:$S3_PORT
+fi
+wait_for MinIO 120 curl -sf "$S3_URL/minio/health/live"
+echo "   postgres :$PG_PORT ($DB_URL)  minio :$S3_PORT ($S3_URL)"
 
-SERVER_ARGS=(--server "${SERVER_BIN:-$ROOT/target/release/veil-server}" --database-url "$DB_URL")
+OBJECT_LAYOUT=${OBJECT_LAYOUT:-objects}
+SERVER_ARGS=(--server "${SERVER_BIN:-$ROOT/target/release/veil-server}" --database-url "$DB_URL" --object-layout "$OBJECT_LAYOUT")
 if [[ "${OBJECTS:-s3}" != "local" ]]; then
     export VEIL_S3_ACCESS_KEY=veilminio VEIL_S3_SECRET_KEY=veilminio-secret
-    SERVER_ARGS+=(--s3-endpoint "http://127.0.0.1:$S3_PORT" --s3-bucket veil-bench)
-    echo "   objects in MinIO"
+    SERVER_ARGS+=(--s3-endpoint "$S3_URL" --s3-bucket veil-bench)
+    echo "   objects in MinIO (layout: $OBJECT_LAYOUT)"
 else
-    echo "   objects in a local directory"
+    echo "   objects in a local directory (layout: $OBJECT_LAYOUT)"
 fi
 
 echo "== building release vl, veil-server and veil-bench"
@@ -130,13 +148,16 @@ OUT=$OUT_DIR/server-$PROFILE-$COMMIT-$STAMP.json
 BENCH=$ROOT/target/release/veil-bench
 mkdir -p "$WORK"
 run() { # the profile's run, bounded
+    if [[ "${OBJECTS:-s3}" != "local" ]]; then
+        wait_for MinIO 60 curl -sf "$S3_URL/minio/health/live"
+    fi
     timeout --kill-after=30 "$STEP_LIMIT" "$@"
     local rc=$?
     ((rc == 124)) && echo "stop: the run passed STEP_LIMIT=${STEP_LIMIT}s" >&2
     return $rc
 }
 
-echo "== $PROFILE through the server (commit $COMMIT)"
+echo "== $PROFILE through the server (commit $COMMIT, layout $OBJECT_LAYOUT)"
 status=0
 case "$PROFILE" in
     openscion)

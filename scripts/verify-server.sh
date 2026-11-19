@@ -22,10 +22,12 @@ D() {
 }
 
 # By default the three services are long-lived containers shared by every
-# run on this machine (`veil-shared-*`): starting YugabyteDB takes a minute
-# or two, so each run only creates its own databases and buckets in them
-# and drops them at the end. VEIL_VERIFY_FRESH=1 starts private containers
-# for this run instead, and removes them afterwards.
+# run on this machine (`veil-shared-*`): each run creates its own databases
+# and buckets in them and drops them at the end, and an idle shared
+# YugabyteDB container is recreated fresh (~6 s with --ui=false) so catalog
+# and dropped-table bloat never accumulates across runs (BUG-2632).
+# VEIL_VERIFY_FRESH=1 starts private containers for this run instead, and
+# removes them afterwards.
 PG_IMAGE=postgres:17-alpine
 YB_IMAGE=yugabytedb/yugabyte:2025.2.8.1-b8
 # MinIO no longer publishes images on Docker Hub; this is the MinIO server
@@ -48,9 +50,9 @@ else
 fi
 PG=$TAG-pg YB=$TAG-yb S3=$TAG-minio
 PG_DB=veil YB_DB=yugabyte
-# Veil v1 supports PostgreSQL only (owner, 2026-11-18): YugabyteDB is
-# experimental, and its steps run only with VEIL_VERIFY_YB=1.
-WITH_YB=${VEIL_VERIFY_YB:-0}
+# YugabyteDB is supported in v1 and runs by default; VEIL_VERIFY_YB=0 skips it.
+WITH_YB=${VEIL_VERIFY_YB:-1}
+YB_STARTED_NOW=0
 
 ysql() { D exec "$YB" sh -c "bin/ysqlsh -h \$(hostname -i) -c \"$1\""; }
 ysql_at() { D exec "$YB" sh -c "bin/ysqlsh -h \$(hostname -i) -tAc \"$1\""; }
@@ -64,7 +66,24 @@ BUCKETS="veil-pg veil-yb veil-hpg veil-hyb veil-load-pg veil-load-yb"
 remove_buckets() { # names in the shared MinIO's data directory
   [ $# -gt 0 ] && D exec "$S3" sh -c 'cd /bitnami/minio/data && for b; do case "$b" in ""|.*|*/*) continue;; esac; rm -rf -- "$b" ".minio.sys/buckets/$b"; done' sh "$@" >/dev/null 2>&1
 }
+kill_vt_orphans() { # detached children (`vl share-keys`, `vl daemon`) left under this run's TMPDIR=$VT
+  case "$VT" in "$HOME"/.vt/??????) ;; *) return 0 ;; esac
+  python3 - "$VT" "$$" <<'PY' 2>/dev/null
+import os, signal, sys
+vt, me = b'TMPDIR=' + sys.argv[1].encode(), int(sys.argv[2])
+for e in os.listdir('/proc'):
+    if not e.isdigit() or int(e) == me: continue
+    try:
+        env = open(f'/proc/{e}/environ', 'rb').read().split(b'\0')
+        if vt in env:
+            os.kill(int(e), signal.SIGTERM)
+    except Exception:
+        pass
+PY
+}
+
 cleanup() {
+  kill_vt_orphans
   case "$VT" in "$HOME"/.vt/??????) rm -rf -- "$VT" 2>/dev/null ;; esac
   if [ $SHARED = 1 ]; then
     remove_buckets $(for k in $BUCKETS; do echo "$k-$RUN"; done)
@@ -86,32 +105,53 @@ trap cleanup EXIT
 port() { D port "$1" "$2" | head -1 | sed 's/.*://'; }
 running() { [ "$(D inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
 
-start_services() {
-  # The load step runs 8 copies of the concurrency tests, each with its own
-  # servers and connection pools; shared runs can overlap, so allow plenty.
-  running "$PG" || { D rm -f "$PG" >/dev/null 2>&1; D run -d --name "$PG" --shm-size=1g -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 "$PG_IMAGE" -c max_connections=1500 >/dev/null || return 1; }
-  running "$S3" || { D rm -f "$S3" >/dev/null 2>&1; D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 "$S3_IMAGE" >/dev/null || return 1; }
-  # Memory capped, one tablet per table, no tablet-count limit: a long-lived
-  # YugabyteDB otherwise grows toward most of the
-  # machine's memory (8 GB seen) while agents build beside it.
-  # A one-node database needs no YSQL operation lease; on a busy machine its
-  # renewal comes late, and YugabyteDB then kills every connection and
-  # restarts (seen on 8-vCPU Boat machines: 370 of 425 tests failed).
-  [ "$WITH_YB" = 1 ] || { PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=-; for i in $(seq 120); do D exec "$PG" pg_isready -h 127.0.0.1 -U veil >/dev/null 2>&1 && break; sleep 1; done; for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done; return 0; }
-  running "$YB" || { D rm -f "$YB" >/dev/null 2>&1; D run -d --name "$YB" -p 127.0.0.1::5433 "$YB_IMAGE" bin/yugabyted start --background=false \
-    --tserver_flags=yb_enable_read_committed_isolation=true,memory_limit_hard_bytes=3221225472,ysql_num_shards_per_tserver=1,enable_ysql_operation_lease=false \
-    --master_flags=memory_limit_hard_bytes=1073741824,enforce_tablet_replica_limits=false,enable_ysql_operation_lease=false >/dev/null || return 1; }
-  PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=$(port "$YB" 5433)
-  # Over TCP: a new container first runs a set-up server on its socket only.
-  for i in $(seq 120); do D exec "$PG" pg_isready -h 127.0.0.1 -U veil >/dev/null 2>&1 && break; sleep 1; done
-  for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done
-  for i in $(seq 180); do ysql "select 1" >/dev/null 2>&1 && break; sleep 2; done
+lift_yb_tablet_limit() {
   # yugabyted (2025.2) sets enforce_tablet_replica_limits=true on the master after
   # the flags above, and a runtime flag is lost when the container restarts: with
   # the limit on, a 3 GiB tserver may hold 438 tablets, three or four of the test
   # databases, and every later CREATE TABLE fails (2026-11-12, after a reboot).
   # Set it at each start; it is idempotent.
   D exec "$YB" sh -c 'H=$(hostname -i); bin/yb-ts-cli --server_address=$H:7100 set_flag --force enforce_tablet_replica_limits false && bin/yb-ts-cli --server_address=$H:7100 set_flag --force tablet_replicas_per_gib_limit 100000' >/dev/null 2>&1 || echo "warning: could not lift YugabyteDB's tablet limit" >&2
+}
+
+start_yb() {
+  D rm -f "$YB" >/dev/null 2>&1
+  # Memory capped, one tablet per table, no tablet-count limit: a long-lived
+  # YugabyteDB otherwise grows toward most of the
+  # machine's memory (8 GB seen) while agents build beside it.
+  # A one-node database needs no YSQL operation lease; on a busy machine its
+  # renewal comes late, and YugabyteDB then kills every connection and
+  # restarts (seen on 8-vCPU Boat machines: 370 of 425 tests failed).
+  # --ui=false turns off the web UI's `system.metrics` tablet, which otherwise
+  # accumulates ~900 MB of SST/WAL even when idle (BUG-2632).
+  D run -d --name "$YB" -p 127.0.0.1::5433 "$YB_IMAGE" bin/yugabyted start --background=false --ui=false \
+    --tserver_flags=yb_enable_read_committed_isolation=true,memory_limit_hard_bytes=3221225472,ysql_num_shards_per_tserver=1,enable_ysql_operation_lease=false \
+    --master_flags=memory_limit_hard_bytes=1073741824,enforce_tablet_replica_limits=false,enable_ysql_operation_lease=false >/dev/null || return 1
+  YB_PORT=$(port "$YB" 5433)
+  for i in $(seq 180); do ysql "select 1" >/dev/null 2>&1 && break; sleep 2; done
+  ysql "select 1" >/dev/null 2>&1 || return 1
+  lift_yb_tablet_limit
+}
+
+start_services() {
+  # The load step runs 8 copies of the concurrency tests, each with its own
+  # servers and connection pools; shared runs can overlap, so allow plenty.
+  running "$PG" || { D rm -f "$PG" >/dev/null 2>&1; D run -d --name "$PG" --shm-size=1g -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 "$PG_IMAGE" -c max_connections=1500 >/dev/null || return 1; }
+  running "$S3" || { D rm -f "$S3" >/dev/null 2>&1; D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 "$S3_IMAGE" >/dev/null || return 1; }
+  PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=-
+  # Over TCP: a new container first runs a set-up server on its socket only.
+  for i in $(seq 120); do D exec "$PG" pg_isready -h 127.0.0.1 -U veil >/dev/null 2>&1 && break; sleep 1; done
+  for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done
+  [ "$WITH_YB" = 1 ] || return 0
+  if running "$YB"; then
+    YB_PORT=$(port "$YB" 5433)
+    for i in $(seq 180); do ysql "select 1" >/dev/null 2>&1 && break; sleep 2; done
+    ysql "select 1" >/dev/null 2>&1 || return 1
+    lift_yb_tablet_limit
+  else
+    start_yb || return 1
+    YB_STARTED_NOW=1
+  fi
 }
 
 # Databases left by runs that were killed before their cleanup ran: each
@@ -128,23 +168,43 @@ drop_dead_runs() {
   done
   local b dead=()
   for b in $(D exec "$S3" ls /bitnami/minio/data 2>/dev/null); do
-    pid=$(echo "$b" | sed -nE 's/^veil-(pg|yb|hpg|hyb|load-pg|load-yb)-([0-9]+)$/\2/p')
+    pid=$(echo "$b" | sed -nE 's/^veil-(pg|yb|opg|oyb|hpg|hyb|load-pg|load-yb)-([0-9]+)$/\2/p')
     [ -n "$pid" ] && [ ! -d "/proc/$pid" ] && dead+=("$b")
   done
   remove_buckets "${dead[@]}"
 }
 
+# BUG-2632: a long-lived YugabyteDB container grows slow within hours as
+# master sys_catalog outgrows its 256 MB cache and dropped test databases
+# leave hundreds of thousands of rocksdb/table-* directories on disk (a
+# `docker restart` preserves that disk state). Recreate the shared container
+# fresh (~6 s with --ui=false) whenever no other run holds a test database
+# or active client session on it.
+recreate_yb_if_idle() {
+  local live_dbs live_conns
+  live_dbs=$(ysql_at "SELECT count(*) FROM pg_database WHERE datname LIKE 'veil_run_%' OR datname LIKE 'r%x%'" 2>/dev/null)
+  # Exclude yugabyted's own UI collector (which holds an idle connection on
+  # `yugabyte` from the container's own IP on pre-`--ui=false` containers).
+  live_conns=$(ysql_at "SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend' AND (datname <> 'yugabyte' OR client_addr IS DISTINCT FROM inet_server_addr())" 2>/dev/null)
+  if [ "$live_dbs" = 0 ] && [ "$live_conns" = 0 ]; then
+    start_yb || return 1
+  fi
+}
+
 if [ $SHARED = 1 ]; then
   echo "== shared containers (VEIL_VERIFY_FRESH=1 for private ones)"
-  # One run at a time starts or replaces them.
+  # One run at a time starts, recreates when idle, or claims a run database.
   exec 9>"${XDG_RUNTIME_DIR:-/tmp}/veil-shared-services.lock"
   flock 9
   start_services || { echo "starting containers failed"; exit 1; }
   drop_dead_runs
-  flock -u 9
+  if [ "$WITH_YB" = 1 ] && [ "$YB_STARTED_NOW" = 0 ]; then
+    recreate_yb_if_idle || { echo "recreating $YB failed"; exit 1; }
+  fi
   PG_DB=veil_run_$RUN YB_DB=veil_run_$RUN
   D exec "$PG" psql -U veil -d veil -c "CREATE DATABASE $PG_DB" >/dev/null || { echo "creating $PG_DB failed"; exit 1; }
   [ "$WITH_YB" = 1 ] && { ysql "CREATE DATABASE $YB_DB" >/dev/null || { echo "creating $YB_DB on YugabyteDB failed"; exit 1; }; }
+  flock -u 9
 else
   echo "== starting containers"
   start_services || { echo "starting containers failed"; exit 1; }
@@ -171,10 +231,97 @@ done
 status=0
 # Every step is bounded: a hang fails the run instead of blocking it.
 STEP_LIMIT=${STEP_LIMIT:-600}
+# BUG-2720: dump process tree, thread wait channels/syscalls, open sockets and
+# active database queries once a step passes WATCHDOG_AT (default 300 s) and
+# again right before `timeout` kills it, so a hung run never dies silent.
+WATCHDOG_AT=${VEIL_WATCHDOG_SECS:-300}
+dump_watchdog() { # out_file, root_pid, step_name, elapsed_s
+  local out=$1 root=$2 name=$3 elapsed=$4 pids p t tid
+  {
+    echo "=== watchdog: step=$name elapsed=${elapsed}s $(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cat /proc/loadavg 2>/dev/null) ==="
+    pids=$(python3 - "$root" "$VT" <<'PY' 2>/dev/null
+import os, sys
+root, vt = int(sys.argv[1]), sys.argv[2].encode()
+children, vt_pids = {}, set()
+for e in os.listdir('/proc'):
+    if not e.isdigit(): continue
+    pid = int(e)
+    try:
+        st = open(f'/proc/{pid}/stat', 'rb').read()
+        ppid = int(st[st.rfind(b')')+2:].split()[1])
+        children.setdefault(ppid, []).append(pid)
+    except Exception:
+        pass
+    try:
+        env = open(f'/proc/{pid}/environ', 'rb').read().split(b'\0')
+        if b'TMPDIR=' + vt in env:
+            vt_pids.add(pid)
+    except Exception:
+        pass
+seen, stack = set(), [root]
+while stack:
+    p = stack.pop()
+    if p in seen: continue
+    seen.add(p)
+    stack.extend(children.get(p, []))
+seen |= vt_pids
+seen.discard(os.getpid())
+print(' '.join(str(p) for p in sorted(seen) if os.path.exists(f'/proc/{p}')))
+PY
+    )
+    if [ -n "$pids" ]; then
+      ps -o pid,ppid,pgid,stat,etime,pcpu,rss,wchan:28,args -p "$(echo "$pids" | tr ' ' ',')" 2>&1 || true
+      for p in $pids; do
+        [ -d "/proc/$p/task" ] || continue
+        echo "--- threads of pid $p ($(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-160)) ---"
+        for t in /proc/$p/task/*; do
+          [ -d "$t" ] || continue
+          tid=${t##*/}
+          echo "  tid=$tid comm=$(cat "$t/comm" 2>/dev/null) wchan=$(cat "$t/wchan" 2>/dev/null) syscall=$(cat "$t/syscall" 2>/dev/null)"
+          sed 's/^/    /' "$t/stack" 2>/dev/null || true
+        done
+      done
+      command -v lsof >/dev/null 2>&1 && lsof -nP -a -i -U -p "$(echo "$pids" | tr ' ' ',')" 2>/dev/null | head -120
+    else
+      echo "(no step processes found)"
+    fi
+    echo "--- postgres active queries ---"
+    D exec "$PG" psql -U veil -d veil -c "SELECT pid, datname, state, wait_event_type, wait_event, now() - query_start AS age, left(query, 160) FROM pg_stat_activity WHERE state <> 'idle' AND pid <> pg_backend_pid()" 2>&1 || true
+    if [ "$WITH_YB" = 1 ]; then
+      echo "--- yugabyte active queries ---"
+      ysql "SELECT pid, datname, state, wait_event_type, wait_event, now() - query_start AS age, left(query, 160) FROM pg_stat_activity WHERE state <> 'idle' AND pid <> pg_backend_pid()" 2>&1 || true
+    fi
+  } >> "$out" 2>&1
+}
+
 step() { # name, command...
   local name=$1; shift
-  if timeout --kill-after=30 "$STEP_LIMIT" "$@" > "$LOGS/$name.log" 2>&1; then echo "   ok    $name"
-  else echo "   FAIL  $name (exit $?: 124 is the ${STEP_LIMIT}s limit)  ($LOGS/$name.log)"; status=1; fi
+  local t0 rc spid wpid dt extra="" wlog="$LOGS/$name.watchdog.log"
+  t0=$(date +%s)
+  rm -f "$wlog"
+  timeout --kill-after=30 "$STEP_LIMIT" "$@" > "$LOGS/$name.log" 2>&1 &
+  spid=$!
+  (
+    local next=$WATCHDOG_AT pre=$(( STEP_LIMIT > 25 ? STEP_LIMIT - 20 : STEP_LIMIT )) pre_done=0 el
+    while kill -0 "$spid" 2>/dev/null; do
+      el=$(( $(date +%s) - t0 ))
+      if (( el >= next )); then
+        dump_watchdog "$wlog" "$spid" "$name" "$el"
+        next=$(( el + 120 ))
+      elif (( !pre_done && el >= pre )); then
+        dump_watchdog "$wlog" "$spid" "$name" "$el"
+        pre_done=1
+      fi
+      sleep 2
+    done
+  ) &
+  wpid=$!
+  wait "$spid"; rc=$?
+  kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  dt=$(( $(date +%s) - t0 ))
+  [ -s "$wlog" ] && extra="  (watchdog: $wlog)"
+  if [ $rc = 0 ]; then echo "   ok    $name (${dt}s)$extra"
+  else echo "   FAIL  $name (${dt}s, exit $rc: 124 is the ${STEP_LIMIT}s limit)  ($LOGS/$name.log)$extra"; status=1; fi
   grep -E '^test result|tests run' "$LOGS/$name.log" | tail -1 | sed 's/^/         /'
 }
 
@@ -194,7 +341,7 @@ step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg-$
 # YugabyteDB is shared by every run on the machine: 8 tests at a time, so
 # several runs at once do not drown it in servers and pools (each test
 # starts its own); results stay trustworthy under load.
-[ "$WITH_YB" = 1 ] || echo "   skip  yugabyte (v1 supports PostgreSQL only; VEIL_VERIFY_YB=1 runs it)"
+[ "$WITH_YB" = 1 ] || echo "   skip  yugabyte (VEIL_VERIFY_YB=0)"
 [ "$WITH_YB" = 1 ] && STEP_LIMIT=1800 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" "${SKIP_HOSTILE[@]}" --test-threads=8
 # One at a time: on a database other runs share, three at once could keep
 # a statement past its timeout.
@@ -227,8 +374,10 @@ load() { # url, bucket, copies (each copy bounded like a step)
   return $rc
 }
 load_step() { # name, url, bucket, copies: the copies are bounded, not the function
-  local name=$1; shift
-  if load "$@" > "$LOGS/$name.log" 2>&1; then echo "   ok    $name"; else echo "   FAIL  $name  ($LOGS/$name.log)"; status=1; fi
+  local name=$1 t0 dt; shift
+  t0=$(date +%s)
+  if load "$@" > "$LOGS/$name.log" 2>&1; then dt=$(( $(date +%s) - t0 )); echo "   ok    $name (${dt}s)"
+  else dt=$(( $(date +%s) - t0 )); echo "   FAIL  $name (${dt}s)  ($LOGS/$name.log)"; status=1; fi
   cat "$LOGS/$name.log" | sed 's/^/         /'
 }
 load_step load-postgres "$PG_URL" veil-load-pg-$RUN 8

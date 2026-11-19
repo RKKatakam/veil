@@ -81,6 +81,10 @@ const FLUSH_EVERY: usize = 512;
 /// Rows per insert statement: small enough that one stays well inside the
 /// statement timeout on a busy YugabyteDB.
 const ROWS_PER_STATEMENT: usize = 1_000;
+/// Path keys per `file_history` `CROSS JOIN LATERAL` lookup (BUG-1068): each
+/// key is a separate index range scan (and on YugabyteDB a DocDB read RPC), so
+/// 1,000 keys in one statement can exceed `STATEMENT_TIMEOUT` under load.
+const HISTORY_KEYS_PER_STATEMENT: usize = 250;
 /// How long a deriver waits for another server's deriver of the same
 /// project; after that the other one (or the next landing) derives it.
 const LOCK_WAIT: Duration = Duration::from_secs(60);
@@ -114,6 +118,10 @@ pub struct Workers {
     /// project's graph made again); a later walk from a newer tip stops
     /// there.
     not_below: LruCache<ObjectId>,
+    /// Derive tasks currently running on this server ([`stop`]).
+    at_work: std::sync::atomic::AtomicUsize,
+    /// Notified when `at_work` reaches zero.
+    idle: tokio::sync::Notify,
 }
 
 impl Workers {
@@ -125,6 +133,8 @@ impl Workers {
             active: Mutex::new(HashMap::new()),
             rows: LruCache::new(64 << 20),
             not_below: LruCache::new(NOT_BELOW_ENTRIES),
+            at_work: std::sync::atomic::AtomicUsize::new(0),
+            idle: tokio::sync::Notify::new(),
         }
     }
 
@@ -147,6 +157,55 @@ impl Workers {
     /// tests' crash and resume).
     pub fn clear_cache(&self) {
         self.rows.clear();
+    }
+}
+
+struct AtWork(Arc<Hub>);
+
+impl AtWork {
+    fn new(hub: &Arc<Hub>) -> Self {
+        hub.derive.at_work.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        AtWork(hub.clone())
+    }
+}
+
+impl Drop for AtWork {
+    fn drop(&mut self) {
+        if self.0.derive.at_work.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            self.0.derive.idle.notify_waiters();
+        }
+    }
+}
+
+/// A stopping server (`landing::stop` has said so) starts no new derive work
+/// and cuts in-flight background derive tasks at their next step (BUG-2635).
+fn stopping(hub: &Hub) -> Result<()> {
+    match hub.landing.stopping() {
+        true => Err(Error::Other(anyhow::anyhow!("the server is stopping: derived history resumes at next start"))),
+        false => Ok(()),
+    }
+}
+
+/// How long a clean stop waits for background derive tasks to exit.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// Wait for every active background derive task (`landed`, `resume`, `landing`,
+/// `catch_up`) on `hub` to exit after `landing::stop` has flagged shutdown
+/// (BUG-2635).
+pub async fn stop(hub: &Arc<Hub>) {
+    let until = tokio::time::Instant::now() + STOP_WAIT;
+    loop {
+        let notified = hub.derive.idle.notified();
+        if hub.derive.at_work.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        if tokio::time::timeout_at(until, notified).await.is_err() {
+            let left = hub.derive.at_work.load(std::sync::atomic::Ordering::SeqCst);
+            if left > 0 {
+                eprintln!("veil-server: {left} derive tasks still at work at the stop");
+            }
+            return;
+        }
     }
 }
 
@@ -350,7 +409,7 @@ pub async fn read<T: Send + 'static>(hub: &Arc<Hub>, project: i64, f: impl FnOnc
 /// moved. Only moved branches are touched (BUG-870): the work of a landing
 /// never grows with how many branches the project has.
 pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
-    if branches.is_empty() {
+    if branches.is_empty() || hub.landing.stopping() {
         return;
     }
     {
@@ -362,11 +421,23 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
         active.insert(project, BTreeSet::new());
     }
     let hub = hub.clone();
+    let at_work = AtWork::new(&hub);
     tokio::spawn(async move {
+        let _at_work = at_work;
         let mut branches = branches;
         loop {
+            if hub.landing.stopping() {
+                hub.derive.active.lock().unwrap().remove(&project);
+                break;
+            }
             if let Err(e) = landing(&hub, project, branches).await {
-                eprintln!("veil-server: deriving the history of project {project}: {e:?}");
+                if !hub.landing.stopping() {
+                    eprintln!("veil-server: deriving the history of project {project}: {e:?}");
+                }
+            }
+            if hub.landing.stopping() {
+                hub.derive.active.lock().unwrap().remove(&project);
+                break;
             }
             let next = {
                 let mut active = hub.derive.active.lock().unwrap();
@@ -387,16 +458,25 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
 /// What [`landed`] runs for the branches a landing moved: derive them, then
 /// memoise their tips' projections for every view key.
 pub async fn landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> Result<Stats> {
+    let _at_work = AtWork::new(hub);
+    stopping(hub)?;
     let moved = branches.clone();
     let hub2 = hub.clone();
-    let stats = tokio::spawn(async move { locked_landing(&hub2, project, branches).await })
-        .await
-        .map_err(|e| Error::Other(e.into()))??;
+    let inner_work = AtWork::new(&hub2);
+    let stats = tokio::spawn(async move {
+        let _at_work = inner_work;
+        locked_landing(&hub2, project, branches).await
+    })
+    .await
+    .map_err(|e| Error::Other(e.into()))??;
+    stopping(hub)?;
     // The project's record of its last valid `.veilrules` (S21, BUG-1259),
     // kept current at each landing on the default branch; a failure here is
     // only a longer walk at the next PR request.
     if let Err(e) = crate::prs::landed(hub, project, &moved).await {
-        eprintln!("veil-server: recording the review rules of project {project}: {e:?}");
+        if !hub.landing.stopping() {
+            eprintln!("veil-server: recording the review rules of project {project}: {e:?}");
+        }
     }
     Ok(stats)
 }
@@ -405,9 +485,22 @@ async fn locked_landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> 
     let key = LOCK_BASE ^ project;
     let deadline = tokio::time::Instant::now() + LOCK_WAIT;
     let (permit, mut c) = loop {
-        hub.limits.derive_turn().await;
-        let permit = hub.derive.permit().await?;
-        let mut c = hub.derive.db.acquire().await?;
+        stopping(hub)?;
+        tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            _ = hub.limits.derive_turn() => {}
+        }
+        let permit = tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            p = hub.derive.permit() => p?,
+        };
+        let mut c = tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            c = hub.derive.db.acquire() => c?,
+        };
         let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(key).fetch_one(&mut *c).await?;
         if got {
             break (permit, c);
@@ -419,17 +512,25 @@ async fn locked_landing(hub: &Arc<Hub>, project: i64, branches: Vec<String>) -> 
                 ..Stats::default()
             });
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
     };
-    let cx = cx(hub, project);
-    let scope = Scope::Branches(branches);
-    let prep = tokio::task::spawn_blocking(move || deriving(|| prepare_landing_run(&cx, scope)))
-        .await
-        .map_err(|e| Error::Other(e.into()));
-    let r = match prep {
-        Ok(Ok(p)) => finish_landing_run(hub, project, p).await,
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(e),
+    let r = if hub.landing.stopping() {
+        Err(stopping(hub).unwrap_err())
+    } else {
+        let cx = cx(hub, project);
+        let scope = Scope::Branches(branches);
+        let prep = tokio::task::spawn_blocking(move || deriving(|| prepare_landing_run(&cx, scope)))
+            .await
+            .map_err(|e| Error::Other(e.into()));
+        match prep {
+            Ok(Ok(p)) => finish_landing_run(hub, project, p).await,
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(e),
+        }
     };
     let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)").bind(key).fetch_one(&mut *c).await;
     if !matches!(unlocked, Ok(true)) {
@@ -449,6 +550,7 @@ struct PreparedLanding {
 }
 
 fn prepare_landing_run(cx: &Cx, scope: Scope) -> Result<PreparedLanding> {
+    stopping(cx.hub())?;
     let pool = cx.pool();
     let mut b = Batch::new(cx)?;
     b.prepare_lists()?;
@@ -489,10 +591,12 @@ fn prepare_landing_run(cx: &Cx, scope: Scope) -> Result<PreparedLanding> {
         }
     }
     b.stats.branches = names.clone();
+    stopping(cx.hub())?;
     // Upload derived changed-path objects before opening the transaction.
     let mut writes = std::mem::take(&mut b.writes);
     let objects = std::mem::take(&mut writes.objects);
     upload_objects(&cx.src.rt, cx.hub(), cx.project(), objects)?;
+    stopping(cx.hub())?;
     // Prepare the search index update while `b.graph.pending` holds the newly
     // derived rows, unless this run derived a large batch (such as a 60,000-file
     // initial push), which is indexed in the background without holding the
@@ -513,6 +617,7 @@ fn prepare_landing_run(cx: &Cx, scope: Scope) -> Result<PreparedLanding> {
 }
 
 async fn finish_landing_run(hub: &Arc<Hub>, project: i64, p: PreparedLanding) -> Result<Stats> {
+    stopping(hub)?;
     let view_info = viewers_of(hub, project).await?;
     let small = p.writes.history.len() <= 64 && p.writes.graph.len() <= 16;
     let memo = match (&view_info, small) {
@@ -539,6 +644,7 @@ async fn finish_landing_run(hub: &Arc<Hub>, project: i64, p: PreparedLanding) ->
         let deadline = tokio::time::Instant::now() + STATEMENT_DEADLINE;
         let mut attempt = 0u32;
         loop {
+            stopping(hub)?;
             attempt += 1;
             let res: Result<(Vec<crate::perm::Viewer>, HashSet<String>, bool)> = async {
                 let mut tx = hub.derive.db.begin().await?;
@@ -579,13 +685,20 @@ async fn finish_landing_run(hub: &Arc<Hub>, project: i64, p: PreparedLanding) ->
                     if !e.is_retryable() || tokio::time::Instant::now() >= deadline {
                         return Err(e);
                     }
-                    tokio::time::sleep(Duration::from_millis(5 << attempt.min(6))).await;
+                    tokio::select! {
+                        biased;
+                        _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+                        _ = tokio::time::sleep(Duration::from_millis(5 << attempt.min(6))) => {}
+                    }
                 }
             }
         }
     }
     cache_derive_rows(hub, project, &p.writes);
     crate::query::graph::cache_prepared_memo(hub, project, &memo, &skip_vks);
+    if hub.landing.stopping() {
+        return Ok(p.stats);
+    }
     if let Some((proj, _)) = &view_info {
         for v in memo.fallback.into_iter().chain(tx_fallback) {
             let _ = crate::query::graph::prefill(hub, proj, &v, &p.tip_oids).await;
@@ -606,7 +719,11 @@ async fn finish_landing_run(hub: &Arc<Hub>, project: i64, p: PreparedLanding) ->
 /// whose derived tip is not its target (a landing skipped, failed or cut
 /// by a restart), one project at a time, in the background (BUG-982).
 pub async fn resume(hub: Arc<Hub>, project: Option<i64>) {
-    let projects: Result<Vec<i64>> = sqlx::query_scalar(
+    let _at_work = AtWork::new(&hub);
+    if hub.landing.stopping() {
+        return;
+    }
+    let query = sqlx::query_scalar(
         "SELECT DISTINCT b.project_id FROM branches b LEFT JOIN derive_progress d \
          ON d.project_id = b.project_id AND d.index_name = $1 AND d.index_version = $2 AND d.branch = b.name \
          WHERE b.hidden_for_embargo IS NULL AND d.through_snapshot IS DISTINCT FROM b.target AND ($3::bigint IS NULL OR b.project_id = $3)",
@@ -614,18 +731,31 @@ pub async fn resume(hub: Arc<Hub>, project: Option<i64>) {
     .bind(INDEX.0)
     .bind(INDEX.1)
     .bind(project)
-    .fetch_all(&hub.db)
-    .await
-    .map_err(Error::from);
+    .fetch_all(&hub.db);
+    let projects: Result<Vec<i64>> = tokio::select! {
+        biased;
+        _ = hub.landing.wait_stop() => return,
+        r = query => r.map_err(Error::from),
+    };
     match projects {
         Ok(projects) => {
             for p in projects {
+                if hub.landing.stopping() {
+                    return;
+                }
                 if let Err(e) = landing(&hub, p, Vec::new()).await {
+                    if hub.landing.stopping() {
+                        return;
+                    }
                     eprintln!("veil-server: resuming the derived history of project {p}: {e:?}");
                 }
             }
         }
-        Err(e) => eprintln!("veil-server: finding underived branches: {e:?}"),
+        Err(e) => {
+            if !hub.landing.stopping() {
+                eprintln!("veil-server: finding underived branches: {e:?}");
+            }
+        }
     }
 }
 
@@ -685,10 +815,15 @@ pub async fn catch_up_project(hub: &Arc<Hub>, project: i64) -> Result<Stats> {
 /// lock. Runs in its own task: a caller that stops waiting (a request whose
 /// client went away) never leaves the lock held on a pooled connection.
 pub async fn catch_up(hub: &Arc<Hub>, project: i64, scope: Scope) -> Result<Stats> {
+    stopping(hub)?;
     let hub = hub.clone();
-    tokio::spawn(async move { locked(&hub, project, scope).await })
-        .await
-        .map_err(|e| Error::Other(e.into()))?
+    let at_work = AtWork::new(&hub);
+    tokio::spawn(async move {
+        let _at_work = at_work;
+        locked(&hub, project, scope).await
+    })
+    .await
+    .map_err(|e| Error::Other(e.into()))?
 }
 
 async fn locked(hub: &Arc<Hub>, project: i64, scope: Scope) -> Result<Stats> {
@@ -698,10 +833,23 @@ async fn locked(hub: &Arc<Hub>, project: i64, scope: Scope) -> Result<Stats> {
     // the lock is (BUG-911): a run waiting for another server's deriver
     // gives both back between tries.
     let (permit, mut c) = loop {
+        stopping(hub)?;
         // Derive work is shed second under load (S24): it waits a little.
-        hub.limits.derive_turn().await;
-        let permit = hub.derive.permit().await?;
-        let mut c = hub.derive.db.acquire().await?;
+        tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            _ = hub.limits.derive_turn() => {}
+        }
+        let permit = tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            p = hub.derive.permit() => p?,
+        };
+        let mut c = tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            c = hub.derive.db.acquire() => c?,
+        };
         let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(key).fetch_one(&mut *c).await?;
         if got {
             break (permit, c);
@@ -713,10 +861,21 @@ async fn locked(hub: &Arc<Hub>, project: i64, scope: Scope) -> Result<Stats> {
                 ..Stats::default()
             });
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            biased;
+            _ = hub.landing.wait_stop() => return Err(stopping(hub).unwrap_err()),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
     };
-    let cx = cx(hub, project);
-    let r = tokio::task::spawn_blocking(move || deriving(|| run(&cx, scope))).await.map_err(|e| Error::Other(e.into()));
+    let r = if hub.landing.stopping() {
+        Err(stopping(hub).unwrap_err())
+    } else {
+        let cx = cx(hub, project);
+        tokio::task::spawn_blocking(move || deriving(|| run(&cx, scope)))
+            .await
+            .map_err(|e| Error::Other(e.into()))
+            .and_then(|res| res)
+    };
     // The lock is the session's: release it, or close the connection so
     // that the lock never goes back into the pool.
     let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)").bind(key).fetch_one(&mut *c).await;
@@ -724,7 +883,7 @@ async fn locked(hub: &Arc<Hub>, project: i64, scope: Scope) -> Result<Stats> {
         let _ = sqlx::Connection::close(c.detach()).await;
     }
     drop(permit);
-    r?
+    r
 }
 
 /// The snapshot that last changed `path` along `at`'s first parents (`at`
@@ -774,7 +933,8 @@ pub struct Batch<'a> {
     /// Read ahead for the snapshots about to be derived (BUG-2361): what
     /// each changed against its first parent, and the deepest
     /// [`HISTORY_AHEAD`] stored `file_history` rows of each path they
-    /// change, as the database held them when read (forgotten at a flush).
+    /// change (updated in place when a flush commits, pruned to the next
+    /// chunk's needed paths: BUG-1068).
     ahead_trees: HashMap<ObjectId, TreeChanges>,
     ahead_history: HashMap<String, Vec<(i64, ObjectId)>>,
 }
@@ -787,6 +947,7 @@ const AHEAD: usize = 512;
 const AHEAD_THREADS: usize = 8;
 
 fn run(cx: &Cx, scope: Scope) -> Result<Stats> {
+    stopping(cx.hub())?;
     let pool = cx.pool();
     let mut b = Batch::new(cx)?;
     b.prepare_lists()?;
@@ -825,6 +986,7 @@ fn run(cx: &Cx, scope: Scope) -> Result<Stats> {
             through.push(tip.hex());
         }
     }
+    stopping(cx.hub())?;
     b.flush_with_progress(Some((&names, &through)))?;
     b.stats.branches = names;
     Ok(b.stats)
@@ -878,6 +1040,7 @@ impl<'a> Batch<'a> {
         let missing_set: HashSet<&str> = missing.iter().map(String::as_str).collect();
         let mut after = String::new();
         loop {
+            stopping(cx.hub())?;
             type Row = (String, i64, String, String);
             let page: Vec<Row> = cx.db(|| {
                 sqlx::query_as(
@@ -960,9 +1123,18 @@ impl<'a> Batch<'a> {
         let order = self.underived(roots)?;
         let mut at = 0;
         while at < order.len() {
+            stopping(self.cx.hub())?;
             let chunk = &order[at..order.len().min(at + AHEAD)];
             let n = self.read_ahead(chunk)?;
             for x in &chunk[..n] {
+                stopping(self.cx.hub())?;
+                if !self.writes.graph.is_empty() {
+                    if let Some((ch, _)) = self.ahead_trees.get(x) {
+                        if self.writes.history.len() + self.writes.rules.len() + ch.len() > MAX_QUEUED_ROWS {
+                            self.flush()?;
+                        }
+                    }
+                }
                 self.derive_one(*x)?;
                 if self.writes.full() {
                     self.flush()?;
@@ -1070,12 +1242,13 @@ impl<'a> Batch<'a> {
 
     /// Read ahead for `chunk` (about to be derived in this order): what each
     /// changed, on [`AHEAD_THREADS`] threads (each read is an object read,
-    /// some from disk), and the stored history of every path they change,
-    /// in one statement per [`ROWS_PER_STATEMENT`] paths instead of one
-    /// for each snapshot (BUG-2361). It reads the first snapshots of
-    /// `chunk` until they changed [`MAX_QUEUED_ROWS`] paths (BUG-2380: what
-    /// 512 snapshots changed is unbounded, as a batch's rows were before
-    /// BUG-867's fix): how many it read, at least one.
+    /// some from disk), and the stored history of every path changed by
+    /// snapshots within [`changes::MAX_PATHS`], in one statement per
+    /// [`HISTORY_KEYS_PER_STATEMENT`] paths instead of one for each snapshot
+    /// (BUG-2361, BUG-1068). It reads the first snapshots of `chunk` until
+    /// they changed [`MAX_QUEUED_ROWS`] paths (BUG-2380: what 512 snapshots
+    /// changed is unbounded, as a batch's rows were before BUG-867's fix):
+    /// how many it read, at least one.
     fn read_ahead(&mut self, chunk: &[ObjectId]) -> Result<usize> {
         let src = &self.cx.src;
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1106,18 +1279,22 @@ impl<'a> Batch<'a> {
         for r in read {
             self.ahead_trees.extend(r?);
         }
-        let mut keys: Vec<String> = self
+        // Only snapshots within `MAX_PATHS` ask `last_changes` for their paths
+        // (`many` snapshots write no changed-paths object: BUG-1068). Retain
+        // any cached history still needed by this chunk and drop the rest so
+        // memory stays bounded.
+        let needed: HashSet<String> = self
             .ahead_trees
             .values()
+            .filter(|(ch, dirs)| ch.len() + dirs.len() <= changes::MAX_PATHS)
             .flat_map(|(ch, _)| ch.iter().map(|c| changes::path_key(&c.path)))
-            .filter(|k| !self.ahead_history.contains_key(k))
-            .collect::<HashSet<_>>()
-            .into_iter()
             .collect();
+        self.ahead_history.retain(|k, _| needed.contains(k));
+        let mut keys: Vec<String> = needed.into_iter().filter(|k| !self.ahead_history.contains_key(k)).collect();
         keys.sort();
         let pool = self.cx.pool();
         let project = self.cx.project();
-        for keys in keys.chunks(ROWS_PER_STATEMENT) {
+        for keys in keys.chunks(HISTORY_KEYS_PER_STATEMENT) {
             let rows: Vec<(i64, i64, String)> = self.cx.db(|| {
                 sqlx::query_as(
                     "SELECT k.n, f.depth, f.snapshot FROM UNNEST($2::text[]) WITH ORDINALITY AS k(path_key, n) \
@@ -1136,11 +1313,15 @@ impl<'a> Batch<'a> {
                 let snap = ObjectId::from_hex(&snap).map_err(bad)?;
                 self.ahead_history.get_mut(&keys[n as usize - 1]).expect("every key").push((d, snap));
             }
-        }
-        // The statement's order (`depth DESC, snapshot DESC`), whatever
-        // order the join returned them in.
-        for rows in self.ahead_history.values_mut() {
-            rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.hex().cmp(&a.1.hex())));
+            // The statement's order (`depth DESC, snapshot DESC`), whatever
+            // order the join returned them in. `ObjectId`'s byte order matches
+            // its lowercase hex order.
+            for k in keys {
+                self.ahead_history
+                    .get_mut(k)
+                    .expect("every key")
+                    .sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+            }
         }
         Ok(next.into_inner().min(chunk.len()))
     }
@@ -1271,9 +1452,9 @@ impl<'a> Batch<'a> {
         if ask.is_empty() {
             return Ok(out);
         }
-        // One query per [`ROWS_PER_STATEMENT`] paths: the deepest few rows of
-        // each. (One query for all of a snapshot's 100,000 paths ran past
-        // the statement timeout on a busy YugabyteDB: BUG-912.)
+        // One query per [`HISTORY_KEYS_PER_STATEMENT`] paths: the deepest few
+        // rows of each. (One query for all of a snapshot's 100,000 paths ran
+        // past the statement timeout on a busy YugabyteDB: BUG-912, BUG-1068.)
         const FIRST: usize = 8;
         const NEXT: i64 = 64;
         let keys: Vec<String> = ask.iter().map(|&i| changes::path_key(&wants[i].0)).collect();
@@ -1281,7 +1462,7 @@ impl<'a> Batch<'a> {
         let pool = self.cx.pool();
         let project = self.cx.project();
         let mut found: HashMap<usize, Vec<(i64, String)>> = HashMap::new();
-        for (part, (keys, maxd)) in keys.chunks(ROWS_PER_STATEMENT).zip(maxd.chunks(ROWS_PER_STATEMENT)).enumerate() {
+        for (part, (keys, maxd)) in keys.chunks(HISTORY_KEYS_PER_STATEMENT).zip(maxd.chunks(HISTORY_KEYS_PER_STATEMENT)).enumerate() {
             let rows: Vec<(i64, i64, String)> = self.cx.db(|| {
                 sqlx::query_as(
                     "SELECT k.n, f.depth, f.snapshot FROM UNNEST($2::text[], $3::bigint[]) WITH ORDINALITY AS k(path_key, maxd, n) \
@@ -1295,7 +1476,7 @@ impl<'a> Batch<'a> {
                 .fetch_all(pool)
             })?;
             for (n, d, s) in rows {
-                found.entry(part * ROWS_PER_STATEMENT + n as usize - 1).or_default().push((d, s));
+                found.entry(part * HISTORY_KEYS_PER_STATEMENT + n as usize - 1).or_default().push((d, s));
             }
         }
         for (j, &i) in ask.iter().enumerate() {
@@ -1362,11 +1543,22 @@ impl<'a> Batch<'a> {
             })?;
         }
         cache_derive_rows(cx.hub(), project, &w);
-        // Written rows are read from the cache or the database from now on;
-        // the history read ahead is no longer all the database holds.
+        // Written rows are read from the cache or the database from now on.
+        // Only this deriver (holding the project's lock) writes `file_history`,
+        // so merging what was just committed into the already-cached entries
+        // keeps their exact top `HISTORY_AHEAD` stored rows without re-querying
+        // the database on every flush (BUG-1068). Keys not already cached stay
+        // absent because earlier stored rows for them are unknown.
         self.graph.pending.clear();
-        self.history.clear();
-        self.ahead_history.clear();
+        let written_history = std::mem::take(&mut self.history);
+        for (key, added) in written_history {
+            if let Some(rows) = self.ahead_history.get_mut(&key) {
+                rows.extend(added);
+                rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+                rows.dedup();
+                rows.truncate(HISTORY_AHEAD);
+            }
+        }
         Ok(())
     }
 }

@@ -10,6 +10,7 @@
 | [`phase-3-server-history.md`](phase-3-server-history.md) | Derived data per change, the query API (log, blame, diff, files, grep, search) projected per viewer | history, blame and search through the API in milliseconds to low hundreds of ms; answers identical to those on a project built from the viewer's view |
 | [`storage-and-cost.md`](storage-and-cost.md) | Cost and speed across phases: one database commit per push, request caches, tips without a hot row, compressed objects, packs per push and their merging, cost gates in every benchmark | at most 2 storage writes and 1 database commit per push; 5 or fewer statements per warm pull; server under 1 GB on the 1 GB profile |
 | [`phase-4-agent-scale.md`](phase-4-agent-scale.md) | Batched server-side landing, conflicts back to agents, protected `main`, land first and test after, bisect and revert, PRs and review, embargo release, CI, rate limits, metrics, the web client | 1,000 landings/s into one `main` with 10,000 agents, p99 under 1 s; PR open or update under 100 ms |
+| [`purge.md`](purge.md) | **Design, not built:** an offline, operator-run purge that removes a named file's content from everything the server holds (both object layouts, the code search index, regional caches), leaves a tombstone so reads answer `purged`, and records who, what and when. Storage is otherwise append-only in v1 | none: building it is the owner's decision |
 
 ## The owner's numbers, phase by phase
 
@@ -40,7 +41,7 @@ S1 is built. **S2** (secrets at scale: keys per access rule, background wrapping
 | S11 | 2 | Agent sessions and attribution; attempts (recorded dead ends) on change records | S10, S8 |
 | S27 | 2 | Compressed objects (zstd) in storage and transport (`storage-and-cost.md` §6). **Built** (`HUB.md` §13.15) | S1 |
 | S28 | 2 | Packs: one storage write per push for small objects, index, range reads (`storage-and-cost.md` §7). **Built** (`HUB.md` §13.20), with staged uploads (BUG-930) and checks several at once (BUG-865) | S5, S27 |
-| S29 | 2 | Merging packs and pack garbage collection (`storage-and-cost.md` §8) | S28 |
+| S29 | 2 | Merging packs and pack garbage collection (`storage-and-cost.md` §8). **Built** (`HUB.md` §13.37); **collection is not run in v1**: storage is append-only, with no garbage collection (owner, 2026-11-18) | S28 |
 | G2 | 2 | Phase 2 gate run: **run on 2026-11-12** (`22b9d837`), with misses (below) | S3–S11, S27–S29 |
 | S12 | 3 | Derived-data framework, commit graph, changed paths, per-rule lists, eager projection memos at each branch move | S1 |
 | S13 | 3 | Query API with per-viewer projection, and the projection-equivalence harness. **Built** (phase 3 §11) | S12 |

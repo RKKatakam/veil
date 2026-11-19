@@ -104,6 +104,48 @@ pub fn new_name() -> String {
     hex::encode(veil_core::crypto::random_bytes::<16>())
 }
 
+/// A fresh authenticated staged upload pack name for `(project, person)`
+/// (`BUG-2851`): 64 random nonce bits followed by a 64-bit keyed BLAKE3 tag
+/// bound to `(project, person, nonce)` under `key`, encoded as 32 lowercase
+/// hex characters (the same wire shape as [`new_name`]).
+pub fn new_staged_name(key: &[u8; 32], project: i64, person: i64) -> String {
+    let nonce = veil_core::crypto::random_bytes::<8>();
+    let tag = staged_name_tag(key, project, person, &nonce);
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&nonce);
+    out[8..].copy_from_slice(&tag);
+    hex::encode(out)
+}
+
+fn staged_name_tag(key: &[u8; 32], project: i64, person: i64, nonce: &[u8; 8]) -> [u8; 8] {
+    let mut h = blake3::Hasher::new_keyed(key);
+    h.update(&project.to_le_bytes());
+    h.update(&person.to_le_bytes());
+    h.update(b"staged pack");
+    h.update(nonce);
+    let mut tag = [0u8; 8];
+    tag.copy_from_slice(&h.finalize().as_bytes()[..8]);
+    tag
+}
+
+/// Is `name` an authenticated staged pack name issued by this cluster for
+/// `(project, person)`? Compared in constant time.
+pub fn verify_staged_name(key: &[u8; 32], project: i64, person: i64, name: &str) -> bool {
+    if !valid_name(name) {
+        return false;
+    }
+    let Ok(raw) = hex::decode(name) else {
+        return false;
+    };
+    if raw.len() != 16 {
+        return false;
+    }
+    let mut nonce = [0u8; 8];
+    nonce.copy_from_slice(&raw[..8]);
+    let expected = staged_name_tag(key, project, person, &nonce);
+    raw[8..].iter().zip(&expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
 /// Is `s` a pack name ([`new_name`]'s form)?
 pub fn valid_name(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -584,22 +626,6 @@ impl Held {
 /// index bytes, the parsed index and the parse's working copy of the slots;
 /// kept, once parsed, for the index alone.
 pub async fn read_index(store: &dyn BlobStore, key: &str, bound: &Bound) -> Result<Option<Held>> {
-    Ok(read(store, key, bound, false).await?.map(|(held, _)| held))
-}
-
-/// [`read_index`] of a pack whole in the first read (at most
-/// [`FIRST_READ`] long), with the pack's bytes: one request for both (a
-/// merge copies the entries from them, BUG-2462). The bytes are not part
-/// of the share. `None` if it is not stored.
-pub async fn read_whole(store: &dyn BlobStore, key: &str, bound: &Bound) -> Result<Option<(Held, Bytes)>> {
-    match read(store, key, bound, true).await? {
-        Some((held, Some(bytes))) => Ok(Some((held, bytes))),
-        Some((_, None)) => bail!("pack {key} is longer than one read"),
-        None => Ok(None),
-    }
-}
-
-async fn read(store: &dyn BlobStore, key: &str, bound: &Bound, whole_bytes: bool) -> Result<Option<(Held, Option<Bytes>)>> {
     let project = project_of_key(key);
     let first_share = bound.take_for(project, FIRST_READ.min(bound.most as u64)).await?;
     let Some((first, size)) = store.get_range(key, 0, FIRST_READ - 1).await? else { return Ok(None) };
@@ -622,8 +648,7 @@ async fn read(store: &dyn BlobStore, key: &str, bound: &Bound, whole_bytes: bool
         },
     };
     let index = parse_index(&first, Some(size)).with_context(|| format!("reading pack {key}"))?;
-    let bytes = (whole_bytes && first.len() as u64 == size).then_some(first);
-    Ok(Some((Held::new(Arc::new(index), size, share), bytes)))
+    Ok(Some(Held::new(Arc::new(index), size, share)))
 }
 
 /// The lookup structures' own memory: a project's entry, and each listed
@@ -757,6 +782,7 @@ pub struct Packs {
     /// holding its share of `bound`; `None` once discarded here.
     staged: LruCache<Option<Arc<Held>>>,
     recent: LruCache<Recent>,
+    recent_lock: Mutex<()>,
 }
 
 fn name_key(project: i64, name: &str) -> ObjectId {
@@ -784,6 +810,65 @@ pub struct StagedSlots {
     pub slots: Vec<(ObjectId, Slot)>,
 }
 
+/// Classification of receipted upload containers (`BUG-2661`).
+pub struct ReceiptPacks {
+    /// Containers still `STAGED` or `LISTED`; any container absent from both
+    /// `usable` and `vanished` was discarded by an earlier check refusal
+    /// (`BUG-930`, `BUG-1155`).
+    pub usable: HashSet<Arc<str>>,
+    /// Containers consumed by a committing request or swept (`objects < 0` or
+    /// row deleted, not refused by checks), whose objects answer `409 Conflict`
+    /// when read (`BUG-2661`).
+    pub vanished: HashSet<Arc<str>>,
+}
+
+/// Classification of pack names supplied in `PushRequest::packs` (BUG-1150,
+/// BUG-2851). Staged pack names carry a keyed BLAKE3 tag bound to
+/// `(project, person)` ([`new_staged_name`]): a missing `packs` row whose
+/// signed name verifies for `(project, person)` under `receipt_key` was
+/// already consumed and purged in `objects` layout (or swept) and goes into
+/// `consumed` (`409 Conflict`, keeping sibling uploads); every other missing
+/// name (forged name, another person's pack, another project's pack) goes into
+/// `invalid` together with packs discarded by an earlier check refusal
+/// (`state = DISCARDED`, `objects >= 0`) so all of them receive the exact same
+/// `400 bad_request` answer (zero oracle).
+pub struct PackCheck {
+    /// Packs `person` staged in `project` that are still `STAGED` or `LISTED`.
+    pub usable: HashSet<Arc<str>>,
+    /// Packs `person` staged in `project` that a committing request already
+    /// consumed (`state = DISCARDED`, `objects < 0`, `BUG-2661`, or a missing
+    /// row whose signed name verifies for `(project, person)`, `BUG-2851`):
+    /// answer `409 Conflict` without discarding sibling packs.
+    pub consumed: HashSet<Arc<str>>,
+    /// Packs not owned by `person` in `project`, never staged, or discarded
+    /// by an earlier check refusal (`state = DISCARDED`, `objects >= 0`,
+    /// `BUG-930`, `BUG-1155`): answer `400 bad_request` and never touch them.
+    pub invalid: HashSet<Arc<str>>,
+}
+
+/// Result of looking up one object across a push's named staged packs
+/// (`PushRequest::packs`, `BUG-2870`).
+pub enum StagedLookup {
+    /// Found in staged pack `name` at `slot`.
+    Found(Arc<str>, Slot),
+    /// Not in any of the named packs (all named packs still exist).
+    NotFound,
+    /// Not found in any live pack, and at least one named pack is gone
+    /// (tombstoned in `self.staged` or missing from `store`).
+    PackGone,
+}
+
+/// Result of checking only this server's `Packs::staged` cache for one object
+/// across `PushRequest::packs` (`BUG-2870`).
+pub enum CachedStagedLookup<'a> {
+    /// Resolved purely from `self.staged` without touching `store` or `bound`.
+    Done(StagedLookup),
+    /// Not found in cached packs; `uncached` packs must be bisected via
+    /// [`Packs::find_staged_slot_uncached`]. `gone` records whether any cached
+    /// pack was already tombstoned.
+    Miss { uncached: Vec<&'a Arc<str>>, gone: bool },
+}
+
 impl Packs {
     pub fn new(db: Option<sqlx::PgPool>) -> Packs {
         Packs {
@@ -797,6 +882,7 @@ impl Packs {
             bound: Bound { most: INDEXES_HELD - STAGED_INDEXES, ..Bound::new(INDEXES_HELD) },
             staged: LruCache::new(STAGED_INDEXES),
             recent: LruCache::new(RECENT_BUDGET),
+            recent_lock: Mutex::new(()),
         }
     }
 
@@ -1098,20 +1184,19 @@ impl Packs {
             return Ok(());
         };
         // `state = 1` (LISTED) written literally, so the partial index
-        // `packs_listed` (migration 41) serves it under a generic plan too:
-        // the rows of packs merges replaced are not read (BUG-2462).
+        // `packs_listed` (migration 41) serves it under a generic plan too.
         const _: () = assert!(LISTED == 1);
-        let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = 1 ORDER BY created_at, name")
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM packs WHERE project_id = $1 AND state = 1 ORDER BY created_at, name")
             .bind(project)
             .fetch_all(db)
             .await?;
         {
             let mut m = p.map.write().unwrap();
-            let current: HashSet<Arc<str>> = rows.iter().map(|n| Arc::<str>::from(n.as_str())).collect();
+            let current: HashSet<Arc<str>> = names.iter().map(|n| Arc::<str>::from(n.as_str())).collect();
             m.names.retain(|n| current.contains(n));
             m.retain(|l| current.contains(&l.name));
         }
-        self.load_listed(p, store, project, rows, reads).await?;
+        self.load_listed(p, store, project, names, reads).await?;
         *last = Some(began);
         Ok(())
     }
@@ -1202,7 +1287,7 @@ impl Packs {
 
     /// Remember the index of a pack staged here, by `person`, with its
     /// share of the bound (given back when the cache drops it, or now if
-    /// the cache does not keep it).
+    /// the cache does not keep it), and list it in `recent` for `person`.
     pub fn staged_here(&self, project: i64, person: i64, name: &Arc<str>, mut held: Held) {
         held.unproject();
         let w = held.index.weight();
@@ -1210,6 +1295,58 @@ impl Packs {
         let k = person_key(project, person);
         let mut q = self.recent.get(&k).unwrap_or_default();
         q.push_front(name.clone());
+        q.truncate(RECENT_UPLOADS);
+        let w = 96 + q.len() * 48;
+        self.recent.insert(k, q, w);
+    }
+
+    /// Cache the index of a newly staged upload container without adding it to
+    /// `recent` yet (`objects` layout: added to `recent` only if the request
+    /// ends without discarding the container, `BUG-2661`).
+    pub fn staged_index_here(&self, project: i64, name: &Arc<str>, mut held: Held) {
+        held.unproject();
+        let w = held.index.weight();
+        self.staged.insert(name_key(project, name), Some(Arc::new(held)), w);
+    }
+
+    /// Whether `name` was marked discarded in this server's staged-index cache.
+    pub fn is_discarded_here(&self, project: i64, name: &str) -> bool {
+        matches!(self.staged.get(&name_key(project, name)), Some(None))
+    }
+
+    /// Remove `names` from `person`'s `recent` upload list so no concurrent
+    /// upload is handed an in-flight container (`BUG-2661`).
+    pub fn claim_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {
+        if names.is_empty() {
+            return;
+        }
+        let _g = self.recent_lock.lock().unwrap();
+        let k = person_key(project, person);
+        let Some(mut q) = self.recent.get(&k) else { return };
+        let before = q.len();
+        q.retain(|n| !names.iter().any(|m| m == n));
+        if q.len() != before {
+            let w = 96 + q.len() * 48;
+            self.recent.insert(k, q, w);
+        }
+    }
+
+    /// Return `names` (those not discarded here) to `person`'s `recent` upload
+    /// list when a request ends without discarding them (`BUG-1157`, `BUG-2661`).
+    pub fn release_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {
+        if names.is_empty() {
+            return;
+        }
+        let _g = self.recent_lock.lock().unwrap();
+        let k = person_key(project, person);
+        let mut q = self.recent.get(&k).unwrap_or_default();
+        for name in names {
+            if self.is_discarded_here(project, name) {
+                continue;
+            }
+            q.retain(|n| n != name);
+            q.push_front(name.clone());
+        }
         q.truncate(RECENT_UPLOADS);
         let w = 96 + q.len() * 48;
         self.recent.insert(k, q, w);
@@ -1223,19 +1360,39 @@ impl Packs {
 
     /// A pack `person` staged here recently that holds every one of `ids`
     /// and is still staged or listed (asked of the database): an upload of
-    /// those objects again gets its receipts instead of a new pack.
+    /// those objects again gets its receipts instead of a new pack. A candidate
+    /// is atomically removed from `recent` before `usable` is awaited so no
+    /// concurrent upload can be handed the same container (`BUG-2661`).
     pub async fn staged_holding(&self, project: i64, person: i64, ids: &[ObjectId]) -> Result<Option<Arc<str>>> {
-        let names: Vec<Arc<str>> = self.recent.get(&person_key(project, person)).map(|q| q.into_iter().collect()).unwrap_or_default();
-        for name in names {
-            let Some(Some(held)) = self.staged.get(&name_key(project, &name)) else { continue };
-            if !ids.iter().all(|id| held.index.get(id).is_some()) {
-                continue;
-            }
+        let k = person_key(project, person);
+        loop {
+            let candidate = {
+                let _g = self.recent_lock.lock().unwrap();
+                let Some(mut q) = self.recent.get(&k) else { return Ok(None) };
+                let mut picked = None;
+                let mut idx = 0;
+                while idx < q.len() {
+                    let matches = match self.staged.get(&name_key(project, &q[idx])) {
+                        Some(Some(held)) => ids.iter().all(|id| held.index.get(id).is_some()),
+                        _ => false,
+                    };
+                    if matches {
+                        picked = q.remove(idx);
+                        break;
+                    }
+                    idx += 1;
+                }
+                if picked.is_some() {
+                    let w = 96 + q.len() * 48;
+                    self.recent.insert(k, q, w);
+                }
+                picked
+            };
+            let Some(name) = candidate else { return Ok(None) };
             if self.usable(project, person, std::slice::from_ref(&name)).await?.contains(&name) {
                 return Ok(Some(name));
             }
         }
-        Ok(None)
     }
 
     /// Of packs `names`, those `person` uploaded that are staged or listed
@@ -1260,9 +1417,121 @@ impl Packs {
         Ok(names.iter().filter(|n| rows.contains(&***n)).cloned().collect())
     }
 
+    /// Classify `names` (all verified by `sync::receipted` as issued to `person`
+    /// in `project`): containers still `STAGED` or `LISTED` go into `usable`;
+    /// containers discarded by an earlier check refusal (`state = DISCARDED`
+    /// with `objects >= 0`, `BUG-930` / `BUG-1155`) are omitted from both sets
+    /// so checks answer `400`; containers consumed by a committing request or
+    /// swept (`objects < 0` or row deleted, `BUG-2661`) go into `vanished`.
+    pub async fn usable_for_receipts(&self, project: i64, person: i64, names: &[Arc<str>]) -> Result<ReceiptPacks> {
+        let Some(db) = &self.db else {
+            return Ok(ReceiptPacks {
+                usable: names.iter().cloned().collect(),
+                vanished: HashSet::new(),
+            });
+        };
+        if names.is_empty() {
+            return Ok(ReceiptPacks {
+                usable: HashSet::new(),
+                vanished: HashSet::new(),
+            });
+        }
+        let asked: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let rows: Vec<(String, i16, i64)> = sqlx::query_as(
+            "SELECT name, state, objects FROM packs WHERE project_id = $1 AND name = ANY($2) AND person_id = $3",
+        )
+        .bind(project)
+        .bind(&asked)
+        .bind(person)
+        .fetch_all(db)
+        .await?;
+        let by_name: HashMap<String, (i16, i64)> = rows.into_iter().map(|(n, s, o)| (n, (s, o))).collect();
+        let mut usable = HashSet::with_capacity(names.len());
+        let mut vanished = HashSet::new();
+        for n in names {
+            match by_name.get(&**n) {
+                Some(&(s, _)) if s == STAGED || s == LISTED => {
+                    usable.insert(n.clone());
+                }
+                Some(&(s, objs)) if s == DISCARDED && objs >= 0 => {}
+                _ => {
+                    vanished.insert(n.clone());
+                }
+            }
+        }
+        Ok(ReceiptPacks { usable, vanished })
+    }
+
+    /// Classify pack names supplied directly by `PushRequest::packs`
+    /// (`BUG-1150`, `BUG-2851`). Only packs whose `packs` row belongs to
+    /// `person` in `project` and is `STAGED` or `LISTED` are `usable`. A row
+    /// owned by `person` with `state = DISCARDED` and `objects < 0` (consumed
+    /// by a committing request, `BUG-2661`), or a missing row whose name is
+    /// authenticated for `(project, person)` under `receipt_key` (consumed and
+    /// purged in `objects` layout or swept, `BUG-2851`), goes into `consumed`.
+    /// Every other name (another person's pack, another project's pack, a
+    /// forged name, or a pack discarded by an earlier check refusal with
+    /// `objects >= 0`) goes into `invalid`.
+    pub async fn usable_for_packs(
+        &self,
+        project: i64,
+        person: i64,
+        names: &[Arc<str>],
+        receipt_key: Option<&[u8; 32]>,
+    ) -> Result<PackCheck> {
+        let Some(db) = &self.db else {
+            return Ok(PackCheck {
+                usable: names.iter().cloned().collect(),
+                consumed: HashSet::new(),
+                invalid: HashSet::new(),
+            });
+        };
+        if names.is_empty() {
+            return Ok(PackCheck {
+                usable: HashSet::new(),
+                consumed: HashSet::new(),
+                invalid: HashSet::new(),
+            });
+        }
+        let asked: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let rows: Vec<(String, i16, i64)> = sqlx::query_as(
+            "SELECT name, state, objects FROM packs WHERE project_id = $1 AND name = ANY($2) AND person_id = $3",
+        )
+        .bind(project)
+        .bind(&asked)
+        .bind(person)
+        .fetch_all(db)
+        .await?;
+        let by_name: HashMap<String, (i16, i64)> = rows.into_iter().map(|(n, s, o)| (n, (s, o))).collect();
+        let mut usable = HashSet::with_capacity(names.len());
+        let mut consumed = HashSet::new();
+        let mut invalid = HashSet::new();
+        for n in names {
+            match by_name.get(&**n) {
+                Some(&(s, _)) if s == STAGED || s == LISTED => {
+                    usable.insert(n.clone());
+                }
+                Some(&(s, objs)) if s == DISCARDED && objs < 0 => {
+                    consumed.insert(n.clone());
+                }
+                Some(&(s, objs)) if s == DISCARDED && objs >= 0 => {
+                    invalid.insert(n.clone());
+                }
+                None if receipt_key.is_some_and(|k| verify_staged_name(k, project, person, n)) => {
+                    consumed.insert(n.clone());
+                }
+                _ => {
+                    invalid.insert(n.clone());
+                }
+            }
+        }
+        Ok(PackCheck { usable, consumed, invalid })
+    }
+
     /// The index and length of staged pack `name`, with its share of the
-    /// bound: from the staged-index cache, or read under a share of its own;
-    /// `None` if it is not in the store (discarded).
+    /// bound: from the staged-index cache, or read under a project-attributed
+    /// share of its own (`BUG-2870`: never unprojected outside the bounded
+    /// `self.staged` cache); `None` if it is not in the store (discarded).
     pub async fn staged_index(&self, store: &dyn BlobStore, project: i64, name: &str) -> Result<Option<Arc<Held>>> {
         if let Some(i) = self.staged.get(&name_key(project, name)) {
             return Ok(i);
@@ -1284,6 +1553,103 @@ impl Packs {
             return Ok(Some(StagedSlots { objects: held.index.len(), size: held.size, slots }));
         }
         self.stored_slots(store, project, &key(project, name), ids, true).await
+    }
+
+    /// Like [`Packs::staged_slots`], without requiring every id in `ids` to
+    /// exist in `name` (`PushRequest::packs`, `BUG-1150`, `BUG-2852`,
+    /// `BUG-2870`). A hit in `self.staged` searches the cached index and drops
+    /// its `Arc<Held>` at once; a miss bisects the stored index under one
+    /// [`FIRST_READ`] share (dropped at once), preserving `Bound::take_for`'s
+    /// deadlock-freedom and per-project fairness.
+    pub async fn staged_slots_optional(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        name: &str,
+        ids: &[ObjectId],
+    ) -> Result<Option<StagedSlots>> {
+        if let Some(cached) = self.staged.get(&name_key(project, name)) {
+            let Some(held) = cached else { return Ok(None) };
+            let slots = ids.iter().filter_map(|id| Some((*id, held.index.get(id)?))).collect();
+            return Ok(Some(StagedSlots { objects: held.index.len(), size: held.size, slots }));
+        }
+        self.stored_slots(store, project, &key(project, name), ids, false).await
+    }
+
+    /// Synchronous fast path for [`Packs::find_staged_slot`]: search every pack
+    /// in `names` that is currently in `self.staged`, dropping each `Arc<Held>`
+    /// immediately before moving on. Never touches `store` or `bound`.
+    pub fn find_staged_slot_cached<'a>(&self, project: i64, names: &'a [Arc<str>], id: &ObjectId) -> CachedStagedLookup<'a> {
+        if names.is_empty() {
+            return CachedStagedLookup::Done(StagedLookup::NotFound);
+        }
+        let mut uncached: Vec<&'a Arc<str>> = Vec::new();
+        let mut gone = false;
+        for n in names {
+            match self.staged.get(&name_key(project, n)) {
+                Some(Some(held)) => {
+                    if let Some(slot) = held.index.get(id) {
+                        return CachedStagedLookup::Done(StagedLookup::Found(n.clone(), slot));
+                    }
+                }
+                Some(None) => {
+                    gone = true;
+                }
+                None => {
+                    uncached.push(n);
+                }
+            }
+        }
+        if uncached.is_empty() {
+            CachedStagedLookup::Done(if gone { StagedLookup::PackGone } else { StagedLookup::NotFound })
+        } else {
+            CachedStagedLookup::Miss { uncached, gone }
+        }
+    }
+
+    /// Async slow path for [`Packs::find_staged_slot`]: bisect each uncached
+    /// staged pack via `Packs::stored_slots` (`every = false`) under one
+    /// [`FIRST_READ`] share at a time (dropped at once).
+    pub async fn find_staged_slot_uncached(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        uncached: &[&Arc<str>],
+        mut gone: bool,
+        id: &ObjectId,
+    ) -> Result<StagedLookup> {
+        for n in uncached {
+            match self.stored_slots(store, project, &key(project, n), std::slice::from_ref(id), false).await? {
+                Some(ss) => {
+                    if let Some(&(_, slot)) = ss.slots.first() {
+                        return Ok(StagedLookup::Found((*n).clone(), slot));
+                    }
+                }
+                None => {
+                    gone = true;
+                }
+            }
+        }
+        Ok(if gone { StagedLookup::PackGone } else { StagedLookup::NotFound })
+    }
+
+    /// Look up `id` across `names` for `PushRequest::packs` (`BUG-2870`):
+    /// checks `self.staged` hits first (dropping each `Arc<Held>` at once),
+    /// then bisects misses via `Packs::stored_slots` under one [`FIRST_READ`]
+    /// share at a time.
+    pub async fn find_staged_slot(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        names: &[Arc<str>],
+        id: &ObjectId,
+    ) -> Result<StagedLookup> {
+        match self.find_staged_slot_cached(project, names, id) {
+            CachedStagedLookup::Done(r) => Ok(r),
+            CachedStagedLookup::Miss { uncached, gone } => {
+                self.find_staged_slot_uncached(store, project, &uncached, gone, id).await
+            }
+        }
     }
 
     /// The slots of `ids` in the index of the pack stored at `k` (a pack of
@@ -1327,9 +1693,12 @@ impl Packs {
             None => 0,
         };
         if rem_start < wanted.len() {
-            bisect_slots(store, k, hl, size, in_first, count, last_first, None, &wanted[rem_start..], every, &mut found)
+            let present = bisect_slots(store, k, hl, size, in_first, count, last_first, None, &wanted[rem_start..], every, &mut found)
                 .await
                 .with_context(|| format!("reading pack {k}"))?;
+            if !present {
+                return Ok(None);
+            }
         }
         let slots = ids.iter().filter_map(|id| Some((*id, *found.get(id)?))).collect();
         Ok(Some(StagedSlots { objects: count, size, slots }))
@@ -1339,41 +1708,133 @@ impl Packs {
     /// first (so no push can list them after), then the storage objects
     /// go, **every one tried** whatever another's delete answers (BUG-1498;
     /// the first error is returned once all were tried). A pack already
-    /// listed is left as it is. A discarded row whose pack is still stored
-    /// (a failed delete, a server stopped in between) is S29's job's to
-    /// delete (`storage-and-cost.md` §8).
+    /// listed is left as it is (BUG-2770: only packs actually transitioned
+    /// from `STAGED` to `DISCARDED` are tombstoned in `self.staged`). A
+    /// discarded row whose pack is still stored (a failed delete, a server
+    /// stopped in between) is S29's job's to delete (`storage-and-cost.md` §8).
     pub async fn discard(&self, store: &dyn BlobStore, project: i64, names: &[Arc<str>]) -> Result<()> {
+        self.discard_counted(store, project, names, &AtomicU64::new(0)).await
+    }
+
+    pub async fn discard_counted(&self, store: &dyn BlobStore, project: i64, names: &[Arc<str>], deletes: &AtomicU64) -> Result<()> {
+        self.discard_with(store, project, names, (false, false), (deletes, &AtomicU64::new(0)))
+            .await
+    }
+
+    pub async fn discard_with(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        names: &[Arc<str>],
+        (mark_consumed, purge_row): (bool, bool),
+        (deletes, pack_rows): (&AtomicU64, &AtomicU64),
+    ) -> Result<()> {
         if names.is_empty() {
             return Ok(());
-        }
-        for n in names {
-            self.staged.insert(name_key(project, n), None, 64);
         }
         let gone: Vec<String> = match &self.db {
             Some(db) => {
                 let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
                 sqlx::query_scalar(
-                    "UPDATE packs SET state = $3, discarded_at = $5 WHERE project_id = $1 AND name = ANY($2) AND state = $4 RETURNING name",
+                    "UPDATE packs \
+                       SET state = $3, \
+                           discarded_at = $5, \
+                           objects = CASE WHEN $6 THEN -1 ELSE objects END \
+                     WHERE project_id = $1 AND name = ANY($2) AND state = $4 \
+                     RETURNING name",
                 )
                 .bind(project)
                 .bind(&names)
                 .bind(DISCARDED)
                 .bind(STAGED)
                 .bind(veil_core::now_millis())
+                .bind(mark_consumed)
                 .fetch_all(db)
                 .await?
             }
             None => names.iter().map(|n| n.to_string()).collect(),
         };
+        for n in &gone {
+            self.staged.insert(name_key(project, n), None, 64);
+        }
+        let mut deleted = Vec::with_capacity(gone.len());
         let (mut first, mut failed) = (None, 0);
         for n in &gone {
-            if let Err(e) = store.delete(&key(project, n)).await {
-                failed += 1;
-                first.get_or_insert(e);
+            deletes.fetch_add(1, Ordering::Relaxed);
+            match store.delete(&key(project, n)).await {
+                Ok(()) => deleted.push(n.clone()),
+                Err(e) => {
+                    failed += 1;
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        if purge_row {
+            if let (Some(db), false) = (&self.db, deleted.is_empty()) {
+                let r = sqlx::query("DELETE FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3")
+                    .bind(project)
+                    .bind(&deleted)
+                    .bind(DISCARDED)
+                    .execute(db)
+                    .await?;
+                if r.rows_affected() > 0 {
+                    pack_rows.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         match first {
             Some(e) => Err(e.context(format!("{failed} of {} discarded packs of project {project} are still stored", gone.len()))),
+            None => Ok(()),
+        }
+    }
+
+    /// Delete containers `names` (already marked `DISCARDED` in a push's
+    /// transaction) from storage, then delete the `packs` rows of those whose
+    /// storage delete succeeded (`object-layout.md` §3). Any container whose
+    /// storage delete fails keeps its `DISCARDED` row for
+    /// `pack_gc::sweep_discarded`.
+    pub async fn purge_discarded(
+        &self,
+        store: &dyn BlobStore,
+        project: i64,
+        names: &[String],
+        deletes: &AtomicU64,
+        pack_rows: &AtomicU64,
+    ) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        for n in names {
+            self.staged.insert(name_key(project, n), None, 64);
+        }
+        let mut deleted = Vec::with_capacity(names.len());
+        let (mut first, mut failed) = (None, 0);
+        for n in names {
+            deletes.fetch_add(1, Ordering::Relaxed);
+            match store.delete(&key(project, n)).await {
+                Ok(()) => deleted.push(n.clone()),
+                Err(e) => {
+                    failed += 1;
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        if let (Some(db), false) = (&self.db, deleted.is_empty()) {
+            let r = sqlx::query("DELETE FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3")
+                .bind(project)
+                .bind(&deleted)
+                .bind(DISCARDED)
+                .execute(db)
+                .await?;
+            if r.rows_affected() > 0 {
+                pack_rows.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        match first {
+            Some(e) => Err(e.context(format!(
+                "{failed} of {} discarded containers of project {project} are still stored",
+                names.len()
+            ))),
             None => Ok(()),
         }
     }
@@ -1418,7 +1879,9 @@ type BisectStep<'a> = (usize, usize, Option<ObjectId>, Option<ObjectId>, &'a [Ob
 /// Find `wanted` (sorted, deduplicated) in entries `lo..hi` of a pack index in
 /// `store` by bisecting with ranged reads of at most [`WINDOW_ENTRIES`]
 /// entries (within one [`FIRST_READ`] buffer). With `every`, each of them
-/// must be there.
+/// must be there. Returns `Ok(false)` if the pack vanished from `store` during
+/// bisection (e.g. swept after its grace period, BUG-2771) so callers treat it
+/// as absent rather than an internal error.
 #[allow(clippy::too_many_arguments)]
 async fn bisect_slots(
     store: &dyn BlobStore,
@@ -1432,7 +1895,7 @@ async fn bisect_slots(
     wanted: &[ObjectId],
     every: bool,
     found: &mut HashMap<ObjectId, Slot>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut work: Vec<BisectStep<'_>> = vec![(lo, hi, prev_before_lo, next_after_hi, wanted)];
     while let Some((lo, hi, prev_lo, next_hi, sub)) = work.pop() {
         if lo >= hi || sub.is_empty() {
@@ -1450,7 +1913,9 @@ async fn bisect_slots(
         let start = HEAD as u64 + (w_lo * ENTRY) as u64;
         let want_bytes = (w_hi - w_lo) * ENTRY;
         let end = start + want_bytes as u64 - 1;
-        let (bytes, total) = store.get_range(key, start, end).await?.context("pack vanished while bisecting its index")?;
+        let Some((bytes, total)) = store.get_range(key, start, end).await? else {
+            return Ok(false);
+        };
         ensure!(total == size && bytes.len() == want_bytes, "pack index truncated at {start}..={end}");
         let first_id = ObjectId(bytes[..32].try_into().unwrap());
         if let Some(p) = prev_lo {
@@ -1489,7 +1954,7 @@ async fn bisect_slots(
     // found is an index that is not what it says (BUG-1499). A lookup in a
     // listed pack asks whether it holds them.
     ensure!(!every || wanted.iter().all(|id| found.contains_key(id)), "a pack's index is not sorted");
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -2472,7 +2937,6 @@ mod tests {
     #[tokio::test]
     async fn bug_1499_staged_slots_refuses_unsorted_duplicated_and_untiled_indexes_like_a_full_read() {
         let dir = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
         let store = crate::store::FsStore::new(dir.path());
         let packs = Packs::new(None);
 
@@ -2509,48 +2973,11 @@ mod tests {
         store.put(&key(1, "unsorted"), damaged.clone()).await.unwrap();
         let missing_wanted_res = packs.staged_slots(&store, 1, "unsorted", &[sorted_ids[1600]]).await;
 
-        // Case 3: When a push touches every object of an uncached staged pack, `sync::packs_to_list` runs `parse_index` on it before listing it as-is.
-        let objects = Arc::new(crate::store::Objects::new(Arc::new(crate::store::FsStore::new(dir.path())), 1 << 20));
-        let db = crate::db::connect_lazy("postgres://veil@127.0.0.1:9/none", 1).unwrap();
-        let hub = Arc::new(crate::Hub {
-            db: db.clone(),
-            objects,
-            trees: LruCache::new(1 << 20),
-            identity: veil_core::Identity::generate("hub"),
-            receipt_key: [0; 32],
-            grants: crate::grant::Grants::load(data.path()).unwrap(),
-            cache_token: crate::cache::feed::load_token(data.path()).unwrap(),
-            session_ttl_ms: 0,
-            certificate: rustls::pki_types::CertificateDer::from(Vec::new()),
-            caches: Default::default(),
-            derive: crate::derive::Workers::new(db),
-            query: Default::default(),
-            landing: Default::default(),
-            events: Default::default(),
-            embargo: Default::default(),
-            pack_gc: Default::default(),
-            limits: crate::limits::Limits::new(Default::default(), 1),
-            commits: Default::default(),
-        });
-        let all_slots: Vec<(ObjectId, Slot)> = sorted_ids.iter().map(|id| (*id, valid_idx.get(id).unwrap())).collect();
-        let touched: HashSet<ObjectId> = sorted_ids.iter().copied().collect();
-        let st_valid = crate::sync::Staged::from_packs(
-            vec![(Arc::from("valid"), StagedSlots { objects: valid_items.len(), size: valid_bytes.len() as u64, slots: all_slots.clone() })],
-            HashMap::new(),
-        );
-        let listed_ok = crate::sync::packs_to_list(&hub, 1, 7, &st_valid, &touched, &[], &Mutex::new(Default::default())).await;
-        assert_eq!(listed_ok.expect("valid uncached staged pack lists as-is").len(), 1);
-        let st_unsorted = crate::sync::Staged::from_packs(
-            vec![(Arc::from("unsorted"), StagedSlots { objects: valid_items.len(), size: damaged.len() as u64, slots: all_slots })],
-            HashMap::new(),
-        );
-        let unsorted_res = crate::sync::packs_to_list(&hub, 1, 7, &st_unsorted, &touched, &[], &Mutex::new(Default::default())).await;
         assert!(
-            untiled_res.is_err() && missing_wanted_res.is_err() && unsorted_res.is_err(),
-            "staged_slots / packs_to_list must refuse untiled and unsorted indexes as a full read would, but returned untiled={:?}, missing_wanted={:?}, unsorted_list={:?}",
+            untiled_res.is_err() && missing_wanted_res.is_err(),
+            "staged_slots must refuse untiled and unsorted indexes as a full read would, but returned untiled={:?}, missing_wanted={:?}",
             untiled_res.map(|o| o.map(|s| s.slots.len())),
             missing_wanted_res.map(|o| o.map(|s| s.slots.len())),
-            unsorted_res.map(|v| v.len()),
         );
     }
 
@@ -2699,77 +3126,205 @@ mod tests {
         drop((f1, f2));
         let _ = p4_waiter.await;
 
-        // Route 2: Splitting a push's own pack of `MAX_OBJECTS + 50,000` small objects in `sync::packs_to_list`.
-        let dir = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let objects = Arc::new(crate::store::Objects::new(Arc::new(crate::store::FsStore::new(dir.path())), 1 << 20));
-        let db = crate::db::connect_lazy("postgres://veil@127.0.0.1:9/none", 1).unwrap();
-        let hub = Arc::new(crate::Hub {
-            db: db.clone(),
-            objects: objects.clone(),
-            trees: LruCache::new(1 << 20),
-            identity: veil_core::Identity::generate("hub"),
-            receipt_key: [0; 32],
-            grants: crate::grant::Grants::load(data.path()).unwrap(),
-            cache_token: crate::cache::feed::load_token(data.path()).unwrap(),
-            session_ttl_ms: 0,
-            certificate: rustls::pki_types::CertificateDer::from(Vec::new()),
-            caches: Default::default(),
-            derive: crate::derive::Workers::new(db),
-            query: Default::default(),
-            landing: Default::default(),
-            events: Default::default(),
-            embargo: Default::default(),
-            pack_gc: Default::default(),
-            limits: crate::limits::Limits::new(Default::default(), 1),
-            commits: Default::default(),
-        });
-        let total_objs = MAX_OBJECTS + 50_000;
-        let mut made_map = HashMap::with_capacity(total_objs);
-        let mut made_ids = Vec::with_capacity(total_objs);
-        for i in 0..total_objs {
-            let mut raw = [0u8; 24];
-            raw[..10].copy_from_slice(b"veil:blob\n");
-            raw[10..18].copy_from_slice(&(i as u64).to_le_bytes());
-            let id = ObjectId::hash(&raw);
-            made_ids.push(id);
-            made_map.insert(id, Bytes::copy_from_slice(&raw));
-        }
-        let st = crate::sync::Staged::from_packs(Vec::new(), made_map);
-        let progress = Mutex::new(crate::sync::Progress::default());
-        let split_res = crate::sync::packs_to_list(&hub, 3, 7, &st, &HashSet::new(), &made_ids, &progress).await;
         assert!(
-            p1_again.is_ok() && p1_after_other.is_ok() && split_res.is_ok(),
-            "Bound::take_for / packs_to_list answered 503 IndexesFull: route1={:?}, route1b={:?}, route2={:?}",
+            p1_again.is_ok() && p1_after_other.is_ok(),
+            "Bound::take_for answered 503 IndexesFull: route1={:?}, route1b={:?}",
             p1_again.err(),
             p1_after_other.err(),
-            split_res.as_ref().err()
         );
-        let listed = split_res.unwrap();
-        assert_eq!(listed.len(), 2, "MAX_OBJECTS + 50,000 objects split into 2 packs");
-        assert_eq!(listed[0].objects + listed[1].objects, total_objs);
-        assert!(objects.index_bound().available() < INDEXES_HELD, "listed packs hold their index shares until listed()");
-        let for_cache: Vec<_> = listed.into_iter().map(|p| (p.name, p.held.map(|h| h.index))).collect();
-        objects.listed(3, for_cache);
-        assert_eq!(objects.index_bound().available(), INDEXES_HELD, "all shares released once split packs join the lookup maps");
+    }
 
-        // Failure path: if `packs_to_list` fails (e.g. a discarded staged pack named after writing the first pack, or an error during `packs_to_list`), all shares are released when `packs_to_list` returns.
-        let mut touched_fail = HashSet::new();
-        let missing_id = ObjectId::hash(b"missing-from-store");
-        touched_fail.insert(missing_id);
-        let st_fail = crate::sync::Staged::from_packs(
-            vec![(
-                Arc::from("vanished"),
-                StagedSlots {
-                    objects: 2,
-                    size: 200,
-                    slots: vec![(missing_id, Slot { offset: HEAD as u64 + 2 * ENTRY as u64, len: 50 })],
-                },
-            )],
-            HashMap::new(),
+    /// BUG-2771: if a large pack (> WINDOW_ENTRIES entries) is swept after its
+    /// grace period between `stored_slots`'s first range read and `bisect_slots`'s
+    /// follow-up range read, `stored_slots` must return `Ok(None)` (not `Err`)
+    /// so `find_paged_in` forgets the vanished pack and falls back to the
+    /// replacement pack cleanly.
+    #[tokio::test]
+    async fn bug_2771_vanished_pack_mid_bisection_returns_none_and_falls_back() {
+        struct VanishAfterFirstRange {
+            inner: Arc<crate::store::FsStore>,
+            vanish_key: String,
+            first_seen: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl BlobStore for VanishAfterFirstRange {
+            async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+                self.inner.get(key).await
+            }
+            async fn put(&self, key: &str, data: Bytes) -> Result<()> {
+                self.inner.put(key, data).await
+            }
+            async fn exists(&self, key: &str) -> Result<bool> {
+                self.inner.exists(key).await
+            }
+            async fn len(&self, key: &str) -> Result<Option<u64>> {
+                self.inner.len(key).await
+            }
+            async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+                let res = self.inner.get_range(key, start, end).await?;
+                if key == self.vanish_key && start == 0 && !self.first_seen.swap(true, Ordering::SeqCst) {
+                    // Simulate another server sweeping the replaced pack right
+                    // after the first range read completes, before bisection.
+                    self.inner.delete(key).await?;
+                }
+                Ok(res)
+            }
+            async fn delete(&self, key: &str) -> Result<()> {
+                self.inner.delete(key).await
+            }
+            async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.inner.list(prefix).await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(crate::store::FsStore::new(dir.path()));
+        let project = 7;
+
+        // Build > WINDOW_ENTRIES objects so the index exceeds FIRST_READ and
+        // requires at least one bisection range read past the first window.
+        let count = WINDOW_ENTRIES + 50;
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            entries.push(obj(&format!("bug-2771-obj-{i}")));
+        }
+        entries.sort_by_key(|(id, _)| *id);
+        let (target_id, target_bytes) = entries.last().unwrap().clone();
+
+        let (old_bytes, _old_idx) = build(entries).unwrap();
+        let old_name: Arc<str> = Arc::from("old-large-pack");
+        let old_key = key(project, &old_name);
+        fs.put(&old_key, old_bytes.clone()).await.unwrap();
+
+        // Replacement merged pack holding `target_id`.
+        let (rep_bytes, _rep_idx) = build(vec![(target_id, target_bytes)]).unwrap();
+        let rep_name: Arc<str> = Arc::from("replacement-pack");
+        let rep_key = key(project, &rep_name);
+        fs.put(&rep_key, rep_bytes).await.unwrap();
+
+        // 1. Direct `stored_slots` call must return `Ok(None)`, not `Err`.
+        let store1 = VanishAfterFirstRange {
+            inner: fs.clone(),
+            vanish_key: old_key.clone(),
+            first_seen: std::sync::atomic::AtomicBool::new(false),
+        };
+        let packs1 = Packs::new(None);
+        let got = packs1
+            .stored_slots(&store1, project, &old_key, &[target_id], false)
+            .await
+            .expect("vanished pack mid-bisection must return Ok(None), not Err");
+        assert!(got.is_none(), "vanished pack mid-bisection must return None");
+
+        // Re-create `old_key` to verify `find_paged` forgets the vanished pack
+        // and continues to the replacement pack.
+        fs.put(&old_key, old_bytes).await.unwrap();
+        let store2: Arc<dyn BlobStore> = Arc::new(VanishAfterFirstRange {
+            inner: fs.clone(),
+            vanish_key: old_key.clone(),
+            first_seen: std::sync::atomic::AtomicBool::new(false),
+        });
+        let packs2 = Packs::new(None);
+        // Listed order: replacement (older in list) then old_name (newest, so
+        // `find_paged` probes `old_name` first as unloaded, hits the mid-bisection
+        // vanish, forgets `old_name`, and falls through to `rep_name`).
+        packs2.listed(project, vec![(rep_name.clone(), None), (old_name.clone(), None)]);
+        let reads = AtomicU64::new(0);
+        let gone_before = packs2.gone.load(Ordering::SeqCst);
+        let found = packs2
+            .find_paged(&store2, project, &target_id, &reads)
+            .await
+            .expect("find_paged must recover from a vanished pack mid-bisection");
+        let (found_name, _) = found.expect("target must be found in replacement pack");
+        assert_eq!(found_name, rep_name);
+        assert!(packs2.gone.load(Ordering::SeqCst) > gone_before, "vanished pack must be forgotten");
+    }
+
+    /// BUG-2870 (review b1b; regression of BUG-1620 introduced by BUG-2852 in
+    /// `t3/fix-1150-review`): `Packs::staged_index` calls `held.unproject()` on
+    /// uncached request-held indexes without placing them in the bounded 32 MiB
+    /// `self.staged` cache. That zeroes `BoundState::held[project]` while
+    /// keeping `12 MiB` of permits in `self.bound.sem` per `MAX_OBJECTS` pack,
+    /// letting one project bypass the 16 MiB per-project `quarter` cap, consume
+    /// `72 MiB`+ of `INDEXES_HELD` (96 MiB), and starve unrelated projects into
+    /// `503 IndexesFull`.
+    #[tokio::test]
+    async fn bug_2870_staged_index_never_bypasses_per_project_quota_to_starve_other_projects() {
+        struct SharedPackStore(Bytes);
+
+        #[async_trait::async_trait]
+        impl BlobStore for SharedPackStore {
+            async fn get(&self, _key: &str) -> Result<Option<Bytes>> {
+                Ok(Some(self.0.clone()))
+            }
+            async fn put(&self, _key: &str, _data: Bytes) -> Result<()> {
+                Ok(())
+            }
+            async fn exists(&self, _key: &str) -> Result<bool> {
+                Ok(true)
+            }
+            async fn len(&self, _key: &str) -> Result<Option<u64>> {
+                Ok(Some(self.0.len() as u64))
+            }
+            async fn get_range(&self, _key: &str, start: u64, end: u64) -> Result<Option<(Bytes, u64)>> {
+                let total = self.0.len() as u64;
+                if start >= total {
+                    return Ok(None);
+                }
+                let stop = (end.min(total - 1) + 1) as usize;
+                Ok(Some((self.0.slice(start as usize..stop), total)))
+            }
+            async fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+        }
+
+        // Build one valid `MAX_OBJECTS` (262,144-object) pack (`weight = 12 MiB`,
+        // `read_weight = 27 MiB`) served for any uncached staged pack name.
+        let mut items = Vec::with_capacity(MAX_OBJECTS);
+        for i in 0..MAX_OBJECTS {
+            let mut raw = [0u8; 18];
+            raw[..10].copy_from_slice(b"veil:blob\n");
+            raw[10..18].copy_from_slice(&(i as u64).to_le_bytes());
+            items.push((ObjectId::hash(&raw), Bytes::copy_from_slice(&raw)));
+        }
+        let (pack_bytes, _) = build(items).unwrap();
+        let store = SharedPackStore(pack_bytes);
+
+        let mut packs = Packs::new(None);
+        packs.bound.wait = Duration::from_millis(250);
+
+        // Project 1 holds as many uncached staged indexes as `staged_index` allows
+        // (up to 6 packs = 72 MiB if unproject() bypasses the 16 MiB quarter cap).
+        let mut p1_held = Vec::new();
+        for i in 0..6 {
+            match packs.staged_index(&store, 1, &format!("p1_{i}")).await {
+                Ok(Some(h)) => p1_held.push(h),
+                Ok(None) => panic!("synthetic staged pack must exist"),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !p1_held.is_empty(),
+            "project 1 must be able to load at least one uncached staged pack"
         );
-        let fail_res = crate::sync::packs_to_list(&hub, 3, 7, &st_fail, &touched_fail, &made_ids, &Mutex::new(Default::default())).await;
-        assert!(fail_res.is_err(), "packs_to_list fails when a touched staged pack vanished");
-        assert_eq!(objects.index_bound().available(), INDEXES_HELD, "all shares released when packs_to_list fails");
+
+        // Under BUG-1620, project 1 may hold at most its per-project share (leaving
+        // >= 48 MiB of `most = 64 MiB` free), so unrelated project 2 must always be
+        // able to load one `MAX_OBJECTS` staged pack (27 MiB read weight).
+        let avail_before_p2 = packs.bound().available();
+        let p2_res = packs.staged_index(&store, 2, "p2_0").await;
+        drop(p1_held);
+        let p2_held = p2_res.unwrap_or_else(|e| {
+            panic!(
+                "unrelated project 2 starved into IndexesFull while project 1 held uncached staged indexes (available before p2: {} MiB / {} MiB): {e:#}",
+                avail_before_p2 >> 20,
+                INDEXES_HELD >> 20
+            )
+        });
+        assert!(p2_held.is_some(), "project 2's staged pack must load");
     }
 }

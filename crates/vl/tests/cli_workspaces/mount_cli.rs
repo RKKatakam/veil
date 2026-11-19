@@ -704,7 +704,6 @@ fn bug_1461_large_files_of_every_kind_are_told_by_their_first_bytes() {
 /// MiB of sealed key material and a one-line edit of another file take
 /// the mount's peak to about 960 MiB (and 13 s of CPU in a debug build).
 #[test]
-#[ignore = "BUG-2650: a mount's recording costs hundreds of MiB of memory per MiB of sealed file (its guard of secret values)"]
 fn bug_2650_a_recording_beside_a_large_sealed_file_keeps_the_mounts_memory_bounded() {
     if !fuse_available() {
         return;
@@ -725,6 +724,68 @@ fn bug_2650_a_recording_beside_a_large_sealed_file_keeps_the_mounts_memory_bound
     assert_eq!(env.stdout("alice", &alice, &["ws", "cat", "view", "README.md"]), "edited\n");
     let peak = mount_peak(&alice, "view");
     assert!(peak < start + 128, "recording a one-line edit beside a 4 MiB sealed file grew the mount's peak from {start} to {peak} MiB");
+}
+
+#[test]
+fn bug_2650_mount_guard_limit_fails_closed_without_weakening_protection() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    let alice = env.dir("alice");
+    write(&alice, "README.md", "hello\n");
+    env.ok("alice", &alice, &["init"]);
+    env.ok("alice", &alice, &["commit", "-m", "base"]);
+    env.ok("alice", &alice, &["ws", "new", "live", "-r", "@-"]);
+    let (live_mnt, _gl) = mount(&env, "alice", &alice, "live");
+
+    // Commit a 17 MiB sealed file (> MAX_GUARD_BYTES = 16 MiB).
+    write(&alice, "internal/.env.plan", &hex_noise(17, 0x9e37_79b9_7f4a_7c15));
+    env.ok("alice", &alice, &["cloak", "internal/.env.plan"]);
+    env.ok("alice", &alice, &["commit", "-m", "oversize sealed"]);
+    env.ok("alice", &alice, &["tag", "set", "main", "-r", "@-"]);
+    let team = env.root.join("team");
+    env.ok("alice", &alice, &["remote", "add", "origin", team.to_str().unwrap()]);
+    env.ok("alice", &alice, &["push"]);
+
+    // 1. Mounting a workspace over the 17 MiB sealed file fails closed immediately.
+    env.ok("alice", &alice, &["ws", "new", "over", "-r", "main"]);
+    let mnt_over = env.dir("mnt-over");
+    let refused = env.vl("alice", &alice, &["ws", "mount", "over", mnt_over.to_str().unwrap()]);
+    let err = text(&refused);
+    assert_eq!(refused.status.code(), Some(1), "{err}");
+    assert!(err.contains("16 MiB limit") && err.contains("internal/.env.plan"), "{err}");
+    assert!(!alice.join(".veil/local/mounts/over/state.json").exists(), "refused mount left state.json");
+
+    // 2. A non-member (bob) who cannot open internal/.env.plan can mount and record edits.
+    env.ok("bob", &env.root, &["clone", "team", "bob"]);
+    let bob = env.root.join("bob");
+    env.ok("bob", &bob, &["ws", "new", "work", "-r", "main"]);
+    let (bm, _gb) = mount(&env, "bob", &bob, "work");
+    assert!(!bm.join("internal").exists());
+    std::fs::write(bm.join("README.md"), "bob edit\n").unwrap();
+    assert_eq!(env.stdout("bob", &bob, &["ws", "cat", "work", "README.md"]), "bob edit\n");
+
+    // 3. If an already-mounted workspace (`live`) moves onto the 17 MiB sealed snapshot
+    // while holding an unrecorded edit, `follow` / `record` refuses before switching
+    // the mount's lower layer or recording without the guard, and `vl ws unmount` keeps
+    // it mounted until the oversized file is removed.
+    std::fs::write(live_mnt.join("README.md"), "live edit\n").unwrap();
+    env.ok("alice", &alice, &["--no-snapshot", "rebase", "-r", "live@", "-d", "main"]);
+    assert!(!live_mnt.join("internal/.env.plan").exists(), "mount switched lower to oversize secret");
+    let unm = env.vl("alice", &alice, &["--no-snapshot", "ws", "unmount", "live"]);
+    let unm_err = text(&unm);
+    assert_eq!(unm.status.code(), Some(1), "{unm_err}");
+    assert!(unm_err.contains("could not record the mount, so it stays mounted"), "{unm_err}");
+    assert!(unm_err.contains("16 MiB limit"), "{unm_err}");
+
+    // Removing the oversized sealed file lets the mount follow, record, and unmount. (A
+    // sealed file stays sealed: there is no `vl uncloak`, so the file goes instead.)
+    std::fs::remove_file(alice.join("internal/.env.plan")).unwrap();
+    env.ok("alice", &alice, &["commit", "-m", "drop dump"]);
+    env.ok("alice", &alice, &["--no-snapshot", "rebase", "-r", "live@", "-d", "@-"]);
+    env.ok("alice", &alice, &["--no-snapshot", "ws", "unmount", "live"]);
+    assert_eq!(env.stdout("alice", &alice, &["ws", "cat", "live", "README.md"]), "live edit\n");
 }
 
 /// Every file below `dir`, as paths.

@@ -1428,16 +1428,8 @@ proptest! {
 
     /// The same with `vl undo` and `vl op restore` among the commands, and
     /// describes concurrent with each other (BUG-1403's reproduction, and
-    /// BUG-1444's). Two causes of what it found are fixed (BUG-1444's
-    /// row: a snapshot that followed a rewrite onto a replacement the
-    /// merge's rebase never walked; the check itself, which did not know
-    /// the rewrites an undo or op restore records). It still fails on
-    /// fresh seeds, about 1 in 60 at this length and more in long runs: an
-    /// undo of an op restore puts a describe back in force and nothing
-    /// moves what was put on its old version meanwhile (BUG-2640), and the
-    /// long runs find more (BUG-2641).
+    /// BUG-1444's; BUG-2640 and BUG-2641 fixed the remaining causes).
     #[test]
-    #[ignore = "BUG-2640: an undo of an op restore puts a rewrite back in force, and what was put on its old snapshot meanwhile stays there (about 1 seed in 60; BUG-2641 in long runs)"]
     fn bug_1444_rewrites_follow_with_undo_restore_and_concurrent_describes(nw in 2usize..5, steps in prop::collection::vec(any::<u16>(), steps(20, 100))) {
         check_rewrites_follow_through_merges(false, nw, true, false, &steps)?;
     }
@@ -1606,7 +1598,7 @@ fn walk_lists_every_operation_after_its_descendants() {
 /// lists `y` (and `a`) before `x` and `z`, which descend from it: `vl undo`
 /// in `x`'s workspace, with `w` another workspace's, would undo `y`.
 #[test]
-#[ignore = "BUG-1432 (a documented residual): on a log written before operation times were clamped, the walk can list an operation before an older descendant reached by a later path"]
+#[ignore = "BUG-1432 (closed, won't fix, owner 2026-11-19: only pre-release logs can hold it): on a log written before operation times were clamped, the walk can list an operation before an older descendant reached by a later path"]
 fn bug_1432_walk_lists_an_operation_after_an_older_descendant_on_another_branch() {
     use veil_core::oplog::{OpStore, Operation};
     let op = |parents: Vec<ObjectId>, timestamp: i64, description: &str| Operation {
@@ -2546,7 +2538,6 @@ fn bug_1444_what_follows_a_rewrite_lands_on_a_current_snapshot() {
 /// describe would have moved `C` onto `A1`: a restore and its undo must
 /// leave the same result.
 #[test]
-#[ignore = "BUG-2640: an undo of an op restore puts a describe back in force, and a commit put on the old version meanwhile stays there"]
 fn bug_2640_an_undo_of_a_restore_reapplies_the_rewrites_it_puts_back_in_force() {
     let me = Identity::generate("alice");
     let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
@@ -2609,7 +2600,6 @@ fn bug_2640_an_undo_of_a_restore_reapplies_the_rewrites_it_puts_back_in_force() 
 /// (`bug_2640_an_undo_of_a_restore_reapplies_…` is this, built by hand).
 /// It fails every replay, before BUG-1444's fix and after.
 #[test]
-#[ignore = "BUG-2640: an undo of an op restore puts a describe back in force, and a commit put on the old version meanwhile stays there (seed 50's input)"]
 fn bug_2640_an_undo_of_a_restore_seed_50_replayed() {
     let steps: Vec<u16> = vec![
         57600, 5947, 8063, 57644, 30607, 24192, 60884, 22268, 36740, 8932, 62002, 2987, 57788, 6348, 39405, 61518, 40713, 21894, 8070, 39670, 26613, 51229, 49270,
@@ -2632,7 +2622,6 @@ fn bug_2640_an_undo_of_a_restore_seed_50_replayed() {
 /// merge collects its rewrite, and what was put on `A` stays there. It
 /// fails 16 to 18 replays in 40, before BUG-1444's fix and after.
 #[test]
-#[ignore = "BUG-2640: an op restore that takes an op restore back puts a describe back in force, and the merge leaves what was put on the old version meanwhile (seed 34's input)"]
 fn bug_2640_a_restore_of_a_restore_seed_34_replayed() {
     let steps: Vec<u16> = vec![
         27364, 17703, 51354, 31916, 38464, 41170, 64826, 60689, 19053, 58688, 20633, 27569, 10649, 24256, 44557, 41677, 45797, 55185, 9335, 5971, 31145, 42550, 31717,
@@ -2664,7 +2653,6 @@ fn bug_2640_a_restore_of_a_restore_seed_34_replayed() {
 /// the describe replaced. Replayed 300 times here, so that it fails most
 /// runs (about 3 in 4).
 #[test]
-#[ignore = "BUG-2641: a settler's recorded rebase that op restores went back past still counts as a version of the snapshot (the whole seed-5 input: about 1 replay in 220, so this test still passes about 1 run in 4: a pass alone does not mean it is fixed)"]
 fn bug_2641_a_settlers_rebase_an_op_restore_went_back_past_replayed() {
     let steps: Vec<u16> = vec![
         12675, 1612, 47070, 57123, 55165, 16163, 44657, 21442, 48616, 10224, 34716, 24770, 33690, 66, 7935, 50658, 60607, 17734, 18538, 62880, 28974, 49248, 22749,
@@ -2686,9 +2674,10 @@ fn bug_2641_a_settlers_rebase_an_op_restore_went_back_past_replayed() {
 /// undo` and `vl op restore` (`bug_1295_every_write_survives_with_undo_and_
 /// restore`, which runs in the default suite at the pinned seed) reports a
 /// conflict's losing tag target dropped. The input it shrank to (86 steps,
-/// three writers), not traced: it fails 8 to 11 replays in 150.
+/// three writers): a losing write settled in an earlier merge had its head
+/// dropped because another head covered it, and a late concurrent undo or
+/// restore dropped that covering head.
 #[test]
-#[ignore = "BUG-2642: the every-write model check with undo and op restore reports a conflict's losing tag target dropped on a fresh seed (not traced)"]
 fn bug_2642_every_write_survives_with_undo_and_restore_replayed() {
     let steps: Vec<u16> = vec![
         39438, 46179, 13977, 5347, 24046, 6292, 64970, 30544, 13397, 31427, 35815, 59922, 8737, 31656, 39721, 24544, 12840, 6634, 10893, 29748, 2557, 33089, 37837,
@@ -2708,11 +2697,10 @@ fn bug_2642_every_write_survives_with_undo_and_restore_replayed() {
 /// BUG-2641: the long runs (120 to 300 steps) of BUG-1444's model check
 /// still fail on fresh seeds after its fixes and with BUG-2640's cause
 /// known: 6 seeds in 16. This is the input of seed 107 (244 steps, two
-/// writers), not traced: a describe's old version still visible below a
-/// head in a command's view. It fails about 16 replays in 30, as often on
-/// the engine before BUG-1444's fixes.
+/// writers): an undo of an op restore putting rewrites back in force
+/// (BUG-2640), plus the fold's intermediate view and retracted settlers'
+/// rebases (BUG-2641).
 #[test]
-#[ignore = "BUG-2641: the long runs of the undo, op restore and concurrent describes model check still fail on fresh seeds (not traced)"]
 fn bug_2641_rewrites_follow_with_undo_restore_in_long_runs_replayed() {
     let steps: Vec<u16> = vec![
         33417, 15452, 58658, 19228, 1610, 57910, 14223, 50835, 37183, 61744, 14153, 13786, 1230, 54063, 32812, 40437, 29068, 62093, 21566, 27474, 10962, 18173, 37637,
@@ -3187,4 +3175,325 @@ fn bug_2550_a_tag_a_describe_moved_and_a_settler_recorded_again_still_conflicts(
     assert!(target == x1 || target == y_now[0], "the tag on one of the two moves: {}", target.short());
     let shown = |s: &ObjectId| repo.view().refs().iter().any(|r| r == s || repo.is_ancestor(s, r).unwrap());
     assert!(shown(&x1), "the described x {} still visible", x1.short());
+}
+
+/// BUG-2640 through a merge, with chained shared-history rewrites and
+/// transient application: `A -> A1 -> A2` is taken back by an op restore
+/// `R1`; a concurrent commit `C` on `A` merges with `R1` (`M1`) and rightly
+/// stays on `A`; a second op restore `R2` (forked from `R1`, concurrent with
+/// `M1`) takes `R1` back to `D2`. Merging `M1` and `R2` must keep `C`, move
+/// `C` all the way onto `A2`, and not re-record `A -> A1` or `A1 -> A2` on
+/// the merge op (so undoing only `D2` afterward cleanly brings `A1` back).
+#[test]
+fn bug_2640_a_reinstated_rewrite_through_a_merge_follows_chains_and_can_still_be_taken_back() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let commit = |repo: &mut Repo, ws: &str, file: &str| -> ObjectId {
+        repo.set_command_workspace(Some(ws.into()));
+        let ov = repo.workspace_overlay(ws).unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace(ws, &ov).unwrap();
+        repo.commit_working_copy(ws, file).unwrap().0
+    };
+    let truth = Device::new(false);
+    let (a, before_d1) = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        repo.create_workspace("v", vec![repo.root_id()]).unwrap();
+        let a = commit(&mut repo, "w", "a");
+        (a, repo.op_id())
+    };
+    let h0 = op_heads(&*truth.fs);
+    // Commit `c` on `a`, seeing neither describes nor restores.
+    let k = truth.fork(&h0);
+    commit(&mut open(&k), "w", "c");
+    let (a1, _op_d1) = {
+        let mut repo = open(&truth);
+        let a1 = repo.describe(a, "a1").unwrap();
+        (a1, repo.op_id())
+    };
+    // Concurrent branch forked at `D1`, committing `d` on `a1`.
+    let h_d1 = op_heads(&*truth.fs);
+    let branch_d = truth.fork(&h_d1);
+    commit(&mut open(&branch_d), "w", "d");
+    let (a2, op_d2) = {
+        let mut repo = open(&truth);
+        let a2 = repo.describe(a1, "a2").unwrap();
+        (a2, repo.op_id())
+    };
+    open(&truth).restore_operation(before_d1).unwrap();
+    // Fork `r2` right after `R1`, before `k` lands, and restore `op_d2`
+    // (taking `R1` back and reinstating `D1` and `D2`).
+    let h_r1 = op_heads(&*truth.fs);
+    let r2 = truth.fork(&h_r1);
+    open(&r2).restore_operation(op_d2).unwrap();
+    // Land `k` onto `R1` and settle `M1`: `c` rightly stays on `a` while `R1` stands.
+    truth.land(&k, &h0);
+    {
+        let repo = open(&truth);
+        assert_eq!(repo.heads().len(), 1, "settled M1 with R1");
+        let c: Vec<ObjectId> = repo.exact().visible().unwrap().into_iter().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "c").collect();
+        assert_eq!(c.len(), 1, "one commit c");
+        assert_eq!(repo.snapshot(&c[0]).unwrap().parents.clone(), vec![a], "c stays on a while R1 stands");
+    }
+    // Now land `r2` (concurrent with `M1`) so reinstating `D1`/`D2` goes through `M2`.
+    truth.land(&r2, &h_r1);
+    assert_eq!(op_heads(&*truth.fs).len(), 2, "M1 and R2");
+    {
+        let repo = open(&truth);
+        assert_eq!(repo.heads().len(), 1, "merged M1 and R2");
+        let visible = repo.exact().visible().unwrap();
+        assert!(visible.contains(&a2), "a2 is back in force");
+        assert!(!visible.contains(&a), "a is gone");
+        assert!(!visible.contains(&a1), "a1 is gone (chained rewrite followed)");
+        let c: Vec<ObjectId> = visible.iter().copied().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "c").collect();
+        assert_eq!(c.len(), 1, "one commit c");
+        assert_eq!(repo.snapshot(&c[0]).unwrap().parents.clone(), vec![a2], "c moved all the way onto a2");
+        let merge_op = repo.ops().get(&repo.op_id()).unwrap();
+        assert!(merge_op.is_merge(), "top op is the merge");
+        assert!(!merge_op.rewritten.contains_key(&a), "shared-history rewrite a->a1 not re-recorded on merge");
+        assert!(!merge_op.rewritten.contains_key(&a1), "shared-history rewrite a1->a2 not re-recorded on merge");
+    }
+    // Now undo ONLY `D2` (not `M2`), then land `branch_d` (committed `d` on
+    // `a1`): because `M2` did not re-record `a1 -> a2`, `d` must stay on `a1`.
+    open(&truth).undo_operation_keeping_edits("v", op_d2).unwrap();
+    truth.land(&branch_d, &h_d1);
+    let repo = open(&truth);
+    assert_eq!(repo.heads().len(), 1, "settled after undoing D2 and landing branch_d");
+    let visible = repo.exact().visible().unwrap();
+    assert!(visible.contains(&a1), "a1 stands again after undoing D2");
+    let d: Vec<ObjectId> = visible.iter().copied().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "d").collect();
+    assert_eq!(d.len(), 1, "one commit d");
+    assert_eq!(repo.snapshot(&d[0]).unwrap().parents.clone(), vec![a1], "d stays on a1 because D2 was undone and M2 did not re-record a1->a2");
+}
+
+/// BUG-2641, cause (c): a settler's merge rebases `X -> X'` (only a merge
+/// records it); an op restore goes back past that merge so `X` stands
+/// again; a describe then rewrites `X -> X2`, while a concurrent describe
+/// of `Y` (child of `X`, forked before the merge) lands last. The retracted
+/// merge's `X -> X'` must not count as a second version of `X` beside `X2`:
+/// `Y2` must move onto `X2`.
+#[test]
+fn bug_2641_a_settlers_rebase_taken_back_by_an_op_restore_does_not_block_a_later_describe() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let commit = |repo: &mut Repo, ws: &str, file: &str| -> ObjectId {
+        repo.set_command_workspace(Some(ws.into()));
+        let ov = repo.workspace_overlay(ws).unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace(ws, &ov).unwrap();
+        repo.commit_working_copy(ws, file).unwrap().0
+    };
+    let truth = Device::new(false);
+    let a = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        commit(&mut repo, "w", "a")
+    };
+    let h0 = op_heads(&*truth.fs);
+    // Side 1: describe `a -> a1`.
+    let da = truth.fork(&h0);
+    open(&da).describe(a, "a1").unwrap();
+    // Side 2: commit `x` on `a`, then `y` on `x`.
+    let xy = truth.fork(&h0);
+    let (x, y, op_xy) = {
+        let mut repo = open(&xy);
+        let x = commit(&mut repo, "w", "x");
+        let y = commit(&mut repo, "w", "y");
+        (x, y, repo.op_id())
+    };
+    // Late branch forked at `op_xy` (before the settler's merge): describes `y`.
+    let dy = xy.fork(&op_heads(&*xy.fs));
+    open(&dy).describe(y, "y2").unwrap();
+    // Settler merges `da` and `xy`, recording merge-only rebases `x -> x'` and `y -> y'`.
+    truth.land(&da, &h0);
+    truth.land(&xy, &h0);
+    assert_eq!(op_heads(&*truth.fs).len(), 2, "da and xy");
+    {
+        let repo = open(&truth);
+        assert_eq!(repo.heads().len(), 1, "settler merged da and xy");
+        let mop = repo.ops().get(&repo.op_id()).unwrap();
+        assert!(mop.is_merge() && mop.rewritten.contains_key(&x), "settler recorded merge-only rebase of x");
+    }
+    // Op restore back to `op_xy` (taking back `da` and the settler's merge),
+    // then describe `x -> x2`.
+    let x2 = {
+        let mut repo = open(&truth);
+        repo.restore_operation(op_xy).unwrap();
+        assert!(repo.exact().visible().unwrap().contains(&x), "restore brought x back");
+        repo.describe(x, "x2").unwrap()
+    };
+    // Land the late describe of `y` (which sits on `x`).
+    truth.land(&dy, &op_heads(&*xy.fs));
+    let repo = open(&truth);
+    assert_eq!(repo.heads().len(), 1, "settled");
+    let visible = repo.exact().visible().unwrap();
+    assert!(visible.contains(&x2), "x2 is visible");
+    assert!(!visible.contains(&x), "x (replaced by x2, with retracted settler rebase) must not stay visible");
+    let y2: Vec<ObjectId> = visible.iter().copied().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "y2").collect();
+    assert_eq!(y2.len(), 1, "one y2");
+    assert_eq!(repo.snapshot(&y2[0]).unwrap().parents.clone(), vec![x2], "y2 moved onto x2");
+}
+
+/// BUG-2642: two concurrent tag writes (`t = X` and `t = Z`) conflict in an
+/// earlier merge `M1` that also includes commits `Wx` (on `X`) and `Wz` (on
+/// `Z`); `M1` adds the losing tag target to `heads`, then
+/// `drop_ancestor_heads` drops it because `Wx`/`Wz` cover it. A concurrent
+/// op restore `U` (forked after `Wx`/`Wz`, restoring to before `X`/`Z`)
+/// drops `Wx` and `Wz` in `M2`. Neither head of `M2` holds the losing
+/// target on `t` or in `heads`, yet the losing write was never retracted or
+/// superseded and must stay visible.
+#[test]
+fn bug_2642_a_conflicts_loser_covered_by_a_head_an_undo_drops_stays_visible() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let commit = |repo: &mut Repo, ws: &str, file: &str| -> ObjectId {
+        repo.set_command_workspace(Some(ws.into()));
+        let ov = repo.workspace_overlay(ws).unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace(ws, &ov).unwrap();
+        repo.commit_working_copy(ws, file).unwrap().0
+    };
+    let truth = Device::new(false);
+    let before_xz = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        let root = repo.root_id();
+        repo.create_workspace("w1", vec![root]).unwrap();
+        repo.create_workspace("w2", vec![root]).unwrap();
+        repo.op_id()
+    };
+    let (x, z) = {
+        let mut repo = open(&truth);
+        let x = commit(&mut repo, "w1", "x");
+        let z = commit(&mut repo, "w2", "z");
+        (x, z)
+    };
+    let h_xz = op_heads(&*truth.fs);
+    // Two concurrent moves of tag `tag1`: one to `x`, one to `z`.
+    let bt1 = truth.fork(&h_xz);
+    open(&bt1).set_tag("tag1", x, true).unwrap();
+    let bt2 = truth.fork(&h_xz);
+    open(&bt2).set_tag("tag1", z, true).unwrap();
+    // Third branch builds commits `wx` on `x` and `wz` on `z`, covering both.
+    let bw = truth.fork(&h_xz);
+    {
+        let mut repo = open(&bw);
+        commit(&mut repo, "w1", "wx");
+        commit(&mut repo, "w2", "wz");
+    }
+    let h_w = op_heads(&*bw.fs);
+    // Fourth branch restores to `before_xz` (dropping `x`, `z`, `wx`, `wz`).
+    let bu = bw.fork(&h_w);
+    open(&bu).restore_operation(before_xz).unwrap();
+    // Settler M1 merges `bt1`, `bt2`, `bw`: conflict on `tag1`, losing target
+    // covered by `wx`/`wz` and dropped from `M1.view.heads`.
+    truth.land(&bt1, &h_xz);
+    truth.land(&bt2, &h_xz);
+    truth.land(&bw, &h_xz);
+    assert_eq!(op_heads(&*truth.fs).len(), 3, "bt1, bt2, bw");
+    {
+        let repo = open(&truth);
+        assert_eq!(repo.heads().len(), 1, "M1 settled");
+        assert!(repo.view().tags.contains_key("tag1"), "tag1 present after M1");
+    }
+    // Land `bu` (concurrent with M1): M2 merges M1 and `bu`.
+    truth.land(&bu, &h_w);
+    let repo = open(&truth);
+    assert_eq!(repo.heads().len(), 1, "M2 settled");
+    let visible = repo.exact().visible().unwrap();
+    assert!(visible.contains(&x), "x (tag1 candidate) must survive M2");
+    assert!(visible.contains(&z), "z (tag1 candidate) must survive M2");
+}
+
+/// BUG-2641 (seeds 121 and 123): two independent settlers `S1` and `S2` both
+/// make the same merge rebase `X -> X'` (moving `X` onto `A1`). `M1` merges
+/// `S1`, `S2`, and a concurrent `describe X -> X2`. A later merge `M2` folds
+/// `M1`, a branch `B1` built on `S1`, and a late `describe Y -> Y2` (child of
+/// `X`). Because `S1` is in the shared history of `M1` and `B1`, `shared`
+/// shows `X'`; `S2`'s `X -> X'` must still be recognized as a merge's rebase
+/// (not a second version of `X`), so `X -> X2` stands and `Y2` does not stay
+/// on `X`.
+#[test]
+fn bug_2641_a_settlers_rebase_also_in_shared_history_is_not_a_second_version() {
+    let me = Identity::generate("alice");
+    let open = |d: &Device| Repo::open(d.fs.clone(), Some(me.clone()), "alice").unwrap();
+    let commit = |repo: &mut Repo, ws: &str, file: &str| -> ObjectId {
+        repo.set_command_workspace(Some(ws.into()));
+        let ov = repo.workspace_overlay(ws).unwrap();
+        ov.write(&VPath::new(file).unwrap(), b"x\n").unwrap();
+        repo.snapshot_workspace(ws, &ov).unwrap();
+        repo.commit_working_copy(ws, file).unwrap().0
+    };
+    let truth = Device::new(false);
+    let a = {
+        let mut repo = Repo::init(truth.fs.clone(), Some(me.clone()), "alice").unwrap();
+        repo.create_workspace("w", vec![repo.root_id()]).unwrap();
+        commit(&mut repo, "w", "a")
+    };
+    let h0 = op_heads(&*truth.fs);
+    // Side 1: describe `a -> a1`.
+    let da = truth.fork(&h0);
+    open(&da).describe(a, "a1").unwrap();
+    // Side 2: commit `x` on `a`, then `y` on `x`.
+    let xy = truth.fork(&h0);
+    let (x, y) = {
+        let mut repo = open(&xy);
+        let x = commit(&mut repo, "w", "x");
+        let y = commit(&mut repo, "w", "y");
+        (x, y)
+    };
+    let h_xy = op_heads(&*xy.fs);
+    // Branches forked at `h_xy`: `dx` describes `x`, `dy` describes `y`,
+    // `u1` and `u2` make two distinct settlers `S1` and `S2`.
+    let dx = xy.fork(&h_xy);
+    open(&dx).describe(x, "x2").unwrap();
+    let dy = xy.fork(&h_xy);
+    open(&dy).describe(y, "y2").unwrap();
+    let u1 = xy.fork(&h_xy);
+    open(&u1).create_workspace("u1", vec![open(&u1).root_id()]).unwrap();
+    let u2 = xy.fork(&h_xy);
+    open(&u2).create_workspace("u2", vec![open(&u2).root_id()]).unwrap();
+    // Settler S1 merges `da` and `u1` (which reaches `xy`), creating merge rebase `x -> x'`.
+    let s1 = truth.fork(&h0);
+    s1.land(&da, &h0);
+    s1.land(&u1, &h0);
+    let x_prime = {
+        let repo = open(&s1);
+        assert_eq!(repo.heads().len(), 1, "S1 settled");
+        let mop = repo.ops().get(&repo.op_id()).unwrap();
+        assert!(mop.is_merge() && mop.rewritten.contains_key(&x), "S1 recorded merge rebase of x");
+        mop.rewritten[&x][0]
+    };
+    let h_s1 = op_heads(&*s1.fs);
+    let b1 = s1.fork(&h_s1);
+    open(&b1).create_workspace("v1", vec![open(&b1).root_id()]).unwrap();
+    // Settler S2 independently merges `da` and `u2`, creating the exact same `x -> x'`.
+    let s2 = truth.fork(&h0);
+    s2.land(&da, &h0);
+    s2.land(&u2, &h0);
+    {
+        let repo = open(&s2);
+        assert_eq!(repo.heads().len(), 1, "S2 settled");
+        let mop = repo.ops().get(&repo.op_id()).unwrap();
+        assert_eq!(mop.rewritten.get(&x).map(Vec::as_slice), Some(&[x_prime][..]), "S2 made the same merge rebase x -> x'");
+    }
+    // M1 merges S1, S2, and dx.
+    truth.land(&s1, &h0);
+    truth.land(&s2, &h0);
+    truth.land(&dx, &h0);
+    {
+        let repo = open(&truth);
+        assert_eq!(repo.heads().len(), 1, "M1 settled");
+    }
+    // Now land `b1` (built on S1) and `dy` (built on x) concurrently with M1 -> M2.
+    truth.land(&b1, &h_s1);
+    truth.land(&dy, &h_xy);
+    let repo = open(&truth);
+    assert_eq!(repo.heads().len(), 1, "M2 settled");
+    let visible = repo.exact().visible().unwrap();
+    assert!(!visible.contains(&x), "old x must not stay visible after M2");
+    let y2: Vec<ObjectId> = visible.iter().copied().filter(|s| repo.snapshot(s).unwrap().description.as_str() == "y2").collect();
+    assert_eq!(y2.len(), 1, "one y2");
+    let y2_parent = repo.snapshot(&y2[0]).unwrap().parents[0];
+    assert_eq!(repo.snapshot(&y2_parent).unwrap().description.as_str(), "x2", "y2 moved onto x2 (not left on old x)");
 }

@@ -29,6 +29,19 @@ to `vl login --ca` once. Objects go to `./hub/objects`, or to S3 with
 `--s3-endpoint URL --s3-bucket NAME` (credentials in `VEIL_S3_ACCESS_KEY` and
 `VEIL_S3_SECRET_KEY`).
 
+**Storage only grows.** In v1 the server's storage is append-only: there
+is no garbage collection, running or run by hand. An object that a
+project's history named is never deleted, so a deleted branch or a history
+that was rewritten still takes its space. Size the directory or the bucket
+for everything ever pushed. The one thing the server deletes is an upload
+it never used: what a push sent and the server did not keep (the push was
+refused, or never came) is discarded. So a plain-text secret that a push
+was refused for is never kept.
+
+Each object is stored under its own key (`--object-layout objects`, the
+default). Packs, the earlier layout, stay readable: a server reads what was
+already written in them, and converts nothing.
+
 `--database-url` (or `VEIL_DATABASE_URL`, which keeps the password off the
 command line) also says whether the connection to the database is encrypted:
 
