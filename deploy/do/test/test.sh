@@ -259,9 +259,10 @@ for g in $(. "$ROOT/deploy/gates.sh" >/dev/null 2>&1; echo "$GATES_ALL"); do
     o=$(env $FULL "$T/do/bench.sh" "$g" 2>&1); r=$?
     [ $r = 0 ] || echo "   (bench.sh $g dry run exited $r)"
     all_bench="$all_bench $o"
-    printf -v "bench_$g" '%s' "$o"
+    printf -v "bench_${g//-/_}" '%s' "$o"
 done
-check "every gate's dry run succeeds and records run.txt, topology.env, images.txt" '[ "$(grep -c "would record run.txt" <<<"$all_bench")" = 13 ] && [ "$(grep -c "would record topology.env" <<<"$all_bench")" = 13 ]'
+check "every gate's dry run succeeds and records run.txt, topology.env, images.txt" '[ "$(grep -c "would record run.txt" <<<"$all_bench")" = 15 ] && [ "$(grep -c "would record topology.env" <<<"$all_bench")" = 15 ]'
+check "yb-scale and yb-onerepo run multi-project (60 projects) and single-repo many-branch (+ separate merge) curves" '[[ "$bench_yb_scale" == *"--mode branches --projects 60 --clients 300"* && "$bench_yb_scale" == *"--mode landing --projects 60 --clients 300"* && "$bench_yb_onerepo" == *"--mode branches --projects 1 --clients 300 --rates max --dir /work/yb-onerepo"* && "$bench_yb_onerepo" == *"--merge-every 5"* ]]'
 check "the drivers' gates run on a driver against the balancer's private address" '[[ "$bench_landing" == *"would run on 203.0.113.8: mkdir -p /srv/bench"*"--url https://10.10.0.4:8443"*"--mode landing --projects 1 --clients 10000 --people 100 --rates 1000"* ]] && [ "$(grep -c "\[landing-" <<<"$bench_landing")" = 6 ] && [[ "$bench_landing" == *"landing-mix-600s"*"--protected --mix"* ]]'
 check "branches runs the cost curve and the headline (300, 1,000 and 3,000 agents merging every 5th push)" '[[ "$bench_branches" == *"[branches on"* && "$bench_branches" == *"--clients 300,1000,3000 --rates max --merge-every 5"* ]]'
 check "onerepo runs 1,000 then 5,000 agents on one project from one driver, samples the three YugabyteDB nodes, and asks the database named veil" '[[ "$bench_onerepo" == *"[onerepo-1000 on"*"--mode branches --projects 1 --clients 1000 --rates max"*"[onerepo-5000 on"*"--clients 5000 --rates max"* ]] && [ "$(grep -c "/srv/metrics/.*-onerepo.stats .*/db[123]-docker-stats.log" <<<"$bench_onerepo")" = 3 ] && [[ "$bench_landing" == *"-U yugabyte -d veil -X"* || "$bench_failover" == *"-U yugabyte -d veil -X"* ]]'

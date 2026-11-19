@@ -314,6 +314,39 @@ printf '2026-11-06T21:20:30Z pg cpu=600.00%% mem=8GiB / 32GiB;\n2026-11-06T21:23
 tab=$(python3 "$ROOT/deploy/onerepo-table.py" --target 7200 --servers 3 --server-vcpus 16 "$mk")
 check "onerepo's table: 50.0 % of the target, 27 server cores (7.50 ms a push), 6 database cores (1.67 ms), and what 7,200 a second needs" '[[ "$tab" == *"| 5,000 | 3,600.0 | 50.0 % | 900 / 2,100 | 3 | 7 | 40.1 | 11.0 | 1.02 | 27.0 | 7.50 | 6.0 | 1.67 | 5.5 |"* && "$tab" == *"54 server cores (5 servers of 16 vCPUs at 70% busy)"* && "$tab" == *"12 database cores (at 70% busy: 18)"* && "$tab" == *"288,720 statements a second"* ]]'
 
+# The yb-scale (multi-project, 60-100 projects) and yb-onerepo (single-repo
+# many-branch + separate main-merge curve) gates and their 3-vs-6 verdict script.
+rm -rf "$T/results"; : > "$FAKE_SSH_LOG"
+rc=0; out=$("$K/bench.sh" --approve yb-scale 2>&1 </dev/null) || rc=$?
+r1=$(res yb-scale)
+check "yb-scale: 60 projects across branches, landing, pull, api, land on all drivers; yb-scale.md produced" '[ $rc = 0 ] && [ "$(grep -c -- "--mode branches --projects 60 --clients 300 --rates max .*yb-scale-branches@" "$FAKE_SSH_LOG")" = 2 ] && [ "$(grep -c -- "--mode landing --projects 60 --clients 300 --people 60 --rates max .*yb-scale-landing@" "$FAKE_SSH_LOG")" = 2 ] && [ "$(grep -c -- "--mode pull --projects 60 --clients 300 --background 0 .*yb-scale-pull@" "$FAKE_SSH_LOG")" = 2 ] && [ "$(grep -c -- "--mode api --projects 60 --clients 120 --rates max .*yb-scale-api@" "$FAKE_SSH_LOG")" = 2 ] && [ "$(grep -c -- "--mode land --projects 60 --clients 120 --rates max .*yb-scale-land@" "$FAKE_SSH_LOG")" = 2 ] && [ -s "$r1/yb-scale.md" ] && grep -qx "YB_SCALE_PROJECTS=60" "$r1/run.txt"'
+rm -rf "$T/results"; : > "$FAKE_SSH_LOG"
+rc=0; out=$("$K/bench.sh" --approve yb-onerepo 2>&1 </dev/null) || rc=$?
+r1=$(res yb-onerepo)
+check "yb-onerepo: single project many-branch plus separate --merge-every curve on one driver; yb-onerepo.md produced" '[ $rc = 0 ] && [ "$(grep -c -- "--mode branches --projects 1 --clients 300 --rates max .*yb-onerepo-branches.json" "$FAKE_SSH_LOG")" = 1 ] && [ "$(grep -c -- "--mode branches --projects 1 --clients 300 --rates max --merge-every 5 .*yb-onerepo-merge.json" "$FAKE_SSH_LOG")" = 1 ] && [ -s "$r1/yb-onerepo.md" ] && grep -q "reported separately" "$r1/yb-onerepo.md" && grep -qx "YB_ONEREPO_CLIENTS=300" "$r1/run.txt"'
+y3=$T/yb-scale-3; y6=$T/yb-scale-6; y6f=$T/yb-scale-6-fail; mkdir -p "$y3" "$y6" "$y6f"
+printf 'YB_NODES=3\nYB_LAYOUT=hash\n' > "$y3/topology.env"
+printf 'YB_NODES=6\nYB_LAYOUT=hash\n' > "$y6/topology.env"
+printf 'YB_NODES=6\nYB_LAYOUT=hash\n' > "$y6f/topology.env"
+for c in branches landing pull api land; do
+    printf '{"runs": [{"mode": "%s", "projects": 60, "clients": 300, "ops_per_s": 500.0, "p50_ms": 20.0, "p99_ms": 50.0, "errors": 0, "window_start_unix_ms": 1794000000000, "window_end_unix_ms": 1794000060000}]}\n' "$c" > "$y3/yb-scale-$c@1.json"
+    printf '{"runs": [{"mode": "%s", "projects": 60, "clients": 300, "ops_per_s": 850.0, "p50_ms": 18.0, "p99_ms": 45.0, "errors": 0, "window_start_unix_ms": 1794000000000, "window_end_unix_ms": 1794000060000}]}\n' "$c" > "$y6/yb-scale-$c@1.json"
+    printf '{"runs": [{"mode": "%s", "projects": 60, "clients": 300, "ops_per_s": 600.0, "p50_ms": 25.0, "p99_ms": 60.0, "errors": 0, "window_start_unix_ms": 1794000000000, "window_end_unix_ms": 1794000060000}]}\n' "$c" > "$y6f/yb-scale-$c@1.json"
+done
+for i in 1 2 3 4 5 6; do printf '2026-11-06T21:20:30Z yb cpu=400.00%% mem=8GiB / 32GiB;\n' > "$y6/db$i-docker-stats.log"; done
+rc_pass=0; tab_pass=$(python3 "$ROOT/deploy/yb-scale-table.py" --gate yb-scale --compare "$y3" "$y6") || rc_pass=$?
+rc_fail=0; tab_fail=$(python3 "$ROOT/deploy/yb-scale-table.py" --gate yb-scale --compare "$y3" "$y6f") || rc_fail=$?
+check "yb-scale-table.py 3-vs-6 multi-project: PASS at 1.70x with balanced 6-node share, FAIL at 1.20x" '[ $rc_pass = 0 ] && [[ "$tab_pass" == *"1.70×"* && "$tab_pass" == *"17%/17%/17%/17%/17%/17%"* && "$tab_pass" == *"**Verdict: PASS**"* ]] && [ $rc_fail = 1 ] && [[ "$tab_fail" == *"1.20×"* && "$tab_fail" == *"**Verdict: FAIL**"* ]]'
+o3=$T/yb-onerepo-3; o6=$T/yb-onerepo-6; mkdir -p "$o3" "$o6"
+printf 'YB_NODES=3\nYB_LAYOUT=hash\n' > "$o3/topology.env"
+printf 'YB_NODES=6\nYB_LAYOUT=hash\n' > "$o6/topology.env"
+printf '{"runs": [{"mode": "branches", "projects": 1, "clients": 300, "ops_per_s": 400.0, "p50_ms": 30.0, "p99_ms": 80.0, "errors": 0, "window_start_unix_ms": 1794000000000, "window_end_unix_ms": 1794000060000}]}\n' > "$o3/yb-onerepo-branches.json"
+printf '{"runs": [{"mode": "branches", "projects": 1, "clients": 300, "ops_per_s": 700.0, "p50_ms": 22.0, "p99_ms": 60.0, "errors": 0, "window_start_unix_ms": 1794000000000, "window_end_unix_ms": 1794000060000}]}\n' > "$o6/yb-onerepo-branches.json"
+printf '{"runs": [{"mode": "branches", "projects": 1, "clients": 300, "ops_per_s": 120.0, "branch_merges": 1440, "p50_ms": 90.0, "p99_ms": 300.0, "errors": 0, "window_start_unix_ms": 1794000000000, "window_end_unix_ms": 1794000060000}]}\n' > "$o3/yb-onerepo-merge.json"
+printf '{"runs": [{"mode": "branches", "projects": 1, "clients": 300, "ops_per_s": 130.0, "branch_merges": 1560, "p50_ms": 85.0, "p99_ms": 280.0, "errors": 0, "window_start_unix_ms": 1794000000000, "window_end_unix_ms": 1794000060000}]}\n' > "$o6/yb-onerepo-merge.json"
+rc_one=0; tab_one=$(python3 "$ROOT/deploy/yb-scale-table.py" --gate yb-onerepo --compare "$o3" "$o6") || rc_one=$?
+check "yb-scale-table.py 3-vs-6 single-repo: PASS when branches >= 1.6x even though serialized main merges are 1.08x (reported separately)" '[ $rc_one = 0 ] && [[ "$tab_one" == *"1.75×"* && "$tab_one" == *"INFO (serialized on main)"* && "$tab_one" == *"24.0 -> 26.0"* && "$tab_one" == *"**Verdict: PASS**"* ]]'
+
 echo "== 6b. the object layout: the setting passed through, the servers' own word recorded"
 rm -rf "$T/results"; : > "$FAKE_SSH_LOG"
 rc=0; out=$(VEIL_GCP_OBJECT_LAYOUT=objects "$K/configure.sh" --approve gcpkit-test 2>&1 </dev/null) || rc=$?

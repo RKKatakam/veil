@@ -12,12 +12,13 @@
 #   db<N>-docker-stats.log   each database machine's samples (PostgreSQL's, or YugabyteDB's nodes)
 #   minio-docker-stats.log   the MinIO storage droplet's samples (VEIL_DO_OBJECTS=minio)
 #   minio-restarts.txt       MinIO's restart count before and after the gate (a change fails it)
-#   scaling.md, onerepo.md, failover-verdict.md, failover-*.txt     the gates' own tables and checks
+#   scaling.md, onerepo.md, yb-scale.md, yb-onerepo.md, failover-verdict.md, failover-*.txt  gate tables and checks
 #
 #   bench.sh [--approve] GATE [veil-bench flags...]
 #
-# GATE (deploy/gates.sh): pull land branches onerepo api landing agents scaling failover   (drivers,
-#   against the one address)   objects openscion scale   (the first server's machine,
+# GATE (deploy/gates.sh): pull land branches onerepo api landing agents scaling yb-scale yb-onerepo failover
+#   (drivers, against the one address; set YB_COMPARE_DIR=<3-node results dir> to compare a 6-node yb-scale
+#   or yb-onerepo run against a 3-node baseline)   objects openscion scale   (the first server's machine,
 #   with a server the tool starts itself)   spaces   (the same, its server on a
 #   Spaces bucket, BUCKET-spaces, with /etc/veil/spaces.env's keys, at a rate
 #   under the bucket's limit). Sizes come from the environment

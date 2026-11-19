@@ -19,6 +19,7 @@
 # configure.sh --approve again (MinIO's local SSD comes back empty).
 #
 #   bench.sh [--approve] GATE [veil-bench flags...]     (gates: deploy/gates.sh, not `spaces`)
+#   YB_COMPARE_DIR=<3-node dir> bench.sh --approve yb-scale|yb-onerepo   (3-vs-6 pass/fail report)
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 . "$DO_ROOT/deploy/gates.sh"
