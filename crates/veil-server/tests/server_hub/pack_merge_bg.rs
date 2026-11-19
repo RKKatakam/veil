@@ -172,6 +172,7 @@ fn bug_2310_a_push_never_lists_an_upload_swept_while_it_ran() {
     let api = hub.api();
     push_file(&api, &p, "slow", "src/first.txt");
     let h = hub.hub();
+    hub.rt.block_on(pack_gc::flush_purged(&h)).unwrap();
     let uploads = |hub: &TestHub| -> Vec<(String, i16)> {
         hub.rt
             .block_on(
