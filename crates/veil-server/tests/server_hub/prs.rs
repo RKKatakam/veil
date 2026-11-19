@@ -2593,9 +2593,11 @@ mod s21_cycle3 {
         let t1 = land(&admin, json!([{"path": ".veilrules", "put": {"text": "[review]\nnormal = { approvals = 2 }\n"}}]));
         assert_eq!(normal(), 2);
 
-        // 2. Server lands an unchanged commit t1 -> t2; with P7 reverted,
-        //    `pr_review_rules.checked` advances to `t2`.
-        let t2 = land(&dev, json!([{"path": "src/b2926.rs", "put": {"text": "fn b() {}\n"}}]));
+        // 2. Server lands an unchanged commit t1 -> t2 (by non-admin `dev`);
+        //    with P7 reverted, `pr_review_rules.checked` advances to the real
+        //    `main` tip (`tip(&admin)`), not `dev`'s projected tip.
+        let _dev_proj_t2 = land(&dev, json!([{"path": "src/b2926.rs", "put": {"text": "fn b() {}\n"}}]));
+        let t2 = tip(&admin);
         assert_ne!(t2, t1);
         let (checked_after_t2, state_after_t2): (String, String) = th
             .rt
@@ -2605,7 +2607,7 @@ mod s21_cycle3 {
                     .fetch_one(&hub.db),
             )
             .unwrap();
-        assert_eq!(checked_after_t2, t2.hex(), "pr_review_rules.checked advances to t2");
+        assert_eq!(checked_after_t2, t2.hex(), "pr_review_rules.checked advances to real t2");
 
         // 3. Peer server lands fast-forward t2 -> t3_broken with broken `.veilrules`.
         let t3_broken = land(&admin, json!([{"path": ".veilrules", "put": {"text": BROKEN}}]));
