@@ -2437,15 +2437,13 @@ fn bug_2931_migration_46_refuses_existing_db_with_empty_tables_without_offline()
     });
 }
 
-/// BUG-2932 (YugabyteDB): `verify_rebuilt_indexes` only checks indexes currently
-/// present in `pg_index` and never checks that the 15 required secondary indexes
-/// exist. Following its own error message ("drop/rebuild it and re-run
-/// `veil-server migrate --offline`") after dropping a bad index causes
-/// `migrate --offline` to skip the already-rebuilt table and record version 46
-/// with a missing UNIQUE index (e.g. `landing_queue_ticket`), breaking
-/// `ON CONFLICT (ticket) DO NOTHING`.
+/// BUG-2932 (YugabyteDB): `verify_rebuilt_indexes` must verify that every
+/// expected composite-hash primary key (11 tables, including `access_epochs`)
+/// and every required secondary/UNIQUE index (14 indexes, including
+/// `landing_queue_ticket`, `landing_queue_person_slot`, and
+/// `landing_queue_session_slot`) exists with the expected uniqueness, is
+/// live/ready/valid, and passes `yb_index_check` before recording version 46.
 #[test]
-#[ignore = "BUG-2932: verify_rebuilt_indexes records migration 46 even when required rebuilt secondary/UNIQUE indexes are missing"]
 fn bug_2932_verify_rebuilt_indexes_does_not_check_required_indexes_exist() {
     let rt = runtime();
     if !on_yugabyte(&rt) {
@@ -2457,22 +2455,33 @@ fn bug_2932_verify_rebuilt_indexes_does_not_check_required_indexes_exist() {
         let db = veil_server::db::connect(&url, 2).await.unwrap();
         veil_server::db::migrate_offline(&db).await.unwrap();
 
-        // Simulate an unrecorded retry where a bad rebuilt index was dropped
+        // Simulate an unrecorded retry where a bad rebuilt UNIQUE index was dropped
         // before re-running `veil-server migrate --offline`.
         exec_retrying(&db, "DELETE FROM schema_migrations WHERE version = 46").await;
         exec_retrying(&db, "DROP INDEX landing_queue_ticket").await;
 
-        let res = veil_server::db::migrate_offline(&db).await;
-        let has_ticket: Option<String> = sqlx::query_scalar("SELECT to_regclass('landing_queue_ticket')::text")
-            .fetch_one(&db)
+        let err = veil_server::db::migrate_offline(&db)
             .await
-            .unwrap();
-        db.close().await;
+            .expect_err("migrate_offline must fail when required UNIQUE index landing_queue_ticket is missing");
+        let msg = err.to_string();
+        assert!(msg.contains("landing_queue_ticket"), "error must name missing index landing_queue_ticket, got: {msg}");
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "version 46 must not be recorded when an index is missing");
 
-        assert!(
-            res.is_err() || has_ticket.is_some(),
-            "migrate_offline recorded migration 46 with required UNIQUE index landing_queue_ticket missing"
-        );
+        // Recreating it without UNIQUE must still fail verification.
+        exec_retrying(&db, "CREATE INDEX landing_queue_ticket ON landing_queue (ticket HASH)").await;
+        let err = veil_server::db::migrate_offline(&db)
+            .await
+            .expect_err("migrate_offline must reject non-UNIQUE landing_queue_ticket");
+        let msg = err.to_string();
+        assert!(msg.contains("landing_queue_ticket") && msg.contains("UNIQUE"), "error must flag uniqueness mismatch, got: {msg}");
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "version 46 must not be recorded when uniqueness is wrong");
+
+        // Recreating it properly as UNIQUE lets `migrate_offline` verify and record version 46.
+        exec_retrying(&db, "DROP INDEX landing_queue_ticket").await;
+        exec_retrying(&db, "CREATE UNIQUE INDEX landing_queue_ticket ON landing_queue (ticket HASH)").await;
+        veil_server::db::migrate_offline(&db).await.expect("migrate_offline succeeds once required UNIQUE index is restored");
+        assert!(veil_server::db::schema_current(&db).await.unwrap(), "version 46 recorded after verification passes");
+        db.close().await;
     });
 }
 

@@ -416,7 +416,7 @@ async fn migrate_once(
                             )));
                         }
                         yugabyte_only_steps(&mut *c, parts.transactional, deadline).await?;
-                        verify_rebuilt_indexes(&mut *c, Q4_REBUILT_TABLES, deadline).await?;
+                        verify_rebuilt_indexes(&mut *c, deadline).await?;
                     } else {
                         yugabyte_only_steps(&mut *c, parts.transactional, deadline).await?;
                     }
@@ -529,31 +529,71 @@ async fn yugabyte_only_steps(c: &mut PgConnection, sql: &str, deadline: tokio::t
 }
 
 /// The eleven hot tables rebuilt by migration 0046 (`0046_single_repo_hash_keys.sql`)
-/// on hash-sharded YugabyteDB databases.
-const Q4_REBUILT_TABLES: &[&str] = &[
-    "branches",
-    "snapshots",
-    "origins",
-    "projections",
-    "landed_changes",
-    "landing_queue",
-    "landings",
-    "landing_leases",
-    "packs",
-    "change_refs",
-    "access_epochs",
+/// on hash-sharded YugabyteDB databases, with their required primary key index
+/// name and composite hash key fragment (BUG-2932).
+const Q4_REBUILT_PKS: &[(&str, &str, &str)] = &[
+    ("branches", "branches_pkey", "(project_id, name) HASH"),
+    ("snapshots", "snapshots_pkey", "(project_id, id) HASH"),
+    ("origins", "origins_pkey", "(project_id, real_id) HASH"),
+    ("projections", "projections_pkey", "(project_id, view_key, real_id) HASH"),
+    ("landed_changes", "landed_changes_pkey", "(project_id, branch) HASH"),
+    ("landing_queue", "landing_queue_pkey", "(project_id, branch) HASH"),
+    ("landings", "landings_pkey", "(project_id, branch) HASH"),
+    ("landing_leases", "landing_leases_pkey", "(project_id, branch) HASH"),
+    ("packs", "packs_pkey", "(project_id, name) HASH"),
+    ("change_refs", "change_refs_pkey", "(project_id, change_id) HASH"),
+    ("access_epochs", "access_epochs_pkey", "(project_id, person_id) HASH"),
 ];
 
-/// On YugabyteDB: verify that every secondary index on the tables rebuilt by
-/// migration 0046 reads live/ready/valid and passes `yb_index_check` before
-/// recording the migration (BUG-2920 / BUG-2626).
-async fn verify_rebuilt_indexes(c: &mut PgConnection, tables: &[&str], deadline: tokio::time::Instant) -> Result<()> {
+/// Every required secondary index created by migration 0046
+/// (`0046_single_repo_hash_keys.sql`) on the rebuilt tables:
+/// `(table_name, index_name, is_unique)` (BUG-2932).
+const Q4_EXPECTED_INDEXES: &[(&str, &str, bool)] = &[
+    ("branches", "branches_by_project", false),
+    ("branches", "branches_hidden_embargo", false),
+    ("landing_queue", "landing_queue_active_state", false),
+    ("landing_queue", "landing_queue_finished", false),
+    ("landing_queue", "landing_queue_person_slot", true),
+    ("landing_queue", "landing_queue_queued", false),
+    ("landing_queue", "landing_queue_session_slot", true),
+    ("landing_queue", "landing_queue_ticket", true),
+    ("landings", "landings_at", false),
+    ("landings", "landings_landed", false),
+    ("packs", "packs_listed", false),
+    ("packs", "packs_unlisted", false),
+    ("projections", "projections_by_projected_at", false),
+    ("projections", "projections_by_view_v2", false),
+];
+
+/// On YugabyteDB: verify that every expected composite-hash primary key and
+/// every expected secondary/UNIQUE index on the eleven tables rebuilt by
+/// migration 0046 exists, reads live/ready/valid, and passes `yb_index_check`
+/// before recording the migration (BUG-2920 / BUG-2626 / BUG-2932).
+async fn verify_rebuilt_indexes(c: &mut PgConnection, deadline: tokio::time::Instant) -> Result<()> {
+    let tables: Vec<&str> = Q4_REBUILT_PKS.iter().map(|(t, _, _)| *t).collect();
     let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(STATEMENT_TIMEOUT);
     let ms = left.as_millis();
     sqlx::raw_sql(&format!("SET statement_timeout = {ms}; SET lock_timeout = {ms}")).execute(&mut *c).await?;
     let res = async {
-        let indexes: Vec<(String, bool)> = sqlx::query_as(
-            "SELECT c.relname::text, (i.indislive AND i.indisready AND i.indisvalid) \
+        let pks: Vec<(String, String, bool, String)> = sqlx::query_as(
+            "SELECT t.relname::text, c.relname::text, (i.indislive AND i.indisready AND i.indisvalid), \
+                    pg_get_indexdef(i.indexrelid) \
+             FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = current_schema() \
+               AND i.indisprimary \
+               AND t.relname = ANY($1)",
+        )
+        .bind(&tables)
+        .fetch_all(&mut *c)
+        .await?;
+        let pk_map: std::collections::HashMap<String, (String, bool, String)> =
+            pks.into_iter().map(|(tbl, idx, built, def)| (tbl, (idx, built, def))).collect();
+
+        let indexes: Vec<(String, String, bool, bool)> = sqlx::query_as(
+            "SELECT t.relname::text, c.relname::text, i.indisunique, (i.indislive AND i.indisready AND i.indisvalid) \
              FROM pg_index i \
              JOIN pg_class c ON c.oid = i.indexrelid \
              JOIN pg_class t ON t.oid = i.indrelid \
@@ -563,20 +603,66 @@ async fn verify_rebuilt_indexes(c: &mut PgConnection, tables: &[&str], deadline:
                AND t.relname = ANY($1) \
              ORDER BY c.relname",
         )
-        .bind(tables)
+        .bind(&tables)
         .fetch_all(&mut *c)
         .await?;
-        for (name, built) in indexes {
-            if !built {
-                return Err(Error::Other(anyhow::anyhow!(
-                    "migration 46 rebuilt index {name} is not live, ready, and valid: drop/rebuild it and re-run `veil-server migrate --offline`"
-                )));
+        let idx_map: std::collections::HashMap<(&str, &str), (bool, bool)> =
+            indexes.iter().map(|(tbl, name, uniq, built)| ((tbl.as_str(), name.as_str()), (*uniq, *built))).collect();
+
+        let mut problems: Vec<String> = Vec::new();
+        for &(table, pk_name, hash_fragment) in Q4_REBUILT_PKS {
+            match pk_map.get(table) {
+                None => problems.push(format!("{table}.{pk_name} (missing primary key)")),
+                Some((actual_name, built, def)) => {
+                    if actual_name != pk_name {
+                        problems.push(format!("{table}.{pk_name} (found primary key {actual_name})"));
+                    }
+                    if !built {
+                        problems.push(format!("{table}.{actual_name} (primary key is not live, ready, and valid)"));
+                    }
+                    if !def.contains(hash_fragment) {
+                        problems.push(format!("{table}.{actual_name} (primary key lacks `{hash_fragment}`: {def})"));
+                    }
+                }
             }
-            if let Err(e) = sqlx::query("SELECT yb_index_check(to_regclass($1))").bind(&name).execute(&mut *c).await {
+        }
+        for &(table, name, expect_unique) in Q4_EXPECTED_INDEXES {
+            match idx_map.get(&(table, name)) {
+                None => {
+                    let kind = if expect_unique { "UNIQUE index" } else { "index" };
+                    problems.push(format!("{name} on {table} (missing required {kind})"));
+                }
+                Some(&(is_unique, built)) => {
+                    if is_unique != expect_unique {
+                        let expected = if expect_unique { "UNIQUE" } else { "non-UNIQUE" };
+                        problems.push(format!("{name} on {table} (expected {expected})"));
+                    }
+                    if !built {
+                        problems.push(format!("{name} on {table} (not live, ready, and valid)"));
+                    }
+                }
+            }
+        }
+        for (table, name, _, built) in &indexes {
+            if !built && !Q4_EXPECTED_INDEXES.iter().any(|&(t, n, _)| t == table && n == name) {
+                problems.push(format!("{name} on {table} (not live, ready, and valid)"));
+            }
+        }
+        if !problems.is_empty() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "migration 46 index verification failed: {}; recreate the missing or invalid index(es) from \
+                 0046_single_repo_hash_keys.sql (dropping any invalid copy first) and re-run `veil-server migrate --offline`",
+                problems.join(", ")
+            )));
+        }
+
+        for (_, name, _, _) in &indexes {
+            if let Err(e) = sqlx::query("SELECT yb_index_check(to_regclass($1))").bind(name).execute(&mut *c).await {
                 let code = e.as_database_error().and_then(|d| d.code()).map(|code| code.into_owned());
                 return Err(match code.as_deref() {
                     Some("XX002") => Error::Other(anyhow::anyhow!(
-                        "migration 46 rebuilt index {name} failed yb_index_check ({e}): drop/rebuild it and re-run `veil-server migrate --offline`"
+                        "migration 46 rebuilt index {name} failed yb_index_check ({e}): drop and recreate it from \
+                         0046_single_repo_hash_keys.sql, then re-run `veil-server migrate --offline`"
                     )),
                     Some("57014" | "55P03") => Error::Other(anyhow::anyhow!(
                         "checking rebuilt index {name} against its table did not finish within {MIGRATION_DEADLINE:?} ({e}): \
