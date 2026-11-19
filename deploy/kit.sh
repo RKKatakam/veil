@@ -100,14 +100,24 @@ hub_name() { if [ "$1" = 1 ]; then echo "$NAME-hub"; else echo "$NAME-hub$1"; fi
 # Addresses saved by create.sh: IP_<name with - as _> and PRIV_<…>.
 ip_of() { local v=IP_${1//-/_}; echo "${!v:-}"; }
 priv_of() { local v=PRIV_${1//-/_}; echo "${!v:-}"; }
+# Whether each server needs a local HAProxy TCP round-robin proxy to spread its
+# YSQL connection pool across every YugabyteDB node (e.g. 3 servers on 6 nodes):
+# sqlx connects a pool to one host, so 1:1 pairing leaves YB_NODES - HUBS nodes
+# with no YSQL sessions. With YB_NODES <= HUBS (e.g. 3 servers on 3 nodes),
+# server I talks straight to node I with no proxy hop.
+use_yb_proxy() { [ "$YB_NODES" -gt "$HUBS" ]; }
+YB_PROXY_PORT=15433
 # The database URL the servers and the benchmarks use (private network).
-# With YugabyteDB, server I connects to node I (any node serves the whole
-# database), so the servers' connections are spread over the cluster.
 database_url() { # [server number, default 1]
     local i=${1:-1} n
     if [ "$YB_NODES" -gt 0 ]; then
-        n=$(( (i - 1) % YB_NODES + 1 )); n=$(priv_of "$NAME-yb$n")
-        echo "postgres://yugabyte@${n:-YB${i}_PRIVATE_IP}:5433/$DB_NAME"
+        if use_yb_proxy; then
+            n=$(hub_name "$i"); n=$(priv_of "$n")
+            echo "postgres://yugabyte@${n:-$(hub_name "$i")_PRIVATE_IP}:$YB_PROXY_PORT/$DB_NAME"
+        else
+            n=$(( (i - 1) % YB_NODES + 1 )); n=$(priv_of "$NAME-yb$n")
+            echo "postgres://yugabyte@${n:-YB${i}_PRIVATE_IP}:5433/$DB_NAME"
+        fi
     else echo "postgres://veil:${DB_PASSWORD:-}@$(priv_of "$NAME-db"):5432/$DB_NAME"; fi
 }
 # The object store the servers use: MinIO on the storage droplet's private

@@ -86,7 +86,7 @@ recover() { # names...: start each again, refresh the addresses, bring its servi
     fi
     for n in "$@"; do
         case ${ROLE[$n]} in
-            hub) remote "$(ip_of "$n")" "docker update --restart unless-stopped veil-server >/dev/null; docker start veil-server >/dev/null; for i in \$(seq 60); do [ \"\$(docker inspect -f '{{.State.Health.Status}}' veil-server)\" = healthy ] && break; sleep 1; done; [ \"\$(docker inspect -f '{{.State.Health.Status}}' veil-server)\" = healthy ]" || return 1 ;;
+            hub) remote "$(ip_of "$n")" "if docker inspect yb-proxy >/dev/null 2>&1; then docker start yb-proxy >/dev/null; fi; docker update --restart unless-stopped veil-server >/dev/null; docker start veil-server >/dev/null; for i in \$(seq 60); do [ \"\$(docker inspect -f '{{.State.Health.Status}}' veil-server)\" = healthy ] && break; sleep 1; done; [ \"\$(docker inspect -f '{{.State.Health.Status}}' veil-server)\" = healthy ]" || return 1 ;;
             lb) remote "$(ip_of "$n")" "docker start veil-lb >/dev/null" || return 1 ;;
             cache) remote "$(ip_of "$n")" "docker start veil-cache >/dev/null" || return 1 ;;
         esac

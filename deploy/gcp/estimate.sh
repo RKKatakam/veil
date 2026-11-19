@@ -126,6 +126,15 @@ for t in "none on-demand (VEIL_GCP_SPOT=none)" "hybrid hybrid Spot (hybrid, the 
     [ "$r" != unknown ] || { printf '   %-44s %9s\n' "$label" unknown; continue; }
     printf '   %-44s %9.3f %9.2f %11.2f %13.2f\n' "$label" "$r" "$(echo "$r * $HOURS" | bc -l)" "$(echo "$r * 24" | bc -l)" "$(echo "$r * $MONTH_HOURS" | bc -l)"
 done
+echo
+echo "every topology (VEIL_GCP_SPOT=$SPOT, $HUBS server(s), $DRIVERS driver(s), sizes as above):"
+printf '   %-44s %9s %9s %11s %13s\n' "topology" "USD/hour" "${HOURS} h" "a day left" "a month left"
+for t in "0 PostgreSQL (VEIL_GCP_YB_NODES=0)" "3 YugabyteDB x3 (VEIL_GCP_YB_NODES=3)" "6 YugabyteDB x6 (VEIL_GCP_YB_NODES=6)"; do
+    read -r y label <<<"$t"
+    r=$(YB_NODES=$y model_hourly "$SPOT")
+    [ "$r" != unknown ] || { printf '   %-44s %9s\n' "$label" unknown; continue; }
+    printf '   %-44s %9.3f %9.2f %11.2f %13.2f\n' "$label" "$r" "$(echo "$r * $HOURS" | bc -l)" "$(echo "$r * 24" | bc -l)" "$(echo "$r * $MONTH_HOURS" | bc -l)"
+done
 if [ $LIVE = 0 ] || [ $APPROVED = 0 ]; then echo "(built-in list prices for us-central1, 2026-11-14; confirm with: $0 --live --approve)"; fi
 if [ "$(echo "$planned >= $BUDGET_MAX" | bc -l)" = 1 ]; then
     echo "estimate: planned cost (\$$(printf '%.2f' "$planned")) reaches or exceeds the \$$BUDGET_MAX budget" >&2
