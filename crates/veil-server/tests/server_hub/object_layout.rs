@@ -1,17 +1,13 @@
 //! The `objects` server object layout (`docs/design/server/object-layout.md`
-//! §8.1, guarantees 1–11): each kept object stored under its own key
-//! `p/<project>/<2 hex>/<62 hex>`, uploads staged in containers that are
-//! marked discarded in the push's statement and deleted from storage and
-//! `packs` after commit, always-write rule on kept objects, mixed-layout
-//! deployments, GC races, object routes, landing batches, crash recovery and
-//! one-shot leftover pack merging.
+//! §8.1): each kept object stored under its own key `p/<project>/<2 hex>/<62 hex>`,
+//! uploads staged in containers that are marked discarded in the push's
+//! statement and deleted from storage and `packs` after commit, always-write
+//! rule on kept objects, pre-existing `LISTED` packs readable alongside loose
+//! objects, object routes, landing batches, and crash recovery.
 
 use std::{
     collections::HashSet,
-    sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
-        Arc,
-    },
+    sync::{atomic::Ordering::Relaxed, Arc},
     time::{Duration, Instant},
 };
 
@@ -25,15 +21,10 @@ use veil_core::{
     object::{Object as O, Snapshot, Text, Visibility},
     ChangeId, Identity, ObjectId,
 };
-use veil_server::{
-    pack_gc::{self, Fault, FaultPoint, Options},
-    ObjectLayout,
-};
 
 use crate::{
     landing_hold::{packs_in, whole_tree_beside},
     limits::{hold_branch, land_edit, release_branch},
-    pack_gc::gc_pass,
     support::*,
 };
 
@@ -204,47 +195,6 @@ fn wait_landed(api: &Api, token: &str, project: &str, ticket: &str) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("ticket {ticket} still queued");
-}
-
-async fn is_yugabyte(db: &sqlx::PgPool) -> bool {
-    let v: String = sqlx::query_scalar("SELECT version()").fetch_one(db).await.unwrap_or_default();
-    v.contains("-YB-")
-}
-
-async fn wait_for_sql_lock(db: &sqlx::PgPool, query_like: &str, msg: &str) {
-    if is_yugabyte(db).await {
-        let end = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < end {
-            let active: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND query LIKE $1",
-            )
-            .bind(query_like)
-            .fetch_one(db)
-            .await
-            .unwrap_or(0);
-            if active > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        return;
-    }
-    let until = Instant::now() + Duration::from_secs(30);
-    loop {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1",
-        )
-        .bind(query_like)
-        .fetch_one(db)
-        .await
-        .unwrap_or(0);
-        if waiting > 0 {
-            return;
-        }
-        assert!(Instant::now() < until, "{msg}");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
 }
 
 /// Guarantee 1 (`object-layout.md` §8.1): a push keeps each object under its
@@ -650,40 +600,64 @@ fn guarantee_5_race_loser_retries_with_same_receipts_and_no_new_upload() {
     assert_eq!((f.status, String::from_utf8_lossy(&f.body).to_string()), (200, blob_text.to_string()));
 }
 
-/// Guarantee 6 (`object-layout.md` §8.1): two servers on one database and
-/// store, one `packs`, one `objects`: each reads what the other pushed, on
-/// every read (`get`, `get_many`, `get_range`, `fetch`), and after each
-/// restarts with the other setting.
+/// Guarantee 6 (`object-layout.md` §8.1): pre-existing `LISTED` packs written
+/// by an older server and new loose objects written by v1 servers coexist on
+/// one database and store; every read path (`get`, `get_many`, `get_range`,
+/// `fetch`) reads both, through warm and cold caches, a second server, and
+/// after a restart.
 #[test]
 fn guarantee_6_mixed_packs_and_objects_servers_read_every_way_and_after_swapping_layouts() {
-    let hub_packs = TestHub::start_with_layout(ObjectLayout::Packs);
-    let hub_objs = TestHub::beside_with_layout(&hub_packs, ObjectLayout::Objects);
-    let p = setup_project(&hub_packs);
-    let pid = project_id(&hub_packs, &p.name);
+    let hub_a = TestHub::start();
+    let p = setup_project(&hub_a);
+    let pid = project_id(&hub_a, &p.name);
 
-    // Push A through the `packs` server (stored in a listed pack, not loose).
+    // Push A, then relocate `id_a1`/`id_a2` exclusively into a pre-existing `LISTED` pack
+    // (deleting their loose keys) so they model data written by an older packs-layout server.
     let (id_a1, raw_a1) = plain_blob(0x1234_5678_9abc_def0, "PACKS-SERVER-A1:");
     let (id_a2, raw_a2) = plain_blob(0x0fed_cba9_8765_4321, "PACKS-SERVER-A2:");
     {
-        let api_p = hub_packs.api();
-        let mut ca = Craft::new(&api_p, &p.admin, &p.name, "main");
+        let api_a = hub_a.api();
+        let mut ca = Craft::new(&api_a, &p.admin, &p.name, "main");
         let O::Blob(b1) = O::decode(&raw_a1).unwrap() else { unreachable!() };
         let O::Blob(b2) = O::decode(&raw_a2).unwrap() else { unreachable!() };
         ca.set("src/from_packs_1.bin", O::Blob(b1), Visibility::Public);
         ca.set("src/from_packs_2.bin", O::Blob(b2), Visibility::Public);
-        let ra = ca.push("main", "pushed on packs server");
+        let ra = ca.push("main", "pushed before migration to objects");
         assert_eq!(ra.status, 200, "{}", String::from_utf8_lossy(&ra.body));
         assert_eq!(ra.json()["results"][0]["ok"], json!(true));
     }
-    assert!(!hub_packs.rt.block_on(hub_packs.blob_store().exists(&veil_server::store::object_key(pid, &id_a1))).unwrap(), "id_a1 is in a pack, not loose");
+    hub_a.rt.block_on(async {
+        let ha = hub_a.hub();
+        let entries = vec![
+            (id_a1, veil_server::store::encode(Bytes::from(raw_a1.clone()))),
+            (id_a2, veil_server::store::encode(Bytes::from(raw_a2.clone()))),
+        ];
+        let (pname, held) = ha.objects.put_pack(pid, 1, entries).await.unwrap();
+        sqlx::query("UPDATE packs SET state = 1 WHERE project_id = $1 AND name = $2")
+            .bind(pid)
+            .bind(&*pname)
+            .execute(&ha.db)
+            .await
+            .unwrap();
+        ha.objects.listed_here(pid, vec![(pname, held.index.clone())]);
+        hub_a.blob_store().delete(&veil_server::store::object_key(pid, &id_a1)).await.unwrap();
+        hub_a.blob_store().delete(&veil_server::store::object_key(pid, &id_a2)).await.unwrap();
+    });
+    assert!(
+        !hub_a.rt.block_on(hub_a.blob_store().exists(&veil_server::store::object_key(pid, &id_a1))).unwrap(),
+        "id_a1 lives exclusively in a pre-existing listed pack, not loose"
+    );
 
-    // Push B through the `objects` server (stored loose, lists no new pack, leaves `packs` server's listed packs untouched).
-    let listed_after_a = pack_counts(&hub_packs, pid).1;
+    let hub_b = TestHub::beside(&hub_a);
+
+    // Push B through the second server (stored loose, lists no new pack, leaves the listed pack untouched).
+    let listed_after_a = pack_counts(&hub_a, pid).1;
+    assert_eq!(listed_after_a, 1);
     let (id_b1, raw_b1) = plain_blob(0xaaaa_bbbb_cccc_dddd, "OBJECTS-SERVER-B1:");
     let (id_b2, raw_b2) = plain_blob(0x1122_3344_5566_7788, "OBJECTS-SERVER-B2:");
     {
-        let api_o = hub_objs.api();
-        let mut cb = Craft::new(&api_o, &p.admin, &p.name, "main");
+        let api_b = hub_b.api();
+        let mut cb = Craft::new(&api_b, &p.admin, &p.name, "main");
         let O::Blob(b1) = O::decode(&raw_b1).unwrap() else { unreachable!() };
         let O::Blob(b2) = O::decode(&raw_b2).unwrap() else { unreachable!() };
         cb.set("src/from_objs_1.bin", O::Blob(b1), Visibility::Public);
@@ -692,8 +666,8 @@ fn guarantee_6_mixed_packs_and_objects_servers_read_every_way_and_after_swapping
         assert_eq!(rb.status, 200, "{}", String::from_utf8_lossy(&rb.body));
         assert_eq!(rb.json()["results"][0]["ok"], json!(true));
     }
-    assert_eq!(pack_counts(&hub_objs, pid).1, listed_after_a, "objects server kept existing listed packs and listed no new pack");
-    assert!(hub_objs.rt.block_on(hub_objs.blob_store().exists(&veil_server::store::object_key(pid, &id_b1))).unwrap(), "id_b1 is stored loose");
+    assert_eq!(pack_counts(&hub_b, pid).1, listed_after_a, "objects server kept existing listed pack and listed no new pack");
+    assert!(hub_b.rt.block_on(hub_b.blob_store().exists(&veil_server::store::object_key(pid, &id_b1))).unwrap(), "id_b1 is stored loose");
 
     let items = [
         ("src/from_packs_1.bin", id_a1, &raw_a1),
@@ -754,154 +728,13 @@ fn guarantee_6_mixed_packs_and_objects_servers_read_every_way_and_after_swapping
     };
 
     let tok = p.dev.token();
-    check_all_reads(&hub_packs, &tok, "before swap: packs server");
-    check_all_reads(&hub_objs, &tok, "before swap: objects server");
+    check_all_reads(&hub_a, &tok, "server A");
+    check_all_reads(&hub_b, &tok, "server B");
 
-    // Restart each server with the OTHER layout setting.
-    let hub_now_objs = hub_packs.restart_with_layout(ObjectLayout::Objects, |_| {});
-    let hub_now_packs = hub_objs.restart_with_layout(ObjectLayout::Packs, |_| {});
-    assert_eq!(veil_server::stats_json(&hub_now_objs.hub(), 0)["object_layout"], json!("objects"));
-    assert_eq!(veil_server::stats_json(&hub_now_packs.hub(), 0)["object_layout"], json!("packs"));
-
-    check_all_reads(&hub_now_objs, &tok, "after swap: server switched packs -> objects");
-    check_all_reads(&hub_now_packs, &tok, "after swap: server switched objects -> packs");
-}
-
-/// Guarantee 7 (`object-layout.md` §8.1): a push whose object GC deletes
-/// between its write and its commit runs again and stores it again; the landed
-/// tip reads whole (the push's twin of BUG-2621's test).
-#[test]
-fn guarantee_7_push_whose_object_gc_deletes_between_write_and_commit_retries_and_stores_again() {
-    const CONTENT: &str = "MARKER-G7-PUSH-DURING-GC-DELETE-0e7a\n";
-    let th = TestHub::start_objects();
-    let p = setup_project(&th);
-    let pid = project_id(&th, &p.name);
-    let api = th.api();
-    let admin_tok = p.admin.token();
-    let h = th.hub();
-    settle(&th);
-
-    let (victim_id, victim_raw) = blob(CONTENT);
-    th.rt.block_on(h.objects.put(pid, &victim_id, Bytes::from(victim_raw))).unwrap();
-    let marked = gc_pass(
-        &th,
-        pid,
-        &Options {
-            min_packs_to_merge: 99,
-            run_gc: true,
-            retention_window_ms: 60_000,
-            ..Options::default()
-        },
-    );
-    assert!(!marked.skipped, "marking pass ran");
-
-    let answer: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<Reply>>>> = Arc::default();
-    let kept_before_push = Arc::new(AtomicUsize::new(0));
-    let push_obj_count = Arc::new(AtomicUsize::new(0));
-
-    let fault = {
-        let (db, h2, answer) = (h.db.clone(), h.clone(), answer.clone());
-        let (kept_before_push, push_obj_count) = (kept_before_push.clone(), push_obj_count.clone());
-        let (authority, cert, tok, name, identity) = (
-            th.authority(),
-            th.cert_pem.clone(),
-            admin_tok.clone(),
-            p.name.clone(),
-            p.admin.identity(),
-        );
-        Fault(Arc::new(move |at, id| {
-            let (db, h2, answer) = (db.clone(), h2.clone(), answer.clone());
-            let (kept_before_push, push_obj_count) = (kept_before_push.clone(), push_obj_count.clone());
-            let (authority, cert, tok, name, identity) = (
-                authority.clone(),
-                cert.clone(),
-                tok.clone(),
-                name.clone(),
-                identity.clone(),
-            );
-            Box::pin(async move {
-                if at == FaultPoint::LooseDelete && id == victim_id {
-                    let api_in = Api::at(&authority, &cert);
-                    let mut c = Craft::with(&api_in, tok.clone(), identity, &name, "main");
-                    c.file("src/g7_reborn.txt", CONTENT);
-                    let s = {
-                        let t = c.tip;
-                        snap(&mut c, vec![t], "g7 push racing loose delete", None)
-                    };
-                    let n_objs = c.objects.len();
-                    push_obj_count.store(n_objs, Relaxed);
-                    let (map, _) = upload_all(&api_in, &c);
-                    let tip = c.tip;
-                    let kb = h2.objects.objects_kept.load(Relaxed) as usize;
-                    kept_before_push.store(kb, Relaxed);
-
-                    let (tx, rx) = std::sync::mpsc::channel::<Reply>();
-                    std::thread::spawn(move || {
-                        let r = push_body(&api_in, &tok, &name, "main", Some(tip), s, &map);
-                        let _ = tx.send(r);
-                    });
-                    *answer.lock().unwrap() = Some(rx);
-
-                    // Wait until the push has completed `Objects::keep` (written `victim_id`!) and
-                    // is blocked at `guard_root_write` behind GC's exclusive gate.
-                    let deadline = Instant::now() + Duration::from_secs(30);
-                    while (h2.objects.objects_kept.load(Relaxed) as usize) < kb + n_objs {
-                        assert!(Instant::now() < deadline, "push never finished first Objects::keep");
-                        tokio::time::sleep(Duration::from_millis(15)).await;
-                    }
-                    wait_for_sql_lock(
-                        &db,
-                        "SELECT e.epoch FROM (SELECT pg_advisory_xact_lock_shared%",
-                        "push never reached guard_root_write",
-                    )
-                    .await;
-                }
-                Ok(())
-            })
-        }))
-    };
-
-    let rep = th
-        .rt
-        .block_on(pack_gc::run_project(
-            &h,
-            pid,
-            &Options {
-                min_packs_to_merge: 99,
-                run_gc: true,
-                retention_window_ms: 60_000,
-                pack_grace_ms: 0,
-                now_offset_ms: 120_000,
-                fault: Some(fault),
-                ..Options::default()
-            },
-        ))
-        .expect("GC pass with racing push succeeded");
-    assert!(!rep.skipped, "GC pass ran: {rep:?}");
-    assert!(rep.loose_objects_deleted >= 1, "GC deleted victim_id between push's first write and commit: {rep:?}");
-
-    let rx = answer.lock().unwrap().take().expect("push started during LooseDelete");
-    let r = rx.recv_timeout(Duration::from_secs(60)).expect("push answered after retry");
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r.body));
-
-    let kb = kept_before_push.load(Relaxed) as u64;
-    let n_objs = push_obj_count.load(Relaxed) as u64;
-    assert!(
-        h.objects.objects_kept.load(Relaxed) >= kb + 2 * n_objs,
-        "push ran Objects::keep a second time on GcMoved retry and stored every object again"
-    );
-    assert_eq!(pack_counts(&th, pid), (0, 0, 0), "staged container kept across retry, then purged after commit");
-
-    // Verify in the raw blob store and from a second server with empty caches.
-    assert!(
-        th.rt.block_on(th.blob_store().exists(&veil_server::store::object_key(pid, &victim_id))).unwrap(),
-        "victim_id was written again by the push retry"
-    );
-    let tip = api.tips(Some(&admin_tok), &p.name).unwrap().branches["main"];
-    assert!(whole_tree_beside(&th, pid, tip) >= 2, "landed tip reads whole from a fresh server");
-    let f = api.get(Some(&admin_tok), &format!("/v1/projects/{}/q/file?rev={}&path=src/g7_reborn.txt", p.name, tip.hex()));
-    assert_eq!((f.status, String::from_utf8_lossy(&f.body).to_string()), (200, CONTENT.to_string()));
+    // Restart server A and verify both legacy packs and loose objects remain readable.
+    let hub_restarted = hub_a.restart(|_| {});
+    assert_eq!(veil_server::stats_json(&hub_restarted.hub(), 0)["object_layout"], json!("objects"));
+    check_all_reads(&hub_restarted, &tok, "after restart");
 }
 
 /// Guarantee 8 (`object-layout.md` §8.1): object routes over loose objects
@@ -1113,42 +946,8 @@ fn guarantee_9_landing_batch_keeps_loose_and_failed_batch_leaves_only_collectibl
     let tip2 = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
     assert_ne!(tip2, base2);
 
-    // Run GC pass 1 inside retention window (`now_offset_ms = 0`): nothing collected yet, marks unreferenced objects.
-    let rep_in_win = gc_pass(
-        &hub,
-        pid,
-        &Options {
-            min_packs_to_merge: 99,
-            run_gc: true,
-            retention_window_ms: 60_000,
-            now_offset_ms: 0,
-            ..Options::default()
-        },
-    );
-    assert_eq!(rep_in_win.loose_objects_deleted, 0, "nothing deleted inside retention window");
-    for k in &attempt1_written {
-        assert!(hub.rt.block_on(store.exists(k)).unwrap(), "unreferenced batch object {k} retained inside window");
-    }
-
-    // Run GC pass 2 past retention window (`now_offset_ms = 120_000`): failed batch's unreferenced objects are collected!
-    let rep_past = gc_pass(
-        &hub,
-        pid,
-        &Options {
-            min_packs_to_merge: 99,
-            run_gc: true,
-            retention_window_ms: 60_000,
-            pack_grace_ms: 0,
-            now_offset_ms: 120_000,
-            ..Options::default()
-        },
-    );
-    assert!(rep_past.loose_objects_deleted >= 1, "failed batch's unreferenced objects collected: {rep_past:?}");
-    let keys_after_gc = loose_keys_in_store(&hub, pid);
-    let collected: Vec<_> = attempt1_written.difference(&keys_after_gc).collect();
-    assert!(!collected.is_empty(), "attempt 1's orphaned trees/snapshots were deleted by GC");
-
-    // Landed `[1, 2]` still read whole!
+    // Landed `[1, 2]` read whole, and no pack was listed!
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "retried landing batch lists no pack");
     assert!(whole_tree_beside(&hub, pid, tip2) >= 5);
     for i in 1..3 {
         let f = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path=src/g9_lost{i}/f.rs", p.name, tip2.hex()));
@@ -1340,44 +1139,11 @@ fn guarantee_10_stop_between_push_writes_and_commit_keeps_staged_collects_orphan
     assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "staged containers purged once retry landed");
     settle(&hub);
 
-    // 4. GC inside window keeps everything; GC past window collects the unreferenced objects from the
-    //    stopped push ("the rest") while NEVER collecting the hidden embargo line!
-    let s1_key = veil_server::store::object_key(pid, &s1);
-    assert!(hub.rt.block_on(hub.blob_store().exists(&s1_key)).unwrap(), "orphaned s1 from stopped push is in store before GC");
-
-    let r_gc1 = gc_pass(
-        &hub,
-        pid,
-        &Options {
-            min_packs_to_merge: 99,
-            run_gc: true,
-            retention_window_ms: 60_000,
-            now_offset_ms: 0,
-            ..Options::default()
-        },
-    );
-    assert_eq!(r_gc1.loose_objects_deleted, 0);
-    assert!(hub.rt.block_on(hub.blob_store().exists(&s1_key)).unwrap(), "orphaned s1 kept inside retention window");
-
-    let r_gc2 = gc_pass(
-        &hub,
-        pid,
-        &Options {
-            min_packs_to_merge: 99,
-            run_gc: true,
-            retention_window_ms: 60_000,
-            pack_grace_ms: 0,
-            now_offset_ms: 180_000,
-            ..Options::default()
-        },
-    );
-    assert!(r_gc2.loose_objects_deleted >= 1, "orphaned loose objects from stopped push collected: {r_gc2:?}");
-    assert!(!hub.rt.block_on(hub.blob_store().exists(&s1_key)).unwrap(), "orphaned s1 collected after retention window");
-
-    // Embargo hidden line was NEVER collected, and releases cleanly onto `main`!
+    // 4. Append-only storage keeps both the interrupted push's written objects and the embargo
+    //    hidden line intact, and the embargo releases cleanly onto `main`!
     assert!(
         hub.rt.block_on(hub.blob_store().exists(&veil_server::store::object_key(pid, &emb_blob_id))).unwrap(),
-        "embargoed blob never collected by GC"
+        "embargoed blob stays stored"
     );
     let rel = api.post_json(
         Some(&sec_tok),
@@ -1391,10 +1157,10 @@ fn guarantee_10_stop_between_push_writes_and_commit_keeps_staged_collects_orphan
 }
 
 /// Guarantee 11 (`object-layout.md` §8.1): pushes schedule no merge and list no
-/// pack; a project with leftover small packs is merged down once and every
-/// object still reads on two servers. `stats.json` names the layout.
+/// pack; pre-existing small `LISTED` packs stay readable untouched across two
+/// servers without online merging, and `stats.json` names the layout.
 #[test]
-fn guarantee_11_pushes_schedule_no_merge_leftover_small_packs_merge_once_and_stats_names_layout() {
+fn guarantee_11_pushes_schedule_no_merge_preexisting_packs_stay_readable_and_stats_names_layout() {
     let hub = TestHub::start_objects();
     let other = TestHub::beside(&hub);
     assert_eq!(veil_server::stats_json(&hub.hub(), 0)["object_layout"], json!("objects"));
@@ -1404,142 +1170,69 @@ fn guarantee_11_pushes_schedule_no_merge_leftover_small_packs_merge_once_and_sta
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
 
-    // 1. Pushes in `objects` mode (>= MERGE_MIN_PACKS + 8 pushes) list no pack and schedule no merge.
-    let pushes = pack_gc::MERGE_MIN_PACKS + 8;
-    for i in 0..pushes {
+    // 1. Pushes in `objects` mode list no pack and leave no pack row.
+    const PUSHES: usize = 16;
+    for i in 0..PUSHES {
         let mut c = Craft::new(&api, &p.admin, &p.name, "main");
         c.file(&format!("src/g11_push/p{i}.txt"), &format!("g11 push {i}\n"));
         let r = c.push_to(&format!("b11-{i}"), None);
         assert_eq!(r.status, 200, "push {i}: {}", String::from_utf8_lossy(&r.body));
         assert_eq!(r.json()["results"][0]["ok"], json!(true));
     }
-    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "{pushes} pushes listed no pack and left no row");
-    assert!(packs_in_store(&hub, pid).is_empty(), "{pushes} pushes wrote no pack in storage");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "{PUSHES} pushes listed no pack and left no row");
+    assert!(packs_in_store(&hub, pid).is_empty(), "{PUSHES} pushes wrote no pack in storage");
 
-    // 2. A project with leftover small listed packs (as from before switching `--object-layout` to
-    //    `objects`) is merged down once when its listing is loaded, and every object still reads on
-    //    both `objects` servers (`hub` and `other`)!
-    let leftover_blobs = pack_gc::MERGE_MIN_PACKS + 6;
-    let mut sample_blobs: Vec<(ObjectId, Bytes)> = Vec::with_capacity(leftover_blobs);
-    let (p_left, pid_left, total_before_merge) = {
-        let init_srv = TestHub::beside(&hub);
-        let p_left = setup_project(&init_srv);
-        let pid_left = project_id(&init_srv, &p_left.name);
-        drop(init_srv);
+    // 2. A project with pre-existing small `LISTED` packs (written by an older server) keeps all
+    //    of them readable untouched across both servers without merging, and later pushes list no
+    //    new pack.
+    const LEGACY_BLOBS: usize = 10;
+    let p_left = setup_project(&hub);
+    let pid_left = project_id(&hub, &p_left.name);
+    let mut sample_blobs: Vec<(ObjectId, Bytes)> = Vec::with_capacity(LEGACY_BLOBS);
+    let mut c_left = Craft::new(&api, &p_left.admin, &p_left.name, "main");
+    for i in 0..LEGACY_BLOBS {
+        let text = format!("MARKER-G11-LEFTOVER-PACK-BLOB-{i:03}\n");
+        let (bid, braw_vec) = blob(&text);
+        sample_blobs.push((bid, Bytes::from(braw_vec)));
+        c_left.file(&format!("src/leftover/f{i:03}.txt"), &text);
+    }
+    let s_left = {
+        let t = c_left.tip;
+        snap(&mut c_left, vec![t], "legacy pack files", None)
+    };
+    let (map_left, _) = upload_all(&api, &c_left);
+    let r_left = push_body(&api, &c_left.token, &p_left.name, "main", Some(c_left.tip), s_left, &map_left);
+    assert_eq!(r_left.status, 200, "{}", String::from_utf8_lossy(&r_left.body));
+    assert_eq!(r_left.json()["results"][0]["ok"], json!(true));
+    settle(&hub);
 
-        let hub_packs = TestHub::beside_with_layout(&hub, ObjectLayout::Packs);
-        let api_packs = hub_packs.api();
-
-        // Push one commit adding `leftover_blobs` files through the real push path on `hub_packs`
-        // so `branches`, `snapshots` and `projections` are committed normally.
-        let mut c_left = Craft::new(&api_packs, &p_left.admin, &p_left.name, "main");
-        for i in 0..leftover_blobs {
-            let text = format!("MARKER-G11-LEFTOVER-PACK-BLOB-{i:03}\n");
-            let (bid, braw_vec) = blob(&text);
-            sample_blobs.push((bid, Bytes::from(braw_vec)));
-            c_left.file(&format!("src/leftover/f{i:03}.txt"), &text);
-        }
-        let s_left = {
-            let t = c_left.tip;
-            snap(&mut c_left, vec![t], "leftover pack files", None)
-        };
-        let (map_left, combined_pack) = upload_all(&api_packs, &c_left);
-        let r_left = push_body(&api_packs, &c_left.token, &p_left.name, "main", Some(c_left.tip), s_left, &map_left);
-        assert_eq!(r_left.status, 200, "{}", String::from_utf8_lossy(&r_left.body));
-        assert_eq!(r_left.json()["results"][0]["ok"], json!(true));
-        settle(&hub_packs);
-
-        // Split `combined_pack` into one small `LISTED` pack per blob plus one small `LISTED` pack
-        // for the trees and snapshot, removing `combined_pack` so every blob lives exclusively in
-        // its own small `LISTED` pack before `hub` or `other` ever loads `pid_left`.
-        let hp = hub_packs.hub();
-        let blob_id_set: HashSet<ObjectId> = sample_blobs.iter().map(|(id, _)| *id).collect();
-        let mut non_blobs = Vec::new();
-        let mut seen = HashSet::new();
-        for (id, raw) in &c_left.objects {
-            if !blob_id_set.contains(id) && seen.insert(*id) {
-                non_blobs.push((*id, veil_server::store::encode(Bytes::from(raw.clone()))));
-            }
-        }
-        hub_packs.rt.block_on(async {
-            for (bid, braw) in &sample_blobs {
-                let enc = veil_server::store::encode(braw.clone());
-                let (pname, _) = hp.objects.put_job_pack(pid_left, vec![(*bid, enc)]).await.unwrap();
-                sqlx::query("UPDATE packs SET state = 1 WHERE project_id = $1 AND name = $2")
-                    .bind(pid_left)
-                    .bind(&*pname)
-                    .execute(&hp.db)
-                    .await
-                    .unwrap();
-            }
-            let (tname, _) = hp.objects.put_job_pack(pid_left, non_blobs).await.unwrap();
+    // Move each sample blob out of loose storage into its own small `LISTED` pack so every blob
+    // lives exclusively in a pre-existing pack before `other` ever reads `pid_left`.
+    let h = hub.hub();
+    hub.rt.block_on(async {
+        for (bid, braw) in &sample_blobs {
+            let enc = veil_server::store::encode(braw.clone());
+            let (pname, held) = h.objects.put_pack(pid_left, 1, vec![(*bid, enc)]).await.unwrap();
             sqlx::query("UPDATE packs SET state = 1 WHERE project_id = $1 AND name = $2")
                 .bind(pid_left)
-                .bind(&*tname)
-                .execute(&hp.db)
+                .bind(&*pname)
+                .execute(&h.db)
                 .await
                 .unwrap();
-            sqlx::query("DELETE FROM packs WHERE project_id = $1 AND name = $2")
-                .bind(pid_left)
-                .bind(&combined_pack)
-                .execute(&hp.db)
-                .await
-                .unwrap();
-            hub_packs.blob_store().delete(&veil_server::pack::key(pid_left, &combined_pack)).await.unwrap();
-        });
-        let total = pack_counts(&hub_packs, pid_left).1 as usize;
-        assert!(total > leftover_blobs, "expected > {leftover_blobs} listed small packs, got {total}");
-        (p_left, pid_left, total)
-    };
-
-    let h = hub.hub();
-    // Reading from `other` (cold listing for `pid_left`, running `ObjectLayout::Objects`) loads the
-    // listing and schedules the one-shot leftover merge!
-    let got0 = other.rt.block_on(other.hub().objects.get(pid_left, &sample_blobs[0].0)).unwrap().expect("reads from leftover pack");
-    assert_eq!(got0, sample_blobs[0].1);
-
-    let until = Instant::now() + Duration::from_secs(30);
-    while pack_counts(&hub, pid_left).1 >= pack_gc::MERGE_MIN_PACKS as i64 && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let (_, listed_after, discarded_after) = pack_counts(&hub, pid_left);
-    assert_eq!(listed_after, 1, "leftover small packs merged down to 1 pack (listed={listed_after}, discarded={discarded_after})");
-    assert_eq!(discarded_after, total_before_merge as i64, "all {total_before_merge} small packs marked discarded");
-
-    // Sweep discarded packs (grace = 0) once `other`'s background merge pass
-    // releases the project's advisory lock, so old packs are physically deleted
-    // from storage, and verify every single object reads back byte-identically
-    // on BOTH servers (`hub` and `other`)!
-    let sweep_opts = Options {
-        min_packs_to_merge: 99,
-        run_gc: false,
-        pack_grace_ms: 0,
-        ..Options::default()
-    };
-    let sweep = {
-        let mut tries = 0;
-        loop {
-            tries += 1;
-            match hub.rt.block_on(pack_gc::run_project(&h, pid_left, &sweep_opts)) {
-                Ok(r) if r.skipped && tries < 40 => std::thread::sleep(Duration::from_millis(25)),
-                Ok(r) => break r,
-                Err(e) if e.is_retryable() && tries < 40 => std::thread::sleep(Duration::from_millis(25)),
-                Err(e) => panic!("sweep pass: {e:?}"),
-            }
+            h.objects.listed_here(pid_left, vec![(pname, held.index.clone())]);
+            hub.blob_store().delete(&veil_server::store::object_key(pid_left, bid)).await.unwrap();
         }
-    };
-    assert!(!sweep.skipped);
-    assert_eq!(sweep.discarded_packs_swept, total_before_merge);
-    assert_eq!(pack_counts(&hub, pid_left), (0, 1, 0));
+    });
+    assert_eq!(pack_counts(&hub, pid_left), (0, LEGACY_BLOBS as i64, 0));
 
     let other_api = other.api();
     let tok_left = p_left.dev.token();
     for (i, (bid, expected)) in sample_blobs.iter().enumerate() {
-        let g1 = hub.rt.block_on(h.objects.get(pid_left, bid)).unwrap().expect("hub reads merged pack");
-        let g2 = other.rt.block_on(other.hub().objects.get(pid_left, bid)).unwrap().expect("other reads merged pack");
+        let g1 = hub.rt.block_on(h.objects.get(pid_left, bid)).unwrap().expect("hub reads legacy pack");
+        let g2 = other.rt.block_on(other.hub().objects.get(pid_left, bid)).unwrap().expect("other reads legacy pack");
         assert_eq!(&g1, expected, "hub blob {i}");
         assert_eq!(&g2, expected, "other blob {i}");
-        if i % 17 == 0 {
+        if i % 3 == 0 {
             assert_eq!(
                 read_file(&other_api, &tok_left, &p_left.name, &format!("src/leftover/f{i:03}.txt")).as_deref(),
                 Some(&expected[10..])
@@ -1547,15 +1240,19 @@ fn guarantee_11_pushes_schedule_no_merge_leftover_small_packs_merge_once_and_sta
         }
     }
 
-    // Further pushes on `hub` (`ObjectLayout::Objects`) list no new pack, leaving only the 1 merged pack.
+    // Further pushes on `hub` list no new pack and leave all pre-existing `LISTED` packs untouched.
     for i in 0..4 {
         let mut c_more = Craft::new(&api, &p_left.admin, &p_left.name, "main");
-        c_more.file(&format!("src/after_merge/m{i}.txt"), &format!("after merge {i}\n"));
-        let r = c_more.push("main", &format!("after merge {i}"));
+        c_more.file(&format!("src/after_legacy/m{i}.txt"), &format!("after legacy {i}\n"));
+        let r = c_more.push("main", &format!("after legacy {i}"));
         assert_eq!(r.status, 200);
         assert_eq!(r.json()["results"][0]["ok"], json!(true));
     }
-    assert_eq!(pack_counts(&hub, pid_left), (0, 1, 0), "later pushes in objects layout list no pack");
+    assert_eq!(
+        pack_counts(&hub, pid_left),
+        (0, LEGACY_BLOBS as i64, 0),
+        "later pushes list no pack and pre-existing listed packs are never merged or discarded"
+    );
 }
 
 /// BUG-2661 (part 1): in `objects` mode, a staged container `C1` that an
@@ -1829,7 +1526,7 @@ fn bug_2661_vanished_receipted_container_answers_409_and_keeps_sibling_uploads()
     let hub = TestHub::start_objects();
     let store = hub.blob_store();
     let vanish = VanishOnEntryStore::wrap(store.clone());
-    let cold = TestHub::beside_with_store(&hub, ObjectLayout::Objects, vanish.clone());
+    let cold = TestHub::beside_with_store(&hub, vanish.clone());
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();

@@ -2176,63 +2176,6 @@ fn bug_1875_a_pr_onto_a_rewritten_line_is_closed_at_release_and_lands_nothing_un
     assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], before);
 }
 
-/// BUG-1875: the collector's roots keep an embargoed fix until it has
-/// landed. The embargo's only PR is closed and its release is held (no
-/// approval); garbage collection, past its retention window, keeps the fix
-/// (the held line is a root), and once approved it lands whole.
-#[test]
-fn bug_1875_the_collector_keeps_a_held_embargos_fix_until_it_lands() {
-    use veil_server::pack_gc::{self, Options};
-    const FIX_FILE: &str = "pub const FIX: &str = \"GC_KEEPS_HELD_FIX_1875\";\n";
-    let hub = TestHub::start();
-    let (p, rev1) = protected_project(&hub);
-    let api = hub.api();
-    let (sec, dev) = (p.sec.token(), p.dev.token());
-    let h = hub.hub();
-    let pid: i64 = hub.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&h.db)).unwrap();
-    let (eid, _, _, _) = push_embargo(
-        &hub,
-        &p.name,
-        &p.sec,
-        "gc-1875",
-        "security",
-        Some(veil_core::now_millis() + 3_600_000),
-        &[("src/gc_1875.rs", FIX_FILE)],
-        "an embargoed fix",
-    );
-    let line = format!("embargo/{eid}");
-    let blob = ObjectId::hash(&veil_core::object::Object::Blob(FIX_FILE.as_bytes().to_vec()).encode());
-
-    // The embargo's PR, closed again; then its release is asked for, and held.
-    let pr = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs", p.name), &json!({"head": line, "title": "the fix"}));
-    assert_eq!(pr.status, 200, "{}", body_str(&pr));
-    let closed = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs/{}/close", p.name, pr.json()["id"].as_str().unwrap()), &json!({}));
-    assert_eq!(closed.status, 200, "{}", body_str(&closed));
-    let rel = api.post_json(Some(&sec), &format!("/v1/projects/{}/embargoes/{eid}/release", p.name), &json!({}));
-    assert_eq!(rel.status, 409, "{}", body_str(&rel));
-    assert!(released_at(&hub, &eid).is_none(), "held, not released");
-
-    // Two collections, the second past the retention window.
-    for now_offset_ms in [0, 180_000] {
-        let opts = Options { min_packs_to_merge: 2, run_gc: true, retention_window_ms: 60_000, pack_grace_ms: 0, now_offset_ms, ..Options::default() };
-        let r = hub.rt.block_on(pack_gc::run_project(&h, pid, &opts)).unwrap();
-        assert!(!r.skipped, "{r:?}");
-    }
-    let fresh = veil_server::store::Objects::with_db(h.objects.blob_store().clone(), 1 << 10, Some(h.db.clone()));
-    assert!(hub.rt.block_on(fresh.exists(pid, &blob)).unwrap(), "the collector deleted a held embargo's fix");
-    assert!(api.tips(Some(&sec), &p.name).unwrap().branches.contains_key(&line), "the held line stays");
-
-    // A new PR of the line, approved: the fix lands whole.
-    let pr2 = api.post_json(Some(&sec), &format!("/v1/projects/{}/prs", p.name), &json!({"head": line, "title": "the fix, again"}));
-    assert_eq!(pr2.status, 200, "{}", body_str(&pr2));
-    let ok = approve(&api, &rev1, &p.name, &pr2.json());
-    assert_eq!(ok.status, 200, "{}", body_str(&ok));
-    assert!(released_at(&hub, &eid).is_some(), "approved, the held release lands");
-    let f = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev=main&path=src/gc_1875.rs", p.name));
-    assert_eq!(f.status, 200, "{}", body_str(&f));
-    assert!(body_str(&f).contains("GC_KEEPS_HELD_FIX_1875"), "{}", body_str(&f));
-}
-
 /// BUG-1875: a release's landing ticket is of one tip of the line. A ticket
 /// that landed (a release that landed and did not finish; made here by
 /// renaming two landed tickets of the project: to the ticket's name before

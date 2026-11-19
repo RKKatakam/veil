@@ -26,14 +26,14 @@ use crate::pack::{Found, Held, Index, Slot, StagedSlots};
 
 /// How this server keeps the objects a push, an API commit or a landing
 /// batch keeps (`--object-layout`, `VEIL_OBJECT_LAYOUT`;
-/// `docs/design/server/object-layout.md`). Reads never depend on it.
+/// `docs/design/server/object-layout.md`). Existing listed packs remain
+/// readable indefinitely, while new objects are always written under their
+/// own keys (`p/<project>/ab/cdef…`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ObjectLayout {
-    /// Listed packs (S28), the default.
-    #[default]
-    Packs,
     /// One object per key (`p/<project>/ab/cdef…`), with uploads still
     /// staged in a container that is deleted when its push answers.
+    #[default]
     Objects,
 }
 
@@ -41,7 +41,6 @@ impl ObjectLayout {
     /// Its flag, environment variable and `stats.json` name.
     pub const fn as_str(self) -> &'static str {
         match self {
-            ObjectLayout::Packs => "packs",
             ObjectLayout::Objects => "objects",
         }
     }
@@ -58,9 +57,9 @@ impl std::str::FromStr for ObjectLayout {
 
     fn from_str(s: &str) -> std::result::Result<ObjectLayout, String> {
         match s {
-            "packs" => Ok(ObjectLayout::Packs),
             "objects" => Ok(ObjectLayout::Objects),
-            _ => Err(format!("{s}: expected `packs` or `objects`")),
+            "packs" => Err("packs: writing packs was removed in v1 (existing listed packs remain readable); use `objects`".into()),
+            _ => Err(format!("{s}: expected `objects`")),
         }
     }
 }
@@ -685,14 +684,6 @@ pub fn encode(raw: Bytes) -> Bytes {
     }
 }
 
-/// A pack kept by [`Objects::keep`] in [`ObjectLayout::Packs`].
-pub struct KeptPack {
-    pub name: Arc<str>,
-    pub size: u64,
-    pub objects: usize,
-    pub held: Option<Held>,
-}
-
 /// Why [`Objects::keep`] could not finish.
 #[derive(Debug)]
 pub enum KeepError {
@@ -705,8 +696,6 @@ pub enum KeepError {
 /// Options for [`Objects::keep`].
 #[derive(Clone, Copy)]
 pub struct KeepOpts {
-    /// Uploader recorded on any staged pack [`ObjectLayout::Packs`] writes.
-    pub person: i64,
     /// Worker threads used to compress `made` objects.
     pub encode_threads: usize,
     /// Whether the caller already holds [`DECODED_IN_FLIGHT`] for its bytes.
@@ -808,7 +797,7 @@ impl Objects {
 
     /// Objects in `store`, with the packs listed in `db`.
     pub fn with_db(store: Arc<dyn BlobStore>, cache_bytes: usize, db: Option<sqlx::PgPool>) -> Objects {
-        Objects::with_layout(store, cache_bytes, db, ObjectLayout::Packs)
+        Objects::with_layout(store, cache_bytes, db, ObjectLayout::Objects)
     }
 
     /// Objects in `store`, keeping new objects in `layout`.
@@ -1248,28 +1237,13 @@ impl Objects {
     }
 
     /// Write `objects` (encodings the caller has checked or made) as one
-    /// pack of `project` in one storage write: its name, index and length.
-    /// Nobody reads it until a transaction lists it, and
-    /// [`Objects::listed_here`] is told.
-    /// Its objects are cached under the pack's staged keys (the project's
-    /// once listed: [`Objects::listed_here`]).
-    /// It is recorded staged for `person` (a row) before it is written, so
-    /// the database names every pack in storage, whatever stops the request
-    /// after (BUG-1399). Its index is held under a share of the server's
-    /// bound on indexes (BUG-1496), taken before it is built.
+    /// staged pack of `project` in one storage write: its name, index and
+    /// length. Recorded staged for `person` before it is written, so the
+    /// database names every container in storage. Its index is held under a
+    /// share of the server's bound on indexes (BUG-1496), taken before it is
+    /// built.
     pub async fn put_pack(&self, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Held)> {
         self.write_pack(project, objects, true, Some(person)).await
-    }
-
-    /// Write `objects` as one staged pack of `project` for a merge or
-    /// garbage-collection pass (`person_id` `None`, S29), recorded in `packs`
-    /// before its storage object is written. **Its objects are not cached**
-    /// (BUG-2230): a merge rewrites objects nobody asked for, up to
-    /// `pack_gc::MAX_MERGED_BYTES` a pack, and caching them pushed the
-    /// requests' own objects out (under the background merges of the
-    /// many-branch run, the store's reads went from 4 to 57 a push).
-    pub async fn put_job_pack(&self, project: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<(Arc<str>, Held)> {
-        self.write_pack(project, objects, true, None).await
     }
 
     /// [`Objects::put_pack`]; when `record` is set, the pack is recorded
@@ -1293,41 +1267,31 @@ impl Objects {
         Ok((name, Held::new(Arc::new(index), size, share)))
     }
 
-    /// Stage `objects` (checked encodings `person` uploaded) as one pack,
-    /// recorded before it is written: its name. Its objects are cached
-    /// under staged keys only. Objects all held by a pack the person staged
-    /// here recently (and not discarded) get that pack again: a push that
-    /// lost a race uploads the same objects again (BUG-1157).
+    /// Stage `objects` (checked encodings `person` uploaded) as one temporary
+    /// upload container, recorded before it is written: its name. Its objects
+    /// are cached under staged keys only. Objects all held by a container the
+    /// person staged here recently (and not discarded) get that container
+    /// again: a push that lost a race uploads the same objects again
+    /// (BUG-1157).
     pub async fn stage(&self, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<Arc<str>> {
         let ids: Vec<ObjectId> = objects.iter().map(|(id, _)| *id).collect();
-        let in_objects = self.layout == ObjectLayout::Objects;
-        if let Some(name) = self.packs.staged_holding(project, person, &ids, in_objects).await? {
+        if let Some(name) = self.packs.staged_holding(project, person, &ids).await? {
             return Ok(name);
         }
         bump(&self.uploads);
         let (name, held) = self.write_pack(project, objects, true, Some(person)).await?;
-        if in_objects {
-            self.packs.staged_index_here(project, &name, held);
-        } else {
-            self.packs.staged_here(project, person, &name, held);
-        }
+        self.packs.staged_index_here(project, &name, held);
         Ok(name)
     }
 
     /// Keep the objects a push, an API commit or a landing batch retains:
     /// those in `touched` from `containers` (staged uploads) and those in
-    /// `made` (canonical encodings built on the server).
-    ///
-    /// - In [`ObjectLayout::Packs`]: lists any container whose objects were
-    ///   all read (`touched`), and writes the rest and `made` into staged
-    ///   pack(s) (recorded in `written`) for the caller's transaction to
-    ///   list.
-    /// - In [`ObjectLayout::Objects`]: writes every unique kept object under
-    ///   its own key `p/<project>/<2 hex>/<62 hex>`, always writing (never
-    ///   skipping when already stored: `object-layout.md` §3.2 fact 2 and
-    ///   §5.2 threat 4), at most `BlobStore::writes_at_once` at a time, with
-    ///   container reads and in-flight buffers held under
-    ///   [`DECODED_IN_FLIGHT`]; returns an empty `Vec`.
+    /// `made` (canonical encodings built on the server). Writes every unique
+    /// kept object under its own key `p/<project>/<2 hex>/<62 hex>`, always
+    /// writing (never skipping when already stored: `object-layout.md` §3.2
+    /// fact 2 and §5.2 threat 4), at most `BlobStore::writes_at_once` at a
+    /// time, with container reads and in-flight buffers held under
+    /// [`DECODED_IN_FLIGHT`].
     pub async fn keep(
         &self,
         project: i64,
@@ -1335,76 +1299,8 @@ impl Objects {
         touched: &std::collections::HashSet<ObjectId>,
         made: Vec<(ObjectId, Bytes)>,
         opts: KeepOpts,
-        written: &mut Vec<Arc<str>>,
-    ) -> std::result::Result<Vec<KeptPack>, KeepError> {
-        match self.layout {
-            ObjectLayout::Packs => {
-                self.keep_packs(project, containers, touched, made, opts, written).await
-            }
-            ObjectLayout::Objects => {
-                self.keep_objects(project, containers, touched, made, opts).await?;
-                Ok(Vec::new())
-            }
-        }
-    }
-
-    async fn keep_packs(
-        &self,
-        project: i64,
-        containers: &[(Arc<str>, StagedSlots)],
-        touched: &std::collections::HashSet<ObjectId>,
-        made: Vec<(ObjectId, Bytes)>,
-        opts: KeepOpts,
-        written: &mut Vec<Arc<str>>,
-    ) -> std::result::Result<Vec<KeptPack>, KeepError> {
-        let mut listed = Vec::new();
-        let mut kept: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
-        for (name, sp) in containers {
-            if sp.objects > 0 && sp.slots.len() == sp.objects && sp.slots.iter().all(|(id, _)| touched.contains(id)) {
-                if self.staged_index(project, name).await.map_err(KeepError::Store)?.is_none() {
-                    return Err(KeepError::Discarded);
-                }
-                for (id, _) in &sp.slots {
-                    if kept.insert(*id) {
-                        bump(&self.objects_kept);
-                    }
-                }
-                listed.push(KeptPack { name: name.clone(), size: sp.size, objects: sp.objects, held: None });
-            }
-        }
-        let mut own: Vec<(ObjectId, Bytes)> = Vec::new();
-        for (name, sp) in containers {
-            for (id, slot) in &sp.slots {
-                if touched.contains(id) && kept.insert(*id) {
-                    let (enc, _) = self
-                        .get_staged(project, name, *slot, id)
-                        .await
-                        .map_err(KeepError::Store)?
-                        .ok_or(KeepError::Discarded)?;
-                    own.push((*id, enc));
-                }
-            }
-        }
-        let to_encode: Vec<(ObjectId, Bytes)> = made.into_iter().filter(|(id, _)| kept.insert(*id)).collect();
-        if !to_encode.is_empty() {
-            let encoded = encode_many(to_encode, opts.encode_threads).await.map_err(KeepError::Store)?;
-            own.extend(encoded.into_iter().map(|(id, _, enc)| (id, enc)));
-        }
-        while !own.is_empty() {
-            let rest = if own.len() > crate::pack::MAX_OBJECTS {
-                own.split_off(crate::pack::MAX_OBJECTS)
-            } else {
-                Vec::new()
-            };
-            let n = own.len() as u64;
-            let (name, mut held) = self.put_pack(project, opts.person, own).await.map_err(KeepError::Store)?;
-            self.objects_kept.fetch_add(n, Ordering::Relaxed);
-            held.unproject();
-            written.push(name.clone());
-            listed.push(KeptPack { name, size: held.size, objects: held.index.len(), held: Some(held) });
-            own = rest;
-        }
-        Ok(listed)
+    ) -> std::result::Result<(), KeepError> {
+        self.keep_objects(project, containers, touched, made, opts).await
     }
 
     async fn keep_objects(
@@ -1714,20 +1610,16 @@ impl Objects {
         self.packs.usable_for_packs(project, person, names).await
     }
 
-    /// Claim `names` out of `person`'s `recent` upload list in `objects` mode
-    /// while a request using them is in flight (`BUG-2661`).
+    /// Claim `names` out of `person`'s `recent` upload list while a request
+    /// using them is in flight (`BUG-2661`).
     pub fn claim_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {
-        if self.layout == ObjectLayout::Objects {
-            self.packs.claim_recent(project, person, names);
-        }
+        self.packs.claim_recent(project, person, names);
     }
 
-    /// Return `names` to `person`'s `recent` upload list in `objects` mode when
-    /// a request ends without discarding them (`BUG-1157`, `BUG-2661`).
+    /// Return `names` to `person`'s `recent` upload list when a request ends
+    /// without discarding them (`BUG-1157`, `BUG-2661`).
     pub fn release_recent(&self, project: i64, person: i64, names: &[Arc<str>]) {
-        if self.layout == ObjectLayout::Objects {
-            self.packs.release_recent(project, person, names);
-        }
+        self.packs.release_recent(project, person, names);
     }
 
     /// The index and length of staged pack `name` of `project`, held under
@@ -1749,7 +1641,7 @@ impl Objects {
     /// encoding and the object, checked against its id; `None` if the pack
     /// is gone (discarded).
     pub async fn get_staged(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<(Bytes, Bytes)>> {
-        if self.layout == ObjectLayout::Objects && self.packs.is_discarded_here(project, name) {
+        if self.packs.is_discarded_here(project, name) {
             return Ok(None);
         }
         let ck = Self::staged_key(project, name, id, false);
@@ -1862,15 +1754,12 @@ impl Objects {
     /// only (or the cache), its entry's head checked; `None` if the pack is
     /// gone.
     pub async fn staged_declared(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<u64>> {
-        if self.layout == ObjectLayout::Objects && self.packs.is_discarded_here(project, name) {
+        if self.packs.is_discarded_here(project, name) {
             return Ok(None);
         }
         if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
             let len = encoding::declared_len(&enc[..enc.len().min(encoding::HEADER)], enc.len() as u64);
-            if self.layout == ObjectLayout::Objects {
-                return len.map(Some).ok_or_else(|| anyhow::anyhow!("corrupt staged object {id} in {name}"));
-            }
-            return Ok(len);
+            return len.map(Some).ok_or_else(|| anyhow::anyhow!("corrupt staged object {id} in {name}"));
         }
         bump(&self.reads);
         let last = s.last().min(s.offset + crate::pack::ENTRY_HEAD + encoding::HEADER as u64 - 1);
@@ -1878,10 +1767,7 @@ impl Objects {
             return Ok(None);
         };
         let len = encoding::declared_len(crate::pack::entry(id, s, &b)?, s.encoding_len());
-        if self.layout == ObjectLayout::Objects {
-            return len.map(Some).ok_or_else(|| anyhow::anyhow!("corrupt staged object {id} in {name}"));
-        }
-        Ok(len)
+        len.map(Some).ok_or_else(|| anyhow::anyhow!("corrupt staged object {id} in {name}"))
     }
 
     /// The encoding of object `id` at slot `s` of staged pack `name` of
@@ -1889,7 +1775,7 @@ impl Objects {
     /// decodes it, checked against the id, within its share of the bound on
     /// decoded bytes); `None` if the pack is gone.
     pub async fn staged_encoding(&self, project: i64, name: &str, s: Slot, id: &ObjectId) -> Result<Option<Bytes>> {
-        if self.layout == ObjectLayout::Objects && self.packs.is_discarded_here(project, name) {
+        if self.packs.is_discarded_here(project, name) {
             return Ok(None);
         }
         if let Some(enc) = self.cache.get(&Self::staged_key(project, name, id, false)) {
@@ -1950,17 +1836,13 @@ impl Objects {
     }
 
     /// Discard staged containers `names` consumed by a committing push or API
-    /// commit in `objects` mode (`BUG-2661`), marking `objects = -1` and
-    /// purging the `packs` row once deleted from storage so a concurrent or
-    /// replayed request naming them answers `409 Conflict`.
+    /// commit (`BUG-2661`), marking `objects = -1` and purging the `packs` row
+    /// once deleted from storage so a concurrent or replayed request naming
+    /// them answers `409 Conflict`.
     pub async fn discard_consumed(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
-        if self.layout == ObjectLayout::Objects {
-            self.packs
-                .discard_with(&*self.store, project, names, (true, true), (&self.deletes, &self.pack_rows))
-                .await
-        } else {
-            self.discard(project, names).await
-        }
+        self.packs
+            .discard_with(&*self.store, project, names, (true, true), (&self.deletes, &self.pack_rows))
+            .await
     }
 
     /// Delete containers `names` (marked `DISCARDED` in a push's transaction)
@@ -3063,12 +2945,10 @@ mod tests {
         let slots = objects.staged_slots(1, &cname, &[a_id, b_id, unread_id]).await.unwrap().unwrap();
         let staged = [(cname, slots)];
         let touched: std::collections::HashSet<ObjectId> = [a_id, b_id].into_iter().collect();
-        let opts = KeepOpts { person: 7, encode_threads: 1, already_held: false };
-        let mut written = Vec::new();
-        let listed = own(objects.keep(1, &staged, &touched, vec![(made_id, made_raw.clone())], opts, &mut written))
+        let opts = KeepOpts { encode_threads: 1, already_held: false };
+        own(objects.keep(1, &staged, &touched, vec![(made_id, made_raw.clone())], opts))
             .await
             .unwrap();
-        assert!(listed.is_empty() && written.is_empty(), "objects layout lists and writes no pack");
         assert_eq!(objects.objects_kept.load(Ordering::Relaxed), 3);
         assert_eq!(objects.own_writes.load(Ordering::Relaxed), 3, "stage was outside own; 3 kept objects inside own");
         assert!(fs.exists(&object_key(1, &a_id)).await.unwrap());
@@ -3082,17 +2962,15 @@ mod tests {
         std::fs::write(dir.path().join(object_key(1, &a_id)), b"stale-bytes").unwrap();
         std::fs::write(dir.path().join(object_key(1, &made_id)), b"stale-bytes").unwrap();
         let touched_again: std::collections::HashSet<ObjectId> = [a_id].into_iter().collect();
-        let listed2 = own(objects.keep(
+        own(objects.keep(
             1,
             &staged,
             &touched_again,
             vec![(made_id, made_raw.clone())],
             opts,
-            &mut written,
         ))
         .await
         .unwrap();
-        assert!(listed2.is_empty());
         assert_eq!(objects.objects_kept.load(Ordering::Relaxed), 5);
         assert_eq!(objects.own_writes.load(Ordering::Relaxed), 5);
         let cold = Objects::with_layout(fs, 1 << 20, None, ObjectLayout::Objects);
@@ -3106,7 +2984,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = Arc::new(FsStore::new(dir.path()));
         let writer = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
-        let opts = KeepOpts { person: 7, encode_threads: 1, already_held: false };
+        let opts = KeepOpts { encode_threads: 1, already_held: false };
 
         let mk = |seed: u64, payload_len: usize| {
             let mut v = Vec::with_capacity(10 + payload_len);
@@ -3134,9 +3012,8 @@ mod tests {
 
         let cold = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
         let reads_before = cold.reads.load(Ordering::Relaxed);
-        let mut written = Vec::new();
         let touched_small: std::collections::HashSet<ObjectId> = [s1_id, s2_id].into_iter().collect();
-        cold.keep(1, &small_staged, &touched_small, Vec::new(), opts, &mut written)
+        cold.keep(1, &small_staged, &touched_small, Vec::new(), opts)
             .await
             .unwrap();
         assert_eq!(cold.reads.load(Ordering::Relaxed) - reads_before, 1, "small container read whole in 1 read");
@@ -3156,7 +3033,7 @@ mod tests {
         let cold2 = Objects::with_layout(fs.clone(), 1 << 20, None, ObjectLayout::Objects);
         let touched_large: std::collections::HashSet<ObjectId> = [l_keep_id].into_iter().collect();
         cold2
-            .keep(2, &[(large_name, large_slots)], &touched_large, Vec::new(), opts, &mut written)
+            .keep(2, &[(large_name, large_slots)], &touched_large, Vec::new(), opts)
             .await
             .unwrap();
         assert!(fs.exists(&object_key(2, &l_keep_id)).await.unwrap());
@@ -3166,7 +3043,7 @@ mod tests {
         // 3. Discarded / missing container returns Err(KeepError::Discarded) whether cached or uncached.
         writer.discard(1, std::slice::from_ref(&small_staged[0].0)).await.unwrap();
         let Err(err_cached) = writer
-            .keep(1, &small_staged, &touched_small, Vec::new(), opts, &mut written)
+            .keep(1, &small_staged, &touched_small, Vec::new(), opts)
             .await
         else {
             panic!("deleted container must fail even when staged entries are cached");
@@ -3174,7 +3051,7 @@ mod tests {
         assert!(matches!(err_cached, KeepError::Discarded), "expected Discarded, got {err_cached:?}");
         let cold3 = Objects::with_layout(fs, 1 << 20, None, ObjectLayout::Objects);
         let Err(err_uncached) = cold3
-            .keep(1, &small_staged, &touched_small, Vec::new(), opts, &mut written)
+            .keep(1, &small_staged, &touched_small, Vec::new(), opts)
             .await
         else {
             panic!("deleted container must fail when uncached");
@@ -3241,12 +3118,11 @@ mod tests {
                 std::fs::write("/proc/self/clear_refs", "5").unwrap();
                 let before = vm("VmRSS:");
                 let mut set = tokio::task::JoinSet::new();
-                let opts = KeepOpts { person: 7, encode_threads: 1, already_held: false };
+                let opts = KeepOpts { encode_threads: 1, already_held: false };
                 for pair in staged {
                     let (f, t) = (fresh.clone(), touched.clone());
                     set.spawn(async move {
-                        let mut written = Vec::new();
-                        f.keep(1, &[pair], &t, Vec::new(), opts, &mut written).await.unwrap();
+                        f.keep(1, &[pair], &t, Vec::new(), opts).await.unwrap();
                     });
                 }
                 while let Some(r) = set.join_next().await {

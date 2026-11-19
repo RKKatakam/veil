@@ -73,7 +73,7 @@ echo "ssh $*" >> "${FAKE_SSH_LOG:?}"
 [[ " $* " == *" -n "* ]] || cat > /dev/null
 case "$*" in
     *"cat /var/lib/veil/hub-"*) echo "fake-server-key-material" ;;
-    *"cat /var/lib/veil/stats.json"*) echo '{"landing_batches": 0, "object_layout": "packs"}' ;;
+    *"cat /var/lib/veil/stats.json"*) echo '{"landing_batches": 0, "object_layout": "objects"}' ;;
     *"{{.RestartCount}}' minio"*)
         [ "${FAKE_MINIO_UNREACHABLE:-0}" = 1 ] && exit 255
         # MinIO's restart count: 0, or one more at every look while it restarts.

@@ -607,7 +607,7 @@ async fn commit(
     mv: Option<Move>,
     land: Option<&(crate::landing::Submitter, crate::landing::Queued)>,
     base_embargo: Option<&str>,
-    held: Option<&Arc<sync::Staged>>,
+    held: &Arc<sync::Staged>,
 ) -> Result<Option<bool>> {
     let pid = who.project.id;
     // A landing: the change (and what it stacks on: `landing::stack`) joins
@@ -665,14 +665,9 @@ async fn commit(
             (cs, aus, ls)
         }
     };
-    // What the change made (and anything its checks made), as one pack the
-    // transaction lists.
-    let packs = match held {
-        None => Vec::new(),
-        Some(st) => store_packed(hub, pid, person, st.made()).await?,
-    };
-    let pack_names: Vec<Arc<str>> = packs.iter().map(|(n, _)| n.clone()).collect();
-    let listing: Vec<String> = pack_names.iter().map(|n| n.to_string()).collect();
+    // What the change made (and anything its checks made), stored under each
+    // object's own key.
+    store_objects(hub, pid, held.made()).await?;
     // An API commit is its push; one that queues a landing, the landing's submit.
     let kind = if land.is_some() { crate::db::Commit::LandSubmit } else { crate::db::Commit::Push };
     let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
@@ -691,7 +686,6 @@ async fn commit(
             base_embargo.clone(),
         );
         let rules_landing = rules_landing.clone();
-        let listing = listing.clone();
         Box::pin(async move {
             crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             if let Some((w, q)) = &land {
@@ -873,42 +867,11 @@ async fn commit(
                 .bind(&what)
                 .execute(&mut *c)
                 .await?;
-            // Its pack turns listed with everything that names what it
-            // holds: the project's from this commit on, nobody's before.
-            if !listing.is_empty() {
-                let listed = sqlx::query("UPDATE packs SET state = $3 WHERE project_id = $1 AND name = ANY($2) AND state = $4")
-                    .bind(pid)
-                    .bind(&listing)
-                    .bind(crate::pack::LISTED)
-                    .bind(crate::pack::STAGED)
-                    .execute(&mut *c)
-                    .await?
-                    .rows_affected();
-                if listed != listing.len() as u64 {
-                    return Err(Error::conflict("the pack of this change's objects was discarded before it was listed; try again"));
-                }
-            }
             Ok((moved, memos))
         })
     })
-    .await;
-    let r = match r {
-        Ok(r) => r,
-        Err(e) => {
-            // Nothing listed its pack (a discard leaves alone one that the
-            // transaction did list after all): it goes, as a push's own.
-            if let Err(d) = hub.objects.discard(pid, &pack_names).await {
-                eprintln!("veil-server: discarding what an API commit did not list: {d:#}");
-            }
-            return Err(e);
-        }
-    };
+    .await?;
     hub.commits.count(kind);
-    // Before anything reads what it stored.
-    if !packs.is_empty() {
-        hub.objects.listed_here(pid, packs.into_iter().map(|(n, h)| (n, h.index)).collect());
-        crate::pack_gc::maybe_schedule(hub, pid);
-    }
     let (r, memos) = r;
     for id in &committed {
         hub.caches.put_committed(pid, id);
@@ -925,75 +888,16 @@ async fn commit(
     Ok(r)
 }
 
-/// Most bytes of objects an API commit made that it stores as one pack
-/// (BUG-1948); a larger change (its uploads' bytes are held once, and would
-/// be held again as a pack) stores them one by one, as before.
-const PACKED_BYTES: usize = 8 << 20;
-
 /// Keep `objects` (what an API commit made, canonical encodings) through
-/// [`crate::store::Objects::keep`]: in `packs`, as one staged pack of
-/// `project` (several past `pack::MAX_OBJECTS`) for `person` until the
-/// commit's transaction lists it; in `objects`, under their own keys,
-/// returning an empty `Vec`.
-async fn store_packed(hub: &Arc<Hub>, project: i64, person: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<Vec<(Arc<str>, crate::pack::Held)>> {
-    let mut written = Vec::new();
-    let opts = crate::store::KeepOpts { person, encode_threads: 1, already_held: true };
-    match crate::store::own(hub.objects.keep(project, &[], &HashSet::new(), objects, opts, &mut written)).await
-    {
-        Ok(kept) => Ok(kept.into_iter().filter_map(|p| Some((p.name, p.held?))).collect()),
+/// [`crate::store::Objects::keep`] under their own object keys.
+async fn store_objects(hub: &Arc<Hub>, project: i64, objects: Vec<(ObjectId, Bytes)>) -> Result<()> {
+    let opts = crate::store::KeepOpts { encode_threads: 1, already_held: true };
+    match crate::store::own(hub.objects.keep(project, &[], &HashSet::new(), objects, opts)).await {
+        Ok(()) => Ok(()),
         Err(crate::store::KeepError::Discarded) => {
             Err(Error::conflict("an upload this commit names was discarded; try again"))
         }
-        Err(crate::store::KeepError::Store(e)) => {
-            if !written.is_empty() {
-                if let Err(d) = hub.objects.discard(project, &written).await {
-                    eprintln!("veil-server: discarding what an API commit did not list: {d:#}");
-                }
-            }
-            Err(Error::Other(e))
-        }
-    }
-}
-
-/// The API commits moving each branch on this server now, by project and
-/// branch (in this process: a hint, nothing depends on it being exact).
-static MOVING: std::sync::LazyLock<std::sync::Mutex<HashMap<(i64, String), usize>>> = std::sync::LazyLock::new(Default::default);
-
-/// One API commit's place among those moving a branch here, from when it
-/// begins until it is answered. A commit that is the only one stores what
-/// it made as a pack; one that races others stores it one object at a
-/// time, as API commits always did: past a branch's capacity most tries
-/// lose their race after their objects are stored, and a pack lost that
-/// way is a row recorded, a write and a discard (two commits and two
-/// storage requests a try: `scripts/bench-server.sh load`'s `api-hot`
-/// curve went from 7 to 20 to 34 commits a landing with packs for all,
-/// BUG-2370), where objects stored loose cost no commit. Commits racing
-/// through other servers are not seen: they cost what a lost pack costs,
-/// never a wrong answer.
-pub struct Moving((i64, String));
-
-impl Moving {
-    pub fn enter(project: i64, branch: &str) -> Moving {
-        let key = (project, branch.to_string());
-        *MOVING.lock().unwrap().entry(key.clone()).or_default() += 1;
-        Moving(key)
-    }
-
-    /// Is this the only commit moving its branch here now?
-    pub fn alone(&self) -> bool {
-        MOVING.lock().unwrap().get(&self.0).is_some_and(|n| *n == 1)
-    }
-}
-
-impl Drop for Moving {
-    fn drop(&mut self) {
-        let mut m = MOVING.lock().unwrap();
-        if let Some(n) = m.get_mut(&self.0) {
-            *n -= 1;
-            if *n == 0 {
-                m.remove(&self.0);
-            }
-        }
+        Err(crate::store::KeepError::Store(e)) => Err(Error::Other(e)),
     }
 }
 
@@ -1317,13 +1221,6 @@ pub(crate) async fn create_with(
             }
         }
     }
-    // This commit's place among those moving the branch here, now (none
-    // for a change that moves no branch, or queues a landing: it cannot
-    // lose a race).
-    let moving = match (&onto, &land) {
-        (Some(o), None) => Some(Moving::enter(project.id, &o.branch)),
-        _ => None,
-    };
     let rebase = onto.as_ref().is_some_and(|o| o.expected == Expected::Rebase);
     let mut rebased = 0u32;
     let mut attempts = 0u32;
@@ -1362,20 +1259,9 @@ pub(crate) async fn create_with(
             _ => None,
         };
         // What the change made is held for the checks below, which read it
-        // from there, and stored by its commit as one pack that the commit's
-        // transaction lists (BUG-1948: stored one by one before the checks,
-        // a change's blob, trees and snapshots were some seven storage
-        // writes where a push makes one). Stored before anything reads it,
-        // one object at a time, as before: a change of more than
-        // `PACKED_BYTES`, and one that races other commits for its branch
-        // (`Moving`: each try that lost would record a pack, write it and
-        // discard it).
-        let packed = hub.objects.layout() == crate::store::ObjectLayout::Objects
-            || (built.store.iter().map(|(_, b)| b.len()).sum::<usize>() <= PACKED_BYTES && moving.as_ref().is_none_or(Moving::alone));
-        let held = packed.then(|| sync::Staged::holding(built.store.iter().cloned()));
-        if held.is_none() {
-            sync::put_all(hub, project.id, built.store.clone()).await?;
-        }
+        // from there, and stored by its commit under each object's own key.
+        let staged_held = sync::Staged::holding(built.store.iter().cloned());
+        let held = Some(staged_held.clone());
         // A landing of edits: the stack is the submitter's history from the
         // branch up to this one, as for a pushed snapshot (BUG-1112).
         if let Some((_, q)) = land.as_mut() {
@@ -1490,7 +1376,7 @@ pub(crate) async fn create_with(
             },
             _ => None,
         };
-        match commit(hub, &plan, &who, &built, &restacked, person.id, gc_epoch, mv, land.as_ref(), base_embargo.as_deref(), held.as_ref()).await {
+        match commit(hub, &plan, &who, &built, &restacked, person.id, gc_epoch, mv, land.as_ref(), base_embargo.as_deref(), &staged_held).await {
             Ok(m) => break (built, m),
             // The tip moved during the request: try again on the new one,
             // with the access as it is now (BUG-1051).

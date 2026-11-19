@@ -405,7 +405,7 @@ so a database reached by an address its certificate does not carry is
 accepted when its CA is the one given. Proven against PostgreSQL 17 with `ssl = on` and
 only `hostssl` lines; not yet run against a managed service.
 
-**Object layout (`--object-layout`, `VEIL_OBJECT_LAYOUT`).** `--object-layout packs|objects` (or `VEIL_OBJECT_LAYOUT`, default `packs`; `docs/HUB.md` §13.42, `docs/design/server/object-layout.md`) chooses whether kept objects are stored in packs or one object per key (`p/<project>/<2 hex>/<62 hex>`). Every read checks both layouts, so switching the flag and restarting needs no migration and converts nothing; `stats.json` records `object_layout`, `storage_deletes`, `storage_lists`, `objects_kept` and `uploads`. In `objects`, a push makes roughly three times as many `PUT`/`DELETE` requests to the object store as in `packs`, so a project that suddenly turns busy meets S3's or Cloud Storage's per-prefix warm-up (~3,500 writes/s before automatic prefix splitting) about three times sooner—and DigitalOcean Spaces' 800 requests/s bucket limit (§2.3) proportionately sooner too. Watch `s3_slow_down` (`503 Slow Down` / `429` retries) and `s3_gave_up` in `stats.json`.
+**Object layout (`--object-layout`, `VEIL_OBJECT_LAYOUT`).** In v1, `objects` is the default and sole writable object layout (`--object-layout objects`, `VEIL_OBJECT_LAYOUT=objects`; `docs/HUB.md` §13.42, `docs/design/server/object-layout.md`): kept objects are stored one object per key (`p/<project>/<2 hex>/<62 hex>`), and passing `packs` is rejected at startup. Every read still checks existing listed packs from earlier `packs` deployments before the loose key, so nothing needs conversion; `stats.json` records `object_layout`, `storage_deletes`, `storage_lists`, `objects_kept` and `uploads`. In `objects`, a push writes each kept object individually (plus one staged upload container that is deleted on commit), so a project that suddenly turns busy meets S3's or Cloud Storage's per-prefix warm-up (~3,500 writes/s before automatic prefix splitting)—and DigitalOcean Spaces' 800 requests/s bucket limit (§2.3)—sooner than packed storage. Watch `s3_slow_down` (`503 Slow Down` / `429` retries) and `s3_gave_up` in `stats.json`.
 
 ## 4. Local rehearsal
 
@@ -1289,18 +1289,18 @@ deploy/gcp/destroy.sh --check --approve      # repeat until it says "nothing lef
 ```
 
 **The object layout a run used** (`docs/HUB.md` §13.42). The kit gives
-the servers no layout: each runs the server's own default. Every gate's
-`run.txt` states the layout that ran, `object_layout=packs` or
-`object_layout=objects`, and it is the servers' word, not the kit's:
+the servers no layout: each runs the server's own default (`objects` in
+v1). Every gate's `run.txt` states the layout that ran
+(`object_layout=objects`), and it is the servers' word, not the kit's:
 before a gate `bench.sh` asks each server (the `object_layout` of its
 `stats.json`), and refuses the gate, recording nothing, when a server
 gives none or two servers differ. The same value goes to every
 `veil-bench` command as `--object-layout`, so the tool's json and tables
 name it, and a server the tool starts itself (`objects`, `openscion`,
-`scale`) runs in the deployment's layout. `VEIL_GCP_OBJECT_LAYOUT=packs`
-(or `objects`) in `deploy/gcp/.env` passes that layout to every server
-`configure.sh` starts; a gate is then also refused while the servers
-report another.
+`scale`) runs in the deployment's layout. `VEIL_GCP_OBJECT_LAYOUT=objects`
+in `deploy/gcp/.env` passes that layout explicitly to every server
+`configure.sh` starts (setting `packs` is refused in v1); a gate is then
+also refused while the servers report another.
 
 ### 12.5 Spot reclaims
 
@@ -1630,3 +1630,35 @@ driver's own cores, and a driver near its vCPUs was the limit, not Veil.
 Statements on YugabyteDB are counted on the node the driver's URL names
 (`pg_stat_statements` is per node): with three servers spread over three
 nodes, about a third of them.
+
+## 13. Storage and garbage collection (v1)
+
+In Veil v1, **storage is append-only and there is no garbage collection of
+history — not even offline** (owner, 2026-11-18).
+
+* **Default layout (`objects`).** `--object-layout` (`VEIL_OBJECT_LAYOUT`,
+  `Config::object_layout`) defaults to `objects`, which is the sole writable
+  layout in v1. Every committed object is written under its own content-addressed
+  key (`p/<project>/<2 hex>/<62 hex>`).
+* **Existing packs stay readable.** Pre-existing `LISTED` packs (`veilpack3\n`)
+  written by earlier servers remain readable across every read path (`get`,
+  `get_many`, `get_encoded`, `get_range`, `prefetch`) with no migration. New
+  data is never written into packs, and online pack merging is removed.
+* **Append-only history.** Objects from deleted branches, force-pushes, or
+  expired snapshots are never collected in v1, and view keys' `view_graph`,
+  `view_changes`, and `view_file_history` rows are kept. Plan storage capacity
+  accordingly.
+* **What servers still delete.** Uploads (`POST …/objects`) still land in
+  temporary staged upload containers (`packs` rows with `state = STAGED`) so
+  refused pushes, unread plain-text secrets beside a landing push, or abandoned
+  uploads are never kept under project keys. Committed pushes and API commits
+  discard and purge their consumed staged containers; refused pushes discard
+  theirs immediately; and background sweepers (`pack_gc::schedule_sweep`,
+  `pack_gc::sweep_scan`) sweep only uncommitted `STAGED` upload containers past
+  `DEFAULT_STAGED_GRACE_MS` (1 hour) and `DISCARDED` upload containers past
+  `DEFAULT_PACK_GRACE_MS` (15 minutes). Neither ever touches `LISTED` packs or
+  committed project objects.
+* **Database support.** Veil v1 supports **PostgreSQL only**; YugabyteDB is
+  experimental and not supported in v1.
+
+

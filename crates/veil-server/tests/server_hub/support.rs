@@ -83,25 +83,17 @@ pub struct TestHub {
     pub _dir: tempfile::TempDir,
 }
 
-/// Object layout for tests that do not pin one: `VEIL_TEST_OBJECT_LAYOUT`
-/// (`packs` or `objects`), defaulting to `packs`.
+/// Object layout for tests: `VEIL_TEST_OBJECT_LAYOUT`, defaulting to `objects`.
 pub fn env_object_layout() -> veil_server::ObjectLayout {
     match std::env::var("VEIL_TEST_OBJECT_LAYOUT") {
         Ok(v) if !v.is_empty() => v.parse().unwrap_or_else(|e| panic!("VEIL_TEST_OBJECT_LAYOUT={v:?}: {e}")),
-        _ => veil_server::ObjectLayout::Packs,
+        _ => veil_server::ObjectLayout::Objects,
     }
 }
 
 impl TestHub {
     pub fn start() -> TestHub {
         TestHub::start_with_ttl(Duration::from_secs(3600))
-    }
-
-    /// A server pinned to [`veil_server::ObjectLayout::Packs`], for tests
-    /// whose assertions are about packs (one storage write a push, listed
-    /// packs, background merges).
-    pub fn start_packs() -> TestHub {
-        TestHub::start_with_layout(veil_server::ObjectLayout::Packs)
     }
 
     /// A server pinned to [`veil_server::ObjectLayout::Objects`].
@@ -241,31 +233,22 @@ impl TestHub {
     /// same database, data directory (identity, certificate, receipt key)
     /// and object storage.
     pub fn beside(other: &TestHub) -> TestHub {
-        TestHub::beside_with_layout(other, other.config.object_layout)
-    }
-
-    /// [`TestHub::beside`] with `object_layout` (mixed deployments,
-    /// `object-layout.md` §5.1).
-    pub fn beside_with_layout(other: &TestHub, object_layout: veil_server::ObjectLayout) -> TestHub {
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
-            object_layout,
             ..other.config.clone()
         };
         TestHub::run(config, dir)
     }
 
-    /// [`TestHub::beside_with_layout`] over a custom `BlobStore` wrapper.
+    /// [`TestHub::beside`] over a custom `BlobStore` wrapper.
     pub fn beside_with_store(
         other: &TestHub,
-        object_layout: veil_server::ObjectLayout,
         store: Arc<dyn veil_server::store::BlobStore>,
     ) -> TestHub {
         let dir = tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap();
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
-            object_layout,
             ..other.config.clone()
         };
         TestHub::run_with_store(config, dir, Some(store))
@@ -274,20 +257,13 @@ impl TestHub {
     /// This server stopped and started again on the same port, data
     /// directory and storage, its memory empty (as after an upgrade);
     /// `between` runs while it is down (a migration).
-    pub fn restart(self, between: impl FnOnce(&str)) -> TestHub {
-        let layout = self.config.object_layout;
-        self.restart_with_layout(layout, between)
-    }
-
-    /// [`TestHub::restart`] switching `object_layout`.
-    pub fn restart_with_layout(mut self, object_layout: veil_server::ObjectLayout, between: impl FnOnce(&str)) -> TestHub {
+    pub fn restart(mut self, between: impl FnOnce(&str)) -> TestHub {
         if let Some(r) = self.running.take() {
             self.rt.block_on(r.stop());
         }
         between(&self.config.database_url);
         let config = Config {
             listen: format!("127.0.0.1:{}", self.port).parse().unwrap(),
-            object_layout,
             ..self.config.clone()
         };
         let dir = std::mem::replace(&mut self._dir, tempfile::Builder::new().prefix("veil-hub-test").tempdir().unwrap());
@@ -394,6 +370,18 @@ impl TestHub {
 
     pub fn hub(&self) -> Arc<veil_server::Hub> {
         self.running.as_ref().unwrap().hub.clone()
+    }
+
+    pub fn database_url(&self) -> &str {
+        &self.config.database_url
+    }
+
+    /// Stop the serving instance, keeping the database, data directory, and
+    /// storage intact.
+    pub fn stop_serving(&mut self) {
+        if let Some(r) = self.running.take() {
+            self.rt.block_on(r.stop());
+        }
     }
 
     /// The server's object storage, opened anew (what another server on it

@@ -37,7 +37,7 @@ use sqlx::{Connection, PgConnection, PgPool};
 /// The lease lock's key: the branch's (a hash) and the epoch's low 31 bits.
 /// Two-integer advisory keys are a space apart from every one-`bigint` key
 /// the server takes (derive, pack GC, migrations, the review gate).
-pub(super) fn key(project: i64, branch: &str, epoch: i64) -> (i32, i32) {
+pub(crate) fn key(project: i64, branch: &str, epoch: i64) -> (i32, i32) {
     (branch_key(project, branch), epoch_key(epoch))
 }
 

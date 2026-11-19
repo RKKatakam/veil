@@ -41,48 +41,6 @@ fn blob(text: &str) -> (ObjectId, Vec<u8>) {
     (ObjectId::hash(&raw), raw)
 }
 
-/// A `vl push` of a change costs one storage write: its upload's staged
-/// pack, listed as it is. A push the server completes (a member who cannot
-/// see every folder: the graft's trees, the real snapshot, the member's
-/// projection) costs one more, its own pack. Everyone reads what they read
-/// before, through a second server too (which learns of the packs from the
-/// database).
-#[test]
-fn a_push_is_one_storage_write_and_reads_come_from_its_pack() {
-    let hub = TestHub::start_packs();
-    let p = setup_project(&hub);
-    let pid = project_id(&hub, &p.name);
-    let (listed0, _) = pack_rows(&hub, pid);
-    assert!(listed0 >= 1, "the initial import is in packs");
-    // The admin: the upload's pack, listed as it is.
-    write_files(&p.dir, &[("src/one.rs", "MARKER-PACK-ADMIN-0d9e")]);
-    p.admin.commit_main(&p.dir, "one file");
-    let w = writes(&hub);
-    p.admin.ok(&p.dir, &["push"]);
-    assert_eq!(writes(&hub) - w, 1, "an admin's push: one storage write");
-    assert_eq!(pack_rows(&hub, pid), (listed0 + 1, 0));
-    // A developer, who cannot see billing: the server completes the
-    // snapshot, and stores what it made in one pack of the push's own.
-    let d = clone(&hub, &p, &p.dev, "dev");
-    write_files(&d, &[("src/two.rs", "MARKER-PACK-DEV-77ab")]);
-    p.dev.commit_main(&d, "dev's file");
-    let w = writes(&hub);
-    p.dev.ok(&d, &["push"]);
-    let n = writes(&hub) - w;
-    assert!(n <= 2, "a completed push: {n} storage writes");
-    // Every viewer reads it, from a fresh server on the same database and
-    // store (nothing cached: the packs read from the listing).
-    let other = TestHub::beside(&hub);
-    let api = other.api();
-    for (who, sees_billing) in [(&p.admin, true), (&p.fin, true), (&p.dev, false)] {
-        let token = who.token();
-        assert_eq!(read_file(&api, &token, &p.name, "src/one.rs").as_deref(), Some(&b"MARKER-PACK-ADMIN-0d9e"[..]));
-        assert_eq!(read_file(&api, &token, &p.name, "src/two.rs").as_deref(), Some(&b"MARKER-PACK-DEV-77ab"[..]));
-        let bill = read_file(&api, &token, &p.name, &format!("{BILL_DIR}/acme/invoice.txt"));
-        assert_eq!(bill.is_some(), sees_billing, "{}", who.name);
-    }
-}
-
 /// The content of the file at `path` on `main` as `token`'s person sees it,
 /// read through `api`'s server: its tips, history and fetch routes.
 fn read_file(api: &Api, token: &str, project: &str, path: &str) -> Option<Vec<u8>> {
@@ -501,7 +459,7 @@ fn bug_1157_a_push_that_lost_a_race_leaves_no_copy_of_its_upload() {
 /// it counts, and `veil-bench load`'s writes-per-push gate counts them.
 #[test]
 fn bug_1153_background_indexing_is_not_counted_as_a_pushs_writes() {
-    let hub = TestHub::start_packs();
+    let hub = TestHub::start();
     let p = setup_project(&hub);
     let settle = || {
         // Until the background work is done: no write for 3 s.
@@ -522,9 +480,11 @@ fn bug_1153_background_indexing_is_not_counted_as_a_pushs_writes() {
     write_files(&p.dir, &[("src/indexed.rs", "fn MARKER_SEARCHED_WORD_b71d() {}")]);
     p.admin.commit_main(&p.dir, "indexed");
     let w = writes(&hub);
+    let kept0 = hub.hub().objects.objects_kept.load(Relaxed);
     p.admin.ok(&p.dir, &["push"]);
     settle();
-    assert_eq!(writes(&hub) - w, 1, "an admin's push, its background work done: one storage write of its own");
+    let kept = hub.hub().objects.objects_kept.load(Relaxed) - kept0;
+    assert_eq!(writes(&hub) - w, 1 + kept, "an admin's push, its background work done: only its upload + kept objects");
 }
 
 /// Guarantee 3: a staged pack that one push of a person lists while
@@ -639,34 +599,6 @@ fn hostile_bug_1156_api_commits_hold_their_uploads_within_the_servers_bound() {
     }
     let grew = vm("VmHWM:").saturating_sub(before);
     assert!(grew < 1 << 30, "six API commits at once took the server {} MiB past where it was", grew >> 20);
-}
-
-/// BUG-1158 (S28 cycle 1): a rolling upgrade runs servers before S28
-/// beside S28 servers, on one database and one object store (the
-/// migrations are built for it: BUG-838). A server before S28 reads an
-/// object only under its own key (`p/<project>/<id>`; `integration` @
-/// `6fa552c4`, `store.rs` `Objects::get`), which is exactly what
-/// `Objects` without a database and without listed packs reads. Whatever
-/// an S28 server took in a push is in packs only, so every older server
-/// answers "missing object" for it (and refuses S28's receipts) until the
-/// last one is stopped; `HUB.md` §13.20 says how to revert, not that the
-/// upgrade cannot be rolling.
-#[test]
-#[ignore = "BUG-1158 (closed by decision: the upgrade to S28 is not rolling, HUB.md §13.20): a server before S28 cannot find what an S28 server stored"]
-fn bug_1158_a_server_before_s28_finds_what_an_s28_server_stored() {
-    let hub = TestHub::start_packs();
-    let p = setup_project(&hub);
-    let pid = project_id(&hub, &p.name);
-    write_files(&p.dir, &[("src/rolling.rs", "MARKER-ROLLING-UPGRADE-0f4b")]);
-    p.admin.commit_main(&p.dir, "during the upgrade");
-    p.admin.ok(&p.dir, &["push"]);
-    let id = blob("MARKER-ROLLING-UPGRADE-0f4b").0;
-    let api = hub.api();
-    assert_eq!(read_file(&api, &p.admin.token(), &p.name, "src/rolling.rs").as_deref(), Some(&b"MARKER-ROLLING-UPGRADE-0f4b"[..]), "the S28 server reads it");
-    // What a server before S28 reads, on the same store.
-    let before_s28 = veil_server::store::Objects::new(hub.blob_store(), 1 << 20);
-    let got = hub.rt.block_on(before_s28.get(pid, &id)).unwrap();
-    assert_eq!(got.as_deref(), Some(&O::Blob(b"MARKER-ROLLING-UPGRADE-0f4b".to_vec()).encode()[..]), "a server before S28 finds no object an S28 server stored");
 }
 
 /// Guarantee 2: a plain-text secret uploaded with a push's objects but
@@ -832,7 +764,7 @@ fn a_guess_gets_one_answer_whatever_receipt_it_shows() {
 #[test]
 fn every_pack_in_storage_has_a_row_after_refusals_races_and_api_commits() {
     // Whatever the storage (S3 or a directory: listed from the store).
-    let hub = TestHub::start_packs();
+    let hub = TestHub::start();
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
     let api = hub.api();
@@ -883,53 +815,6 @@ fn every_pack_in_storage_has_a_row_after_refusals_races_and_api_commits() {
         }
         assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "after an API commit (landed: {ok})");
     }
-}
-
-/// BUG-1399 (S28 cycle 2; BUG-1157's class): a push whose client goes away
-/// while its transaction runs (a `vl push` stopped, a network that drops) is
-/// cancelled by the HTTP server where it stands: the code after
-/// `push_staged` that deletes the push's own pack when its transaction did
-/// not list it (`sync::push`) never runs. The own pack was written before
-/// the transaction and gets its row only in it, so it stays in storage
-/// with no row: nothing (not S29's job, which reads the rows) knows it is
-/// there. Here the push waits on the upload's row, held by another
-/// transaction, so the client's 3 s run out within it.
-#[test]
-fn bug_1399_a_push_whose_client_goes_away_leaves_no_pack_without_a_row() {
-    let hub = TestHub::start_packs();
-    let p = setup_project(&hub);
-    let pid = project_id(&hub, &p.name);
-    let api = hub.api();
-    assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "before");
-    // A developer's push: the server completes it, in a pack of its own.
-    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
-    c.file("src/gone.rs", "MARKER-CLIENT-GONE-3b7e");
-    let s = { let t = c.tip; snap(&mut c, vec![t], "the client goes", None) };
-    let before = packs_in_store(&hub, pid);
-    let (map, pack) = upload_all(&api, &c);
-    let mut lock = hub.rt.block_on(hub.hub().db.begin()).unwrap();
-    hub.rt
-        .block_on(sqlx::query("SELECT 1 FROM packs WHERE project_id = $1 AND name = $2 FOR UPDATE").bind(pid).bind(&pack).execute(&mut *lock))
-        .unwrap();
-    let body = json!({"updates": [{"branch": "main", "expected": c.tip.hex(), "new": s.hex()}], "receipts": map});
-    let gave_up = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        api.post_json_within(&c.token, &format!("/v1/projects/{}/push", p.name), &body, std::time::Duration::from_secs(3))
-    }));
-    assert!(gave_up.is_err(), "the client gave up before the push was answered: {:?}", gave_up.map(|r| r.status));
-    // The push's own pack is in storage by now (written before its
-    // transaction, which waits on the row), and has a row (BUG-1399's fix).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !packs_in_store(&hub, pid).iter().any(|n| *n != pack && !before.contains(n)) {
-        assert!(std::time::Instant::now() < deadline, "the push never wrote its own pack");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert_eq!(packs_without_rows(&hub, pid), Vec::<String>::new(), "the push's own pack has its row before it is written");
-    hub.rt.block_on(lock.rollback()).unwrap();
-    // Whatever the push does now, it has had time to do it.
-    std::thread::sleep(std::time::Duration::from_secs(10));
-    let tip = api.tips(Some(&c.token), &p.name).unwrap().branches["main"];
-    let orphans = packs_without_rows(&hub, pid);
-    assert!(orphans.is_empty(), "packs in storage with no row: {orphans:?} (the push landed: {})", tip != c.tip);
 }
 
 /// BUG-1398 (S28 cycle 2; BUG-1153's class): a pull is no push, yet the
@@ -1164,128 +1049,6 @@ fn bug_1624_a_push_projecting_a_committed_tip_does_not_count_it_as_its_own_stora
         writes(&other) - w_before,
         0,
         "a push that lost a race must not count projecting an already-committed tip as its own storage write"
-    );
-}
-
-/// S28 cycle 7 review (Guarantee 1): a push of more than `MAX_OBJECTS` small
-/// objects (where `sync::packs_to_list` splits `own` across multiple packs)
-/// lands without waiting on its own earlier pack's share, and releases all its
-/// index shares when it ends, whether the push succeeds or fails.
-#[test]
-fn a_push_of_more_than_max_objects_lands_and_releases_every_share() {
-    let hub = TestHub::start_packs();
-    let p = setup_project(&hub);
-    let pid = project_id(&hub, &p.name);
-    let api = hub.api();
-
-    let count = veil_server::pack::MAX_OBJECTS + 48_000;
-    let mut c = Craft::new(&api, &p.dev, &p.name, "main");
-    let tip = c.tip;
-
-    let mut frames = Vec::with_capacity((count + 16) * 56);
-    let mut obj_ids = Vec::with_capacity(count + 16);
-
-    // Put an unread object at the very start of the first `MAX_OBJECTS` chunk so neither staged pack is
-    // listed as-is (`sp.slots.len() < sp.objects` on both), forcing `packs_to_list` to copy all `count`
-    // touched objects into `own` and split `own` across two `put_pack` calls.
-    let (unread0_id, unread0_raw) = blob("MARKER-UNREAD-FIRST-PACK");
-    put_frame(&mut frames, &unread0_id, &unread0_raw);
-    obj_ids.push(unread0_id);
-
-    let mut dir_entries = Vec::with_capacity(count);
-    for i in 0..count {
-        let mut raw = [0u8; 18];
-        raw[..10].copy_from_slice(b"veil:blob\n");
-        raw[10..18].copy_from_slice(&(i as u64).to_le_bytes());
-        let id = ObjectId::hash(&raw);
-        put_frame(&mut frames, &id, &raw);
-        obj_ids.push(id);
-        dir_entries.push(veil_core::TreeEntry {
-            name: format!("b{i:06}"),
-            id,
-            kind: veil_core::object::EntryKind::File,
-            executable: false,
-            size: 8,
-            visibility: veil_core::object::Visibility::Public,
-        });
-    }
-    let (unread1_id, unread1_raw) = blob("MARKER-UNREAD-SECOND-PACK");
-    put_frame(&mut frames, &unread1_id, &unread1_raw);
-    obj_ids.push(unread1_id);
-
-    let sub_tree = O::Tree(veil_core::Tree { entries: dir_entries }).encode_with(veil_core::object::TreeEncoding::Binary);
-    let sub_tree_id = ObjectId::hash(&sub_tree);
-    put_frame(&mut frames, &sub_tree_id, &sub_tree);
-    obj_ids.push(sub_tree_id);
-
-    c.refer_dir("src/many", sub_tree_id);
-    for (id, raw) in &c.objects {
-        put_frame(&mut frames, id, raw);
-        obj_ids.push(*id);
-    }
-
-    let snap_id = snap(&mut c, vec![tip], "more than MAX_OBJECTS", None);
-    let snap_raw = c.objects.iter().find(|(id, _)| *id == snap_id).unwrap().1.clone();
-    put_frame(&mut frames, &snap_id, &snap_raw);
-    obj_ids.push(snap_id);
-
-    // Clear any staged-index cache entries from setup_project so `available()` reflects this push's shares only.
-    let initial_staged: Vec<std::sync::Arc<str>> = hub
-        .rt
-        .block_on(sqlx::query_scalar::<_, String>("SELECT name FROM packs WHERE project_id = $1").bind(pid).fetch_all(&hub.hub().db))
-        .unwrap()
-        .into_iter()
-        .map(std::sync::Arc::from)
-        .collect();
-    let _ = hub.rt.block_on(hub.hub().objects.discard(pid, &initial_staged));
-    assert_eq!(hub.hub().objects.index_bound().available(), veil_server::pack::INDEXES_HELD, "idle bound before push");
-
-    // 1. Success first: upload and push > MAX_OBJECTS small objects; it splits `own` into 2 packs,
-    //    lands without waiting on its own earlier pack's share, and releases every share when done.
-    let (listed_before, _) = pack_rows(&hub, pid);
-    let up = api.upload_encoded_body(&c.token, &p.name, &frames);
-    assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body[..up.body.len().min(400)]));
-    let receipts: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
-    assert_eq!(receipts.len(), obj_ids.len());
-    let mut map = serde_json::Map::new();
-    for (id, r) in obj_ids.iter().zip(&receipts) {
-        if *id != unread0_id && *id != unread1_id {
-            map.insert(id.hex(), json!(r));
-        }
-    }
-    let r = push_body(&api, &c.token, &p.name, tip, snap_id, &map);
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r.body));
-    let (listed_after, _) = pack_rows(&hub, pid);
-    assert!(listed_after - listed_before >= 2, "push of > MAX_OBJECTS listed {} packs", listed_after - listed_before);
-    assert_eq!(
-        hub.hub().objects.index_bound().available(),
-        veil_server::pack::INDEXES_HELD,
-        "all index shares released after a landing push of > MAX_OBJECTS (discarded staged uploads evicted from staged cache, listed own packs moved to lookup maps)"
-    );
-
-    // 2. Failure path: a refused push (unsigned/unknown-signer snapshot) with > MAX_OBJECTS receipts
-    //    also releases all its shares when it ends.
-    let new_tip = api.tips(Some(&c.token), &p.name).unwrap().branches["main"];
-    let stranger = veil_core::Identity::generate("stranger");
-    let bad_snap_id = snap(&mut c, vec![new_tip], "bad signer", Some(&stranger));
-    let bad_snap_raw = c.objects.iter().find(|(id, _)| *id == bad_snap_id).unwrap().1.clone();
-    let mut bad_frames = Vec::new();
-    let (bad_b_id, bad_b_raw) = blob("MARKER-BAD-PUSH-UPLOAD");
-    put_frame(&mut bad_frames, &bad_b_id, &bad_b_raw);
-    put_frame(&mut bad_frames, &bad_snap_id, &bad_snap_raw);
-    let up_bad = api.upload_encoded_body(&c.token, &p.name, &bad_frames);
-    assert_eq!(up_bad.status, 200);
-    let bad_receipts: Vec<String> = serde_json::from_value(up_bad.json()["receipts"].clone()).unwrap();
-    let mut bad_map = serde_json::Map::new();
-    bad_map.insert(bad_b_id.hex(), json!(bad_receipts[0]));
-    bad_map.insert(bad_snap_id.hex(), json!(bad_receipts[1]));
-    let r_bad = push_body(&api, &c.token, &p.name, new_tip, bad_snap_id, &bad_map);
-    assert_eq!(r_bad.status, 403, "refused push: {}", String::from_utf8_lossy(&r_bad.body));
-    assert_eq!(
-        hub.hub().objects.index_bound().available(),
-        veil_server::pack::INDEXES_HELD,
-        "all index shares released after a failed push"
     );
 }
 
@@ -1530,7 +1293,7 @@ fn a_push_of_a_stack_with_attempts_across_windows_keeps_every_attempt_and_lands_
 /// and none on `main` until release, and its objects are in the push's pack.
 #[test]
 fn embargoed_stack_across_guess_windows_stays_on_hidden_line_until_release_and_packs_its_objects() {
-    let hub = TestHub::start_packs();
+    let hub = TestHub::start();
     let p = setup_project(&hub);
     p.admin.ok(&p.dir, &["group", "add", "devs", &p.sec.name]);
     let pid = project_id(&hub, &p.name);
@@ -1655,6 +1418,7 @@ fn embargoed_stack_across_guess_windows_stays_on_hidden_line_until_release_and_p
 
     let (listed_before, discarded_before) = pack_rows(&hub, pid);
     let w_before = writes(&hub);
+    let kept_before = hub.hub().objects.objects_kept.load(Relaxed);
 
     let up = api.upload(&c.token, &p.name, &c.objects);
     assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
@@ -1673,22 +1437,23 @@ fn embargoed_stack_across_guess_windows_stays_on_hidden_line_until_release_and_p
     assert_eq!(r.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.json()["results"][0]["branch"], json!("main"));
 
-    // Pack check: `p.sec` cannot see `billing/`, so the server completes every snapshot
-    // across both GUESS_WINDOW chunks and writes at most 2 packs (upload's pack + push's own pack).
+    // Objects layout: `p.sec` cannot see `billing/`, so the server completes every snapshot
+    // across both GUESS_WINDOW chunks, stores every kept object loose (1 upload container + kept),
+    // and lists no new pack.
     let w_used = writes(&hub) - w_before;
-    assert!((1..=2).contains(&w_used), "expected 1..=2 storage writes for upload + push, got {w_used}");
+    let kept = hub.hub().objects.objects_kept.load(Relaxed) - kept_before;
+    assert_eq!(w_used, 1 + kept, "expected 1 upload + {kept} kept objects, got {w_used}");
     let (listed_after, discarded_after) = pack_rows(&hub, pid);
-    assert!(listed_after > listed_before, "push must list packs ({listed_before} -> {listed_after})");
-    assert_eq!(discarded_after, discarded_before, "no pack discarded on successful push");
+    assert_eq!(listed_after, listed_before, "push in objects layout lists no pack ({listed_before} -> {listed_after})");
+    assert_eq!(discarded_after, discarded_before, "upload container purged after commit");
 
-    // Verify all uploaded blobs and completed snapshots are readable from the listed packs
-    // (including from a fresh server `other` that only reads the listed packs).
+    // Verify all uploaded blobs and completed snapshots are readable from a fresh server `other`.
     let other = TestHub::beside(&hub);
     let h_other = other.hub();
     for bid in &file_blobs {
         assert!(
             other.rt.block_on(h_other.objects.get(pid, bid)).unwrap().is_some(),
-            "blob {bid} must be in the push's listed pack"
+            "blob {bid} must be readable on a fresh server"
         );
     }
     let _ = upload_pack;
@@ -1824,161 +1589,6 @@ fn bug_2370_racing_pushes_leave_no_pack_of_their_own_behind() {
         }
     }
 }
-
-/// BUG-2665: in `packs` layout, uploading the same objects multiple times as
-/// one person deduplicates to one staged pack (`BUG-1157`). Concurrent API
-/// commits (`POST …/changes`) naming those receipts all answer `200` and keep
-/// `objects >= 0` on the discarded row, and an in-flight sharer that passed
-/// `staging()` before the first commit's `settle_uploads` discarded the staged
-/// pack still reads its entries from `Objects::cache` (`is_discarded_here` is
-/// gated to `ObjectLayout::Objects`).
-#[test]
-fn bug_2665_concurrent_api_commits_sharing_a_deduplicated_upload_all_succeed() {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-    use veil_core::hub::encoding;
-
-    let hub = TestHub::start_packs();
-    let other = TestHub::beside(&hub);
-    let p = setup_project(&hub);
-    let pid = project_id(&hub, &p.name);
-    let api = hub.api();
-    let other_api = other.api();
-    let token = p.dev.token();
-    let base = api.tips(Some(&token), &p.name).unwrap().branches["main"];
-
-    let make_frames = |seed: u8| -> Vec<(ObjectId, Vec<u8>, Vec<u8>)> {
-        let mut x: u64 = 0x9e37_79b9_7f4a_7c15 ^ u64::from(seed);
-        (0..4u8)
-            .map(|k| {
-                let mut content = vec![0u8; 64 << 10];
-                for i in (0..content.len()).step_by(16) {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    content[i] = x as u8;
-                }
-                content[0] = seed;
-                content[1] = k;
-                let raw = O::Blob(content.clone()).encode();
-                let id = ObjectId::hash(&raw);
-                let enc = encoding::encode(&raw).into_owned();
-                (id, content, enc)
-            })
-            .collect()
-    };
-
-    // 1. 3 uploads deduplicated to 1 staged pack on `hub`, followed by 3
-    //    simultaneous API commits on `hub`.
-    let frames_a = make_frames(0x41);
-    let w0 = writes(&hub);
-    let mut packs_a = HashSet::new();
-    let commits_a: Vec<serde_json::Value> = (0..3)
-        .map(|n| {
-            let mut body = Vec::new();
-            for (id, _, enc) in &frames_a {
-                put_frame(&mut body, id, enc);
-            }
-            let up = api.upload_encoded_body(&token, &p.name, &body);
-            assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
-            let receipts: Vec<String> = serde_json::from_value(up.json()["receipts"].clone()).unwrap();
-            for r in &receipts {
-                packs_a.insert(r.split_once('.').unwrap().1.to_string());
-            }
-            let edits: Vec<serde_json::Value> = frames_a
-                .iter()
-                .enumerate()
-                .map(|(i, (id, _, _))| json!({"path": format!("src/c2665_a{n}/f{i}.bin"), "put": {"object": id.hex()}}))
-                .collect();
-            let rmap: serde_json::Map<String, serde_json::Value> = frames_a
-                .iter()
-                .zip(&receipts)
-                .map(|((id, _, _), r)| (id.hex(), json!(r)))
-                .collect();
-            json!({"base": base.hex(), "description": format!("c2665 a{n}"), "edits": edits, "receipts": rmap})
-        })
-        .collect();
-    assert_eq!(packs_a.len(), 1, "all 3 uploads must share one deduplicated pack: {packs_a:?}");
-    assert_eq!(writes(&hub) - w0, 1, "deduplicated uploads write one staged pack");
-    let pack_a = packs_a.into_iter().next().unwrap();
-
-    let replies_a: Vec<Reply> = std::thread::scope(|s| {
-        let hs: Vec<_> = commits_a
-            .iter()
-            .map(|c| s.spawn(|| api.post_json(Some(&token), &format!("/v1/projects/{}/changes", p.name), c)))
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    for (n, r) in replies_a.iter().enumerate() {
-        assert_eq!(r.status, 200, "commit a{n}: {}", String::from_utf8_lossy(&r.body));
-        let snap_id = ObjectId::from_hex(r.json()["snapshot"].as_str().unwrap()).unwrap();
-        let fetched = other_api.post_json(
-            Some(&token),
-            &format!("/v1/projects/{}/fetch", p.name),
-            &json!({"snapshot": snap_id.hex(), "objects": [{"path": format!("src/c2665_a{n}/f0.bin"), "id": frames_a[0].0.hex()}]}),
-        );
-        assert_eq!(fetched.status, 200, "fetch a{n}: {}", String::from_utf8_lossy(&fetched.body));
-        assert_eq!(O::decode(&fetched.frames()[0].1).unwrap(), O::Blob(frames_a[0].1.clone()));
-    }
-    let row_a: (i16, i64) = hub
-        .rt
-        .block_on(
-            sqlx::query_as("SELECT state, objects FROM packs WHERE project_id = $1 AND name = $2")
-                .bind(pid)
-                .bind(&pack_a)
-                .fetch_one(&hub.hub().db),
-        )
-        .unwrap();
-    assert_eq!(row_a, (2, 4), "shared pack_a must be DISCARDED with objects intact after settlement");
-    assert!(
-        !hub.rt.block_on(hub.hub().objects.blob_store().exists(&veil_server::pack::key(pid, &pack_a))).unwrap(),
-        "discarded pack_a must be deleted from storage"
-    );
-
-    // 2. Deterministic reproduction of the `hostile_bug_1156` `ReadAhead::wait`
-    //    window: an in-flight sharer resolves `staged_slots` during `staging()`,
-    //    then Commit 0's `settle_uploads` runs `discard` (marking `pack_b`
-    //    `DISCARDED` and deleting it from storage), and the parked sharer
-    //    subsequently reads `staged_declared`, `staged_encoding` and
-    //    `get_staged` from `Objects::cache`.
-    let frames_b = make_frames(0x73);
-    let mut body_b = Vec::new();
-    for (id, _, enc) in &frames_b {
-        put_frame(&mut body_b, id, enc);
-    }
-    let up_b = api.upload_encoded_body(&token, &p.name, &body_b);
-    assert_eq!(up_b.status, 200, "{}", String::from_utf8_lossy(&up_b.body));
-    let receipts_b: Vec<String> = serde_json::from_value(up_b.json()["receipts"].clone()).unwrap();
-    let pack_b = receipts_b[0].split_once('.').unwrap().1.to_string();
-    let ids_b: Vec<ObjectId> = frames_b.iter().map(|(id, _, _)| *id).collect();
-
-    let h = hub.hub();
-    let slots_b = hub
-        .rt
-        .block_on(h.objects.staged_slots(pid, &pack_b, &ids_b))
-        .unwrap()
-        .expect("staged_slots present before Commit 0 settles");
-    assert_eq!(slots_b.slots.len(), 4);
-
-    let pack_b_arc: Arc<str> = Arc::from(pack_b.as_str());
-    hub.rt.block_on(h.objects.discard(pid, std::slice::from_ref(&pack_b_arc))).unwrap();
-    assert!(h.objects.packs().is_discarded_here(pid, &pack_b));
-    assert!(!hub.rt.block_on(h.objects.blob_store().exists(&veil_server::pack::key(pid, &pack_b))).unwrap());
-
-    for (id, slot) in &slots_b.slots {
-        let (_, content, enc) = frames_b.iter().find(|(fid, _, _)| fid == id).unwrap();
-        let raw_expected = O::Blob(content.clone()).encode();
-        let declared = hub.rt.block_on(h.objects.staged_declared(pid, &pack_b, *slot, id)).unwrap();
-        assert_eq!(declared, Some(raw_expected.len() as u64), "staged_declared must still answer from cache in packs mode");
-        let got_enc = hub.rt.block_on(h.objects.staged_encoding(pid, &pack_b, *slot, id)).unwrap();
-        assert_eq!(got_enc.as_deref(), Some(enc.as_slice()), "staged_encoding must still answer from cache in packs mode");
-        let got_both = hub.rt.block_on(h.objects.get_staged(pid, &pack_b, *slot, id)).unwrap();
-        let (got_e2, got_raw) = got_both.expect("get_staged must still answer from cache in packs mode");
-        assert_eq!(got_e2.as_ref(), enc.as_slice());
-        assert_eq!(got_raw.as_ref(), raw_expected.as_slice());
-    }
-}
-
 /// BUG-1150: a push introducing enough objects (~500,500 tiny blobs + trees)
 /// that per-object receipts exceed the 64 MiB JSON body limit is refused with
 /// 413 before the fix and lands cleanly once a push names its staged packs.
@@ -1993,7 +1603,7 @@ fn bug_1150_push_past_64_mib_of_per_object_receipts_lands() {
         Repo,
     };
 
-    let hub = TestHub::start_packs();
+    let hub = TestHub::start();
     let p = setup_project(&hub);
     let dir = clone(&hub, &p, &p.admin, "admin-1150");
 
@@ -2115,8 +1725,8 @@ fn bug_1150_push_past_64_mib_of_per_object_receipts_lands() {
     assert_eq!(O::decode(&frames[0].1).unwrap(), O::Blob(sample_text.into_bytes()));
 }
 
-/// Shared proof-of-upload test for BUG-1150 (`PushRequest::packs` and
-/// `LandRequest::packs`), run against both `packs` and `objects` layouts.
+/// Proof-of-upload test for BUG-1150 (`PushRequest::packs` and
+/// `LandRequest::packs`) in `objects` layout.
 fn bug_1150_push_packs_proof_of_upload(hub: TestHub) {
     let p = setup_project(&hub);
     let pid = project_id(&hub, &p.name);
@@ -2375,11 +1985,6 @@ fn bug_1150_push_packs_proof_of_upload(hub: TestHub) {
     assert_eq!(r_land_ok.status, 200, "{}", String::from_utf8_lossy(&r_land_ok.body));
     assert_eq!(r_land_ok.json()["state"], "landed", "{}", String::from_utf8_lossy(&r_land_ok.body));
     assert_eq!(read_file(&api, &dev_tok, &p.name, "src/land_1150.rs"), Some(b"MARKER-LAND-1150\n".to_vec()));
-}
-
-#[test]
-fn bug_1150_push_packs_proof_of_upload_in_packs_layout() {
-    bug_1150_push_packs_proof_of_upload(TestHub::start_packs());
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //! ```text
 //! veil-server --database-url postgres://… --data ./hub [--listen 127.0.0.1:8443]
 //!             [--storage DIR | --s3-endpoint URL --s3-bucket B]
-//!             [--object-layout packs|objects]
+//!             [--object-layout objects]
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
 //!             [--device-rate 200/50000] [--anonymous-rate 20/1000]
 //!             [--max-connections 1024] [--request-memory 512M]   (docs/HUB.md §13.25)
@@ -49,8 +49,8 @@ struct Args {
     s3_bucket: Option<String>,
     #[arg(long, default_value = "us-east-1")]
     s3_region: String,
-    /// How this server keeps new objects: `packs` or `objects` (default:
-    /// VEIL_OBJECT_LAYOUT, or `packs`).
+    /// How this server keeps new objects: `objects` (default: VEIL_OBJECT_LAYOUT,
+    /// or `objects`; existing listed packs remain readable).
     #[arg(long)]
     object_layout: Option<ObjectLayout>,
     /// TLS certificate chain (PEM); without it, a self-signed certificate.
@@ -163,7 +163,7 @@ fn object_layout(given: Option<ObjectLayout>, env: Option<&str>) -> anyhow::Resu
     match (given, env) {
         (Some(l), _) => Ok(l),
         (None, Some(s)) => s.parse::<ObjectLayout>().map_err(|e| anyhow::anyhow!("VEIL_OBJECT_LAYOUT: {e}")),
-        (None, None) => Ok(ObjectLayout::Packs),
+        (None, None) => Ok(ObjectLayout::Objects),
     }
 }
 
@@ -373,18 +373,20 @@ mod tests {
     #[test]
     fn object_layout_flag_and_env() {
         use clap::Parser;
-        use veil_server::ObjectLayout::{Objects, Packs};
+        use veil_server::ObjectLayout::Objects;
 
-        assert_eq!(super::object_layout(None, None).unwrap(), Packs);
-        assert_eq!(super::object_layout(None, Some("packs")).unwrap(), Packs);
+        assert_eq!(super::object_layout(None, None).unwrap(), Objects);
         assert_eq!(super::object_layout(None, Some("objects")).unwrap(), Objects);
-        assert_eq!(super::object_layout(Some(Objects), Some("packs")).unwrap(), Objects);
-        assert_eq!(super::object_layout(Some(Packs), Some("objects")).unwrap(), Packs);
+        assert_eq!(super::object_layout(Some(Objects), Some("objects")).unwrap(), Objects);
+        let packs_err = super::object_layout(None, Some("packs")).unwrap_err().to_string();
+        assert!(packs_err.contains("VEIL_OBJECT_LAYOUT:"), "unexpected error: {packs_err}");
+        assert!(packs_err.contains("packs"), "unexpected error: {packs_err}");
         let err = super::object_layout(None, Some("blobs")).unwrap_err().to_string();
-        assert_eq!(err, "VEIL_OBJECT_LAYOUT: blobs: expected `packs` or `objects`");
+        assert_eq!(err, "VEIL_OBJECT_LAYOUT: blobs: expected `objects`");
 
         let parsed = super::Args::try_parse_from(["veil-server", "--data", "/tmp/h", "--object-layout", "objects"]).unwrap();
         assert_eq!(parsed.object_layout, Some(Objects));
+        assert!(super::Args::try_parse_from(["veil-server", "--data", "/tmp/h", "--object-layout", "packs"]).is_err());
         assert!(super::Args::try_parse_from(["veil-server", "--data", "/tmp/h", "--object-layout", "blobs"]).is_err());
     }
 }

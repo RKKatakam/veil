@@ -167,7 +167,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub database_url: String,
     pub storage: Storage,
-    /// How this server keeps new objects (`packs` or `objects`).
+    /// How this server keeps new objects (`objects`; v1 is append-only).
     pub object_layout: ObjectLayout,
     pub tls: tls::TlsSource,
     /// The server's identity and the self-signed certificate live here.
@@ -201,13 +201,20 @@ pub struct Running {
 impl Running {
     /// A clean stop: the server stops taking connections, then its landing
     /// services end and give their leases up (`landing::stop`, BUG-1970),
-    /// and its search index updates at work end (`search::index::stop`,
-    /// BUG-1990).
+    /// and its background derivers, viewer-graph fills, search index updates,
+    /// and upload-container sweepers end (`derive::stop`, `query::graph::stop`,
+    /// `search::index::stop`, `pack_gc::stop`, BUG-1990, BUG-2635).
     pub async fn stop(self) {
         let _ = self.shutdown.send(true);
         let _ = self.task.await;
         landing::stop(&self.hub).await;
-        search::index::stop(&self.hub).await;
+        tokio::join!(
+            derive::stop(&self.hub),
+            query::graph::stop(&self.hub),
+            search::index::stop(&self.hub),
+            pack_gc::stop(&self.hub),
+        );
+        tokio::task::yield_now().await;
     }
 }
 
@@ -293,7 +300,6 @@ pub async fn start_with_store(config: Config, store_override: Option<Arc<dyn sto
         limits: limits::Limits::new(config.limits, config.db_connections),
         commits: Default::default(),
     });
-    pack_gc::wire_leftover_merges(&hub);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::watch::channel(false);
@@ -314,14 +320,16 @@ pub async fn start_with_store(config: Config, store_override: Option<Arc<dyn sto
             async move {
                 derive::resume(hub.clone(), None).await;
                 // The search index follows (S15, BUG-1231).
-                crate::search::index::resume(hub, None).await;
+                if !hub.landing.stopping() {
+                    crate::search::index::resume(hub, None).await;
+                }
             }
         });
         // Landings queued when a server stopped are landed.
         tokio::spawn(landing::resume(hub.clone()));
         tokio::spawn(bisect::resume(hub.clone()));
-        // Packs a stopped server left to sweep, then a look every few
-        // minutes (BUG-2280).
+        // Staged/discarded upload containers left to sweep, then a look every
+        // few minutes.
         tokio::spawn(pack_gc::sweep_scan(hub.clone(), sweep_stop));
     }
     Ok(Running {
