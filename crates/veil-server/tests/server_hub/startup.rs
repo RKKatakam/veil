@@ -1415,3 +1415,180 @@ fn not_safe_to_run_again(sql: &str) -> Option<String> {
     }
     None
 }
+
+/// Q4: migration 46 (`-- veil: yugabyte-only`) is skipped on PostgreSQL and
+/// rebuilds the 10 hot per-branch/per-change tables with composite hash keys
+/// on YugabyteDB while preserving every row, keeping sequences owned/working,
+/// and running idempotently if re-applied.
+#[test]
+fn q4_single_repo_hash_keys_migration_preserves_rows_and_is_idempotent() {
+    use veil_server::db::{is_yugabyte, migration_parts, IndexStep, MIGRATIONS, ONLINE_INDEXES, YUGABYTE_ONLY};
+
+    // Unit checks for `YUGABYTE_ONLY` parsing.
+    let yb_sql = format!("{YUGABYTE_ONLY}\nSELECT 1;\n");
+    let p = migration_parts(&yb_sql).expect("yugabyte-only");
+    assert!(p.yugabyte_only && p.online.is_empty());
+    let mixed = format!("{YUGABYTE_ONLY}\nSELECT 1;\n{ONLINE_INDEXES}\nDROP INDEX CONCURRENTLY IF EXISTS x;\n");
+    assert!(migration_parts(&mixed).is_err(), "cannot mix yugabyte-only and online indexes");
+
+    let rt = runtime();
+    let (url, name) = fresh_database(&rt);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
+        let yb = is_yugabyte(&version);
+
+        // Apply migrations 1..=45 cleanly on the fresh database.
+        exec_retrying(
+            &db,
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        )
+        .await;
+        for &(ver, mname, sql) in MIGRATIONS.iter().filter(|m| m.0 < 46) {
+            let parts = migration_parts(sql).unwrap();
+            assert!(!parts.yugabyte_only);
+            let mut stmts = Vec::new();
+            if parts.transactional.lines().any(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("--")
+            }) {
+                stmts.push(parts.transactional.to_string());
+            }
+            for s in parts.online {
+                match s {
+                    IndexStep::Create { sql, .. } => stmts.push(sql),
+                    IndexStep::Drop { name } => stmts.push(format!("DROP INDEX IF EXISTS {name}")),
+                }
+            }
+            for s in stmts {
+                exec_retrying(&db, &s).await;
+            }
+            sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, 0)")
+                .bind(ver)
+                .bind(mname)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+
+        // Seed rows in all 10 tables rebuilt by migration 46.
+        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('q4alice', 1)").await;
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'q4proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'q4alice'",
+        )
+        .await;
+        let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'q4proj'").fetch_one(&db).await.unwrap();
+        let uid: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'q4alice'").fetch_one(&db).await.unwrap();
+
+        for q in [
+            format!("INSERT INTO branches (project_id, name, target) VALUES ({pid}, 'main', 'snap1'), ({pid}, 'agent-1', 'snap2')"),
+            format!("INSERT INTO snapshots (project_id, id, author) VALUES ({pid}, 'snap1', {uid}), ({pid}, 'snap2', {uid})"),
+            format!("INSERT INTO origins (project_id, real_id, origin_id) VALUES ({pid}, 'snap1', 'orig1')"),
+            format!(
+                "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+                 VALUES ({pid}, 'vk1', 'snap1', 'proj1', 100, false)"
+            ),
+            format!(
+                "INSERT INTO landed_changes (project_id, branch, lineage, change_id, author, landed) \
+                 VALUES ({pid}, 'main', 1, 'chg1', {uid}, 'snap1')"
+            ),
+            format!(
+                "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, \
+                 person_epoch, project_epoch, state, created_at, priority, person_slot, session, session_slot) \
+                 VALUES ({pid}, 'main', 'tkt-1', {uid}, 'q4alice', 'dev1', '[]', 1, 0, 0, 'queued', 100, 0, 0, 's1', 0)"
+            ),
+            format!(
+                "INSERT INTO landings (project_id, branch, lineage, submitted, landed, at) \
+                 VALUES ({pid}, 'main', 1, 'sub1', 'snap1', 100)"
+            ),
+            format!(
+                "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at, served, lock_epoch) \
+                 VALUES ({pid}, 'main', 'hub1', 1, 9999, 2, 1)"
+            ),
+            format!(
+                "INSERT INTO packs (project_id, name, state, person_id, size, objects, created_at) \
+                 VALUES ({pid}, 'pack-listed', 1, NULL, 128, 3, 100), ({pid}, 'pack-staged', 0, {uid}, 64, 1, 101)"
+            ),
+            format!(
+                "INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) \
+                 VALUES ({pid}, 'chg1', 'snap1', {uid}, 100)"
+            ),
+        ] {
+            exec_retrying(&db, &q).await;
+        }
+
+        // Apply migration 46 via the real runner, then re-apply it to prove idempotency.
+        for pass in 1..=2 {
+            veil_server::db::migrate(&db).await.unwrap_or_else(|e| panic!("migrate pass {pass}: {e:?}"));
+            assert!(veil_server::db::schema_current(&db).await.unwrap());
+
+            let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT \
+                   (SELECT count(*) FROM branches WHERE project_id = $1), \
+                   (SELECT count(*) FROM snapshots WHERE project_id = $1), \
+                   (SELECT count(*) FROM origins WHERE project_id = $1), \
+                   (SELECT count(*) FROM projections WHERE project_id = $1), \
+                   (SELECT count(*) FROM landed_changes WHERE project_id = $1), \
+                   (SELECT count(*) FROM landing_queue WHERE project_id = $1), \
+                   (SELECT count(*) FROM landings WHERE project_id = $1), \
+                   (SELECT count(*) FROM landing_leases WHERE project_id = $1), \
+                   (SELECT count(*) FROM packs WHERE project_id = $1), \
+                   (SELECT count(*) FROM change_refs WHERE project_id = $1)",
+            )
+            .bind(pid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(counts, (2, 2, 1, 1, 1, 1, 1, 1, 2, 1), "pass {pass} preserved all rows");
+
+            if yb {
+                for (tbl, want_hash) in [
+                    ("branches", "(project_id, name) HASH"),
+                    ("snapshots", "(project_id, id) HASH"),
+                    ("origins", "(project_id, real_id) HASH"),
+                    ("projections", "(project_id, view_key, real_id) HASH"),
+                    ("landed_changes", "(project_id, branch) HASH"),
+                    ("landing_queue", "(project_id, branch) HASH"),
+                    ("landings", "(project_id, branch) HASH"),
+                    ("landing_leases", "(project_id, branch) HASH"),
+                    ("packs", "(project_id, name) HASH"),
+                    ("change_refs", "(project_id, change_id) HASH"),
+                ] {
+                    let def: String = sqlx::query_scalar(
+                        "SELECT pg_get_indexdef(i.indexrelid) FROM pg_index i \
+                         WHERE i.indrelid = to_regclass($1) AND i.indisprimary",
+                    )
+                    .bind(tbl)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+                    assert!(def.contains(want_hash), "pass {pass}: {tbl} PK missing {want_hash}: {def}");
+                }
+                let has_bp: Option<String> = sqlx::query_scalar("SELECT to_regclass('branches_by_project')::text").fetch_one(&db).await.unwrap();
+                assert!(has_bp.is_some(), "branches_by_project must exist on YB");
+            }
+
+            if pass == 1 {
+                exec_retrying(&db, "DELETE FROM schema_migrations WHERE version = 46").await;
+            }
+        }
+
+        // Verify landing_queue_seq_seq still works via DEFAULT after rebuild.
+        exec_retrying(
+            &db,
+            &format!(
+                "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, \
+                 person_epoch, project_epoch, state, created_at, priority, person_slot, session, session_slot) \
+                 VALUES ({pid}, 'agent-1', 'tkt-2', {uid}, 'q4alice', 'dev1', '[]', 1, 0, 0, 'queued', 102, 0, 1, 's1', 1)"
+            ),
+        )
+        .await;
+        let qcount: i64 = sqlx::query_scalar("SELECT count(*) FROM landing_queue WHERE project_id = $1").bind(pid).fetch_one(&db).await.unwrap();
+        assert_eq!(qcount, 2);
+
+        db.close().await;
+    });
+    drop_database(&rt, &name);
+}

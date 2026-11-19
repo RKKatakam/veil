@@ -88,6 +88,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (43, "drop_hot_fks", include_str!("../migrations/0043_drop_hot_fks.sql")),
     (44, "prune_repair_indexes", include_str!("../migrations/0044_prune_repair_indexes.sql")),
     (45, "person_epochs", include_str!("../migrations/0045_person_epochs.sql")),
+    (46, "single_repo_hash_keys", include_str!("../migrations/0046_single_repo_hash_keys.sql")),
 ];
 
 pub async fn connect(url: &str, max: u32) -> anyhow::Result<PgPool> {
@@ -337,6 +338,20 @@ async fn migrate_once(
         eprintln!("veil-server: applying migration {version} ({name})");
         let parts = migration_parts(sql).map_err(|e| Error::Other(anyhow::anyhow!("migration {version} ({name}): {e}")))?;
         let record = "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)";
+        if parts.yugabyte_only {
+            let yb = match yugabyte {
+                Some(yb) => yb,
+                None => {
+                    let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&mut *c).await?;
+                    *yugabyte.insert(is_yugabyte(&version))
+                }
+            };
+            if yb {
+                yugabyte_only_steps(&mut *c, parts.transactional, deadline).await?;
+            }
+            sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
+            continue;
+        }
         if parts.online.is_empty() {
             // Each migration in its own transaction. Migration files are
             // idempotent (`IF NOT EXISTS`): YugabyteDB applies DDL in a
@@ -362,25 +377,61 @@ async fn migrate_once(
             Some(yb) => yb,
             None => {
                 let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&mut *c).await?;
-                let yb = is_yugabyte(&version);
-                if yb {
-                    // YugabyteDB's online build holds every row only while it
-                    // waits for every backend to see each stage of the index.
-                    let off: Option<String> =
-                        sqlx::query_scalar("SELECT current_setting('yb_disable_wait_for_backends_catalog_version', true)").fetch_one(&mut *c).await?;
-                    if off.as_deref() == Some("on") {
-                        return Err(Error::Other(anyhow::anyhow!(
-                            "this YugabyteDB runs with yb_disable_wait_for_backends_catalog_version on, so an index built online \
-                             could miss rows written during its build: set it off (its default) to migrate"
-                        )));
-                    }
-                }
-                *yugabyte.insert(yb)
+                *yugabyte.insert(is_yugabyte(&version))
             }
         };
+        if yb {
+            // YugabyteDB's online build holds every row only while it
+            // waits for every backend to see each stage of the index.
+            let off: Option<String> =
+                sqlx::query_scalar("SELECT current_setting('yb_disable_wait_for_backends_catalog_version', true)").fetch_one(&mut *c).await?;
+            if off.as_deref() == Some("on") {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "this YugabyteDB runs with yb_disable_wait_for_backends_catalog_version on, so an index built online \
+                     could miss rows written during its build: set it off (its default) to migrate"
+                )));
+            }
+        }
         online_index_steps(&mut *c, yb, &parts.online, deadline, after_build, builds).await?;
         sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
     }
+    Ok(())
+}
+
+/// Run a [`YUGABYTE_ONLY`] migration's [`YUGABYTE_STEP`]-delimited steps one by
+/// one outside a transaction block, under the remaining migration deadline's
+/// statement and lock timeouts (resetting both afterwards).
+async fn yugabyte_only_steps(c: &mut PgConnection, sql: &str, deadline: tokio::time::Instant) -> Result<()> {
+    let mut step = String::new();
+    let mut steps = Vec::new();
+    for line in sql.lines() {
+        if line.trim() == YUGABYTE_STEP {
+            if has_statements(&step) {
+                steps.push(std::mem::take(&mut step));
+            } else {
+                step.clear();
+            }
+        } else {
+            step.push_str(line);
+            step.push('\n');
+        }
+    }
+    if has_statements(&step) {
+        steps.push(step);
+    }
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(STATEMENT_TIMEOUT);
+    let ms = left.as_millis();
+    sqlx::raw_sql(&format!("SET statement_timeout = {ms}; SET lock_timeout = {ms}")).execute(&mut *c).await?;
+    let mut res = Ok(());
+    for s in &steps {
+        if let Err(e) = sqlx::raw_sql(s).execute(&mut *c).await {
+            res = Err(Error::from(e));
+            break;
+        }
+    }
+    let reset = sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout").execute(&mut *c).await;
+    res?;
+    reset?;
     Ok(())
 }
 
@@ -442,12 +493,25 @@ async fn migrate_once(
 /// (no server writes a table it does not know): it stays in the transaction.
 pub const ONLINE_INDEXES: &str = "-- veil: online indexes";
 
-/// A migration's statements: those applied in one transaction, then its
-/// [`ONLINE_INDEXES`] steps.
+/// First line of a migration whose SQL uses YugabyteDB-only DDL (such as
+/// composite hash keys `PRIMARY KEY ((a, b) HASH)`). On PostgreSQL
+/// (`!is_yugabyte(version)`) the runner skips executing the SQL and records
+/// the migration as applied; on YugabyteDB its [`YUGABYTE_STEP`]-delimited
+/// steps run one by one outside a transaction block.
+pub const YUGABYTE_ONLY: &str = "-- veil: yugabyte-only";
+
+/// Step boundary inside a [`YUGABYTE_ONLY`] migration: each step runs as its
+/// own top-level query outside a transaction block.
+pub const YUGABYTE_STEP: &str = "-- veil: step";
+
+/// A migration's statements: those applied in one transaction (or step by step
+/// on YugabyteDB when `yugabyte_only` is set), then its [`ONLINE_INDEXES`]
+/// steps.
 #[derive(Debug)]
 pub struct MigrationParts<'a> {
     pub transactional: &'a str,
     pub online: Vec<IndexStep>,
+    pub yugabyte_only: bool,
 }
 
 /// One step of a migration's [`ONLINE_INDEXES`] section.
@@ -462,10 +526,14 @@ pub enum IndexStep {
 /// Split a migration at its [`ONLINE_INDEXES`] line, and read its steps;
 /// what the section holds that is not a step is refused.
 pub fn migration_parts(sql: &str) -> std::result::Result<MigrationParts<'_>, String> {
+    let yugabyte_only = sql.lines().next().is_some_and(|l| l.trim() == YUGABYTE_ONLY);
     let at = sql.match_indices(ONLINE_INDEXES).map(|(i, _)| i).find(|&i| i == 0 || sql.as_bytes()[i - 1] == b'\n');
     let Some(at) = at else {
-        return Ok(MigrationParts { transactional: sql, online: Vec::new() });
+        return Ok(MigrationParts { transactional: sql, online: Vec::new(), yugabyte_only });
     };
+    if yugabyte_only {
+        return Err("a yugabyte-only migration may not hold an online indexes section".into());
+    }
     let rest = &sql[at..];
     let section = rest.split_once('\n').map_or("", |(_, after)| after);
     if section.lines().any(|l| l.trim_start().starts_with(ONLINE_INDEXES)) {
@@ -507,7 +575,7 @@ pub fn migration_parts(sql: &str) -> std::result::Result<MigrationParts<'_>, Str
     if online.is_empty() {
         return Err("an online indexes section with no step".into());
     }
-    Ok(MigrationParts { transactional: &sql[..at], online })
+    Ok(MigrationParts { transactional: &sql[..at], online, yugabyte_only })
 }
 
 /// Whether `sql` holds anything but blank lines and `--` comments.
