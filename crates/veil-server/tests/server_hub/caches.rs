@@ -533,11 +533,9 @@ fn p6_person_epochs_sharded_tested_cached_embargo_live() {
     let t3 = b.api().tips(Some(&admin), &p.name).unwrap();
     assert_eq!(t3.embargoes.len(), 1, "new embargo must be visible immediately without waiting for TIPS_TTL");
     assert_eq!(t3.embargoes[0].id, "emb-p6-live");
-    // And an outsider (fin, removed from finance and not in eng) still sees none:
-    let t3_out = b.api().tips(Some(&p.fin.token()), &p.name);
-    if let Some(t) = t3_out {
-        assert!(t.embargoes.is_empty());
-    }
+    // And an outsider (fin, removed from finance and not in eng, still reads public src/) sees no embargoes:
+    let t3_out = b.api().tips(Some(&p.fin.token()), &p.name).expect("fin still reads public src/");
+    assert!(t3_out.embargoes.is_empty(), "outsider must not see eng embargo: {:?}", t3_out.embargoes);
     // Releasing the embargo sets released_at (embargo_free becomes true, no_embargoes stays false so released record is still returned for pull keychain sync):
     a.rt.block_on(
         sqlx::query("UPDATE embargo_lines SET released_at = $2 WHERE project_id = $1 AND embargo_id = 'emb-p6-live'")

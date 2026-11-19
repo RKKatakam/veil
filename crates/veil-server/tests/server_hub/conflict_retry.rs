@@ -20,7 +20,7 @@ use crate::{limits::project_id_of, support::*};
 /// run again and stored once the lock is free: 200, never 500.
 #[test]
 fn bug_2340_an_upload_whose_pack_row_waits_out_a_lock_is_retried_not_an_internal_error() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_own();
     let p = setup_project(&hub);
     let api = hub.api();
     let token = p.dev.token();

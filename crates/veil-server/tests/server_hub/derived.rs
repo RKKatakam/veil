@@ -2400,7 +2400,7 @@ fn bug_2480_a_run_over_many_moved_branches_asks_and_reads_them_together() {
 fn p8_derive_debounce_coalesces_pushes_and_immediate_read_sees_history() {
     use veil_server::db::Commit;
 
-    let th = TestHub::start();
+    let th = TestHub::start_own();
     let hub = th.hub();
     assert_eq!(hub.derive.debounce(), derive::DEFAULT_DEBOUNCE);
     assert_eq!(derive::DEFAULT_DEBOUNCE, Duration::from_millis(250));
