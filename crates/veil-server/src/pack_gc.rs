@@ -58,19 +58,6 @@ pub const SWEEP_RECHECK: std::time::Duration = std::time::Duration::from_secs(10
 /// containers to sweep, starting once at server start-up.
 pub const SWEEP_SCAN: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Coalescing delay before background deletion of consumed `packs` rows whose
-/// storage containers were already deleted synchronously (`P5-B`).
-pub const PURGE_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// Flush a project's queued consumed-pack row deletions early once this many
-/// rows accumulate.
-const PURGE_BATCH_SIZE: usize = 256;
-
-/// Upper bound on queued consumed-pack row names in memory per server. Excess
-/// rows remain `DISCARDED (objects = -1)` in `packs` and are swept later by
-/// [`sweep_discarded`].
-const MAX_QUEUED_PURGES: usize = 16_384;
-
 /// Async test hook (used by `embargo::State::before_review`).
 #[derive(Clone)]
 pub struct SwitchHook(
@@ -123,25 +110,12 @@ pub struct SweepReport {
     pub staged_packs_swept: usize,
 }
 
-/// Pending consumed `packs` row names whose storage objects were already
-/// deleted, coalesced per project for batched `DELETE FROM packs`.
-#[derive(Default)]
-struct PurgedQueue {
-    by_project: HashMap<i64, Vec<String>>,
-    total: usize,
-    running: bool,
-}
-
 /// Per-server background upload-container sweeper state on [`Hub`].
 #[derive(Default)]
 pub struct State {
     /// Projects with a sweeper task on this server ([`schedule_sweep`]),
     /// each with whether it was asked again since it last looked.
     sweeping: Mutex<HashMap<i64, bool>>,
-    /// Consumed `packs` rows awaiting background batched `DELETE`.
-    purged: Mutex<PurgedQueue>,
-    /// Wakes the purged-row flusher early when a project hits [`PURGE_BATCH_SIZE`].
-    purged_wake: tokio::sync::Notify,
     /// Sweeper tasks currently running on this server ([`stop`]).
     at_work: std::sync::atomic::AtomicUsize,
     /// Notified when `at_work` reaches zero.
@@ -189,117 +163,6 @@ pub async fn stop(hub: &Arc<Hub>) {
             return;
         }
     }
-}
-
-/// Queue consumed `packs` row names (already `DISCARDED` with `objects < 0`
-/// and deleted from object storage) for background batched `DELETE FROM packs`.
-///
-/// Moving the `DELETE` out of the foreground push removes one DB commit per
-/// push while preserving immediate storage deletion of staged containers; if
-/// the server crashes before the batch runs, [`sweep_project`] removes the
-/// `DISCARDED` rows after [`DEFAULT_PACK_GRACE_MS`].
-pub fn enqueue_deleted_rows(hub: &Arc<Hub>, project: i64, names: Vec<String>) {
-    if names.is_empty() {
-        return;
-    }
-    let (spawn, hit_batch) = {
-        let mut q = hub.pack_gc.purged.lock().unwrap();
-        let room = MAX_QUEUED_PURGES.saturating_sub(q.total);
-        if room > 0 {
-            let take = names.len().min(room);
-            let entry = q.by_project.entry(project).or_default();
-            entry.extend(names.into_iter().take(take));
-            q.total += take;
-        }
-        let hit_batch = q.by_project.get(&project).is_some_and(|v| v.len() >= PURGE_BATCH_SIZE);
-        let spawn = if !q.running && !hub.landing.stopping() {
-            q.running = true;
-            true
-        } else {
-            false
-        };
-        (spawn, hit_batch)
-    };
-    if spawn {
-        let hub = hub.clone();
-        let at_work = AtWork::new(&hub);
-        tokio::spawn(async move {
-            let _at_work = at_work;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = hub.landing.wait_stop() => {
-                        let _ = flush_purged(&hub).await;
-                        hub.pack_gc.purged.lock().unwrap().running = false;
-                        return;
-                    }
-                    _ = hub.pack_gc.purged_wake.notified() => {}
-                    _ = tokio::time::sleep(PURGE_FLUSH_DELAY) => {}
-                }
-                if let Err(e) = flush_purged(&hub).await {
-                    eprintln!("veil-server: flushing consumed pack rows: {e:?}");
-                }
-                let mut q = hub.pack_gc.purged.lock().unwrap();
-                if q.by_project.is_empty() || hub.landing.stopping() {
-                    q.running = false;
-                    return;
-                }
-            }
-        });
-    } else if hit_batch {
-        hub.pack_gc.purged_wake.notify_one();
-    }
-}
-
-/// Delete all queued consumed `packs` rows (whose storage containers were
-/// already deleted) in bounded per-project batches.
-pub async fn flush_purged(hub: &Hub) -> Result<usize> {
-    let pending = {
-        let mut q = hub.pack_gc.purged.lock().unwrap();
-        q.total = 0;
-        std::mem::take(&mut q.by_project)
-    };
-    let mut deleted = 0usize;
-    for (project, names) in pending {
-        deleted += delete_purged_rows(hub, project, &names).await?;
-    }
-    Ok(deleted)
-}
-
-/// Delete queued consumed `packs` rows for a single project (used by
-/// [`sweep_project`] before [`sweep_discarded`]).
-async fn flush_purged_project(hub: &Hub, project: i64) -> Result<usize> {
-    let names = {
-        let mut q = hub.pack_gc.purged.lock().unwrap();
-        match q.by_project.remove(&project) {
-            Some(v) => {
-                q.total = q.total.saturating_sub(v.len());
-                v
-            }
-            None => return Ok(0),
-        }
-    };
-    delete_purged_rows(hub, project, &names).await
-}
-
-async fn delete_purged_rows(hub: &Hub, project: i64, names: &[String]) -> Result<usize> {
-    let mut deleted = 0usize;
-    for chunk in names.chunks(PURGE_BATCH_SIZE) {
-        let r = sqlx::query(
-            "DELETE FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3 AND objects < 0",
-        )
-        .bind(project)
-        .bind(chunk)
-        .bind(DISCARDED)
-        .execute(&hub.db)
-        .await?;
-        let n = r.rows_affected() as usize;
-        if n > 0 {
-            hub.objects.pack_rows.fetch_add(1, Ordering::Relaxed);
-            deleted += n;
-        }
-    }
-    Ok(deleted)
 }
 
 /// Sweep `project`'s abandoned `STAGED` and `DISCARDED` upload containers as
@@ -496,10 +359,6 @@ pub async fn sweep_project(hub: &Arc<Hub>, project: i64, opts: SweepOptions) -> 
             let mut report = SweepReport::default();
             async {
                 sweep_staged(&hub, project, now_ms, opts.staged_grace_ms, &mut report).await?;
-                if !hub.landing.stopping() {
-                    let flushed = flush_purged_project(&hub, project).await?;
-                    report.discarded_packs_swept += flushed;
-                }
                 if !hub.landing.stopping() {
                     sweep_discarded(&hub, project, now_ms, opts.pack_grace_ms, MAX_SWEEP_PER_PASS, &mut report).await?;
                 }

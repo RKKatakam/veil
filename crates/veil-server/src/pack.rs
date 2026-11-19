@@ -1717,31 +1717,25 @@ impl Packs {
     }
 
     pub async fn discard_counted(&self, store: &dyn BlobStore, project: i64, names: &[Arc<str>], deletes: &AtomicU64) -> Result<()> {
-        self.discard_with(store, project, names, false, deletes).await.1
+        self.discard_with(store, project, names, (false, false), (deletes, &AtomicU64::new(0)))
+            .await
     }
 
-    /// Mark staged packs `names` of `project` as `DISCARDED` (`objects = -1`
-    /// when `mark_consumed` is set) and delete each storage object immediately
-    /// (every one tried, `BUG-1498`). Returns the names whose storage object
-    /// was deleted together with the first error, if any, without running a
-    /// foreground `DELETE FROM packs` (consumed rows are batch-deleted by
-    /// `pack_gc::enqueue_deleted_rows`; refused rows keep their `DISCARDED`
-    /// row for `pack_gc::sweep_discarded`).
     pub async fn discard_with(
         &self,
         store: &dyn BlobStore,
         project: i64,
         names: &[Arc<str>],
-        mark_consumed: bool,
-        deletes: &AtomicU64,
-    ) -> (Vec<String>, Result<()>) {
+        (mark_consumed, purge_row): (bool, bool),
+        (deletes, pack_rows): (&AtomicU64, &AtomicU64),
+    ) -> Result<()> {
         if names.is_empty() {
-            return (Vec::new(), Ok(()));
+            return Ok(());
         }
         let gone: Vec<String> = match &self.db {
             Some(db) => {
                 let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-                match sqlx::query_scalar(
+                sqlx::query_scalar(
                     "UPDATE packs \
                        SET state = $3, \
                            discarded_at = $5, \
@@ -1756,33 +1750,59 @@ impl Packs {
                 .bind(veil_core::now_millis())
                 .bind(mark_consumed)
                 .fetch_all(db)
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => return (Vec::new(), Err(e.into())),
-                }
+                .await?
             }
             None => names.iter().map(|n| n.to_string()).collect(),
         };
-        self.delete_discarded_storage(store, project, &gone, deletes).await
+        for n in &gone {
+            self.staged.insert(name_key(project, n), None, 64);
+        }
+        let mut deleted = Vec::with_capacity(gone.len());
+        let (mut first, mut failed) = (None, 0);
+        for n in &gone {
+            deletes.fetch_add(1, Ordering::Relaxed);
+            match store.delete(&key(project, n)).await {
+                Ok(()) => deleted.push(n.clone()),
+                Err(e) => {
+                    failed += 1;
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        if purge_row {
+            if let (Some(db), false) = (&self.db, deleted.is_empty()) {
+                let r = sqlx::query("DELETE FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3")
+                    .bind(project)
+                    .bind(&deleted)
+                    .bind(DISCARDED)
+                    .execute(db)
+                    .await?;
+                if r.rows_affected() > 0 {
+                    pack_rows.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        match first {
+            Some(e) => Err(e.context(format!("{failed} of {} discarded packs of project {project} are still stored", gone.len()))),
+            None => Ok(()),
+        }
     }
 
-    /// Tombstone `names` locally and delete containers `names` (already marked
-    /// `DISCARDED` in a push's transaction or [`Packs::discard_with`]) from
-    /// storage immediately, without running a foreground `DELETE FROM packs`.
-    /// Returns the names whose storage delete succeeded (for background batched
-    /// `DELETE` in `pack_gc::enqueue_deleted_rows`), plus the first storage
-    /// error if any failed (leaving failed ones for `pack_gc::sweep_discarded`,
-    /// `BUG-1498`).
-    pub async fn delete_discarded_storage(
+    /// Delete containers `names` (already marked `DISCARDED` in a push's
+    /// transaction) from storage, then delete the `packs` rows of those whose
+    /// storage delete succeeded (`object-layout.md` §3). Any container whose
+    /// storage delete fails keeps its `DISCARDED` row for
+    /// `pack_gc::sweep_discarded`.
+    pub async fn purge_discarded(
         &self,
         store: &dyn BlobStore,
         project: i64,
         names: &[String],
         deletes: &AtomicU64,
-    ) -> (Vec<String>, Result<()>) {
+        pack_rows: &AtomicU64,
+    ) -> Result<()> {
         if names.is_empty() {
-            return (Vec::new(), Ok(()));
+            return Ok(());
         }
         for n in names {
             self.staged.insert(name_key(project, n), None, 64);
@@ -1799,14 +1819,24 @@ impl Packs {
                 }
             }
         }
-        let res = match first {
+        if let (Some(db), false) = (&self.db, deleted.is_empty()) {
+            let r = sqlx::query("DELETE FROM packs WHERE project_id = $1 AND name = ANY($2) AND state = $3")
+                .bind(project)
+                .bind(&deleted)
+                .bind(DISCARDED)
+                .execute(db)
+                .await?;
+            if r.rows_affected() > 0 {
+                pack_rows.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        match first {
             Some(e) => Err(e.context(format!(
                 "{failed} of {} discarded containers of project {project} are still stored",
                 names.len()
             ))),
             None => Ok(()),
-        };
-        (deleted, res)
+        }
     }
 }
 

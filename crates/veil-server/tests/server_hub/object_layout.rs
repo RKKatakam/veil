@@ -50,13 +50,6 @@ fn pack_counts(hub: &TestHub, project: i64) -> (i64, i64, i64) {
         .unwrap()
 }
 
-/// Flush pending background consumed-row deletions (`pack_gc::flush_purged`)
-/// and return `(staged, listed, discarded)` pack rows of `project`.
-fn pack_counts_after_purge(hub: &TestHub, project: i64) -> (i64, i64, i64) {
-    hub.rt.block_on(veil_server::pack_gc::flush_purged(&hub.hub())).unwrap();
-    pack_counts(hub, project)
-}
-
 fn packs_in_store(hub: &TestHub, project: i64) -> Vec<String> {
     let prefix = format!("p/{project}/pack/");
     let keys = hub.rt.block_on(hub.blob_store().list(&prefix)).unwrap();
@@ -218,7 +211,7 @@ fn guarantee_1_push_keeps_loose_lists_no_pack_purges_container_and_always_writes
     let store = hub.blob_store();
     settle(&hub);
 
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0), "setup_project in objects mode leaves no pack rows");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "setup_project in objects mode leaves no pack rows");
     assert!(packs_in_store(&hub, pid).is_empty(), "setup_project in objects mode leaves no packs in storage");
 
     // `Craft::file` records intermediate trees when called multiple times; retain only the 5 objects
@@ -273,7 +266,7 @@ fn guarantee_1_push_keeps_loose_lists_no_pack_purges_container_and_always_writes
         "push storage writes are exactly 1 (upload container) + kept objects"
     );
     assert_eq!(h.objects.deletes.load(Relaxed) - deletes_0, 1, "staged container deleted after commit");
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0), "no staged, listed or discarded pack rows remain");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "no staged, listed or discarded pack rows remain");
     assert!(!hub.rt.block_on(store.exists(&veil_server::pack::key(pid, &container1))).unwrap(), "container deleted from store");
     for id in &unique_ids_1 {
         assert!(
@@ -314,7 +307,7 @@ fn guarantee_1_push_keeps_loose_lists_no_pack_purges_container_and_always_writes
         1 + k2,
         "push writes are 1 + objects_kept even when objects are already stored"
     );
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0));
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0));
     assert!(!hub.rt.block_on(store.exists(&veil_server::pack::key(pid, &container2))).unwrap());
 
     // 3. Restricted member push (`p.dev` cannot see billing -> server completes trees + snapshots):
@@ -336,7 +329,7 @@ fn guarantee_1_push_keeps_loose_lists_no_pack_purges_container_and_always_writes
     let k3 = h.objects.objects_kept.load(Relaxed) - kept_2;
     assert!(k3 > c3.objects.len() as u64, "completed push kept uploaded + server-made objects ({k3})");
     assert_eq!(h.objects.own_writes.load(Relaxed) - own_2, 1 + k3);
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0));
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0));
     assert!(!hub.rt.block_on(store.exists(&veil_server::pack::key(pid, &container3))).unwrap());
 
     let other = TestHub::beside(&hub);
@@ -430,7 +423,7 @@ fn guarantee_3_unread_uploaded_object_beside_landing_push_is_not_kept() {
 
     assert!(!hub.rt.block_on(store.exists(&veil_server::store::object_key(pid, &unread_id))).unwrap(), "unread upload is not written under any project key");
     assert!(!hub.rt.block_on(store.exists(&veil_server::pack::key(pid, &container))).unwrap(), "upload container is deleted");
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0), "upload container row is deleted");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "upload container row is deleted");
 
     let fresh = TestHub::beside(&hub);
     assert!(fresh.rt.block_on(fresh.hub().objects.get(pid, &unread_id)).unwrap().is_none());
@@ -600,7 +593,7 @@ fn guarantee_5_race_loser_retries_with_same_receipts_and_no_new_upload() {
     assert_eq!(r_land.status, 200, "{}", String::from_utf8_lossy(&r_land.body));
     assert_eq!(r_land.json()["results"][0]["ok"], json!(true), "{}", String::from_utf8_lossy(&r_land.body));
     assert_eq!(h.objects.uploads.load(Relaxed) - uploads_before, 0, "landed with zero new upload requests");
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0), "staged container purged once retry lands");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "staged container purged once retry lands");
     assert!(!hub.rt.block_on(hub.blob_store().exists(&veil_server::pack::key(pid, &container))).unwrap());
 
     let f = api.get(Some(&c.token), &format!("/v1/projects/{}/q/file?rev=dev/g5&path=src/g5_raced.rs", p.name));
@@ -765,7 +758,7 @@ fn guarantee_8_object_routes_over_loose_objects_enforce_grants_and_indistinguish
         assert_eq!(r.status, 200);
         assert_eq!(r.json()["results"][0]["ok"], json!(true));
     }
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0), "all project objects are loose");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "all project objects are loose");
 
     // 1. A stored, unreferenced loose object.
     let (unref_id, unref_raw) = plain_blob(0xdead_beef_cafe_f00d, "UNREFERENCED-LOOSE-G8:");
@@ -884,7 +877,7 @@ fn guarantee_9_landing_batch_keeps_loose_and_failed_batch_leaves_only_collectibl
     }
     let tip1 = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
     assert_ne!(tip1, base1);
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0), "landing batch in objects mode creates no pack rows");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "landing batch in objects mode creates no pack rows");
     assert!(packs_in(&hub, pid, 1).is_empty());
     assert!(hub.rt.block_on(store.exists(&veil_server::store::object_key(pid, &tip1))).unwrap(), "landed tip stored loose under its key");
     assert!(whole_tree_beside(&hub, pid, tip1) >= 6);
@@ -949,7 +942,7 @@ fn guarantee_9_landing_batch_keeps_loose_and_failed_batch_leaves_only_collectibl
     assert_ne!(tip2, base2);
 
     // Landed `[1, 2]` read whole, and no pack was listed!
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0), "retried landing batch lists no pack");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "retried landing batch lists no pack");
     assert!(whole_tree_beside(&hub, pid, tip2) >= 5);
     for i in 1..3 {
         let f = api.get(Some(&dev), &format!("/v1/projects/{}/q/file?rev={}&path=src/g9_lost{i}/f.rs", p.name, tip2.hex()));
@@ -1138,7 +1131,7 @@ fn guarantee_10_stop_between_push_writes_and_commit_keeps_staged_collects_orphan
         assert_eq!(r_retry.status, 200, "{}", String::from_utf8_lossy(&r_retry.body));
         assert_eq!(r_retry.json()["results"][0]["ok"], json!(true), "retry using staged container landed");
     }
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0), "staged containers purged once retry landed");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "staged containers purged once retry landed");
     settle(&hub);
 
     // 4. Append-only storage keeps both the interrupted push's written objects and the embargo
@@ -1181,7 +1174,7 @@ fn guarantee_11_pushes_schedule_no_merge_preexisting_packs_stay_readable_and_sta
         assert_eq!(r.status, 200, "push {i}: {}", String::from_utf8_lossy(&r.body));
         assert_eq!(r.json()["results"][0]["ok"], json!(true));
     }
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0), "{PUSHES} pushes listed no pack and left no row");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "{PUSHES} pushes listed no pack and left no row");
     assert!(packs_in_store(&hub, pid).is_empty(), "{PUSHES} pushes wrote no pack in storage");
 
     // 2. A project with pre-existing small `LISTED` packs (written by an older server) keeps all
@@ -1448,7 +1441,7 @@ fn bug_2661_concurrent_uploads_by_one_person_do_not_share_in_flight_containers()
         },
     );
 
-    assert_eq!(pack_counts_after_purge(&hub, pid), (0, 0, 0), "all staged containers purged cleanly");
+    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "all staged containers purged cleanly");
 }
 
 /// BUG-2661 (part 2): whenever a request's receipted container has vanished
@@ -1799,155 +1792,6 @@ fn bug_2661_vanished_receipted_container_answers_409_and_keeps_sibling_uploads()
             hub.rt.block_on(hub.hub().objects.discard(pid, &[Arc::<str>::from(a1_pack.as_str()), Arc::<str>::from(asib_pack.as_str())])).unwrap();
         }
     }
-}
-
-/// P5-B: consumed `packs` row deletion moves out of foreground pushes into
-/// `pack_gc`'s background batcher (storage containers still deleted
-/// immediately), and skipping the pre-tx `SELECT FROM packs` for authenticated
-/// staged names still enforces `400` on cross-hub refused packs and `409` on
-/// cross-hub consumed packs without losing live siblings.
-#[test]
-fn p5b_batched_consumed_pack_purge_and_cross_hub_recheck() {
-    let hub = TestHub::start_objects();
-    let other = TestHub::beside(&hub);
-    let p = setup_project(&hub);
-    let pid = project_id(&hub, &p.name);
-    let api = hub.api();
-    let other_api = other.api();
-    let dev_tok = p.dev.token();
-    let h = hub.hub();
-    hub.rt.block_on(veil_server::pack_gc::flush_purged(&h)).unwrap();
-
-    // 1. Burst of 4 committing pushes: storage containers are deleted
-    //    synchronously, foreground `pack_rows` only counts the 4 upload INSERTs,
-    //    and one `flush_purged` batch-deletes all 4 consumed rows with 0 extra
-    //    storage deletes.
-    let rows_before = h.objects.pack_rows.load(Relaxed);
-    let deletes_before = h.objects.deletes.load(Relaxed);
-    for i in 0..4 {
-        let mut c = Craft::new(&api, &p.dev, &p.name, "main");
-        c.file(&format!("src/p5b_{i}.rs"), &format!("// p5b {i}\n"));
-        let tip = c.tip;
-        let s = snap(&mut c, vec![tip], &format!("p5b {i}"), None);
-        let up = api.upload(&dev_tok, &p.name, &c.objects);
-        assert_eq!(up.status, 200, "{}", String::from_utf8_lossy(&up.body));
-        let pack = up.json()["packs"][0].as_str().unwrap().to_string();
-        let r = api.post_json(
-            Some(&dev_tok),
-            &format!("/v1/projects/{}/push", p.name),
-            &json!({
-                "updates": [{"branch": format!("p5b-{i}"), "expected": null, "new": s.hex()}],
-                "packs": [&pack],
-            }),
-        );
-        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-        assert_eq!(r.json()["results"][0]["ok"], json!(true));
-    }
-    assert!(packs_in_store(&hub, pid).is_empty(), "all 4 staged containers deleted from storage immediately");
-    assert_eq!(h.objects.deletes.load(Relaxed) - deletes_before, 4, "4 immediate storage deletes");
-    let flushed = hub.rt.block_on(veil_server::pack_gc::flush_purged(&h)).unwrap();
-    let rows_delta = h.objects.pack_rows.load(Relaxed) - rows_before;
-    assert!(
-        rows_delta <= 6,
-        "batched cleanup uses far fewer pack_rows commits than 2 per push (got {rows_delta}, flushed={flushed})"
-    );
-    assert_eq!(h.objects.deletes.load(Relaxed) - deletes_before, 4, "flush_purged issues 0 extra storage deletes");
-    assert_eq!(pack_counts(&hub, pid), (0, 0, 0), "all consumed rows removed");
-
-    // 2. Cross-hub refused pack: upload P1 and P2 on Hub A (cached in Hub A's
-    //    `self.staged`), refuse P1 on Hub B (`state = DISCARDED, objects >= 0`),
-    //    then push `[P1, P2]` back on Hub A. Pre-tx `usable_for_packs` must
-    //    return 400 BAD_PACK_UPLOAD, discard P2, and not create the branch.
-    let mut c1 = Craft::new(&api, &p.dev, &p.name, "main");
-    c1.file("src/p5b_refused_1.rs", "// p1\n");
-    let tip = c1.tip;
-    let s1 = snap(&mut c1, vec![tip], "p1", None);
-    let up1 = api.upload(&dev_tok, &p.name, &c1.objects);
-    assert_eq!(up1.status, 200);
-    let p1 = up1.json()["packs"][0].as_str().unwrap().to_string();
-
-    let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
-    c2.file("src/p5b_refused_2.rs", "// p2\n");
-    let s2 = snap(&mut c2, vec![tip], "p2", None);
-    let up2 = api.upload(&dev_tok, &p.name, &c2.objects);
-    assert_eq!(up2.status, 200);
-    let p2 = up2.json()["packs"][0].as_str().unwrap().to_string();
-
-    // Refuse P1 on Hub B (missing target snapshot -> 400 -> discard_refused).
-    let r_refuse = other_api.post_json(
-        Some(&dev_tok),
-        &format!("/v1/projects/{}/push", p.name),
-        &json!({
-            "updates": [{"branch": "p5b-refuse-b", "expected": null, "new": ObjectId::hash(b"missing-p5b").hex()}],
-            "packs": [&p1],
-        }),
-    );
-    assert_eq!(r_refuse.status, 400, "{}", String::from_utf8_lossy(&r_refuse.body));
-
-    // Replay `[P1, P2]` on Hub A (where P1's index/objects are still cached!).
-    let r_replay_refused = api.post_json(
-        Some(&dev_tok),
-        &format!("/v1/projects/{}/push", p.name),
-        &json!({
-            "updates": [{"branch": "p5b-should-not-land", "expected": null, "new": s1.hex()}],
-            "packs": [&p1, &p2],
-        }),
-    );
-    assert_eq!(r_replay_refused.status, 400, "cross-hub refused pack must answer 400: {}", String::from_utf8_lossy(&r_replay_refused.body));
-    assert!(!api.tips(Some(&dev_tok), &p.name).unwrap().branches.contains_key("p5b-should-not-land"));
-    assert!(hub.rt.block_on(h.objects.staged_index(pid, &p2)).unwrap().is_none(), "live sibling P2 discarded on 400");
-    let _ = s2;
-
-    // 3. Cross-hub consumed pack: upload P3 and P4 on Hub A (cached in Hub A's
-    //    `self.staged`), consume P3 on Hub B, then push `[P3, P4]` back on Hub A.
-    //    Hub A must answer 409 conflict and keep live sibling P4 intact.
-    let mut c3 = Craft::new(&api, &p.dev, &p.name, "main");
-    c3.file("src/p5b_consumed_3.rs", "// p3\n");
-    let s3 = snap(&mut c3, vec![tip], "p3", None);
-    let up3 = api.upload(&dev_tok, &p.name, &c3.objects);
-    assert_eq!(up3.status, 200);
-    let p3 = up3.json()["packs"][0].as_str().unwrap().to_string();
-
-    let mut c4 = Craft::new(&api, &p.dev, &p.name, "main");
-    c4.file("src/p5b_consumed_4.rs", "// p4\n");
-    let s4 = snap(&mut c4, vec![tip], "p4", None);
-    let up4 = api.upload(&dev_tok, &p.name, &c4.objects);
-    assert_eq!(up4.status, 200);
-    let p4 = up4.json()["packs"][0].as_str().unwrap().to_string();
-
-    let r_consume_b = other_api.post_json(
-        Some(&dev_tok),
-        &format!("/v1/projects/{}/push", p.name),
-        &json!({
-            "updates": [{"branch": "p5b-consumed-b", "expected": null, "new": s3.hex()}],
-            "packs": [&p3],
-        }),
-    );
-    assert_eq!(r_consume_b.status, 200, "{}", String::from_utf8_lossy(&r_consume_b.body));
-    assert_eq!(r_consume_b.json()["results"][0]["ok"], json!(true));
-
-    let r_replay_consumed = api.post_json(
-        Some(&dev_tok),
-        &format!("/v1/projects/{}/push", p.name),
-        &json!({
-            "updates": [{"branch": "p5b-consumed-a", "expected": null, "new": s4.hex()}],
-            "packs": [&p3, &p4],
-        }),
-    );
-    assert_eq!(r_replay_consumed.status, 409, "cross-hub consumed pack must answer 409: {}", String::from_utf8_lossy(&r_replay_consumed.body));
-    assert!(hub.rt.block_on(h.objects.staged_index(pid, &p4)).unwrap().is_some(), "live sibling P4 kept intact on 409");
-
-    // Retrying with `[P4]` alone succeeds.
-    let r_retry = api.post_json(
-        Some(&dev_tok),
-        &format!("/v1/projects/{}/push", p.name),
-        &json!({
-            "updates": [{"branch": "p5b-consumed-a", "expected": null, "new": s4.hex()}],
-            "packs": [&p4],
-        }),
-    );
-    assert_eq!(r_retry.status, 200, "{}", String::from_utf8_lossy(&r_retry.body));
-    assert_eq!(r_retry.json()["results"][0]["ok"], json!(true));
 }
 
 /// BUG-2923 (P5-B): skipping pre-tx `usable_for_packs` when staged names are

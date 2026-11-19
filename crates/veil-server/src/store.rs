@@ -1841,24 +1841,27 @@ impl Objects {
     /// refused by its checks (`BUG-930`, `BUG-1155`): keeps `objects >= 0` on
     /// the `DISCARDED` row so re-presenting those receipts still answers `400`.
     pub async fn discard_refused(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
-        self.packs.discard_with(&*self.store, project, names, false, &self.deletes).await.1
+        self.packs
+            .discard_with(&*self.store, project, names, (false, false), (&self.deletes, &self.pack_rows))
+            .await
     }
 
     /// Discard staged containers `names` consumed by a committing push or API
-    /// commit (`BUG-2661`), marking `objects = -1` and deleting their storage
-    /// containers immediately. Returns the names whose storage object was
-    /// deleted (for background batched `DELETE FROM packs` via
-    /// `pack_gc::enqueue_deleted_rows`) and the first error, if any.
-    pub async fn discard_consumed_storage(&self, project: i64, names: &[Arc<str>]) -> (Vec<String>, Result<()>) {
-        self.packs.discard_with(&*self.store, project, names, true, &self.deletes).await
+    /// commit (`BUG-2661`), marking `objects = -1` and purging the `packs` row
+    /// once deleted from storage so a concurrent or replayed request naming
+    /// them answers `409 Conflict`.
+    pub async fn discard_consumed(&self, project: i64, names: &[Arc<str>]) -> Result<()> {
+        self.packs
+            .discard_with(&*self.store, project, names, (true, true), (&self.deletes, &self.pack_rows))
+            .await
     }
 
-    /// Delete containers `names` (already marked `DISCARDED` with
-    /// `objects = -1` in a push's transaction) from storage immediately and
-    /// return the names whose storage delete succeeded (for background batched
-    /// `DELETE FROM packs` via `pack_gc::enqueue_deleted_rows`).
-    pub async fn delete_discarded_storage(&self, project: i64, names: &[String]) -> (Vec<String>, Result<()>) {
-        self.packs.delete_discarded_storage(&*self.store, project, names, &self.deletes).await
+    /// Delete containers `names` (marked `DISCARDED` in a push's transaction)
+    /// from storage and remove their `packs` rows.
+    pub async fn purge_discarded(&self, project: i64, names: &[String]) -> Result<()> {
+        self.packs
+            .purge_discarded(&*self.store, project, names, &self.deletes, &self.pack_rows)
+            .await
     }
 
     /// Remove `key` from the blob store, counting the delete request.

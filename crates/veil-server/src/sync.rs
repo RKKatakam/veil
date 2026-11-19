@@ -3553,9 +3553,7 @@ async fn push_to_its_end(
     match &r {
         Ok((_, _, Some(kept))) => {
             let unkept: Vec<Arc<str>> = owned_names.into_iter().filter(|n| !kept.contains(n)).collect();
-            let (deleted, res) = hub.objects.discard_consumed_storage(project.id, &unkept).await;
-            crate::pack_gc::enqueue_deleted_rows(hub, project.id, deleted);
-            if let Err(e) = res {
+            if let Err(e) = hub.objects.discard_consumed(project.id, &unkept).await {
                 eprintln!("veil-server: discarding what a push did not list: {e:#}");
             }
         }
@@ -4615,9 +4613,7 @@ async fn push_staged(
         }
     };
     let kept = if commits {
-        let (deleted, res) = hub.objects.delete_discarded_storage(project.id, &discarded_containers).await;
-        crate::pack_gc::enqueue_deleted_rows(hub, project.id, deleted);
-        if let Err(e) = res {
+        if let Err(e) = hub.objects.purge_discarded(project.id, &discarded_containers).await {
             eprintln!("veil-server: deleting what a push discarded: {e:#}");
         }
         let settled: HashSet<Arc<str>> = st.names().into_iter().collect();
@@ -5246,9 +5242,7 @@ pub(crate) async fn settle_uploads<T>(
     names.dedup();
     match outcome {
         Ok(_) => {
-            let (deleted, res) = hub.objects.discard_consumed_storage(project, &names).await;
-            crate::pack_gc::enqueue_deleted_rows(hub, project, deleted);
-            if let Err(e) = res {
+            if let Err(e) = hub.objects.discard_consumed(project, &names).await {
                 eprintln!("veil-server: discarding staged uploads: {e:#}");
             }
         }
