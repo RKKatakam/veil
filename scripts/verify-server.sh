@@ -22,10 +22,12 @@ D() {
 }
 
 # By default the three services are long-lived containers shared by every
-# run on this machine (`veil-shared-*`): starting YugabyteDB takes a minute
-# or two, so each run only creates its own databases and buckets in them
-# and drops them at the end. VEIL_VERIFY_FRESH=1 starts private containers
-# for this run instead, and removes them afterwards.
+# run on this machine (`veil-shared-*`): each run creates its own databases
+# and buckets in them and drops them at the end, and an idle shared
+# YugabyteDB container is recreated fresh (~6 s with --ui=false) so catalog
+# and dropped-table bloat never accumulates across runs (BUG-2632).
+# VEIL_VERIFY_FRESH=1 starts private containers for this run instead, and
+# removes them afterwards.
 PG_IMAGE=postgres:17-alpine
 YB_IMAGE=yugabytedb/yugabyte:2025.2.8.1-b8
 # MinIO no longer publishes images on Docker Hub; this is the MinIO server
@@ -48,9 +50,9 @@ else
 fi
 PG=$TAG-pg YB=$TAG-yb S3=$TAG-minio
 PG_DB=veil YB_DB=yugabyte
-# Veil v1 supports PostgreSQL only (owner, 2026-11-18): YugabyteDB is
-# experimental, and its steps run only with VEIL_VERIFY_YB=1.
-WITH_YB=${VEIL_VERIFY_YB:-0}
+# YugabyteDB is supported in v1 and runs by default; VEIL_VERIFY_YB=0 skips it.
+WITH_YB=${VEIL_VERIFY_YB:-1}
+YB_STARTED_NOW=0
 
 ysql() { D exec "$YB" sh -c "bin/ysqlsh -h \$(hostname -i) -c \"$1\""; }
 ysql_at() { D exec "$YB" sh -c "bin/ysqlsh -h \$(hostname -i) -tAc \"$1\""; }
@@ -103,32 +105,53 @@ trap cleanup EXIT
 port() { D port "$1" "$2" | head -1 | sed 's/.*://'; }
 running() { [ "$(D inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
 
-start_services() {
-  # The load step runs 8 copies of the concurrency tests, each with its own
-  # servers and connection pools; shared runs can overlap, so allow plenty.
-  running "$PG" || { D rm -f "$PG" >/dev/null 2>&1; D run -d --name "$PG" --shm-size=1g -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 "$PG_IMAGE" -c max_connections=1500 >/dev/null || return 1; }
-  running "$S3" || { D rm -f "$S3" >/dev/null 2>&1; D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 "$S3_IMAGE" >/dev/null || return 1; }
-  # Memory capped, one tablet per table, no tablet-count limit: a long-lived
-  # YugabyteDB otherwise grows toward most of the
-  # machine's memory (8 GB seen) while agents build beside it.
-  # A one-node database needs no YSQL operation lease; on a busy machine its
-  # renewal comes late, and YugabyteDB then kills every connection and
-  # restarts (seen on 8-vCPU Boat machines: 370 of 425 tests failed).
-  [ "$WITH_YB" = 1 ] || { PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=-; for i in $(seq 120); do D exec "$PG" pg_isready -h 127.0.0.1 -U veil >/dev/null 2>&1 && break; sleep 1; done; for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done; return 0; }
-  running "$YB" || { D rm -f "$YB" >/dev/null 2>&1; D run -d --name "$YB" -p 127.0.0.1::5433 "$YB_IMAGE" bin/yugabyted start --background=false \
-    --tserver_flags=yb_enable_read_committed_isolation=true,memory_limit_hard_bytes=3221225472,ysql_num_shards_per_tserver=1,enable_ysql_operation_lease=false \
-    --master_flags=memory_limit_hard_bytes=1073741824,enforce_tablet_replica_limits=false,enable_ysql_operation_lease=false >/dev/null || return 1; }
-  PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=$(port "$YB" 5433)
-  # Over TCP: a new container first runs a set-up server on its socket only.
-  for i in $(seq 120); do D exec "$PG" pg_isready -h 127.0.0.1 -U veil >/dev/null 2>&1 && break; sleep 1; done
-  for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done
-  for i in $(seq 180); do ysql "select 1" >/dev/null 2>&1 && break; sleep 2; done
+lift_yb_tablet_limit() {
   # yugabyted (2025.2) sets enforce_tablet_replica_limits=true on the master after
   # the flags above, and a runtime flag is lost when the container restarts: with
   # the limit on, a 3 GiB tserver may hold 438 tablets, three or four of the test
   # databases, and every later CREATE TABLE fails (2026-11-12, after a reboot).
   # Set it at each start; it is idempotent.
   D exec "$YB" sh -c 'H=$(hostname -i); bin/yb-ts-cli --server_address=$H:7100 set_flag --force enforce_tablet_replica_limits false && bin/yb-ts-cli --server_address=$H:7100 set_flag --force tablet_replicas_per_gib_limit 100000' >/dev/null 2>&1 || echo "warning: could not lift YugabyteDB's tablet limit" >&2
+}
+
+start_yb() {
+  D rm -f "$YB" >/dev/null 2>&1
+  # Memory capped, one tablet per table, no tablet-count limit: a long-lived
+  # YugabyteDB otherwise grows toward most of the
+  # machine's memory (8 GB seen) while agents build beside it.
+  # A one-node database needs no YSQL operation lease; on a busy machine its
+  # renewal comes late, and YugabyteDB then kills every connection and
+  # restarts (seen on 8-vCPU Boat machines: 370 of 425 tests failed).
+  # --ui=false turns off the web UI's `system.metrics` tablet, which otherwise
+  # accumulates ~900 MB of SST/WAL even when idle (BUG-2632).
+  D run -d --name "$YB" -p 127.0.0.1::5433 "$YB_IMAGE" bin/yugabyted start --background=false --ui=false \
+    --tserver_flags=yb_enable_read_committed_isolation=true,memory_limit_hard_bytes=3221225472,ysql_num_shards_per_tserver=1,enable_ysql_operation_lease=false \
+    --master_flags=memory_limit_hard_bytes=1073741824,enforce_tablet_replica_limits=false,enable_ysql_operation_lease=false >/dev/null || return 1
+  YB_PORT=$(port "$YB" 5433)
+  for i in $(seq 180); do ysql "select 1" >/dev/null 2>&1 && break; sleep 2; done
+  ysql "select 1" >/dev/null 2>&1 || return 1
+  lift_yb_tablet_limit
+}
+
+start_services() {
+  # The load step runs 8 copies of the concurrency tests, each with its own
+  # servers and connection pools; shared runs can overlap, so allow plenty.
+  running "$PG" || { D rm -f "$PG" >/dev/null 2>&1; D run -d --name "$PG" --shm-size=1g -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 "$PG_IMAGE" -c max_connections=1500 >/dev/null || return 1; }
+  running "$S3" || { D rm -f "$S3" >/dev/null 2>&1; D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 "$S3_IMAGE" >/dev/null || return 1; }
+  PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=-
+  # Over TCP: a new container first runs a set-up server on its socket only.
+  for i in $(seq 120); do D exec "$PG" pg_isready -h 127.0.0.1 -U veil >/dev/null 2>&1 && break; sleep 1; done
+  for i in $(seq 120); do curl -sf "http://127.0.0.1:$S3_PORT/minio/health/live" >/dev/null && break; sleep 1; done
+  [ "$WITH_YB" = 1 ] || return 0
+  if running "$YB"; then
+    YB_PORT=$(port "$YB" 5433)
+    for i in $(seq 180); do ysql "select 1" >/dev/null 2>&1 && break; sleep 2; done
+    ysql "select 1" >/dev/null 2>&1 || return 1
+    lift_yb_tablet_limit
+  else
+    start_yb || return 1
+    YB_STARTED_NOW=1
+  fi
 }
 
 # Databases left by runs that were killed before their cleanup ran: each
@@ -151,17 +174,37 @@ drop_dead_runs() {
   remove_buckets "${dead[@]}"
 }
 
+# BUG-2632: a long-lived YugabyteDB container grows slow within hours as
+# master sys_catalog outgrows its 256 MB cache and dropped test databases
+# leave hundreds of thousands of rocksdb/table-* directories on disk (a
+# `docker restart` preserves that disk state). Recreate the shared container
+# fresh (~6 s with --ui=false) whenever no other run holds a test database
+# or active client session on it.
+recreate_yb_if_idle() {
+  local live_dbs live_conns
+  live_dbs=$(ysql_at "SELECT count(*) FROM pg_database WHERE datname LIKE 'veil_run_%' OR datname LIKE 'r%x%'" 2>/dev/null)
+  # Exclude yugabyted's own UI collector (which holds an idle connection on
+  # `yugabyte` from the container's own IP on pre-`--ui=false` containers).
+  live_conns=$(ysql_at "SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend' AND (datname <> 'yugabyte' OR client_addr IS DISTINCT FROM inet_server_addr())" 2>/dev/null)
+  if [ "$live_dbs" = 0 ] && [ "$live_conns" = 0 ]; then
+    start_yb || return 1
+  fi
+}
+
 if [ $SHARED = 1 ]; then
   echo "== shared containers (VEIL_VERIFY_FRESH=1 for private ones)"
-  # One run at a time starts or replaces them.
+  # One run at a time starts, recreates when idle, or claims a run database.
   exec 9>"${XDG_RUNTIME_DIR:-/tmp}/veil-shared-services.lock"
   flock 9
   start_services || { echo "starting containers failed"; exit 1; }
   drop_dead_runs
-  flock -u 9
+  if [ "$WITH_YB" = 1 ] && [ "$YB_STARTED_NOW" = 0 ]; then
+    recreate_yb_if_idle || { echo "recreating $YB failed"; exit 1; }
+  fi
   PG_DB=veil_run_$RUN YB_DB=veil_run_$RUN
   D exec "$PG" psql -U veil -d veil -c "CREATE DATABASE $PG_DB" >/dev/null || { echo "creating $PG_DB failed"; exit 1; }
   [ "$WITH_YB" = 1 ] && { ysql "CREATE DATABASE $YB_DB" >/dev/null || { echo "creating $YB_DB on YugabyteDB failed"; exit 1; }; }
+  flock -u 9
 else
   echo "== starting containers"
   start_services || { echo "starting containers failed"; exit 1; }
@@ -298,7 +341,7 @@ step postgres env VEIL_TEST_DATABASE_URL="$PG_URL" VEIL_TEST_S3_BUCKET=veil-pg-$
 # YugabyteDB is shared by every run on the machine: 8 tests at a time, so
 # several runs at once do not drown it in servers and pools (each test
 # starts its own); results stay trustworthy under load.
-[ "$WITH_YB" = 1 ] || echo "   skip  yugabyte (v1 supports PostgreSQL only; VEIL_VERIFY_YB=1 runs it)"
+[ "$WITH_YB" = 1 ] || echo "   skip  yugabyte (VEIL_VERIFY_YB=0)"
 [ "$WITH_YB" = 1 ] && STEP_LIMIT=1800 step yugabyte env VEIL_TEST_DATABASE_URL="$YB_URL" VEIL_TEST_S3_BUCKET=veil-yb-$RUN "$BIN" "${SKIP_HOSTILE[@]}" --test-threads=8
 # One at a time: on a database other runs share, three at once could keep
 # a statement past its timeout.

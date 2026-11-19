@@ -81,6 +81,10 @@ const FLUSH_EVERY: usize = 512;
 /// Rows per insert statement: small enough that one stays well inside the
 /// statement timeout on a busy YugabyteDB.
 const ROWS_PER_STATEMENT: usize = 1_000;
+/// Path keys per `file_history` `CROSS JOIN LATERAL` lookup (BUG-1068): each
+/// key is a separate index range scan (and on YugabyteDB a DocDB read RPC), so
+/// 1,000 keys in one statement can exceed `STATEMENT_TIMEOUT` under load.
+const HISTORY_KEYS_PER_STATEMENT: usize = 250;
 /// How long a deriver waits for another server's deriver of the same
 /// project; after that the other one (or the next landing) derives it.
 const LOCK_WAIT: Duration = Duration::from_secs(60);
@@ -929,7 +933,8 @@ pub struct Batch<'a> {
     /// Read ahead for the snapshots about to be derived (BUG-2361): what
     /// each changed against its first parent, and the deepest
     /// [`HISTORY_AHEAD`] stored `file_history` rows of each path they
-    /// change, as the database held them when read (forgotten at a flush).
+    /// change (updated in place when a flush commits, pruned to the next
+    /// chunk's needed paths: BUG-1068).
     ahead_trees: HashMap<ObjectId, TreeChanges>,
     ahead_history: HashMap<String, Vec<(i64, ObjectId)>>,
 }
@@ -1123,6 +1128,13 @@ impl<'a> Batch<'a> {
             let n = self.read_ahead(chunk)?;
             for x in &chunk[..n] {
                 stopping(self.cx.hub())?;
+                if !self.writes.graph.is_empty() {
+                    if let Some((ch, _)) = self.ahead_trees.get(x) {
+                        if self.writes.history.len() + self.writes.rules.len() + ch.len() > MAX_QUEUED_ROWS {
+                            self.flush()?;
+                        }
+                    }
+                }
                 self.derive_one(*x)?;
                 if self.writes.full() {
                     self.flush()?;
@@ -1230,12 +1242,13 @@ impl<'a> Batch<'a> {
 
     /// Read ahead for `chunk` (about to be derived in this order): what each
     /// changed, on [`AHEAD_THREADS`] threads (each read is an object read,
-    /// some from disk), and the stored history of every path they change,
-    /// in one statement per [`ROWS_PER_STATEMENT`] paths instead of one
-    /// for each snapshot (BUG-2361). It reads the first snapshots of
-    /// `chunk` until they changed [`MAX_QUEUED_ROWS`] paths (BUG-2380: what
-    /// 512 snapshots changed is unbounded, as a batch's rows were before
-    /// BUG-867's fix): how many it read, at least one.
+    /// some from disk), and the stored history of every path changed by
+    /// snapshots within [`changes::MAX_PATHS`], in one statement per
+    /// [`HISTORY_KEYS_PER_STATEMENT`] paths instead of one for each snapshot
+    /// (BUG-2361, BUG-1068). It reads the first snapshots of `chunk` until
+    /// they changed [`MAX_QUEUED_ROWS`] paths (BUG-2380: what 512 snapshots
+    /// changed is unbounded, as a batch's rows were before BUG-867's fix):
+    /// how many it read, at least one.
     fn read_ahead(&mut self, chunk: &[ObjectId]) -> Result<usize> {
         let src = &self.cx.src;
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1266,18 +1279,22 @@ impl<'a> Batch<'a> {
         for r in read {
             self.ahead_trees.extend(r?);
         }
-        let mut keys: Vec<String> = self
+        // Only snapshots within `MAX_PATHS` ask `last_changes` for their paths
+        // (`many` snapshots write no changed-paths object: BUG-1068). Retain
+        // any cached history still needed by this chunk and drop the rest so
+        // memory stays bounded.
+        let needed: HashSet<String> = self
             .ahead_trees
             .values()
+            .filter(|(ch, dirs)| ch.len() + dirs.len() <= changes::MAX_PATHS)
             .flat_map(|(ch, _)| ch.iter().map(|c| changes::path_key(&c.path)))
-            .filter(|k| !self.ahead_history.contains_key(k))
-            .collect::<HashSet<_>>()
-            .into_iter()
             .collect();
+        self.ahead_history.retain(|k, _| needed.contains(k));
+        let mut keys: Vec<String> = needed.into_iter().filter(|k| !self.ahead_history.contains_key(k)).collect();
         keys.sort();
         let pool = self.cx.pool();
         let project = self.cx.project();
-        for keys in keys.chunks(ROWS_PER_STATEMENT) {
+        for keys in keys.chunks(HISTORY_KEYS_PER_STATEMENT) {
             let rows: Vec<(i64, i64, String)> = self.cx.db(|| {
                 sqlx::query_as(
                     "SELECT k.n, f.depth, f.snapshot FROM UNNEST($2::text[]) WITH ORDINALITY AS k(path_key, n) \
@@ -1296,11 +1313,15 @@ impl<'a> Batch<'a> {
                 let snap = ObjectId::from_hex(&snap).map_err(bad)?;
                 self.ahead_history.get_mut(&keys[n as usize - 1]).expect("every key").push((d, snap));
             }
-        }
-        // The statement's order (`depth DESC, snapshot DESC`), whatever
-        // order the join returned them in.
-        for rows in self.ahead_history.values_mut() {
-            rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.hex().cmp(&a.1.hex())));
+            // The statement's order (`depth DESC, snapshot DESC`), whatever
+            // order the join returned them in. `ObjectId`'s byte order matches
+            // its lowercase hex order.
+            for k in keys {
+                self.ahead_history
+                    .get_mut(k)
+                    .expect("every key")
+                    .sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+            }
         }
         Ok(next.into_inner().min(chunk.len()))
     }
@@ -1431,9 +1452,9 @@ impl<'a> Batch<'a> {
         if ask.is_empty() {
             return Ok(out);
         }
-        // One query per [`ROWS_PER_STATEMENT`] paths: the deepest few rows of
-        // each. (One query for all of a snapshot's 100,000 paths ran past
-        // the statement timeout on a busy YugabyteDB: BUG-912.)
+        // One query per [`HISTORY_KEYS_PER_STATEMENT`] paths: the deepest few
+        // rows of each. (One query for all of a snapshot's 100,000 paths ran
+        // past the statement timeout on a busy YugabyteDB: BUG-912, BUG-1068.)
         const FIRST: usize = 8;
         const NEXT: i64 = 64;
         let keys: Vec<String> = ask.iter().map(|&i| changes::path_key(&wants[i].0)).collect();
@@ -1441,7 +1462,7 @@ impl<'a> Batch<'a> {
         let pool = self.cx.pool();
         let project = self.cx.project();
         let mut found: HashMap<usize, Vec<(i64, String)>> = HashMap::new();
-        for (part, (keys, maxd)) in keys.chunks(ROWS_PER_STATEMENT).zip(maxd.chunks(ROWS_PER_STATEMENT)).enumerate() {
+        for (part, (keys, maxd)) in keys.chunks(HISTORY_KEYS_PER_STATEMENT).zip(maxd.chunks(HISTORY_KEYS_PER_STATEMENT)).enumerate() {
             let rows: Vec<(i64, i64, String)> = self.cx.db(|| {
                 sqlx::query_as(
                     "SELECT k.n, f.depth, f.snapshot FROM UNNEST($2::text[], $3::bigint[]) WITH ORDINALITY AS k(path_key, maxd, n) \
@@ -1455,7 +1476,7 @@ impl<'a> Batch<'a> {
                 .fetch_all(pool)
             })?;
             for (n, d, s) in rows {
-                found.entry(part * ROWS_PER_STATEMENT + n as usize - 1).or_default().push((d, s));
+                found.entry(part * HISTORY_KEYS_PER_STATEMENT + n as usize - 1).or_default().push((d, s));
             }
         }
         for (j, &i) in ask.iter().enumerate() {
@@ -1522,11 +1543,22 @@ impl<'a> Batch<'a> {
             })?;
         }
         cache_derive_rows(cx.hub(), project, &w);
-        // Written rows are read from the cache or the database from now on;
-        // the history read ahead is no longer all the database holds.
+        // Written rows are read from the cache or the database from now on.
+        // Only this deriver (holding the project's lock) writes `file_history`,
+        // so merging what was just committed into the already-cached entries
+        // keeps their exact top `HISTORY_AHEAD` stored rows without re-querying
+        // the database on every flush (BUG-1068). Keys not already cached stay
+        // absent because earlier stored rows for them are unknown.
         self.graph.pending.clear();
-        self.history.clear();
-        self.ahead_history.clear();
+        let written_history = std::mem::take(&mut self.history);
+        for (key, added) in written_history {
+            if let Some(rows) = self.ahead_history.get_mut(&key) {
+                rows.extend(added);
+                rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+                rows.dedup();
+                rows.truncate(HISTORY_AHEAD);
+            }
+        }
         Ok(())
     }
 }
