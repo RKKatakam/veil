@@ -10,6 +10,7 @@
 | [`phase-3-server-history.md`](phase-3-server-history.md) | Derived data per change, the query API (log, blame, diff, files, grep, search) projected per viewer | history, blame and search through the API in milliseconds to low hundreds of ms; answers identical to those on a project built from the viewer's view |
 | [`storage-and-cost.md`](storage-and-cost.md) | Cost and speed across phases: one database commit per push, request caches, tips without a hot row, compressed objects, packs per push and their merging, cost gates in every benchmark | at most 2 storage writes and 1 database commit per push; 5 or fewer statements per warm pull; server under 1 GB on the 1 GB profile |
 | [`phase-4-agent-scale.md`](phase-4-agent-scale.md) | Batched server-side landing, conflicts back to agents, protected `main`, land first and test after, bisect and revert, PRs and review, embargo release, CI, rate limits, metrics, the web client | 1,000 landings/s into one `main` with 10,000 agents, p99 under 1 s; PR open or update under 100 ms |
+| [`purge.md`](purge.md) | **Design, not built:** an offline, operator-run purge that removes a named file's content from everything the server holds (both object layouts, the code search index, regional caches), leaves a tombstone so reads answer `purged`, and records who, what and when. Storage is otherwise append-only in v1 | none: building it is the owner's decision |
 
 ## The owner's numbers, phase by phase
 
