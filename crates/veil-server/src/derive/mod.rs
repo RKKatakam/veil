@@ -100,6 +100,18 @@ pub const DERIVERS: usize = 4;
 /// Connections of the deriver's own pool: each run holds the project
 /// lock's and at most one statement's at a time.
 pub const DERIVE_CONNECTIONS: u32 = 2 * DERIVERS as u32;
+/// Default coalescing delay before a background [`landed`] run acquires the
+/// project advisory lock and derives (`VEIL_DERIVE_DEBOUNCE_MS`). Rapid
+/// pushes/landings on the same project fold into one derive transaction;
+/// on-demand [`ensure`] stays synchronous and never waits.
+pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
+
+fn default_debounce_ms() -> u64 {
+    std::env::var("VEIL_DERIVE_DEBOUNCE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DEBOUNCE.as_millis() as u64)
+}
 
 /// The derive workers' state in one server process.
 pub struct Workers {
@@ -122,6 +134,8 @@ pub struct Workers {
     at_work: std::sync::atomic::AtomicUsize,
     /// Notified when `at_work` reaches zero.
     idle: tokio::sync::Notify,
+    /// Background coalescing delay in milliseconds before [`landed`] runs.
+    debounce_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Workers {
@@ -135,7 +149,19 @@ impl Workers {
             not_below: LruCache::new(NOT_BELOW_ENTRIES),
             at_work: std::sync::atomic::AtomicUsize::new(0),
             idle: tokio::sync::Notify::new(),
+            debounce_ms: std::sync::atomic::AtomicU64::new(default_debounce_ms()),
         }
+    }
+
+    /// Background coalescing delay before [`landed`] starts a derive run.
+    pub fn debounce(&self) -> Duration {
+        Duration::from_millis(self.debounce_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Override the background coalescing delay for [`landed`].
+    pub fn set_debounce(&self, delay: Duration) {
+        self.debounce_ms
+            .store(delay.as_millis().min(u64::MAX as u128) as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A snapshot `x` of `project` is not below, if one is known.
@@ -404,10 +430,13 @@ pub async fn read<T: Send + 'static>(hub: &Arc<Hub>, project: i64, f: impl FnOnc
 }
 
 /// A landing moved `branches` of `project`: derive them in the background.
-/// The caller never waits; a landing while this project is being derived
-/// here makes the worker run once more, for the branches that landing
-/// moved. Only moved branches are touched (BUG-870): the work of a landing
-/// never grows with how many branches the project has.
+/// The caller never waits; landings on `project` within `hub.derive.debounce()`
+/// (default [`DEFAULT_DEBOUNCE`], 250 ms) coalesce into one derive run and one
+/// advisory-lock acquisition, and a landing while this project is being derived
+/// here schedules one more coalesced pass for the branches it moved. On-demand
+/// [`ensure`] stays synchronous and never waits on this delay. Only moved
+/// branches are touched (BUG-870): the work of a landing never grows with how
+/// many branches the project has.
 pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
     if branches.is_empty() || hub.landing.stopping() {
         return;
@@ -418,18 +447,37 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
             waiting.extend(branches);
             return;
         }
-        active.insert(project, BTreeSet::new());
+        active.insert(project, branches.into_iter().collect());
     }
     let hub = hub.clone();
     let at_work = AtWork::new(&hub);
     tokio::spawn(async move {
         let _at_work = at_work;
-        let mut branches = branches;
         loop {
+            let debounce = hub.derive.debounce();
+            if !debounce.is_zero() {
+                tokio::select! {
+                    biased;
+                    _ = hub.landing.wait_stop() => {
+                        hub.derive.active.lock().unwrap().remove(&project);
+                        break;
+                    }
+                    _ = tokio::time::sleep(debounce) => {}
+                }
+            }
             if hub.landing.stopping() {
                 hub.derive.active.lock().unwrap().remove(&project);
                 break;
             }
+            let branches: Vec<String> = {
+                let mut active = hub.derive.active.lock().unwrap();
+                let next = active.get_mut(&project).map(std::mem::take).unwrap_or_default();
+                if next.is_empty() {
+                    active.remove(&project);
+                    break;
+                }
+                next.into_iter().collect()
+            };
             if let Err(e) = landing(&hub, project, branches).await {
                 if !hub.landing.stopping() {
                     eprintln!("veil-server: deriving the history of project {project}: {e:?}");
@@ -439,18 +487,17 @@ pub fn landed(hub: &Arc<Hub>, project: i64, branches: Vec<String>) {
                 hub.derive.active.lock().unwrap().remove(&project);
                 break;
             }
-            let next = {
+            let more = {
                 let mut active = hub.derive.active.lock().unwrap();
-                let next = active.get_mut(&project).map(std::mem::take).unwrap_or_default();
-                if next.is_empty() {
+                let has_more = active.get(&project).is_some_and(|w| !w.is_empty());
+                if !has_more {
                     active.remove(&project);
                 }
-                next
+                has_more
             };
-            if next.is_empty() {
+            if !more {
                 break;
             }
-            branches = next.into_iter().collect();
         }
     });
 }
