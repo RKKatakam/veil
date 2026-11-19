@@ -2588,7 +2588,11 @@ take no lock:
   workspaces, tags, remote tags: one side's change wins, two different
   changes go to the first side and the other target stays a visible head
   (through the rest of the fold too: a later step's dropped head never
-  hides a loser, BUG-1298), with a warning printed once by the process that writes the merge; a
+  hides a loser, BUG-1298; and a loser settled by an earlier merge whose
+  head `drop_ancestor_heads` removed because a covering head sat above it
+  is recovered if a concurrent undo or op restore drops that covering head,
+  provided the losing write was neither retracted nor superseded on that
+  ref, BUG-2642), with a warning printed once by the process that writes the merge; a
   removal loses to a change; a workspace's or tag's cloak merges separately
   and a cloaked side wins; a release tag's target and annotation are one
   unit and win over an ordinary tag). Each side's `rewritten` is applied to
@@ -2608,16 +2612,24 @@ take no lock:
   shows set (a tag on the old version, a workspace on it, an undo's
   revert) stays where it is, and every other ref follows the rewrite. A
   rewrite only merges recorded (the op log does not say which command it
-  is) is still judged by the views: not applied when a head that saw it
-  shows its old snapshot, or a side shows it where the fold step's shared
-  history does not (BUG-1295). Two rewrites of one snapshot that stand
-  and differ are a divergent change, whether their commands ran
-  concurrently or one saw the other (a command that saw a rewrite and
-  rewrote the old version again made a second version, BUG-1488; one
-  that was taken back is dropped by what the op log says took it back,
-  never because a later one "replaces" it). Nothing follows either
-  version, and a snapshot with two versions that commands made (each
-  recorded by a command the merge collects, neither taken back) stays
+  is) stands only when at least one merge that recorded it was not taken
+  back by an op restore still in force (BUG-2641), and is still judged by
+  the views: not applied when a head that saw it shows its old snapshot,
+  or a folded head shows it where its own shared history with the incoming
+  head does not (BUG-1295, BUG-2641 — each folded head is checked
+  individually rather than the un-rebased accumulated view); and when it
+  meets a standing command's rewrite of the same snapshot, `is_merge_rebase`
+  distinguishes a merge's own parent rebase (including one another settler
+  also made in the shared history) from a shared-history command copied
+  onto a merge, so a settler's rebase does not turn a command's rewrite
+  into a false divergence (BUG-2641). Two rewrites
+  of one snapshot that stand and differ are a divergent change, whether
+  their commands ran concurrently or one saw the other (a command that saw
+  a rewrite and rewrote the old version again made a second version,
+  BUG-1488; one that was taken back is dropped by what the op log says
+  took it back, never because a later one "replaces" it). Nothing follows
+  either version, and a snapshot with two versions that commands made
+  (each recorded by a command the merge collects, neither taken back) stays
   where it is, with what is on it: the merge's rebase does not move it
   through an ancestor's rewrite either (that made a third version). One
   whose differing rewrites only merges recorded is rebased like any
@@ -2636,13 +2648,17 @@ take no lock:
   it replaces), and what follows the rewrite lands on the result. A
   command's own rebase is unchanged: its replacements are where the
   command put them (the server's version of a change, a projection).
-  Open: an undo of an op restore (or of an undo) puts rewrites back in
-  force that nothing applies to what was put on their old snapshots
-  meanwhile (BUG-2640); in a fold of three or more heads the merged
-  view of the heads folded so far, not rebased yet, can be taken for a
-  side that brought an old snapshot back, and a settler's recorded
-  rebase that op restores went back past still counts as a version of
-  its snapshot (BUG-2641).
+  **Reinstated rewrites** (BUG-2640): when an undo, redo or op restore
+  takes an earlier undo or op restore back — whether as a single command
+  (`Repo::reinstated_for_command`) or on one side of a merge
+  (`Repo::extend_with_reinstated`) — the shared-history commands it puts
+  back in force (and what the shared history made of their replacements,
+  followed transitively) are applied to what the resulting view shows on
+  their old snapshots (never walking `start_view` on an undo/restore, so
+  dropped heads are not rebased back in), respecting pinned refs and
+  divergent changes, and are **not** re-recorded on the operation's
+  `rewritten` so a later undo or restore of the original command still
+  takes them back cleanly.
   The confinement check runs against **every side's view**: a rewrite that
   would move a change out of an unreleased embargo either side had it in
   is dropped and its replacement rewritten back, so the change stays

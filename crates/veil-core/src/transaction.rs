@@ -63,6 +63,16 @@ struct MergeCtx {
     pinned: BTreeSet<crate::repo::RefKey>,
     /// Snapshots the rebase leaves where they are (`MergePlan::divergent`).
     divergent: BTreeSet<ObjectId>,
+    /// Rewrites from shared-history commands an undo, redo or op restore put
+    /// back in force: applied to the view, not recorded again (`MergePlan::transient`).
+    transient: BTreeSet<ObjectId>,
+}
+
+/// Rewrites an undo, redo or op restore puts back in force (BUG-2640).
+struct RestoreCtx {
+    pinned: BTreeSet<crate::repo::RefKey>,
+    divergent: BTreeSet<ObjectId>,
+    transient: BTreeSet<ObjectId>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +119,7 @@ pub struct Transaction<'r> {
     /// commit that what this transaction brought in is still there.
     pub(crate) check_carried: bool,
     merge: Option<MergeCtx>,
+    restore: Option<RestoreCtx>,
     done: bool,
     /// The staging directory, kept after the objects' publication for the
     /// staged operation ([`STAGED_OP`]); removed when it is published, or
@@ -189,6 +200,7 @@ impl<'r> Transaction<'r> {
             reg,
             check_carried: false,
             merge: None,
+            restore: None,
             done: false,
             kept_dir: None,
             keep_attribution: false,
@@ -206,6 +218,7 @@ impl<'r> Transaction<'r> {
         let crate::repo::MergePlan {
             view,
             rewritten,
+            transient,
             divergent,
             pinned,
             before,
@@ -247,8 +260,33 @@ impl<'r> Transaction<'r> {
             held: Vec::new(),
             pinned,
             divergent,
+            transient,
         });
         Ok(tx)
+    }
+
+    /// What this uncommitted command itself takes back, if it is an undo,
+    /// redo or op restore.
+    fn own_retractor(&self) -> Result<Option<crate::repo::Retractor>> {
+        use crate::repo::Retractor;
+        if let Some(u) = self.undo_of {
+            return Ok(Some(Retractor::Undo(u)));
+        }
+        if let Some(u) = self.redo_of {
+            return Ok(Some(Retractor::Redo(u)));
+        }
+        let target = match self.restore_of {
+            Some(t) => Some(t),
+            None => self
+                .description
+                .strip_prefix("restore to operation ")
+                .filter(|_| !self.base.is_empty() && self.merge.is_none())
+                .and_then(|p| self.repo.ops.resolve_prefix_from(&self.base, p).ok()),
+        };
+        match target {
+            Some(t) => Ok(Some(Retractor::Restore(self.repo.ops.split(&self.base, &[t])?.only_a.into_iter().collect()))),
+            None => Ok(None),
+        }
     }
 
     /// Record this operation as one of no particular workspace (tags,
@@ -1223,21 +1261,52 @@ impl<'r> Transaction<'r> {
     }
 
     fn rebase_descendants(&mut self) -> Result<()> {
-        // A merge leaves the refs it pinned where they are, and what only
-        // they reach (BUG-1434).
-        let pinned = self.merge.as_ref().map(|m| m.pinned.clone()).unwrap_or_default();
-        let unpinned = |v: &View| -> Vec<ObjectId> {
+        // A merge (or an undo/restore putting rewrites back in force) leaves
+        // the refs it pinned where they are, and what only they reach
+        // (BUG-1434, BUG-2640). A ref whose snapshot this command itself
+        // rewrote (`restore_view_keeping_edits`) still moves to its edit.
+        let pinned = self
+            .merge
+            .as_ref()
+            .map(|m| m.pinned.clone())
+            .or_else(|| self.restore.as_ref().map(|r| r.pinned.clone()))
+            .unwrap_or_default();
+        let is_pinned = |key: crate::repo::RefKey, s: ObjectId, rw: &HashMap<ObjectId, Rewrite>, restore: &Option<RestoreCtx>| {
+            pinned.contains(&key) && restore.as_ref().is_none_or(|r| !rw.contains_key(&s) || r.transient.contains(&s))
+        };
+        let unpinned = |v: &View, rw: &HashMap<ObjectId, Rewrite>, restore: &Option<RestoreCtx>| -> Vec<ObjectId> {
             if pinned.is_empty() {
                 return v.refs();
             }
-            let mut out: Vec<ObjectId> = v.heads.iter().filter(|h| !pinned.contains(&crate::repo::RefKey::Head(**h))).copied().collect();
-            out.extend(v.workspaces.iter().filter(|(n, _)| !pinned.contains(&crate::repo::RefKey::Ws((*n).clone()))).map(|(_, w)| w.wc));
-            out.extend(v.tags.iter().filter(|(n, _)| !pinned.contains(&crate::repo::RefKey::Tag((*n).clone()))).map(|(_, t)| t.target));
+            let mut out: Vec<ObjectId> = v
+                .heads
+                .iter()
+                .filter(|h| !is_pinned(crate::repo::RefKey::Head(**h), **h, rw, restore))
+                .copied()
+                .collect();
+            out.extend(
+                v.workspaces
+                    .iter()
+                    .filter(|(n, w)| !is_pinned(crate::repo::RefKey::Ws((*n).clone()), w.wc, rw, restore))
+                    .map(|(_, w)| w.wc),
+            );
+            out.extend(
+                v.tags
+                    .iter()
+                    .filter(|(n, t)| !is_pinned(crate::repo::RefKey::Tag((*n).clone()), t.target, rw, restore))
+                    .map(|(_, t)| t.target),
+            );
             out.extend(v.remote_tags.values().copied());
             out
         };
-        let mut roots = unpinned(&self.start_view);
-        roots.extend(unpinned(&self.view));
+        let mut roots = match self.restore.is_some() {
+            // An undo, redo or op restore replaced `start_view` with `view`:
+            // walking `start_view` would rebase heads it just dropped and put
+            // them back into `view.heads` (BUG-2640).
+            true => Vec::new(),
+            false => unpinned(&self.start_view, &self.rewritten, &self.restore),
+        };
+        roots.extend(unpinned(&self.view, &self.rewritten, &self.restore));
         // Only descendants of a rewritten snapshot can move, and each has a
         // larger generation than the oldest one: the walk stops there
         // instead of reading all history.
@@ -1253,19 +1322,24 @@ impl<'r> Transaction<'r> {
             crate::graph_index::Gen::MAX => HashMap::new(),
             f => self.repo.exact().down_to(roots.iter().copied(), f + 1)?,
         };
-        // A merge: whatever follows a rewrite lands on a current snapshot
-        // (BUG-1444). A side's rewrite can name a replacement no ref of the
-        // merged view shows (a settler's rebased copy whose head the views'
-        // merge dropped, the commit a restored working copy was snapshotted
-        // into), on a parent rewritten since. A ref or a parent that
-        // resolves to it would be left there, above what a rewrite
-        // replaced: the replacement is part of the rebase, with its
-        // ancestors above the floor. (A command's replacements are where
-        // the command put them: the server's version of a change, a
-        // projection.)
-        let merging = self.merge.is_some() && floor != crate::graph_index::Gen::MAX;
-        // A merge leaves a divergent snapshot where it is (BUG-1488).
-        let divergent = self.merge.as_ref().map(|m| m.divergent.clone()).unwrap_or_default();
+        // A merge (or reinstated rewrites): whatever follows a rewrite lands
+        // on a current snapshot (BUG-1444, BUG-2640). A side's rewrite can
+        // name a replacement no ref of the merged view shows (a settler's
+        // rebased copy whose head the views' merge dropped, the commit a
+        // restored working copy was snapshotted into), on a parent rewritten
+        // since. A ref or a parent that resolves to it would be left there,
+        // above what a rewrite replaced: the replacement is part of the
+        // rebase, with its ancestors above the floor. (An ordinary command's
+        // replacements are where the command put them: the server's version
+        // of a change, a projection.)
+        let merging = (self.merge.is_some() || self.restore.is_some()) && floor != crate::graph_index::Gen::MAX;
+        // Leave a divergent snapshot where it is (BUG-1488).
+        let divergent = self
+            .merge
+            .as_ref()
+            .map(|m| m.divergent.clone())
+            .or_else(|| self.restore.as_ref().map(|r| r.divergent.clone()))
+            .unwrap_or_default();
         if merging {
             let mut asked: HashSet<ObjectId> = HashSet::new();
             // What lands somewhere: a ref, and a parent of a snapshot the
@@ -1401,11 +1475,11 @@ impl<'r> Transaction<'r> {
             self.add_head(nid)?;
         }
 
-        // Re-point every reference (but those a merge pinned).
+        // Re-point every reference (but those pinned).
         let heads: Vec<ObjectId> = self.view.heads.iter().copied().collect();
         self.view.heads = heads
             .into_iter()
-            .flat_map(|h| match pinned.contains(&crate::repo::RefKey::Head(h)) {
+            .flat_map(|h| match is_pinned(crate::repo::RefKey::Head(h), h, &self.rewritten, &self.restore) {
                 true => vec![h],
                 false => self.resolve(h).0,
             })
@@ -1417,14 +1491,14 @@ impl<'r> Transaction<'r> {
         let tags: Vec<(String, ObjectId)> =
             self.view.tags.iter().filter(|(_, t)| t.annotation.is_none()).map(|(n, t)| (n.clone(), t.target)).collect();
         for (name, target) in tags {
-            if self.rewritten.contains_key(&target) && !pinned.contains(&crate::repo::RefKey::Tag(name.clone())) {
+            if self.rewritten.contains_key(&target) && !is_pinned(crate::repo::RefKey::Tag(name.clone()), target, &self.rewritten, &self.restore) {
                 let r = self.resolve(target).0;
                 self.view.tags.get_mut(&name).unwrap().target = r.first().copied().unwrap_or(root);
             }
         }
         let wss: Vec<(String, ObjectId)> = self.view.workspaces.iter().map(|(n, w)| (n.clone(), w.wc)).collect();
         for (name, wc) in wss {
-            if !self.rewritten.contains_key(&wc) || pinned.contains(&crate::repo::RefKey::Ws(name.clone())) {
+            if !self.rewritten.contains_key(&wc) || is_pinned(crate::repo::RefKey::Ws(name.clone()), wc, &self.rewritten, &self.restore) {
                 continue;
             }
             let (r, abandoned) = self.resolve(wc);
@@ -1830,7 +1904,13 @@ impl<'r> Transaction<'r> {
                 change.short()
             ));
         }
-        self.merge.as_mut().expect("a merge").warnings.extend(warn);
+        let m = self.merge.as_mut().expect("a merge");
+        m.warnings.extend(warn);
+        for old in &m.transient {
+            if !reversals.contains_key(old) {
+                self.rewritten.remove(old);
+            }
+        }
         Ok(())
     }
 
@@ -2043,6 +2123,30 @@ impl<'r> Transaction<'r> {
         if self.merge.is_some() {
             self.merge_rebase()?;
         } else {
+            if let Some(ret) = self.own_retractor()? {
+                let plan = self.repo.reinstated_for_command(&self.base, &ret, &self.view)?;
+                let mut transient = BTreeSet::new();
+                for (old, new) in plan.rewritten {
+                    if self.rewritten.contains_key(&old) {
+                        continue;
+                    }
+                    let r = match new.as_slice() {
+                        [] => match self.repo.exact().snapshot(&old)? {
+                            Some(s) => Rewrite::Abandoned(s.parents.clone()),
+                            None => continue,
+                        },
+                        [one] => Rewrite::Replaced(*one),
+                        _ => continue,
+                    };
+                    self.rewritten.insert(old, r);
+                    transient.insert(old);
+                }
+                self.restore = Some(RestoreCtx {
+                    pinned: plan.pinned,
+                    divergent: plan.divergent,
+                    transient,
+                });
+            }
             if !self.rewritten.is_empty() {
                 self.rebase_descendants()?;
             }
@@ -2054,6 +2158,11 @@ impl<'r> Transaction<'r> {
             }
             if self.view != self.repo.view {
                 self.check_withheld()?;
+            }
+            if let Some(r) = &self.restore {
+                for old in &r.transient {
+                    self.rewritten.remove(old);
+                }
             }
         }
         if self.view != self.start_view {
