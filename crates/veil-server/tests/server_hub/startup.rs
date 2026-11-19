@@ -1785,7 +1785,6 @@ fn bug_2920_migration_46_never_reverts_updates_committed_during_or_before_retry(
 /// `PRIMARY KEY ((...) HASH)` / `CREATE INDEX (... HASH)` DDL on colocated
 /// databases, which YugabyteDB rejects with `cannot colocate hash partitioned table`.
 #[test]
-#[ignore = "BUG-2921: migration 0046 fails unconditionally on colocated YugabyteDB databases (the deployment kit's default YB_LAYOUT=colocated)"]
 fn bug_2921_migration_46_succeeds_on_colocated_yugabytedb_database() {
     let rt = runtime();
     if !on_yugabyte(&rt) {

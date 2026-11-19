@@ -347,7 +347,14 @@ async fn migrate_once(
                 }
             };
             if yb {
-                yugabyte_only_steps(&mut *c, parts.transactional, deadline).await?;
+                // Colocated YugabyteDB databases reject hash-partitioned DDL
+                // (`cannot colocate hash partitioned table`, BUG-2921): skip
+                // hash-sharding migrations on colocated databases and record
+                // them as applied, matching PostgreSQL.
+                let colocated: bool = sqlx::query_scalar("SELECT yb_is_database_colocated()").fetch_one(&mut *c).await?;
+                if !colocated {
+                    yugabyte_only_steps(&mut *c, parts.transactional, deadline).await?;
+                }
             }
             sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
             continue;
@@ -513,11 +520,12 @@ async fn yugabyte_only_steps(c: &mut PgConnection, sql: &str, deadline: tokio::t
 /// (no server writes a table it does not know): it stays in the transaction.
 pub const ONLINE_INDEXES: &str = "-- veil: online indexes";
 
-/// First line of a migration whose SQL uses YugabyteDB-only DDL (such as
-/// composite hash keys `PRIMARY KEY ((a, b) HASH)`). On PostgreSQL
-/// (`!is_yugabyte(version)`) the runner skips executing the SQL and records
-/// the migration as applied; on YugabyteDB its [`YUGABYTE_STEP`]-delimited
-/// steps run one by one outside a transaction block.
+/// First line of a migration whose SQL uses YugabyteDB-only hash-sharding DDL
+/// (such as composite hash keys `PRIMARY KEY ((a, b) HASH)`). On PostgreSQL
+/// (`!is_yugabyte(version)`) and on colocated YugabyteDB databases
+/// (`yb_is_database_colocated()`, BUG-2921) the runner skips executing the SQL
+/// and records the migration as applied; on non-colocated YugabyteDB its
+/// [`YUGABYTE_STEP`]-delimited steps run one by one outside a transaction block.
 pub const YUGABYTE_ONLY: &str = "-- veil: yugabyte-only";
 
 /// Step boundary inside a [`YUGABYTE_ONLY`] migration: each step runs as its
