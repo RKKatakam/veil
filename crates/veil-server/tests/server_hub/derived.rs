@@ -97,7 +97,7 @@ pub struct Hist {
 
 /// Encode `files` as trees; every object goes to `out`. A path ending in
 /// `/` is an empty folder.
-fn build_tree(files: &Files, out: &mut Vec<(ObjectId, Vec<u8>)>) -> ObjectId {
+pub(crate) fn build_tree(files: &Files, out: &mut Vec<(ObjectId, Vec<u8>)>) -> ObjectId {
     let mut here: BTreeMap<String, TreeEntry> = BTreeMap::new();
     let mut sub: BTreeMap<String, Files> = BTreeMap::new();
     for (p, c) in files {

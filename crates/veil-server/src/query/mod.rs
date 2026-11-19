@@ -226,15 +226,23 @@ pub async fn resolve_real(hub: &Arc<Hub>, ask: &Ask, rev: &str, deadline: Instan
                 }
             } else {
                 // Only an id this viewer was given: a projection memoised
-                // under their view key.
-                sqlx::query_scalar("SELECT real_id FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 LIMIT 1")
-                    // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
-                    .persistent(false)
-                    .bind(project)
-                    .bind(&vk)
-                    .bind(id.hex())
-                    .fetch_optional(&hub.db)
-                    .await?
+                // under their view key, preferring the snapshot it stands for
+                // over a hidden change collapsed into it.
+                sqlx::query_scalar(
+                    "SELECT real_id FROM ( \
+                       (SELECT real_id, 0 AS ord FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed LIMIT 1) \
+                       UNION ALL \
+                       (SELECT real_id, 1 AS ord FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 \
+                        AND NOT EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND view_key = $2 AND projected_id = $3 AND NOT collapsed) LIMIT 1) \
+                     ) q ORDER BY ord LIMIT 1",
+                )
+                // Planned for its own id (`sync::resolve_for_mode`, BUG-2467).
+                .persistent(false)
+                .bind(project)
+                .bind(&vk)
+                .bind(id.hex())
+                .fetch_optional(&hub.db)
+                .await?
             };
             let r = real.and_then(|r| ObjectId::from_hex(&r).ok()).ok_or_else(no_revision)?;
             if crate::embargo::is_withheld_for_query(hub, project, &r).await? {

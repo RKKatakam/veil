@@ -493,10 +493,14 @@ impl Caches {
     }
 
     /// Record that `real` projects to `projected` under `view_key` (a row of
-    /// `projections` as stored), and so that, for that view, `projected`
-    /// stands for `real`.
+    /// `projections` as stored), and, when the row is not collapsed, that
+    /// `projected` stands for `real` in that view.
     pub fn put_memo(&self, project: i64, view_key: &str, real: &ObjectId, projected: &ObjectId) {
-        self.put_memo_at(project, self.gc_epoch(project), view_key, real, projected);
+        self.put_memo_row(project, view_key, real, projected, false);
+    }
+
+    pub fn put_memo_row(&self, project: i64, view_key: &str, real: &ObjectId, projected: &ObjectId, collapsed: bool) {
+        self.put_memo_row_at(project, self.gc_epoch(project), view_key, real, projected, collapsed);
     }
 
     pub fn put_memo_at(
@@ -507,6 +511,18 @@ impl Caches {
         real: &ObjectId,
         projected: &ObjectId,
     ) {
+        self.put_memo_row_at(project, gc_epoch, view_key, real, projected, false);
+    }
+
+    pub fn put_memo_row_at(
+        &self,
+        project: i64,
+        gc_epoch: i64,
+        view_key: &str,
+        real: &ObjectId,
+        projected: &ObjectId,
+        collapsed: bool,
+    ) {
         let p = project.to_le_bytes();
         let g = gc_epoch.to_le_bytes();
         self.snapshots.insert(
@@ -514,11 +530,13 @@ impl Caches {
             *projected,
             SNAPSHOT_ENTRY,
         );
-        self.snapshots.insert(
-            key("resolved", &[&p, &g, view_key.as_bytes(), &projected.0]),
-            *real,
-            SNAPSHOT_ENTRY,
-        );
+        if !collapsed {
+            self.snapshots.insert(
+                key("resolved", &[&p, &g, view_key.as_bytes(), &projected.0]),
+                *real,
+                SNAPSHOT_ENTRY,
+            );
+        }
     }
 
     /// A real snapshot that projects to `id` under `view_key` (`sync::resolve`):

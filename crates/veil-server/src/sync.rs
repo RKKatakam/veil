@@ -665,18 +665,20 @@ pub(crate) async fn projected_inner(
                     Some(p) => Some(p),
                     None => {
                         let gce = hub.caches.gc_epoch(project.id);
-                        let m: Option<String> =
-                            sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                        let m: Option<(String, bool)> =
+                            sqlx::query_as("SELECT projected_id, collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
                                 .bind(project.id)
                                 .bind(&view_key)
                                 .bind(x.hex())
                                 .fetch_optional(&hub.db)
                                 .await?;
-                        let m = m.map(|p| ObjectId::from_hex(&p).map_err(|e| Error::Other(e.into()))).transpose()?;
-                        if let Some(p) = &m {
-                            hub.caches.put_memo_at(project.id, gce, &view_key, &x, p);
+                        let m = m
+                            .map(|(p, c)| ObjectId::from_hex(&p).map(|p| (p, c)).map_err(|e| Error::Other(e.into())))
+                            .transpose()?;
+                        if let Some((p, c)) = &m {
+                            hub.caches.put_memo_row_at(project.id, gce, &view_key, &x, p, *c);
                         }
-                        m
+                        m.map(|(p, _)| p)
                     }
                 },
             };
@@ -786,19 +788,19 @@ pub(crate) async fn projected_inner(
                 }
                 // Another request stored it first: every server answers what
                 // is stored.
-                let stored = if inserted == 1 {
-                    result
+                let (stored, stored_collapsed) = if inserted == 1 {
+                    (result, collapsed)
                 } else {
-                    let p: String =
-                        sqlx::query_scalar("SELECT projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
+                    let (p, c): (String, bool) =
+                        sqlx::query_as("SELECT projected_id, collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
                             .bind(project.id)
                             .bind(&view_key)
                             .bind(x.hex())
                             .fetch_one(&hub.db)
                             .await?;
-                    ObjectId::from_hex(&p).map_err(|e| Error::Other(e.into()))?
+                    (ObjectId::from_hex(&p).map_err(|e| Error::Other(e.into()))?, c)
                 };
-                hub.caches.put_memo(project.id, &view_key, &x, &stored);
+                hub.caches.put_memo_row(project.id, &view_key, &x, &stored, stored_collapsed);
                 // A fill's progress, when a fill asked (BUG-1943).
                 crate::query::graph::projected_one();
                 stored
@@ -888,12 +890,13 @@ async fn resolve_at_most(hub: &Hub, project: i64, view_key: &str, id: &ObjectId,
     if let Some(real) = hub.caches.resolved(project, view_key, id) {
         return Ok(vec![real]);
     }
-    resolve_stored(hub, project, id, limit).await
+    resolve_stored(hub, project, view_key, id, limit).await
 }
 
-/// [`resolve`] as the database answers it now, newest first, in one
-/// statement: the first `limit` of it when given (all when `None`).
-async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId, limit: Option<i64>) -> Result<Vec<ObjectId>> {
+/// [`resolve`] as the database answers it now, for `view_key` alone (BUG-915,
+/// BUG-2634), in one statement: the first `limit` of it when given (all when
+/// `None`).
+async fn resolve_stored(hub: &Hub, project: i64, view_key: &str, id: &ObjectId, limit: Option<i64>) -> Result<Vec<ObjectId>> {
     if *id == root_snapshot_id() || hub.caches.committed(project, id) {
         return Ok(vec![*id]);
     }
@@ -903,20 +906,28 @@ async fn resolve_stored(hub: &Hub, project: i64, id: &ObjectId, limit: Option<i6
     // read the whole run. The projections are read only for an id that is
     // no committed snapshot (the `NOT EXISTS`, uncorrelated: decided once,
     // before any of them is read; a committed id stands for itself alone),
-    // and newest first by `projections_by_projected_at`, so a limit stops
-    // the read (`LIMIT NULL` is none). The same rows, in the same order, as
-    // reading them all and taking the first `limit`.
+    // for `view_key` alone, preferring the snapshot `id` stands for
+    // (`projections_own`, `NOT collapsed`) over any hidden changes collapsed
+    // into it (`projections_by_view`, read only when there is no uncollapsed
+    // row, stopped after `limit`).
     let rows: Vec<(String, i32, i64)> = sqlx::query_as(
         "SELECT id, 0, 0::BIGINT FROM snapshots WHERE project_id = $1 AND id = $2 \
-         UNION ALL (SELECT real_id, 1, created_at FROM projections WHERE project_id = $1 AND projected_id = $2 \
-         AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
-         ORDER BY created_at DESC LIMIT $3) \
+         UNION ALL (SELECT real_id, 1, created_at FROM projections \
+         WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 AND NOT collapsed \
+           AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
+         ORDER BY created_at DESC LIMIT $4) \
+         UNION ALL (SELECT real_id, 2, 0::BIGINT FROM projections \
+         WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 \
+           AND NOT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2) \
+           AND NOT EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND view_key = $3 AND projected_id = $2 AND NOT collapsed) \
+         LIMIT $4) \
          ORDER BY 2, 3 DESC",
     )
     // Planned for its own id (`resolve_for_mode`, BUG-2467).
     .persistent(false)
     .bind(project)
     .bind(id.hex())
+    .bind(view_key)
     .bind(limit)
     .fetch_all(&hub.db)
     .await?;
@@ -1091,17 +1102,17 @@ pub(crate) async fn own_projection(
         if !need_db.is_empty() {
             let gce = hub.caches.gc_epoch(project.id);
             let need_hex: Vec<String> = need_db.iter().map(ObjectId::hex).collect();
-            let stored: Vec<(String, String)> = sqlx::query_as(
-                "SELECT real_id, projected_id FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3)",
+            let stored: Vec<(String, String, bool)> = sqlx::query_as(
+                "SELECT real_id, projected_id, collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3)",
             )
             .bind(project.id)
             .bind(key)
             .bind(&need_hex)
             .fetch_all(&hub.db)
             .await?;
-            for (r_hex, pp_hex) in stored {
+            for (r_hex, pp_hex, collapsed) in stored {
                 if let (Ok(p0), Ok(pp)) = (ObjectId::from_hex(&r_hex), ObjectId::from_hex(&pp_hex)) {
-                    hub.caches.put_memo_at(project.id, gce, key, &p0, &pp);
+                    hub.caches.put_memo_row_at(project.id, gce, key, &p0, &pp, collapsed);
                     p0_proj.insert(p0, pp);
                 }
             }
@@ -3836,7 +3847,7 @@ async fn push_staged(
             let Some(n) = new else { continue };
             out.push((n.hex(), eid.to_string()));
             for (_, r, p) in &deferred.rows {
-                if *r == *n {
+                if *r == *n && !deferred.collapsed.contains(r) {
                     out.push((p.hex(), eid.to_string()));
                 }
             }
@@ -3853,7 +3864,7 @@ async fn push_staged(
                         }
                     }
                     for (_, r, p) in &deferred.rows {
-                        if *r == x {
+                        if *r == x && !deferred.collapsed.contains(r) {
                             out.push((p.hex(), eid.to_string()));
                         }
                     }
@@ -4238,7 +4249,7 @@ async fn push_staged(
     }
     for ((view_key, real, projected), stored) in deferred.rows.iter().zip(memo_stored) {
         if stored {
-            hub.caches.put_memo(project.id, view_key, real, projected);
+            hub.caches.put_memo_row(project.id, view_key, real, projected, deferred.collapsed.contains(real));
         }
     }
     // The landings: their services wake, and with `wait` the push answers

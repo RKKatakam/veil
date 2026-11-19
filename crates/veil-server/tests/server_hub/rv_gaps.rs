@@ -286,18 +286,14 @@ fn bug_1890_people_a_project_vouches_for_keep_their_rate_behind_a_spent_address(
     assert!(refused >= 80, "a new person behind the spent address is still refused: {refused} of 100: {answers:?}");
 }
 
-/// BUG-1892 (open; the gap BUG-1890's fix left). A person someone else
-/// vouches for counts alone, and anyone can vouch: people who sign up from
-/// one address name each other in their own projects' rules (or groups),
-/// and each then has a whole rate of their own, as every sign-up had before
-/// BUG-1890. Here 27 sign-ups from one address: one's project names the
-/// other 26 in a rule, and another's names the first. Expected, as for
-/// sign-ups nobody vouches for: together they are served what one person
-/// is (ten device rates). Actual: each their own, about 27 device rates.
-/// Whichever way the owner closes it (a per-address bound over vouched
-/// people too, or an operator's setting), the bound asserted here follows.
+/// BUG-1892 (fixed): people who sign up from one address and vouch for
+/// each other in their own projects' rules (or groups) still pay their
+/// address's vouched umbrella bucket, separate from newcomers so unvouched
+/// floods cannot starve vouched teammates (BUG-1890). Here 27 sign-ups
+/// from one address: one's project names the other 26 in a rule, and
+/// another's names the first; together they stay within one person's
+/// umbrella rate (ten device rates).
 #[test]
-#[ignore = "BUG-1892: people who sign up from one address and vouch for each other each count alone, so the address is served a multiple of one person's rate"]
 fn bug_1892_sign_ups_from_one_address_that_vouch_for_each_other_stay_within_a_persons_rate() {
     let device = Rate { per_second: 100_000, per_hour: 300 };
     let hub = TestHub::start_with_limits(Settings { device, ..TestHub::limits() });

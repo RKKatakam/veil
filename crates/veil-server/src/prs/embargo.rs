@@ -412,33 +412,38 @@ pub async fn projected(
     for attempt in 0..8 {
         let gc_epoch = crate::pack_gc::read_gc_epoch(hub, pid).await?;
         let mut map = HashMap::with_capacity(reals.len());
-        let mut extra_projected: Vec<String> = Vec::new();
+        let mut real_hex: Vec<String> = Vec::new();
         for &r in reals {
             let p = crate::sync::projected(hub, &ask.project, &ask.viewer, r).await?;
             if p != r {
-                extra_projected.push(p.hex());
+                real_hex.push(r.hex());
             }
             map.insert(r, p);
         }
-        if extra_projected.is_empty() {
+        let vk = ask.project.view(&ask.viewer).key();
+        if real_hex.is_empty() {
             return Ok(map);
         }
-        extra_projected.sort();
-        extra_projected.dedup();
+        real_hex.sort();
+        real_hex.dedup();
         let eid = embargo_id.to_string();
         let tagged = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
-            let (eid, extra_projected) = (eid.clone(), extra_projected.clone());
+            let (eid, vk, real_hex) = (eid.clone(), vk.clone(), real_hex.clone());
             Box::pin(async move {
                 crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 sqlx::query(
                     "INSERT INTO embargo_snapshots (project_id, snapshot, embargo_id) \
-                     SELECT $1, p, $2 FROM UNNEST($3::text[]) AS p \
-                     WHERE EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL) \
+                     SELECT DISTINCT $1, pr.projected_id, $2 FROM projections pr \
+                     JOIN embargo_snapshots es ON es.project_id = pr.project_id AND es.embargo_id = $2 AND es.snapshot = pr.real_id \
+                     WHERE pr.project_id = $1 AND pr.view_key = $3 AND pr.real_id = ANY($4) \
+                       AND NOT pr.collapsed AND pr.projected_id <> pr.real_id \
+                       AND EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL) \
                      ON CONFLICT DO NOTHING",
                 )
                 .bind(pid)
                 .bind(&eid)
-                .bind(&extra_projected)
+                .bind(&vk)
+                .bind(&real_hex)
                 .execute(&mut *c)
                 .await?;
                 Ok(())

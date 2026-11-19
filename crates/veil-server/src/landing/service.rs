@@ -1825,8 +1825,8 @@ impl Service {
         for s in &b.snapshots {
             hub.caches.put_committed(self.project, s);
         }
-        for (k, real, proj, _) in &b.memos {
-            hub.caches.put_memo(self.project, k, real, proj);
+        for (k, real, proj, collapsed) in &b.memos {
+            hub.caches.put_memo_row(self.project, k, real, proj, *collapsed);
         }
         // Every server's copy too, by a notice after the commit (BUG-2459).
         if moved {
@@ -1933,17 +1933,17 @@ async fn memos(hub: &Hub, project: i64, keys: &[String], reals: &[ObjectId]) -> 
     }
     let gce = hub.caches.gc_epoch(project);
     let hex: Vec<String> = reals.iter().map(ObjectId::hex).collect();
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT view_key, real_id, projected_id FROM projections WHERE project_id = $1 AND view_key = ANY($2) AND real_id = ANY($3)",
+    let rows: Vec<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT view_key, real_id, projected_id, collapsed FROM projections WHERE project_id = $1 AND view_key = ANY($2) AND real_id = ANY($3)",
     )
     .bind(project)
     .bind(keys)
     .bind(&hex)
     .fetch_all(&hub.db)
     .await?;
-    for (k, r, p) in rows {
+    for (k, r, p, collapsed) in rows {
         if let (Ok(r), Ok(p)) = (ObjectId::from_hex(&r), ObjectId::from_hex(&p)) {
-            hub.caches.put_memo_at(project, gce, &k, &r, &p);
+            hub.caches.put_memo_row_at(project, gce, &k, &r, &p, collapsed);
             out.insert((k, r), p);
         }
     }

@@ -16,8 +16,10 @@
 //! 2. **Rate** ([`bucket`]): a token from the device's or the address's
 //!    buckets, else `429 rate_limited` with `retry_after_ms`, naming
 //!    nothing. A signed-in request, under a session or a grant, also pays
-//!    its person's umbrella, and a person nobody else vouches for their
-//!    address's (`vouched`, BUG-1890).
+//!    its person's umbrella, and their address's bucket — `Limits::newcomers`
+//!    for people nobody else vouches for (BUG-1890), or `Limits::vouched_addresses`
+//!    for people vouched for (BUG-1892), so mutual vouching cannot multiply one
+//!    address's rate while unvouched sign-ups cannot drain vouched teammates.
 //! 3. **The body** ([`body`]): read under a share of the memory budget that
 //!    grows as it arrives, at a minimum rate.
 //! 4. **Bulkheads** ([`gate`]): a place in the project's gate, for callers
@@ -184,6 +186,13 @@ pub struct Limits {
     /// for ([`vouched`]), together: one person's umbrella, so signing up
     /// again and again from one address gains nothing (BUG-1890).
     newcomers: Buckets,
+    /// The signed-in people behind one address whom a project vouches
+    /// for ([`vouched`]), together: one person's umbrella, separate from
+    /// [`Self::newcomers`] so unvouched sign-ups from the same address
+    /// cannot starve vouched teammates behind a NAT (BUG-1890), while
+    /// mutually-vouching sign-ups from one address still stay within one
+    /// person's umbrella rate (BUG-1892).
+    vouched_addresses: Buckets,
     /// Session lookups per address (tokens this server does not know yet),
     /// at the device rate: a restarted server's people behind one address
     /// are looked up, made-up tokens are not looked up past it (BUG-1338).
@@ -214,6 +223,7 @@ impl Limits {
             people: Buckets::new(person_rate),
             addresses: Buckets::new(settings.anonymous),
             newcomers: Buckets::new(person_rate),
+            vouched_addresses: Buckets::new(person_rate),
             lookups: Buckets::new(settings.device),
             bodies: body::Pools::new(settings.request_memory),
             answers: answers::Answers::new(settings.request_memory),
@@ -579,9 +589,12 @@ async fn who(hub: &HubState, parts: &mut axum::http::request::Parts, address: Ke
 /// sign up, any number of times, and a new person's own buckets start
 /// full: so a person nobody vouches for also pays their address's
 /// [`Limits::newcomers`] bucket, and one address's sign-ups are served
-/// together what one person is (BUG-1890). Someone vouched for counts
-/// alone, however many colleagues share their address. A person's first
-/// request to a server (nothing cached yet) pays the address too.
+/// together what one person is (BUG-1890). Someone vouched for pays
+/// [`Limits::vouched_addresses`] instead, so unvouched floods behind the
+/// same address cannot drain vouched teammates while mutually-vouching
+/// sign-ups from one address still stay within one person's umbrella rate
+/// (BUG-1892). A person's first request to a server (nothing cached yet)
+/// pays [`Limits::newcomers`].
 fn vouched(hub: &HubState, name: Option<&str>, who: &Who) -> bool {
     let Some(id) = who.person_id else { return false };
     if hub.caches.vouched(id) {
@@ -604,11 +617,14 @@ fn vouched(hub: &HubState, name: Option<&str>, who: &Who) -> bool {
 
 /// The address's share of a signed-in request ([`vouched`]): taken after
 /// the device's and the person's own, so a caller past their own rate
-/// takes nothing from the others behind their address.
+/// takes nothing from the others behind their address. Vouched callers
+/// pay [`Limits::vouched_addresses`]; unvouched callers pay
+/// [`Limits::newcomers`] (BUG-1890, BUG-1892).
 fn newcomer(hub: &HubState, name: Option<&str>, who: &Who, address: Key) -> Result<(), Duration> {
     match who.person_id {
-        Some(_) if !vouched(hub, name, who) => hub.limits.newcomers.take(address),
-        _ => Ok(()),
+        Some(_) if vouched(hub, name, who) => hub.limits.vouched_addresses.take(address),
+        Some(_) => hub.limits.newcomers.take(address),
+        None => Ok(()),
     }
 }
 
