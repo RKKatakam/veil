@@ -2561,6 +2561,78 @@ mod s21_cycle3 {
         assert_eq!(normal(), 3, "kept through 16 concurrent landings");
     }
 
+    /// P7: fast-forward commits/landings on the default branch that leave a
+    /// non-broken `.veilrules` (valid or absent) unchanged skip locking and
+    /// rewriting `pr_review_rules`; landing a `.veilrules` change still updates
+    /// `pr_review_rules` and enforces the new rules, and a subsequent broken
+    /// `.veilrules` still inherits the last valid rules (not `strict`).
+    #[test]
+    fn p7_unchanged_veilrules_skips_pr_review_rules_write_and_changes_land() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let hub = th.hub();
+        let pid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.db)).unwrap();
+        let admin = p.admin.token();
+        let dev = p.dev.token();
+        let tip = |token: &str| th.api().tips(Some(token), &p.name).unwrap().branches["main"];
+        let land = |token: &str, edits: Value| -> ObjectId {
+            let base = tip(token);
+            let r = th.api().post_json(
+                Some(token),
+                &format!("/v1/projects/{}/changes", p.name),
+                &json!({"base": base.hex(), "edits": edits, "onto": {"branch": "main", "expected": "rebase"}}),
+            );
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let v = r.json();
+            assert_eq!(v["branch"]["status"], "ok", "{v}");
+            ObjectId::from_hex(v["branch"]["tip"].as_str().unwrap()).unwrap()
+        };
+        let recorded = || -> Option<String> {
+            th.rt
+                .block_on(sqlx::query_scalar::<_, String>("SELECT checked FROM pr_review_rules WHERE project_id = $1").bind(pid).fetch_optional(&hub.db))
+                .unwrap()
+        };
+        let normal = || th.rt.block_on(prs::rules_of_project(&hub, pid, "main")).unwrap().need(Risk::Normal).approvals;
+
+        // 1. Admin lands a valid `.veilrules` (approvals = 2): updates pr_review_rules.
+        let t1 = land(&admin, json!([{"path": ".veilrules", "put": {"text": "[review]\nnormal = { approvals = 2 }\n"}}]));
+        assert_eq!(recorded().as_deref(), Some(t1.hex().as_str()));
+        assert_eq!(normal(), 2);
+
+        // 2. Dev lands a normal code change without touching `.veilrules`:
+        //    `pr_review_rules` is NOT rewritten (checked remains at t1), and rules stay 2.
+        let t2 = land(&dev, json!([{"path": "src/p7_a.rs", "put": {"text": "fn a() {}\n"}}]));
+        assert_ne!(t2, t1);
+        assert_eq!(recorded().as_deref(), Some(t1.hex().as_str()), "unchanged valid .veilrules skips pr_review_rules write");
+        assert_eq!(normal(), 2);
+        // Even calling rules_of_project (and derive::landing) does not rewrite `checked` when state is unchanged:
+        assert_eq!(recorded().as_deref(), Some(t1.hex().as_str()), "rules_in_force skips rewriting checked when non-broken state matches");
+
+        // 3. Admin lands a `.veilrules` change (approvals = 4): DOES update pr_review_rules!
+        let t3 = land(&admin, json!([{"path": ".veilrules", "put": {"text": "[review]\nnormal = { approvals = 4 }\n"}}]));
+        assert_eq!(recorded().as_deref(), Some(t3.hex().as_str()), "changing .veilrules updates pr_review_rules");
+        assert_eq!(normal(), 4);
+
+        // 4. Another unchanged commit (skips write), THEN admin lands a BROKEN `.veilrules`:
+        //    must still inherit approvals = 4 (from old_file) and record the broken tip!
+        let t4 = land(&dev, json!([{"path": "src/p7_b.rs", "put": {"text": "fn b() {}\n"}}]));
+        assert_eq!(recorded().as_deref(), Some(t3.hex().as_str()));
+        let t5 = land(&admin, json!([{"path": ".veilrules", "put": {"text": BROKEN}}]));
+        assert_ne!(t5, t4);
+        assert_eq!(recorded().as_deref(), Some(t5.hex().as_str()), "broken .veilrules records its tip");
+        assert_eq!(normal(), 4, "broken .veilrules inherits last valid approvals=4 even after skipped intermediate commits");
+
+        // 5. Deleting `.veilrules` transitions to Absent (default approvals = 1),
+        //    and a subsequent code commit skips rewriting pr_review_rules.
+        let t6 = land(&admin, json!([{"path": ".veilrules", "delete": true}]));
+        assert_eq!(recorded().as_deref(), Some(t6.hex().as_str()));
+        assert_eq!(normal(), 1);
+        let t7 = land(&dev, json!([{"path": "src/p7_c.rs", "put": {"text": "fn c() {}\n"}}]));
+        assert_ne!(t7, t6);
+        assert_eq!(recorded().as_deref(), Some(t6.hex().as_str()), "unchanged absent .veilrules skips pr_review_rules write");
+        assert_eq!(normal(), 1);
+    }
+
     /// Bounded reviews in answers (cycle 3): 300 reviewers' verdicts with
     /// 64 KiB texts: a PR answer lists the 100 latest, with texts within
     /// 256 KiB, and says how many there are.
@@ -2945,7 +3017,7 @@ mod s21_redesign {
                     .await?
                     .rows_affected();
                 assert_eq!(n, 1, "main moved from {old} to {new}");
-                record_landing(&mut tx, project, &Landing { old: Some(old), new, file: file.clone(), fast_forward: true }).await.map_err(|e| sqlx::Error::Protocol(format!("{e:?}")))?;
+                record_landing(&mut tx, project, &Landing { old: Some(old), new, file: file.clone(), old_file: None, fast_forward: true }).await.map_err(|e| sqlx::Error::Protocol(format!("{e:?}")))?;
                 tx.commit().await
             }
             .await;

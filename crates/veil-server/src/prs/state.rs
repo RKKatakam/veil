@@ -115,13 +115,34 @@ fn state_json(s: &RulesState) -> String {
 }
 
 /// What a landing on the default branch brings: its old and new tip, the
-/// new tip's file, and whether the move is a fast-forward from the old one.
+/// new tip's file, the old tip's file (when known), and whether the move is
+/// a fast-forward from the old one.
 #[derive(Clone, Debug)]
 pub struct Landing {
     pub old: Option<ObjectId>,
     pub new: ObjectId,
     pub file: RulesFile,
+    pub old_file: Option<RulesFile>,
     pub fast_forward: bool,
+}
+
+impl Landing {
+    /// True when this fast-forward landing leaves a non-broken `.veilrules`
+    /// (valid or absent) unchanged from `old` to `new`. In that case the
+    /// review rules in force cannot change, and `pr_review_rules` does not
+    /// need to be locked or updated in the landing's transaction: if a later
+    /// landing breaks `.veilrules`, `next_record` derives `old`'s recorded
+    /// state directly from `old_file`.
+    pub fn unchanged_non_broken(&self) -> bool {
+        if !self.fast_forward || self.old.is_none() {
+            return false;
+        }
+        match (&self.old_file, &self.file) {
+            (Some(RulesFile::Absent), RulesFile::Absent) => true,
+            (Some(RulesFile::Valid(a)), RulesFile::Valid(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// The state `l` records over the record `row` read, and whether that can
@@ -133,6 +154,14 @@ pub struct Landing {
 fn next_record(row: &Option<(String, String)>, l: &Landing) -> (RulesState, bool) {
     let recorded: Option<RulesState> = match (row, l.old) {
         (Some((checked, state)), Some(old)) if *checked == old.hex() => serde_json::from_str(state).ok(),
+        // When earlier unchanged non-broken landings skipped rewriting
+        // `pr_review_rules`, `old`'s own valid/absent `.veilrules` is the
+        // exact state in force at `old` (broken tips always write `checked`).
+        (_, Some(_)) => match l.old_file.as_ref() {
+            Some(RulesFile::Valid(t)) => Some(RulesState::File { text: t.clone() }),
+            Some(RulesFile::Absent) => Some(RulesState::Absent),
+            _ => None,
+        },
         _ => None,
     };
     let prev = if l.fast_forward { recorded.as_ref() } else { None };
@@ -148,6 +177,9 @@ fn next_record(row: &Option<(String, String)>, l: &Landing) -> (RulesState, bool
 /// the rules again. Its branch row's lock keeps the record where it is
 /// until it records.
 pub async fn changes_rules(c: &mut sqlx::PgConnection, project: i64, l: &Landing) -> Result<bool> {
+    if l.unchanged_non_broken() {
+        return Ok(false);
+    }
     let row: Option<(String, String)> = sqlx::query_as("SELECT checked, state FROM pr_review_rules WHERE project_id = $1")
         .bind(project)
         .fetch_optional(&mut *c)
@@ -163,6 +195,9 @@ pub async fn changes_rules(c: &mut sqlx::PgConnection, project: i64, l: &Landing
 /// that a batch on another branch either reads the new rules or commits
 /// before this landing does (BUG-2061).
 pub async fn record_landing(c: &mut sqlx::PgConnection, project: i64, l: &Landing) -> Result<bool> {
+    if l.unchanged_non_broken() {
+        return Ok(false);
+    }
     let row: Option<(String, String)> = sqlx::query_as("SELECT checked, state FROM pr_review_rules WHERE project_id = $1 FOR UPDATE")
         .bind(project)
         .fetch_optional(&mut *c)
@@ -217,7 +252,11 @@ pub async fn rules_in_force(hub: &Arc<Hub>, project: &crate::perm::Project, bran
         _ => None,
     };
     let state = next_state(&file, prev.as_ref());
-    if state != RulesState::Strict {
+    // When `.veilrules` is valid or absent and `pr_review_rules` already
+    // records the exact same state, skip rewriting `checked`.
+    let same_non_broken = !matches!(file, RulesFile::Broken(_))
+        && recorded.as_ref().and_then(|r| r.2.as_ref()) == Some(&state);
+    if state != RulesState::Strict && !same_non_broken {
         write_record(hub, project.id, recorded.as_ref().map(|r| r.0.as_str()), tip, &state).await?;
     }
     Ok(review_of(&file, &state))
