@@ -217,7 +217,15 @@ async fn schema_current_in(pool: &PgPool) -> Result<bool> {
 ///
 /// `veil-server migrate` runs it on its own, before servers start.
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    migrate_with(pool, None).await
+    migrate_with_options(pool, None, false).await
+}
+
+/// Apply every migration, permitting offline maintenance migrations that
+/// rebuild existing non-empty tables (such as migration 0046 on hash-sharded
+/// YugabyteDB). Every `veil-server` instance must be stopped before running
+/// `veil-server migrate --offline` (BUG-2920).
+pub async fn migrate_offline(pool: &PgPool) -> anyhow::Result<()> {
+    migrate_with_options(pool, None, true).await
 }
 
 /// What [`migrate_with`] runs after each online index build returns, before
@@ -230,6 +238,10 @@ pub type AfterBuild = dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>>
 /// left incomplete, as YugabyteDB's did (BUG-2571), made at will.
 #[doc(hidden)]
 pub async fn migrate_with(pool: &PgPool, after_build: Option<&AfterBuild>) -> anyhow::Result<()> {
+    migrate_with_options(pool, after_build, false).await
+}
+
+async fn migrate_with_options(pool: &PgPool, after_build: Option<&AfterBuild>, offline: bool) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + MIGRATION_DEADLINE;
     let mut check_attempt: u32 = 0;
     loop {
@@ -279,7 +291,7 @@ pub async fn migrate_with(pool: &PgPool, after_build: Option<&AfterBuild>) -> an
             }
         }
     }
-    let r = migrate_locked(&mut c, deadline, after_build).await;
+    let r = migrate_locked(&mut c, deadline, after_build, offline).await;
     // The lock is the session's: release it, and reset the online index
     // steps' timeouts in case a step's own reset failed
     // (`online_index_step`), or close the connection so that neither goes
@@ -296,7 +308,7 @@ pub async fn migrate_with(pool: &PgPool, after_build: Option<&AfterBuild>) -> an
 /// DDL can still lose a race with other databases' catalog changes on
 /// YugabyteDB (the catalog is shared): each step runs again, within the
 /// deadline, on a retryable error.
-async fn migrate_locked(c: &mut PgConnection, deadline: tokio::time::Instant, after_build: Option<&AfterBuild>) -> anyhow::Result<()> {
+async fn migrate_locked(c: &mut PgConnection, deadline: tokio::time::Instant, after_build: Option<&AfterBuild>, offline: bool) -> anyhow::Result<()> {
     let mut attempt: u32 = 0;
     // Per-index completed build counts persist across retryable restarts of
     // `migrate_once` so no index is built more than `BUILD_ATTEMPTS` times
@@ -304,7 +316,7 @@ async fn migrate_locked(c: &mut PgConnection, deadline: tokio::time::Instant, af
     let mut builds: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     loop {
         attempt += 1;
-        match migrate_once(&mut *c, deadline, after_build, &mut builds).await {
+        match migrate_once(&mut *c, deadline, after_build, &mut builds, offline).await {
             Ok(()) => return Ok(()),
             Err(e) if e.is_retryable() && tokio::time::Instant::now() < deadline => {
                 eprintln!("veil-server: migrating, retrying: {e:?}");
@@ -322,6 +334,7 @@ async fn migrate_once(
     deadline: tokio::time::Instant,
     after_build: Option<&AfterBuild>,
     builds: &mut std::collections::HashMap<String, u32>,
+    offline: bool,
 ) -> Result<()> {
     let table: Option<String> = sqlx::query_scalar("SELECT to_regclass('schema_migrations')::text").fetch_one(&mut *c).await?;
     if table.is_none() {
@@ -353,7 +366,15 @@ async fn migrate_once(
                 // them as applied, matching PostgreSQL.
                 let colocated: bool = sqlx::query_scalar("SELECT yb_is_database_colocated()").fetch_one(&mut *c).await?;
                 if !colocated {
-                    yugabyte_only_steps(&mut *c, parts.transactional, deadline).await?;
+                    if version == 46 {
+                        if !offline {
+                            ensure_q4_offline_safe(&mut *c).await?;
+                        }
+                        yugabyte_only_steps(&mut *c, parts.transactional, deadline).await?;
+                        verify_rebuilt_indexes(&mut *c, Q4_REBUILT_TABLES, deadline).await?;
+                    } else {
+                        yugabyte_only_steps(&mut *c, parts.transactional, deadline).await?;
+                    }
                 }
             }
             sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
@@ -456,6 +477,106 @@ async fn yugabyte_only_steps(c: &mut PgConnection, sql: &str, deadline: tokio::t
             break;
         }
     }
+    let reset = sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout").execute(&mut *c).await;
+    res?;
+    reset?;
+    Ok(())
+}
+
+/// The ten hot tables rebuilt by migration 0046 (`0046_single_repo_hash_keys.sql`)
+/// on hash-sharded YugabyteDB databases.
+const Q4_REBUILT_TABLES: &[&str] = &[
+    "branches",
+    "snapshots",
+    "origins",
+    "projections",
+    "landed_changes",
+    "landing_queue",
+    "landings",
+    "landing_leases",
+    "packs",
+    "change_refs",
+];
+
+/// Refuse to run migration 0046 automatically during server startup or an
+/// online `veil-server migrate` when any rebuilt table already holds rows or
+/// an interrupted `_q4` staging table exists (BUG-2920). Fresh empty
+/// deployments proceed automatically; existing non-empty hash-sharded
+/// YugabyteDB deployments must stop all `veil-server` instances and run
+/// `veil-server migrate --offline`.
+async fn ensure_q4_offline_safe(c: &mut PgConnection) -> Result<()> {
+    for &t in Q4_REBUILT_TABLES {
+        let staging = format!("{t}_q4");
+        let has_staging: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text").bind(&staging).fetch_one(&mut *c).await?;
+        if has_staging.is_some() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "migration 46 (0046_single_repo_hash_keys) found leftover staging table {staging} from an interrupted rebuild: \
+                 stop all veil-server instances and run `veil-server migrate --offline` (migration 46 is offline-only on non-empty \
+                 hash-sharded YugabyteDB databases)"
+            )));
+        }
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text").bind(t).fetch_one(&mut *c).await?;
+        if exists.is_some() {
+            let has_rows: bool = sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM {t} LIMIT 1)")).fetch_one(&mut *c).await?;
+            if has_rows {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "migration 46 (0046_single_repo_hash_keys) rebuilds non-empty table {t} on hash-sharded YugabyteDB and is not \
+                     rolling-upgrade safe: stop all veil-server instances and run `veil-server migrate --offline`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// On YugabyteDB: verify that every secondary index on the tables rebuilt by
+/// migration 0046 reads live/ready/valid and passes `yb_index_check` before
+/// recording the migration (BUG-2920 / BUG-2626).
+async fn verify_rebuilt_indexes(c: &mut PgConnection, tables: &[&str], deadline: tokio::time::Instant) -> Result<()> {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(STATEMENT_TIMEOUT);
+    let ms = left.as_millis();
+    sqlx::raw_sql(&format!("SET statement_timeout = {ms}; SET lock_timeout = {ms}")).execute(&mut *c).await?;
+    let res = async {
+        let indexes: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT c.relname::text, (i.indislive AND i.indisready AND i.indisvalid) \
+             FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = current_schema() \
+               AND NOT i.indisprimary \
+               AND t.relname = ANY($1) \
+             ORDER BY c.relname",
+        )
+        .bind(tables)
+        .fetch_all(&mut *c)
+        .await?;
+        for (name, built) in indexes {
+            if !built {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "migration 46 rebuilt index {name} is not live, ready, and valid: drop/rebuild it and re-run `veil-server migrate --offline`"
+                )));
+            }
+            if let Err(e) = sqlx::query("SELECT yb_index_check(to_regclass($1))").bind(&name).execute(&mut *c).await {
+                let code = e.as_database_error().and_then(|d| d.code()).map(|code| code.into_owned());
+                return Err(match code.as_deref() {
+                    Some("XX002") => Error::Other(anyhow::anyhow!(
+                        "migration 46 rebuilt index {name} failed yb_index_check ({e}): drop/rebuild it and re-run `veil-server migrate --offline`"
+                    )),
+                    Some("57014" | "55P03") => Error::Other(anyhow::anyhow!(
+                        "checking rebuilt index {name} against its table did not finish within {MIGRATION_DEADLINE:?} ({e}): \
+                         the migration is not recorded, and the next `veil-server migrate --offline` checks again"
+                    )),
+                    Some("42883") => Error::Other(anyhow::anyhow!(
+                        "this YugabyteDB has no yb_index_check ({e}), so rebuilt index {name} cannot be verified against its table"
+                    )),
+                    _ => Error::from(e),
+                });
+            }
+        }
+        Ok(())
+    }
+    .await;
     let reset = sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout").execute(&mut *c).await;
     res?;
     reset?;

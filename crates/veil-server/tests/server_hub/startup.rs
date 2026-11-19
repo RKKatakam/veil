@@ -1519,9 +1519,23 @@ fn q4_single_repo_hash_keys_migration_preserves_rows_and_is_idempotent() {
             exec_retrying(&db, &q).await;
         }
 
-        // Apply migration 46 via the real runner, then re-apply it to prove idempotency.
+        // On hash-sharded YugabyteDB with existing rows, automatic online `migrate()`
+        // must refuse (BUG-2920) without touching any table; `migrate_offline()`
+        // executes the rebuild cleanly and is idempotent across re-runs.
+        if yb {
+            let err = veil_server::db::migrate(&db).await.expect_err("online migrate must refuse non-empty Q4 tables on YB");
+            assert!(
+                err.to_string().contains("--offline"),
+                "expected --offline refusal guidance, got: {err:?}"
+            );
+            assert!(!veil_server::db::schema_current(&db).await.unwrap());
+        }
         for pass in 1..=2 {
-            veil_server::db::migrate(&db).await.unwrap_or_else(|e| panic!("migrate pass {pass}: {e:?}"));
+            if yb {
+                veil_server::db::migrate_offline(&db).await.unwrap_or_else(|e| panic!("migrate_offline pass {pass}: {e:?}"));
+            } else {
+                veil_server::db::migrate(&db).await.unwrap_or_else(|e| panic!("migrate pass {pass}: {e:?}"));
+            }
             assert!(veil_server::db::schema_current(&db).await.unwrap());
 
             let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
@@ -1665,13 +1679,12 @@ async fn apply_migrations_through(db: &sqlx::PgPool, max_version: i64) {
 }
 
 /// BUG-2920 (YugabyteDB): migration 0046 rebuilds each table in three
-/// non-transactional steps (`CREATE TABLE <t>_q4`, `INSERT ... ON CONFLICT DO
-/// NOTHING`, `count(*)` check + `DROP TABLE <t>` + `RENAME`). Any `UPDATE`
-/// committed between step 2 and step 3 (live server write during rolling
-/// upgrade) or between an interrupted attempt 1 and a clean offline retry 2
-/// keeps `count(*)` unchanged and is silently reverted when `<t>` is dropped.
+/// non-transactional steps. Automatic online `db::migrate()` must refuse to
+/// touch non-empty or interrupted tables without `--offline`, and an offline
+/// retry (`db::migrate_offline()`) after an interrupted attempt must drop stale
+/// `<t>_q4` staging tables and re-copy fresh rows so updates committed before
+/// the retry are never silently reverted.
 #[test]
-#[ignore = "BUG-2920: migration 0046 silently reverts committed UPDATEs on branches/packs during live writes or after interrupted retry on YugabyteDB"]
 fn bug_2920_migration_46_never_reverts_updates_committed_during_or_before_retry() {
     let rt = runtime();
     if !on_yugabyte(&rt) {
@@ -1708,28 +1721,13 @@ fn bug_2920_migration_46_never_reverts_updates_committed_during_or_before_retry(
         .await;
 
         // Simulate attempt 1 completing steps 1 and 2 for `branches` and `packs`
-        // before aborting (e.g. a concurrent insert caused c_new < c_old or a
-        // transient catalog error interrupted step 3).
+        // before aborting (leaving stale `<t>_q4` staging tables behind).
         let sql46 = veil_server::db::MIGRATIONS
             .iter()
             .find(|(v, _, _)| *v == 46)
             .expect("migration 46")
             .2;
-        let mut steps: Vec<String> = Vec::new();
-        let mut cur = String::new();
-        for line in sql46.lines() {
-            if line.trim() == "-- veil: step" {
-                if !cur.trim().is_empty() {
-                    steps.push(std::mem::take(&mut cur));
-                }
-            } else {
-                cur.push_str(line);
-                cur.push('\n');
-            }
-        }
-        if !cur.trim().is_empty() {
-            steps.push(cur);
-        }
+        let steps = veil_server::db::migration_steps(sql46);
         let find_step = |needle: &str| {
             steps
                 .iter()
@@ -1744,7 +1742,7 @@ fn bug_2920_migration_46_never_reverts_updates_committed_during_or_before_retry(
         exec_retrying(&db, find_step("INSERT INTO packs_q4")).await;
 
         // A live server commits a push advancing `main` and refuses `pack-refused`
-        // (`state = 2` DISCARDED) before the migration retries or enters step 3.
+        // (`state = 2` DISCARDED) before the offline retry begins.
         exec_retrying(
             &db,
             &format!("UPDATE branches SET target = 'snap-committed' WHERE project_id = {pid} AND name = 'main'"),
@@ -1756,8 +1754,15 @@ fn bug_2920_migration_46_never_reverts_updates_committed_during_or_before_retry(
         )
         .await;
 
-        // Now run the real migration runner cleanly (even with zero concurrent writers).
-        veil_server::db::migrate(&db).await.expect("migration 46 completes");
+        // Online `db::migrate()` must refuse without `--offline` and leave live rows untouched.
+        let err = veil_server::db::migrate(&db).await.expect_err("online migrate must refuse migration 46 with existing rows/staging");
+        assert!(err.to_string().contains("--offline"), "expected --offline refusal, got: {err:?}");
+        assert!(!veil_server::db::schema_current(&db).await.unwrap());
+
+        // Offline retry (`veil-server migrate --offline`) drops stale `_q4` tables,
+        // re-copies the latest rows, swaps cleanly, verifies indexes, and preserves
+        // every committed update.
+        veil_server::db::migrate_offline(&db).await.expect("offline migration 46 completes");
         assert!(veil_server::db::schema_current(&db).await.unwrap());
 
         let target: String = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'")

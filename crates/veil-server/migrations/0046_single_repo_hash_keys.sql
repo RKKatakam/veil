@@ -42,12 +42,17 @@
 --
 -- Each table rebuild uses 3 separate `-- veil: step` blocks so DDL and DML
 -- never share a YugabyteDB transaction (where DDL commits immediately while
--- DML aborts/rolls back on catalog conflict):
---   1. Create `<t>_q4` and its indexes if `<t>` does not yet have the new PK.
---   2. Copy all rows into `<t>_q4` via `INSERT ... ON CONFLICT DO NOTHING`
---      (standalone DML transaction — committed durably before any DROP).
---   3. Verify `count(<t>_q4) >= count(<t>)`, detach any owned sequence, DROP
+-- DML aborts/rolls back on catalog conflict), and is gated offline on any
+-- non-empty YugabyteDB database (`veil-server migrate --offline`, BUG-2920):
+--   1. If `<t>` exists and lacks the new PK, `DROP TABLE IF EXISTS <t>_q4`
+--      (wiping any stale staging table left by an interrupted prior attempt)
+--      and create a fresh empty `<t>_q4` with its indexes.
+--   2. Copy all rows from `<t>` into fresh `<t>_q4` (standalone DML tx —
+--      committed durably before any DROP).
+--   3. Verify `count(<t>_q4) = count(<t>)`, detach any owned sequence, DROP
 --      `<t>`, rename `<t>_q4` -> `<t>` and its indexes, re-attach sequence.
+-- After all steps finish, `db::migrate_once` verifies every secondary index on
+-- the rebuilt tables is live, ready, valid, and passes `yb_index_check`.
 
 -- 1. branches
 DO $q4$
@@ -57,6 +62,7 @@ BEGIN
     WHERE i.indrelid = to_regclass('branches') AND i.indisprimary
       AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, name) HASH%'
   ) THEN
+    DROP TABLE IF EXISTS branches_q4;
     CREATE TABLE IF NOT EXISTS branches_q4 (
       project_id         BIGINT  NOT NULL,
       name               TEXT    NOT NULL,
@@ -80,8 +86,7 @@ DO $q4$
 BEGIN
   IF to_regclass('branches') IS NOT NULL AND to_regclass('branches_q4') IS NOT NULL THEN
     EXECUTE 'INSERT INTO branches_q4 (project_id, name, target, lineage, hidden_for_embargo, changes_recorded) '
-         || 'SELECT project_id, name, target, lineage, hidden_for_embargo, changes_recorded FROM branches '
-         || 'ON CONFLICT DO NOTHING';
+         || 'SELECT project_id, name, target, lineage, hidden_for_embargo, changes_recorded FROM branches';
   END IF;
 END
 $q4$;
@@ -100,8 +105,8 @@ BEGIN
   ) THEN
     EXECUTE 'SELECT count(*) FROM branches' INTO c_old;
     EXECUTE 'SELECT count(*) FROM branches_q4' INTO c_new;
-    IF c_new < c_old THEN
-      RAISE EXCEPTION 'branches_q4 has % rows, fewer than branches (% rows)', c_new, c_old;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'branches_q4 has % rows, expected % rows from branches', c_new, c_old;
     END IF;
     DROP TABLE IF EXISTS branches;
   END IF;
@@ -124,6 +129,7 @@ BEGIN
     WHERE i.indrelid = to_regclass('snapshots') AND i.indisprimary
       AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, id) HASH%'
   ) THEN
+    DROP TABLE IF EXISTS snapshots_q4;
     CREATE TABLE IF NOT EXISTS snapshots_q4 (
       project_id BIGINT NOT NULL,
       id         TEXT   NOT NULL,
@@ -140,8 +146,7 @@ DO $q4$
 BEGIN
   IF to_regclass('snapshots') IS NOT NULL AND to_regclass('snapshots_q4') IS NOT NULL THEN
     EXECUTE 'INSERT INTO snapshots_q4 (project_id, id, author) '
-         || 'SELECT project_id, id, author FROM snapshots '
-         || 'ON CONFLICT DO NOTHING';
+         || 'SELECT project_id, id, author FROM snapshots';
   END IF;
 END
 $q4$;
@@ -160,8 +165,8 @@ BEGIN
   ) THEN
     EXECUTE 'SELECT count(*) FROM snapshots' INTO c_old;
     EXECUTE 'SELECT count(*) FROM snapshots_q4' INTO c_new;
-    IF c_new < c_old THEN
-      RAISE EXCEPTION 'snapshots_q4 has % rows, fewer than snapshots (% rows)', c_new, c_old;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'snapshots_q4 has % rows, expected % rows from snapshots', c_new, c_old;
     END IF;
     DROP TABLE IF EXISTS snapshots;
   END IF;
@@ -182,6 +187,7 @@ BEGIN
     WHERE i.indrelid = to_regclass('origins') AND i.indisprimary
       AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, real_id) HASH%'
   ) THEN
+    DROP TABLE IF EXISTS origins_q4;
     CREATE TABLE IF NOT EXISTS origins_q4 (
       project_id BIGINT NOT NULL,
       real_id    TEXT   NOT NULL,
@@ -198,8 +204,7 @@ DO $q4$
 BEGIN
   IF to_regclass('origins') IS NOT NULL AND to_regclass('origins_q4') IS NOT NULL THEN
     EXECUTE 'INSERT INTO origins_q4 (project_id, real_id, origin_id) '
-         || 'SELECT project_id, real_id, origin_id FROM origins '
-         || 'ON CONFLICT DO NOTHING';
+         || 'SELECT project_id, real_id, origin_id FROM origins';
   END IF;
 END
 $q4$;
@@ -218,8 +223,8 @@ BEGIN
   ) THEN
     EXECUTE 'SELECT count(*) FROM origins' INTO c_old;
     EXECUTE 'SELECT count(*) FROM origins_q4' INTO c_new;
-    IF c_new < c_old THEN
-      RAISE EXCEPTION 'origins_q4 has % rows, fewer than origins (% rows)', c_new, c_old;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'origins_q4 has % rows, expected % rows from origins', c_new, c_old;
     END IF;
     DROP TABLE IF EXISTS origins;
   END IF;
@@ -240,6 +245,7 @@ BEGIN
     WHERE i.indrelid = to_regclass('projections') AND i.indisprimary
       AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, view_key, real_id) HASH%'
   ) THEN
+    DROP TABLE IF EXISTS projections_q4;
     CREATE TABLE IF NOT EXISTS projections_q4 (
       project_id   BIGINT  NOT NULL,
       view_key     TEXT    NOT NULL,
@@ -263,8 +269,7 @@ DO $q4$
 BEGIN
   IF to_regclass('projections') IS NOT NULL AND to_regclass('projections_q4') IS NOT NULL THEN
     EXECUTE 'INSERT INTO projections_q4 (project_id, view_key, real_id, projected_id, created_at, collapsed) '
-         || 'SELECT project_id, view_key, real_id, projected_id, created_at, collapsed FROM projections '
-         || 'ON CONFLICT DO NOTHING';
+         || 'SELECT project_id, view_key, real_id, projected_id, created_at, collapsed FROM projections';
   END IF;
 END
 $q4$;
@@ -283,8 +288,8 @@ BEGIN
   ) THEN
     EXECUTE 'SELECT count(*) FROM projections' INTO c_old;
     EXECUTE 'SELECT count(*) FROM projections_q4' INTO c_new;
-    IF c_new < c_old THEN
-      RAISE EXCEPTION 'projections_q4 has % rows, fewer than projections (% rows)', c_new, c_old;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'projections_q4 has % rows, expected % rows from projections', c_new, c_old;
     END IF;
     DROP TABLE IF EXISTS projections;
   END IF;
@@ -307,6 +312,7 @@ BEGIN
     WHERE i.indrelid = to_regclass('landed_changes') AND i.indisprimary
       AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, branch) HASH%'
   ) THEN
+    DROP TABLE IF EXISTS landed_changes_q4;
     CREATE TABLE IF NOT EXISTS landed_changes_q4 (
       project_id BIGINT NOT NULL,
       branch     TEXT   NOT NULL,
@@ -326,8 +332,7 @@ DO $q4$
 BEGIN
   IF to_regclass('landed_changes') IS NOT NULL AND to_regclass('landed_changes_q4') IS NOT NULL THEN
     EXECUTE 'INSERT INTO landed_changes_q4 (project_id, branch, lineage, change_id, author, landed) '
-         || 'SELECT project_id, branch, lineage, change_id, author, landed FROM landed_changes '
-         || 'ON CONFLICT DO NOTHING';
+         || 'SELECT project_id, branch, lineage, change_id, author, landed FROM landed_changes';
   END IF;
 END
 $q4$;
@@ -346,8 +351,8 @@ BEGIN
   ) THEN
     EXECUTE 'SELECT count(*) FROM landed_changes' INTO c_old;
     EXECUTE 'SELECT count(*) FROM landed_changes_q4' INTO c_new;
-    IF c_new < c_old THEN
-      RAISE EXCEPTION 'landed_changes_q4 has % rows, fewer than landed_changes (% rows)', c_new, c_old;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'landed_changes_q4 has % rows, expected % rows from landed_changes', c_new, c_old;
     END IF;
     DROP TABLE IF EXISTS landed_changes;
   END IF;
@@ -368,6 +373,7 @@ BEGIN
     WHERE i.indrelid = to_regclass('landing_queue') AND i.indisprimary
       AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, branch) HASH%'
   ) THEN
+    DROP TABLE IF EXISTS landing_queue_q4;
     CREATE TABLE IF NOT EXISTS landing_queue_q4 (
       project_id    BIGINT  NOT NULL,
       branch        TEXT    NOT NULL,
@@ -428,7 +434,7 @@ BEGIN
          || 'SELECT project_id, branch, seq, ticket, person_id, person_name, device_key, '
          || 'stack, lineage, person_epoch, project_epoch, state, result, created_at, '
          || 'done_at, merges, agent_session, session, priority, person_slot, session_slot '
-         || 'FROM landing_queue ON CONFLICT DO NOTHING';
+         || 'FROM landing_queue';
   END IF;
 END
 $q4$;
@@ -447,8 +453,8 @@ BEGIN
   ) THEN
     EXECUTE 'SELECT count(*) FROM landing_queue' INTO c_old;
     EXECUTE 'SELECT count(*) FROM landing_queue_q4' INTO c_new;
-    IF c_new < c_old THEN
-      RAISE EXCEPTION 'landing_queue_q4 has % rows, fewer than landing_queue (% rows)', c_new, c_old;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'landing_queue_q4 has % rows, expected % rows from landing_queue', c_new, c_old;
     END IF;
     ALTER SEQUENCE landing_queue_seq_seq OWNED BY NONE;
     DROP TABLE IF EXISTS landing_queue;
@@ -477,6 +483,7 @@ BEGIN
     WHERE i.indrelid = to_regclass('landings') AND i.indisprimary
       AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, branch) HASH%'
   ) THEN
+    DROP TABLE IF EXISTS landings_q4;
     CREATE TABLE IF NOT EXISTS landings_q4 (
       project_id BIGINT NOT NULL,
       branch     TEXT   NOT NULL,
@@ -500,8 +507,7 @@ DO $q4$
 BEGIN
   IF to_regclass('landings') IS NOT NULL AND to_regclass('landings_q4') IS NOT NULL THEN
     EXECUTE 'INSERT INTO landings_q4 (project_id, branch, lineage, submitted, landed, at) '
-         || 'SELECT project_id, branch, lineage, submitted, landed, at FROM landings '
-         || 'ON CONFLICT DO NOTHING';
+         || 'SELECT project_id, branch, lineage, submitted, landed, at FROM landings';
   END IF;
 END
 $q4$;
@@ -520,8 +526,8 @@ BEGIN
   ) THEN
     EXECUTE 'SELECT count(*) FROM landings' INTO c_old;
     EXECUTE 'SELECT count(*) FROM landings_q4' INTO c_new;
-    IF c_new < c_old THEN
-      RAISE EXCEPTION 'landings_q4 has % rows, fewer than landings (% rows)', c_new, c_old;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'landings_q4 has % rows, expected % rows from landings', c_new, c_old;
     END IF;
     DROP TABLE IF EXISTS landings;
   END IF;
@@ -544,6 +550,7 @@ BEGIN
     WHERE i.indrelid = to_regclass('landing_leases') AND i.indisprimary
       AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, branch) HASH%'
   ) THEN
+    DROP TABLE IF EXISTS landing_leases_q4;
     CREATE TABLE IF NOT EXISTS landing_leases_q4 (
       project_id BIGINT NOT NULL,
       branch     TEXT   NOT NULL,
@@ -564,8 +571,7 @@ DO $q4$
 BEGIN
   IF to_regclass('landing_leases') IS NOT NULL AND to_regclass('landing_leases_q4') IS NOT NULL THEN
     EXECUTE 'INSERT INTO landing_leases_q4 (project_id, branch, holder, epoch, expires_at, served, lock_epoch) '
-         || 'SELECT project_id, branch, holder, epoch, expires_at, served, lock_epoch FROM landing_leases '
-         || 'ON CONFLICT DO NOTHING';
+         || 'SELECT project_id, branch, holder, epoch, expires_at, served, lock_epoch FROM landing_leases';
   END IF;
 END
 $q4$;
@@ -584,8 +590,8 @@ BEGIN
   ) THEN
     EXECUTE 'SELECT count(*) FROM landing_leases' INTO c_old;
     EXECUTE 'SELECT count(*) FROM landing_leases_q4' INTO c_new;
-    IF c_new < c_old THEN
-      RAISE EXCEPTION 'landing_leases_q4 has % rows, fewer than landing_leases (% rows)', c_new, c_old;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'landing_leases_q4 has % rows, expected % rows from landing_leases', c_new, c_old;
     END IF;
     DROP TABLE IF EXISTS landing_leases;
   END IF;
@@ -606,6 +612,7 @@ BEGIN
     WHERE i.indrelid = to_regclass('packs') AND i.indisprimary
       AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, name) HASH%'
   ) THEN
+    DROP TABLE IF EXISTS packs_q4;
     CREATE TABLE IF NOT EXISTS packs_q4 (
       project_id   BIGINT   NOT NULL,
       name         TEXT     NOT NULL,
@@ -631,8 +638,7 @@ DO $q4$
 BEGIN
   IF to_regclass('packs') IS NOT NULL AND to_regclass('packs_q4') IS NOT NULL THEN
     EXECUTE 'INSERT INTO packs_q4 (project_id, name, state, person_id, size, objects, created_at, discarded_at) '
-         || 'SELECT project_id, name, state, person_id, size, objects, created_at, discarded_at FROM packs '
-         || 'ON CONFLICT DO NOTHING';
+         || 'SELECT project_id, name, state, person_id, size, objects, created_at, discarded_at FROM packs';
   END IF;
 END
 $q4$;
@@ -651,8 +657,8 @@ BEGIN
   ) THEN
     EXECUTE 'SELECT count(*) FROM packs' INTO c_old;
     EXECUTE 'SELECT count(*) FROM packs_q4' INTO c_new;
-    IF c_new < c_old THEN
-      RAISE EXCEPTION 'packs_q4 has % rows, fewer than packs (% rows)', c_new, c_old;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'packs_q4 has % rows, expected % rows from packs', c_new, c_old;
     END IF;
     DROP TABLE IF EXISTS packs;
   END IF;
@@ -675,6 +681,7 @@ BEGIN
     WHERE i.indrelid = to_regclass('change_refs') AND i.indisprimary
       AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, change_id) HASH%'
   ) THEN
+    DROP TABLE IF EXISTS change_refs_q4;
     CREATE TABLE IF NOT EXISTS change_refs_q4 (
       project_id BIGINT NOT NULL,
       change_id  TEXT   NOT NULL,
@@ -693,8 +700,7 @@ DO $q4$
 BEGIN
   IF to_regclass('change_refs') IS NOT NULL AND to_regclass('change_refs_q4') IS NOT NULL THEN
     EXECUTE 'INSERT INTO change_refs_q4 (project_id, change_id, snapshot, created_by, created_at) '
-         || 'SELECT project_id, change_id, snapshot, created_by, created_at FROM change_refs '
-         || 'ON CONFLICT DO NOTHING';
+         || 'SELECT project_id, change_id, snapshot, created_by, created_at FROM change_refs';
   END IF;
 END
 $q4$;
@@ -713,8 +719,8 @@ BEGIN
   ) THEN
     EXECUTE 'SELECT count(*) FROM change_refs' INTO c_old;
     EXECUTE 'SELECT count(*) FROM change_refs_q4' INTO c_new;
-    IF c_new < c_old THEN
-      RAISE EXCEPTION 'change_refs_q4 has % rows, fewer than change_refs (% rows)', c_new, c_old;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'change_refs_q4 has % rows, expected % rows from change_refs', c_new, c_old;
     END IF;
     DROP TABLE IF EXISTS change_refs;
   END IF;

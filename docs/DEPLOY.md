@@ -189,6 +189,20 @@ What `configure.sh` sets up, and why:
   `tablet_replicas_per_gib_limit`) on each master **before the
   migrations**. The flag is lost when a node restarts: run that line again
   (or `configure.sh --approve` again) before any schema change.
+- **Migration 0046 (`0046_single_repo_hash_keys`) on existing hash-sharded
+  databases**: migration 46 rebuilds ten hot tables with composite hash primary
+  keys (`(project_id, name) HASH`, `(project_id, branch) HASH`, …) for
+  single-repo horizontal scaling. On PostgreSQL and colocated YugabyteDB
+  databases it is skipped and recorded automatically. On fresh, empty
+  hash-sharded YugabyteDB databases `veil-server migrate` applies it
+  automatically. On an **existing, non-empty hash-sharded YugabyteDB
+  database**, migration 46 is **not rolling-upgrade safe** (rebuilding primary
+  keys drops and renames each table outside a transaction): automatic startup
+  and plain `veil-server migrate` refuse to run it. Stop all `veil-server`
+  instances first, then run `veil-server migrate --offline` before starting the
+  new servers; the runner drops any leftover `_q4` staging tables on retry and
+  verifies every rebuilt secondary index with `yb_index_check` before recording
+  version 46.
 - Memory: a `c-8` has 16 GB; `yugabyted` sizes its processes from it. With
   three servers of 64 database connections each spread over the nodes, and
   the drivers' counters, a node serves under 100 YSQL connections, well
