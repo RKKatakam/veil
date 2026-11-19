@@ -1679,7 +1679,7 @@ history — not even offline** (owner, 2026-11-18).
   `DEFAULT_STAGED_GRACE_MS` (1 hour) and `DISCARDED` upload containers past
   `DEFAULT_PACK_GRACE_MS` (15 minutes). Neither ever touches `LISTED` packs or
   committed project objects.
-* **Database support.** Veil v1 supports **PostgreSQL only**; YugabyteDB is
-  experimental and not supported in v1.
+* **Database support.** Veil v1 supports **PostgreSQL and YugabyteDB**; both
+  run in the required checks (`scripts/verify-server.sh`).
 
 
