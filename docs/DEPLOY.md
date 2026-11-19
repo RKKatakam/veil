@@ -190,9 +190,10 @@ What `configure.sh` sets up, and why:
   migrations**. The flag is lost when a node restarts: run that line again
   (or `configure.sh --approve` again) before any schema change.
 - **Migration 0046 (`0046_single_repo_hash_keys`) on existing hash-sharded
-  databases**: migration 46 rebuilds ten hot tables with composite hash primary
-  keys (`(project_id, name) HASH`, `(project_id, branch) HASH`, …) for
-  single-repo horizontal scaling. On PostgreSQL and colocated YugabyteDB
+  databases**: migration 46 rebuilds eleven hot tables with composite hash
+  primary keys (`(project_id, name) HASH`, `(project_id, branch) HASH`,
+  `(project_id, person_id) HASH` on `access_epochs`, …) for single-repo and
+  global-epoch horizontal scaling. On PostgreSQL and colocated YugabyteDB
   databases it is skipped and recorded automatically. On a **fresh database**
   (where `schema_migrations` is absent or empty when `veil-server migrate`
   takes the migrations lock, so this same run creates the schema from scratch)
@@ -203,8 +204,8 @@ What `configure.sh` sets up, and why:
   startup and plain `veil-server migrate` refuse to run it. Stop all
   `veil-server` instances first, then run `veil-server migrate --offline`
   before starting the new servers; the runner drops any leftover `_q4` staging
-  tables on retry and verifies every rebuilt secondary index with
-  `yb_index_check` before recording version 46.
+  tables on retry and verifies every expected rebuilt primary key and secondary
+  index with `yb_index_check` before recording version 46.
 - Memory: a `c-8` has 16 GB; `yugabyted` sizes its processes from it. With
   three servers of 64 database connections each spread over the nodes, and
   the drivers' counters, a node serves under 100 YSQL connections, well

@@ -643,18 +643,18 @@ fn viewer_key(project: i64, person: &Person) -> ObjectId {
     key("viewer", &[&project.to_le_bytes(), &person.id.to_le_bytes(), person.device_key.as_bytes()])
 }
 
-/// The access epochs of `person` (0: anyone on Earth, read from sharded
-/// `person_epochs`) and of `project` (`access_epochs`), and live embargo
-/// presence for `project` (whether it has an unreleased embargo line, and
-/// whether it has any `embargo_lines` row at all — by its primary key's
-/// prefix: a project has few), in one statement. Rows that do not exist yet
-/// read as 0.
+/// The access epochs of `person` (0: anyone on Earth) and of `project`
+/// (`access_epochs`, composite hash-sharded on `(project_id, person_id)` on
+/// YugabyteDB by migration 0046), and live embargo presence for `project`
+/// (whether it has an unreleased embargo line, and whether it has any
+/// `embargo_lines` row at all — by its primary key's prefix: a project has
+/// few), in one statement. Rows that do not exist yet read as 0.
 pub async fn read_epochs(db: &sqlx::PgPool, person: i64, project: Option<i64>) -> Result<Epochs> {
     let Some(pid) = project else {
         if person <= 0 {
             return Ok(Epochs::default());
         }
-        let pe: i64 = sqlx::query_scalar("SELECT COALESCE((SELECT epoch FROM person_epochs WHERE person_id = $1), 0)")
+        let pe: i64 = sqlx::query_scalar("SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1), 0)")
             .bind(person)
             .fetch_one(db)
             .await?;
@@ -666,7 +666,7 @@ pub async fn read_epochs(db: &sqlx::PgPool, person: i64, project: Option<i64>) -
         });
     };
     let (pe, je, embargoed, any_embargo): (i64, i64, bool, bool) = sqlx::query_as(
-        "SELECT COALESCE(CASE WHEN $1 > 0 THEN (SELECT epoch FROM person_epochs WHERE person_id = $1) END, 0), \
+        "SELECT COALESCE(CASE WHEN $1 > 0 THEN (SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1) END, 0), \
          COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = 0), 0), \
          COALESCE(e.unreleased, FALSE), \
          e.any_line \

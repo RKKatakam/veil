@@ -8,7 +8,7 @@
 -- PostgreSQL skips this migration via the `-- veil: yugabyte-only` runner
 -- marker (`db::YUGABYTE_ONLY`) and records it as applied.
 --
--- Rebuilt tables (10):
+-- Rebuilt tables (11):
 --   1. branches       PRIMARY KEY ((project_id, name) HASH)
 --                     + branches_by_project (project_id HASH, name ASC)
 --                       (keeps per-project scans like GET /tips bounded;
@@ -35,6 +35,10 @@
 --                     + packs_listed (project_id HASH, created_at ASC, name ASC) INCLUDE (size, objects)
 --                     + packs_unlisted (project_id HASH) INCLUDE (name, state, person_id, created_at, discarded_at) WHERE state <> 1
 --  10. change_refs    PRIMARY KEY ((project_id, change_id) HASH)
+--  11. access_epochs  PRIMARY KEY ((project_id, person_id) HASH)
+--                     (spreads `(0, person_id)` global person epoch rows across
+--                      all tablets without a dual-written `person_epochs` table;
+--                      every query is an exact `(project_id, person_id)` point lookup, BUG-2930)
 --
 -- audit_log keeps PRIMARY KEY (id) (id HASH on YB, synchronous in-tx per P9)
 -- so audit writes already spread across all nodes for both multi-project and
@@ -734,6 +738,65 @@ BEGIN
     ALTER TABLE change_refs_q4 RENAME TO change_refs;
   END IF;
   ALTER INDEX IF EXISTS change_refs_q4_pkey RENAME TO change_refs_pkey;
+END
+$q4$;
+
+-- veil: step
+
+-- 11. access_epochs
+DO $q4$
+BEGIN
+  IF to_regclass('access_epochs') IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    WHERE i.indrelid = to_regclass('access_epochs') AND i.indisprimary
+      AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, person_id) HASH%'
+  ) THEN
+    DROP TABLE IF EXISTS access_epochs_q4;
+    CREATE TABLE IF NOT EXISTS access_epochs_q4 (
+      project_id BIGINT NOT NULL,
+      person_id  BIGINT NOT NULL,
+      epoch      BIGINT NOT NULL,
+      changed_at BIGINT NOT NULL,
+      PRIMARY KEY ((project_id, person_id) HASH)
+    );
+  END IF;
+END
+$q4$;
+
+-- veil: step
+
+DO $q4$
+BEGIN
+  IF to_regclass('access_epochs') IS NOT NULL AND to_regclass('access_epochs_q4') IS NOT NULL THEN
+    EXECUTE 'INSERT INTO access_epochs_q4 (project_id, person_id, epoch, changed_at) '
+         || 'SELECT project_id, person_id, epoch, changed_at FROM access_epochs';
+  END IF;
+END
+$q4$;
+
+-- veil: step
+
+DO $q4$
+DECLARE
+  c_old BIGINT;
+  c_new BIGINT;
+BEGIN
+  IF to_regclass('access_epochs') IS NOT NULL AND to_regclass('access_epochs_q4') IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    WHERE i.indrelid = to_regclass('access_epochs') AND i.indisprimary
+      AND pg_get_indexdef(i.indexrelid) LIKE '%(project_id, person_id) HASH%'
+  ) THEN
+    EXECUTE 'SELECT count(*) FROM access_epochs' INTO c_old;
+    EXECUTE 'SELECT count(*) FROM access_epochs_q4' INTO c_new;
+    IF c_new <> c_old THEN
+      RAISE EXCEPTION 'access_epochs_q4 has % rows, expected % rows from access_epochs', c_new, c_old;
+    END IF;
+    DROP TABLE IF EXISTS access_epochs;
+  END IF;
+  IF to_regclass('access_epochs') IS NULL AND to_regclass('access_epochs_q4') IS NOT NULL THEN
+    ALTER TABLE access_epochs_q4 RENAME TO access_epochs;
+  END IF;
+  ALTER INDEX IF EXISTS access_epochs_q4_pkey RENAME TO access_epochs_pkey;
 END
 $q4$;
 

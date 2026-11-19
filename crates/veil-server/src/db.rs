@@ -528,7 +528,7 @@ async fn yugabyte_only_steps(c: &mut PgConnection, sql: &str, deadline: tokio::t
     Ok(())
 }
 
-/// The ten hot tables rebuilt by migration 0046 (`0046_single_repo_hash_keys.sql`)
+/// The eleven hot tables rebuilt by migration 0046 (`0046_single_repo_hash_keys.sql`)
 /// on hash-sharded YugabyteDB databases.
 const Q4_REBUILT_TABLES: &[&str] = &[
     "branches",
@@ -541,6 +541,7 @@ const Q4_REBUILT_TABLES: &[&str] = &[
     "landing_leases",
     "packs",
     "change_refs",
+    "access_epochs",
 ];
 
 /// On YugabyteDB: verify that every secondary index on the tables rebuilt by

@@ -938,7 +938,7 @@ impl Service {
             p
         };
         let epochs: Vec<(i64, i64, i64)> = sqlx::query_as(
-            "SELECT 0::bigint AS project_id, person_id, epoch FROM person_epochs WHERE person_id = ANY($1) \
+            "SELECT project_id, person_id, epoch FROM access_epochs WHERE project_id = 0 AND person_id = ANY($1) \
              UNION ALL \
              SELECT project_id, person_id, epoch FROM access_epochs WHERE project_id = $2 AND person_id = 0",
         )
@@ -1441,7 +1441,7 @@ impl Service {
                         return Err(Error::conflict(MOVED));
                     }
                     let cur: (i64, i64) = sqlx::query_as(
-                        "SELECT COALESCE((SELECT epoch FROM person_epochs WHERE person_id = $1), 0), \
+                        "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1), 0), \
                          COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $2 AND person_id = 0), 0)",
                     )
                     .bind(person_id)

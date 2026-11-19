@@ -93,7 +93,7 @@ pub async fn epochs(State(hub): State<HubState>, headers: HeaderMap, body: Bytes
     .await?;
     let devices: Vec<(String, i64)> = sqlx::query_as(
         "SELECT d.signing_key, COALESCE(e.epoch, 0) FROM devices d \
-         LEFT JOIN person_epochs e ON e.person_id = d.person_id \
+         LEFT JOIN access_epochs e ON e.project_id = 0 AND e.person_id = d.person_id \
          WHERE d.signing_key = ANY($1) AND d.removed_at IS NULL AND NOT d.pending",
     )
     .bind(&req.devices)
