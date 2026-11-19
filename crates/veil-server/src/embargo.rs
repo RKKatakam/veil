@@ -268,12 +268,13 @@ pub async fn is_withheld_in(hub: &Hub, project: &Project, viewer: &Viewer, epoch
 /// request found **after** it read that. `resolved` is every snapshot the
 /// request named with the real snapshot the server then found behind it
 /// (`sync::resolve_first`: for a projected id, the snapshot the viewer's own
-/// view projects to it), and this is called after the last of them was found,
-/// before anything of them is read or projected. An embargoed snapshot
-/// committed in between can be what a named id now stands for (an embargo
-/// member of the same view key pulled it and stored the row), and the
-/// flag read before it says nothing of it: the routes served it (BUG-1947's
-/// review). So a request that read "no unreleased line" reads it once more
+/// view projects to it, falling back across other views if their own view has
+/// none), and this is called after the last of them was found, before
+/// anything of them is read or projected. An embargoed snapshot committed in
+/// between can be what a named id now stands for (an embargo member of the
+/// same or another view pulled it and stored the row), and the flag read
+/// before it says nothing of it: the routes served it (BUG-1947's review).
+/// So a request that read "no unreleased line" reads it once more
 /// here, one statement for the request: still none, and nothing it found is
 /// withheld (a line and its snapshots commit together, `record_in_tx`, so
 /// one committed before the snapshot was found is seen); with one, every

@@ -2285,3 +2285,128 @@ fn bug_2850_resolve_for_mode_ignores_collapsed_embargoed_projections_under_same_
     assert_eq!(probe_emb.json()["message"], format!("no snapshot {} that you can see", embargoed.short()));
 }
 
+/// BUG-2880: restricting `resolve_stored_excluding` strictly to the caller's
+/// current `view_key` broke legitimate cross-view resolution (e.g. `vl pull`
+/// calling `POST /history` with tips from before an access change, or `GET
+/// /subtree` naming another view's projected id). With an active embargo
+/// present (exercising the `!exclude_embargoes.is_empty()` branch too), a
+/// cross-view public projected id must still resolve and project through the
+/// caller's current view, while another view's embargoed projected id remains
+/// refused as unknown.
+#[test]
+fn bug_2880_cross_view_resolution_still_resolves_public_ids_and_excludes_withheld_embargoes() {
+    let hub = TestHub::start();
+    let p = setup_project(&hub);
+    let api = hub.api();
+    let (dev, fin) = (p.dev.token(), p.fin.token());
+
+    // Public commit touching both `src/` and `billing/` so `dev` and `fin`
+    // hold distinct projected ids for `main`'s tip.
+    write_files(
+        &p.dir,
+        &[
+            ("src/pub_2880.rs", "pub const V: u32 = 1;\n"),
+            (&format!("{BILL_DIR}/pub_2880.txt"), "billing public\n"),
+        ],
+    );
+    p.admin.ok(&p.dir, &["commit", "-m", "public commit 2880"]);
+    p.admin.ok(&p.dir, &["push"]);
+
+    let dev_pub_tip = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
+    let fin_pub_tip = api.tips(Some(&fin), &p.name).unwrap().branches["main"];
+    assert_ne!(dev_pub_tip, fin_pub_tip, "dev and fin have distinct views of main");
+
+    // `fin` pushes an active embargo scoped to `finance` (so `dev` is outside
+    // it and `withheld_eids` is non-empty for `dev`).
+    let eid = "2880deadbe".to_string();
+    let now = veil_core::now_millis();
+    let mut fin_craft = Craft::new(&api, &p.fin, &p.name, "main");
+    let fin_base = fin_craft.tip;
+    fin_craft.file(&format!("{BILL_DIR}/embargo_2880.txt"), "secret embargo 2880\n");
+    let mut emb_snap = veil_core::object::Snapshot {
+        parents: vec![fin_base],
+        change_id: veil_core::ChangeId::random(),
+        tree: fin_craft.root,
+        description: veil_core::object::Text::Plain("embargo 2880".into()),
+        author: "fin".into(),
+        timestamp: now,
+        predecessors: vec![],
+        conflicts: vec![],
+        embargo: Some(eid.clone()),
+        signature: None,
+        agent: None,
+        attempts: vec![],
+        abandoned: None,
+    };
+    emb_snap.sign(&fin_craft.identity);
+    let emb_real = fin_craft.put(veil_core::object::Object::Snapshot(emb_snap));
+    let up = api.upload(&fin_craft.token, &p.name, &fin_craft.objects);
+    assert_eq!(up.status, 200, "upload embargo: {}", String::from_utf8_lossy(&up.body));
+    let packs: Vec<String> = serde_json::from_value(up.json()["packs"].clone()).unwrap();
+    let rec = veil_core::keychain::EmbargoRecord {
+        format: veil_core::keychain::EMBARGO_FORMAT,
+        id: eid.clone(),
+        scope: "finance".into(),
+        until: Some(now + 3_600_000),
+        released_at: None,
+        created: now,
+        state: None,
+        reason: None,
+    };
+    let push_emb = api.post_json(
+        Some(&fin_craft.token),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "main", "expected": fin_base.hex(), "new": emb_real.hex()}],
+            "packs": packs,
+            "embargoes": [rec],
+        }),
+    );
+    assert_eq!(push_emb.status, 200, "push embargo: {}", String::from_utf8_lossy(&push_emb.body));
+    assert_eq!(push_emb.json()["results"][0]["ok"], json!(true));
+
+    let fin_emb_proj = api.tips(Some(&fin), &p.name).unwrap().branches[&format!("embargo/{eid}")];
+    assert_ne!(fin_emb_proj, fin_pub_tip);
+
+    // 1. Cross-view public projected id (`fin_pub_tip`) resolves for `dev`
+    //    even while an active withheld embargo exists in the project.
+    let hist_pub = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/history", p.name),
+        &json!({ "tips": [fin_pub_tip.hex()], "stop": [] }),
+    );
+    assert_eq!(hist_pub.status, 200, "cross-view public history must succeed: {}", String::from_utf8_lossy(&hist_pub.body));
+
+    // And `GET /subtree` with `fin_pub_tip` resolves the snapshot and projects
+    // it through `dev`'s own view (refusing `BILL_DIR` as no such path, not as
+    // unknown snapshot, while serving `src`).
+    let sub_hidden = api.get(
+        Some(&dev),
+        &format!("/v1/projects/{}/subtree?snapshot={}&path={BILL_DIR}", p.name, fin_pub_tip.hex()),
+    );
+    assert_eq!(sub_hidden.status, 404);
+    assert_eq!(sub_hidden.json()["message"], "no such object at that path that you can see");
+
+    let sub_visible = api.get(
+        Some(&dev),
+        &format!("/v1/projects/{}/subtree?snapshot={}&path=src", p.name, fin_pub_tip.hex()),
+    );
+    assert_eq!(sub_visible.status, 200, "cross-view public subtree of visible path must succeed: {}", String::from_utf8_lossy(&sub_visible.body));
+
+    // 2. Cross-view embargoed projected id (`fin_emb_proj`) must remain
+    //    refused as unknown for `dev` across `history` and `subtree`.
+    let hist_emb = api.post_json(
+        Some(&dev),
+        &format!("/v1/projects/{}/history", p.name),
+        &json!({ "tips": [fin_emb_proj.hex()], "stop": [] }),
+    );
+    assert_eq!(hist_emb.status, 404);
+    assert_eq!(hist_emb.json()["message"], format!("no snapshot {} that you can see", fin_emb_proj.short()));
+
+    let sub_emb = api.get(
+        Some(&dev),
+        &format!("/v1/projects/{}/subtree?snapshot={}&path=src", p.name, fin_emb_proj.hex()),
+    );
+    assert_eq!(sub_emb.status, 404);
+    assert_eq!(sub_emb.json()["message"], format!("no snapshot {} that you can see", fin_emb_proj.short()));
+}
