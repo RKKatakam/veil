@@ -184,15 +184,24 @@ impl FChange {
 #[derive(Default)]
 pub struct Fill {
     /// Rows this fill computed (since it last forgot), by path key:
-    /// `(depth, snapshot)`.
+    /// `(depth, snapshot)`, kept sorted ascending so [`Fill::intro`] scans
+    /// downward in place without cloning or sorting.
     known: HashMap<String, Vec<(i64, ObjectId)>>,
     known_rows: usize,
     /// For each snapshot this fill computed (since it last forgot): the
     /// lowest depth of the run of such snapshots down its first parents.
     fresh: HashMap<ObjectId, i64>,
+    /// Top rows of `view_file_history` prefetched in a batch for incremental
+    /// fills: `(rows ordered depth DESC, snapshot DESC; done if fewer than
+    /// `STORED_PREFETCH` existed)`. Cleared whenever rows are written.
+    stored: HashMap<String, (Vec<(i64, ObjectId)>, bool)>,
     /// Rows not written yet: `(path key, depth, snapshot, change)`.
     pub pending: Vec<(String, i64, ObjectId, String)>,
 }
+
+/// Top rows of `view_file_history` read per path in one [`Fill::prefetch_stored`]
+/// batch.
+const STORED_PREFETCH: usize = 8;
 
 impl Fill {
     /// Compute the rows of projected snapshot `id` (row `row`, computed by
@@ -205,6 +214,15 @@ impl Fill {
         let (now, before) = t.roots_of(row)?;
         let (ch, _) = changes::diff(t, before, now)?;
         t.forget();
+        self.add_changes(g, id, row, ch)
+    }
+
+    /// Record pre-computed changes `ch` for projected snapshot `id` (row `row`).
+    pub(crate) fn add_changes(&mut self, g: &G, id: ObjectId, row: &VRow, ch: Vec<veil_core::hub::project::Change>) -> Result<()> {
+        if row.withheld() {
+            // An embargo line has no file history until its release (S22).
+            return Ok(());
+        }
         for c in ch {
             let key = path_key(&c.path);
             let mut prev = Vec::with_capacity(row.parents.len());
@@ -212,13 +230,79 @@ impl Fill {
                 prev.push(self.intro(g, *q, &c.path, &key)?);
             }
             let change = FChange { old: c.old, new: c.new, prev };
-            self.known.entry(key.clone()).or_default().push((row.depth, id));
-            self.known_rows += 1;
+            self.record_known(&key, row.depth, id);
             self.pending.push((key, row.depth, id, serde_json::to_string(&change).map_err(bad)?));
         }
         let low = row.parents.first().and_then(|q| self.fresh.get(q)).copied().unwrap_or(row.depth);
         self.fresh.insert(id, low);
         Ok(())
+    }
+
+    fn record_known(&mut self, key: &str, depth: i64, id: ObjectId) {
+        let v = match self.known.get_mut(key) {
+            Some(v) => v,
+            None => self.known.entry(key.to_string()).or_default(),
+        };
+        let item = (depth, id);
+        if v.last().is_none_or(|&last| last < item) {
+            v.push(item);
+            self.known_rows += 1;
+        } else if let Err(pos) = v.binary_search(&item) {
+            v.insert(pos, item);
+            self.known_rows += 1;
+        }
+    }
+
+    /// Whether [`Fill::intro`] for `parent` may need to read `view_file_history`.
+    pub(crate) fn needs_stored(&self, parent: &ObjectId) -> bool {
+        *parent != super::graph::root() && self.fresh.get(parent).is_none_or(|&low| low > 1)
+    }
+
+    /// Batch-fetch the deepest [`STORED_PREFETCH`] rows of `view_file_history`
+    /// for each path key in `keys` not yet cached in [`Fill::stored`].
+    pub(crate) fn prefetch_stored(&mut self, g: &G, keys: &[String]) -> Result<()> {
+        if self.stored.len() > 32_768 {
+            self.stored.clear();
+        }
+        let mut ask: Vec<String> = keys.iter().filter(|k| !self.stored.contains_key(k.as_str())).cloned().collect();
+        if ask.is_empty() {
+            return Ok(());
+        }
+        ask.sort();
+        ask.dedup();
+        let cx = g.cx;
+        let pool = &cx.hub().db;
+        let project = cx.project();
+        for chunk in ask.chunks(ROWS_PER_STATEMENT) {
+            let rows: Vec<(i64, i64, String)> = cx.db(|| {
+                sqlx::query_as(
+                    "SELECT k.n, f.depth, f.snapshot FROM UNNEST($3::text[]) WITH ORDINALITY AS k(path_key, n) \
+                     CROSS JOIN LATERAL (SELECT depth, snapshot FROM view_file_history \
+                       WHERE project_id = $1 AND view_key = $2 AND path_key = k.path_key \
+                       ORDER BY depth DESC, snapshot DESC LIMIT 8) f",
+                )
+                .bind(project)
+                .bind(g.vk)
+                .bind(chunk)
+                .fetch_all(pool)
+            })?;
+            let mut per: Vec<Vec<(i64, ObjectId)>> = vec![Vec::new(); chunk.len()];
+            for (n, d, snap) in rows {
+                let snap = ObjectId::from_hex(&snap).map_err(bad)?;
+                per[n as usize - 1].push((d, snap));
+            }
+            for (k, mut list) in chunk.iter().zip(per) {
+                list.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.hex().cmp(&a.1.hex())));
+                let done = list.len() < STORED_PREFETCH;
+                self.stored.insert(k.clone(), (list, done));
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear prefetched stored rows (called when pending rows are written).
+    pub(crate) fn clear_stored(&mut self) {
+        self.stored.clear();
     }
 
     /// The snapshot that last changed `path` along `at`'s first parents.
@@ -227,13 +311,23 @@ impl Fill {
     /// along such a run: a fill that ran at the same time, after a lease
     /// expired, may have written rows this one skipped.)
     fn intro(&self, g: &G, at: ObjectId, path: &str, key: &str) -> Result<Option<(i64, ObjectId)>> {
-        let Some(&low) = self.fresh.get(&at) else { return Files::new(g).intro(at, path) };
+        if at == super::graph::root() {
+            return Ok(None);
+        }
+        let Some(&low) = self.fresh.get(&at) else {
+            let d = g.get(&at)?.depth;
+            return self.intro_stored(g, at, path, key, d);
+        };
         let d = g.get(&at)?.depth;
-        let mut mine: Vec<(i64, ObjectId)> = self.known.get(key).into_iter().flatten().filter(|(dd, _)| *dd <= d && *dd >= low).copied().collect();
-        mine.sort_by(|a, b| b.cmp(a));
-        for (dd, c) in mine {
-            if g.at_depth(at, dd)? == Some(c) {
-                return Ok(Some((dd, c)));
+        if let Some(v) = self.known.get(key) {
+            let end = v.partition_point(|&(dd, _)| dd <= d);
+            for &(dd, c) in v[..end].iter().rev() {
+                if dd < low {
+                    break;
+                }
+                if g.at_depth(at, dd)? == Some(c) {
+                    return Ok(Some((dd, c)));
+                }
             }
         }
         // Below the run's lowest snapshot is its first parent; the root
@@ -241,7 +335,21 @@ impl Fill {
         if low <= 1 {
             return Ok(None);
         }
-        Files::new(g).intro_at(at, path, low - 1)
+        self.intro_stored(g, at, path, key, low - 1)
+    }
+
+    fn intro_stored(&self, g: &G, at: ObjectId, path: &str, key: &str, d: i64) -> Result<Option<(i64, ObjectId)>> {
+        if let Some((rows, done)) = self.stored.get(key) {
+            for &(dd, c) in rows {
+                if dd <= d && g.at_depth(at, dd)? == Some(c) {
+                    return Ok(Some((dd, c)));
+                }
+            }
+            if *done {
+                return Ok(None);
+            }
+        }
+        Files::new(g).intro_at(at, path, d)
     }
 
     /// Write the pending rows (before the graph rows that mark their
@@ -259,6 +367,7 @@ impl Fill {
                 cx.hub().commits.count(crate::db::Commit::Fill);
                 Ok(())
             })?;
+            self.stored.clear();
         }
         self.forget_if_large();
         Ok(())
@@ -269,6 +378,7 @@ impl Fill {
             self.known.clear();
             self.known_rows = 0;
             self.fresh.clear();
+            self.stored.clear();
         }
     }
 

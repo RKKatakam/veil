@@ -780,6 +780,7 @@ async fn walk_tips(
                 w.pmap.insert(*t, *p);
                 w.walk(*t)?;
             }
+            w.diff_pending()?;
             Ok(())
         })();
         // What was computed is kept, also when the walk failed: the next
@@ -879,6 +880,19 @@ async fn project_tips_together(hub: &Arc<Hub>, project: &Project, viewer: &Viewe
 
 /// Most snapshots one [`Walk::learn`] asks about at once.
 const AHEAD: usize = 512;
+/// Snapshots batched together for parallel tree prefetching before diffing
+/// (BUG-1954), aligned with [`ROWS_PER_STATEMENT`].
+const DIFF_BATCH: usize = 500;
+/// Tree object ids passed per `Objects::prefetch` + decode chunk.
+const PREFETCH_CHUNK: usize = 2048;
+/// Concurrent decode tasks per prefetch chunk.
+const PREFETCH_CONCURRENCY: usize = 16;
+/// Cap on tree pairs queued per BFS level during batch prefetching.
+const MAX_PREFETCH_FRONTIER: usize = 16_384;
+
+/// One snapshot waiting for batched tree prefetch and diff:
+/// `(projected id, row, change id, real root tree, real first parent)`.
+type DiffItem = (ObjectId, Arc<VRow>, ChangeId, ObjectId, Option<ObjectId>);
 
 /// One extension of a viewer's graph: its rows, and with `files` its file
 /// history (S14: `files::Fill`, the rows of each snapshot's changed paths,
@@ -900,6 +914,9 @@ struct Walk<'w, 'g, 'a> {
     rows: HashMap<ObjectId, Arc<VRow>>,
     /// Rows not written yet, parents first, with their change ids.
     pending: Vec<(ObjectId, Arc<VRow>, ChangeId)>,
+    /// Snapshots awaiting batched tree prefetch and diff (not in `pending`
+    /// until their file history is computed).
+    to_diff: Vec<DiffItem>,
     inline_cap: bool,
     /// How many snapshots the next [`Walk::learn`] asks about: one, then
     /// four times as many each time, up to [`AHEAD`]. A landing's one new
@@ -924,6 +941,7 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             absent: HashSet::new(),
             rows: HashMap::new(),
             pending: Vec::new(),
+            to_diff: Vec::new(),
             inline_cap: false,
             ahead: 1,
             read: HashMap::new(),
@@ -1112,13 +1130,280 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             let row = Arc::new(VRow::compute(&ps, &parents, x));
             self.g.keep(px, row.clone());
             self.rows.insert(px, row.clone());
-            if self.files {
-                self.fill.add(self.g, self.t, px, &row)?;
+            if self.files && !self.inline_cap {
+                self.to_diff.push((px, row, ps.change_id, s.tree, s.parents.first().copied()));
+                if self.to_diff.len() >= DIFF_BATCH {
+                    self.diff_pending()?;
+                }
+            } else {
+                if self.files {
+                    self.fill.add(self.g, self.t, px, &row)?;
+                }
+                self.pending.push((px, row, ps.change_id));
+                if self.inline_cap && (self.pending.len() >= 16 || self.fill.pending.len() >= 64) {
+                    return Err(bad("inline fill exceeded cap"));
+                }
+                if self.pending.len() >= ROWS_PER_STATEMENT || self.fill.pending.len() >= 4 * ROWS_PER_STATEMENT {
+                    self.flush()?;
+                }
             }
-            self.pending.push((px, row, ps.change_id));
-            if self.inline_cap && (self.pending.len() >= 16 || self.fill.pending.len() >= 64) {
-                return Err(bad("inline fill exceeded cap"));
+        }
+        Ok(())
+    }
+
+    /// Prefetch all trees needed to diff [`Walk::to_diff`] in coalesced ranged
+    /// pack reads and parallel decode tasks (BUG-1954), then diff and queue
+    /// their file-history and graph rows in topological order.
+    fn diff_pending(&mut self) -> Result<()> {
+        use veil_core::{
+            hub::project::{empty_tree_id, Change},
+            object::EntryKind,
+            tree::MAX_TREE_DEPTH,
+        };
+
+        if self.to_diff.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(&mut self.to_diff);
+        let hub = self.g.cx.hub();
+        let project = self.g.cx.project();
+        let rt = &self.g.cx.src.rt;
+        let empty = empty_tree_id();
+
+        // 1. Collect real root trees of the batch and any external first parents.
+        let mut batch_trees: HashMap<ObjectId, ObjectId> = HashMap::with_capacity(batch.len());
+        for (_, row, _, now_real, _) in &batch {
+            if !row.withheld() {
+                batch_trees.insert(row.real, *now_real);
             }
+        }
+        let mut ext_parents: Vec<ObjectId> = Vec::new();
+        let mut seen_ext: HashSet<ObjectId> = HashSet::new();
+        for (_, row, _, _, first_parent) in &batch {
+            if row.withheld() {
+                continue;
+            }
+            if let Some(p) = first_parent {
+                if *p != root() && !batch_trees.contains_key(p) && seen_ext.insert(*p) {
+                    ext_parents.push(*p);
+                }
+            }
+        }
+        if ext_parents.len() > 1 {
+            rt.block_on(hub.objects.prefetch(project, &ext_parents));
+        }
+        for p in ext_parents {
+            batch_trees.insert(p, self.g.snapshot(&p)?.tree);
+        }
+
+        // 2. For restricted viewers with access rules, BFS-prefetch every
+        //    policy-rule directory that `Projector::root` will walk.
+        if !self.admin && self.t.has_rules() {
+            let view = self.t.view();
+            let mut seen_rule: HashSet<(String, ObjectId)> = HashSet::new();
+            let mut frontier: Vec<(String, ObjectId)> = Vec::new();
+            let mut push_root = |id: ObjectId| {
+                if id != empty && seen_rule.insert((String::new(), id)) {
+                    frontier.push((String::new(), id));
+                }
+            };
+            for (_, row, _, now_real, first_parent) in &batch {
+                if row.withheld() {
+                    continue;
+                }
+                push_root(*now_real);
+                if let Some(p) = first_parent {
+                    if *p != root() {
+                        push_root(batch_trees[p]);
+                    }
+                }
+            }
+            for _ in 0..=MAX_TREE_DEPTH {
+                if frontier.is_empty() {
+                    break;
+                }
+                let mut missing_set: HashSet<ObjectId> = HashSet::new();
+                let mut missing: Vec<ObjectId> = Vec::new();
+                for (_, id) in &frontier {
+                    if *id != empty && missing_set.insert(*id) && hub.trees.get(&hub.objects.tree_key(project, id)).is_none() {
+                        missing.push(*id);
+                    }
+                }
+                if !missing.is_empty() {
+                    rt.block_on(prefetch_trees_async(hub, project, missing));
+                }
+                if let Some(p) = &self.progress {
+                    p.step();
+                }
+                let mut next: Vec<(String, ObjectId)> = Vec::new();
+                'expand_rules: for (dir, id) in frontier {
+                    let Some(tree) = self.t.cached_tree(&id) else { continue };
+                    for e in &tree.entries {
+                        if e.kind == EntryKind::Dir {
+                            let child = if dir.is_empty() { e.name.clone() } else { format!("{dir}/{}", e.name) };
+                            if view.rule_below(&child) && seen_rule.insert((child.clone(), e.id)) {
+                                next.push((child, e.id));
+                                if next.len() >= MAX_PREFETCH_FRONTIER {
+                                    break 'expand_rules;
+                                }
+                            }
+                        }
+                    }
+                }
+                frontier = next;
+            }
+        }
+
+        // 3. Project roots for every non-withheld snapshot in the batch.
+        let mut projected_pairs: Vec<Option<(ObjectId, ObjectId)>> = Vec::with_capacity(batch.len());
+        for (_, row, _, now_real, first_parent) in &batch {
+            if row.withheld() {
+                projected_pairs.push(None);
+                continue;
+            }
+            let now_proj = self.t.root(*now_real)?;
+            let before_proj = match first_parent {
+                None => empty,
+                Some(p) if *p == root() => empty,
+                Some(p) => self.t.root(batch_trees[p])?,
+            };
+            projected_pairs.push(Some((before_proj, now_proj)));
+        }
+
+        // 4. Level-by-level BFS prefetch of all differing subtrees across the
+        //    batch so `changes::diff` hits `hub.trees` in memory.
+        let mut seen_pairs: HashSet<(ObjectId, ObjectId)> = HashSet::new();
+        let mut frontier: Vec<(ObjectId, ObjectId)> = Vec::new();
+        for pair in projected_pairs.iter().flatten() {
+            let (a, b) = *pair;
+            if a != b && seen_pairs.insert((a.min(b), a.max(b))) {
+                frontier.push((a, b));
+            }
+        }
+        for _ in 0..=MAX_TREE_DEPTH {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut missing_set: HashSet<ObjectId> = HashSet::new();
+            let mut missing: Vec<ObjectId> = Vec::new();
+            for &(a, b) in &frontier {
+                for id in [a, b] {
+                    if id != empty
+                        && !self.t.is_created(&id)
+                        && missing_set.insert(id)
+                        && hub.trees.get(&hub.objects.tree_key(project, &id)).is_none()
+                    {
+                        missing.push(id);
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                rt.block_on(prefetch_trees_async(hub, project, missing));
+            }
+            if let Some(p) = &self.progress {
+                p.step();
+            }
+            let mut next: Vec<(ObjectId, ObjectId)> = Vec::new();
+            'expand_diff: for (a, b) in frontier {
+                let ta = self.t.cached_tree(&a);
+                let tb = self.t.cached_tree(&b);
+                let oe = ta.as_deref().map(|t| t.entries.as_slice()).unwrap_or_default();
+                let ne = tb.as_deref().map(|t| t.entries.as_slice()).unwrap_or_default();
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < oe.len() || j < ne.len() {
+                    let (o, n) = match (oe.get(i), ne.get(j)) {
+                        (Some(x), Some(y)) => match x.name.cmp(&y.name) {
+                            std::cmp::Ordering::Less => {
+                                i += 1;
+                                (Some(x), None)
+                            }
+                            std::cmp::Ordering::Greater => {
+                                j += 1;
+                                (None, Some(y))
+                            }
+                            std::cmp::Ordering::Equal => {
+                                i += 1;
+                                j += 1;
+                                (Some(x), Some(y))
+                            }
+                        },
+                        (Some(x), None) => {
+                            i += 1;
+                            (Some(x), None)
+                        }
+                        (None, Some(y)) => {
+                            j += 1;
+                            (None, Some(y))
+                        }
+                        (None, None) => break,
+                    };
+                    if o == n {
+                        continue;
+                    }
+                    let od = o.filter(|e| e.kind == EntryKind::Dir).map(|e| e.id);
+                    let nd = n.filter(|e| e.kind == EntryKind::Dir).map(|e| e.id);
+                    let sub = match (od, nd) {
+                        (Some(x), Some(y)) if x != y => Some((x, y)),
+                        (Some(x), None) => Some((x, empty)),
+                        (None, Some(y)) => Some((empty, y)),
+                        _ => None,
+                    };
+                    if let Some((x, y)) = sub {
+                        if seen_pairs.insert((x.min(y), x.max(y))) {
+                            next.push((x, y));
+                            if next.len() >= MAX_PREFETCH_FRONTIER {
+                                break 'expand_diff;
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        // 5. Diff in topological order, batch-prefetching stored history when
+        //    any parent needs it, and flush completed rows in order.
+        let mut ready: Vec<(ObjectId, Arc<VRow>, ChangeId, Vec<Change>)> = Vec::with_capacity(batch.len());
+        let mut ready_changes = 0usize;
+        for ((px, row, cid, _, _), pair) in batch.into_iter().zip(projected_pairs) {
+            let ch = match pair {
+                Some((before_proj, now_proj)) => crate::derive::changes::diff(self.t, before_proj, now_proj)?.0,
+                None => Vec::new(),
+            };
+            ready_changes += ch.len();
+            ready.push((px, row, cid, ch));
+            if ready_changes >= 4 * ROWS_PER_STATEMENT {
+                self.drain_diffed(&mut ready)?;
+                ready_changes = 0;
+            }
+        }
+        if !ready.is_empty() {
+            self.drain_diffed(&mut ready)?;
+        }
+        self.t.forget();
+        Ok(())
+    }
+
+    fn drain_diffed(&mut self, ready: &mut Vec<(ObjectId, Arc<VRow>, ChangeId, Vec<veil_core::hub::project::Change>)>) -> Result<()> {
+        let mut keys: Vec<String> = Vec::new();
+        for (_, row, _, ch) in ready.iter() {
+            if row.withheld() || ch.is_empty() {
+                continue;
+            }
+            if row.parents.iter().any(|q| self.fill.needs_stored(q)) {
+                for c in ch {
+                    keys.push(crate::derive::changes::path_key(&c.path));
+                }
+            }
+        }
+        if !keys.is_empty() {
+            self.fill.prefetch_stored(self.g, &keys)?;
+        }
+        for (px, row, cid, ch) in ready.drain(..) {
+            if !row.withheld() {
+                self.fill.add_changes(self.g, px, &row, ch)?;
+            }
+            self.pending.push((px, row, cid));
             if self.pending.len() >= ROWS_PER_STATEMENT || self.fill.pending.len() >= 4 * ROWS_PER_STATEMENT {
                 self.flush()?;
             }
@@ -1136,6 +1421,9 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
         let vk = self.g.vk;
         let files = std::mem::take(&mut self.fill.pending);
         let graph = std::mem::take(&mut self.pending);
+        if !files.is_empty() {
+            self.fill.clear_stored();
+        }
         self.fill.forget_if_large();
         let gce = hub.caches.gc_epoch(project);
         // File history first: a graph row's `files` mark means its file
@@ -1158,6 +1446,56 @@ impl<'w, 'g, 'a> Walk<'w, 'g, 'a> {
             p.wrote(graph.len() as u64);
         }
         Ok(())
+    }
+}
+
+/// About the memory decoded tree `t` holds in [`Hub::trees`].
+fn tree_weight(t: &veil_core::object::Tree) -> usize {
+    let heap: usize = t
+        .entries
+        .iter()
+        .map(|e| e.name.capacity() + if e.visibility.is_public() { 0 } else { 64 })
+        .sum();
+    128 + std::mem::size_of::<veil_core::object::Tree>()
+        + t.entries.capacity() * std::mem::size_of::<veil_core::TreeEntry>()
+        + heap
+}
+
+/// Prefetch and decode tree objects `ids` into [`Hub::trees`] using coalesced
+/// ranged pack reads (`Objects::prefetch`) and bounded parallel decoding.
+/// Best-effort: missing or corrupt objects are skipped so the diff pass
+/// reports them through its normal error path.
+async fn prefetch_trees_async(hub: &Arc<Hub>, project: i64, ids: Vec<ObjectId>) {
+    use veil_core::object::Object;
+    for chunk in ids.chunks(PREFETCH_CHUNK) {
+        hub.objects.prefetch(project, chunk).await;
+        let mut set = tokio::task::JoinSet::new();
+        let mut it = chunk.iter().copied();
+        loop {
+            while set.len() < PREFETCH_CONCURRENCY {
+                let Some(id) = it.next() else { break };
+                let hub = hub.clone();
+                set.spawn(async move {
+                    let ck = hub.objects.tree_key(project, &id);
+                    if hub.trees.get(&ck).is_some() {
+                        return;
+                    }
+                    let Ok(Some(raw)) = hub.objects.get(project, &id).await else {
+                        return;
+                    };
+                    let Some(enc) = Object::tree_encoding(&raw) else {
+                        return;
+                    };
+                    if let Ok(Object::Tree(t)) = Object::decode(&raw) {
+                        let w = tree_weight(&t);
+                        hub.trees.insert(ck, (Arc::new(t), enc), w);
+                    }
+                });
+            }
+            if set.join_next().await.is_none() {
+                break;
+            }
+        }
     }
 }
 
