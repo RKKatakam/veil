@@ -44,6 +44,11 @@ pub struct LandRequest {
     /// Upload receipts of the objects the snapshot or the edits name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub receipts: BTreeMap<ObjectId, String>,
+    /// Staged packs (`POST …/objects`, [`super::wire::Uploaded::packs`])
+    /// carrying the objects an uploaded `snapshot` introduces (revision 9,
+    /// BUG-1150). Mutually exclusive with `receipts`; only with `snapshot`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<String>,
     /// Return only once the outcome is known (up to about 30 s), not at
     /// `queued`.
     #[serde(default = "yes", skip_serializing_if = "is_true")]

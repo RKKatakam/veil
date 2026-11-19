@@ -1983,7 +1983,6 @@ fn bug_2665_concurrent_api_commits_sharing_a_deduplicated_upload_all_succeed() {
 /// that per-object receipts exceed the 64 MiB JSON body limit is refused with
 /// 413 before the fix and lands cleanly once a push names its staged packs.
 #[test]
-#[ignore = "BUG-1150: per-object receipts in PushRequest pass the 64 MiB body limit"]
 fn bug_1150_push_past_64_mib_of_per_object_receipts_lands() {
     use std::sync::Arc;
     use veil_core::{
@@ -2114,4 +2113,276 @@ fn bug_1150_push_past_64_mib_of_per_object_receipts_lands() {
     let frames = fetched.frames();
     assert_eq!(frames.len(), 1);
     assert_eq!(O::decode(&frames[0].1).unwrap(), O::Blob(sample_text.into_bytes()));
+}
+
+/// Shared proof-of-upload test for BUG-1150 (`PushRequest::packs` and
+/// `LandRequest::packs`), run against both `packs` and `objects` layouts.
+fn bug_1150_push_packs_proof_of_upload(hub: TestHub) {
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let h = hub.hub();
+    let dev_tok = p.dev.token();
+    let carol_tok = p.carol.token();
+
+    let assert_bad_request = |r: &Reply, what: &str| {
+        assert_eq!(r.status, 400, "{what}: status {} body {}", r.status, String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["code"], "bad_request", "{what}: body {}", String::from_utf8_lossy(&r.body));
+    };
+
+    // 1. Naming another person's staged pack is refused (400 bad_request) and
+    //    never discards the other person's staged pack.
+    let mut c1 = Craft::new(&api, &p.dev, &p.name, "main");
+    c1.file("src/owned_1150.rs", "MARKER-OWNED-1150\n");
+    let tip1 = c1.tip;
+    let snap1 = snap(&mut c1, vec![tip1], "dev owned", None);
+    let up_dev1 = api.upload(&dev_tok, &p.name, &c1.objects);
+    assert_eq!(up_dev1.status, 200, "{}", String::from_utf8_lossy(&up_dev1.body));
+    let dev_packs1: Vec<String> = serde_json::from_value(up_dev1.json()["packs"].clone()).unwrap();
+    assert_eq!(dev_packs1.len(), 1);
+    let dev_pack1 = dev_packs1[0].clone();
+
+    let carol_text = "MARKER-CAROL-1150\n";
+    let (carol_blob_id, carol_blob_raw) = blob(carol_text);
+    let mut carol_frames = Vec::new();
+    put_frame(&mut carol_frames, &carol_blob_id, &carol_blob_raw);
+    let up_carol = api.upload_body(&carol_tok, &p.name, &carol_frames);
+    assert_eq!(up_carol.status, 200, "{}", String::from_utf8_lossy(&up_carol.body));
+    let carol_packs: Vec<String> = serde_json::from_value(up_carol.json()["packs"].clone()).unwrap();
+    assert_eq!(carol_packs.len(), 1);
+    let carol_pack = carol_packs[0].clone();
+
+    let push_packs = |client: &Api, tok: &str, expected: ObjectId, new: ObjectId, packs: &[&str]| {
+        client.post_json(
+            Some(tok),
+            &format!("/v1/projects/{}/push", p.name),
+            &json!({
+                "updates": [{"branch": "main", "expected": expected.hex(), "new": new.hex()}],
+                "packs": packs,
+            }),
+        )
+    };
+
+    let r_carol_using_dev = push_packs(&api, &carol_tok, tip1, snap1, &[&dev_pack1]);
+    assert_bad_request(&r_carol_using_dev, "carol naming dev's pack");
+    assert!(
+        hub.rt.block_on(h.objects.staged_index(pid, &dev_pack1)).unwrap().is_some(),
+        "another person naming dev's pack must not discard dev's pack"
+    );
+
+    let r_dev_using_carol = push_packs(&api, &dev_tok, tip1, snap1, &[&carol_pack]);
+    assert_bad_request(&r_dev_using_carol, "dev naming carol's pack");
+    let r_dev_mixed = push_packs(&api, &dev_tok, tip1, snap1, &[&dev_pack1, &carol_pack]);
+    assert_bad_request(&r_dev_mixed, "dev naming own pack + carol's pack");
+    assert_eq!(
+        r_dev_using_carol.body, r_dev_mixed.body,
+        "naming another person's pack alone or beside own pack gives the same answer"
+    );
+    assert!(
+        hub.rt.block_on(h.objects.staged_index(pid, &carol_pack)).unwrap().is_some(),
+        "dev naming carol's pack must never discard carol's staged pack"
+    );
+    assert!(
+        hub.rt.block_on(h.objects.staged_index(pid, &dev_pack1)).unwrap().is_none(),
+        "dev's own staged pack in a refused push is discarded"
+    );
+
+    // 2. Duplicate pack name, forged/malformed pack names, mixing `packs` and
+    //    `receipts`, then a clean push with `packs`.
+    let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
+    c2.file("src/valid_1150.rs", "MARKER-VALID-1150\n");
+    let tip2 = c2.tip;
+    let snap2 = snap(&mut c2, vec![tip2], "dev valid", None);
+    let up_dev2 = api.upload(&dev_tok, &p.name, &c2.objects);
+    assert_eq!(up_dev2.status, 200, "{}", String::from_utf8_lossy(&up_dev2.body));
+    let up_dev2_json = up_dev2.json();
+    let dev_pack2 = up_dev2_json["packs"][0].as_str().unwrap().to_string();
+    let dev_receipt0 = up_dev2_json["receipts"][0].as_str().unwrap().to_string();
+
+    let r_dup = push_packs(&api, &dev_tok, tip2, snap2, &[&dev_pack2, &dev_pack2]);
+    assert_bad_request(&r_dup, "same pack named twice");
+
+    for bad in ["", ".", "../x", &"A".repeat(32), &"0".repeat(31)] {
+        let r_bad = push_packs(&api, &dev_tok, tip2, snap2, &[bad]);
+        assert_bad_request(&r_bad, &format!("malformed pack name {bad:?}"));
+    }
+
+    let r_both = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "main", "expected": tip2.hex(), "new": snap2.hex()}],
+            "packs": [&dev_pack2],
+            "receipts": {c2.objects[0].0.hex(): dev_receipt0},
+        }),
+    );
+    assert_bad_request(&r_both, "push sending both packs and receipts");
+
+    let r_forged = push_packs(&api, &dev_tok, tip2, snap2, &[&"0".repeat(32)]);
+    assert_bad_request(&r_forged, "forged 32-hex pack name");
+    assert_eq!(
+        r_forged.body, r_dev_using_carol.body,
+        "forged 32-hex pack name must give the exact same answer as another person's pack (no oracle)"
+    );
+
+    let r_ok = push_packs(&api, &dev_tok, tip2, snap2, &[&dev_pack2]);
+    assert_eq!(r_ok.status, 200, "{}", String::from_utf8_lossy(&r_ok.body));
+    assert_eq!(r_ok.json()["results"][0]["ok"], true);
+    assert_eq!(read_file(&api, &dev_tok, &p.name, "src/valid_1150.rs"), Some(b"MARKER-VALID-1150\n".to_vec()));
+
+    // 3. Introducing an object not in the named packs (hidden billing blob vs
+    //    random nonexistent id): refused with identical 400 bad_request answers.
+    let hidden_path = format!("{BILL_DIR}/acme/invoice.txt");
+    let real_hidden_id = real_paths(&p.dir)
+        .into_iter()
+        .find(|(path, _)| *path == hidden_path)
+        .expect("billing invoice")
+        .1;
+    let right_bytes = format!("{BILL_MARK}\nsecond").into_bytes();
+    let wrong_bytes = b"MARKER-WRONG-1150-NOT-STORED".to_vec();
+    let (rid, rraw) = (ObjectId::hash(&O::Blob(right_bytes.clone()).encode()), O::Blob(right_bytes.clone()).encode());
+    let (wid, wraw) = (ObjectId::hash(&O::Blob(wrong_bytes.clone()).encode()), O::Blob(wrong_bytes.clone()).encode());
+    assert_eq!(rid, real_hidden_id, "right guess matches hidden billing blob");
+
+    let mut unuploaded_answers = Vec::new();
+    for (id, bytes, label) in [(wid, &wrong_bytes, "random missing"), (rid, &right_bytes, "hidden billing")] {
+        let mut cg = Craft::new(&api, &p.dev, &p.name, "main");
+        cg.set("src/claim_1150.txt", O::Blob(bytes.clone()), veil_core::object::Visibility::Public);
+        cg.objects.retain(|(o, _)| *o != id);
+        let tip = cg.tip;
+        let sg = snap(&mut cg, vec![tip], "claim unuploaded", None);
+        let up = api.upload(&dev_tok, &p.name, &cg.objects);
+        assert_eq!(up.status, 200, "{label}: {}", String::from_utf8_lossy(&up.body));
+        let pack = up.json()["packs"][0].as_str().unwrap().to_string();
+        let r = push_packs(&api, &dev_tok, tip, sg, &[&pack]);
+        assert_bad_request(&r, &format!("object not in named pack ({label})"));
+        assert!(
+            hub.rt.block_on(h.objects.staged_index(pid, &pack)).unwrap().is_none(),
+            "refused push's staged pack is discarded ({label})"
+        );
+        let mut norm = String::from_utf8_lossy(&r.body).into_owned();
+        for oid in cg.objects.iter().map(|(o, _)| *o).chain([id, sg]) {
+            norm = norm.replace(&oid.hex(), "ID").replace(&oid.short(), "ID");
+        }
+        unuploaded_answers.push((r.status, norm));
+    }
+    assert_eq!(
+        unuploaded_answers[1], unuploaded_answers[0],
+        "naming an unuploaded hidden object must match a random missing id (no oracle)"
+    );
+
+    // 4. Discarded pack from an earlier refused push (BUG-1155 with `packs`):
+    //    refused with identical 400 bad_request answers for right vs wrong guess.
+    let up_guess = api.upload(&dev_tok, &p.name, &[(rid, rraw), (wid, wraw)]);
+    assert_eq!(up_guess.status, 200, "{}", String::from_utf8_lossy(&up_guess.body));
+    let g_pack = up_guess.json()["packs"][0].as_str().unwrap().to_string();
+    let tip_now = api.tips(Some(&dev_tok), &p.name).unwrap().branches["main"];
+    let refused_discard = push_packs(&api, &dev_tok, tip_now, ObjectId::hash(b"missing-snap-1150"), &[&g_pack]);
+    assert_bad_request(&refused_discard, "push discarding g_pack");
+    assert!(hub.rt.block_on(h.objects.staged_index(pid, &g_pack)).unwrap().is_none(), "g_pack discarded");
+
+    let mut discarded_answers = Vec::new();
+    for (id, bytes, label) in [(wid, &wrong_bytes, "wrong guess"), (rid, &right_bytes, "right guess")] {
+        let mut cg = Craft::new(&api, &p.dev, &p.name, "main");
+        cg.set("src/guess_1150.txt", O::Blob(bytes.clone()), veil_core::object::Visibility::Public);
+        cg.objects.retain(|(o, _)| *o != id);
+        let tip = cg.tip;
+        let sg = snap(&mut cg, vec![tip], "discarded pack guess", None);
+        let up = api.upload(&dev_tok, &p.name, &cg.objects);
+        assert_eq!(up.status, 200, "{label}: {}", String::from_utf8_lossy(&up.body));
+        let cg_pack = up.json()["packs"][0].as_str().unwrap().to_string();
+        let r = push_packs(&api, &dev_tok, tip, sg, &[&cg_pack, &g_pack]);
+        assert_bad_request(&r, &format!("discarded pack ({label})"));
+        assert_eq!(r.body, r_forged.body, "discarded pack must match forged pack (no oracle)");
+        assert!(hub.rt.block_on(h.objects.staged_index(pid, &cg_pack)).unwrap().is_none(), "sibling pack discarded");
+        discarded_answers.push((r.status, r.body));
+    }
+    assert_eq!(discarded_answers[1], discarded_answers[0]);
+
+    // 5. Carol's untouched pack from step 1 still works through a cold second
+    //    server (`TestHub::beside`), and an unread extra blob in a named pack
+    //    is not kept in the project's store.
+    let carol_path = format!("{PERSON_DIR}/carol_1150.txt");
+    let mut cc = Craft::new(&api, &p.carol, &p.name, "main");
+    cc.set(&carol_path, O::Blob(carol_text.as_bytes().to_vec()), veil_core::object::Visibility::Public);
+    cc.objects.retain(|(o, _)| *o != carol_blob_id);
+    let c_tip = cc.tip;
+    let c_snap = snap(&mut cc, vec![c_tip], "carol uses her earlier pack", None);
+    let (unread_id, unread_raw) = blob("MARKER-UNREAD-EXTRA-1150\n");
+    cc.objects.push((unread_id, unread_raw));
+    let up_c2 = api.upload(&carol_tok, &p.name, &cc.objects);
+    assert_eq!(up_c2.status, 200, "{}", String::from_utf8_lossy(&up_c2.body));
+    let carol_pack2 = up_c2.json()["packs"][0].as_str().unwrap().to_string();
+
+    let cold = TestHub::beside(&hub);
+    let cold_api = cold.api();
+    let r_carol_ok = push_packs(&cold_api, &carol_tok, c_tip, c_snap, &[&carol_pack, &carol_pack2]);
+    assert_eq!(r_carol_ok.status, 200, "{}", String::from_utf8_lossy(&r_carol_ok.body));
+    assert_eq!(r_carol_ok.json()["results"][0]["ok"], true);
+    assert_eq!(read_file(&api, &carol_tok, &p.name, &carol_path), Some(carol_text.as_bytes().to_vec()));
+    assert!(
+        hub.rt.block_on(h.objects.get(pid, &unread_id)).unwrap().is_none(),
+        "unread extra object in a named staged pack must not be kept in the project"
+    );
+
+    // 6. Snapshot landing (`POST …/land`) accepts `packs`, refuses `packs` +
+    //    `receipts`, and refuses `packs` with `edits`.
+    let mut cl = Craft::new(&api, &p.dev, &p.name, "main");
+    cl.file("src/land_1150.rs", "MARKER-LAND-1150\n");
+    let l_tip = cl.tip;
+    let l_snap = snap(&mut cl, vec![l_tip], "land with packs", None);
+    let up_l = api.upload(&dev_tok, &p.name, &cl.objects);
+    assert_eq!(up_l.status, 200, "{}", String::from_utf8_lossy(&up_l.body));
+    let l_pack = up_l.json()["packs"][0].as_str().unwrap().to_string();
+    let l_rec0 = up_l.json()["receipts"][0].as_str().unwrap().to_string();
+
+    let r_land_both = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({
+            "onto": "main",
+            "snapshot": l_snap.hex(),
+            "packs": [&l_pack],
+            "receipts": {cl.objects[0].0.hex(): l_rec0},
+            "wait": true,
+        }),
+    );
+    assert_bad_request(&r_land_both, "land with both packs and receipts");
+
+    let r_land_edits = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({
+            "onto": "main",
+            "base": l_tip.hex(),
+            "edits": [{"path": "src/e.txt", "put": {"text": "hi"}}],
+            "packs": [&l_pack],
+            "wait": true,
+        }),
+    );
+    assert_bad_request(&r_land_edits, "land with packs and edits");
+
+    let r_land_ok = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/land", p.name),
+        &json!({
+            "onto": "main",
+            "snapshot": l_snap.hex(),
+            "packs": [&l_pack],
+            "wait": true,
+        }),
+    );
+    assert_eq!(r_land_ok.status, 200, "{}", String::from_utf8_lossy(&r_land_ok.body));
+    assert_eq!(r_land_ok.json()["state"], "landed", "{}", String::from_utf8_lossy(&r_land_ok.body));
+    assert_eq!(read_file(&api, &dev_tok, &p.name, "src/land_1150.rs"), Some(b"MARKER-LAND-1150\n".to_vec()));
+}
+
+#[test]
+fn bug_1150_push_packs_proof_of_upload_in_packs_layout() {
+    bug_1150_push_packs_proof_of_upload(TestHub::start_packs());
+}
+
+#[test]
+fn bug_1150_push_packs_proof_of_upload_in_objects_layout() {
+    bug_1150_push_packs_proof_of_upload(TestHub::start_objects());
 }
