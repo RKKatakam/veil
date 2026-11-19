@@ -1803,15 +1803,17 @@ fn bug_2921_migration_46_succeeds_on_colocated_yugabytedb_database() {
     });
 }
 
-/// BUG-2922 (PostgreSQL): migration 0045 runs `CREATE TABLE person_epochs`,
-/// `CREATE OR REPLACE FUNCTION veil_bump_epoch`, and the backfill
-/// `INSERT INTO person_epochs SELECT ... FROM access_epochs` inside one
-/// transaction. A pre-0045 server revoking a person while that transaction is
-/// open executes the old `veil_bump_epoch`, updating `access_epochs (0, person)`
-/// without touching `person_epochs`. When 0045 commits, `person_epochs` keeps
-/// the pre-revocation epoch so new servers keep honoring revoked grants/landings.
+/// BUG-2922 (PostgreSQL): migration 0045 must never lose a concurrent access
+/// revocation committed by a pre-0045 server at any point during the migration:
+///   1. revocation fired while step 1's transaction is open (blocked on
+///      `SHARE ROW EXCLUSIVE` of `access_epochs` until step 1 commits, then
+///      mirrors into `person_epochs` via `veil_access_epochs_mirror_person`);
+///   2. revocation committed between step 1's commit and step 2's backfill
+///      (preserved by `ON CONFLICT (person_id) DO NOTHING`);
+///   3. revocation fired while step 2's backfill transaction is open (waits on
+///      step 2's `person_epochs` row lock, then overwrites the backfilled value
+///      via `ON CONFLICT (person_id) DO UPDATE`).
 #[test]
-#[ignore = "BUG-2922: concurrent access revocation during migration 0045 leaves person_epochs stale at the pre-revocation epoch"]
 fn bug_2922_migration_45_never_loses_concurrent_revocation_from_person_epochs() {
     let rt = runtime();
     if on_yugabyte(&rt) {
@@ -1820,10 +1822,12 @@ fn bug_2922_migration_45_never_loses_concurrent_revocation_from_person_epochs() 
     let (url, name) = fresh_database(&rt);
     let _drop = DropFreshDb(&rt, name);
     rt.block_on(async {
-        let db = veil_server::db::connect(&url, 4).await.unwrap();
+        let db = veil_server::db::connect(&url, 6).await.unwrap();
         apply_migrations_through(&db, 44).await;
 
-        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2922alice', 1)").await;
+        for person in ["b2922alice", "b2922bob", "b2922carol"] {
+            exec_retrying(&db, &format!("INSERT INTO people (name, created_at) VALUES ('{person}', 1)")).await;
+        }
         exec_retrying(
             &db,
             "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
@@ -1831,62 +1835,98 @@ fn bug_2922_migration_45_never_loses_concurrent_revocation_from_person_epochs() 
         )
         .await;
         let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2922proj'").fetch_one(&db).await.unwrap();
-        let uid: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2922alice'").fetch_one(&db).await.unwrap();
+        let alice: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2922alice'").fetch_one(&db).await.unwrap();
+        let bob: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2922bob'").fetch_one(&db).await.unwrap();
+        let carol: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2922carol'").fetch_one(&db).await.unwrap();
         exec_retrying(&db, &format!("INSERT INTO groups (project_id, name) VALUES ({pid}, 'eng')")).await;
         let gid: i64 = sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'eng'")
             .bind(pid)
             .fetch_one(&db)
             .await
             .unwrap();
-        exec_retrying(&db, &format!("INSERT INTO group_members (group_id, person_id) VALUES ({gid}, {uid})")).await;
+        for uid in [alice, bob, carol] {
+            exec_retrying(&db, &format!("INSERT INTO group_members (group_id, person_id) VALUES ({gid}, {uid})")).await;
+        }
 
-        let e_before: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
-            .bind(uid)
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_ne!(e_before, 0, "group membership insert bumped access_epochs");
+        let mut before = Vec::new();
+        for uid in [alice, bob, carol] {
+            let e: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(uid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_ne!(e, 0, "group membership insert bumped access_epochs");
+            before.push(e);
+        }
 
         let sql45 = veil_server::db::MIGRATIONS
             .iter()
             .find(|(v, _, _)| *v == 45)
             .expect("migration 45")
             .2;
+        let steps = veil_server::db::migration_steps(sql45);
+        assert_eq!(steps.len(), 2, "migration 45 must run in 2 committed steps");
 
-        // Run migration 0045 in a transaction exactly as `db::migrate_once` does
-        // on PostgreSQL, pausing just before COMMIT while a pre-0045 server
-        // revokes Alice's group membership on another connection.
-        let mut mig_tx = db.begin().await.unwrap();
-        sqlx::raw_sql(sql45).execute(&mut *mig_tx).await.unwrap();
-        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (45, 'person_epochs', 0)")
-            .execute(&mut *mig_tx)
-            .await
-            .unwrap();
+        // Window 1: start step 1 transaction; concurrently revoke Alice while
+        // step 1 holds `SHARE ROW EXCLUSIVE` on `access_epochs`, then commit step 1.
+        let mut tx1 = db.begin().await.unwrap();
+        sqlx::raw_sql(&steps[0]).execute(&mut *tx1).await.unwrap();
+        let db_alice = db.clone();
+        let revoke_alice = tokio::spawn(async move {
+            sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND person_id = $2")
+                .bind(gid)
+                .bind(alice)
+                .execute(&db_alice)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx1.commit().await.unwrap();
+        revoke_alice.await.unwrap();
 
-        // Concurrent pre-0045 server revokes Alice: DELETE FROM group_members
-        // fires veil_epoch_person_row -> old veil_bump_epoch(0, uid).
+        // Window 2: revoke Bob after step 1 commits and before step 2 starts.
         sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND person_id = $2")
             .bind(gid)
-            .bind(uid)
+            .bind(bob)
             .execute(&db)
             .await
             .unwrap();
-        let e_revoked: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
-            .bind(uid)
-            .fetch_one(&db)
+
+        // Window 3: run step 2's backfill in a transaction, pause before COMMIT
+        // while Carol is concurrently revoked, then commit step 2.
+        let mut tx2 = db.begin().await.unwrap();
+        sqlx::raw_sql(&steps[1]).execute(&mut *tx2).await.unwrap();
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (45, 'person_epochs', 0)")
+            .execute(&mut *tx2)
             .await
             .unwrap();
-        assert_ne!(e_revoked, e_before, "revocation bumped access_epochs");
+        let db_carol = db.clone();
+        let revoke_carol = tokio::spawn(async move {
+            sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND person_id = $2")
+                .bind(gid)
+                .bind(carol)
+                .execute(&db_carol)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx2.commit().await.unwrap();
+        revoke_carol.await.unwrap();
 
-        mig_tx.commit().await.unwrap();
-
-        let read = veil_server::caches::read_epochs(&db, uid, Some(pid)).await.unwrap();
+        for (label, uid, e_before) in [("alice (during step 1)", alice, before[0]), ("bob (between steps)", bob, before[1]), ("carol (during step 2)", carol, before[2])] {
+            let e_revoked: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(uid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_ne!(e_revoked, e_before, "{label}: revocation bumped access_epochs");
+            let read = veil_server::caches::read_epochs(&db, uid, Some(pid)).await.unwrap();
+            assert_eq!(
+                read.person, e_revoked,
+                "{label}: new server reading person_epochs must see revoked epoch {e_revoked}, not pre-revocation epoch {e_before}"
+            );
+        }
         db.close().await;
-
-        assert_eq!(
-            read.person, e_revoked,
-            "new server reading person_epochs must see revoked epoch {e_revoked}, not pre-revocation epoch {e_before}"
-        );
     });
 }
 

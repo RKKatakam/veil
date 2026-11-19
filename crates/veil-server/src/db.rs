@@ -352,25 +352,38 @@ async fn migrate_once(
             sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
             continue;
         }
+        let steps = migration_steps(parts.transactional);
         if parts.online.is_empty() {
-            // Each migration in its own transaction. Migration files are
-            // idempotent (`IF NOT EXISTS`): YugabyteDB applies DDL in a
-            // transaction block statement by statement unless transactional
-            // DDL is enabled, so a migration interrupted half-way is applied
-            // again from the start.
-            let mut tx = sqlx::Connection::begin(&mut *c).await?;
-            sqlx::raw_sql(sql).execute(&mut *tx).await?;
-            sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *tx).await?;
-            tx.commit().await?;
+            // Each step in its own committed transaction; the final step
+            // records `schema_migrations` atomically with its statements.
+            // Multi-step migrations (separated by `-- veil: step`) commit
+            // earlier DDL/triggers before later backfill steps so concurrent
+            // pre-migration sessions cannot miss the new triggers (BUG-2922).
+            // Migration files are idempotent (`IF NOT EXISTS`): YugabyteDB
+            // applies DDL in a transaction block statement by statement unless
+            // transactional DDL is enabled, so a migration interrupted half-way
+            // is applied again from the start.
+            let last = steps.len().saturating_sub(1);
+            for (i, step) in steps.iter().enumerate() {
+                let mut tx = sqlx::Connection::begin(&mut *c).await?;
+                sqlx::raw_sql(step).execute(&mut *tx).await?;
+                if i == last {
+                    sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+            }
+            if steps.is_empty() {
+                sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
+            }
             continue;
         }
-        // The statements before the online section in one transaction, not
-        // recorded; then the online index steps one by one; then the
+        // The statements before the online section in committed transaction(s),
+        // not recorded; then the online index steps one by one; then the
         // record. A migration that fails anywhere is not recorded and is
         // applied again from the start (both parts are idempotent).
-        if has_statements(parts.transactional) {
+        for step in &steps {
             let mut tx = sqlx::Connection::begin(&mut *c).await?;
-            sqlx::raw_sql(parts.transactional).execute(&mut *tx).await?;
+            sqlx::raw_sql(step).execute(&mut *tx).await?;
             tx.commit().await?;
         }
         let yb = match yugabyte {
@@ -398,10 +411,9 @@ async fn migrate_once(
     Ok(())
 }
 
-/// Run a [`YUGABYTE_ONLY`] migration's [`YUGABYTE_STEP`]-delimited steps one by
-/// one outside a transaction block, under the remaining migration deadline's
-/// statement and lock timeouts (resetting both afterwards).
-async fn yugabyte_only_steps(c: &mut PgConnection, sql: &str, deadline: tokio::time::Instant) -> Result<()> {
+/// Split a migration's SQL at [`YUGABYTE_STEP`] (`-- veil: step`) lines,
+/// dropping empty or comment-only chunks.
+pub fn migration_steps(sql: &str) -> Vec<String> {
     let mut step = String::new();
     let mut steps = Vec::new();
     for line in sql.lines() {
@@ -419,6 +431,14 @@ async fn yugabyte_only_steps(c: &mut PgConnection, sql: &str, deadline: tokio::t
     if has_statements(&step) {
         steps.push(step);
     }
+    steps
+}
+
+/// Run a [`YUGABYTE_ONLY`] migration's [`YUGABYTE_STEP`]-delimited steps one by
+/// one outside a transaction block, under the remaining migration deadline's
+/// statement and lock timeouts (resetting both afterwards).
+async fn yugabyte_only_steps(c: &mut PgConnection, sql: &str, deadline: tokio::time::Instant) -> Result<()> {
+    let steps = migration_steps(sql);
     let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(STATEMENT_TIMEOUT);
     let ms = left.as_millis();
     sqlx::raw_sql(&format!("SET statement_timeout = {ms}; SET lock_timeout = {ms}")).execute(&mut *c).await?;
