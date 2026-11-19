@@ -2344,3 +2344,43 @@ fn bug_2931_migration_46_online_guard_misses_existing_live_org_without_pushes() 
     });
 }
 
+/// BUG-2932 (YugabyteDB): `verify_rebuilt_indexes` only checks indexes currently
+/// present in `pg_index` and never checks that the 15 required secondary indexes
+/// exist. Following its own error message ("drop/rebuild it and re-run
+/// `veil-server migrate --offline`") after dropping a bad index causes
+/// `migrate --offline` to skip the already-rebuilt table and record version 46
+/// with a missing UNIQUE index (e.g. `landing_queue_ticket`), breaking
+/// `ON CONFLICT (ticket) DO NOTHING`.
+#[test]
+#[ignore = "BUG-2932: verify_rebuilt_indexes records migration 46 even when required rebuilt secondary/UNIQUE indexes are missing"]
+fn bug_2932_verify_rebuilt_indexes_does_not_check_required_indexes_exist() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate_offline(&db).await.unwrap();
+
+        // Simulate an unrecorded retry where a bad rebuilt index was dropped
+        // before re-running `veil-server migrate --offline`.
+        exec_retrying(&db, "DELETE FROM schema_migrations WHERE version = 46").await;
+        exec_retrying(&db, "DROP INDEX landing_queue_ticket").await;
+
+        let res = veil_server::db::migrate_offline(&db).await;
+        let has_ticket: Option<String> = sqlx::query_scalar("SELECT to_regclass('landing_queue_ticket')::text")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        db.close().await;
+
+        assert!(
+            res.is_err() || has_ticket.is_some(),
+            "migrate_offline recorded migration 46 with required UNIQUE index landing_queue_ticket missing"
+        );
+    });
+}
+
+
