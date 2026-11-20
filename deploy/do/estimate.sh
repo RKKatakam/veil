@@ -73,6 +73,7 @@ echo "every topology (sizes and $DRIVERS driver(s) as above; + Spaces \$$SPACES_
 printf '   %-66s %9s %9s %11s %13s\n' "topology" "USD/hour" "${HOURS} h" "a day left" "a month left"
 for t in "1 0 0 minio one server, PostgreSQL, MinIO (the default)" "1 3 0 minio one server, YugabyteDB x3, MinIO" \
          "2 3 0 minio two servers + balancer, YugabyteDB x3, MinIO" "3 3 0 minio three servers + balancer, YugabyteDB x3, MinIO (the full run)" \
+         "3 6 0 minio three servers + balancer, YugabyteDB x6, MinIO" \
          "3 3 0 spaces the full run with objects on Spaces (no MinIO)" \
          "3 0 0 minio three servers + balancer, PostgreSQL, MinIO" "3 3 1 minio the full run + the cache"; do
     read -r h y c o label <<<"$t"

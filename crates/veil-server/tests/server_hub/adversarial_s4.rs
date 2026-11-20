@@ -61,7 +61,14 @@ fn bug_913_caches_are_bounded_by_bytes_not_by_what_an_attacker_writes() {
     let before = rss();
     for p in 1..=100i64 {
         let TipsLookup::Read(read) = c.tips(p) else { panic!("a first read") };
-        let rows: Vec<(String, String)> = (0..10_000u32).map(|i| (format!("{i:0>100}"), ObjectId::hash(&i.to_le_bytes()).hex())).collect();
+        let rows: Vec<veil_server::caches::BranchRow> = (0..10_000u32)
+            .map(|i| veil_server::caches::BranchRow {
+                name: format!("{i:0>100}"),
+                target: ObjectId::hash(&i.to_le_bytes()).hex(),
+                tested: None,
+                hidden_for_embargo: None,
+            })
+            .collect();
         c.put_tips(p, read, Instant::now(), rows);
     }
     std::thread::sleep(TIPS_TTL * 3);

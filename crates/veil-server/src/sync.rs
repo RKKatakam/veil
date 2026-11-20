@@ -784,19 +784,18 @@ pub(crate) struct Deferred {
     made: Vec<ObjectId>,
 }
 
-/// Is `id` committed history of `project` (`snapshots`, keyed by GC epoch)?
+/// Is `id` committed history of `project` (`snapshots`)?
 async fn committed(hub: &Hub, project: i64, id: &ObjectId) -> Result<bool> {
     if hub.caches.committed(project, id) {
         return Ok(true);
     }
-    let gce = hub.caches.gc_epoch(project);
     let stored: Option<String> = sqlx::query_scalar("SELECT id FROM snapshots WHERE project_id = $1 AND id = $2")
         .bind(project)
         .bind(id.hex())
         .fetch_optional(&hub.db)
         .await?;
     if stored.is_some() {
-        hub.caches.put_committed_at(project, gce, id);
+        hub.caches.put_committed(project, id);
     }
     Ok(stored.is_some())
 }
@@ -868,7 +867,6 @@ pub(crate) async fn projected_inner(
                 None => match hub.caches.memo(project.id, &view_key, &x) {
                     Some(p) => Some(p),
                     None => {
-                        let gce = hub.caches.gc_epoch(project.id);
                         let m: Option<(String, bool)> =
                             sqlx::query_as("SELECT projected_id, collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = $3")
                                 .bind(project.id)
@@ -880,7 +878,7 @@ pub(crate) async fn projected_inner(
                             .map(|(p, c)| ObjectId::from_hex(&p).map(|p| (p, c)).map_err(|e| Error::Other(e.into())))
                             .transpose()?;
                         if let Some((p, c)) = &m {
-                            hub.caches.put_memo_row_at(project.id, gce, &view_key, &x, p, *c);
+                            hub.caches.put_memo_row(project.id, &view_key, &x, p, *c);
                         }
                         m.map(|(p, _)| p)
                     }
@@ -1173,7 +1171,6 @@ async fn resolve_stored_excluding(
     if *id == root_snapshot_id() || hub.caches.committed(project, id) {
         return Ok(vec![*id]);
     }
-    let gce = hub.caches.gc_epoch(project);
     // Read no more than the answer (BUG-2510): a run hidden from a view is
     // projected to one id, so reading every row with that id to sort them
     // read the whole run. The projections are read only for an id that is
@@ -1249,7 +1246,7 @@ async fn resolve_stored_excluding(
         .await?
     };
     if rows.first().is_some_and(|r| r.1 == 0) {
-        hub.caches.put_committed_at(project, gce, id);
+        hub.caches.put_committed(project, id);
         return Ok(vec![*id]);
     }
     Ok(rows.iter().filter_map(|r| ObjectId::from_hex(&r.0).ok()).collect())
@@ -1429,7 +1426,6 @@ async fn own_projection_excluding(
             }
         }
         if !need_db.is_empty() {
-            let gce = hub.caches.gc_epoch(project.id);
             let need_hex: Vec<String> = need_db.iter().map(ObjectId::hex).collect();
             let stored: Vec<(String, String, bool)> = sqlx::query_as(
                 "SELECT real_id, projected_id, collapsed FROM projections WHERE project_id = $1 AND view_key = $2 AND real_id = ANY($3)",
@@ -1441,7 +1437,7 @@ async fn own_projection_excluding(
             .await?;
             for (r_hex, pp_hex, collapsed) in stored {
                 if let (Ok(p0), Ok(pp)) = (ObjectId::from_hex(&r_hex), ObjectId::from_hex(&pp_hex)) {
-                    hub.caches.put_memo_row_at(project.id, gce, key, &p0, &pp, collapsed);
+                    hub.caches.put_memo_row(project.id, key, &p0, &pp, collapsed);
                     p0_proj.insert(p0, pp);
                 }
             }
@@ -1664,7 +1660,6 @@ async fn resolve_for_mode(
     let projected_somewhere = if hub.caches.committed(project.id, id) {
         return Ok(seen(*id).await?.then_some(*id));
     } else {
-        let gce = hub.caches.gc_epoch(project.id);
         let (stored, projected): (bool, bool) = sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM snapshots WHERE project_id = $1 AND id = $2), \
              EXISTS (SELECT 1 FROM projections WHERE project_id = $1 AND projected_id = $2)",
@@ -1682,7 +1677,7 @@ async fn resolve_for_mode(
         .fetch_one(&hub.db)
         .await?;
         if stored {
-            hub.caches.put_committed_at(project.id, gce, id);
+            hub.caches.put_committed(project.id, id);
             return Ok(seen(*id).await?.then_some(*id));
         }
         projected
@@ -1849,22 +1844,20 @@ async fn resolve_for_mode(
 /// as a line; past it, the change they stand on.
 pub const NEWEST_BOUND: usize = 4_096;
 
-/// Branch tips as `viewer` sees them: every branch, or (`only`) those of
-/// them named (`tips?branches=`, `docs/HUB.md` §13.41), each projected as
-/// in the full answer. The branch rows come from this server's memory for
-/// at most `caches::TIPS_TTL`, dropped at every push's notice; each
-/// viewer's projection is of their current view.
-pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, only: Option<&std::collections::BTreeSet<String>>) -> Result<Vec<(String, ObjectId)>> {
-    use crate::caches::TipsLookup;
+/// Read a project's raw branch + current-lineage `@tested` rows from
+/// `caches.tips` (serving cached rows within `caches::TIPS_TTL`, coalescing
+/// concurrent misses, and dropping on `tips_moved` notices).
+pub(crate) async fn cached_branch_rows(hub: &Arc<Hub>, project_id: i64) -> Result<crate::caches::BranchRows> {
+    use crate::caches::{BranchRow, TipsLookup};
     let asked = std::time::Instant::now();
-    let rows = loop {
-        match hub.caches.tips(project.id) {
-            TipsLookup::Hit(rows) => break rows,
+    loop {
+        match hub.caches.tips(project_id) {
+            TipsLookup::Hit(rows) => return Ok(rows),
             TipsLookup::Wait(done) => {
                 let woken = done.woken().notified();
                 tokio::pin!(woken);
                 woken.as_mut().enable();
-                if hub.caches.tips_reading(project.id, &done) {
+                if hub.caches.tips_reading(project_id, &done) {
                     // A read whose request was dropped never wakes anyone:
                     // after TIPS_TTL the next asker reads.
                     let _ = tokio::time::timeout(crate::caches::TIPS_TTL, woken).await;
@@ -1872,41 +1865,92 @@ pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, only: Opti
                 // A read that started after this request answers it, kept
                 // or not (BUG-2460).
                 if let Some(rows) = done.rows_for(asked) {
-                    break rows;
+                    return Ok(rows);
                 }
             }
             TipsLookup::Read(read) => {
                 let at = std::time::Instant::now();
-                let r: std::result::Result<Vec<(String, String)>, sqlx::Error> =
-                    sqlx::query_as("SELECT name, target FROM branches WHERE project_id = $1 ORDER BY name")
-                        .bind(project.id)
-                        .fetch_all(&hub.db)
-                        .await;
+                type RawBranchRow = (String, String, Option<String>, Option<String>);
+                let r: std::result::Result<Vec<RawBranchRow>, sqlx::Error> = sqlx::query_as(
+                    "SELECT b.name, b.target, \
+                     CASE WHEN t.lineage = b.lineage THEN t.snapshot ELSE NULL END, \
+                     b.hidden_for_embargo \
+                     FROM branches b \
+                     LEFT JOIN tested t ON t.project_id = b.project_id AND t.branch = b.name \
+                     WHERE b.project_id = $1 ORDER BY b.name",
+                )
+                .bind(project_id)
+                .fetch_all(&hub.db)
+                .await;
                 match r {
-                    Ok(rows) => break hub.caches.put_tips(project.id, read, at, rows),
+                    Ok(rows) => {
+                        let rows = rows
+                            .into_iter()
+                            .map(|(name, target, tested, hidden_for_embargo)| BranchRow {
+                                name,
+                                target,
+                                tested,
+                                hidden_for_embargo,
+                            })
+                            .collect();
+                        return Ok(hub.caches.put_tips(project_id, read, at, rows));
+                    }
                     Err(e) => {
-                        hub.caches.tips_failed(project.id, read);
+                        hub.caches.tips_failed(project_id, read);
                         return Err(e.into());
                     }
                 }
             }
         }
-    };
-    let named: Vec<(String, String)>;
-    let rows: &[(String, String)] = match only {
-        Some(only) => {
-            named = rows.iter().filter(|(name, _)| only.contains(name)).cloned().collect();
-            &named
-        }
-        None => rows.as_slice(),
-    };
-    let rows = crate::embargo::filter_branches(hub, project, viewer, rows).await?;
-    let mut out = Vec::new();
-    for (name, target) in rows.iter() {
-        let real = ObjectId::from_hex(target).map_err(|e| Error::Other(e.into()))?;
-        out.push((name.clone(), projected(hub, project, viewer, real).await?));
+    }
+}
+
+/// Branch tips as `viewer` sees them: every branch, or (`only`) those of
+/// them named (`tips?branches=`, `docs/HUB.md` §13.41), each projected as
+/// in the full answer. The branch rows come from this server's memory for
+/// at most `caches::TIPS_TTL`, dropped at every push's notice; each
+/// viewer's projection is of their current view.
+pub async fn tips(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, only: Option<&std::collections::BTreeSet<String>>) -> Result<Vec<(String, ObjectId)>> {
+    let rows = cached_branch_rows(hub, project.id).await?;
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .filter(|r| only.is_none_or(|o| o.contains(&r.name)))
+        .map(|r| (r.name.clone(), r.target.clone()))
+        .collect();
+    let pairs = crate::embargo::filter_branches(hub, project, viewer, &pairs).await?;
+    let mut out = Vec::with_capacity(pairs.len());
+    for (name, target) in pairs {
+        let real = ObjectId::from_hex(&target).map_err(|e| Error::Other(e.into()))?;
+        out.push((name, projected(hub, project, viewer, real).await?));
     }
     Ok(out)
+}
+
+/// Branch tips and `<branch>@tested` pointers from the same cached
+/// `BranchRows` snapshot (`caches.tips`), with every embargo visibility check
+/// evaluated live (`embargo::filter_branches`, `embargo::can_see`,
+/// `embargo::is_withheld_in`).
+pub async fn tips_and_tested(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    epochs: &crate::caches::Epochs,
+    only: Option<&std::collections::BTreeSet<String>>,
+) -> Result<(Vec<(String, ObjectId)>, std::collections::BTreeMap<String, ObjectId>)> {
+    let rows = cached_branch_rows(hub, project.id).await?;
+    let pairs: Vec<(String, String)> = rows
+        .iter()
+        .filter(|r| only.is_none_or(|o| o.contains(&r.name)))
+        .map(|r| (r.name.clone(), r.target.clone()))
+        .collect();
+    let pairs = crate::embargo::filter_branches(hub, project, viewer, &pairs).await?;
+    let mut branches = Vec::with_capacity(pairs.len());
+    for (name, target) in pairs {
+        let real = ObjectId::from_hex(&target).map_err(|e| Error::Other(e.into()))?;
+        branches.push((name, projected(hub, project, viewer, real).await?));
+    }
+    let tested = crate::ci::tested_from_rows(hub, project, viewer, epochs, &rows, only).await?;
+    Ok((branches, tested))
 }
 
 /// The snapshots reachable from `tips` in `viewer`'s projected history,
@@ -3567,7 +3611,6 @@ async fn push_staged(
     if req.force && viewer.agent {
         return Err(agent_refusal("an agent session never forces a branch move"));
     }
-    let gc_epoch = crate::pack_gc::push_gc_epoch(hub, project.id, who.epochs.gc).await?;
     if req.updates.len() > MAX_PUSH_UPDATES {
         return Err(Error::bad_request(format!("at most {MAX_PUSH_UPDATES} branch updates per push")));
     }
@@ -4348,7 +4391,6 @@ async fn push_staged(
         let embargo_snaps = embargo_snaps2.clone();
         let tx_packs = tx_packs.clone();
         Box::pin(async move {
-            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             for q in &queued {
                 crate::landing::insert(&mut *c, pid, &who, q).await?;
             }

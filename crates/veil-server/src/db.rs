@@ -85,6 +85,10 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (40, "packs_unlisted", include_str!("../migrations/0040_packs_unlisted.sql")),
     (41, "packs_listed", include_str!("../migrations/0041_packs_listed.sql")),
     (42, "projections_by_projected_at", include_str!("../migrations/0042_projections_by_projected_at.sql")),
+    (43, "drop_hot_fks", include_str!("../migrations/0043_drop_hot_fks.sql")),
+    (44, "prune_repair_indexes", include_str!("../migrations/0044_prune_repair_indexes.sql")),
+    (45, "person_epochs", include_str!("../migrations/0045_person_epochs.sql")),
+    (46, "single_repo_hash_keys", include_str!("../migrations/0046_single_repo_hash_keys.sql")),
 ];
 
 pub async fn connect(url: &str, max: u32) -> anyhow::Result<PgPool> {
@@ -194,12 +198,16 @@ pub async fn schema_current(pool: &PgPool) -> anyhow::Result<bool> {
 }
 
 async fn schema_current_in(pool: &PgPool) -> Result<bool> {
+    schema_current_through_in(pool, None).await
+}
+
+async fn schema_current_through_in(pool: &PgPool, max_version: Option<i64>) -> Result<bool> {
     let table: Option<String> = sqlx::query_scalar("SELECT to_regclass('schema_migrations')::text").fetch_one(pool).await?;
     if table.is_none() {
         return Ok(false);
     }
     let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM schema_migrations").fetch_all(pool).await?;
-    Ok(MIGRATIONS.iter().all(|(v, _, _)| applied.contains(v)))
+    Ok(MIGRATIONS.iter().filter(|(v, _, _)| max_version.is_none_or(|max| *v <= max)).all(|(v, _, _)| applied.contains(v)))
 }
 
 /// Apply every migration not applied yet (BUG-838).
@@ -213,7 +221,15 @@ async fn schema_current_in(pool: &PgPool) -> Result<bool> {
 ///
 /// `veil-server migrate` runs it on its own, before servers start.
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    migrate_with(pool, None).await
+    migrate_with_options(pool, None, false, None).await
+}
+
+/// Apply every migration, permitting offline maintenance migrations that
+/// rebuild existing tables (such as migration 0046 on an existing hash-sharded
+/// YugabyteDB database). Every `veil-server` instance must be stopped before
+/// running `veil-server migrate --offline` (BUG-2920, BUG-2931).
+pub async fn migrate_offline(pool: &PgPool) -> anyhow::Result<()> {
+    migrate_with_options(pool, None, true, None).await
 }
 
 /// What [`migrate_with`] runs after each online index build returns, before
@@ -226,10 +242,28 @@ pub type AfterBuild = dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>>
 /// left incomplete, as YugabyteDB's did (BUG-2571), made at will.
 #[doc(hidden)]
 pub async fn migrate_with(pool: &PgPool, after_build: Option<&AfterBuild>) -> anyhow::Result<()> {
+    migrate_with_options(pool, after_build, false, None).await
+}
+
+/// [`migrate`], applying only migrations up to `max_version` (inclusive).
+/// For tests only (`startup::bug_2482_…`, `startup::s3rd3_migration_21_…`):
+/// lets YugabyteDB tests exercise online migrations through 45 before
+/// verifying that migration 46 requires [`migrate_offline`] (BUG-2931).
+#[doc(hidden)]
+pub async fn migrate_through(pool: &PgPool, max_version: i64) -> anyhow::Result<()> {
+    migrate_with_options(pool, None, false, Some(max_version)).await
+}
+
+async fn migrate_with_options(
+    pool: &PgPool,
+    after_build: Option<&AfterBuild>,
+    offline: bool,
+    max_version: Option<i64>,
+) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + MIGRATION_DEADLINE;
     let mut check_attempt: u32 = 0;
     loop {
-        match schema_current_in(pool).await {
+        match schema_current_through_in(pool, max_version).await {
             Ok(true) => return Ok(()),
             Ok(false) => break,
             Err(e) if e.is_retryable() && tokio::time::Instant::now() < deadline => {
@@ -275,7 +309,7 @@ pub async fn migrate_with(pool: &PgPool, after_build: Option<&AfterBuild>) -> an
             }
         }
     }
-    let r = migrate_locked(&mut c, deadline, after_build).await;
+    let r = migrate_locked(&mut c, deadline, after_build, offline, max_version).await;
     // The lock is the session's: release it, and reset the online index
     // steps' timeouts in case a step's own reset failed
     // (`online_index_step`), or close the connection so that neither goes
@@ -292,15 +326,27 @@ pub async fn migrate_with(pool: &PgPool, after_build: Option<&AfterBuild>) -> an
 /// DDL can still lose a race with other databases' catalog changes on
 /// YugabyteDB (the catalog is shared): each step runs again, within the
 /// deadline, on a retryable error.
-async fn migrate_locked(c: &mut PgConnection, deadline: tokio::time::Instant, after_build: Option<&AfterBuild>) -> anyhow::Result<()> {
+async fn migrate_locked(
+    c: &mut PgConnection,
+    deadline: tokio::time::Instant,
+    after_build: Option<&AfterBuild>,
+    offline: bool,
+    max_version: Option<i64>,
+) -> anyhow::Result<()> {
     let mut attempt: u32 = 0;
     // Per-index completed build counts persist across retryable restarts of
     // `migrate_once` so no index is built more than `BUILD_ATTEMPTS` times
     // in one start (BUG-2625).
     let mut builds: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    // Whether this lock hold created the schema from nothing (`schema_migrations`
+    // absent or empty when `migrate_once` first inspected it). Persisted across
+    // retryable restarts within the same `MIGRATION_LOCK` hold so a fresh-DB
+    // bootstrap that retries a transient YB 40001 mid-migration-46 still knows
+    // it created the schema itself and no earlier server can be writing (BUG-2931).
+    let mut created_from_scratch: Option<bool> = None;
     loop {
         attempt += 1;
-        match migrate_once(&mut *c, deadline, after_build, &mut builds).await {
+        match migrate_once(&mut *c, deadline, after_build, &mut builds, offline, max_version, &mut created_from_scratch).await {
             Ok(()) => return Ok(()),
             Err(e) if e.is_retryable() && tokio::time::Instant::now() < deadline => {
                 eprintln!("veil-server: migrating, retrying: {e:?}");
@@ -318,6 +364,9 @@ async fn migrate_once(
     deadline: tokio::time::Instant,
     after_build: Option<&AfterBuild>,
     builds: &mut std::collections::HashMap<String, u32>,
+    offline: bool,
+    max_version: Option<i64>,
+    created_from_scratch: &mut Option<bool>,
 ) -> Result<()> {
     let table: Option<String> = sqlx::query_scalar("SELECT to_regclass('schema_migrations')::text").fetch_one(&mut *c).await?;
     if table.is_none() {
@@ -326,58 +375,312 @@ async fn migrate_once(
             .await?;
     }
     let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM schema_migrations").fetch_all(&mut *c).await?;
+    let from_scratch = *created_from_scratch.get_or_insert_with(|| table.is_none() || applied.is_empty());
     let mut yugabyte = None;
     for &(version, name, sql) in MIGRATIONS {
+        if max_version.is_some_and(|max| version > max) {
+            continue;
+        }
         if applied.contains(&version) {
             continue;
         }
         eprintln!("veil-server: applying migration {version} ({name})");
         let parts = migration_parts(sql).map_err(|e| Error::Other(anyhow::anyhow!("migration {version} ({name}): {e}")))?;
         let record = "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)";
-        if parts.online.is_empty() {
-            // Each migration in its own transaction. Migration files are
-            // idempotent (`IF NOT EXISTS`): YugabyteDB applies DDL in a
-            // transaction block statement by statement unless transactional
-            // DDL is enabled, so a migration interrupted half-way is applied
-            // again from the start.
-            let mut tx = sqlx::Connection::begin(&mut *c).await?;
-            sqlx::raw_sql(sql).execute(&mut *tx).await?;
-            sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *tx).await?;
-            tx.commit().await?;
+        if parts.yugabyte_only {
+            let yb = match yugabyte {
+                Some(yb) => yb,
+                None => {
+                    let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&mut *c).await?;
+                    *yugabyte.insert(is_yugabyte(&version))
+                }
+            };
+            if yb {
+                // Colocated YugabyteDB databases reject hash-partitioned DDL
+                // (`cannot colocate hash partitioned table`, BUG-2921): skip
+                // hash-sharding migrations on colocated databases and record
+                // them as applied, matching PostgreSQL.
+                let colocated: bool = sqlx::query_scalar("SELECT yb_is_database_colocated()").fetch_one(&mut *c).await?;
+                if !colocated {
+                    if version == 46 {
+                        // Migration 46 rebuilds hot tables outside a transaction
+                        // and is never rolling-upgrade safe on an existing database,
+                        // even if those tables happen to be empty (BUG-2920, BUG-2931).
+                        // Allow it without `--offline` only when this same lock hold
+                        // created the schema from nothing (applying migration 1 itself).
+                        if !offline && !from_scratch {
+                            return Err(Error::Other(anyhow::anyhow!(
+                                "migration 46 (0046_single_repo_hash_keys) rebuilds hot tables on an existing hash-sharded \
+                                 YugabyteDB database and is not rolling-upgrade safe: stop all veil-server instances and run \
+                                 `veil-server migrate --offline`"
+                            )));
+                        }
+                        yugabyte_only_steps(&mut *c, parts.transactional, deadline).await?;
+                        verify_rebuilt_indexes(&mut *c, deadline).await?;
+                    } else {
+                        yugabyte_only_steps(&mut *c, parts.transactional, deadline).await?;
+                    }
+                }
+            }
+            sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
             continue;
         }
-        // The statements before the online section in one transaction, not
-        // recorded; then the online index steps one by one; then the
+        let steps = migration_steps(parts.transactional);
+        if parts.online.is_empty() {
+            // Each step in its own committed transaction; the final step
+            // records `schema_migrations` atomically with its statements.
+            // Multi-step migrations (separated by `-- veil: step`) commit
+            // earlier DDL/triggers before later backfill steps so concurrent
+            // pre-migration sessions cannot miss the new triggers (BUG-2922).
+            // Migration files are idempotent (`IF NOT EXISTS`): YugabyteDB
+            // applies DDL in a transaction block statement by statement unless
+            // transactional DDL is enabled, so a migration interrupted half-way
+            // is applied again from the start.
+            let last = steps.len().saturating_sub(1);
+            for (i, step) in steps.iter().enumerate() {
+                let mut tx = sqlx::Connection::begin(&mut *c).await?;
+                sqlx::raw_sql(step).execute(&mut *tx).await?;
+                if i == last {
+                    sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+            }
+            if steps.is_empty() {
+                sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
+            }
+            continue;
+        }
+        // The statements before the online section in committed transaction(s),
+        // not recorded; then the online index steps one by one; then the
         // record. A migration that fails anywhere is not recorded and is
         // applied again from the start (both parts are idempotent).
-        if has_statements(parts.transactional) {
+        for step in &steps {
             let mut tx = sqlx::Connection::begin(&mut *c).await?;
-            sqlx::raw_sql(parts.transactional).execute(&mut *tx).await?;
+            sqlx::raw_sql(step).execute(&mut *tx).await?;
             tx.commit().await?;
         }
         let yb = match yugabyte {
             Some(yb) => yb,
             None => {
                 let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&mut *c).await?;
-                let yb = is_yugabyte(&version);
-                if yb {
-                    // YugabyteDB's online build holds every row only while it
-                    // waits for every backend to see each stage of the index.
-                    let off: Option<String> =
-                        sqlx::query_scalar("SELECT current_setting('yb_disable_wait_for_backends_catalog_version', true)").fetch_one(&mut *c).await?;
-                    if off.as_deref() == Some("on") {
-                        return Err(Error::Other(anyhow::anyhow!(
-                            "this YugabyteDB runs with yb_disable_wait_for_backends_catalog_version on, so an index built online \
-                             could miss rows written during its build: set it off (its default) to migrate"
-                        )));
-                    }
-                }
-                *yugabyte.insert(yb)
+                *yugabyte.insert(is_yugabyte(&version))
             }
         };
+        if yb {
+            // YugabyteDB's online build holds every row only while it
+            // waits for every backend to see each stage of the index.
+            let off: Option<String> =
+                sqlx::query_scalar("SELECT current_setting('yb_disable_wait_for_backends_catalog_version', true)").fetch_one(&mut *c).await?;
+            if off.as_deref() == Some("on") {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "this YugabyteDB runs with yb_disable_wait_for_backends_catalog_version on, so an index built online \
+                     could miss rows written during its build: set it off (its default) to migrate"
+                )));
+            }
+        }
         online_index_steps(&mut *c, yb, &parts.online, deadline, after_build, builds).await?;
         sqlx::query(record).bind(version).bind(name).bind(veil_core::now_millis()).execute(&mut *c).await?;
     }
+    Ok(())
+}
+
+/// Split a migration's SQL at [`YUGABYTE_STEP`] (`-- veil: step`) lines,
+/// dropping empty or comment-only chunks.
+pub fn migration_steps(sql: &str) -> Vec<String> {
+    let mut step = String::new();
+    let mut steps = Vec::new();
+    for line in sql.lines() {
+        if line.trim() == YUGABYTE_STEP {
+            if has_statements(&step) {
+                steps.push(std::mem::take(&mut step));
+            } else {
+                step.clear();
+            }
+        } else {
+            step.push_str(line);
+            step.push('\n');
+        }
+    }
+    if has_statements(&step) {
+        steps.push(step);
+    }
+    steps
+}
+
+/// Run a [`YUGABYTE_ONLY`] migration's [`YUGABYTE_STEP`]-delimited steps one by
+/// one outside a transaction block, under the remaining migration deadline's
+/// statement and lock timeouts (resetting both afterwards).
+async fn yugabyte_only_steps(c: &mut PgConnection, sql: &str, deadline: tokio::time::Instant) -> Result<()> {
+    let steps = migration_steps(sql);
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(STATEMENT_TIMEOUT);
+    let ms = left.as_millis();
+    sqlx::raw_sql(&format!("SET statement_timeout = {ms}; SET lock_timeout = {ms}")).execute(&mut *c).await?;
+    let mut res = Ok(());
+    for s in &steps {
+        if let Err(e) = sqlx::raw_sql(s).execute(&mut *c).await {
+            res = Err(Error::from(e));
+            break;
+        }
+    }
+    let reset = sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout").execute(&mut *c).await;
+    res?;
+    reset?;
+    Ok(())
+}
+
+/// The eleven hot tables rebuilt by migration 0046 (`0046_single_repo_hash_keys.sql`)
+/// on hash-sharded YugabyteDB databases, with their required primary key index
+/// name and composite hash key fragment (BUG-2932).
+const Q4_REBUILT_PKS: &[(&str, &str, &str)] = &[
+    ("branches", "branches_pkey", "(project_id, name) HASH"),
+    ("snapshots", "snapshots_pkey", "(project_id, id) HASH"),
+    ("origins", "origins_pkey", "(project_id, real_id) HASH"),
+    ("projections", "projections_pkey", "(project_id, view_key, real_id) HASH"),
+    ("landed_changes", "landed_changes_pkey", "(project_id, branch) HASH"),
+    ("landing_queue", "landing_queue_pkey", "(project_id, branch) HASH"),
+    ("landings", "landings_pkey", "(project_id, branch) HASH"),
+    ("landing_leases", "landing_leases_pkey", "(project_id, branch) HASH"),
+    ("packs", "packs_pkey", "(project_id, name) HASH"),
+    ("change_refs", "change_refs_pkey", "(project_id, change_id) HASH"),
+    ("access_epochs", "access_epochs_pkey", "(project_id, person_id) HASH"),
+];
+
+/// Every required secondary index created by migration 0046
+/// (`0046_single_repo_hash_keys.sql`) on the rebuilt tables:
+/// `(table_name, index_name, is_unique)` (BUG-2932).
+const Q4_EXPECTED_INDEXES: &[(&str, &str, bool)] = &[
+    ("branches", "branches_by_project", false),
+    ("branches", "branches_hidden_embargo", false),
+    ("landing_queue", "landing_queue_active_state", false),
+    ("landing_queue", "landing_queue_finished", false),
+    ("landing_queue", "landing_queue_person_slot", true),
+    ("landing_queue", "landing_queue_queued", false),
+    ("landing_queue", "landing_queue_session_slot", true),
+    ("landing_queue", "landing_queue_ticket", true),
+    ("landings", "landings_at", false),
+    ("landings", "landings_landed", false),
+    ("packs", "packs_listed", false),
+    ("packs", "packs_unlisted", false),
+    ("projections", "projections_by_projected_at", false),
+    ("projections", "projections_by_view_v2", false),
+];
+
+/// On YugabyteDB: verify that every expected composite-hash primary key and
+/// every expected secondary/UNIQUE index on the eleven tables rebuilt by
+/// migration 0046 exists, reads live/ready/valid, and passes `yb_index_check`
+/// before recording the migration (BUG-2920 / BUG-2626 / BUG-2932).
+async fn verify_rebuilt_indexes(c: &mut PgConnection, deadline: tokio::time::Instant) -> Result<()> {
+    let tables: Vec<&str> = Q4_REBUILT_PKS.iter().map(|(t, _, _)| *t).collect();
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(STATEMENT_TIMEOUT);
+    let ms = left.as_millis();
+    sqlx::raw_sql(&format!("SET statement_timeout = {ms}; SET lock_timeout = {ms}")).execute(&mut *c).await?;
+    let res = async {
+        let pks: Vec<(String, String, bool, String)> = sqlx::query_as(
+            "SELECT t.relname::text, c.relname::text, (i.indislive AND i.indisready AND i.indisvalid), \
+                    pg_get_indexdef(i.indexrelid) \
+             FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = current_schema() \
+               AND i.indisprimary \
+               AND t.relname = ANY($1)",
+        )
+        .bind(&tables)
+        .fetch_all(&mut *c)
+        .await?;
+        let pk_map: std::collections::HashMap<String, (String, bool, String)> =
+            pks.into_iter().map(|(tbl, idx, built, def)| (tbl, (idx, built, def))).collect();
+
+        let indexes: Vec<(String, String, bool, bool)> = sqlx::query_as(
+            "SELECT t.relname::text, c.relname::text, i.indisunique, (i.indislive AND i.indisready AND i.indisvalid) \
+             FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = current_schema() \
+               AND NOT i.indisprimary \
+               AND t.relname = ANY($1) \
+             ORDER BY c.relname",
+        )
+        .bind(&tables)
+        .fetch_all(&mut *c)
+        .await?;
+        let idx_map: std::collections::HashMap<(&str, &str), (bool, bool)> =
+            indexes.iter().map(|(tbl, name, uniq, built)| ((tbl.as_str(), name.as_str()), (*uniq, *built))).collect();
+
+        let mut problems: Vec<String> = Vec::new();
+        for &(table, pk_name, hash_fragment) in Q4_REBUILT_PKS {
+            match pk_map.get(table) {
+                None => problems.push(format!("{table}.{pk_name} (missing primary key)")),
+                Some((actual_name, built, def)) => {
+                    if actual_name != pk_name {
+                        problems.push(format!("{table}.{pk_name} (found primary key {actual_name})"));
+                    }
+                    if !built {
+                        problems.push(format!("{table}.{actual_name} (primary key is not live, ready, and valid)"));
+                    }
+                    if !def.contains(hash_fragment) {
+                        problems.push(format!("{table}.{actual_name} (primary key lacks `{hash_fragment}`: {def})"));
+                    }
+                }
+            }
+        }
+        for &(table, name, expect_unique) in Q4_EXPECTED_INDEXES {
+            match idx_map.get(&(table, name)) {
+                None => {
+                    let kind = if expect_unique { "UNIQUE index" } else { "index" };
+                    problems.push(format!("{name} on {table} (missing required {kind})"));
+                }
+                Some(&(is_unique, built)) => {
+                    if is_unique != expect_unique {
+                        let expected = if expect_unique { "UNIQUE" } else { "non-UNIQUE" };
+                        problems.push(format!("{name} on {table} (expected {expected})"));
+                    }
+                    if !built {
+                        problems.push(format!("{name} on {table} (not live, ready, and valid)"));
+                    }
+                }
+            }
+        }
+        for (table, name, _, built) in &indexes {
+            if !built && !Q4_EXPECTED_INDEXES.iter().any(|&(t, n, _)| t == table && n == name) {
+                problems.push(format!("{name} on {table} (not live, ready, and valid)"));
+            }
+        }
+        if !problems.is_empty() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "migration 46 index verification failed: {}; recreate the missing or invalid index(es) from \
+                 0046_single_repo_hash_keys.sql (dropping any invalid copy first) and re-run `veil-server migrate --offline`",
+                problems.join(", ")
+            )));
+        }
+
+        for (_, name, _, _) in &indexes {
+            if let Err(e) = sqlx::query("SELECT yb_index_check(to_regclass($1))").bind(name).execute(&mut *c).await {
+                let code = e.as_database_error().and_then(|d| d.code()).map(|code| code.into_owned());
+                return Err(match code.as_deref() {
+                    Some("XX002") => Error::Other(anyhow::anyhow!(
+                        "migration 46 rebuilt index {name} failed yb_index_check ({e}): drop and recreate it from \
+                         0046_single_repo_hash_keys.sql, then re-run `veil-server migrate --offline`"
+                    )),
+                    Some("57014" | "55P03") => Error::Other(anyhow::anyhow!(
+                        "checking rebuilt index {name} against its table did not finish within {MIGRATION_DEADLINE:?} ({e}): \
+                         the migration is not recorded, and the next `veil-server migrate --offline` checks again"
+                    )),
+                    Some("42883") => Error::Other(anyhow::anyhow!(
+                        "this YugabyteDB has no yb_index_check ({e}), so rebuilt index {name} cannot be verified against its table"
+                    )),
+                    _ => Error::from(e),
+                });
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let reset = sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout").execute(&mut *c).await;
+    res?;
+    reset?;
     Ok(())
 }
 
@@ -439,12 +742,26 @@ async fn migrate_once(
 /// (no server writes a table it does not know): it stays in the transaction.
 pub const ONLINE_INDEXES: &str = "-- veil: online indexes";
 
-/// A migration's statements: those applied in one transaction, then its
-/// [`ONLINE_INDEXES`] steps.
+/// First line of a migration whose SQL uses YugabyteDB-only hash-sharding DDL
+/// (such as composite hash keys `PRIMARY KEY ((a, b) HASH)`). On PostgreSQL
+/// (`!is_yugabyte(version)`) and on colocated YugabyteDB databases
+/// (`yb_is_database_colocated()`, BUG-2921) the runner skips executing the SQL
+/// and records the migration as applied; on non-colocated YugabyteDB its
+/// [`YUGABYTE_STEP`]-delimited steps run one by one outside a transaction block.
+pub const YUGABYTE_ONLY: &str = "-- veil: yugabyte-only";
+
+/// Step boundary inside a [`YUGABYTE_ONLY`] migration: each step runs as its
+/// own top-level query outside a transaction block.
+pub const YUGABYTE_STEP: &str = "-- veil: step";
+
+/// A migration's statements: those applied in one transaction (or step by step
+/// on YugabyteDB when `yugabyte_only` is set), then its [`ONLINE_INDEXES`]
+/// steps.
 #[derive(Debug)]
 pub struct MigrationParts<'a> {
     pub transactional: &'a str,
     pub online: Vec<IndexStep>,
+    pub yugabyte_only: bool,
 }
 
 /// One step of a migration's [`ONLINE_INDEXES`] section.
@@ -459,10 +776,14 @@ pub enum IndexStep {
 /// Split a migration at its [`ONLINE_INDEXES`] line, and read its steps;
 /// what the section holds that is not a step is refused.
 pub fn migration_parts(sql: &str) -> std::result::Result<MigrationParts<'_>, String> {
+    let yugabyte_only = sql.lines().next().is_some_and(|l| l.trim() == YUGABYTE_ONLY);
     let at = sql.match_indices(ONLINE_INDEXES).map(|(i, _)| i).find(|&i| i == 0 || sql.as_bytes()[i - 1] == b'\n');
     let Some(at) = at else {
-        return Ok(MigrationParts { transactional: sql, online: Vec::new() });
+        return Ok(MigrationParts { transactional: sql, online: Vec::new(), yugabyte_only });
     };
+    if yugabyte_only {
+        return Err("a yugabyte-only migration may not hold an online indexes section".into());
+    }
     let rest = &sql[at..];
     let section = rest.split_once('\n').map_or("", |(_, after)| after);
     if section.lines().any(|l| l.trim_start().starts_with(ONLINE_INDEXES)) {
@@ -504,7 +825,7 @@ pub fn migration_parts(sql: &str) -> std::result::Result<MigrationParts<'_>, Str
     if online.is_empty() {
         return Err("an online indexes section with no step".into());
     }
-    Ok(MigrationParts { transactional: &sql[..at], online })
+    Ok(MigrationParts { transactional: &sql[..at], online, yugabyte_only })
 }
 
 /// Whether `sql` holds anything but blank lines and `--` comments.

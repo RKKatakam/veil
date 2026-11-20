@@ -5718,8 +5718,8 @@ transaction per landing instead of 23.
    by the batch waiting for it once it is 2 s old and its writer's lock is
    free. Writers wait for one another on the gate as before (an exclusive
    lock among writers only).
-   Every transaction takes its locks in this order: the GC guard
-   (`pack_gc::guard_root_write`), the landing lease's row, branch rows, the
+   Every transaction takes its locks in this order: the landing lease's
+   row, branch rows, the
    review gate, then the rows it writes (queue rows, PRs, snapshots, the
    project's row); nothing that holds the gate waits for a lease or a
    branch row, so no cycle is possible through them. A transaction that
@@ -6036,7 +6036,7 @@ Design: [`docs/design/server/storage-and-cost.md` §8](design/server/storage-and
   * `sweep_staged` discards stale `STAGED` rows (`state = 0 AND (person_id IS NULL OR created_at <= cutoff)`) via `Objects::discard`. `Packs::discard` tombstones its in-memory `staged` cache only for names actually transitioned from `STAGED` to `DISCARDED` by `UPDATE ... RETURNING name` (BUG-2770).
   * `sweep_discarded` deletes up to `MAX_SWEEP_PER_PASS` (256) `DISCARDED` containers past `pack_grace_ms` (`AT_ONCE = 32` storage deletes at a time, followed by deleting their `packs` rows).
   * `sweep_scan` runs at server start-up and every `SWEEP_SCAN` (10 min), querying the partial index `packs_unlisted` (migration 40) to start `schedule_sweep` for any project with stale `STAGED` or `DISCARDED` containers so abandoned uploads are swept without waiting for a push (BUG-2280). `Running::stop` stops and waits for background derivers, viewer-graph fills, search indexers, and sweepers (`derive::stop`, `query::graph::stop`, `search::index::stop`, `pack_gc::stop`, BUG-2635).
-* **Inert GC epoch & root writers' gate.** The per-project GC epoch row (`access_epochs (project_id, -1)`) and root writers' gate (`GUARD_SQL`, `guard_root_write`) remain in place and inert in v1: nothing ever raises the epoch.
+* **No GC epoch or root writers' gate.** Because storage is append-only in v1, the per-project GC epoch (`access_epochs (project_id, -1)`) and root writers' gate were removed; any pre-existing `person_id = -1` rows in `access_epochs` are unused.
 * **Entry-kind validation kept (BUG-2622).** `sync::check_changes` (and API commits in `changes.rs`) still refuse any file or symlink entry or conflict term whose object is not a blob or sealed envelope, any directory entry whose object is not a tree, and any conflict entry whose object is not a conflict (`400`, naming the path).
 * **Paged read resilience for pre-existing large packs (BUG-2771).** `Packs::bisect_slots` propagates missing range reads (`Ok(None)`) cleanly as `Ok(false)` so `stored_slots` returns `Ok(None)` instead of an internal `500` error.
 

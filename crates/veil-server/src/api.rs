@@ -717,10 +717,6 @@ async fn create_project(State(hub): State<HubState>, caller: Caller, Path(name):
                 .bind(me.id)
                 .execute(&mut *c)
                 .await?;
-            sqlx::query("INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) VALUES ($1, -1, 0, 0) ON CONFLICT (project_id, person_id) DO NOTHING")
-                .bind(id)
-                .execute(&mut *c)
-                .await?;
             Ok(())
         })
     })
@@ -762,9 +758,9 @@ async fn tips(State(hub): State<HubState>, caller: Caller, Path(p): Path<String>
         o.insert(project.default_branch.clone());
         o
     });
-    let branches = sync::tips(&hub, &project, &viewer, only.as_ref()).await?.into_iter().collect();
-    let tested = crate::ci::all_tested_for(&hub, &project, &viewer, only.as_ref()).await?;
-    let embargoes = crate::embargo::embargoes_for(&hub, &project, &viewer).await?;
+    let (branches, tested) = sync::tips_and_tested(&hub, &project, &viewer, &epochs, only.as_ref()).await?;
+    let branches = branches.into_iter().collect();
+    let embargoes = crate::embargo::embargoes_for_at(&hub, &project, &viewer, &epochs).await?;
     let grants = crate::grant::for_tips(&hub, &project, &viewer, &caller, epochs, &branches).await?;
     Ok(Json(Tips {
         grants,

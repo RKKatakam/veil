@@ -101,7 +101,7 @@ for v in SIZE_HUB SIZE_LB SIZE_DRIVER SIZE_DB SIZE_OBJECTS SIZE_CACHE; do
     [[ "${!v}" =~ ^[a-z][a-z0-9]*-[a-z]+-[0-9]+$ ]] || bad "invalid VEIL_GCP_$v '${!v}' (a predefined machine type, as c2d-standard-16)"
 done
 [[ "$HUBS" =~ ^[123]$ ]] || bad "invalid VEIL_GCP_HUBS '$HUBS' (1, 2 or 3 servers)"
-[[ "$YB_NODES" =~ ^[03]$ ]] || bad "invalid VEIL_GCP_YB_NODES '$YB_NODES' (0: PostgreSQL; 3: a three-node YugabyteDB cluster)"
+[[ "$YB_NODES" =~ ^[036]$ ]] || bad "invalid VEIL_GCP_YB_NODES '$YB_NODES' (0: PostgreSQL; 3 or 6: a three- or six-node YugabyteDB cluster)"
 [[ "$DRIVERS" =~ ^[1-9]$ ]] || bad "invalid VEIL_GCP_DRIVERS '$DRIVERS' (1 to 9)"
 [[ "$WITH_CACHE" =~ ^[01]$ ]] || bad "invalid VEIL_GCP_WITH_CACHE '$WITH_CACHE' (0 or 1)"
 [[ "$DB_CONNECTIONS" =~ ^[1-9][0-9]*$ ]] || bad "invalid VEIL_GCP_DB_CONNECTIONS '$DB_CONNECTIONS'"

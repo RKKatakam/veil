@@ -78,7 +78,22 @@ GATES_DIR=${GATES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 # setup's bursts, the merges and the deriver. 100 agents, 5 minutes.
 : "${SPACES_AGENTS:=100}" "${SPACES_RATE:=20}" "${SPACES_DURATION:=300}"
 
-GATES_ALL="pull land branches onerepo api landing agents scaling failover objects openscion scale spaces"
+# yb-scale: multi-project horizontal scaling across YugabyteDB nodes (3 vs 6).
+# Drives 60-100 projects across branches, landing, pull, api and land from
+# every driver at once. Reported by deploy/yb-scale-table.py (single run, or
+# 3-vs-6 >= 1.6x pass/fail verdict when YB_COMPARE_DIR is set).
+: "${YB_SCALE_PROJECTS:=60}" "${YB_SCALE_DURATION:=60}" "${YB_SCALE_PEOPLE:=60}"
+: "${YB_SCALE_BRANCH_CLIENTS:=300}" "${YB_SCALE_LANDING_CLIENTS:=300}"
+: "${YB_SCALE_PULL_CLIENTS:=300}" "${YB_SCALE_PULL_BACKGROUND:=0}"
+: "${YB_SCALE_API_CLIENTS:=120}" "${YB_SCALE_LAND_CLIENTS:=120}"
+# yb-onerepo: single-repository many-branch scaling across YugabyteDB nodes
+# (3 vs 6, from one driver so all agents share one project). Runs pure branch
+# pushes (the >= 1.6x 3->6 pass curve) and a separate --merge-every curve whose
+# serialized merges onto `main` are reported separately (informational).
+: "${YB_ONEREPO_DURATION:=60}" "${YB_ONEREPO_CLIENTS:=300}"
+: "${YB_ONEREPO_MERGE_CLIENTS:=300}" "${YB_ONEREPO_MERGE_EVERY:=5}"
+
+GATES_ALL="pull land branches onerepo api landing agents scaling yb-scale yb-onerepo failover objects openscion scale spaces"
 # The settings recorded beside every result (run.txt).
 GATE_SETTINGS="DURATION WARMUP PULL_CLIENTS PULL_BACKGROUND LAND_PROJECTS LAND_CLIENTS BRANCH_CLIENTS OBJECT_CLIENTS
  OPENSCION_FILES OPENSCION_RUNS SCALE_PROFILE SCALE_RUNS LANDING_AGENTS LANDING_PEOPLE LANDING_RATE LANDING_DURATIONS
@@ -86,7 +101,10 @@ GATE_SETTINGS="DURATION WARMUP PULL_CLIENTS PULL_BACKGROUND LAND_PROJECTS LAND_C
  SCALING_PULL_CLIENTS SCALING_BRANCH_CLIENTS SCALING_LANDING_PROJECTS SCALING_LANDING_CLIENTS FAILOVER_AGENTS
  FAILOVER_PEOPLE FAILOVER_RATE FAILOVER_DURATION FAILOVER_AFTER FAILOVER_HOW FAILOVER_SETTLE SPACES_AGENTS SPACES_RATE
  SPACES_DURATION AGENTS_COUNTS AGENTS_DURATION AGENTS_THINK AGENTS_TIME_SCALE AGENTS_SUBAGENTS AGENTS_LAND_EVERY
- ONEREPO_AGENTS ONEREPO_DURATION ONEREPO_TARGET"
+ ONEREPO_AGENTS ONEREPO_DURATION ONEREPO_TARGET YB_SCALE_PROJECTS YB_SCALE_DURATION YB_SCALE_PEOPLE
+ YB_SCALE_BRANCH_CLIENTS YB_SCALE_LANDING_CLIENTS YB_SCALE_PULL_CLIENTS YB_SCALE_PULL_BACKGROUND
+ YB_SCALE_API_CLIENTS YB_SCALE_LAND_CLIENTS YB_ONEREPO_DURATION YB_ONEREPO_CLIENTS
+ YB_ONEREPO_MERGE_CLIENTS YB_ONEREPO_MERGE_EVERY"
 
 db_one() { db_sql | head -1; }
 db_now_us() { echo "select (extract(epoch from clock_timestamp()) * 1000000)::bigint" | db_one; }
@@ -140,6 +158,15 @@ run_gate() {
                 bench driver "agents-$n" "${load[@]}" --duration "$AGENTS_DURATION" --mode agents --projects 1 --clients "$n" --think "$AGENTS_THINK" --time-scale "$AGENTS_TIME_SCALE" --subagents "$AGENTS_SUBAGENTS" --merge-every "$AGENTS_LAND_EVERY" --dir /work/agents --out "$R/agents-$n.json" "$@" || rc=1
             done ;;
         scaling) gate_scaling "$@" || rc=1 ;;
+        yb-scale)
+            bench drivers yb-scale-branches "${load[@]}" --duration "$YB_SCALE_DURATION" --mode branches --projects "$YB_SCALE_PROJECTS" --clients "$YB_SCALE_BRANCH_CLIENTS" --rates max --dir /work/yb-scale@D --out "$R/yb-scale-branches@D.json" "$@" || rc=1
+            bench drivers yb-scale-landing "${load[@]}" --duration "$YB_SCALE_DURATION" --mode landing --projects "$YB_SCALE_PROJECTS" --clients "$YB_SCALE_LANDING_CLIENTS" --people "$YB_SCALE_PEOPLE" --rates max --dir /work/yb-scale@D --out "$R/yb-scale-landing@D.json" "$@" || rc=1
+            bench drivers yb-scale-pull "${load[@]}" --duration "$YB_SCALE_DURATION" --mode pull --projects "$YB_SCALE_PROJECTS" --clients "$YB_SCALE_PULL_CLIENTS" --background "$YB_SCALE_PULL_BACKGROUND" --dir /work/yb-scale@D --out "$R/yb-scale-pull@D.json" "$@" || rc=1
+            bench drivers yb-scale-api "${load[@]}" --duration "$YB_SCALE_DURATION" --mode api --projects "$YB_SCALE_PROJECTS" --clients "$YB_SCALE_API_CLIENTS" --rates max --dir /work/yb-scale@D --out "$R/yb-scale-api@D.json" "$@" || rc=1
+            bench drivers yb-scale-land "${load[@]}" --duration "$YB_SCALE_DURATION" --mode land --projects "$YB_SCALE_PROJECTS" --clients "$YB_SCALE_LAND_CLIENTS" --rates max --dir /work/yb-scale@D --out "$R/yb-scale-land@D.json" "$@" || rc=1 ;;
+        yb-onerepo)
+            bench driver yb-onerepo-branches "${load[@]}" --duration "$YB_ONEREPO_DURATION" --mode branches --projects 1 --clients "$YB_ONEREPO_CLIENTS" --rates max --dir /work/yb-onerepo --out "$R/yb-onerepo-branches.json" "$@" || rc=1
+            bench driver yb-onerepo-merge "${load[@]}" --duration "$YB_ONEREPO_DURATION" --mode branches --projects 1 --clients "$YB_ONEREPO_MERGE_CLIENTS" --rates max --merge-every "$YB_ONEREPO_MERGE_EVERY" --dir /work/yb-onerepo-merge --out "$R/yb-onerepo-merge.json" "$@" || rc=1 ;;
         failover) gate_failover "$@" || rc=$? ;;
         # The three gates below start a server of their own beside the
         # deployment's, on the first server's machine (BUG-1591 for the cache).
@@ -256,6 +283,11 @@ gate_report() { # GATE, results directory
     case $1 in
         scaling) python3 "$GATES_DIR/scaling-table.py" "$2" > "$2/scaling.md" && cat "$2/scaling.md" ;;
         onerepo) python3 "$GATES_DIR/onerepo-table.py" --target "$ONEREPO_TARGET" --servers "$SERVERS" --server-vcpus "${SERVER_VCPUS:-0}" "$2" > "$2/onerepo.md" && cat "$2/onerepo.md" ;;
+        yb-scale|yb-onerepo)
+            local cmp=()
+            [ -n "${YB_COMPARE_DIR:-}" ] && cmp=(--compare "$YB_COMPARE_DIR")
+            python3 "$GATES_DIR/yb-scale-table.py" --gate "$1" "${cmp[@]+"${cmp[@]}"}" "$2" | tee "$2/$1.md"
+            return "${PIPESTATUS[0]}" ;;
         failover) python3 "$GATES_DIR/checks/failover-verdict.py" "$2" | tee "$2/failover-verdict.md"; return "${PIPESTATUS[0]}" ;;
         spaces) python3 "$GATES_DIR/checks/spaces-verdict.py" "$2" | tee "$2/spaces-verdict.md"; return "${PIPESTATUS[0]}" ;;
     esac

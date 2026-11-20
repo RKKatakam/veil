@@ -131,9 +131,6 @@ impl Error {
                     retry: Retry::None,
                 }
             }
-            Error::Other(e) if crate::pack_gc::gc_epoch_changed(&e) => {
-                Answer { status: StatusCode::SERVICE_UNAVAILABLE, code: "busy", message: BUSY_DB.into(), retry: Retry::GcEpoch }
-            }
             Error::Other(e) if crate::error::caused_by::<crate::sync::StagedUploadDiscarded>(&e) => Answer {
                 status: StatusCode::CONFLICT,
                 code: "conflict",
@@ -180,8 +177,6 @@ pub enum Retry {
     None,
     /// A retryable database error (`Error::is_retryable`).
     Db,
-    /// `pack_gc::GcEpochChanged` (`db::retry_requests` reruns the request).
-    GcEpoch,
 }
 
 /// The client-safe HTTP answer of an [`Error`] after logging internal detail
@@ -203,7 +198,6 @@ impl Answer {
                 message: self.message,
             },
             Retry::Db => Error::Other(anyhow::Error::new(RetryableDb)),
-            Retry::GcEpoch => Error::Other(anyhow::Error::new(crate::pack_gc::GcEpochChanged)),
         }
     }
 }
@@ -437,20 +431,6 @@ mod tests {
         assert_eq!(wrapped_idx.code, "busy");
         assert_eq!(wrapped_idx.message, crate::pack::IndexesFull.to_string());
         assert_eq!(wrapped_idx.retry, Retry::None);
-
-        // `GcEpochChanged` wrapped inside `VeilError::Io` (as `sync::Source` wraps object reads).
-        let wrapped_gc = Error::from(veil_core::VeilError::Io {
-            path: "object store".into(),
-            source: std::io::Error::other(AnyhowCause(anyhow::Error::new(crate::pack_gc::GcEpochChanged))),
-        });
-        let gc_ans = wrapped_gc.answer();
-        assert_eq!(gc_ans.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(gc_ans.code, "busy");
-        assert_eq!(gc_ans.retry, Retry::GcEpoch);
-        let gc_err = gc_ans.clone().into_error();
-        assert!(crate::pack_gc::is_gc_epoch_changed(&gc_err));
-        assert!(!gc_err.is_retryable());
-        assert!(gc_ans.into_response().extensions().get::<crate::db::Retryable>().is_some());
 
         const RPC: &str = "Timed out; Rpc timeout";
         let db_ans = Error::Db(sqlx::Error::Database(Box::new(YbError(RPC)))).answer();

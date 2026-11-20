@@ -409,54 +409,45 @@ pub async fn projected(
     reals: &[ObjectId],
 ) -> Result<HashMap<ObjectId, ObjectId>> {
     let pid = ask.project.id;
-    for attempt in 0..8 {
-        let gc_epoch = crate::pack_gc::read_gc_epoch(hub, pid).await?;
-        let mut map = HashMap::with_capacity(reals.len());
-        let mut real_hex: Vec<String> = Vec::new();
-        for &r in reals {
-            let p = crate::sync::projected(hub, &ask.project, &ask.viewer, r).await?;
-            if p != r {
-                real_hex.push(r.hex());
-            }
-            map.insert(r, p);
+    let mut map = HashMap::with_capacity(reals.len());
+    let mut real_hex: Vec<String> = Vec::new();
+    for &r in reals {
+        let p = crate::sync::projected(hub, &ask.project, &ask.viewer, r).await?;
+        if p != r {
+            real_hex.push(r.hex());
         }
-        let vk = ask.project.view(&ask.viewer).key();
-        if real_hex.is_empty() {
-            return Ok(map);
-        }
-        real_hex.sort();
-        real_hex.dedup();
-        let eid = embargo_id.to_string();
-        let tagged = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
-            let (eid, vk, real_hex) = (eid.clone(), vk.clone(), real_hex.clone());
-            Box::pin(async move {
-                crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
-                sqlx::query(
-                    "INSERT INTO embargo_snapshots (project_id, snapshot, embargo_id) \
-                     SELECT DISTINCT $1, pr.projected_id, $2 FROM projections pr \
-                     JOIN embargo_snapshots es ON es.project_id = pr.project_id AND es.embargo_id = $2 AND es.snapshot = pr.real_id \
-                     WHERE pr.project_id = $1 AND pr.view_key = $3 AND pr.real_id = ANY($4) \
-                       AND NOT pr.collapsed AND pr.projected_id <> pr.real_id \
-                       AND EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL) \
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(pid)
-                .bind(&eid)
-                .bind(&vk)
-                .bind(&real_hex)
-                .execute(&mut *c)
-                .await?;
-                Ok(())
-            })
-        })
-        .await;
-        match tagged {
-            Ok(()) => return Ok(map),
-            Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) && attempt < 7 => continue,
-            Err(e) => return Err(e),
-        }
+        map.insert(r, p);
     }
-    unreachable!("the last attempt returns")
+    let vk = ask.project.view(&ask.viewer).key();
+    if real_hex.is_empty() {
+        return Ok(map);
+    }
+    real_hex.sort();
+    real_hex.dedup();
+    let eid = embargo_id.to_string();
+    transaction(&hub.db, Isolation::ReadCommitted, move |c| {
+        let (eid, vk, real_hex) = (eid.clone(), vk.clone(), real_hex.clone());
+        Box::pin(async move {
+            sqlx::query(
+                "INSERT INTO embargo_snapshots (project_id, snapshot, embargo_id) \
+                 SELECT DISTINCT $1, pr.projected_id, $2 FROM projections pr \
+                 JOIN embargo_snapshots es ON es.project_id = pr.project_id AND es.embargo_id = $2 AND es.snapshot = pr.real_id \
+                 WHERE pr.project_id = $1 AND pr.view_key = $3 AND pr.real_id = ANY($4) \
+                   AND NOT pr.collapsed AND pr.projected_id <> pr.real_id \
+                   AND EXISTS (SELECT 1 FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(pid)
+            .bind(&eid)
+            .bind(&vk)
+            .bind(&real_hex)
+            .execute(&mut *c)
+            .await?;
+            Ok(())
+        })
+    })
+    .await?;
+    Ok(map)
 }
 
 /// Compute `veil.diff/2` between `from_real` and `to_real` in `ask.viewer`'s
@@ -620,10 +611,6 @@ pub async fn finish_release(
     record_json: &str,
     submitter: Option<(&Viewer, &crate::landing::Submitter)>,
 ) -> Result<bool> {
-    // Read before any object is judged: what this step queues and what it
-    // records wait in line with GC's switch (BUG-1881), and a switch
-    // meanwhile has `embargo::release_one` run the release again.
-    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     type CandRow = (String, String, i64, String, String, String, i32, i64, i64, bool);
     let prs: Vec<CandRow> = sqlx::query_as(
         "SELECT p.id, p.target, p.author, pe.name, p.title, p.body, p.revision, p.created_at, p.updated_at, p.land_at_release \
@@ -755,17 +742,8 @@ pub async fn finish_release(
             judged,
             &who,
             manual_retry,
-            gc_epoch,
         )
         .await;
-        // GC switched meanwhile: the release runs again (never: the PR is
-        // left unlanded because of it).
-        if let Err(e) = outcome {
-            if crate::pack_gc::is_gc_epoch_changed(&e) {
-                return Err(e);
-            }
-            continue;
-        }
         if matches!(&outcome, Ok(o) if o.state == LandState::Landed) {
             landed_prs.insert(id.clone());
             touched_branches.insert(land_branch);
@@ -801,7 +779,6 @@ pub async fn finish_release(
             let landed_set = landed_set.clone();
             let closed_set = closed_set.clone();
             Box::pin(async move {
-                crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 let n = sqlx::query(
                     "UPDATE embargo_lines SET released_at = COALESCE(released_at, $1), record_json = $2 \
                      WHERE project_id = $3 AND embargo_id = $4 AND released_at IS NULL",

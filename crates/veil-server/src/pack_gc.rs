@@ -17,9 +17,6 @@
 //!   [`DEFAULT_PACK_GRACE_MS`] (containers whose immediate storage delete
 //!   failed or was interrupted by a crash). It never touches `LISTED` packs or
 //!   loose project objects.
-//! * The per-project GC epoch (`access_epochs (project_id, -1)`) and root
-//!   writers' gate (`GUARD_SQL`, [`guard_root_write`]) remain inert in v1:
-//!   nothing ever raises the epoch.
 
 use std::{
     collections::HashMap,
@@ -28,8 +25,6 @@ use std::{
         Arc, Mutex,
     },
 };
-
-use sqlx::PgConnection;
 
 use crate::{
     error::{Error, Result},
@@ -467,102 +462,5 @@ async fn sweep_discarded(
     }
 
     report.discarded_packs_swept += deleted_names.len();
-    Ok(())
-}
-
-/// Inert error marker for GC-epoch mismatch. In Veil v1 there is no GC, so
-/// `access_epochs (project_id, -1)` never advances and this error is never
-/// raised.
-#[derive(Debug)]
-pub struct GcEpochChanged;
-
-impl std::fmt::Display for GcEpochChanged {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("project GC epoch changed during root write")
-    }
-}
-
-impl std::error::Error for GcEpochChanged {}
-
-pub fn gc_epoch_changed(e: &anyhow::Error) -> bool {
-    crate::error::caused_by::<GcEpochChanged>(e)
-}
-
-pub fn is_gc_epoch_changed(e: &Error) -> bool {
-    matches!(e, Error::Other(a) if gc_epoch_changed(a))
-}
-
-/// Ensure the project's GC epoch row (`access_epochs (project, -1)`) exists,
-/// read its current value, and synchronize `hub`'s in-memory caches.
-/// Inert in v1: nothing raises the epoch.
-pub async fn read_gc_epoch(hub: &Hub, project: i64) -> Result<i64> {
-    let epoch: Option<i64> = sqlx::query_scalar(
-        "SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1",
-    )
-    .bind(project)
-    .fetch_optional(&hub.db)
-    .await?;
-    let epoch = match epoch {
-        Some(e) => e,
-        None => {
-            sqlx::query(
-                "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) \
-                 VALUES ($1, -1, 0, 0) ON CONFLICT (project_id, person_id) DO NOTHING",
-            )
-            .bind(project)
-            .execute(&hub.db)
-            .await?;
-            sqlx::query_scalar(
-                "SELECT COALESCE((SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1), 0)",
-            )
-            .bind(project)
-            .fetch_one(&hub.db)
-            .await?
-        }
-    };
-    hub.observe_gc_epoch(project, epoch);
-    Ok(epoch)
-}
-
-/// [`read_gc_epoch`] for a push, reusing the epoch the session check read once
-/// this server has seen the row exist. Inert in v1.
-pub async fn push_gc_epoch(hub: &Hub, project: i64, read: Option<(i64, i64)>) -> Result<i64> {
-    if let Some((p, epoch)) = read {
-        if p == project && hub.caches.gc_row_known(project) {
-            return Ok(epoch);
-        }
-    }
-    let epoch = read_gc_epoch(hub, project).await?;
-    hub.caches.know_gc_row(project);
-    Ok(epoch)
-}
-
-/// Advisory lock namespace for the inert root-writers' gate (`"veilgcgt"` ^ `project_id`).
-const GATE_BASE: i64 = 0x7665_696c_6763_6774;
-
-/// Inert root-writers' gate query: takes a shared advisory lock and locks
-/// `access_epochs (project, -1)` `FOR SHARE`. Nothing takes either lock
-/// exclusively in v1.
-pub(crate) const GUARD_SQL: &str = "SELECT e.epoch FROM (SELECT pg_advisory_xact_lock_shared($2)) g, access_epochs e \
-     WHERE e.project_id = $1 AND e.person_id = -1 FOR SHARE OF e";
-
-pub(crate) fn gate_key(project: i64) -> i64 {
-    GATE_BASE ^ project
-}
-
-/// Verify the project's inert GC epoch still matches `expected_epoch`.
-pub async fn guard_root_write(
-    c: &mut PgConnection,
-    project: i64,
-    expected_epoch: i64,
-) -> Result<()> {
-    let cur: Option<i64> = sqlx::query_scalar(GUARD_SQL)
-        .bind(project)
-        .bind(gate_key(project))
-        .fetch_optional(&mut *c)
-        .await?;
-    if cur != Some(expected_epoch) {
-        return Err(Error::Other(anyhow::Error::new(GcEpochChanged)));
-    }
     Ok(())
 }

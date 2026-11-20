@@ -221,10 +221,11 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
     let rt = runtime();
     let (url, name) = fresh_database(&rt);
     let rows: i64 = std::env::var("VEIL_TEST_GRAPH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
-    let timeout = rt.block_on(async {
+    let (timeout, yb) = rt.block_on(async {
         let db = veil_server::db::connect(&url, 1).await.unwrap();
         let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
-        let timeout = if veil_server::db::is_yugabyte(&version) { YB_MIGRATION_TIMEOUT } else { Duration::from_millis(250) };
+        let yb = veil_server::db::is_yugabyte(&version);
+        let timeout = if yb { YB_MIGRATION_TIMEOUT } else { Duration::from_millis(250) };
         // The schema before migration 21, applied and recorded as `migrate` does.
         sqlx::raw_sql("CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)")
             .execute(&db)
@@ -288,7 +289,7 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM view_graph").fetch_one(&db).await.unwrap();
         assert_eq!(n, rows);
         db.close().await;
-        timeout
+        (timeout, yb)
     });
     let started = std::time::Instant::now();
     let migrated = rt.block_on(async {
@@ -296,7 +297,14 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
         let ms = timeout.as_millis().to_string();
         let opts = opts.options([("statement_timeout", ms.as_str()), ("lock_timeout", ms.as_str())]);
         let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
-        let r = tokio::time::timeout(Duration::from_secs(60), veil_server::db::migrate(&pool)).await;
+        let r = if yb {
+            // On an existing hash-sharded YugabyteDB database, migration 46 is
+            // offline-only (BUG-2931); exercise online migrations 21..45 under
+            // the bounded timeout, then assert 46 refuses without `--offline`.
+            tokio::time::timeout(Duration::from_secs(60), veil_server::db::migrate_through(&pool, 45)).await
+        } else {
+            tokio::time::timeout(Duration::from_secs(60), veil_server::db::migrate(&pool)).await
+        };
         pool.close().await;
         r
     });
@@ -309,9 +317,15 @@ fn s3rd3_migration_21_clears_a_large_viewer_graph_in_bounded_time() {
     eprintln!("migrated {rows} viewer graph rows under a {timeout:?} statement timeout in {took:?}");
     rt.block_on(async {
         let db = veil_server::db::connect(&url, 1).await.unwrap();
-        assert!(veil_server::db::schema_current(&db).await.unwrap());
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM view_graph").fetch_one(&db).await.unwrap();
         assert_eq!(n, 0, "the viewer graph (a cache) is cleared");
+        if yb {
+            let err = veil_server::db::migrate(&db).await.expect_err("existing YB DB must refuse migration 46 without --offline");
+            assert!(err.to_string().contains("veil-server migrate --offline"), "expected --offline refusal, got: {err:?}");
+            assert!(!veil_server::db::schema_current(&db).await.unwrap());
+            veil_server::db::migrate_offline(&db).await.expect("offline migration 46 completes");
+        }
+        assert!(veil_server::db::schema_current(&db).await.unwrap());
         db.close().await;
     });
     // The test's own database goes (the shared server keeps no leftovers).
@@ -686,10 +700,20 @@ async fn exec_retrying(db: &sqlx::PgPool, q: &str) {
 /// one project of `rows` packs (two thirds listed). Returns the database's
 /// URL and name, the project and whether it is YugabyteDB.
 fn before_migration_41(rt: &tokio::runtime::Runtime, rows: i64) -> (String, String, i64, bool) {
+    before_migration_41_at(rt, rows, None)
+}
+
+/// [`before_migration_41`], migrating only through `max_version` when `Some`
+/// (used on YugabyteDB when testing online migrations 1..=45 under live
+/// writers before verifying that migration 46 requires `--offline`, BUG-2931).
+fn before_migration_41_at(rt: &tokio::runtime::Runtime, rows: i64, max_version: Option<i64>) -> (String, String, i64, bool) {
     let (url, name) = fresh_database(rt);
     let (project, yb) = rt.block_on(async {
         let db = veil_server::db::connect(&url, 2).await.unwrap();
-        veil_server::db::migrate(&db).await.expect("migrates");
+        match max_version {
+            Some(max) => veil_server::db::migrate_through(&db, max).await.expect("migrates"),
+            None => veil_server::db::migrate(&db).await.expect("migrates"),
+        }
         let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
         exec_retrying(&db, "DROP INDEX packs_listed").await;
         exec_retrying(&db, "DELETE FROM schema_migrations WHERE version = 41").await;
@@ -763,7 +787,11 @@ async fn listed_with_and_without_the_index(url: &str, project: i64) -> (Vec<Stri
 /// build (begun once the index existed, done while it was not yet valid)
 /// and are in it,
 /// it holds every listed row (read through it, the plan checked), and the
-/// connection's own timeouts are back afterwards.
+/// connection's own timeouts are back afterwards. On YugabyteDB, online
+/// migration stops at version 45 under the live writers, asserts that
+/// migration 46 refuses without `--offline` while writers are active
+/// (BUG-2931), then stops the writers, runs `migrate_offline`, and checks
+/// every row and rebuilt index again.
 #[test]
 fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_row() {
     let rt = runtime();
@@ -774,10 +802,10 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
         veil_server::db::is_yugabyte(&v)
     });
     let rows = std::env::var("VEIL_TEST_PACK_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(if yb { 300_000 } else { 4_000_000 });
-    let (url, name, project, _) = before_migration_41(&rt, rows);
+    let (url, name, project, _) = before_migration_41_at(&rt, rows, yb.then_some(45));
     let stop = AtomicBool::new(false);
     let during = std::sync::Mutex::new(Vec::<String>::new());
-    let (results, written) = std::thread::scope(|s| {
+    let (results, online_46_refusal, written) = std::thread::scope(|s| {
         let writers: Vec<_> = (0..4)
             .map(|w| {
                 let (url, stop, during, rt) = (&url, &stop, &during, &rt);
@@ -837,7 +865,11 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
                         let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
                         let opts = opts.options([("statement_timeout", "250"), ("lock_timeout", "250")]);
                         let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
-                        let r = tokio::time::timeout(Duration::from_secs(180), veil_server::db::migrate(&pool)).await;
+                        let r = if yb {
+                            tokio::time::timeout(Duration::from_secs(180), veil_server::db::migrate_through(&pool, 45)).await
+                        } else {
+                            tokio::time::timeout(Duration::from_secs(180), veil_server::db::migrate(&pool)).await
+                        };
                         // The connection `migrate` used keeps its own timeouts.
                         let after: Option<String> = match r {
                             Ok(Ok(())) => Some(sqlx::query_scalar("SHOW statement_timeout").fetch_one(&pool).await.unwrap()),
@@ -850,17 +882,56 @@ fn bug_2482_an_index_migration_on_a_large_table_written_meanwhile_holds_every_ro
             })
             .collect();
         let results: Vec<_> = starts.into_iter().map(|h| h.join().unwrap()).collect();
+        // On YugabyteDB, while writers are still live, assert that online
+        // `db::migrate` refuses migration 46 with the `--offline` message.
+        let online_46_refusal = if yb {
+            Some(rt.block_on(async {
+                let db = veil_server::db::connect(&url, 1).await.unwrap();
+                let err = veil_server::db::migrate(&db).await.expect_err("online migrate must refuse migration 46 on live YB DB");
+                let current = veil_server::db::schema_current(&db).await.unwrap();
+                db.close().await;
+                (err.to_string(), current)
+            }))
+        } else {
+            None
+        };
         std::thread::sleep(Duration::from_millis(300));
         stop.store(true, Ordering::Relaxed);
         let written: Vec<String> = writers.into_iter().flat_map(|h| h.join().unwrap()).collect();
-        (results, written)
+        (results, online_46_refusal, written)
     });
     for (r, after) in &results {
         assert!(matches!(r, Ok(Ok(()))), "a start migrating beside writes under a 250 ms statement timeout: {r:?}");
         assert_eq!(after.as_deref(), Some("250ms"), "the migrating connection's statement timeout is its own again");
     }
+    if let Some((msg, current)) = &online_46_refusal {
+        assert!(msg.contains("veil-server migrate --offline"), "expected --offline refusal on live YB DB, got: {msg}");
+        assert!(!current, "migration 46 must not be recorded before offline run");
+    }
     let during = during.into_inner().unwrap();
     assert!(!during.is_empty(), "rows were written while the index was built (begun after it existed, done before it was valid)");
+    if yb {
+        // Verify online migration 41 held every row before offline migration 46 runs.
+        let (with_pre, without_pre) = rt.block_on(listed_with_and_without_the_index(&url, project));
+        let missing_pre: Vec<&String> = written.iter().filter(|n| with_pre.binary_search(n).is_err()).collect();
+        assert!(
+            missing_pre.is_empty(),
+            "{} of {} rows written beside the build are missing from packs_listed before 46: {:?}",
+            missing_pre.len(),
+            written.len(),
+            &missing_pre[..missing_pre.len().min(10)]
+        );
+        assert!(during.iter().all(|n| with_pre.binary_search(n).is_ok()), "every row written during the build is in packs_listed");
+        assert_eq!(with_pre.len(), without_pre.len(), "packs_listed holds every listed row before 46");
+        assert!(with_pre == without_pre, "packs_listed holds exactly the listed rows before 46");
+
+        // Now that writers are stopped, apply migration 46 offline.
+        rt.block_on(async {
+            let db = veil_server::db::connect(&url, 1).await.unwrap();
+            veil_server::db::migrate_offline(&db).await.expect("offline migration 46 completes after writers stop");
+            db.close().await;
+        });
+    }
     rt.block_on(async {
         let db = veil_server::db::connect(&url, 1).await.unwrap();
         let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_migrations WHERE version = 41").fetch_one(&db).await.unwrap();
@@ -1415,3 +1486,1003 @@ fn not_safe_to_run_again(sql: &str) -> Option<String> {
     }
     None
 }
+
+/// Q4: migration 46 (`-- veil: yugabyte-only`) is skipped on PostgreSQL and
+/// rebuilds the 10 hot per-branch/per-change tables with composite hash keys
+/// on YugabyteDB while preserving every row, keeping sequences owned/working,
+/// and running idempotently if re-applied.
+#[test]
+fn q4_single_repo_hash_keys_migration_preserves_rows_and_is_idempotent() {
+    use veil_server::db::{is_yugabyte, migration_parts, IndexStep, MIGRATIONS, ONLINE_INDEXES, YUGABYTE_ONLY};
+
+    // Unit checks for `YUGABYTE_ONLY` parsing.
+    let yb_sql = format!("{YUGABYTE_ONLY}\nSELECT 1;\n");
+    let p = migration_parts(&yb_sql).expect("yugabyte-only");
+    assert!(p.yugabyte_only && p.online.is_empty());
+    let mixed = format!("{YUGABYTE_ONLY}\nSELECT 1;\n{ONLINE_INDEXES}\nDROP INDEX CONCURRENTLY IF EXISTS x;\n");
+    assert!(migration_parts(&mixed).is_err(), "cannot mix yugabyte-only and online indexes");
+
+    let rt = runtime();
+    let (url, name) = fresh_database(&rt);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
+        let yb = is_yugabyte(&version);
+
+        // Apply migrations 1..=45 cleanly on the fresh database.
+        exec_retrying(
+            &db,
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        )
+        .await;
+        for &(ver, mname, sql) in MIGRATIONS.iter().filter(|m| m.0 < 46) {
+            let parts = migration_parts(sql).unwrap();
+            assert!(!parts.yugabyte_only);
+            let mut stmts = Vec::new();
+            if parts.transactional.lines().any(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("--")
+            }) {
+                stmts.push(parts.transactional.to_string());
+            }
+            for s in parts.online {
+                match s {
+                    IndexStep::Create { sql, .. } => stmts.push(sql),
+                    IndexStep::Drop { name } => stmts.push(format!("DROP INDEX IF EXISTS {name}")),
+                }
+            }
+            for s in stmts {
+                exec_retrying(&db, &s).await;
+            }
+            sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, 0)")
+                .bind(ver)
+                .bind(mname)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+
+        // Seed rows in all 11 tables rebuilt by migration 46.
+        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('q4alice', 1)").await;
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'q4proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'q4alice'",
+        )
+        .await;
+        let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'q4proj'").fetch_one(&db).await.unwrap();
+        let uid: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'q4alice'").fetch_one(&db).await.unwrap();
+
+        for q in [
+            format!("INSERT INTO branches (project_id, name, target) VALUES ({pid}, 'main', 'snap1'), ({pid}, 'agent-1', 'snap2')"),
+            format!("INSERT INTO snapshots (project_id, id, author) VALUES ({pid}, 'snap1', {uid}), ({pid}, 'snap2', {uid})"),
+            format!("INSERT INTO origins (project_id, real_id, origin_id) VALUES ({pid}, 'snap1', 'orig1')"),
+            format!(
+                "INSERT INTO projections (project_id, view_key, real_id, projected_id, created_at, collapsed) \
+                 VALUES ({pid}, 'vk1', 'snap1', 'proj1', 100, false)"
+            ),
+            format!(
+                "INSERT INTO landed_changes (project_id, branch, lineage, change_id, author, landed) \
+                 VALUES ({pid}, 'main', 1, 'chg1', {uid}, 'snap1')"
+            ),
+            format!(
+                "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, \
+                 person_epoch, project_epoch, state, created_at, priority, person_slot, session, session_slot) \
+                 VALUES ({pid}, 'main', 'tkt-1', {uid}, 'q4alice', 'dev1', '[]', 1, 0, 0, 'queued', 100, 0, 0, 's1', 0)"
+            ),
+            format!(
+                "INSERT INTO landings (project_id, branch, lineage, submitted, landed, at) \
+                 VALUES ({pid}, 'main', 1, 'sub1', 'snap1', 100)"
+            ),
+            format!(
+                "INSERT INTO landing_leases (project_id, branch, holder, epoch, expires_at, served, lock_epoch) \
+                 VALUES ({pid}, 'main', 'hub1', 1, 9999, 2, 1)"
+            ),
+            format!(
+                "INSERT INTO packs (project_id, name, state, person_id, size, objects, created_at) \
+                 VALUES ({pid}, 'pack-listed', 1, NULL, 128, 3, 100), ({pid}, 'pack-staged', 0, {uid}, 64, 1, 101)"
+            ),
+            format!(
+                "INSERT INTO change_refs (project_id, change_id, snapshot, created_by, created_at) \
+                 VALUES ({pid}, 'chg1', 'snap1', {uid}, 100)"
+            ),
+            format!(
+                "INSERT INTO access_epochs (project_id, person_id, epoch, changed_at) \
+                 VALUES (0, {uid}, 4201, 1001), ({pid}, 0, 9901, 1002)"
+            ),
+        ] {
+            exec_retrying(&db, &q).await;
+        }
+
+        // On hash-sharded YugabyteDB with existing migrations, automatic online
+        // `migrate()` must refuse (BUG-2920, BUG-2931) without touching any table;
+        // `migrate_offline()` executes the rebuild cleanly and is idempotent across re-runs.
+        if yb {
+            let err = veil_server::db::migrate(&db).await.expect_err("online migrate must refuse existing DB on YB");
+            assert!(
+                err.to_string().contains("--offline"),
+                "expected --offline refusal guidance, got: {err:?}"
+            );
+            assert!(!veil_server::db::schema_current(&db).await.unwrap());
+        }
+        for pass in 1..=2 {
+            if yb {
+                veil_server::db::migrate_offline(&db).await.unwrap_or_else(|e| panic!("migrate_offline pass {pass}: {e:?}"));
+            } else {
+                veil_server::db::migrate(&db).await.unwrap_or_else(|e| panic!("migrate pass {pass}: {e:?}"));
+            }
+            assert!(veil_server::db::schema_current(&db).await.unwrap());
+
+            let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT \
+                   (SELECT count(*) FROM branches WHERE project_id = $1), \
+                   (SELECT count(*) FROM snapshots WHERE project_id = $1), \
+                   (SELECT count(*) FROM origins WHERE project_id = $1), \
+                   (SELECT count(*) FROM projections WHERE project_id = $1), \
+                   (SELECT count(*) FROM landed_changes WHERE project_id = $1), \
+                   (SELECT count(*) FROM landing_queue WHERE project_id = $1), \
+                   (SELECT count(*) FROM landings WHERE project_id = $1), \
+                   (SELECT count(*) FROM landing_leases WHERE project_id = $1), \
+                   (SELECT count(*) FROM packs WHERE project_id = $1), \
+                   (SELECT count(*) FROM change_refs WHERE project_id = $1)",
+            )
+            .bind(pid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(counts, (2, 2, 1, 1, 1, 1, 1, 1, 2, 1), "pass {pass} preserved all rows");
+            let ae_rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+                "SELECT project_id, person_id, epoch, changed_at FROM access_epochs \
+                 WHERE (project_id = 0 AND person_id = $1) OR (project_id = $2 AND person_id = 0) \
+                 ORDER BY project_id, person_id",
+            )
+            .bind(uid)
+            .bind(pid)
+            .fetch_all(&db)
+            .await
+            .unwrap();
+            assert_eq!(
+                ae_rows,
+                vec![(0, uid, 4201, 1001), (pid, 0, 9901, 1002)],
+                "pass {pass} preserved access_epochs rows exactly"
+            );
+
+            if yb {
+                for (tbl, want_hash) in [
+                    ("branches", "(project_id, name) HASH"),
+                    ("snapshots", "(project_id, id) HASH"),
+                    ("origins", "(project_id, real_id) HASH"),
+                    ("projections", "(project_id, view_key, real_id) HASH"),
+                    ("landed_changes", "(project_id, branch) HASH"),
+                    ("landing_queue", "(project_id, branch) HASH"),
+                    ("landings", "(project_id, branch) HASH"),
+                    ("landing_leases", "(project_id, branch) HASH"),
+                    ("packs", "(project_id, name) HASH"),
+                    ("change_refs", "(project_id, change_id) HASH"),
+                    ("access_epochs", "(project_id, person_id) HASH"),
+                ] {
+                    let def: String = sqlx::query_scalar(
+                        "SELECT pg_get_indexdef(i.indexrelid) FROM pg_index i \
+                         WHERE i.indrelid = to_regclass($1) AND i.indisprimary",
+                    )
+                    .bind(tbl)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+                    assert!(def.contains(want_hash), "pass {pass}: {tbl} PK missing {want_hash}: {def}");
+                }
+                let has_bp: Option<String> = sqlx::query_scalar("SELECT to_regclass('branches_by_project')::text").fetch_one(&db).await.unwrap();
+                assert!(has_bp.is_some(), "branches_by_project must exist on YB");
+            }
+
+            if pass == 1 {
+                exec_retrying(&db, "DELETE FROM schema_migrations WHERE version = 46").await;
+            }
+        }
+
+        // Verify landing_queue_seq_seq still works via DEFAULT after rebuild.
+        exec_retrying(
+            &db,
+            &format!(
+                "INSERT INTO landing_queue (project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, \
+                 person_epoch, project_epoch, state, created_at, priority, person_slot, session, session_slot) \
+                 VALUES ({pid}, 'agent-1', 'tkt-2', {uid}, 'q4alice', 'dev1', '[]', 1, 0, 0, 'queued', 102, 0, 1, 's1', 1)"
+            ),
+        )
+        .await;
+        let qcount: i64 = sqlx::query_scalar("SELECT count(*) FROM landing_queue WHERE project_id = $1").bind(pid).fetch_one(&db).await.unwrap();
+        assert_eq!(qcount, 2);
+
+        db.close().await;
+    });
+    drop_database(&rt, &name);
+}
+
+struct DropFreshDb<'a>(&'a tokio::runtime::Runtime, String);
+
+impl Drop for DropFreshDb<'_> {
+    fn drop(&mut self) {
+        drop_database(self.0, &self.1);
+    }
+}
+
+fn fresh_colocated_database(rt: &tokio::runtime::Runtime) -> (String, String) {
+    let admin = std::env::var("VEIL_TEST_DATABASE_URL").unwrap();
+    let name = format!("{}{}", crate::support::test_db_prefix(), unique("veil_coloc_"));
+    rt.block_on(async {
+        let db = veil_server::db::connect(&admin, 1).await.unwrap();
+        let mut c = db.acquire().await.unwrap();
+        sqlx::raw_sql("SET statement_timeout = 0").execute(&mut *c).await.unwrap();
+        let mut tries = 0;
+        loop {
+            match sqlx::raw_sql(&format!("CREATE DATABASE {name} WITH COLOCATION = true")).execute(&mut *c).await {
+                Ok(_) => break,
+                Err(e) if tries > 0 && e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42P04") => break,
+                Err(e) if retryable(&e) && tries < 50 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("CREATE DATABASE {name} WITH COLOCATION = true: {e}"),
+            }
+        }
+        drop(c);
+        db.close().await;
+    });
+    let (base, _) = admin.rsplit_once('/').unwrap();
+    (format!("{base}/{name}"), name)
+}
+
+async fn apply_migrations_through(db: &sqlx::PgPool, max_version: i64) {
+    use veil_server::db::{migration_parts, IndexStep, MIGRATIONS};
+    exec_retrying(
+        db,
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+    )
+    .await;
+    for &(ver, mname, sql) in MIGRATIONS {
+        if ver > max_version {
+            break;
+        }
+        let parts = migration_parts(sql).unwrap();
+        let mut stmts = Vec::new();
+        if parts.transactional.lines().any(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with("--")
+        }) {
+            stmts.push(parts.transactional.to_string());
+        }
+        for s in parts.online {
+            match s {
+                IndexStep::Create { sql, .. } => stmts.push(sql),
+                IndexStep::Drop { name } => stmts.push(format!("DROP INDEX IF EXISTS {name}")),
+            }
+        }
+        for s in stmts {
+            exec_retrying(db, &s).await;
+        }
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, 0)")
+            .bind(ver)
+            .bind(mname)
+            .execute(db)
+            .await
+            .unwrap();
+    }
+}
+
+/// BUG-2920 (YugabyteDB): migration 0046 rebuilds each table in three
+/// non-transactional steps. Automatic online `db::migrate()` must refuse to
+/// touch non-empty or interrupted tables without `--offline`, and an offline
+/// retry (`db::migrate_offline()`) after an interrupted attempt must drop stale
+/// `<t>_q4` staging tables and re-copy fresh rows so updates committed before
+/// the retry are never silently reverted.
+#[test]
+fn bug_2920_migration_46_never_reverts_updates_committed_during_or_before_retry() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        apply_migrations_through(&db, 45).await;
+
+        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2920alice', 1)").await;
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'b2920proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2920alice'",
+        )
+        .await;
+        let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2920proj'").fetch_one(&db).await.unwrap();
+        let uid: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2920alice'").fetch_one(&db).await.unwrap();
+
+        exec_retrying(
+            &db,
+            &format!("INSERT INTO branches (project_id, name, target) VALUES ({pid}, 'main', 'snap-old')"),
+        )
+        .await;
+        exec_retrying(
+            &db,
+            &format!(
+                "INSERT INTO packs (project_id, name, state, person_id, size, objects, created_at) \
+                 VALUES ({pid}, 'pack-refused', 0, {uid}, 64, 1, 100)"
+            ),
+        )
+        .await;
+
+        // Simulate attempt 1 completing steps 1 and 2 for `branches` and `packs`
+        // before aborting (leaving stale `<t>_q4` staging tables behind).
+        let sql46 = veil_server::db::MIGRATIONS
+            .iter()
+            .find(|(v, _, _)| *v == 46)
+            .expect("migration 46")
+            .2;
+        let steps = veil_server::db::migration_steps(sql46);
+        let find_step = |needle: &str| {
+            steps
+                .iter()
+                .find(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("missing 0046 step containing {needle}"))
+                .as_str()
+        };
+        // Steps 1 & 2 for `branches` and `packs` (create `_q4` + copy existing rows).
+        exec_retrying(&db, find_step("CREATE TABLE IF NOT EXISTS branches_q4")).await;
+        exec_retrying(&db, find_step("INSERT INTO branches_q4")).await;
+        exec_retrying(&db, find_step("CREATE TABLE IF NOT EXISTS packs_q4")).await;
+        exec_retrying(&db, find_step("INSERT INTO packs_q4")).await;
+
+        // A live server commits a push advancing `main` and refuses `pack-refused`
+        // (`state = 2` DISCARDED) before the offline retry begins.
+        exec_retrying(
+            &db,
+            &format!("UPDATE branches SET target = 'snap-committed' WHERE project_id = {pid} AND name = 'main'"),
+        )
+        .await;
+        exec_retrying(
+            &db,
+            &format!("UPDATE packs SET state = 2, discarded_at = 200 WHERE project_id = {pid} AND name = 'pack-refused'"),
+        )
+        .await;
+
+        // Online `db::migrate()` must refuse without `--offline` and leave live rows untouched.
+        let err = veil_server::db::migrate(&db).await.expect_err("online migrate must refuse migration 46 with existing rows/staging");
+        assert!(err.to_string().contains("--offline"), "expected --offline refusal, got: {err:?}");
+        assert!(!veil_server::db::schema_current(&db).await.unwrap());
+
+        // Offline retry (`veil-server migrate --offline`) drops stale `_q4` tables,
+        // re-copies the latest rows, swaps cleanly, verifies indexes, and preserves
+        // every committed update.
+        veil_server::db::migrate_offline(&db).await.expect("offline migration 46 completes");
+        assert!(veil_server::db::schema_current(&db).await.unwrap());
+
+        let target: String = sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main'")
+            .bind(pid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let pack_state: i16 = sqlx::query_scalar("SELECT state FROM packs WHERE project_id = $1 AND name = 'pack-refused'")
+            .bind(pid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        db.close().await;
+
+        assert!(
+            target == "snap-committed" && pack_state == 2,
+            "migration 0046 silently reverted committed updates: branches.target={target:?} (expected \"snap-committed\"), packs.state={pack_state} (expected 2 DISCARDED)"
+        );
+    });
+}
+
+/// BUG-2921 (YugabyteDB): the deployment kit defaults to `YB_LAYOUT=colocated`
+/// (`CREATE DATABASE veil WITH COLOCATION = true`), but `db::migrate_once`
+/// checks only `is_yugabyte(version)` and executes migration 0046's
+/// `PRIMARY KEY ((...) HASH)` / `CREATE INDEX (... HASH)` DDL on colocated
+/// databases, which YugabyteDB rejects with `cannot colocate hash partitioned table`.
+#[test]
+fn bug_2921_migration_46_succeeds_on_colocated_yugabytedb_database() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_colocated_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        let colocated: bool = sqlx::query_scalar("SELECT yb_is_database_colocated()").fetch_one(&db).await.unwrap();
+        assert!(colocated, "test database must be colocated");
+        let res = veil_server::db::migrate(&db).await;
+        db.close().await;
+        res.expect("veil-server migrate must succeed on a colocated YugabyteDB database");
+    });
+}
+
+/// BUG-2922 / BUG-2930 (PostgreSQL and YugabyteDB): migration 0045's
+/// `person_epochs` split was withdrawn so `access_epochs` remains the single
+/// source of truth across rolling upgrades (with migration 0046 sharding
+/// `access_epochs` by `PRIMARY KEY ((project_id, person_id) HASH)` offline on
+/// hash-sharded YugabyteDB). Revocations committed before, during, or after
+/// applying migration 0045 are always observed immediately by
+/// `caches::read_epochs`.
+#[test]
+fn bug_2922_migration_45_never_loses_concurrent_revocation_from_person_epochs() {
+    let rt = runtime();
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 6).await.unwrap();
+        let version: String = sqlx::query_scalar("SELECT version()").fetch_one(&db).await.unwrap();
+        let yb = veil_server::db::is_yugabyte(&version);
+        apply_migrations_through(&db, 44).await;
+
+        for person in ["b2922alice", "b2922bob", "b2922carol"] {
+            exec_retrying(&db, &format!("INSERT INTO people (name, created_at) VALUES ('{person}', 1)")).await;
+        }
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'b2922proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2922alice'",
+        )
+        .await;
+        let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2922proj'").fetch_one(&db).await.unwrap();
+        let alice: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2922alice'").fetch_one(&db).await.unwrap();
+        let bob: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2922bob'").fetch_one(&db).await.unwrap();
+        let carol: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2922carol'").fetch_one(&db).await.unwrap();
+        exec_retrying(&db, &format!("INSERT INTO groups (project_id, name) VALUES ({pid}, 'eng')")).await;
+        let gid: i64 = sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'eng'")
+            .bind(pid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        for uid in [alice, bob, carol] {
+            exec_retrying(&db, &format!("INSERT INTO group_members (group_id, person_id) VALUES ({gid}, {uid})")).await;
+        }
+
+        let mut before = Vec::new();
+        for uid in [alice, bob, carol] {
+            let e: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(uid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_ne!(e, 0, "group membership insert bumped access_epochs");
+            before.push(e);
+        }
+
+        let sql45 = veil_server::db::MIGRATIONS
+            .iter()
+            .find(|(v, _, _)| *v == 45)
+            .expect("migration 45")
+            .2;
+        assert!(veil_server::db::migration_steps(sql45).is_empty(), "migration 45 is a withdrawn no-op");
+
+        // Revoke Alice before 45, hold Bob's revocation open across 45, revoke Carol after 45.
+        sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND person_id = $2")
+            .bind(gid)
+            .bind(alice)
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let mut bob_tx = db.begin().await.unwrap();
+        sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND person_id = $2")
+            .bind(gid)
+            .bind(bob)
+            .execute(&mut *bob_tx)
+            .await
+            .unwrap();
+
+        if yb {
+            veil_server::db::migrate_through(&db, 45).await.expect("migration 45 applies online on YB");
+        } else {
+            veil_server::db::migrate(&db).await.expect("migrations 45..46 apply on PG");
+        }
+
+        bob_tx.commit().await.expect("in-flight revocation commits cleanly after migration 45");
+
+        sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND person_id = $2")
+            .bind(gid)
+            .bind(carol)
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let has_pe: Option<String> = sqlx::query_scalar("SELECT to_regclass('person_epochs')::text").fetch_one(&db).await.unwrap();
+        assert!(has_pe.is_none(), "person_epochs table must not exist");
+
+        for (label, uid, e_before) in [
+            ("alice (before 45)", alice, before[0]),
+            ("bob (in-flight across 45)", bob, before[1]),
+            ("carol (after 45)", carol, before[2]),
+        ] {
+            let e_revoked: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(uid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_ne!(e_revoked, e_before, "{label}: revocation bumped access_epochs");
+            let read = veil_server::caches::read_epochs(&db, uid, Some(pid)).await.unwrap();
+            assert_eq!(
+                read.person, e_revoked,
+                "{label}: read_epochs must see revoked epoch {e_revoked}, not pre-revocation epoch {e_before}"
+            );
+        }
+        db.close().await;
+    });
+}
+
+/// BUG-2924: migration 0044 drops `landing_queue_ticket (ticket)` in the same
+/// migration that creates `(project_id, ticket)`. Any pre-0044 server still
+/// running during a rolling upgrade executes `bisect::revert_confirmed_culprit`
+/// with `ON CONFLICT (ticket) DO NOTHING`, which fails with PostgreSQL `42P10`.
+#[test]
+fn bug_2924_migration_44_preserves_pre_44_bisect_on_conflict_ticket_during_rolling_upgrade() {
+    let rt = runtime();
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        apply_migrations_through(&db, 44).await;
+
+        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2924admin', 1)").await;
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'b2924proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2924admin'",
+        )
+        .await;
+        let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2924proj'").fetch_one(&db).await.unwrap();
+        let uid: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2924admin'").fetch_one(&db).await.unwrap();
+
+        // Exact SQL issued by pre-0044 servers (`3d0a690b:crates/veil-server/src/bisect.rs:1813-1820`).
+        let res = sqlx::query(
+            "INSERT INTO landing_queue ( \
+                project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, \
+                person_epoch, project_epoch, priority, state, created_at \
+             ) VALUES ($1, 'main', 'revert-1-main-1-0000', $2, 'b2924admin', 'dev1', '[]', 1, 0, 0, 1, 'queued', 100) \
+             ON CONFLICT (ticket) DO NOTHING",
+        )
+        .bind(pid)
+        .bind(uid)
+        .execute(&db)
+        .await;
+        db.close().await;
+
+        res.expect("pre-0044 bisect ON CONFLICT (ticket) DO NOTHING must keep working during rolling upgrade");
+    });
+}
+
+/// BUG-2925 (YugabyteDB): migration 0046 changes `landing_queue_finished`,
+/// `landings_at`, and `packs_unlisted` to composite hash keys
+/// `((project_id, branch) HASH, ...)` / `((project_id, name) HASH)`, which do
+/// not match `landing::service::clean` (`WHERE project_id = $1 AND done_at < $2` /
+/// `at < $2`) or `pack_gc::sweep_*` (`WHERE project_id = $1 AND state ...`), so
+/// YugabyteDB ignores all three indexes and scans the primary keys across tablets.
+#[test]
+fn bug_2925_migration_46_keeps_sweep_and_retention_indexes_usable_on_yugabytedb() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate(&db).await.unwrap();
+
+        // Populate a small realistic dataset and ANALYZE: under YugabyteDB 2025.2's
+        // default `yb_enable_base_scans_cost_model = on`, empty/unanalyzed tables
+        // always favor `*_pkey` (startup cost 21.00 < secondary index 24.00) even
+        // on pre-0046 schemas. With stats present, composite-hash indexes are still
+        // ignored while covering `(project_id HASH, ...) INCLUDE (...)` indexes get
+        // chosen for `Index Only Scan`.
+        exec_retrying(
+            &db,
+            "INSERT INTO landing_queue ( \
+                project_id, branch, ticket, person_id, person_name, device_key, stack, lineage, \
+                person_epoch, project_epoch, state, created_at, done_at \
+             ) SELECT 1, 'b' || g, 't' || g, 1, 'a', 'd', '[]', 1, 0, 0, \
+                      CASE WHEN g <= 10 THEN 'landed' ELSE 'queued' END, 50, \
+                      CASE WHEN g <= 10 THEN 50 ELSE NULL END \
+               FROM generate_series(1, 500) g",
+        )
+        .await;
+        exec_retrying(
+            &db,
+            "INSERT INTO landings (project_id, branch, lineage, submitted, landed, at) \
+             SELECT 1, 'b' || g, 1, 's' || g, 'l' || g, CASE WHEN g <= 10 THEN 50 ELSE 5000 END \
+             FROM generate_series(1, 500) g",
+        )
+        .await;
+        exec_retrying(
+            &db,
+            "INSERT INTO packs (project_id, name, state, person_id, size, objects, created_at, discarded_at) \
+             SELECT 1, 'p' || g, CASE WHEN g <= 5 THEN 0 ELSE 1 END, 1, 100, 1, 50, NULL \
+             FROM generate_series(1, 500) g",
+        )
+        .await;
+        exec_retrying(&db, "ANALYZE landing_queue, landings, packs").await;
+
+        let explain = |sql: &str| {
+            let db = db.clone();
+            let q = format!("EXPLAIN {sql}");
+            async move {
+                let rows: Vec<String> = sqlx::query_scalar(&q).fetch_all(&db).await.unwrap();
+                rows.join("\n")
+            }
+        };
+
+        let p_finished = explain(
+            "SELECT project_id, branch, seq FROM landing_queue \
+             WHERE project_id = 1 AND done_at < 100 AND state NOT IN ('queued', 'merging') LIMIT 500",
+        )
+        .await;
+        let p_landings = explain(
+            "SELECT project_id, branch, lineage, submitted FROM landings \
+             WHERE project_id = 1 AND at < 100 LIMIT 500",
+        )
+        .await;
+        let p_packs_due = explain(
+            "SELECT min(discarded_at) FILTER (WHERE state = 2), count(*) FILTER (WHERE state = 0 AND person_id IS NULL), \
+             min(created_at) FILTER (WHERE state = 0 AND person_id IS NOT NULL) FROM packs WHERE project_id = 1 AND state <> 1",
+        )
+        .await;
+        let p_packs_staged = explain(
+            "SELECT name FROM packs WHERE project_id = 1 AND state = 0 AND (person_id IS NULL OR created_at <= 100)",
+        )
+        .await;
+        db.close().await;
+
+        let mut failures: Vec<String> = Vec::new();
+        if !p_finished.contains("landing_queue_finished") {
+            failures.push(format!("landing::clean ignored landing_queue_finished:\n{p_finished}"));
+        }
+        if !p_landings.contains("landings_at") {
+            failures.push(format!("landing::clean ignored landings_at:\n{p_landings}"));
+        }
+        if !p_packs_due.contains("packs_unlisted") {
+            failures.push(format!("pack_gc::sweep_due ignored packs_unlisted:\n{p_packs_due}"));
+        }
+        if !p_packs_staged.contains("packs_unlisted") {
+            failures.push(format!("pack_gc::sweep_staged ignored packs_unlisted:\n{p_packs_staged}"));
+        }
+        assert!(failures.is_empty(), "BUG-2925 unusable indexes:\n{}", failures.join("\n---\n"));
+    });
+}
+
+/// BUG-2930 (PostgreSQL and YugabyteDB): `person_epochs` was withdrawn in
+/// migration 0045 (now a no-op) and replaced by rebuilding `access_epochs`
+/// with `PRIMARY KEY ((project_id, person_id) HASH)` inside offline-or-fresh
+/// migration 0046.
+///
+/// Part A (PG + YB): an in-flight `READ COMMITTED` revocation
+/// (`DELETE FROM group_members`) opened before migration 0045 and committed
+/// after version 45 is recorded is always seen by `caches::read_epochs`.
+/// Part B (YB): offline migration 0046 rebuilds `access_epochs` to
+/// `PRIMARY KEY ((project_id, person_id) HASH)`, preserves every `(0, person)`
+/// and `(project, 0)` row's exact `(epoch, changed_at)`, and subsequent
+/// revocations via `veil_bump_epoch` continue updating `access_epochs` cleanly
+/// and are seen by `caches::read_epochs`.
+#[test]
+fn bug_2930_migration_45_yugabytedb_loses_concurrent_revocation_in_person_epochs() {
+    let rt = runtime();
+    let yb = on_yugabyte(&rt);
+
+    // Part A: concurrent in-flight revocation across migration 0045 (PG + YB).
+    {
+        let (url, name) = fresh_database(&rt);
+        let _drop = DropFreshDb(&rt, name);
+        rt.block_on(async {
+            let db = veil_server::db::connect(&url, 6).await.unwrap();
+            apply_migrations_through(&db, 44).await;
+
+            exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2930alice', 1)").await;
+            exec_retrying(
+                &db,
+                "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+                 SELECT 'b2930proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2930alice'",
+            )
+            .await;
+            let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2930proj'").fetch_one(&db).await.unwrap();
+            let alice: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2930alice'").fetch_one(&db).await.unwrap();
+            exec_retrying(&db, &format!("INSERT INTO branches (project_id, name, target) VALUES ({pid}, 'main', 'snap0')")).await;
+            exec_retrying(&db, &format!("INSERT INTO groups (project_id, name) VALUES ({pid}, 'eng')")).await;
+            let gid: i64 = sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'eng'")
+                .bind(pid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            exec_retrying(&db, &format!("INSERT INTO group_members (group_id, person_id) VALUES ({gid}, {alice})")).await;
+
+            let e_before: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(alice)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_ne!(e_before, 0, "group insert bumped access_epochs");
+
+            // Pre-0045 server begins a READ COMMITTED revocation transaction
+            // (`api::change_group` / `Op::RemoveMember`) and deletes Alice from
+            // `group_members`, bumping `access_epochs (0, alice)` before 0045.
+            let mut rev_tx = db.begin().await.unwrap();
+            let deleted = sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND person_id = $2")
+                .bind(gid)
+                .bind(alice)
+                .execute(&mut *rev_tx)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(deleted, 1, "alice removed from group_members in open tx");
+
+            // Concurrently, a new server runs `db::migrate(&db)`: applies 0045
+            // (withdrawn no-op) and records version 45; on YB refuses 0046 online.
+            if yb {
+                let mig_err = veil_server::db::migrate(&db)
+                    .await
+                    .expect_err("0046 refuses online on existing YB DB");
+                assert!(
+                    mig_err.to_string().contains("veil-server migrate --offline"),
+                    "expected 0046 --offline refusal after 0045, got: {mig_err:?}"
+                );
+            } else {
+                veil_server::db::migrate(&db).await.expect("PG migrates cleanly through 46");
+            }
+            let applied_45: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 45)")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert!(applied_45, "migration 45 must be recorded in schema_migrations");
+
+            // The pre-0045 revocation finishes its trailing read and commits cleanly.
+            let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM group_members WHERE group_id = $1")
+                .bind(gid)
+                .fetch_one(&mut *rev_tx)
+                .await
+                .unwrap();
+            assert_eq!(remaining, 0);
+            rev_tx.commit().await.expect("pre-0045 revocation tx commits");
+
+            let e_revoked: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(alice)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_ne!(e_revoked, e_before, "committed revocation updated access_epochs");
+
+            let has_pe: Option<String> = sqlx::query_scalar("SELECT to_regclass('person_epochs')::text").fetch_one(&db).await.unwrap();
+            assert!(has_pe.is_none(), "person_epochs table must not exist");
+
+            let read = veil_server::caches::read_epochs(&db, alice, Some(pid)).await.unwrap();
+            assert_eq!(
+                read.person, e_revoked,
+                "Part A: read_epochs must see revoked epoch {e_revoked}, not pre-revocation {e_before}"
+            );
+            db.close().await;
+        });
+    }
+
+    // Part B (YugabyteDB): offline migration 0046 rebuilds `access_epochs` with
+    // `PRIMARY KEY ((project_id, person_id) HASH)`, preserves every epoch row
+    // bit-for-bit, and post-0046 `veil_bump_epoch` revocations keep working.
+    if yb {
+        let (url, name) = fresh_database(&rt);
+        let _drop = DropFreshDb(&rt, name);
+        rt.block_on(async {
+            let db = veil_server::db::connect(&url, 6).await.unwrap();
+            apply_migrations_through(&db, 45).await;
+
+            for person in ["b2930bob", "b2930carol"] {
+                exec_retrying(&db, &format!("INSERT INTO people (name, created_at) VALUES ('{person}', 1)")).await;
+            }
+            exec_retrying(
+                &db,
+                "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+                 SELECT 'b2930proj2', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2930bob'",
+            )
+            .await;
+            let pid: i64 = sqlx::query_scalar("SELECT id FROM projects WHERE name = 'b2930proj2'").fetch_one(&db).await.unwrap();
+            let bob: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2930bob'").fetch_one(&db).await.unwrap();
+            let carol: i64 = sqlx::query_scalar("SELECT id FROM people WHERE name = 'b2930carol'").fetch_one(&db).await.unwrap();
+            exec_retrying(&db, &format!("INSERT INTO groups (project_id, name) VALUES ({pid}, 'eng')")).await;
+            let gid: i64 = sqlx::query_scalar("SELECT id FROM groups WHERE project_id = $1 AND name = 'eng'")
+                .bind(pid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            // Trigger both project-level `(pid, 0)` and person-level `(0, uid)` rows via `veil_bump_epoch`.
+            exec_retrying(&db, &format!("INSERT INTO group_members (group_id, person_id) VALUES ({gid}, {bob}), ({gid}, {carol})")).await;
+            exec_retrying(&db, &format!("UPDATE projects SET policy_text = '# v1' WHERE id = {pid}")).await;
+
+            let before_rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+                "SELECT project_id, person_id, epoch, changed_at FROM access_epochs ORDER BY project_id, person_id",
+            )
+            .fetch_all(&db)
+            .await
+            .unwrap();
+            assert!(
+                before_rows.iter().any(|r| r.0 == 0 && r.1 == bob)
+                    && before_rows.iter().any(|r| r.0 == 0 && r.1 == carol)
+                    && before_rows.iter().any(|r| r.0 == pid && r.1 == 0),
+                "expected person and project access_epochs rows before 0046, got: {before_rows:?}"
+            );
+
+            // Offline 0046 rebuilds `access_epochs` to composite hash PK and preserves every row.
+            veil_server::db::migrate_offline(&db).await.expect("offline migration 46 succeeds");
+            assert!(veil_server::db::schema_current(&db).await.unwrap());
+
+            let pk_def: String = sqlx::query_scalar(
+                "SELECT pg_get_indexdef(i.indexrelid) FROM pg_index i \
+                 WHERE i.indrelid = to_regclass('access_epochs') AND i.indisprimary",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert!(pk_def.contains("(project_id, person_id) HASH"), "access_epochs PK missing composite hash: {pk_def}");
+
+            let after_rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+                "SELECT project_id, person_id, epoch, changed_at FROM access_epochs ORDER BY project_id, person_id",
+            )
+            .fetch_all(&db)
+            .await
+            .unwrap();
+            assert_eq!(after_rows, before_rows, "0046 rebuild must preserve every access_epochs row exactly");
+
+            // Post-0046 revocation through `veil_bump_epoch` trigger works on a fresh server pool
+            // (and on existing connections via plan invalidation / retry) and is seen by `read_epochs`.
+            let fresh = veil_server::db::connect(&url, 2).await.unwrap();
+            let bob_before = before_rows.iter().find(|r| r.0 == 0 && r.1 == bob).unwrap().2;
+            exec_retrying(&fresh, &format!("DELETE FROM group_members WHERE group_id = {gid} AND person_id = {bob}")).await;
+            let bob_after: i64 = sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = 0 AND person_id = $1")
+                .bind(bob)
+                .fetch_one(&fresh)
+                .await
+                .unwrap();
+            assert_ne!(bob_after, bob_before, "post-0046 revocation must bump access_epochs");
+            let read = veil_server::caches::read_epochs(&fresh, bob, Some(pid)).await.unwrap();
+            assert_eq!(read.person, bob_after, "read_epochs must observe post-0046 revocation");
+            assert_eq!(
+                read.project,
+                Some((pid, before_rows.iter().find(|r| r.0 == pid && r.1 == 0).unwrap().2)),
+                "read_epochs must observe preserved project epoch"
+            );
+            fresh.close().await;
+            db.close().await;
+        });
+    }
+}
+
+/// BUG-2931 (YugabyteDB): migration 0046 must never run automatically without
+/// `--offline` on an existing database (even when all rebuilt tables are empty
+/// because no project has received a push yet). Only a migrate run that created
+/// the schema from scratch (`schema_migrations` absent or empty when it took
+/// the migrations lock) may apply 0046 without `--offline`.
+#[test]
+fn bug_2931_migration_46_online_guard_misses_existing_live_org_without_pushes() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        apply_migrations_through(&db, 45).await;
+
+        // Existing live deployment: users, project, and active session exist,
+        // pre-0046 servers are serving, but no push has populated the rebuilt
+        // tables yet.
+        exec_retrying(&db, "INSERT INTO people (name, created_at) VALUES ('b2931admin', 1)").await;
+        exec_retrying(
+            &db,
+            "INSERT INTO projects (name, created_by, created_at, default_branch, policy_text, policy_bindings, policy_version) \
+             SELECT 'b2931proj', id, 1, 'main', '', '{}', 0 FROM people WHERE name = 'b2931admin'",
+        )
+        .await;
+
+        let res = veil_server::db::migrate(&db).await;
+        let err = res.expect_err("online db::migrate() must refuse migration 46 on an existing non-empty org database");
+        assert!(err.to_string().contains("veil-server migrate --offline"), "expected --offline refusal, got: {err:?}");
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "migration 46 must not be recorded");
+
+        veil_server::db::migrate_offline(&db).await.expect("offline migration 46 succeeds");
+        assert!(veil_server::db::schema_current(&db).await.unwrap());
+        db.close().await;
+    });
+}
+
+/// BUG-2931 (YugabyteDB): no emptiness gate — even a database already migrated
+/// through version 45 where every rebuilt table (and `people`/`projects`) is
+/// completely empty must refuse migration 46 without `--offline`, and then
+/// apply it cleanly with `migrate_offline`.
+#[test]
+fn bug_2931_migration_46_refuses_existing_db_with_empty_tables_without_offline() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate_through(&db, 45).await.expect("migrate through 45");
+
+        // Confirm every table rebuilt by 0046 is empty.
+        for tbl in [
+            "branches",
+            "snapshots",
+            "origins",
+            "projections",
+            "landed_changes",
+            "landing_queue",
+            "landings",
+            "landing_leases",
+            "packs",
+            "change_refs",
+            "access_epochs",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {tbl}")).fetch_one(&db).await.unwrap();
+            assert_eq!(count, 0, "{tbl} must be empty");
+        }
+
+        let err = veil_server::db::migrate(&db)
+            .await
+            .expect_err("existing DB at 45 with all rebuilt tables empty must still refuse 46 without --offline");
+        assert!(err.to_string().contains("veil-server migrate --offline"), "expected --offline refusal, got: {err:?}");
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "migration 46 must not be recorded");
+
+        veil_server::db::migrate_offline(&db).await.expect("offline migration 46 applies cleanly");
+        assert!(veil_server::db::schema_current(&db).await.unwrap());
+        db.close().await;
+    });
+}
+
+/// BUG-2932 (YugabyteDB): `verify_rebuilt_indexes` must verify that every
+/// expected composite-hash primary key (11 tables, including `access_epochs`)
+/// and every required secondary/UNIQUE index (14 indexes, including
+/// `landing_queue_ticket`, `landing_queue_person_slot`, and
+/// `landing_queue_session_slot`) exists with the expected uniqueness, is
+/// live/ready/valid, and passes `yb_index_check` before recording version 46.
+#[test]
+fn bug_2932_verify_rebuilt_indexes_does_not_check_required_indexes_exist() {
+    let rt = runtime();
+    if !on_yugabyte(&rt) {
+        return;
+    }
+    let (url, name) = fresh_database(&rt);
+    let _drop = DropFreshDb(&rt, name);
+    rt.block_on(async {
+        let db = veil_server::db::connect(&url, 2).await.unwrap();
+        veil_server::db::migrate_offline(&db).await.unwrap();
+
+        // Simulate an unrecorded retry where a bad rebuilt UNIQUE index was dropped
+        // before re-running `veil-server migrate --offline`.
+        exec_retrying(&db, "DELETE FROM schema_migrations WHERE version = 46").await;
+        exec_retrying(&db, "DROP INDEX landing_queue_ticket").await;
+
+        let err = veil_server::db::migrate_offline(&db)
+            .await
+            .expect_err("migrate_offline must fail when required UNIQUE index landing_queue_ticket is missing");
+        let msg = err.to_string();
+        assert!(msg.contains("landing_queue_ticket"), "error must name missing index landing_queue_ticket, got: {msg}");
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "version 46 must not be recorded when an index is missing");
+
+        // Recreating it without UNIQUE must still fail verification.
+        exec_retrying(&db, "CREATE INDEX landing_queue_ticket ON landing_queue (ticket HASH)").await;
+        let err = veil_server::db::migrate_offline(&db)
+            .await
+            .expect_err("migrate_offline must reject non-UNIQUE landing_queue_ticket");
+        let msg = err.to_string();
+        assert!(msg.contains("landing_queue_ticket") && msg.contains("UNIQUE"), "error must flag uniqueness mismatch, got: {msg}");
+        assert!(!veil_server::db::schema_current(&db).await.unwrap(), "version 46 must not be recorded when uniqueness is wrong");
+
+        // Recreating it properly as UNIQUE lets `migrate_offline` verify and record version 46.
+        exec_retrying(&db, "DROP INDEX landing_queue_ticket").await;
+        exec_retrying(&db, "CREATE UNIQUE INDEX landing_queue_ticket ON landing_queue (ticket HASH)").await;
+        veil_server::db::migrate_offline(&db).await.expect("migrate_offline succeeds once required UNIQUE index is restored");
+        assert!(veil_server::db::schema_current(&db).await.unwrap(), "version 46 recorded after verification passes");
+        db.close().await;
+    });
+}
+
+

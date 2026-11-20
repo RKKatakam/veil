@@ -17,6 +17,10 @@ set -euo pipefail
 [ $# -gt 0 ] && [[ "$1" != -* ]] || { echo "haproxy-cfg: usage: haproxy-cfg.sh HOST:PORT..." >&2; exit 2; }
 DNS=${HAPROXY_DNS:-}
 [ -z "$DNS" ] || [[ "$DNS" =~ ^[0-9.]+:[0-9]+$ ]] || { echo "haproxy-cfg: invalid HAPROXY_DNS '$DNS' (IP:PORT)" >&2; exit 2; }
+BIND=${HAPROXY_BIND:-:8443}
+[[ "$BIND" =~ ^([0-9.]+)?:[0-9]+$ ]] || { echo "haproxy-cfg: invalid HAPROXY_BIND '$BIND' ([IP]:PORT)" >&2; exit 2; }
+BALANCE=${HAPROXY_BALANCE:-leastconn}
+[[ "$BALANCE" =~ ^(leastconn|roundrobin)$ ]] || { echo "haproxy-cfg: invalid HAPROXY_BALANCE '$BALANCE' (leastconn or roundrobin)" >&2; exit 2; }
 cat <<CFG
 global
     maxconn 400000
@@ -37,11 +41,11 @@ resolvers dns
 CFG
 cat <<CFG
 frontend veil
-    bind :8443
+    bind $BIND
     maxconn 400000
     default_backend hubs
 backend hubs
-    balance leastconn
+    balance $BALANCE
     default-server check inter 1s fall 2 rise 2 on-marked-down shutdown-sessions maxconn 200000${DNS:+ resolvers dns init-addr last,libc,none}
 CFG
 i=0

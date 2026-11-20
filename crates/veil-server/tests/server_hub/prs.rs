@@ -2561,6 +2561,87 @@ mod s21_cycle3 {
         assert_eq!(normal(), 3, "kept through 16 concurrent landings");
     }
 
+    /// BUG-2926: every default-branch commit updates `pr_review_rules.checked`
+    /// (`t1 -> t2` advances `checked` to `t2`) so a peer server landing a
+    /// fast-forward commit `t2 -> t3` with a broken `.veilrules` always sees
+    /// `checked == t2` and preserves the stricter review rules (`approvals = 2`)
+    /// rather than downgrading to `Strict` (`approvals = 1`).
+    #[test]
+    fn bug_2926_rolling_upgrade_broken_veilrules_preserves_strict_rules_after_p7_skip() {
+        let th = TestHub::start();
+        let p = setup_project(&th);
+        let hub = th.hub();
+        let pid: i64 = th.rt.block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.db)).unwrap();
+        let admin = p.admin.token();
+        let dev = p.dev.token();
+        let tip = |token: &str| th.api().tips(Some(token), &p.name).unwrap().branches["main"];
+        let land = |token: &str, edits: Value| -> ObjectId {
+            let base = tip(token);
+            let r = th.api().post_json(
+                Some(token),
+                &format!("/v1/projects/{}/changes", p.name),
+                &json!({"base": base.hex(), "edits": edits, "onto": {"branch": "main", "expected": "rebase"}}),
+            );
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let v = r.json();
+            assert_eq!(v["branch"]["status"], "ok", "{v}");
+            ObjectId::from_hex(v["branch"]["tip"].as_str().unwrap()).unwrap()
+        };
+        let normal = || th.rt.block_on(prs::rules_of_project(&hub, pid, "main")).unwrap().need(Risk::Normal).approvals;
+
+        // 1. Admin sets `.veilrules` requiring 2 approvals at t1.
+        let t1 = land(&admin, json!([{"path": ".veilrules", "put": {"text": "[review]\nnormal = { approvals = 2 }\n"}}]));
+        assert_eq!(normal(), 2);
+
+        // 2. Server lands an unchanged commit t1 -> t2 (by non-admin `dev`);
+        //    with P7 reverted, `pr_review_rules.checked` advances to the real
+        //    `main` tip (`tip(&admin)`), not `dev`'s projected tip.
+        let _dev_proj_t2 = land(&dev, json!([{"path": "src/b2926.rs", "put": {"text": "fn b() {}\n"}}]));
+        let t2 = tip(&admin);
+        assert_ne!(t2, t1);
+        let (checked_after_t2, state_after_t2): (String, String) = th
+            .rt
+            .block_on(
+                sqlx::query_as("SELECT checked, state FROM pr_review_rules WHERE project_id = $1")
+                    .bind(pid)
+                    .fetch_one(&hub.db),
+            )
+            .unwrap();
+        assert_eq!(checked_after_t2, t2.hex(), "pr_review_rules.checked advances to real t2");
+
+        // 3. Peer server lands fast-forward t2 -> t3_broken with broken `.veilrules`.
+        let t3_broken = land(&admin, json!([{"path": ".veilrules", "put": {"text": BROKEN}}]));
+        th.rt.block_on(async {
+            let mut tx = hub.db.begin().await.unwrap();
+            sqlx::query("UPDATE pr_review_rules SET checked = $2, state = $3 WHERE project_id = $1")
+                .bind(pid)
+                .bind(&checked_after_t2)
+                .bind(&state_after_t2)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            prs::state::record_landing(
+                &mut tx,
+                pid,
+                &prs::state::Landing {
+                    old: Some(t2),
+                    new: t3_broken,
+                    file: prs::state::RulesFile::Broken(prs::rules::Review::strict("bad toml".into())),
+                    fast_forward: true,
+                },
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        });
+
+        assert_eq!(
+            normal(),
+            2,
+            "broken .veilrules landed after an unchanged commit must preserve 2 approvals, not downgrade to Strict (1)"
+        );
+    }
+
     /// Bounded reviews in answers (cycle 3): 300 reviewers' verdicts with
     /// 64 KiB texts: a PR answer lists the 100 latest, with texts within
     /// 256 KiB, and says how many there are.

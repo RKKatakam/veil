@@ -656,7 +656,6 @@ pub async fn create_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr
     let title = check_title(&q.title)?;
     let body = q.body.unwrap_or_default();
     check_text("the body", &body, MAX_TEXT)?;
-    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let onto = q.onto.unwrap_or_else(|| ask.project.default_branch.clone());
     let deadline = Instant::now() + DEADLINE;
     // The target is a branch, named as the caller names it.
@@ -717,7 +716,6 @@ pub async fn create_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, q: CreatePr
                 id2.clone(),
             );
             Box::pin(async move {
-                crate::pack_gc::guard_root_write(&mut *c, project, gc_epoch).await?;
                 if !pr_emb.is_empty() {
                     let locked = sqlx::query(
                         "UPDATE embargo_lines SET has_pr = TRUE WHERE project_id = $1 AND embargo_id = $2 AND released_at IS NULL",
@@ -991,7 +989,6 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
     if pr.revision >= MAX_REVISIONS {
         return Err(Error::bad_request(format!("a PR has at most {MAX_REVISIONS} revisions; open a new one")));
     }
-    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let deadline = Instant::now() + DEADLINE;
     let (head, head_emb) = embargo::resolve_head(hub, ask, &q.head, deadline).await?;
     // An embargoed PR never has a source branch to delete (BUG-1885).
@@ -1074,7 +1071,6 @@ pub async fn add_revision(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, 
         let (key, lines, prid, pr_emb, r, moved, src_b) =
             (key.clone(), lines.clone(), prid.clone(), pr_emb.clone(), r.clone(), moved.clone(), source_branch.clone());
         Box::pin(async move {
-            crate::pack_gc::guard_root_write(&mut *c, project, gc_epoch).await?;
             close_review_gate(&mut *c, project).await?;
             let class = class::put_class_for(&mut *c, project, &key, &lines, &pr_emb).await?;
             // The compare-and-swap: two new revisions at once, one wins.
@@ -2249,7 +2245,6 @@ pub async fn land(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str) -> Resul
 pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: LandPr) -> Result<Value> {
     let me = participant(ask, caller)?;
     let person = signed_in(caller)?.clone();
-    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, ask.project.id).await?;
     let pr = visible(hub, ask, id).await?;
     if !pr.embargo.is_empty() {
         return embargo::land_embargoed(hub, ask, me, &pr, q.at_release).await;
@@ -2323,7 +2318,6 @@ pub async fn land_with(hub: &Arc<Hub>, ask: &Ask, caller: &Caller, id: &str, q: 
     let r = transaction(&hub.db, Isolation::ReadCommitted, move |c| {
         let (q, who) = (q2.clone(), who2.clone());
         Box::pin(async move {
-            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             crate::landing::insert(&mut *c, pid, &who, &q).await
         })
     })

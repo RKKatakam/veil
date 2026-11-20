@@ -99,7 +99,7 @@ if [ "$YB_NODES" -gt 0 ]; then
         # in /etc/hosts, works on every cloud.
         remote "$ip" "hostnamectl set-hostname $n && { grep -q ' $n\$' /etc/hosts || echo '$priv $n' >> /etc/hosts; }"
         db_disk "$ip"
-        remote "$ip" "docker rm -f yb >/dev/null 2>&1; docker run -d --name yb --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v $YB_DATA:/root/var $YB_IMAGE bin/yugabyted start --background=false --advertise_address=$priv $join --tserver_flags=yb_enable_read_committed_isolation=true,ysql_num_shards_per_tserver=$YB_TABLETS --master_flags=enforce_tablet_replica_limits=false"
+        remote "$ip" "docker rm -f yb >/dev/null 2>&1; docker run -d --name yb --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v $YB_DATA:/root/var $YB_IMAGE bin/yugabyted start --background=false --advertise_address=$priv $join --tserver_flags=yb_enable_read_committed_isolation=true,ysql_num_tablets=-1,ysql_num_shards_per_tserver=$YB_TABLETS --master_flags=enforce_tablet_replica_limits=false"
         remote "$ip" 'for i in $(seq 120); do docker exec yb bin/ysqlsh -h '"$priv"' -tAc "select 1" >/dev/null 2>&1 && { echo "   yb'"$i"' answers"; exit 0; }; sleep 2; done; echo "configure: yb'"$i"' did not answer in 4 minutes (docker logs yb on it)" >&2; exit 1'
     done
     remote "$YB1" 'for i in $(seq 60); do n=$(docker exec yb bin/ysqlsh -h '"$FIRST"' -tAc "select count(*) from yb_servers()" 2>/dev/null); [ "$n" = '"$YB_NODES"' ] && break; sleep 2; done; echo "   YugabyteDB nodes in the cluster: $n (expected '"$YB_NODES"')"; [ "$n" = '"$YB_NODES"' ]'
@@ -107,10 +107,10 @@ if [ "$YB_NODES" -gt 0 ]; then
     # whatever --master_flags says, and the limit counts every replica a
     # node holds: with three tablets per table, a migrated Veil database is
     # about three times its table count on every node (docs/DEPLOY.md §2).
-    # Lifted on every master, as the rehearsal and scripts/verify-server.sh
-    # do; a node that restarts needs it again (configure.sh --approve again,
-    # or this one command on it), before any table is created.
-    for i in $(seq "$YB_NODES"); do
+    # Lifted on every master (the first three nodes in an RF=3 cluster; nodes
+    # 4..6 run tserver only), before any table is created.
+    MASTERS=$(( YB_NODES < 3 ? YB_NODES : 3 ))
+    for i in $(seq "$MASTERS"); do
         n=$NAME-yb$i
         remote "$(addr "$n")" "docker exec yb bin/yb-ts-cli --server_address=$(paddr "$n"):7100 set_flag --force enforce_tablet_replica_limits false && docker exec yb bin/yb-ts-cli --server_address=$(paddr "$n"):7100 set_flag --force tablet_replicas_per_gib_limit 100000"
     done
@@ -171,11 +171,28 @@ fi
 
 echo "== 5. the servers ($HUBS), all on the one database and the bucket $BUCKET ($OBJECTS: $(objects_endpoint))"
 HUB1=$(addr "$NAME-hub")
+if use_yb_proxy; then
+    # More YugabyteDB nodes than servers (e.g. 6 nodes, 3 servers): run a local
+    # HAProxy TCP round-robin proxy on each server so its connection pool
+    # spreads across every YugabyteDB node.
+    YB_BACKENDS=()
+    for i in $(seq "$YB_NODES"); do YB_BACKENDS+=("$(paddr "$NAME-yb$i"):5433"); done
+    for i in $(seq "$HUBS"); do
+        hn=$(hub_name "$i"); hip=$(addr "$hn"); hpriv=$(paddr "$hn")
+        if [ $APPROVED = 1 ]; then
+            HAPROXY_BIND="$hpriv:$YB_PROXY_PORT" HAPROXY_BALANCE=roundrobin "$DO_ROOT/deploy/lb/haproxy-cfg.sh" "${YB_BACKENDS[@]}" > "$STATE/yb-proxy-$i.cfg"
+        else
+            echo "would write $STATE/yb-proxy-$i.cfg (HAPROXY_BIND=$hpriv:$YB_PROXY_PORT HAPROXY_BALANCE=roundrobin deploy/lb/haproxy-cfg.sh ${YB_BACKENDS[*]})" >&2
+        fi
+        copy_to "$STATE/yb-proxy-$i.cfg" "$hip" /etc/veil/yb-proxy.cfg
+        remote "$hip" "chmod 644 /etc/veil/yb-proxy.cfg; docker rm -f yb-proxy >/dev/null 2>&1; docker run -d --name yb-proxy --restart unless-stopped --network host --ulimit nofile=1048576:1048576 -v /etc/veil/yb-proxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro $HAPROXY_IMAGE"
+    done
+fi
 # Each server's /etc/veil/hub.env: the object store's keys (MinIO's, with
 # the run's CA, or Spaces') and its database URL (with YugabyteDB, server I
-# connects to node I). The drivers get the first server's: their
-# benchmarks read the database's counters, and the same-machine gates
-# start a server of their own.
+# connects to node I, or to its local yb-proxy when YB_NODES > HUBS). The
+# drivers get the first server's: their benchmarks read the database's
+# counters, and the same-machine gates start a server of their own.
 hub_env() { # server number, host
     if [ $APPROVED = 1 ]; then
         umask 077
@@ -197,6 +214,15 @@ elif [ $APPROVED = 1 ]; then
     copy_to "$STATE/spaces.env" "$HUB1" /etc/veil/spaces.env
 else echo "would copy /etc/veil/spaces.env (Spaces keys, the database URL of server 1) to $HUB1" >&2; fi
 remote "$HUB1" "docker run --rm --env-file /etc/veil/hub.env veil-server:$TAG migrate"
+if [ "$YB_NODES" -gt 0 ] && [ "$YB_LAYOUT" = hash ]; then
+    # Verify ysql_num_tablets=-1 took effect (BUG-2890): yugabyted defaults
+    # ysql_num_tablets=1, which silently collapses every hash table to 1 tablet
+    # regardless of ysql_num_shards_per_tserver. Count distinct tablets of
+    # `branches` across every YugabyteDB node; expected = YB_NODES * YB_TABLETS.
+    WANT_TABLETS=$((YB_NODES * YB_TABLETS))
+    YB_PRIVS=""; for i in $(seq "$YB_NODES"); do YB_PRIVS+=" $(paddr "$NAME-yb$i")"; done
+    remote "$YB1" "t=\$(for h in$YB_PRIVS; do docker exec yb bin/ysqlsh -h \$h -d $DB_NAME -X -tA -c \"SELECT tablet_id FROM yb_local_tablets WHERE namespace_name = '$DB_NAME' AND table_name = 'branches'\"; done | grep -v '^\$' | sort -u | wc -l); echo \"   branches tablets across $YB_NODES nodes: \$t (expected $WANT_TABLETS)\"; [ \"\$t\" -eq $WANT_TABLETS ] || { echo 'configure: branches has '\"\$t\"' tablet(s), expected $WANT_TABLETS (check ysql_num_tablets=-1 and ysql_num_shards_per_tserver=$YB_TABLETS)' >&2; exit 1; }"
+fi
 # The limits per device and per address are lifted, as veil-bench lifts
 # them on a server it starts (crates/veil-bench/src/server.rs): a driver's
 # 10,000 agents are a few devices on one address, and would measure the

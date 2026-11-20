@@ -644,18 +644,17 @@ pub fn merge(inputs: &[Arc<Segment>], newer: &dyn Fn(&str) -> bool, oldest: bool
     (finish_encoded(out, gram_count, table, postings), dropped)
 }
 
-fn cache_key(project: i64, gc_epoch: i64, id: &ObjectId) -> ObjectId {
+fn cache_key(project: i64, id: &ObjectId) -> ObjectId {
     let mut h = blake3::Hasher::new();
     h.update(b"search-segment");
     h.update(&project.to_le_bytes());
-    h.update(&gc_epoch.to_le_bytes());
     h.update(&id.0);
     ObjectId(*h.finalize().as_bytes())
 }
 
 /// Segment `id` of `project`, from [`crate::Hub::segments`] or the store.
 pub fn load(src: &crate::sync::Source, id: &ObjectId) -> Result<Arc<Segment>> {
-    let k = cache_key(src.project, src.hub.objects.gc_epoch(src.project), id);
+    let k = cache_key(src.project, id);
     if let Some(s) = src.hub.segments.get(&k) {
         return Ok(s);
     }
@@ -669,7 +668,7 @@ pub fn load(src: &crate::sync::Source, id: &ObjectId) -> Result<Arc<Segment>> {
 /// [`crate::Hub::segments`] when already resident, otherwise decodes without
 /// inserting transient inputs into the cache (BUG-2663).
 pub fn load_uncached(src: &crate::sync::Source, id: &ObjectId) -> Result<Arc<Segment>> {
-    let k = cache_key(src.project, src.hub.objects.gc_epoch(src.project), id);
+    let k = cache_key(src.project, id);
     if let Some(s) = src.hub.segments.get(&k) {
         return Ok(s);
     }

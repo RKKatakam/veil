@@ -1,0 +1,14 @@
+-- Migration 0045 (`person_epochs`) was withdrawn (BUG-2930):
+--
+-- Splitting global person epochs into a separate dual-written `person_epochs`
+-- table with an `AFTER INSERT OR UPDATE` mirror trigger and backfill cannot be
+-- applied safely across a rolling upgrade on YugabyteDB without fighting the
+-- distributed catalog (DDL does not drain in-flight transactions under older
+-- catalog versions, and retries commit `DROP TRIGGER` immediately).
+--
+-- Instead, migration 0046 (`0046_single_repo_hash_keys.sql`, fresh-or-offline
+-- only on hash-sharded YugabyteDB) rebuilds `access_epochs` with composite
+-- `PRIMARY KEY ((project_id, person_id) HASH)` so `(0, person_id)` rows spread
+-- across all tablets directly, with zero dual-writes or mirror triggers.
+--
+-- Kept as a no-op migration so migration numbering stays contiguous.

@@ -2391,3 +2391,112 @@ fn bug_2480_a_run_over_many_moved_branches_asks_and_reads_them_together() {
     assert!(statements < BRANCHES / 4, "{statements} statements for {BRANCHES} moved branches: not one a branch");
     assert!(store.most.load(SeqCst) > 1, "the branches' lines are read together, not one snapshot after another");
 }
+
+/// P8: background `derive::landed` debounces per project (250 ms default) so
+/// rapid back-to-back pushes coalesce into one derive transaction, while
+/// `derive::ensure` (and query reads) stay synchronous so a read right after
+/// a push sees the pushed commit immediately without waiting for the debounce.
+#[test]
+fn p8_derive_debounce_coalesces_pushes_and_immediate_read_sees_history() {
+    use veil_server::db::Commit;
+
+    let th = TestHub::start_own();
+    let hub = th.hub();
+    assert_eq!(hub.derive.debounce(), derive::DEFAULT_DEBOUNCE);
+    assert_eq!(derive::DEFAULT_DEBOUNCE, Duration::from_millis(250));
+
+    // 1. Immediate read right after a push sees current history even when the
+    //    background deriver is held back by a 10 s debounce window.
+    let p = setup_project(&th);
+    let api = th.api();
+    let token = p.admin.token();
+    hub.derive.set_debounce(Duration::from_secs(10));
+
+    let marker = "p8-immediate-read-marker";
+    write_files(&p.dir, &[("src/p8.txt", "fresh after push\n")]);
+    p.admin.commit_main(&p.dir, marker);
+    p.admin.ok(&p.dir, &["push"]);
+
+    let started = Instant::now();
+    let log = api.get(Some(&token), &format!("/v1/projects/{}/q/log?n=20", p.name));
+    assert_eq!(log.status, 200, "q/log failed: {}", String::from_utf8_lossy(&log.body));
+    let log_json = log.json();
+    let entries = log_json["entries"].as_array().expect("log entries");
+    assert!(
+        entries.iter().any(|e| e["description"].as_str() == Some(marker)),
+        "immediate q/log right after push did not see {marker}: {log_json}"
+    );
+    let tips = api.tips(Some(&token), &p.name).expect("tips");
+    let main_tip = *tips.branches.get("main").expect("main tip");
+    let pid: i64 = th
+        .rt
+        .block_on(sqlx::query_scalar("SELECT id FROM projects WHERE name = $1").bind(&p.name).fetch_one(&hub.db))
+        .unwrap();
+    let ensured = th.rt.block_on(derive::ensure(&hub, pid, main_tip)).expect("derive::ensure");
+    assert!(!ensured.skipped);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "immediate read + derive::ensure waited on the 10 s debounce ({:?})",
+        started.elapsed()
+    );
+    // Confirm the snapshot's graph row is now present via synchronous ensure().
+    let has_row: bool = th
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM graph WHERE project_id = $1 AND snapshot = $2)")
+                .bind(pid)
+                .bind(main_tip.hex())
+                .fetch_one(&hub.db),
+        )
+        .unwrap();
+    assert!(has_row, "derive::ensure synchronously derived main_tip");
+
+    // 2. Rapid back-to-back landings on a fresh project under the default
+    //    250 ms debounce coalesce into one background derive transaction.
+    hub.derive.set_debounce(derive::DEFAULT_DEBOUNCE);
+    let (text, bindings) = policy(910_008);
+    let mut h = Hist::new(&th, &text, &bindings);
+    let base = h.commit(&th, &[root_snapshot_id()], Files::from([("pub/a.txt".to_string(), b"a\n".to_vec())]), [1; 16], 1, None);
+    h.set_branch(&th, "main", base);
+    th.rt.block_on(derive::landing(&h.hub, h.id, vec!["main".into()])).unwrap();
+
+    const BURST: usize = 6;
+    let mut tips_hex = Vec::new();
+    let commits_before = h.hub.commits.of(Commit::Derive);
+    for i in 0..BURST {
+        let mut change = [7; 16];
+        change[0] = i as u8;
+        let tip = h.commit(
+            &th,
+            &[base],
+            Files::from([("pub/a.txt".to_string(), b"a\n".to_vec()), (format!("pub/b{i}.txt"), format!("v{i}\n").into_bytes())]),
+            change,
+            10 + i as i64,
+            None,
+        );
+        let name = format!("burst-{i}");
+        h.set_branch(&th, &name, tip);
+        tips_hex.push(tip.hex());
+        let _in_rt = th.rt.enter();
+        derive::landed(&h.hub, h.id, vec![name]);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let done: i64 = th
+            .rt
+            .block_on(
+                sqlx::query_scalar("SELECT count(*) FROM derive_progress WHERE project_id = $1 AND through_snapshot = ANY($2)")
+                    .bind(h.id)
+                    .bind(&tips_hex)
+                    .fetch_one(&h.hub.db),
+            )
+            .unwrap();
+        if done == BURST as i64 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "debounced derive did not catch up all {BURST} branches (done={done})");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let derive_commits = h.hub.commits.of(Commit::Derive) - commits_before;
+    assert_eq!(derive_commits, 1, "all {BURST} rapid landings should coalesce into 1 derive commit, got {derive_commits}");
+}

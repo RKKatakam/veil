@@ -114,7 +114,6 @@ pub async fn post_check_route(
         validate_log(l).map_err(Error::bad_request)?;
     }
 
-    let gc_epoch = crate::pack_gc::read_gc_epoch(&hub, project.id).await?;
     let Some(real_id) = resolve_snapshot(&hub, &project, &viewer, &req.snapshot).await? else {
         return Err(Error::not_found("no such snapshot in your view of this project"));
     };
@@ -162,7 +161,6 @@ pub async fn post_check_route(
         let project_for_tx = project_for_tx.clone();
         let rules_for_tx = rules_for_tx.clone();
         Box::pin(async move {
-            crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
             let existing: Option<(i64, String, bool)> = sqlx::query_as(
                 "SELECT runner_id, session_paths, admin_only FROM checks WHERE project_id = $1 AND snapshot = $2 AND name = $3",
             )
@@ -491,36 +489,45 @@ pub async fn tested_for(hub: &Arc<Hub>, project: &Project, viewer: &Viewer, bran
 
 /// All `<branch>@tested` pointers in `project` as `viewer` sees them, for
 /// [`veil_core::hub::wire::Tips::tested`]: of every branch, or (`only`) of
-/// those named (`tips?branches=`).
+/// those named (`tips?branches=`). Backed by `caches.tips` (`sync::cached_branch_rows`,
+/// invalidated on `advance_tested` and branch moves) with live embargo checks.
 pub async fn all_tested_for(
     hub: &Arc<Hub>,
     project: &Project,
     viewer: &Viewer,
     only: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<BTreeMap<String, ObjectId>> {
-    let names: Option<Vec<String>> = only.map(|o| o.iter().cloned().collect());
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT t.branch, t.snapshot, b.hidden_for_embargo FROM tested t \
-         JOIN branches b ON b.project_id = t.project_id AND b.name = t.branch \
-         WHERE t.project_id = $1 AND t.lineage = b.lineage AND ($2::text[] IS NULL OR t.branch = ANY($2)) ORDER BY t.branch",
-    )
-    .bind(project.id)
-    .bind(names)
-    .fetch_all(&hub.db)
-    .await?;
+    let rows = sync::cached_branch_rows(hub, project.id).await?;
+    tested_from_rows(hub, project, viewer, &crate::caches::Epochs::default(), &rows, only).await
+}
+
+/// Project `<branch>@tested` pointers from cached [`crate::caches::BranchRow`]s
+/// with live embargo checks (`embargo::can_see` and `embargo::is_withheld_in`).
+pub(crate) async fn tested_from_rows(
+    hub: &Arc<Hub>,
+    project: &Project,
+    viewer: &Viewer,
+    epochs: &crate::caches::Epochs,
+    rows: &[crate::caches::BranchRow],
+    only: Option<&std::collections::BTreeSet<String>>,
+) -> Result<BTreeMap<String, ObjectId>> {
     let mut out = BTreeMap::new();
-    for (branch, hex, hidden) in rows {
-        if let Some(eid) = hidden {
-            if !crate::embargo::can_see(hub, project, viewer, &eid).await? {
+    for row in rows {
+        let Some(hex) = &row.tested else { continue };
+        if only.is_some_and(|o| !o.contains(&row.name)) {
+            continue;
+        }
+        if let Some(eid) = &row.hidden_for_embargo {
+            if !crate::embargo::can_see(hub, project, viewer, eid).await? {
                 continue;
             }
         }
-        if let Ok(real) = ObjectId::from_hex(&hex) {
-            if crate::embargo::is_withheld_from_viewer(hub, project, viewer, &real).await? {
+        if let Ok(real) = ObjectId::from_hex(hex) {
+            if crate::embargo::is_withheld_in(hub, project, viewer, epochs, &real).await? {
                 continue;
             }
             let proj = sync::projected(hub, project, viewer, real).await?;
-            out.insert(branch, proj);
+            out.insert(row.name.clone(), proj);
         }
     }
     Ok(out)
@@ -707,21 +714,7 @@ const MAX_TESTED_WALK: usize = 1024;
 /// Re-evaluate `<branch>@tested` for every branch of `project`, advancing
 /// `tested` monotonically to the newest snapshot on the branch's
 /// first-parent chain whose required checks have all passed.
-///
-/// `tested.snapshot` is a root: it is written behind GC's guard, and after
-/// a switch the branches are read again under the new epoch (BUG-1881).
 pub async fn advance_tested(hub: &Arc<Hub>, project: &Project) -> Result<()> {
-    for attempt in 0..8 {
-        match advance_tested_once(hub, project).await {
-            Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) && attempt < 7 => continue,
-            r => return r,
-        }
-    }
-    unreachable!("the last attempt returns")
-}
-
-async fn advance_tested_once(hub: &Arc<Hub>, project: &Project) -> Result<()> {
-    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project.id).await?;
     let branches: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT name, target, lineage FROM branches WHERE project_id = $1 AND hidden_for_embargo IS NULL ORDER BY name",
     )
@@ -839,6 +832,7 @@ async fn advance_tested_once(hub: &Arc<Hub>, project: &Project) -> Result<()> {
     }
 
     let now = veil_core::now_millis();
+    let mut moved = false;
     for (branch, (lineage, chain)) in chains {
         let Some(reqs) = rules.required_checks.get(&branch).filter(|r| !r.is_empty()) else {
             continue;
@@ -851,11 +845,10 @@ async fn advance_tested_once(hub: &Arc<Hub>, project: &Project) -> Result<()> {
         });
         if let Some((winner, depth)) = passed {
             let (pid, winner) = (project.id, winner.hex());
-            crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
+            let changed = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, move |c| {
                 let (branch, winner) = (branch.clone(), winner.clone());
                 Box::pin(async move {
-                    crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
-                    sqlx::query(
+                    let res = sqlx::query(
                         "INSERT INTO tested (project_id, branch, lineage, snapshot, depth, updated_at) \
                          VALUES ($1, $2, $3, $4, $5, $6) \
                          ON CONFLICT (project_id, branch) DO UPDATE \
@@ -874,11 +867,15 @@ async fn advance_tested_once(hub: &Arc<Hub>, project: &Project) -> Result<()> {
                     .bind(now)
                     .execute(&mut *c)
                     .await?;
-                    Ok(())
+                    Ok(res.rows_affected() > 0)
                 })
             })
             .await?;
+            moved |= changed;
         }
+    }
+    if moved {
+        hub.caches.tips_moved(project.id);
     }
     Ok(())
 }

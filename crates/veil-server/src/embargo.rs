@@ -219,6 +219,22 @@ pub async fn embargoes_for(hub: &Hub, project: &Project, viewer: &Viewer) -> Res
     Ok(out)
 }
 
+/// [`embargoes_for`], using the live `embargo_lines` check already performed
+/// by `caches::read_epochs` on this request (`Epochs::no_embargoes`). Nothing
+/// about embargoes is cached across requests: when `epochs` did not check this
+/// project or saw any row (active or released), [`embargoes_for`] runs live.
+pub async fn embargoes_for_at(
+    hub: &Hub,
+    project: &Project,
+    viewer: &Viewer,
+    epochs: &crate::caches::Epochs,
+) -> Result<Vec<EmbargoRecord>> {
+    if epochs.no_embargoes(project.id) {
+        return Ok(Vec::new());
+    }
+    embargoes_for(hub, project, viewer).await
+}
+
 /// Is `snapshot` (real or projected) on an active embargo line in `project`?
 /// Used by the query API to withhold unreleased embargo snapshots from every
 /// viewer (including admins) until release.
@@ -1205,8 +1221,7 @@ pub(crate) async fn read_embargo_ticket(
 /// every landing (its submitter's outstanding-landing bounds, S24), and wait
 /// for the landing service (S17). A ticket that failed is queued again only
 /// when a person asks (`manual_retry`); a push to the line removes it
-/// (`record_in_tx`). `gc_epoch`: the project's GC epoch as read before
-/// `judged` was computed (BUG-1881).
+/// (`record_in_tx`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn queue_and_wait_embargo_landing(
     hub: &Arc<Hub>,
@@ -1217,7 +1232,6 @@ pub(crate) async fn queue_and_wait_embargo_landing(
     judged: crate::landing::Judged,
     who: &crate::landing::Submitter,
     manual_retry: bool,
-    gc_epoch: i64,
 ) -> Result<veil_core::hub::land::LandResult> {
     let existing = read_embargo_ticket(hub, project.id, ticket).await?;
     let need_queue = match &existing {
@@ -1240,9 +1254,6 @@ pub(crate) async fn queue_and_wait_embargo_landing(
             let q = q.clone();
             let who2 = who2.clone();
             Box::pin(async move {
-                // The queue row holds the stack's snapshots (roots): in line
-                // with GC's switch before any other lock (BUG-1881).
-                crate::pack_gc::guard_root_write(&mut *c, pid, gc_epoch).await?;
                 let unreleased: Option<bool> = sqlx::query_scalar(
                     "SELECT released_at IS NULL FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2 FOR UPDATE",
                 )
@@ -1388,25 +1399,20 @@ pub async fn release_one(
     pushed_record: Option<EmbargoRecord>,
     submitter: Option<(&Viewer, &crate::landing::Submitter)>,
 ) -> Result<bool> {
-    loop {
-        match release_one_once(hub, project_id, embargo_id, pushed_record.clone(), submitter).await {
-            Err(e) if crate::pack_gc::is_gc_epoch_changed(&e) => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            // Another server released it while this one judged the line
-            // (BUG-2560): its review check then found the approved PR landed,
-            // no longer open, and counted no approval. Released is released.
-            Err(e @ Error::Api { code: "not_ready" | "conflict", .. }) => {
-                let released: Option<bool> =
-                    sqlx::query_scalar("SELECT released_at IS NOT NULL FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2")
-                        .bind(project_id)
-                        .bind(embargo_id)
-                        .fetch_optional(&hub.db)
-                        .await?;
-                return if released == Some(true) { Ok(false) } else { Err(e) };
-            }
-            other => return other,
+    match release_one_once(hub, project_id, embargo_id, pushed_record, submitter).await {
+        // Another server released it while this one judged the line
+        // (BUG-2560): its review check then found the approved PR landed,
+        // no longer open, and counted no approval. Released is released.
+        Err(e @ Error::Api { code: "not_ready" | "conflict", .. }) => {
+            let released: Option<bool> =
+                sqlx::query_scalar("SELECT released_at IS NOT NULL FROM embargo_lines WHERE project_id = $1 AND embargo_id = $2")
+                    .bind(project_id)
+                    .bind(embargo_id)
+                    .fetch_optional(&hub.db)
+                    .await?;
+            if released == Some(true) { Ok(false) } else { Err(e) }
         }
+        other => other,
     }
 }
 
@@ -1417,7 +1423,6 @@ async fn release_one_once(
     pushed_record: Option<EmbargoRecord>,
     submitter: Option<(&Viewer, &crate::landing::Submitter)>,
 ) -> Result<bool> {
-    let gc_epoch = crate::pack_gc::read_gc_epoch(hub, project_id).await?;
     type Line = (Vec<String>, String, String, Option<i64>, String, String);
     let row: Option<Line> = sqlx::query_as(
         "SELECT group_names, target_branch, embargo_branch, released_at, record_json, created_by \
@@ -1568,7 +1573,7 @@ async fn release_one_once(
             // stands in for commits pushed to the line since (BUG-1875).
             let ticket = format!("embargo-{project_id}-{embargo_id}-{}", &etip_hex[..16]);
             let outcome =
-                queue_and_wait_embargo_landing(hub, &project, embargo_id, &ticket, &target_branch, judged, &who, manual, gc_epoch).await?;
+                queue_and_wait_embargo_landing(hub, &project, embargo_id, &ticket, &target_branch, judged, &who, manual).await?;
             if outcome.state != LandState::Landed {
                 let msg = outcome
                     .message

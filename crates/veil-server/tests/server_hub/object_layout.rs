@@ -882,10 +882,10 @@ fn guarantee_9_landing_batch_keeps_loose_and_failed_batch_leaves_only_collectibl
     assert!(hub.rt.block_on(store.exists(&veil_server::store::object_key(pid, &tip1))).unwrap(), "landed tip stored loose under its key");
     assert!(whole_tree_beside(&hub, pid, tip1) >= 6);
 
-    // 2. A landing batch that does not commit: hold the GC epoch row while the batch writes its
-    //    objects, cancel `tickets2[0]` and bump the epoch so attempt 1 rolls back and attempt 2
-    //    lands only `tickets2[1..3]`. Attempt 1's `[0+1, 0+1+2]` trees/snapshots/projections are
-    //    left unreferenced in storage, kept inside the retention window, and collected after it.
+    // 2. A landing batch that does not commit: hold the branch row while the batch writes its
+    //    objects, then cancel `tickets2[0]` so attempt 1 rolls back (`landing_queue` state check)
+    //    and attempt 2 lands only `tickets2[1..3]`. Attempt 1's `[0+1, 0+1+2]` trees/snapshots/projections
+    //    are left unreferenced in storage.
     settle(&hub);
     let base2 = api.tips(Some(&dev), &p.name).unwrap().branches["main"];
     hold_branch(&hub, pid, "main");
@@ -899,10 +899,10 @@ fn guarantee_9_landing_batch_keeps_loose_and_failed_batch_leaves_only_collectibl
     let kept_before = h.objects.objects_kept.load(Relaxed);
 
     let mut switch = hub.rt.block_on(h.db.begin()).unwrap();
-    let epoch: i64 = hub
+    let _locked: String = hub
         .rt
         .block_on(
-            sqlx::query_scalar("SELECT epoch FROM access_epochs WHERE project_id = $1 AND person_id = -1 FOR UPDATE")
+            sqlx::query_scalar("SELECT target FROM branches WHERE project_id = $1 AND name = 'main' FOR UPDATE")
                 .bind(pid)
                 .fetch_one(&mut *switch),
         )
@@ -921,18 +921,13 @@ fn guarantee_9_landing_batch_keeps_loose_and_failed_batch_leaves_only_collectibl
     assert!(!attempt1_written.is_empty(), "failed batch attempt wrote loose objects before committing");
     assert_eq!(api.tips(Some(&dev), &p.name).unwrap().branches["main"], base2, "nothing landed while tx waited");
 
-    // Cancel `tickets2[0]` and bump GC epoch so attempt 1 aborts and attempt 2 builds a batch without `tickets2[0]`.
+    // Cancel `tickets2[0]` so attempt 1 aborts at its `landing_queue` CAS and attempt 2 builds a batch without `tickets2[0]`.
     hub.rt
         .block_on(async {
             sqlx::query("UPDATE landing_queue SET state = 'cancelled', done_at = $3 WHERE project_id = $1 AND ticket = $2")
                 .bind(pid)
                 .bind(&tickets2[0])
                 .bind(veil_core::now_millis())
-                .execute(&mut *switch)
-                .await?;
-            sqlx::query("UPDATE access_epochs SET epoch = $2 WHERE project_id = $1 AND person_id = -1")
-                .bind(pid)
-                .bind(epoch + 1)
                 .execute(&mut *switch)
                 .await?;
             switch.commit().await
@@ -1798,5 +1793,167 @@ fn bug_2661_vanished_receipted_container_answers_409_and_keeps_sibling_uploads()
         }
     }
 }
+
+/// BUG-2923 (P5-B): skipping pre-tx `usable_for_packs` when staged names are
+/// cryptographically verified and not locally tombstoned lets a replay of a
+/// cross-hub refused pack `P1` on Hub A:
+///   1. write `P1`'s objects permanently into `p/<project>/...` in object storage
+///      via `keep_uploads` (before the push tx's `UPDATE packs` aborts with 400);
+///   2. answer non-uniform `403` instead of uniform `400 BAD_PACK_UPLOAD` when
+///      a pre-tx check refusal fires first;
+///   3. destroy live sibling `P4` via `discard_refused` when a cross-hub
+///      consumed pack `P3` is paired with a pre-tx check refusal instead of
+///      answering `409 DISCARDED_UPLOAD` and keeping `P4`.
+#[test]
+fn bug_2923_cross_hub_refused_or_consumed_pack_never_persists_objects_or_destroys_siblings() {
+    let hub = TestHub::start_objects();
+    let other = TestHub::beside(&hub);
+    let p = setup_project(&hub);
+    let pid = project_id(&hub, &p.name);
+    let api = hub.api();
+    let other_api = other.api();
+    let dev_tok = p.dev.token();
+    let h = hub.hub();
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // 1. Permanent S3 write of already-refused pack P1:
+    //    Upload P1 on Hub A (cached in Hub A's staged index + object cache),
+    //    refuse P1 on Hub B (`state = DISCARDED, objects >= 0`, S3 deleted),
+    //    then replay P1 on Hub A with valid snapshot `s1`.
+    let refused_text = "// must never be persisted to p/<pid>/\n";
+    let (refused_blob, _) = blob(refused_text);
+    let mut c1 = Craft::new(&api, &p.dev, &p.name, "main");
+    c1.file("src/b2923_refused.rs", refused_text);
+    let tip = c1.tip;
+    let s1 = snap(&mut c1, vec![tip], "b2923 refused", None);
+    let (_, p1) = upload_all(&api, &c1);
+
+    let r_refuse1 = other_api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "b2923-refuse1", "expected": null, "new": ObjectId::hash(b"missing-b2923-1").hex()}],
+            "packs": [&p1],
+        }),
+    );
+    assert_eq!(r_refuse1.status, 400, "{}", String::from_utf8_lossy(&r_refuse1.body));
+
+    let r_replay = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "b2923-replay", "expected": null, "new": s1.hex()}],
+            "packs": [&p1],
+        }),
+    );
+    assert_eq!(r_replay.status, 400, "{}", String::from_utf8_lossy(&r_replay.body));
+    let s1_key = veil_server::store::object_key(pid, &s1);
+    let blob_key = veil_server::store::object_key(pid, &refused_blob);
+    let stored_keys = loose_keys_in_store(&hub, pid);
+    if stored_keys.contains(&s1_key) || stored_keys.contains(&blob_key) {
+        failures.push(format!(
+            "1) already-refused pack P1 had objects permanently written to S3 (s1_present={}, blob_present={})",
+            stored_keys.contains(&s1_key),
+            stored_keys.contains(&blob_key),
+        ));
+    }
+
+    // 2. Non-uniform status oracle: upload P2 on Hub A, refuse P2 on Hub B,
+    //    then replay P2 on Hub A with non-admin `force: true`. Must still
+    //    answer uniform `400 BAD_PACK_UPLOAD`, not `403`.
+    let mut c2 = Craft::new(&api, &p.dev, &p.name, "main");
+    c2.file("src/b2923_oracle.rs", "// oracle\n");
+    let s2 = snap(&mut c2, vec![tip], "b2923 oracle", None);
+    let (_, p2) = upload_all(&api, &c2);
+
+    let r_refuse2 = other_api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "b2923-refuse2", "expected": null, "new": ObjectId::hash(b"missing-b2923-2").hex()}],
+            "packs": [&p2],
+        }),
+    );
+    assert_eq!(r_refuse2.status, 400, "{}", String::from_utf8_lossy(&r_refuse2.body));
+
+    let r_force = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "force": true,
+            "updates": [{"branch": "b2923-force", "expected": null, "new": s2.hex()}],
+            "packs": [&p2],
+        }),
+    );
+    if r_force.status != 400 {
+        failures.push(format!(
+            "2) refused pack P2 with force:true answered {} instead of uniform 400 BAD_PACK_UPLOAD: {}",
+            r_force.status,
+            String::from_utf8_lossy(&r_force.body)
+        ));
+    }
+
+    // 3. Cross-hub consumed pack P3 + live sibling P4 + pre-tx check refusal:
+    //    must answer 409 DISCARDED_UPLOAD and preserve live sibling P4.
+    let mut c3 = Craft::new(&api, &p.dev, &p.name, "main");
+    c3.file("src/b2923_p3.rs", "// p3\n");
+    let s3 = snap(&mut c3, vec![tip], "b2923 p3", None);
+    let (_, p3) = upload_all(&api, &c3);
+
+    let mut c4 = Craft::new(&api, &p.dev, &p.name, "main");
+    c4.file("src/b2923_p4.rs", "// p4\n");
+    let s4 = snap(&mut c4, vec![tip], "b2923 p4", None);
+    let (_, p4) = upload_all(&api, &c4);
+
+    let r_consume = other_api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "updates": [{"branch": "b2923-p3", "expected": null, "new": s3.hex()}],
+            "packs": [&p3],
+        }),
+    );
+    assert_eq!(r_consume.status, 200, "{}", String::from_utf8_lossy(&r_consume.body));
+
+    let r_consumed_refusal = api.post_json(
+        Some(&dev_tok),
+        &format!("/v1/projects/{}/push", p.name),
+        &json!({
+            "force": true,
+            "updates": [{"branch": "b2923-p4", "expected": null, "new": s4.hex()}],
+            "packs": [&p3, &p4],
+        }),
+    );
+    if r_consumed_refusal.status != 409 {
+        failures.push(format!(
+            "3a) consumed pack P3 + force:true answered {} instead of 409 DISCARDED_UPLOAD: {}",
+            r_consumed_refusal.status,
+            String::from_utf8_lossy(&r_consumed_refusal.body)
+        ));
+    }
+    let p4_state: Option<i16> = hub
+        .rt
+        .block_on(
+            sqlx::query_scalar("SELECT state FROM packs WHERE project_id = $1 AND name = $2")
+                .bind(pid)
+                .bind(&p4)
+                .fetch_optional(&h.db),
+        )
+        .unwrap();
+    if p4_state != Some(0) {
+        failures.push(format!(
+            "3b) live sibling P4 was destroyed (packs.state={p4_state:?} instead of STAGED=Some(0))"
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "BUG-2923 violations:\n{}",
+        failures.join("\n")
+    );
+}
+
+
 
 

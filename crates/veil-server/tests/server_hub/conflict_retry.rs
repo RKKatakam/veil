@@ -15,12 +15,12 @@ use veil_core::object::Object as O;
 use crate::{limits::project_id_of, support::*};
 
 /// A push's upload whose pack row waits on a lock past the database's
-/// `lock_timeout` (the pusher's `people` row held `FOR UPDATE`, as a
-/// conflicting transaction holds it) is run again and stored once the lock
-/// is free: 200, never 500.
+/// `lock_timeout` (PostgreSQL `LOCK TABLE packs IN EXCLUSIVE MODE`, or a
+/// YugabyteDB SERIALIZABLE read holding a predicate lock on `packs`) is
+/// run again and stored once the lock is free: 200, never 500.
 #[test]
 fn bug_2340_an_upload_whose_pack_row_waits_out_a_lock_is_retried_not_an_internal_error() {
-    let hub = TestHub::start();
+    let hub = TestHub::start_own();
     let p = setup_project(&hub);
     let api = hub.api();
     let token = p.dev.token();
@@ -29,20 +29,29 @@ fn bug_2340_an_upload_whose_pack_row_waits_out_a_lock_is_retried_not_an_internal
         .rt
         .block_on(sqlx::query_scalar("SELECT id FROM people WHERE name = $1").bind(&p.dev.name).fetch_one(&h.db))
         .unwrap();
+    let ver: String = hub.rt.block_on(sqlx::query_scalar("SELECT version()").fetch_one(&h.db)).unwrap();
+    let is_yb = veil_server::db::is_yugabyte(&ver);
 
     // Past the lock timeout (10 s): the first attempt's insert gives up.
     let hold = veil_server::db::LOCK_TIMEOUT + Duration::from_secs(2);
     let (locked, wait_locked) = mpsc::channel();
     let db = h.db.clone();
     let holder = hub.rt.spawn(async move {
-        let mut tx = db.begin().await.unwrap();
-        let got: i64 = sqlx::query_scalar("SELECT id FROM people WHERE id = $1 FOR UPDATE").bind(person).fetch_one(&mut *tx).await.unwrap();
-        assert_eq!(got, person);
+        let mut tx = if is_yb {
+            db.begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE").await.unwrap()
+        } else {
+            db.begin().await.unwrap()
+        };
+        if is_yb {
+            let _: i64 = sqlx::query_scalar("SELECT count(*) FROM packs").fetch_one(&mut *tx).await.unwrap();
+        } else {
+            sqlx::query("LOCK TABLE packs IN EXCLUSIVE MODE").execute(&mut *tx).await.unwrap();
+        }
         locked.send(()).unwrap();
         tokio::time::sleep(hold).await;
         tx.commit().await.unwrap();
     });
-    wait_locked.recv_timeout(Duration::from_secs(30)).expect("the people row locked");
+    wait_locked.recv_timeout(Duration::from_secs(30)).expect("the packs lock acquired");
 
     let started = Instant::now();
     let raw = O::Blob(b"bug 2340: stored once the lock is free\n".to_vec()).encode();

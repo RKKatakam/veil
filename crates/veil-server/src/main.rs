@@ -7,7 +7,7 @@
 //!             [--tls-cert cert.pem --tls-key key.pem]   (default: self-signed)
 //!             [--device-rate 200/50000] [--anonymous-rate 20/1000]
 //!             [--max-connections 1024] [--request-memory 512M]   (docs/HUB.md §13.25)
-//! veil-server migrate --database-url postgres://…   (apply migrations, then exit)
+//! veil-server migrate --database-url postgres://… [--offline]   (apply migrations, then exit)
 //! veil-server cache --upstream https://hub:8443 --token-file TOKEN --dir DIR
 //!             [--listen 127.0.0.1:8444] [--size 10G] [--memory 128M] [--max-connections 1024]
 //!             [--upstream-ca PEM]
@@ -101,6 +101,11 @@ enum Command {
         /// PostgreSQL or YugabyteDB connection URL (default: VEIL_DATABASE_URL).
         #[arg(long)]
         database_url: Option<String>,
+        /// Permit offline maintenance migrations that rebuild existing
+        /// tables (such as migration 0046 on an existing hash-sharded
+        /// YugabyteDB database). All veil-server instances must be stopped first.
+        #[arg(long)]
+        offline: bool,
     },
     /// Run a regional cache of the object routes in front of a Veil
     /// server (`docs/HUB.md` §13.18). It holds objects only, no key and no
@@ -203,9 +208,13 @@ fn main() -> anyhow::Result<()> {
 
 async fn serve() -> anyhow::Result<()> {
     let a = Args::parse();
-    if let Some(Command::Migrate { database_url: url }) = a.command {
+    if let Some(Command::Migrate { database_url: url, offline }) = a.command {
         let db = veil_server::db::connect(&database_url(url)?, 2).await?;
-        veil_server::db::migrate(&db).await?;
+        if offline {
+            veil_server::db::migrate_offline(&db).await?;
+        } else {
+            veil_server::db::migrate(&db).await?;
+        }
         println!("veil-server: the database schema is current");
         return Ok(());
     }
