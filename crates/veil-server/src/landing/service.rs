@@ -1162,20 +1162,23 @@ impl Service {
         let first_gap = attach.iter().map(|a| a.2 + 1).min().unwrap_or(recent.len());
         let gap: Vec<ObjectId> = recent[first_gap.min(recent.len())..].to_vec();
         let (s2, g2) = (stacks.clone(), gap.clone());
-        let mut ids: Vec<ObjectId> = sync::blocking(hub, self.project, move |src| {
-            let mut ids = s2.clone();
+        let (mut ids, mut preds): (Vec<ObjectId>, Vec<ObjectId>) = sync::blocking(hub, self.project, move |src| {
+            let (mut ids, mut preds) = (s2.clone(), s2.clone());
             // Read at once, not one after another: each read the server's
             // memory misses waits on the object store (`READ_THREADS`).
             let read: Vec<ObjectId> = s2.iter().chain(&g2).copied().collect();
-            for s in on_threads(&read, READ_THREADS, READ_LEAST, |x| src.snapshot(x).ok()) {
+            for (i, s) in on_threads(&read, READ_THREADS, READ_LEAST, |x| src.snapshot(x).ok()).into_iter().enumerate() {
                 // A recent snapshot may be the batch's being committed, not
                 // stored yet: its parents are then on the line itself.
                 let Some(s) = s else { continue };
                 ids.extend(s.parents.iter().skip(1).copied());
                 ids.extend(s.predecessors.iter().copied());
                 ids.extend(s.attempts.iter().copied());
+                if i < s2.len() {
+                    preds.extend(s.predecessors.iter().copied());
+                }
             }
-            Ok(ids)
+            Ok((ids, preds))
         })
         .await?;
         ids.sort_unstable();
@@ -1186,6 +1189,23 @@ impl Service {
             false => memos(hub, self.project, &keys, &ids).await?,
         };
         memo.extend(self.won.lock().unwrap().drain());
+        // What the build reads of each new snapshot's predecessors (a stack
+        // snapshot, and its own when merged: `project_onto`), each kept
+        // view key's projection of it, read at once now: in the build they
+        // were read one after another, each the server's memory missed a
+        // round trip to the object store (`READ_THREADS`). Only read: what
+        // is missing or unreadable is the build's to find, as before.
+        preds.sort_unstable();
+        preds.dedup();
+        let projected: Vec<ObjectId> =
+            memo.iter().filter(|((_, r), _)| preds.binary_search(r).is_ok()).map(|(_, p)| *p).collect::<BTreeSet<_>>().into_iter().collect();
+        if !projected.is_empty() {
+            sync::blocking(hub, self.project, move |src| {
+                on_threads(&projected, READ_THREADS, READ_LEAST, |q| src.snapshot(q).is_ok());
+                Ok(())
+            })
+            .await?;
+        }
         // (No origins: a projection equal to a pusher's own snapshot is
         // that pusher's view key's, whose memo the push stored.)
         let origins = HashMap::new();
