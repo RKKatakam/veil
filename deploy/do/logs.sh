@@ -15,7 +15,7 @@ STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT=$DO_ROOT/deploy/results/$NAME/logs-$STAMP
 [ $APPROVED = 1 ] && mkdir -p "$OUT"
 # The storage droplet: the space MinIO's data takes and what is left.
-MINIO_DISK='df -h /srv/minio /mnt/minio-data 2>/dev/null; du -sh /srv/minio /mnt/minio-data 2>/dev/null'
+MINIO_DISK='df -h /srv/minio /mnt/minio-data 2>/dev/null; df -i /srv/minio /mnt/minio-data 2>/dev/null; du -sh /srv/minio /mnt/minio-data 2>/dev/null'
 while read -r role name size; do
     ip=$(ip_of "$name"); ip=${ip:-${name}_IP}; d=$OUT/$name
     if [ $APPROVED = 1 ]; then
