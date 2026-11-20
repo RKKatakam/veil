@@ -627,6 +627,7 @@ impl Service {
                 continue;
             }
             // Retention runs whether or not the branch is busy (BUG-1303).
+            let t = Instant::now();
             if cleaned.is_none_or(|t| t.elapsed() > CLEAN_EVERY) {
                 self.clean().await?;
                 cleaned = Some(Instant::now());
@@ -634,6 +635,7 @@ impl Service {
             let has_merging = self.reclaim_expired_merges().await?;
             let exclude = inflight.as_ref().map(|f| f.seqs.clone()).unwrap_or_default();
             let rows = self.ready(&exclude).await?;
+            spent(&self.hub.landing.stats.ready_us, t);
             if rows.is_empty() {
                 if let Some(f) = inflight.take() {
                     if !self.finish(f, &mut state).await? {
@@ -695,7 +697,10 @@ impl Service {
                 }))))
             };
             if let Some(f) = inflight.take() {
-                if !self.finish(f, &mut state).await? {
+                let t = Instant::now();
+                let held = self.finish(f, &mut state).await?;
+                spent(&self.hub.landing.stats.wait_us, t);
+                if !held {
                     return Ok(());
                 }
                 // Built on a tip that did not come to be (the batch before
@@ -1157,17 +1162,23 @@ impl Service {
         let first_gap = attach.iter().map(|a| a.2 + 1).min().unwrap_or(recent.len());
         let gap: Vec<ObjectId> = recent[first_gap.min(recent.len())..].to_vec();
         let (s2, g2) = (stacks.clone(), gap.clone());
-        let mut ids: Vec<ObjectId> = sync::blocking(hub, self.project, move |src| {
-            let mut ids = s2.clone();
-            for x in s2.iter().chain(&g2) {
+        let (mut ids, mut preds): (Vec<ObjectId>, Vec<ObjectId>) = sync::blocking(hub, self.project, move |src| {
+            let (mut ids, mut preds) = (s2.clone(), s2.clone());
+            // Read at once, not one after another: each read the server's
+            // memory misses waits on the object store (`READ_THREADS`).
+            let read: Vec<ObjectId> = s2.iter().chain(&g2).copied().collect();
+            for (i, s) in on_threads(&read, READ_THREADS, READ_LEAST, |x| src.snapshot(x).ok()).into_iter().enumerate() {
                 // A recent snapshot may be the batch's being committed, not
                 // stored yet: its parents are then on the line itself.
-                let Ok(s) = src.snapshot(x) else { continue };
+                let Some(s) = s else { continue };
                 ids.extend(s.parents.iter().skip(1).copied());
                 ids.extend(s.predecessors.iter().copied());
                 ids.extend(s.attempts.iter().copied());
+                if i < s2.len() {
+                    preds.extend(s.predecessors.iter().copied());
+                }
             }
-            Ok(ids)
+            Ok((ids, preds))
         })
         .await?;
         ids.sort_unstable();
@@ -1178,6 +1189,23 @@ impl Service {
             false => memos(hub, self.project, &keys, &ids).await?,
         };
         memo.extend(self.won.lock().unwrap().drain());
+        // What the build reads of each new snapshot's predecessors (a stack
+        // snapshot, and its own when merged: `project_onto`), each kept
+        // view key's projection of it, read at once now: in the build they
+        // were read one after another, each the server's memory missed a
+        // round trip to the object store (`READ_THREADS`). Only read: what
+        // is missing or unreadable is the build's to find, as before.
+        preds.sort_unstable();
+        preds.dedup();
+        let projected: Vec<ObjectId> =
+            memo.iter().filter(|((_, r), _)| preds.binary_search(r).is_ok()).map(|(_, p)| *p).collect::<BTreeSet<_>>().into_iter().collect();
+        if !projected.is_empty() {
+            sync::blocking(hub, self.project, move |src| {
+                on_threads(&projected, READ_THREADS, READ_LEAST, |q| src.snapshot(q).is_ok());
+                Ok(())
+            })
+            .await?;
+        }
         // (No origins: a projection equal to a pusher's own snapshot is
         // that pusher's view key's, whose memo the push stored.)
         let origins = HashMap::new();
@@ -1380,6 +1408,7 @@ impl Service {
         // wait for this batch).
         let writers_seen: Arc<std::sync::Mutex<(Vec<i64>, bool)>> = Arc::default();
         let tx_writers = writers_seen.clone();
+        let tx_hub = hub.clone();
         let mut run = tx_fn(move |c| {
             let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing, active_review_checks, review_guard) = (
                 ls.clone(),
@@ -1412,7 +1441,9 @@ impl Service {
             let run_asks = run_asks.clone();
             let stored = stored.clone();
             let writers_seen = tx_writers.clone();
+            let store_wait = tx_hub.clone();
             Box::pin(async move {
+                let store_wait = &store_wait.landing.stats.store_wait_us;
                 run_asks.store(0, Ordering::Relaxed);
                 // Fencing: only the lease's current holder moves the branch.
                 // (And the entries it has served: what a submit reads the
@@ -1691,7 +1722,10 @@ impl Service {
                 // holds the lease's row (and the branch's other servers)
                 // for long; past that, outside the transaction, which then
                 // runs again (BUG-1982).
-                match tokio::time::timeout(STORE_IN_TRANSACTION, Storing::wait(&stored)).await {
+                let waited = Instant::now();
+                let r = tokio::time::timeout(STORE_IN_TRANSACTION, Storing::wait(&stored)).await;
+                spent(store_wait, waited);
+                match r {
                     Ok(r) => r?,
                     Err(_) => return Err(Error::conflict(STORE_SLOW)),
                 }
@@ -1699,8 +1733,15 @@ impl Service {
             })
         });
         let r = loop {
-            match crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, &mut run).await {
-                Err(Error::Api { code: "conflict", message, .. }) if message == STORE_SLOW => Storing::wait(&stored_outside).await?,
+            let t = Instant::now();
+            let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, &mut run).await;
+            spent(&hub.landing.stats.tx_us, t);
+            match r {
+                Err(Error::Api { code: "conflict", message, .. }) if message == STORE_SLOW => {
+                    let t = Instant::now();
+                    Storing::wait(&stored_outside).await?;
+                    spent(&hub.landing.stats.store_wait_us, t);
+                }
                 Err(Error::Api { code: "conflict", message, .. }) if message == REVIEW_WRITERS => {
                     let ids = std::mem::take(&mut writers_seen.lock().unwrap().0);
                     crate::prs::review_gate::wait_review_writers(&hub.db, pid, &ids).await?;
@@ -1977,6 +2018,15 @@ fn build_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
 }
 
+/// The threads reads that wait on the object store, not on a core, are
+/// spread on (a batch's snapshots in `prepare`, its entries' reads ahead),
+/// at least [`READ_LEAST`] items a thread. A read the server's memory misses
+/// is a round trip to the store: one after another, a batch of 64 entries
+/// read about 35 snapshots in 71 ms and its entries in 41 ms with 0.5 ms
+/// between the server and the store (`docs/design/server/landing-network.md`).
+const READ_THREADS: usize = 32;
+const READ_LEAST: usize = 2;
+
 /// `f` of each of `items`, in their order, on up to `threads` threads (at
 /// least `least` items a thread; with one thread, or few items, here).
 fn on_threads<T: Sync, R: Send>(items: &[T], threads: usize, least: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
@@ -1991,14 +2041,15 @@ fn on_threads<T: Sync, R: Send>(items: &[T], threads: usize, least: usize, f: im
     })
 }
 
-/// [`read_entry`] of each entry, on `threads` threads (BUG-1955: a batch
-/// was built on one core of the machine's). `None` for an entry whose read
+/// [`read_entry`] of each entry, on [`READ_THREADS`] threads when `threads`
+/// is more than one (BUG-1955: a batch was built on one core of the
+/// machine's). `None` for an entry whose read
 /// failed, and for all with one thread: [`entry`] reads it in its turn, and
 /// answers what it always did.
 fn read_ahead(src: &Source, entries: &[Prepared], threads: usize) -> Vec<Option<Read>> {
     match threads {
         0 | 1 => entries.iter().map(|_| None).collect(),
-        _ => on_threads(entries, threads, 8, |p| read_entry(src, &p.row.stack).ok()),
+        _ => on_threads(entries, threads.max(READ_THREADS), READ_LEAST, |p| read_entry(src, &p.row.stack).ok()),
     }
 }
 

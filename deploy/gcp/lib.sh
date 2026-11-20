@@ -200,9 +200,13 @@ OWN_RE="^$NAME-(hub[23]?|lb|db|yb[0-9]|driver[0-9]|minio|cache)(-data)?\$"
 OWN_FILTER="labels.$LABEL=$NAME OR name~'$OWN_RE'"
 # The remote command that gives MinIO its data directory on the storage
 # machine's local NVMe SSD (configure.sh, VEIL_KIT=gcp): a file system is
-# made only on a device that has none (it is blank after every stop).
+# made only on a device that has none (it is blank after every stop). One
+# inode per 4 KiB (`-i 4096`, about 97 million on 375 GB): MinIO keeps each
+# object as a directory and its xl.meta, two inodes, and the default (one
+# per 16 KiB, about 24 million) ran out at about 12 million objects, with
+# 70% of the blocks free: every PUT then answered 507 (BUG-2941).
 local_ssd_mount() { # mount point
-    echo "dev=/dev/disk/by-id/google-local-nvme-ssd-0; for i in \$(seq 60); do [ -e \$dev ] && break; sleep 2; done; [ -e \$dev ] || { echo 'configure: no local SSD on the storage machine' >&2; exit 1; }; mkdir -p $1 && { mountpoint -q $1 || { blkid \$dev >/dev/null 2>&1 || mkfs.ext4 -q -F -E lazy_itable_init=1,discard \$dev; mount -o discard,defaults,noatime \$dev $1; }; }"
+    echo "dev=/dev/disk/by-id/google-local-nvme-ssd-0; for i in \$(seq 60); do [ -e \$dev ] && break; sleep 2; done; [ -e \$dev ] || { echo 'configure: no local SSD on the storage machine' >&2; exit 1; }; mkdir -p $1 && { mountpoint -q $1 || { blkid \$dev >/dev/null 2>&1 || mkfs.ext4 -q -F -i 4096 -E lazy_itable_init=1,discard \$dev; mount -o discard,defaults,noatime \$dev $1; }; }"
 }
 # The remote command that mounts a database machine's data disk (configure.sh,
 # VEIL_KIT=gcp): a file system is made only on a disk that has none (a

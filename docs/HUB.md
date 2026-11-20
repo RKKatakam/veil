@@ -5606,10 +5606,17 @@ transaction per landing instead of 23.
 8. **A batch's entries are read on several threads** (`landing/service.rs`
    `read_ahead`, BUG-1955). What an entry's build reads that no other entry
    changes (its stack's snapshots, each change's edit set and base tree:
-   objects, by id) is read for all entries of the batch on up to 8 threads;
-   then the entries are built on the tip one after another, as before. An
-   entry whose read failed is read again in its turn, and answered what it
-   always was. The batch is the one built on one thread, byte for byte.
+   objects, by id) is read for all entries of the batch on up to 32
+   threads, two entries or more a thread (`READ_THREADS`: these reads wait
+   on the object store, not on a core); then the entries are built on the
+   tip one after another, as before. An entry whose read failed is read
+   again in its turn, and answered what it always was. The batch is the one
+   built on one thread, byte for byte. Before the build, `prepare` reads
+   the batch's stack snapshots, and each kept view key's projection of
+   them (what each new snapshot's projection reads of its predecessor), on
+   the same threads: one after another they were a round trip to the
+   store each the server's memory missed, 71 ms and 21–28 ms of a batch
+   with 0.5 ms to the store (`docs/design/server/landing-network.md`).
 9. **Fewer round trips a batch and a submit** (BUG-1955): the authors a
    batch's commit records are read in one statement (one a landing before,
    in turn); a submit takes one of its person's slots at random without

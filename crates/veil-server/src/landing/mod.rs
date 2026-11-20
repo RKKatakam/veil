@@ -359,6 +359,16 @@ pub struct Stats {
     pub prepare_us: AtomicU64,
     pub store_us: AtomicU64,
     pub commit_us: AtomicU64,
+    /// Microseconds of the parts of a batch's time that are waits
+    /// (docs/design/server/landing-network.md): choosing it (retention, the
+    /// merges reclaimed, the ready rows); the service's loop waiting for the
+    /// batch before it to commit (the commit, not the build, sets the pace);
+    /// its transaction (every run of it); and the transaction waiting for
+    /// the batch's objects to be stored, in it or outside it.
+    pub ready_us: AtomicU64,
+    pub wait_us: AtomicU64,
+    pub tx_us: AtomicU64,
+    pub store_wait_us: AtomicU64,
     /// Batches refused at commit because the lease had moved (fencing).
     pub lease_lost: AtomicU64,
     /// Projections the services made (each new snapshot, for each view key
@@ -462,6 +472,14 @@ pub struct Services {
 const CLASSES: usize = 262_144;
 
 const RETRY_LEASE: Duration = Duration::from_millis(500);
+
+impl Services {
+    /// This server's name as a lease holder (`stats.json`'s `landing_holder`:
+    /// how the failover gate finds the server a lease row names).
+    pub fn holder(&self) -> &str {
+        &self.holder
+    }
+}
 
 impl Default for Services {
     fn default() -> Self {

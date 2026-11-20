@@ -18,6 +18,10 @@
 #   KEEP=1         leave the stack running (tear down later with the printed `down -v`)
 #   LB_PORT        the balancer's port on 127.0.0.1 (default 18443)
 #   STEP_LIMIT     seconds allowed per benchmark command (default 1200)
+#   LATENCY_MS=…   a fixed round-trip delay, in milliseconds, on every connection to the
+#                  database and to MinIO, as when they are machines of their own (default:
+#                  none). `tc netem` delays what each of them sends, from a helper container
+#                  with NET_ADMIN in its network namespace (no root on the host).
 #   the gates' sizes (DURATION, LANDING_AGENTS, …): small defaults below
 #
 # Memory: every container has a limit (docker-compose.yml); the defaults add
@@ -33,6 +37,8 @@ NAME=${1:-${USER:-rehearsal}}
 [[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || { echo "rehearsal: invalid NAME '$NAME'" >&2; exit 2; }
 DB=${DB:-yb}
 case $DB in yb|pg) ;; *) echo "rehearsal: DB must be yb or pg" >&2; exit 2 ;; esac
+LATENCY_MS=${LATENCY_MS:-0}
+[[ "$LATENCY_MS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "rehearsal: LATENCY_MS must be a number of milliseconds" >&2; exit 2; }
 PROJECT=veil-dokit-$NAME
 STEP_LIMIT=${STEP_LIMIT:-1200}
 # The gates' sizes, small (the paid run's are deploy/gates.sh's defaults).
@@ -136,6 +142,22 @@ cleanup() {
     rm -f "$ENV_FILE"
 }
 trap cleanup EXIT
+# LATENCY_MS: everything SERVICE sends waits that long (so each round trip
+# to it does), the helper's qdisc staying in its namespace after the helper.
+NETEM_IMAGE=veil-rehearsal-netem:1
+delay() { # service...
+    [ "$LATENCY_MS" != 0 ] || return 0
+    local s id
+    D image inspect "$NETEM_IMAGE" >/dev/null 2>&1 || printf '%s\n' "FROM $NETEM_BASE" \
+        'RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*' |
+        D build -q -t "$NETEM_IMAGE" - >/dev/null || { echo "rehearsal: building the delay helper failed"; return 1; }
+    for s in "$@"; do
+        id=$(C ps -q "$s")
+        D run --rm --network "container:$id" --cap-add NET_ADMIN "$NETEM_IMAGE" \
+            tc qdisc replace dev eth0 root netem delay "${LATENCY_MS}ms" limit 1000000 || { echo "rehearsal: delaying $s failed"; return 1; }
+        echo "   $s: every packet it sends waits ${LATENCY_MS} ms"
+    done
+}
 diagnose() { C ps -a; C logs --no-color --tail 30 migrate hub1 hub2 lb 2>&1 | tail -80; }
 healthy() { # service: wait until its health check passes
     local id i st=
@@ -164,12 +186,18 @@ else
     C up -d --wait --wait-timeout 300 postgres || { echo "rehearsal: postgres did not come up"; diagnose; exit 1; }
 fi
 C up -d --wait --wait-timeout 120 minio || { echo "rehearsal: minio did not come up"; diagnose; exit 1; }
+delay $([ "$DB" = yb ] && echo yb1 yb2 yb3 || echo postgres) minio || exit 1
 C run --rm --no-deps -T migrate > "$OUT/migrate-run.log" 2>&1 || { echo "rehearsal: the migrations failed"; tail -20 "$OUT/migrate-run.log"; exit 1; }
 C up -d --no-deps hub1 && healthy hub1 || { echo "rehearsal: hub1 did not come up"; diagnose; exit 1; }
 C run --rm --no-deps -T hub2-keys || { echo "rehearsal: copying the keys failed"; exit 1; }
 C up -d --no-deps hub2 && healthy hub2 || { echo "rehearsal: hub2 did not come up"; diagnose; exit 1; }
 C up -d --no-deps lb || { echo "rehearsal: the balancer did not start"; diagnose; exit 1; }
 echo "   up in $((SECONDS - t_up)) s"
+if [ "$LATENCY_MS" != 0 ]; then
+    for target in "$([ "$DB" = yb ] && echo yb1:5433 || echo postgres:5432)" minio:9000; do
+        echo "   hub1 -> $target: TCP connect $(C exec -T hub1 curl -s -o /dev/null --max-time 2 -w '%{time_connect}' "telnet://$target" </dev/null || true) s"
+    done
+fi
 C ps --format '   {{.Service}}: {{.Status}}'
 if [ "$DB" = yb ]; then
     echo "   tablets on yb1: $(C exec -T yb1 bin/ysqlsh -h yb1 -tAc 'select count(*) from yb_local_tablets' 2>/dev/null || echo '?')"
@@ -233,14 +261,19 @@ for GATE in $GATES; do
     R=/work/results/$GATE
     echo "== gate: $GATE"
     { gate_meta "$COMMIT" "$TAG"; echo "rehearsal=$PROJECT"; } > "$G_OUT/run.txt"
-    { echo "DB=$DB"; echo "SERVERS=2"; echo "DRIVERS=1"; echo "BALANCER=haproxy"; grep -E '^(DB_CONNECTIONS|BENCH_MEM|YB_MEM|YB_TSERVER_FLAGS|YB_MASTER_FLAGS|LB_PORT)=' "$ENV_FILE"; } > "$G_OUT/topology.env"
+    { echo "DB=$DB"; echo "LATENCY_MS=$LATENCY_MS"; echo "SERVERS=2"; echo "DRIVERS=1"; echo "BALANCER=haproxy"; grep -E '^(DB_CONNECTIONS|BENCH_MEM|YB_MEM|YB_TSERVER_FLAGS|YB_MASTER_FLAGS|LB_PORT)=' "$ENV_FILE"; } > "$G_OUT/topology.env"
     {
         for img in "veil-server:$TAG" "veil-bench:$TAG"; do echo "$img $(D image inspect -f '{{.Id}}' "$img")"; done
         echo "PG_IMAGE=$PG_IMAGE"; echo "YB_IMAGE=$YB_IMAGE"; echo "HAPROXY_IMAGE=$HAPROXY_IMAGE"; echo "MINIO_IMAGE=$MINIO_IMAGE"
         C ps --format '{{.Service}} {{.Image}}'
     } > "$G_OUT/images.txt"
     t0=$SECONDS
+    # PostgreSQL: the gate's statements, counted from zero (pg_stat_statements,
+    # this run's own database).
+    [ "$DB" != pg ] || echo 'select pg_stat_statements_reset()' | db_sql >/dev/null || true
     rc=0; run_gate "$GATE" || rc=$?
+    [ "$DB" != pg ] || echo "select calls, round(total_exec_time::numeric, 1), round(mean_exec_time::numeric, 4), regexp_replace(left(query, 240), '\s+', ' ', 'g') from pg_stat_statements order by calls desc limit 100" |
+        db_sql > "$G_OUT/pg-stat-statements.txt" 2>&1 || true
     for i in 1 2; do hub_stats "$i" > "$G_OUT/hub$i-stats.json" || true; done
     gate_report "$GATE" "$G_OUT" || rc=1
     # A gate is only valid on a store that stayed up (BUG-2432).
