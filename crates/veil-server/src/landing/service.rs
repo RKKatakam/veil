@@ -627,6 +627,7 @@ impl Service {
                 continue;
             }
             // Retention runs whether or not the branch is busy (BUG-1303).
+            let t = Instant::now();
             if cleaned.is_none_or(|t| t.elapsed() > CLEAN_EVERY) {
                 self.clean().await?;
                 cleaned = Some(Instant::now());
@@ -634,6 +635,7 @@ impl Service {
             let has_merging = self.reclaim_expired_merges().await?;
             let exclude = inflight.as_ref().map(|f| f.seqs.clone()).unwrap_or_default();
             let rows = self.ready(&exclude).await?;
+            spent(&self.hub.landing.stats.ready_us, t);
             if rows.is_empty() {
                 if let Some(f) = inflight.take() {
                     if !self.finish(f, &mut state).await? {
@@ -695,7 +697,10 @@ impl Service {
                 }))))
             };
             if let Some(f) = inflight.take() {
-                if !self.finish(f, &mut state).await? {
+                let t = Instant::now();
+                let held = self.finish(f, &mut state).await?;
+                spent(&self.hub.landing.stats.wait_us, t);
+                if !held {
                     return Ok(());
                 }
                 // Built on a tip that did not come to be (the batch before
@@ -1380,6 +1385,7 @@ impl Service {
         // wait for this batch).
         let writers_seen: Arc<std::sync::Mutex<(Vec<i64>, bool)>> = Arc::default();
         let tx_writers = writers_seen.clone();
+        let tx_hub = hub.clone();
         let mut run = tx_fn(move |c| {
             let (ls, ll, mc, cc, ca, cl, snapshot_authors, active_agents, rules_landing, active_review_checks, review_guard) = (
                 ls.clone(),
@@ -1412,7 +1418,9 @@ impl Service {
             let run_asks = run_asks.clone();
             let stored = stored.clone();
             let writers_seen = tx_writers.clone();
+            let store_wait = tx_hub.clone();
             Box::pin(async move {
+                let store_wait = &store_wait.landing.stats.store_wait_us;
                 run_asks.store(0, Ordering::Relaxed);
                 // Fencing: only the lease's current holder moves the branch.
                 // (And the entries it has served: what a submit reads the
@@ -1691,7 +1699,10 @@ impl Service {
                 // holds the lease's row (and the branch's other servers)
                 // for long; past that, outside the transaction, which then
                 // runs again (BUG-1982).
-                match tokio::time::timeout(STORE_IN_TRANSACTION, Storing::wait(&stored)).await {
+                let waited = Instant::now();
+                let r = tokio::time::timeout(STORE_IN_TRANSACTION, Storing::wait(&stored)).await;
+                spent(store_wait, waited);
+                match r {
                     Ok(r) => r?,
                     Err(_) => return Err(Error::conflict(STORE_SLOW)),
                 }
@@ -1699,8 +1710,15 @@ impl Service {
             })
         });
         let r = loop {
-            match crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, &mut run).await {
-                Err(Error::Api { code: "conflict", message, .. }) if message == STORE_SLOW => Storing::wait(&stored_outside).await?,
+            let t = Instant::now();
+            let r = crate::db::transaction(&hub.db, crate::db::Isolation::ReadCommitted, &mut run).await;
+            spent(&hub.landing.stats.tx_us, t);
+            match r {
+                Err(Error::Api { code: "conflict", message, .. }) if message == STORE_SLOW => {
+                    let t = Instant::now();
+                    Storing::wait(&stored_outside).await?;
+                    spent(&hub.landing.stats.store_wait_us, t);
+                }
                 Err(Error::Api { code: "conflict", message, .. }) if message == REVIEW_WRITERS => {
                     let ids = std::mem::take(&mut writers_seen.lock().unwrap().0);
                     crate::prs::review_gate::wait_review_writers(&hub.db, pid, &ids).await?;
