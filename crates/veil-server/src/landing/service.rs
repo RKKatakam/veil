@@ -1164,10 +1164,13 @@ impl Service {
         let (s2, g2) = (stacks.clone(), gap.clone());
         let mut ids: Vec<ObjectId> = sync::blocking(hub, self.project, move |src| {
             let mut ids = s2.clone();
-            for x in s2.iter().chain(&g2) {
+            // Read at once, not one after another: each read the server's
+            // memory misses waits on the object store (`READ_THREADS`).
+            let read: Vec<ObjectId> = s2.iter().chain(&g2).copied().collect();
+            for s in on_threads(&read, READ_THREADS, READ_LEAST, |x| src.snapshot(x).ok()) {
                 // A recent snapshot may be the batch's being committed, not
                 // stored yet: its parents are then on the line itself.
-                let Ok(s) = src.snapshot(x) else { continue };
+                let Some(s) = s else { continue };
                 ids.extend(s.parents.iter().skip(1).copied());
                 ids.extend(s.predecessors.iter().copied());
                 ids.extend(s.attempts.iter().copied());
@@ -1995,6 +1998,15 @@ fn build_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
 }
 
+/// The threads reads that wait on the object store, not on a core, are
+/// spread on (a batch's snapshots in `prepare`, its entries' reads ahead),
+/// at least [`READ_LEAST`] items a thread. A read the server's memory misses
+/// is a round trip to the store: one after another, a batch of 64 entries
+/// read about 35 snapshots in 71 ms and its entries in 41 ms with 0.5 ms
+/// between the server and the store (`docs/design/server/landing-network.md`).
+const READ_THREADS: usize = 32;
+const READ_LEAST: usize = 2;
+
 /// `f` of each of `items`, in their order, on up to `threads` threads (at
 /// least `least` items a thread; with one thread, or few items, here).
 fn on_threads<T: Sync, R: Send>(items: &[T], threads: usize, least: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
@@ -2009,14 +2021,15 @@ fn on_threads<T: Sync, R: Send>(items: &[T], threads: usize, least: usize, f: im
     })
 }
 
-/// [`read_entry`] of each entry, on `threads` threads (BUG-1955: a batch
-/// was built on one core of the machine's). `None` for an entry whose read
+/// [`read_entry`] of each entry, on [`READ_THREADS`] threads when `threads`
+/// is more than one (BUG-1955: a batch was built on one core of the
+/// machine's). `None` for an entry whose read
 /// failed, and for all with one thread: [`entry`] reads it in its turn, and
 /// answers what it always did.
 fn read_ahead(src: &Source, entries: &[Prepared], threads: usize) -> Vec<Option<Read>> {
     match threads {
         0 | 1 => entries.iter().map(|_| None).collect(),
-        _ => on_threads(entries, threads, 8, |p| read_entry(src, &p.row.stack).ok()),
+        _ => on_threads(entries, threads.max(READ_THREADS), READ_LEAST, |p| read_entry(src, &p.row.stack).ok()),
     }
 }
 
