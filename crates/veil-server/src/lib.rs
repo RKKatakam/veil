@@ -667,6 +667,7 @@ pub fn stats_json(hub: &Hub, n: u64) -> serde_json::Value {
         "tips_hits": c.tips_hits.load(Relaxed),
         "tips_misses": c.tips_misses.load(Relaxed),
         "notices": hub.caches.notices.load(Relaxed),
+        "landing_holder": hub.landing.holder(),
         "landing_batches": hub.landing.stats.batches.load(Relaxed),
         "landing_landed": hub.landing.stats.landed.load(Relaxed),
         "landing_conflicts": hub.landing.stats.conflicts.load(Relaxed),

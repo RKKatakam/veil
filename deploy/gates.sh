@@ -69,6 +69,10 @@ GATES_DIR=${GATES_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 # failover: a landing run during which the server that holds `main`'s lease goes away.
 : "${FAILOVER_AGENTS:=1000}" "${FAILOVER_PEOPLE:=100}" "${FAILOVER_RATE:=300}"
 : "${FAILOVER_DURATION:=120}" "${FAILOVER_AFTER:=45}" "${FAILOVER_HOW:=stop}" "${FAILOVER_SETTLE:=120}"
+# After FAILOVER_AFTER, up to FAILOVER_WAIT more seconds for `main`'s lease to be
+# held and landings to flow (the tool sets its agents up first: 72 s for 1,000
+# agents on the cloud's second run, BUG-2940).
+: "${FAILOVER_WAIT:=300}"
 
 # spaces: the many-branch shape on a real Spaces bucket, for correctness
 # and flow, not speed (owner, 2026-11-13; BUG-2290). A push makes about
@@ -99,7 +103,7 @@ GATE_SETTINGS="DURATION WARMUP PULL_CLIENTS PULL_BACKGROUND LAND_PROJECTS LAND_C
  OPENSCION_FILES OPENSCION_RUNS SCALE_PROFILE SCALE_RUNS LANDING_AGENTS LANDING_PEOPLE LANDING_RATE LANDING_DURATIONS
  LANDING_VARIANTS HEADLINE_AGENTS MERGE_EVERY HEADLINE_RATE HEADLINE_DURATION SCALING_SERVERS SCALING_DURATION
  SCALING_PULL_CLIENTS SCALING_BRANCH_CLIENTS SCALING_LANDING_PROJECTS SCALING_LANDING_CLIENTS FAILOVER_AGENTS
- FAILOVER_PEOPLE FAILOVER_RATE FAILOVER_DURATION FAILOVER_AFTER FAILOVER_HOW FAILOVER_SETTLE SPACES_AGENTS SPACES_RATE
+ FAILOVER_PEOPLE FAILOVER_RATE FAILOVER_DURATION FAILOVER_AFTER FAILOVER_WAIT FAILOVER_HOW FAILOVER_SETTLE SPACES_AGENTS SPACES_RATE
  SPACES_DURATION AGENTS_COUNTS AGENTS_DURATION AGENTS_THINK AGENTS_TIME_SCALE AGENTS_SUBAGENTS AGENTS_LAND_EVERY
  ONEREPO_AGENTS ONEREPO_DURATION ONEREPO_TARGET YB_SCALE_PROJECTS YB_SCALE_DURATION YB_SCALE_PEOPLE
  YB_SCALE_BRANCH_CLIENTS YB_SCALE_LANDING_CLIENTS YB_SCALE_PULL_CLIENTS YB_SCALE_PULL_BACKGROUND
@@ -214,29 +218,45 @@ gate_scaling() {
 # exactly once (deploy/checks/failover.sql says what each row proves;
 # deploy/checks/failover-verdict.py judges them, and holds every answer the
 # agents got, failover.landings.jsonl, against `main`'s line, failover-line.txt).
+# The holder is the server the lease row names, once landings flow: never a
+# server picked by its counters, which count every project's batches since
+# it started (BUG-2940).
 gate_failover() {
-    local i rc=0 pid t0 stop holder=0 best=0 a b st before after left=
+    local i rc=0 pid t0 stop holder=0 row id landed seen= waited=0 names st before after left=
     [ "$SERVERS" -ge 2 ] || { echo "gates: failover needs at least two servers behind one address (VEIL_DO_HUBS=2 or 3)" >&2; return 2; }
     t0=$(db_now_us)
     bench driver failover load --url "$URL" --ca /tls/ca.pem --warmup "$WARMUP" --duration "$FAILOVER_DURATION" --mode landing --projects 1 --clients "$FAILOVER_AGENTS" --people "$FAILOVER_PEOPLE" --rates "$FAILOVER_RATE" --dir /work/failover --out "$R/failover.json" "$@" &
     pid=$!
     pause "$FAILOVER_AFTER"
-    # The holder is the one server whose landing batches are counting up.
-    declare -A first
-    for i in $(seq "$SERVERS"); do first[$i]=$(hub_stats "$i" | stat_of landing_batches); done
-    pause 3
-    for i in $(seq "$SERVERS"); do
-        a=${first[$i]:-0}; st=$(hub_stats "$i"); b=$(stat_of landing_batches <<<"$st")
-        if [ -z "$st" ] && [ "$DRY" != 1 ]; then
-            echo "   server $i: gave no counters (its stats.json is missing or empty: can it write its data directory? see its log)" >&2
+    # Wait until the lease is held and the run's landed tickets rise between
+    # two looks 2 s apart, at most FAILOVER_WAIT seconds.
+    while [ "$DRY" != 1 ]; do
+        row=$(check_sql failover-held.sql "$t0" | db_one); id=${row%%|*}; landed=${row#*|}
+        [[ "$landed" =~ ^[0-9]+$ ]] || landed=0
+        if [ -n "$id" ] && [ -n "$seen" ] && [ "$landed" -gt "$seen" ]; then break; fi
+        [ -n "$id" ] && seen=$landed || seen=
+        if [ "$waited" -ge "$FAILOVER_WAIT" ] || ! kill -0 "$pid" 2>/dev/null; then
+            if [ -z "$id" ]; then echo "   failover: no server held main's landing lease $((FAILOVER_AFTER + waited)) s after the load began: nothing to fail over (see failover.log)" >&2
+            else echo "   failover: main's lease is held ($id) but no landing came in $((FAILOVER_AFTER + waited)) s ($landed landed): nothing to fail over (see failover.log)" >&2; fi
+            wait "$pid" || true; return 1
         fi
-        echo "   server $i: landing batches $a -> $b in about 3 s"
-        if [ $((b - a)) -gt "$best" ]; then best=$((b - a)); holder=$i; fi
+        pause 2; waited=$((waited + 2))
     done
     if [ "$DRY" = 1 ]; then holder=1
-    elif [ "$holder" = 0 ]; then
-        echo "   failover: no server ran a landing batch in 3 s: nothing to fail over (is the load running? see failover.log)" >&2
-        wait "$pid" || true; return 1
+    else
+        echo "   failover: main's lease held by $id, $landed landed, $((FAILOVER_AFTER + waited)) s after the load began"
+        for i in $(seq "$SERVERS"); do
+            st=$(hub_stats "$i")
+            [ -n "$st" ] || echo "   server $i: gave no counters (its stats.json is missing or empty: can it write its data directory? see its log)" >&2
+            names=$(python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("landing_holder", ""))
+except Exception: print("")' <<<"$st")
+            [ "$names" = "$id" ] && holder=$i
+        done
+        if [ "$holder" = 0 ]; then
+            echo "   failover: the lease's holder $id is none of the servers' (their stats.json landing_holder): nothing stopped" >&2
+            wait "$pid" || true; return 1
+        fi
     fi
     before=$(check_sql failover-lease.sql "$t0" | db_one)
     stop=$(db_now_us)

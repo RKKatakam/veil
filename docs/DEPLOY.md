@@ -608,10 +608,18 @@ The landing service of a branch runs on the server that holds the
 branch's lease (`landing_leases`: a holder name random per server start, a
 fencing epoch that rises at every take, an expiry 2 s ahead on the
 database's clock, renewed by every batch; `crates/veil-server/src/landing/service.rs`
-`take_lease`). The gate asks every server for its counters twice, 3 s
-apart (`SIGUSR1` → `stats.json`): the holder is the one whose
-`landing_batches` rises. It reads the lease row, stops that server, and
-records the moment on the database's clock (`failover-run.txt`). When the
+`take_lease`). After `FAILOVER_AFTER` seconds the gate waits, at most
+`FAILOVER_WAIT` more (300), until the run's lease row is held (unexpired)
+and the run's landed tickets rise between two looks 2 s apart
+(`deploy/checks/failover-held.sql`): the tool sets its agents up before it
+lands anything, 72 s for 1,000 agents on the cloud's second run. The holder
+is the server whose name (`stats.json`'s `landing_holder`, through
+`SIGUSR1`) the lease row names; never a server picked by its batch
+counters, which count every project's batches since it started (BUG-2940).
+If no lease is held, landings never flow, or no server has the lease's
+name, the gate fails with that reason and stops nothing. It reads the
+lease row, stops that server, and records the moment on the database's
+clock (`failover-run.txt`). When the
 load ends it waits until no ticket of the run is still queued and the
 tip of `main` is in the derived graph, then runs `deploy/checks/failover.sql`
 (`failover-check.txt`) and dumps `main`'s first-parent line

@@ -473,6 +473,14 @@ const CLASSES: usize = 262_144;
 
 const RETRY_LEASE: Duration = Duration::from_millis(500);
 
+impl Services {
+    /// This server's name as a lease holder (`stats.json`'s `landing_holder`:
+    /// how the failover gate finds the server a lease row names).
+    pub fn holder(&self) -> &str {
+        &self.holder
+    }
+}
+
 impl Default for Services {
     fn default() -> Self {
         let holder = format!("{}-{}", std::process::id(), hex::encode(veil_core::crypto::random_bytes::<8>()));
