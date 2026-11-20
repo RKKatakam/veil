@@ -479,7 +479,15 @@ SKIP_BUILD=1 TAG=<tag> GATES="failover scaling" deploy/compose/rehearsal.sh NAME
 DB=pg deploy/compose/rehearsal.sh NAME                 # PostgreSQL instead of YugabyteDB
 KEEP=1 deploy/compose/rehearsal.sh NAME                # leave it running; it prints the `down -v` command
 LB_PORT=28443 deploy/compose/rehearsal.sh NAME         # a free host port on a shared machine
+LATENCY_MS=0.5 DB=pg GATES=landing deploy/compose/rehearsal.sh NAME   # 0.5 ms more to every database and MinIO round trip
 ```
+
+`LATENCY_MS` delays everything the database (each YugabyteDB node) and
+MinIO send, with `tc netem` from a helper container that has `NET_ADMIN`
+in each one's network namespace (no root on the host); with `DB=pg` each
+gate's results hold its statements (`pg-stat-statements.txt`, counted
+from zero for the gate). `docs/design/server/landing-network.md` measured
+the landing service with it.
 
 Results: `deploy/compose/results/<stamp>/<gate>/`, and each container's
 log in `deploy/compose/results/<stamp>/`. On a machine others use, run
