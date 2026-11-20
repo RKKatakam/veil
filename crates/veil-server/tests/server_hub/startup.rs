@@ -2292,7 +2292,7 @@ fn bug_2930_migration_45_yugabytedb_loses_concurrent_revocation_in_person_epochs
                 .unwrap();
             // Trigger both project-level `(pid, 0)` and person-level `(0, uid)` rows via `veil_bump_epoch`.
             exec_retrying(&db, &format!("INSERT INTO group_members (group_id, person_id) VALUES ({gid}, {bob}), ({gid}, {carol})")).await;
-            exec_retrying(&db, &format!("UPDATE projects SET policy_version = 1 WHERE id = {pid}")).await;
+            exec_retrying(&db, &format!("UPDATE projects SET policy_text = '# v1' WHERE id = {pid}")).await;
 
             let before_rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
                 "SELECT project_id, person_id, epoch, changed_at FROM access_epochs ORDER BY project_id, person_id",
