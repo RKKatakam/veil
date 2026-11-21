@@ -176,13 +176,23 @@ fn repository_is_usable_right_after_a_crash_while_locked() {
     assert!(!proj.join(".veil/lock").exists(), "a recording took the repository lock");
     let start = Instant::now();
     let out = env.vl("alice", &proj, &["status"]);
+    let after_crash = start.elapsed();
+    assert!(out.status.success(), "after {after_crash:?}: {}", text(&out));
+    assert!(staging().is_empty(), "the dead process's staging was not removed: {:?}", staging());
+    // What the same status costs on this machine with no crash before it: it
+    // hashes 40 new files of 1.1 MB (5.2 s on a 2-core CI machine, BUG-2943).
+    // A wait for the dead process (a lease of 10 s or more, two minutes
+    // before the fix) still fails the bound; the machine's speed doesn't.
+    large_files("baseline");
+    let start = Instant::now();
+    let base = env.vl("alice", &proj, &["status"]);
+    let baseline = start.elapsed();
+    assert!(base.status.success(), "{}", text(&base));
     assert!(
-        out.status.success() && start.elapsed() < Duration::from_secs(5),
-        "after {:?}: {}",
-        start.elapsed(),
+        after_crash < baseline + Duration::from_secs(5),
+        "after a crash {after_crash:?}, with none {baseline:?}: {}",
         text(&out)
     );
-    assert!(staging().is_empty(), "the dead process's staging was not removed: {:?}", staging());
     env.ok("alice", &proj, &["fsck"]);
 }
 
