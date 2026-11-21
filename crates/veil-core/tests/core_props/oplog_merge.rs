@@ -1435,6 +1435,15 @@ proptest! {
     }
 }
 
+/// BUG-2944: the input GitHub CI's run of the test above shrank to (run
+/// 44951820661, 2026-11-21): a change `op restore` rewrote stays visible.
+#[test]
+#[ignore = "BUG-2944: after `op restore 3 back`, the version it rewrote is still visible from the final view's head"]
+fn bug_2944_op_restore_leaves_a_rewritten_version_visible() {
+    let steps: Vec<u16> = vec![21874, 56464, 55109, 54244, 44308, 16580, 20507, 6281, 13382, 59506, 13274, 42265, 47245, 4750, 37796, 17177, 64752, 32355, 10352, 9104, 36987, 42920, 62131, 33646, 64817, 19671, 24123, 45587, 33863, 490, 28006, 26579, 37619, 51094, 46213, 61087, 27721, 21739, 57655, 40, 18295, 28977, 47764, 1419, 55337, 19571, 38028, 61193, 41439, 51039, 51210, 60253, 33644, 25014, 16044, 49116, 7938, 3735, 33694, 42058, 38820, 7268, 25464, 39238, 51640, 12364, 6535, 62572, 53055, 15562];
+    check_rewrites_follow_through_merges(false, 3, true, false, &steps).unwrap();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: review_cases(64), failure_persistence: None, ..ProptestConfig::default() })]
 
