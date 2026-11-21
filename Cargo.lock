@@ -3127,6 +3127,14 @@ dependencies = [
  "toml_edit",
  "ureq",
  "veil-core",
+ "vl-fuser-macos",
+]
+
+[[package]]
+name = "vl-fuser-macos"
+version = "0.1.0"
+dependencies = [
+ "fuser",
 ]
 
 [[package]]

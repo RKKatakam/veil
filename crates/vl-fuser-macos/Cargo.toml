@@ -1,0 +1,15 @@
+[package]
+name = "vl-fuser-macos"
+description = "The fuser crate under a name of its own, for vl's opt-in macOS mount (the macfuse feature)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# vl depends on fuser on Linux, and on this crate for the opt-in macOS mount
+# (`--features macfuse`, which needs macFUSE). Naming fuser twice in vl's own
+# dependencies (`fuser_macos = { package = "fuser" }`) is refused by
+# `cargo metadata --all-features`, which the release tool (cargo-dist) runs.
+[dependencies]
+fuser = { version = "0.18", default-features = false }

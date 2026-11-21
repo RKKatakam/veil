@@ -815,6 +815,20 @@ fn all_text(dir: &Path) -> String {
 #[test]
 fn the_command_inherits_no_descriptor_of_vl_but_its_stdio() {
     let t = T::new();
+    // The test runner may hand this process descriptors it inherited itself
+    // (GitHub's runner: 10, 142 and 145), which are not vl's. Marked
+    // close-on-exec, neither the baseline shell nor `vl` gets them, as on a
+    // developer's machine; what `vl` itself leaks still shows below.
+    for e in std::fs::read_dir("/proc/self/fd").unwrap() {
+        let Some(fd) = e.unwrap().file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+        if fd > 2 {
+            // SAFETY: fcntl on a descriptor number only reads or sets its flags.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags >= 0 {
+                unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            }
+        }
+    }
     // `ls` lists the shell's descriptors: what the same shell has outside.
     let script = "ls /proc/$$/fd > fds.txt; true";
     let base = t.env.dir("fd-baseline");
