@@ -34,9 +34,9 @@ The Hub follows **the design of Anthropic's Scion**, which handles tens of thous
 - **Layered caches:** the client, then a cache daemon on each machine, then regional caches, then the server. Files are addressed by their hash, so any cache can serve them with no coordination; Scion serves over 99% of reads from caches. Caches only ever hold what the asker is allowed to see.
 - **No locked merge queue:** ready changes that don't overlap are **merged in batches** (500 ready PRs become one move of `main`). Conflicts go back to an agent to fix. Tests run after merging and before deploy.
 - **Few branches:** work lives as changes and PRs, not thousands of long-lived branches.
-- **Cheap storage:** each file is stored once, compressed, in S3-style object storage. A push's small files go up together as **one pack** (one storage write per push instead of one per file), and a background job merges small packs, as Git hosting does. Readers still get files one at a time, only those they may see (`docs/design/server/storage-and-cost.md`).
-- **One database commit per push,** and sign-ins, permissions and branch tips answered from each server's memory, so the database is never the bottleneck.
-- **Horizontal scaling:** stateless API servers, **YugabyteDB** for metadata (Spanner-style; PostgreSQL for development and CI), and object storage. Capacity grows by adding machines.
+- **Simple storage:** each file version is stored once, compressed, as its own object in S3-style object storage, as Scion does. Storage is **append-only** in this version: nothing is deleted and nothing is merged in the background, so no cleanup can race a writer. Readers get files one at a time, only those they may see (`docs/design/server/storage-and-cost.md`; HUB.md §13.37).
+- **A few database commits a push** (3.6 to 4 in the 2026-11-20 and 21 cloud runs), with sign-ins, permissions and branch tips answered from each server's memory.
+- **Horizontal scaling:** stateless API servers, object storage, and for metadata either **PostgreSQL** (the most work a core; one machine) or **YugabyteDB** (Spanner-style; its hash layout spreads even one repository across every node). With YugabyteDB, capacity grows by adding machines: 3 to 6 nodes gave 1.62× on one busy repository (README, "Measured").
 - **Permissions on every request,** cached per person and folder, so access control never becomes the bottleneck.
 
 ### Design targets (the server's benchmark must prove them)

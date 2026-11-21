@@ -1685,6 +1685,52 @@ Statements on YugabyteDB are counted on the node the driver's URL names
 (`pg_stat_statements` is per node): with three servers spread over three
 nodes, about a third of them.
 
+### 12.11 The runs on Google Cloud (2026-11-20 and 21)
+
+**Topology** (every machine Spot, `VEIL_GCP_SPOT=all`; us-central1-a):
+- 3 servers (e2-standard-32) and the balancer (e2-standard-8);
+- the database, one of:
+  - PostgreSQL 17 on one c2d-standard-56;
+  - YugabyteDB 2025.2.8.1 on 3 or 6 c2d-standard-8 nodes (`VEIL_GCP_SIZE_DB=c2d-standard-8`), `VEIL_GCP_YB_LAYOUT=hash` or `colocated`;
+- a 500 GB `pd-ssd` data disk for each database machine;
+- MinIO (c2d-standard-16, local NVMe; `mkfs.ext4 -i 4096` since BUG-2941);
+- one driver (n2d-standard-16).
+
+The YugabyteDB nodes are 8 vCPUs because the project's quotas (200 CPUs and
+100 C2D CPUs in the region) don't fit 56-vCPU nodes. Increases were
+requested; only the all-regions quota was granted that night.
+
+**Builds:** `da8ab108` for the first PostgreSQL deployment (run 4), and
+`8efc94ab` (landing reads storage at once, BUG-2942; the failover gate's
+lease check, BUG-2940; MinIO's inodes, BUG-2941) for everything after.
+
+**The runs, in order:**
+
+| Run | Deployment | Gates | Outcome |
+|---|---|---|---|
+| 4 (2026-11-20, 02:42 to 05:35 UTC) | PostgreSQL | pull, land, api, branches, landing, onerepo, yb-scale, yb-onerepo, scaling, failover, agents | Kept: everything before `scaling`. **MinIO's file system ran out of inodes** during `scaling` (every PUT answered 507), which voids the 3-server step, `failover` and `agents` (BUG-2941). |
+| 5 (23:51 UTC) | PostgreSQL, then YugabyteDB 3 nodes | none | `configure` lost its SSH connection to the database machine; the YugabyteDB create hit the CPU quota with 56-vCPU nodes. Stopped; about $1. |
+| 6, 6b, 6c (2026-11-21, 00:26 to 03:44 UTC) | PostgreSQL | landing, onerepo, scaling, failover, agents | The balancer and then the database were reclaimed during `landing` and its rerun, so `landing` ran a third time on the same machines (valid). The first `failover` found server 2 not yet reporting after `scaling` and was run again after `agents` (valid). |
+| 7, 7b (03:44 to 06:41 UTC) | YugabyteDB 3 hash, 6 hash, 3 colocated | yb-scale, yb-onerepo, branches, pull, landing, onerepo, agents (3 hash); yb-scale, yb-onerepo, agents (6 hash); yb-scale, yb-onerepo (3 colocated) | The first create timed out at Google's API (`ReadTimeout`), so it was destroyed and created again. `landing` on 3 nodes was voided: the balancer was reclaimed in it and in its rerun. `onerepo` on 3 nodes lost its SSH connection. |
+
+**The key file was cleared mid-run** (the local secrets directory) at
+03:20 UTC. Run 6c's teardown then couldn't sign in, and the PostgreSQL
+machines kept running until the key was given again and they were
+destroyed by hand. It cost about $1.
+
+Every deployment ended with `destroy.sh --check`: "nothing left". The total
+was about $39 for the two nights. Results are in
+`deploy/results/veil-test/20261120T*` and `20261121T*`. The README's
+"Measured" has the tables.
+
+**Findings:**
+1. **YugabyteDB's hash layout scales one repository:** 3 to 6 nodes gave 1.62× the pushes, with the work split evenly (17 % a node). Colocated left 79 % of it on one node.
+2. **The multi-project `yb-scale` gate missed 1.6× in every curve** (1.07 to 1.58×). Its 300 agents in a closed loop don't fill 6 nodes, which ran at about half their CPU. The gate needs a load that grows until the nodes are full.
+3. **YugabyteDB used 6 to 10 times PostgreSQL's database CPU a push** below saturation, and collapsed (retries) when 3 nodes were full. The 2026-11-21 investigation found no statement reading more rows than it returns. The next run should record every node's `pg_stat_statements` and tablet-server metrics before and after each curve.
+4. **Pulls on the PostgreSQL deployment were 3.6 to 6 times slower** than on YugabyteDB at 10 and 100 agents, with the same code. The cause is not yet known.
+5. **Landing on 3 servers dropped to 161 a second** (254 and 242 on 1 and 2). It is still unexplained with MinIO healthy.
+6. **The balancer should be on demand:** its three reclaims voided two landing runs. About $0.27 an hour more.
+
 ## 13. Storage and garbage collection (v1)
 
 In Veil v1, **storage is append-only and there is no garbage collection of

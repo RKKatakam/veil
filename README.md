@@ -61,113 +61,180 @@ blame and search answered by the server in milliseconds.
 
 ## Measured
 
-Two sets of numbers: a deployment across ten machines on Google Cloud
-(2026-11-14 and 15), and one 32-core machine running everything. Misses
-are listed with the passes. The kits in `deploy/` set up the deployment
-and run the benchmarks ([DEPLOY.md §12](docs/DEPLOY.md#12-google-cloud-deploygcp)
-for Google Cloud; both runs together cost about $13.50). The colocated
-YugabyteDB and PostgreSQL layouts below were switched by hand on the same
-machines (PostgreSQL alone is a kit option; colocation is not yet). The
-run log is [DEPLOY.md §12.9](docs/DEPLOY.md#129-the-runs-on-google-cloud-2026-11-14-and-15).
+Two sets of numbers: a deployment across up to twelve machines on Google
+Cloud (2026-11-20 and 21, the current code), and one 32-core machine
+running everything (2026-11-12 and 14, older code). Misses are listed with
+the passes. The kits in `deploy/` set up the deployment and run the
+benchmarks ([DEPLOY.md §12](docs/DEPLOY.md#12-google-cloud-deploygcp));
+the two nights' runs cost about $39. The run log is
+[DEPLOY.md §12.11](docs/DEPLOY.md#1211-the-runs-on-google-cloud-2026-11-20-and-21).
 
-### Across machines (Google Cloud, 2026-11-14 and 15)
+### Across machines (Google Cloud, 2026-11-20 and 21)
 
-**The deployment:**
-- 3 Veil servers (c2d-standard-16, Spot) behind one HAProxy balancer;
-- a 3-node YugabyteDB cluster (c2d-standard-8, on demand);
-- MinIO for the objects (c2d-standard-16 with a local NVMe SSD);
-- 2 load machines (n2d-standard-8);
-- one zone (us-central1-a), network disks (pd-balanced).
+**The deployment** (every machine a Spot VM, one zone, us-central1-a):
+- 3 Veil servers (e2-standard-32) behind one HAProxy balancer (e2-standard-8);
+- the database, one of:
+  - PostgreSQL 17 on **one c2d-standard-56** (56 vCPUs);
+  - YugabyteDB 2025.2 on **3 or 6 c2d-standard-8 nodes** (8 vCPUs each), with the **hash layout** (every table split across the nodes, one repository included), or the colocated layout as a baseline;
+- a 500 GB pd-ssd disk for each database machine;
+- MinIO for the file contents (c2d-standard-16 with a local NVMe SSD);
+- one load machine (n2d-standard-16).
 
-The server build was `b6de7035` throughout; the realistic-agents benchmark
-was `135245b2`. No Spot machine was reclaimed, and MinIO never restarted.
+The server build was `8efc94ab`. Some PostgreSQL rows were measured the
+night before on `da8ab108`, which differs only in the landing service:
+pulls, `land`, the API, branches, and PostgreSQL's columns in the
+many-projects and one-busy-repository tables. File
+contents are stored one object per file version, and nothing is deleted
+(append-only storage, the only layout in this version).
 
-**Reads** (0 errors in every row):
+**Core counts differ.** PostgreSQL had 56 vCPUs; YugabyteDB had 24 or 48.
+The YugabyteDB nodes were kept small to fit the cloud project's CPU quota,
+and because the point of a distributed database is to grow by adding cheap
+machines.
 
-| | 10 | 100 | 1,000 |
-|---|---|---|---|
-| Pulls a second (agents) | 866 | **5,590** | 3,928 |
-| Fresh thin workspaces a second, from the servers (readers; 103 files each) | 499 | 740 | 766 |
-| The same through the regional cache | 870 | **1,364** | 1,341 |
+#### YugabyteDB: adding nodes
 
-- The regional cache answered 99.96 to 100 % of reads itself, using 6 to 8 times less server CPU per read, at a peak of 103 MiB.
-- The API (history, diffs and the like) answered 354 to 361 requests a second.
+**One busy repository:** 300 agents, each pushing to a branch of its own
+in one project, as fast as it is answered, with some merges onto `main`:
 
-**Landing** (0 errors in every row):
-- **Across 100 projects:** 283 landings a second, pushed straight onto each project's `main`.
-- **Server count:** landings grow exactly with the number of servers: 93, 185 and **279 a second (3.0×)** on 1, 2 and 3 servers.
-- **The rest flattens:** pushes (88, 138, 153 a second) and pulls (300, 528, 514 a second) stop growing after two servers. The database is the limit there.
+| | YugabyteDB 3 nodes, colocated | YugabyteDB 3 nodes, hash | YugabyteDB 6 nodes, hash | PostgreSQL, one machine |
+|---|---|---|---|---|
+| Pushes a second | 19.9 | 30.3 | **48.9** | 392 |
+| p50 (a push) | 13.5 s | 8.7 s | 5.2 s | 0.76 s |
+| Merges onto `main` a second | 1.7 | 4.0 | **6.8** | 28.1 |
+| Busiest database node's share of the work | **79 %** | 33 % | 17 % | (one machine) |
+| Errors | 0 | 0 | 0 | 0 |
 
-**Failover: passed every check.** The first server was stopped in the
-middle of a landing load, and another server took over the landing queue.
-- 17,386 changes landed, each exactly once on `main`.
-- None was lost or landed twice.
-- No agent was told "landed" for a change that is not on `main`.
-
-**Agents on branches of their own, landing on one `main`** (each pushes
-flat out, with no thinking time, and lands its branch every 5th push). The
-same machines, with three database layouts:
-
-| Database | Pushes a second, 100 agents | 300 agents | 1,000 agents |
-|---|---|---|---|
-| YugabyteDB, 3 nodes, as deployed (5 min) | 118 | 6.7 merges on `main` a second, p99 39 s, 0 errors | 8.1 a second, 55 errors |
-| YugabyteDB, 3 nodes, **colocated** (3 min) | 137 | **15.6** a second, p99 9 s, 0 errors | **12.5** a second, 0 errors |
-| **PostgreSQL on one of those 8-core machines** (3 min) | **246** | **30.6** a second, p99 7.6 s | **25.2** a second |
-
-- **Errors:** the PostgreSQL runs' 123 and 301 errors were `warming` answers ("try again in a few seconds"). `vl` waits those out; the benchmark counted them as errors. That is fixed in `135245b2`.
-- **Caveats:** the layouts after the first ran for 3 minutes instead of 5, on fresh databases.
-- **At 3,000 agents,** the deployed layout did 5.7 merges a second with 7,597 errors.
+- **From 3 to 6 nodes: 1.62× the pushes and 1.63× the merges.** The target is 1.6×, so this **passes**.
+- **The hash layout spreads one repository over every node.** Colocated puts it on one node, which did 79 % of the work while the others idled; adding nodes can't help that layout.
 
 **Agents at a coding agent's pace.** Each agent:
 - thinks 2 minutes between steps on average;
 - pushes to its own branch;
 - forks 3 subagents on branches off its own, which push 3 times each and are merged into it;
-- lands its branch on `main` every 20 pushes.
+- lands its branch on `main`.
 
 The thinking is compressed 20 times, so 1,000 agents put the load of about
 20,000 agents at the real pace on the servers.
 
-| Database | Agents (at the real pace) | Pushes a second | p50 / p99 (a push) | Errors |
-|---|---|---|---|---|
-| YugabyteDB, as deployed | 1,000 (about 20,000) | 79 | 6.4 s / 22 s | **0** |
-| YugabyteDB, colocated | 1,000 (about 20,000) | 71 | 7.4 s / 26 s | **0** |
-| PostgreSQL, one machine | 1,000 (about 20,000) | **102** | **3.5 s / 18 s** | **0** |
-| Each of the three | 3,000 (about 60,000) | 37 to 40 | about 11 s / 70 s | 4,700 to 5,100 |
-| PostgreSQL, one machine | 10,000 (about 200,000) | 40 | 33 s / 64 s | about 19,500 |
+| 1,000 agents (about 20,000 at the real pace) | YugabyteDB 3 nodes | **YugabyteDB 6 nodes** | PostgreSQL, one machine |
+|---|---|---|---|
+| Pushes to their own branch, a second (p50) | 70 (4.0 s) | **162 (0.25 s)** | 163 (0.10 s) |
+| Subagent merges into their agent's branch | 5.9 a second | **16.0** | 16.3 |
+| Branches landed on `main` | 2.4 a second | **5.2** | 3.8 |
+| Pulls and workspace starts (p50) | 10 a second (2.1 s) | **23 (0.13 s)** | 23 (19 ms) |
+| Errors, all operations | 42 | **0** | 118 |
 
-- Every subagent's work reached `main`: each subagent merge carried its 3 pushes.
-- **At 3,000 agents and more, the servers are the limit, not the database.** All three layouts give the same numbers, and the servers used about 10 of their 16 cores.
-- **The cause is in Veil.** A subagent's merged branch can't be deleted by its agent, so branches pile up, and every push first asks for the branch tips, for which the server signs a grant per branch. Database statements per operation grew from 25 to 140 to 570. It is the next thing to fix.
+| 3,000 agents (about 60,000; past every setup's capacity) | YugabyteDB 3 nodes | YugabyteDB 6 nodes | PostgreSQL, one machine |
+|---|---|---|---|
+| Pushes a second | 64 | **138** | 130 |
+| Subagent merges a second | 2.5 | **9.0** | 8.3 |
+| Branches landed on `main` a second | 2.9 | **4.6** | 3.1 |
+| Errors, all operations | 3,729 | **231** | 959 |
+
+- **From 3 to 6 nodes, every operation at 1,000 agents did 2.2 to 2.7 times as much,** and the waits fell from seconds to a fraction of a second.
+- **Six 8-vCPU nodes keep up with one 56-vCPU PostgreSQL machine.** Per-request waits are longer, but they land more often on `main`, and past capacity they carry more with fewer errors.
+
+**Many projects at once** (60 projects; 300 agents, 120 for the last two rows):
+
+| | PostgreSQL | YugabyteDB 3, colocated | YugabyteDB 3, hash | YugabyteDB 6, hash | 3 → 6 nodes |
+|---|---|---|---|---|---|
+| Pushes to branches a second | 333 | 336 | 250 | 318 | 1.27× |
+| Landings (the landing service) a second | 243 | 148 | 141 | 211 | 1.50× |
+| Pulls a second | 11,244 | 10,855 | 11,068 | 11,828 | 1.07× |
+| API commits a second | 259 | 236 | 247 | 291 | 1.18× |
+| `land` straight onto `main` a second | 234 | 17 | 28 | 44 | 1.58× |
+
+- **Miss: the 3 → 6 target of 1.6× in every row.** 0 errors anywhere.
+- **The likely reason, not yet proven, is the benchmark's fixed load.** It keeps the same 300 agents, each waiting for its answer. On 6 nodes the database ran at about half its CPU (a median of 3.5 to 4.7 of 8 cores a node), and the writes' waits fell 16 to 36 % instead of the work doubling. A run that adds agents until 6 nodes are full has not been done.
+- **On 3 nodes, colocated is faster for plain pushes** (336 against 250 a second). It keeps a write on one node, while the hash layout pays for transactions across nodes. It can't grow past that node.
+
+**What YugabyteDB costs.** Below its limit, a push uses 6 to 10 times the
+database CPU it uses on PostgreSQL. Measured on the development machine,
+that is 32 to 53 ms against 4 to 5 ms: about 195 calls between nodes, 93
+replicated writes and 3 distributed transactions a push. When the nodes'
+CPUs are full, retries pile up and it collapses: 3 nodes took about 800 ms
+of database CPU a push for one busy repository. The fix is to tell agents
+to come back before the database is full, as Veil already does elsewhere;
+it is not built yet.
+
+#### PostgreSQL deployment
+
+**Reads** (0 errors in every row):
+
+| Agents | 10 | 100 | 1,000 |
+|---|---|---|---|
+| Pulls a second, PostgreSQL (p50) | 279 (45 ms) | 1,509 (66 ms) | 1,424 (716 ms) |
+| The same on YugabyteDB, 3 nodes, hash | **1,644 (2.8 ms)** | **5,478 (7.6 ms)** | 1,425 (712 ms) |
+
+- **Miss, cause not yet found:** with the same code, PostgreSQL's pulls at 10 and 100 agents were 3.6 to 6 times slower than YugabyteDB's. It lies in the PostgreSQL deployment, not in the permission checks.
+- **At 1,000 agents both stop at the same rate,** limited by something they share (the load machine, the servers or MinIO).
+
+**Commits** (0 errors in every row):
+
+| | 10 projects | 100 projects |
+|---|---|---|
+| `land`: a push straight onto each project's `main`, a second | 181 | 372 |
+| API commits a second | 249 | 470 |
+
+**Agents on branches of their own in one project** (as fast as they are
+answered; with merges onto `main` in the second table):
+
+| Agents | 1 | 10 | 100 |
+|---|---|---|---|
+| Pushes a second, PostgreSQL | 21 | 189 | **435** |
+| The same, YugabyteDB 3 nodes, hash | 18 | 132 | 302 |
+
+| Agents | 300 | 1,000 | 3,000 |
+|---|---|---|---|
+| Merges onto `main` a second, PostgreSQL | **31.3**, 0 errors | 25.5, 1,014 errors | **1.1, 8,823 errors** |
+| The same, YugabyteDB 3 nodes, hash | 9.4, 0 errors | 14.4, 0 errors | 16.3, 2,160 errors |
+
+- **Miss: PostgreSQL collapses at 3,000 agents** on one repository.
+
+**One busy repository, against GitHub's figure of 7,200 pushes a second**
+(their internal test of 5,000 agents on one repository; each agent pushes
+to a branch of its own):
+
+| Agents | Pushes a second | Of 7,200 | p50 / p99 | Errors |
+|---|---|---|---|---|
+| 1,000 | 393 | 5.5 % | 2.6 s / 3.1 s | 0 |
+| 5,000 | 367 | 5.1 % | 12 s / 32 s | 0 (689,410 told to come back) |
+
+- **Miss:** 5 % of the figure.
+- **The limit is not yet known.** Neither the servers (5 to 7 of their 96 cores) nor the database (2 to 3 cores) was busy. The most likely limit is a push's chain of round trips (tips, upload, push) and its writes to MinIO, which were not measured in this run.
 
 **Landing on one `main` past its capacity** (10,000 agents offering 1,000
-a second, as deployed):
-- **Done:** 85 to 106 a second for 3 minutes, 63 to 65 for 10.
-- **Refused:** almost all the rest was told "busy, come back".
-- **Conflicts:** 0.00 to 0.02 collisions a landing.
+a second):
 
-This was the standard YugabyteDB layout, the bottleneck above; the
-one-machine table below has the same test on PostgreSQL at 995 a second.
+| | 3 minutes | 10 minutes | The night before (`da8ab108`) |
+|---|---|---|---|
+| Plain | **207** a second | 198 | 169 and 171 |
+| Protected `main` (review rules) | 185 | 175 | 182 and 183 |
+| Protected, with 3 % overlapping and 2 % conflicting changes | 182 | 181 | 181 and 175 |
 
-**A 1 GB project:**
+- **Waits:** the p50 is about 62 s, because the offered load is five times what one `main` lands. The rest are told to come back, or time out.
+- **Change:** `8efc94ab` reads storage in parallel; it gained 16 to 22 % on plain landing. Each batch now waits about 150 ms for MinIO to store its objects.
+- **YugabyteDB 3 nodes, hash:** 142 to 149 a second in the three 3-minute runs that finished. The run as a whole was voided when a Spot machine was reclaimed.
 
-| Operation | Time |
-|---|---|
-| First push, all history | 169 s |
-| Push of one new snapshot | 0.33 s |
-| Thin clone | 23 s (0.43 GB on disk) |
-| Full clone | 51 s |
-| Clone of one folder | 0.65 s |
-| Pull of one new snapshot | 0.08 s |
-| `status` | 10 to 30 ms |
-| `log -n 20` | 0.16 s |
+**Server count** (1, 2 and 3 servers; 1,000 agents; 0 errors):
 
-**Miss:** during the full clone the server's memory peaked at 1,042 MiB,
-over the 1 GB gate.
+| | 1 server | 2 servers | 3 servers |
+|---|---|---|---|
+| Pulls a second | 1,451 | 1,417 (0.98×) | 1,445 (1.00×) |
+| Pushes to branches a second | 371 | 400 (1.08×) | 404 (1.09×) |
+| Landings a second, 100 projects | 254 | 242 (0.95×) | **161 (0.63×)** |
 
-**`vl` beside Git on a cloud machine** (network disk, 1,000 and 10,000
-files of 4 KiB):
-- **Veil was faster** at importing a folder (110 vs 251 ms; 720 vs 2,233 ms), cloning 1,000 files (233 vs 334 ms), cloning one folder (64 vs 76 and 86 ms) and `status` among 10,000 files (7 vs 13 ms).
-- **Git was faster** at committing one file (7 vs 15 ms; 15 vs 18 ms), `log -n 20` (about 2 vs 7 ms) and cloning all 10,000 files (1.0 vs 2.1 s).
+- **Miss:** adding servers doesn't help here. They share one database and one MinIO, which set the pace.
+- **The drop on 3 servers is not explained yet.**
+
+**Failover: passed every integrity check.** The server holding `main`'s
+landing lease was stopped in the middle of a landing load:
+- 10,473 changes landed, each exactly once on `main`.
+- None was lost or landed twice.
+- No agent was told "landed" for a change that isn't on `main`.
+- Another server took the lease, and the first landing after the stop came **1.6 s** later.
+- **Miss:** the longest pause in landings after the stop was 2.46 s, against a target of 2 s. In the 30 s before the stop, the longest was 4.05 s.
 
 **Per day, beside Anthropic's reported load.** Anthropic's post on Scion
 ([Redesigning source control](https://www.anthropic.com/research/redesigning-source-control))
@@ -178,14 +245,13 @@ does not give. The figures below are Veil's measured rates held for a day:
 
 | Veil, measured | A second | A day | Anthropic's reported load |
 |---|---|---|---|
-| Merges on one `main`, agents on branches, PostgreSQL (300 agents) | 30.6 | **2.6 million** | over 30,000 merges a day |
-| The same, colocated YugabyteDB (300 agents) | 15.6 | 1.3 million | |
-| The same, YugabyteDB as deployed (300 agents, 0 errors) | 6.7 | 580,000 | |
-| Landings on `main` at a coding agent's pace (1,000 agents, about 20,000 at the real pace, 0 errors) | 2.6 to 3.1 | 220,000 to 270,000 | |
-| Subagent merges into their agents' branches (same run) | 5.8 to 9.7 | 500,000 to 840,000 | (Scion has few branches) |
-| Landings across 100 projects | 283 | 24 million | |
-| Landings on one `main`, one machine, PostgreSQL | 995 | 86 million | |
-| Pulls (100 agents) | 5,590 | 480 million | about 25 million CI checkouts a day |
+| Merges onto one `main`, agents on branches, PostgreSQL (300 agents, 0 errors) | 31.3 | **2.7 million** | over 30,000 merges a day |
+| The same on YugabyteDB, 6 nodes, hash (one-repository run, 300 agents, 0 errors) | 6.8 | 590,000 | |
+| Branches landed on `main` at a coding agent's pace, YugabyteDB 6 nodes (1,000 agents, about 20,000 at the real pace, 0 errors) | 5.2 | 450,000 | |
+| Subagent merges into their agents' branches (same run) | 16.0 | 1.4 million | (Scion has few branches) |
+| `land` across 100 projects, PostgreSQL | 372 | 32 million | |
+| Landings on one `main` past capacity, PostgreSQL | 207 | 18 million | |
+| Pulls (100 agents), YugabyteDB 3 nodes | 5,478 | 470 million | about 25 million CI checkouts a day |
 
 **These figures don't say Veil out-scales Scion:**
 - **Usage against capacity:** Anthropic's numbers are what Scion carries, not its ceiling.
@@ -197,17 +263,27 @@ What they show: on modest machines, Veil's design handles the merge rate
 that one of the busiest agent-driven repositories reported, with room to
 spare.
 
-**What the cloud runs did not show:** a project far bigger than 1 GB, more
-than one zone or region, and the 10-minute landing mix.
+**What went wrong during the runs:**
+- **Spot reclaims:** Google reclaimed Spot machines four times (the balancer three times, the database once). Each run they hit was rerun or voided.
+- **MinIO's disk:** an earlier attempt filled MinIO's file system's inodes while 70 % of its space was free (BUG-2941, fixed in the kit). Those results were discarded.
 
-The first multi-machine attempt, on DigitalOcean on 2026-11-14, gave no
-speed result. Its 4-vCPU storage droplet's MinIO restarted every 72
-seconds ([DEPLOY.md §9.0](docs/DEPLOY.md#90-first-run-on-digitalocean-2026-11-14-four-vcpu-machines-limited-by-its-storage-droplet)).
+**What the cloud runs did not show:**
+- a project far bigger than 1 GB;
+- more than one zone or region;
+- YugabyteDB on nodes as large as PostgreSQL's;
+- a load that grows until 6 YugabyteDB nodes are full.
+
+The earlier runs on older code (Google Cloud, 2026-11-14 and 15, with a
+1 GB project and a comparison with Git on a cloud machine) are in
+[DEPLOY.md §12.9](docs/DEPLOY.md#129-the-runs-on-google-cloud-2026-11-14-and-15).
+They came before the added permission checks and append-only storage, so
+they are not comparable.
 
 ### On one machine
 
 Landings measured on 2026-11-14 (`1e141f0b`), the comparison with Git on
-2026-11-12. One 32-core machine also ran the load generator, PostgreSQL
+2026-11-12: **older code**, before append-only storage and the added
+permission checks, and not measured again since. One 32-core machine also ran the load generator, PostgreSQL
 (with the deployment's settings) and the object store (a local directory).
 The load tool, the server and the database share 32 cores and 30 GB of
 memory, which runs short about 100 s into a 10,000-agent run (BUG-2363).
@@ -308,20 +384,22 @@ buys:
 **Many branches.**
 - *Costs:* more rows written per push.
 - *Buys:* every agent and subagent has its own branch, which is how agents work. Scion discourages branches other than `main` and releases.
-- *Open:* the growing cost of the branch-tips answer is the limit the realistic-agents run found. Making it independent of the number of branches is the next fix.
+- *Fixed since the first cloud run:* the branch-tips answer no longer grows with the number of branches (BUG-2445), and a branch merged into another is deleted with the merge, so subagent branches don't pile up (BUG-2446).
 
 **Permissions on every answer.**
 - *Costs:* a permission lookup in each request (cached).
 - *Buys:* nobody receives a file, a log line, a search hit or a diff from a folder they can't see.
 
-**Metadata in a database, contents in object storage.**
-- *What goes where:* PostgreSQL or YugabyteDB hold branches, the history graph, indexes, permissions, the landing queue and pull requests. File contents go to S3-compatible storage, in packs, with a background cleanup.
-- *Buys:* the database stays a small fraction of the repository's size.
-- *Costs:* packs need a pack list and cleanup, where storing every file version as its own object (as Scion does) would need neither but means many more objects.
+**Metadata in a database, contents in object storage, nothing deleted.**
+- *What goes where:* PostgreSQL or YugabyteDB hold branches, the history graph, indexes, permissions, the landing queue and pull requests. File contents go to S3-compatible storage, one object per file version, as Scion does.
+- *Append-only:* this version never deletes stored history: no garbage collection and no background merging of objects.
+- *Buys:* the database stays a small fraction of the repository's size, and no cleanup can race a writer.
+- *Costs:* more storage and more storage requests than packing files together would need.
 
 **PostgreSQL or YugabyteDB.**
-- *PostgreSQL:* one machine was 2 to 4 times faster than three YugabyteDB nodes in the runs above. It is the right choice for most teams, with a standby copy.
-- *YugabyteDB:* keeps working when a machine or a zone fails, and grows past one machine's writes. It needs the colocated layout, which more than doubled its merge rate.
+- *PostgreSQL:* the most work for each core. One machine does a push with 6 to 10 times less database CPU, and it is the right choice for most teams, with a standby copy. It can't grow past one machine's writes.
+- *YugabyteDB:* keeps working when a machine or a zone fails, and grows by adding machines. With the hash layout, one repository spreads over every node. 6 small nodes did 1.6 times the work of 3 on one busy repository, and matched one large PostgreSQL machine on the realistic-agents run.
+- *Costs:* YugabyteDB needs more machines for the same load, and it collapses when its CPUs are full (above).
 
 **Only secrets are encrypted.**
 - *Costs:* the server can read the code, as GitHub can.
@@ -329,43 +407,47 @@ buys:
 
 **One `main` row per project.**
 - *Costs:* moving `main` is one compare-and-swap on one database row, done one at a time, as in Scion. No database removes that limit.
-- *Buys:* Veil's landing service batches many changes into each move. Pushing straight onto one `main` without it fell to 8 a second with 50 agents racing; the landing service holds 995 a second on one machine.
+- *Buys:* Veil's landing service batches many changes into each move. Pushing straight onto one `main` without it fell to 8 a second with 50 agents racing; the landing service held 995 a second on one machine (older code, below), and about 200 a second on the cloud deployment above, where each batch waits for MinIO.
 
 ## Where it stands
 
-Veil is pre-release. Every planned feature is built and has run across
-several machines; the work left is speed (the next steps below).
+Veil is a **pre-1.0 preview**. Every planned feature is built and has run
+across several machines; the work left is speed and the open items below.
 
 | Part | State |
 |---|---|
-| Client engine, workspaces, sandboxes | Built |
-| Thin clones, caches, storage on S3 with PostgreSQL or YugabyteDB | Built |
+| Client engine, workspaces, sandboxes | Built; the sandbox is Linux-only |
+| Thin clones, caches, storage on S3 with PostgreSQL or YugabyteDB | Built; storage is append-only |
+| YugabyteDB across nodes, one repository included (hash layout) | Built, and measured on 3 and 6 nodes (above) |
 | History, blame and search answered by the server | Built, speed gate passed |
-| Landing at agent scale, CI, pull requests, embargoes, web client | Built; landing holds about 1,000 a second for three minutes, not yet ten with overlapping changes |
+| Landing at agent scale, CI, pull requests, embargoes, web client | Built |
 | Review of the whole code base (eight passes) | Done: about 75 bugs found, all but a handful fixed |
-| Benchmarks on the final code | Run on 2026-11-12: 10 misses filed (BUG-1940 to BUG-1949); 5 fixed so far, the rest in progress |
-| A run across several machines | Done on Google Cloud, 2026-11-14 and 15 (above). Next: the branch-tips cost, letting agents delete merged branches, the colocated YugabyteDB layout by default |
+| A run across several machines | Done on Google Cloud, 2026-11-20 and 21 (above), and 2026-11-14 and 15 on older code |
 
-The correctness suite is green: about 800 server tests, each run on
-PostgreSQL and on YugabyteDB, and about 2,300 client and engine tests. Every
+The correctness suite is green: about 970 server tests, each run on
+PostgreSQL and on YugabyteDB, and about 2,570 client and engine tests. Every
 bug found is in [docs/BUGS.md](docs/BUGS.md) with the test that reproduces
 it, the open ones included.
 
-Not proven yet: projects far bigger than 1 GB, more than one zone or region,
-the gates that have no benchmark yet (bisect over 10,000 candidates,
-workspaces of a million files), and the sandbox on macOS,
-where commands run unconfined for now. By design, a clone is not a full
-standalone copy as in Git: you can edit, commit, split, squash and undo
-offline, and everything shared goes through the server.
+Not proven yet:
+- projects far bigger than 1 GB;
+- more than one zone or region;
+- YugabyteDB under a load that fills 6 nodes or more;
+- the gates that have no benchmark yet (bisect over 10,000 candidates, workspaces of a million files);
+- the sandbox on macOS, where commands run unconfined for now.
+
+By design, a clone is not a full standalone copy as in Git: you can edit,
+commit, split, squash and undo offline, and everything shared goes
+through the server.
 
 **Next steps**, from the Google Cloud runs
-([DEPLOY.md §12.9](docs/DEPLOY.md#129-the-runs-on-google-cloud-2026-11-14-and-15)):
-1. **Make the branch-tips answer cost the same however many branches there are.** It is the limit at 3,000 or more agents.
-2. **Let an agent delete a branch it has merged into another branch,** so subagent branches don't pile up.
-3. **Bring the 1 GB project's full clone under 1 GB of server memory** (1,042 MiB on Google Cloud). Fixed on the development machine (BUG-2456: 962 to 976 MiB, from 1,001 to 1,026); not yet run on the cloud.
-4. **Make the colocated layout the default for YugabyteDB.**
-5. **Benchmark fix:** its set-up should wait out `busy` answers.
-6. **Run again:** the 10-minute landing mix across machines, and projects much bigger than 1 GB.
+([DEPLOY.md §12.11](docs/DEPLOY.md#1211-the-runs-on-google-cloud-2026-11-20-and-21)):
+1. **Find why pulls on the PostgreSQL deployment are slower** than on YugabyteDB with the same code (279 against 1,644 a second at 10 agents).
+2. **Find why landing drops on 3 servers** (254, 242, then 161 a second).
+3. **Tell agents to come back before YugabyteDB's CPUs are full,** so retries can't make it collapse.
+4. **Measure YugabyteDB with a load that grows until the nodes are full,** and record each node's statements in the cloud runs.
+5. **Make the balancer an on-demand machine:** Spot reclaims of it voided two landing runs.
+6. **Run again:** projects much bigger than 1 GB, and more than one zone.
 
 ## Who can see what
 

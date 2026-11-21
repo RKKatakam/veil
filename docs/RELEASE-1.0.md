@@ -1,5 +1,12 @@
 # Veil 1.0.0 release checklist
 
+> **Out of date (2026-11-21).** This checklist predates the server
+> milestones, append-only storage and the cloud runs. Veil now ships as a
+> **pre-1.0 preview**. Its current state, what is proven and what isn't,
+> and the next steps are in the README's "Where it stands" and "Measured".
+> Open bugs are in [BUGS.md](BUGS.md). A 1.0.0 checklist will be written
+> again before a 1.0.0 release.
+
 1.0.0 means **the `vl` client and the Veil server, with the permission
 model, stable for the owner and their team on Linux and macOS**, and a
 repository format that later versions will always read. Veil is
