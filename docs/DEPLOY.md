@@ -1720,8 +1720,8 @@ destroyed by hand. It cost about $1.
 
 Every deployment ended with `destroy.sh --check`: "nothing left". The total
 was about $39 for the two nights. Results are in
-`deploy/results/veil-test/20261120T*` and `20261121T*`. The README's
-"Measured" has the tables.
+`deploy/results/veil-test/20261120T*` and `20261121T*`. [BENCHMARKS.md](BENCHMARKS.md)
+has the full tables (summarized with charts in the README).
 
 **Findings:**
 1. **YugabyteDB's hash layout scales one repository:** 3 to 6 nodes gave 1.62× the pushes, with the work split evenly (17 % a node). Colocated left 79 % of it on one node.

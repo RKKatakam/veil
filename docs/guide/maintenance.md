@@ -156,7 +156,7 @@ too), `VEIL_HOME`, leftover sandboxes, the repository's format and lock
 `.veil/lock.steal.<hash>`, that a `vl` crashing mid-takeover left behind:
 it removes those whose holder has provably exited, which is the one thing
 it changes, and names the rest), the stat cache, the vault, the filesystem (network mounts, `fsync`, case and
-Unicode folding, see the README's [platform notes](../../README.md#platform-notes))
+Unicode folding, see [platform notes](../PLATFORM.md#platform-notes))
 and the clock.
 
 Run it after installing, after moving a repository to another disk, and

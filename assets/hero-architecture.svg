@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 446" width="920" height="446" role="img" aria-label="Git for Human Teams vs Veil for AI Agent Fleets">
+  <title>Git for Human Teams vs Veil for AI Agent Fleets</title>
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d1220"/>
+      <stop offset="100%" stop-color="#090d16"/>
+    </linearGradient>
+    <linearGradient id="veilGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="cyanGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0284c7"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="emeraldGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="amberGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#fbbf24"/>
+    </linearGradient>
+    <linearGradient id="roseGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#be123c"/>
+      <stop offset="100%" stop-color="#fb7185"/>
+    </linearGradient>
+    <linearGradient id="slateGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#334155"/>
+      <stop offset="100%" stop-color="#64748b"/>
+    </linearGradient>
+    <linearGradient id="topAccent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="50%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+    <marker id="arrRose" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,1.5 L8.5,5 L0,8.5 Z" fill="#f43f5e"/>
+    </marker>
+    <marker id="arrViolet" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,1.5 L8.5,5 L0,8.5 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrCyan" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,1.5 L8.5,5 L0,8.5 Z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrEmerald" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,1.5 L8.5,5 L0,8.5 Z" fill="#34d399"/>
+    </marker>
+    <radialGradient id="hubGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="919" height="445" rx="16" fill="url(#bgGrad)" stroke="#243047" stroke-width="1"/>
+  <rect x="24" y="0.5" width="872" height="2.5" rx="1.25" fill="url(#topAccent)" opacity="0.85"/>
+  <text x="28.0" y="34.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="700" fill="#a78bfa" text-anchor="start" letter-spacing="1.4">ARCHITECTURE SHIFT</text>
+  <text x="28.0" y="58.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="700" fill="#f8fafc" text-anchor="start">Why Git Breaks at Agent Scale — and How Veil Fixes It</text>
+  <text x="28.0" y="77.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#8b9bb4" text-anchor="start">Software is shifting from 5 humans taking turns pushing to 1,000+ autonomous agents landing in parallel.</text>
+  <rect x="28" y="96" width="408" height="330" rx="12" fill="#1a131c" stroke="#4c1d2e" stroke-width="1.2"/>
+  <text x="46.0" y="124.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#fb7185" text-anchor="start">Git  ·  Built for human turns</text>
+  <rect x="318.0" y="109.0" width="102.0" height="22.0" rx="11.0" fill="#38121f" stroke="#881337" stroke-width="1"/>
+  <text x="369.0" y="123.2" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5" font-weight="600" fill="#fb7185" text-anchor="middle">RETRY STORM</text>
+  <rect x="46" y="148" width="102" height="32" rx="7" fill="#231622" stroke="#5b2338" stroke-width="1"/>
+  <text x="97.0" y="162.5" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="middle">Agent 1</text>
+  <text x="97.0" y="174.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9" font-weight="400" fill="#8b9bb4" text-anchor="middle">full local clone</text>
+  <path d="M 150 164 C 198 164, 196 226, 244 226" fill="none" stroke="#f43f5e" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.85" marker-end="url(#arrRose)"/>
+  <rect x="46" y="189" width="102" height="32" rx="7" fill="#231622" stroke="#5b2338" stroke-width="1"/>
+  <text x="97.0" y="203.5" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="middle">Agent 2</text>
+  <text x="97.0" y="215.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9" font-weight="400" fill="#8b9bb4" text-anchor="middle">full local clone</text>
+  <path d="M 150 205 C 198 205, 196 226, 244 226" fill="none" stroke="#f43f5e" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.85" marker-end="url(#arrRose)"/>
+  <rect x="46" y="230" width="102" height="32" rx="7" fill="#231622" stroke="#5b2338" stroke-width="1"/>
+  <text x="97.0" y="244.5" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="middle">Agent 3</text>
+  <text x="97.0" y="256.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9" font-weight="400" fill="#8b9bb4" text-anchor="middle">full local clone</text>
+  <path d="M 150 246 C 198 246, 196 226, 244 226" fill="none" stroke="#f43f5e" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.85" marker-end="url(#arrRose)"/>
+  <rect x="46" y="271" width="102" height="32" rx="7" fill="#231622" stroke="#5b2338" stroke-width="1"/>
+  <text x="97.0" y="285.5" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="middle">… Agent N</text>
+  <text x="97.0" y="297.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9" font-weight="400" fill="#8b9bb4" text-anchor="middle">full local clone</text>
+  <path d="M 150 287 C 198 287, 196 226, 244 226" fill="none" stroke="#f43f5e" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.85" marker-end="url(#arrRose)"/>
+  <rect x="248" y="162" width="168" height="128" rx="10" fill="#2b121c" stroke="#f43f5e" stroke-width="1.4"/>
+  <text x="332.0" y="186.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#fb7185" text-anchor="middle">Global main Race</text>
+  <text x="332.0" y="206.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="400" fill="#cbd5e1" text-anchor="middle">push rejected (stale)</text>
+  <text x="332.0" y="224.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="400" fill="#cbd5e1" text-anchor="middle">pull -&gt; rebase -&gt; retry</text>
+  <text x="332.0" y="242.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="400" fill="#cbd5e1" text-anchor="middle">conflict freezes tree</text>
+  <rect x="266.0" y="256.0" width="132.0" height="22.0" rx="11.0" fill="#450a1a" stroke="#9f1239" stroke-width="1"/>
+  <text x="332.0" y="270.4" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="600" fill="#fda4af" text-anchor="middle">~20–30 lands/sec</text>
+  <path d="M 332.0 292 C 332.0 310, 198 310, 160 300" fill="none" stroke="#f43f5e" stroke-width="1.35" stroke-dasharray="3 3" opacity="0.8" marker-end="url(#arrRose)"/>
+  <text x="264.0" y="324.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5" font-weight="400" fill="#fb7185" text-anchor="middle">losers pull, rebase &amp; retry</text>
+  <text x="46.0" y="354.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="12" font-weight="700" fill="#f43f5e" text-anchor="start">×</text>
+  <text x="62.0" y="354.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.8" font-weight="400" fill="#cbd5e1" text-anchor="start">All-or-nothing access: any clone reads the whole repo</text>
+  <text x="46.0" y="376.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="12" font-weight="700" fill="#f43f5e" text-anchor="start">×</text>
+  <text x="62.0" y="376.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.8" font-weight="400" fill="#cbd5e1" text-anchor="start">Unconfined host execution: ~/.ssh and secrets exposed</text>
+  <text x="46.0" y="398.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="12" font-weight="700" fill="#f43f5e" text-anchor="start">×</text>
+  <text x="62.0" y="398.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.8" font-weight="400" fill="#cbd5e1" text-anchor="start">Broken main stalls every agent until manual bisect</text>
+  <rect x="452" y="96" width="440" height="330" rx="12" fill="#12172b" stroke="#4c2d8a" stroke-width="1.3"/>
+  <ellipse cx="717" cy="231" rx="140" ry="95" fill="url(#hubGlow)"/>
+  <text x="470.0" y="124.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#a78bfa" text-anchor="start">Veil (vl)  ·  jj model + Scion Hub</text>
+  <rect x="778.0" y="109.0" width="98.0" height="22.0" rx="11.0" fill="#1e1b4b" stroke="#6d28d9" stroke-width="1"/>
+  <text x="827.0" y="123.2" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5" font-weight="600" fill="#c4b5fd" text-anchor="middle">LOCK-FREE</text>
+  <rect x="470" y="148" width="112" height="32" rx="7" fill="#182036" stroke="#3b4d71" stroke-width="1"/>
+  <text x="526.0" y="162.5" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="middle">Agent 1</text>
+  <text x="526.0" y="174.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9" font-weight="400" fill="#38bdf8" text-anchor="middle">src/auth/ only</text>
+  <path d="M 584 164 C 614 164, 614 228, 630 228" fill="none" stroke="#a78bfa" stroke-width="1.6" opacity="0.9" marker-end="url(#arrViolet)"/>
+  <rect x="470" y="189" width="112" height="32" rx="7" fill="#182036" stroke="#3b4d71" stroke-width="1"/>
+  <text x="526.0" y="203.5" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="middle">Agent 2</text>
+  <text x="526.0" y="215.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9" font-weight="400" fill="#38bdf8" text-anchor="middle">src/api/ only</text>
+  <path d="M 584 205 C 614 205, 614 228, 630 228" fill="none" stroke="#a78bfa" stroke-width="1.6" opacity="0.9" marker-end="url(#arrViolet)"/>
+  <rect x="470" y="230" width="112" height="32" rx="7" fill="#182036" stroke="#3b4d71" stroke-width="1"/>
+  <text x="526.0" y="244.5" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="middle">Agent 3</text>
+  <text x="526.0" y="256.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9" font-weight="400" fill="#38bdf8" text-anchor="middle">tests/ only</text>
+  <path d="M 584 246 C 614 246, 614 228, 630 228" fill="none" stroke="#a78bfa" stroke-width="1.6" opacity="0.9" marker-end="url(#arrViolet)"/>
+  <rect x="470" y="271" width="112" height="32" rx="7" fill="#182036" stroke="#3b4d71" stroke-width="1"/>
+  <text x="526.0" y="285.5" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="middle">… 10,000+</text>
+  <text x="526.0" y="297.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9" font-weight="400" fill="#38bdf8" text-anchor="middle">ms workspace</text>
+  <path d="M 584 287 C 614 287, 614 228, 630 228" fill="none" stroke="#a78bfa" stroke-width="1.6" opacity="0.9" marker-end="url(#arrViolet)"/>
+  <rect x="634" y="148" width="134" height="162" rx="10" fill="#1b1636" stroke="#8b5cf6" stroke-width="1.6"/>
+  <text x="701.0" y="170.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="700" fill="#f8fafc" text-anchor="middle">Veil Hub</text>
+  <text x="701.0" y="184.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.2" font-weight="400" fill="#a78bfa" text-anchor="middle">Server-Centric Core</text>
+  <rect x="644" y="197" width="114" height="21" rx="5" fill="#111528" stroke="#312e59" stroke-width="0.9"/>
+  <text x="701.0" y="211.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.8" font-weight="600" fill="#38bdf8" text-anchor="middle">1. Folder ACLs</text>
+  <rect x="644" y="223" width="114" height="21" rx="5" fill="#111528" stroke="#312e59" stroke-width="0.9"/>
+  <text x="701.0" y="237.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.8" font-weight="600" fill="#a78bfa" text-anchor="middle">2. Lock-free write</text>
+  <rect x="644" y="249" width="114" height="21" rx="5" fill="#111528" stroke="#312e59" stroke-width="0.9"/>
+  <text x="701.0" y="263.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.8" font-weight="600" fill="#34d399" text-anchor="middle">3. Batch land CAS</text>
+  <rect x="644" y="275" width="114" height="21" rx="5" fill="#111528" stroke="#312e59" stroke-width="0.9"/>
+  <text x="701.0" y="289.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.8" font-weight="600" fill="#fbbf24" text-anchor="middle">4. Auto-bisect CI</text>
+  <path d="M 770 188 L 782 188" fill="none" stroke="#34d399" stroke-width="1.6" marker-end="url(#arrEmerald)"/>
+  <rect x="786" y="150" width="90" height="74" rx="8" fill="#0d2622" stroke="#10b981" stroke-width="1.2"/>
+  <text x="831.0" y="169.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11.5" font-weight="700" fill="#34d399" text-anchor="middle">main</text>
+  <text x="831.0" y="185.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.2" font-weight="400" fill="#f8fafc" text-anchor="middle">1 atomic CAS</text>
+  <text x="831.0" y="201.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.2" font-weight="600" fill="#34d399" text-anchor="middle">main@tested</text>
+  <text x="831.0" y="215.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="8.6" font-weight="400" fill="#8b9bb4" text-anchor="middle">always green</text>
+  <path d="M 770 271 L 782 271" fill="none" stroke="#38bdf8" stroke-width="1.6" marker-end="url(#arrCyan)"/>
+  <rect x="786" y="234" width="90" height="74" rx="8" fill="#0e2234" stroke="#0ea5e9" stroke-width="1.2"/>
+  <text x="831.0" y="253.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.8" font-weight="700" fill="#38bdf8" text-anchor="middle">Scale Store</text>
+  <text x="831.0" y="269.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.1" font-weight="400" fill="#f8fafc" text-anchor="middle">PG / Yugabyte</text>
+  <text x="831.0" y="285.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.1" font-weight="400" fill="#f8fafc" text-anchor="middle">+ S3 Objects</text>
+  <text x="831.0" y="299.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="8.6" font-weight="400" fill="#8b9bb4" text-anchor="middle">append-only</text>
+  <text x="470.0" y="354.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="start">✓</text>
+  <text x="486.0" y="354.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.8" font-weight="400" fill="#f8fafc" text-anchor="start">Zero pull/rebase retries: server batches vl land onto main</text>
+  <text x="470.0" y="376.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="start">✓</text>
+  <text x="486.0" y="376.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.8" font-weight="400" fill="#f8fafc" text-anchor="start">Linux bubblewrap sandboxes + encrypted secrets + folder ACLs</text>
+  <text x="470.0" y="398.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="12" font-weight="700" fill="#34d399" text-anchor="start">✓</text>
+  <text x="486.0" y="398.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.8" font-weight="400" fill="#f8fafc" text-anchor="start">Conflicts stored as data; agents start from main@tested</text>
+</svg>

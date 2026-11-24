@@ -337,8 +337,8 @@ it.
 ### `warning: A and B differ only in case or Unicode normalisation; a checkout on a case-insensitive filesystem (macOS by default) will refuse this snapshot. Rename one of them`
 
 Two names collide on macOS. Rename one. To rehearse a macOS checkout on
-Linux: `VEIL_FS_FOLDING=macos vl edit REV`. See the README's
-[platform notes](../../README.md#case-insensitive-filesystems).
+Linux: `VEIL_FS_FOLDING=macos vl edit REV`. See
+[platform notes](../PLATFORM.md#case-insensitive-filesystems).
 
 ### `error: … ` followed by `hint: the repository already moved to that snapshot. To work here meanwhile, move the working copy back without touching files: `vl --no-snapshot undo``
 

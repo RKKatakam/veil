@@ -509,7 +509,7 @@ other way round), then delete the moved-aside copy.
 | `--no-snapshot` | Don't record the working copy before the command |
 | `VEIL_HOME` | Where your identity lives (default `$XDG_CONFIG_HOME/veil` or `~/.config/veil`) |
 | `VEIL_USER` | Your name on new changes (`Name <email>` records an email too) |
-| `VEIL_FS_FOLDING` | Override the detected filename case/Unicode folding (see the README's platform notes) |
+| `VEIL_FS_FOLDING` | Override the detected filename case/Unicode folding (see [platform notes](../PLATFORM.md#case-insensitive-filesystems)) |
 | `VEIL_MAX_OBJECT` | Largest object a pack may hold when read (default `4G`; a larger declared size is refused as damaged or hostile) |
 | `NO_COLOR` | Disable colours (they are off anyway when output is not a terminal) |
 

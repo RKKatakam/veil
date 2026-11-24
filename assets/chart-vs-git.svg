@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 412" width="920" height="412" role="img" aria-label="Veil vs Git Client Speed on a 1 GB Repository and Operational Gates">
+  <title>Veil vs Git Client Speed on a 1 GB Repository and Operational Gates</title>
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d1220"/>
+      <stop offset="100%" stop-color="#090d16"/>
+    </linearGradient>
+    <linearGradient id="veilGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="cyanGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0284c7"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="emeraldGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="amberGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#fbbf24"/>
+    </linearGradient>
+    <linearGradient id="roseGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#be123c"/>
+      <stop offset="100%" stop-color="#fb7185"/>
+    </linearGradient>
+    <linearGradient id="slateGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#334155"/>
+      <stop offset="100%" stop-color="#64748b"/>
+    </linearGradient>
+    <linearGradient id="topAccent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="50%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="919" height="411" rx="16" fill="url(#bgGrad)" stroke="#243047" stroke-width="1"/>
+  <rect x="24" y="0.5" width="872" height="2.5" rx="1.25" fill="url(#topAccent)" opacity="0.85"/>
+  <text x="28.0" y="34.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="700" fill="#34d399" text-anchor="start" letter-spacing="1.4">CLIENT PERFORMANCE &amp; RELIABILITY GATES</text>
+  <text x="28.0" y="58.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="700" fill="#f8fafc" text-anchor="start">Faster Than Git on Real Workloads — With Crash-Safe Commits</text>
+  <text x="28.0" y="77.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#8b9bb4" text-anchor="start">Same-machine medians on identical files (1 GB / 35,000-file project &amp; 10,000-file import). Shorter bar = faster.</text>
+  <rect x="28" y="96" width="864" height="214" rx="12" fill="#111827" stroke="#243047" stroke-width="1"/>
+  <rect x="602" y="110" width="11" height="11" rx="2.5" fill="#a78bfa"/>
+  <text x="618.0" y="119.5" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="700" fill="#f8fafc" text-anchor="start">Veil (vl)</text>
+  <rect x="696" y="110" width="11" height="11" rx="2.5" fill="#64748b"/>
+  <text x="712.0" y="119.5" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#cbd5e1" text-anchor="start">Git (same machine)</text>
+  <text x="46.0" y="120.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#8b9bb4" text-anchor="start">Normalized to slower tool = 100% per operation  (shorter is faster)</text>
+  <text x="48.0" y="150.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="start">Default clone · 1 GB (thin vs full)</text>
+  <text x="440.0" y="150.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#34d399" text-anchor="end">3.1× faster</text>
+  <rect x="48" y="157" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="48" y="157" width="70.0" height="10" rx="3" fill="url(#veilGrad)"/>
+  <text x="274.0" y="165.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#a78bfa" text-anchor="start">9.4 s</text>
+  <rect x="48" y="171" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="48" y="171" width="216.0" height="10" rx="3" fill="url(#slateGrad)"/>
+  <text x="274.0" y="179.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.6" font-weight="400" fill="#8b9bb4" text-anchor="start">29.0 s</text>
+  <text x="48.0" y="204.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="start">Import project · 1 GB (35k files)</text>
+  <text x="440.0" y="204.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#34d399" text-anchor="end">2.6× faster</text>
+  <rect x="48" y="211" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="48" y="211" width="83.2" height="10" rx="3" fill="url(#veilGrad)"/>
+  <text x="274.0" y="219.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#a78bfa" text-anchor="start">4.2 s</text>
+  <rect x="48" y="225" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="48" y="225" width="216.0" height="10" rx="3" fill="url(#slateGrad)"/>
+  <text x="274.0" y="233.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.6" font-weight="400" fill="#8b9bb4" text-anchor="start">10.9 s</text>
+  <text x="48.0" y="258.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="start">status · 1 GB (watcher running*)</text>
+  <text x="440.0" y="258.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#34d399" text-anchor="end">5.4× faster</text>
+  <rect x="48" y="265" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="48" y="265" width="39.8" height="10" rx="3" fill="url(#veilGrad)"/>
+  <text x="274.0" y="273.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#a78bfa" text-anchor="start">5.8 ms</text>
+  <rect x="48" y="279" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="48" y="279" width="216.0" height="10" rx="3" fill="url(#slateGrad)"/>
+  <text x="274.0" y="287.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.6" font-weight="400" fill="#8b9bb4" text-anchor="start">31.5 ms</text>
+  <text x="480.0" y="150.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="start">Import folder · 10,000 files</text>
+  <text x="872.0" y="150.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#34d399" text-anchor="end">2.7× faster</text>
+  <rect x="480" y="157" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="480" y="157" width="81.0" height="10" rx="3" fill="url(#veilGrad)"/>
+  <text x="706.0" y="165.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#a78bfa" text-anchor="start">304 ms</text>
+  <rect x="480" y="171" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="480" y="171" width="216.0" height="10" rx="3" fill="url(#slateGrad)"/>
+  <text x="706.0" y="179.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.6" font-weight="400" fill="#8b9bb4" text-anchor="start">811 ms</text>
+  <text x="480.0" y="204.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="start">Commit 1 file · 1 GB (watcher + fsync)</text>
+  <text x="872.0" y="204.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#38bdf8" text-anchor="end">durable fsync</text>
+  <rect x="480" y="211" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="480" y="211" width="152.5" height="10" rx="3" fill="url(#veilGrad)"/>
+  <text x="706.0" y="219.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#a78bfa" text-anchor="start">24 ms</text>
+  <rect x="480" y="225" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="480" y="225" width="216.0" height="10" rx="3" fill="url(#slateGrad)"/>
+  <text x="706.0" y="233.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.6" font-weight="400" fill="#8b9bb4" text-anchor="start">34 ms (27 no fsync)</text>
+  <text x="480.0" y="258.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#f8fafc" text-anchor="start">log -n 20 · 1 GB (watcher running)</text>
+  <text x="872.0" y="258.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#fbbf24" text-anchor="end">Git wins</text>
+  <rect x="480" y="265" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="480" y="265" width="216.0" height="10" rx="3" fill="url(#amberGrad)"/>
+  <text x="706.0" y="273.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="700" fill="#fbbf24" text-anchor="start">8.1 ms</text>
+  <rect x="480" y="279" width="216.0" height="10" rx="3" fill="#182235"/>
+  <rect x="480" y="279" width="53.3" height="10" rx="3" fill="url(#slateGrad)"/>
+  <text x="706.0" y="287.5" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.6" font-weight="400" fill="#8b9bb4" text-anchor="start">2.0 ms</text>
+  <line x1="460" y1="136" x2="460" y2="296" stroke="#1e293b" stroke-width="1"/>
+  <rect x="28" y="322" width="207" height="68" rx="10" fill="#151d2e" stroke="#243047" stroke-width="1"/>
+  <text x="42.0" y="346.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="16.5" font-weight="700" fill="#a78bfa" text-anchor="start">&lt; 300 ms</text>
+  <text x="42.0" y="364.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#f8fafc" text-anchor="start">200k-File Workspace</text>
+  <text x="42.0" y="378.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.0" font-weight="400" fill="#8b9bb4" text-anchor="start">288 ms cold / 259 ms warm start</text>
+  <rect x="247" y="322" width="207" height="68" rx="10" fill="#151d2e" stroke="#243047" stroke-width="1"/>
+  <text x="261.0" y="346.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="16.5" font-weight="700" fill="#34d399" text-anchor="start">1.6 s · 0 lost</text>
+  <text x="261.0" y="364.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#f8fafc" text-anchor="start">Failover Integrity Pass</text>
+  <text x="261.0" y="378.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.0" font-weight="400" fill="#8b9bb4" text-anchor="start">10,473/10,473 once (2.46s max gap)</text>
+  <rect x="466" y="322" width="207" height="68" rx="10" fill="#151d2e" stroke="#243047" stroke-width="1"/>
+  <text x="480.0" y="346.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="16.5" font-weight="700" fill="#38bdf8" text-anchor="start">6 – 22 ms</text>
+  <text x="480.0" y="364.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#f8fafc" text-anchor="start">100,000 Pull Requests</text>
+  <text x="480.0" y="378.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.0" font-weight="400" fill="#8b9bb4" text-anchor="start">Median list, search, open &amp; update</text>
+  <rect x="685" y="322" width="207" height="68" rx="10" fill="#151d2e" stroke="#243047" stroke-width="1"/>
+  <text x="699.0" y="346.0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="16.5" font-weight="700" fill="#fbbf24" text-anchor="start">3,540+ Tests</text>
+  <text x="699.0" y="364.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#f8fafc" text-anchor="start">Green Correctness Suite</text>
+  <text x="699.0" y="378.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.0" font-weight="400" fill="#8b9bb4" text-anchor="start">~970 server (PG+YB) · ~2,570 client</text>
+  <text x="28.0" y="404.0" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="9.0" font-weight="400" fill="#64748b" text-anchor="start">* Client vs. Git on 32-core NVMe (2026-11-12, pre-append-only). With daemon stopped, status is 63–68 ms. Failover on GCP (2026-11-21; 2s max-gap target missed at 2.46s).</text>
+</svg>
