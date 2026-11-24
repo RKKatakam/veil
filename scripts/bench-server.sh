@@ -65,7 +65,7 @@ cleanup() {
             D logs "$S3"
         } > "${OUT%.json}-minio.log" 2>&1 || true
     fi
-    D rm -f "$PG" "$S3" >/dev/null 2>&1
+    D rm -fv "$PG" "$S3" >/dev/null 2>&1
     # Only ever inside the worktree's .scratch/.
     [[ -n "$WORK" && "$WORK" == "$ROOT/.scratch/"* ]] && rm -rf "$WORK"
 }

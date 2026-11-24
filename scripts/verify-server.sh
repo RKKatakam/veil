@@ -97,7 +97,7 @@ cleanup() {
       done
     fi
   else
-    D rm -f "$PG" "$YB" "$S3" >/dev/null 2>&1
+    D rm -fv "$PG" "$YB" "$S3" >/dev/null 2>&1
   fi
 }
 trap cleanup EXIT
@@ -115,7 +115,7 @@ lift_yb_tablet_limit() {
 }
 
 start_yb() {
-  D rm -f "$YB" >/dev/null 2>&1
+  D rm -fv "$YB" >/dev/null 2>&1
   # Memory capped, one tablet per table, no tablet-count limit: a long-lived
   # YugabyteDB otherwise grows toward most of the
   # machine's memory (8 GB seen) while agents build beside it.
@@ -136,8 +136,8 @@ start_yb() {
 start_services() {
   # The load step runs 8 copies of the concurrency tests, each with its own
   # servers and connection pools; shared runs can overlap, so allow plenty.
-  running "$PG" || { D rm -f "$PG" >/dev/null 2>&1; D run -d --name "$PG" --shm-size=1g -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 "$PG_IMAGE" -c max_connections=1500 >/dev/null || return 1; }
-  running "$S3" || { D rm -f "$S3" >/dev/null 2>&1; D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 "$S3_IMAGE" >/dev/null || return 1; }
+  running "$PG" || { D rm -fv "$PG" >/dev/null 2>&1; D run -d --name "$PG" --shm-size=1g -e POSTGRES_PASSWORD=veil -e POSTGRES_USER=veil -e POSTGRES_DB=veil -p 127.0.0.1::5432 "$PG_IMAGE" -c max_connections=1500 >/dev/null || return 1; }
+  running "$S3" || { D rm -fv "$S3" >/dev/null 2>&1; D run -d --name "$S3" -e MINIO_ROOT_USER=veilminio -e MINIO_ROOT_PASSWORD=veilminio-secret -p 127.0.0.1::9000 "$S3_IMAGE" >/dev/null || return 1; }
   PG_PORT=$(port "$PG" 5432) S3_PORT=$(port "$S3" 9000) YB_PORT=-
   # Over TCP: a new container first runs a set-up server on its socket only.
   for i in $(seq 120); do D exec "$PG" pg_isready -h 127.0.0.1 -U veil >/dev/null 2>&1 && break; sleep 1; done
